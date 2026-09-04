@@ -1674,7 +1674,20 @@ async fn put_streams_a_local_file_into_the_tree() {
     );
 
     // An explicit file destination is taken as written, whatever the file
-    // was called; and an empty file is a file.
+    // was called, and a second put replaces what the first published.
+    let written = synch_cli::write::put(
+        data_dir,
+        &files.path().join("1.txt"),
+        "media/copies/renamed.txt",
+    )
+    .await
+    .unwrap();
+    assert_eq!(written.entry.path, "copies/renamed.txt");
+    assert_eq!(
+        read(data_dir, cat("media/copies/renamed.txt", None, None)).await,
+        b"hello from disk\n"
+    );
+    // ...and an empty file is a file.
     let written = synch_cli::write::put(
         data_dir,
         &files.path().join("empty"),
@@ -1684,6 +1697,9 @@ async fn put_streams_a_local_file_into_the_tree() {
     .unwrap();
     assert_eq!(written.entry.path, "copies/renamed.txt");
     assert_eq!(written.entry.size, 0);
+    assert!(read(data_dir, cat("media/copies/renamed.txt", None, None))
+        .await
+        .is_empty());
 
     // Nothing was materialized: the API source has no directory and no local
     // files, and the bytes are in the CAS.
@@ -1730,15 +1746,74 @@ async fn put_into_a_filesystem_source_writes_the_file() {
     daemon.shutdown().await;
 }
 
-/// A put that cannot complete publishes nothing, and one this process can
-/// refuse on its own — a missing file, a directory, stdin without a name, a
-/// malformed destination — is refused before any write opens.
+/// A reader that hands over a fixed number of bytes and then fails — a
+/// producer that died mid-stream, for a test, since no file on disk fails
+/// to read on cue.
+struct DyingReader {
+    remaining: usize,
+}
+
+impl tokio::io::AsyncRead for DyingReader {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        _cx: &mut std::task::Context<'_>,
+        buf: &mut tokio::io::ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        if this.remaining == 0 {
+            return std::task::Poll::Ready(Err(std::io::Error::other("the producer died")));
+        }
+        let take = this.remaining.min(buf.remaining());
+        buf.put_slice(&vec![7u8; take]);
+        this.remaining -= take;
+        std::task::Poll::Ready(Ok(()))
+    }
+}
+
+/// A put that cannot complete publishes nothing: a read that fails partway
+/// aborts the write after a full chunk was already staged, and the daemon
+/// throws that chunk away. One this process can refuse on its own — a
+/// missing file, a directory, stdin without a name, a malformed destination
+/// — is refused before any write opens.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_failed_put_publishes_nothing() {
     let (dir, daemon, _space, _scan) = daemon_with_space(&[]).await;
     let data_dir = dir.path();
     let files = tempfile::tempdir().unwrap();
     std::fs::write(files.path().join("a.txt"), b"a").unwrap();
+
+    // The reader fails after enough has arrived that a full control chunk
+    // was already streamed into the daemon's staging file — the abort must
+    // throw *staged* bytes away, not just an empty write.
+    let error = synch_cli::write::put_from(
+        data_dir,
+        DyingReader { remaining: 300_000 },
+        "media/gone.bin",
+    )
+    .await
+    .unwrap_err();
+    // The error carries the daemon's own account of the abort, with the one
+    // full chunk it had staged and threw away.
+    assert!(
+        format!("{error:#}").contains("abandoned after 262144 byte(s)"),
+        "{error:#}"
+    );
+    assert!(
+        format!("{error:#}").contains("the producer died"),
+        "{error:#}"
+    );
+    assert_eq!(
+        resolve(data_dir, resolve_req("media", "gone.bin"))
+            .await
+            .unwrap_err(),
+        ErrorCode::NotFound
+    );
+
+    // A stream has no name to complete a directory destination with.
+    let error = synch_cli::write::put_from(data_dir, DyingReader { remaining: 1 }, "media/")
+        .await
+        .unwrap_err();
+    assert!(format!("{error:#}").contains("names no file"), "{error:#}");
 
     let missing = files.path().join("missing.txt");
     let a = files.path().join("a.txt");
@@ -1780,7 +1855,8 @@ async fn a_failed_put_publishes_nothing() {
 
 /// `synch delete` publishes this node's tombstone through the same call the
 /// gateway's `DeleteObject` uses, and says whether another origin still
-/// publishes the path.
+/// publishes the path — here, with one publisher, nobody does; the two-origin
+/// answer is the gateway's `DeleteObject` path, exercised where a peer exists.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn delete_publishes_a_tombstone() {
     let (dir, daemon, _space, _scan) = daemon_with_space(&[("gone.txt", b"bytes")]).await;

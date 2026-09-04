@@ -182,9 +182,9 @@ used.
 
 Only API sources are valid on a cloud-backed node. They have no scanner,
 watcher, or local directory: gateway writes, `synch put`, `synch fetch`, and
-`synch adopt path` ingest directly into the cloud CAS, while `cat`, `get`, and gateway reads fill the ephemeral range
-cache on demand. A durable-disk node can configure a replica checkout when a
-filesystem projection is wanted elsewhere.
+`synch adopt path` ingest directly into the cloud CAS, while `cat`, `get`, and
+gateway reads fill the ephemeral range cache on demand. A durable-disk node can
+configure a replica checkout when a filesystem projection is wanted elsewhere.
 
 The default `SYNCH_CAS_UPLOAD=own+pinned` uploads content created by this node
 and peer content it pins. Use `own` to upload only locally created content, or
@@ -415,7 +415,9 @@ publisher has done so the path leaves the tree.
 Write without a checkout. `put` streams a local file, or stdin, through the same
 typed write the S3 gateway uses and publishes it as this node's own version;
 `delete` publishes this node's tombstone. Both work on an API source, where
-nothing is materialized:
+nothing is materialized. The end of stdin is the end of the payload — put cannot
+tell a producer that finished from one that died — so when that matters, write
+to a file first and put the file:
 
 ```sh
 synch put notes.txt media/notes.txt                  # this node's version of the path

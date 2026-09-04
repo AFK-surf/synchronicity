@@ -428,11 +428,13 @@ pub enum Command {
     /// The payload streams through this process into the daemon and is
     /// published as this node's own version of the destination path, exactly
     /// as a write through the API would be. The space needs no local
-    /// directory: on an API source nothing is materialized. Nothing is
-    /// published unless the whole payload arrives: a read that fails partway
-    /// leaves the tree untouched.
+    /// directory: on an API source nothing is materialized. A read that
+    /// fails partway leaves the tree untouched.
     ///
-    /// The write replaces whatever the destination path held.
+    /// The write replaces whatever the destination path held, and the end of
+    /// the input is the end of the payload: put cannot tell a producer that
+    /// finished from one that died, so when that matters, write to a file
+    /// first and put the file.
     Put {
         /// The file to write, or `-` to read stdin.
         file: PathBuf,

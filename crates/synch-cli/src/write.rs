@@ -4,12 +4,15 @@
 //! Both are clients of the daemon's typed write path (§9.4). `put` streams a
 //! local file, or stdin, into the same `Put` the S3 gateway and `synch fetch`
 //! write through, so no copy of the payload is ever held whole anywhere and
-//! the entry is published only once the whole payload arrived — a read that
-//! fails partway aborts the write and the daemon keeps nothing. `delete`
-//! publishes this node's tombstone through the same `Delete` the gateway's
-//! `DeleteObject` uses. Neither needs the space to have a directory: on an
-//! API source the payload goes CAS-direct and nothing is materialized
-//! (`docs/SERVERLESS.md` §10).
+//! the entry is published only once the reader ended — a read that *fails*
+//! partway aborts the write and the daemon keeps nothing. What put cannot
+//! tell apart is a producer that finished from one that died: a pipe whose
+//! writer was killed delivers a clean end of stream, and that is the end of
+//! the payload. `fetch` has `Content-Length` to hold a server to; a pipe
+//! promises nothing. `delete` publishes this node's tombstone through the
+//! same `Delete` the gateway's `DeleteObject` uses. Neither needs the space
+//! to have a directory: on an API source the payload goes CAS-direct and
+//! nothing is materialized (`docs/SERVERLESS.md` §10).
 
 use std::path::Path;
 
@@ -53,10 +56,12 @@ pub async fn put(data_dir: &Path, file: &Path, destination: &str) -> Result<Writ
             anyhow::bail!("stdin carries no file name; give the destination an explicit file name")
         }
         None => {
+            // `file_name` is already one component — never `.`, `..`, or a
+            // separator — so the only way to lack a name is to be `..`, a
+            // root, or not UTF-8.
             let name = file
                 .file_name()
                 .and_then(|name| name.to_str())
-                .filter(|name| !name.is_empty())
                 .with_context(|| {
                     format!(
                         "{} does not name a file; give the destination an explicit file name",
@@ -71,16 +76,51 @@ pub async fn put(data_dir: &Path, file: &Path, destination: &str) -> Result<Writ
         false => Some(open(file).await?),
     };
 
-    // The daemon takes its gates — publishability, a resolvable target —
-    // before `put` returns, so a destination it refuses fails here, before
-    // a byte of the payload is read (§9.4).
-    let mut client = Client::connect(data_dir).await?;
-    let put = client.put(&destination.space, &path).await?;
-
     match opened {
-        Some(reader) => stream(reader, put, &file.display().to_string()).await,
-        None => stream(tokio::io::stdin(), put, "stdin").await,
+        Some(reader) => {
+            stream(
+                data_dir,
+                reader,
+                &destination.space,
+                &path,
+                &file.display().to_string(),
+            )
+            .await
+        }
+        None => {
+            stream(
+                data_dir,
+                tokio::io::stdin(),
+                &destination.space,
+                &path,
+                "stdin",
+            )
+            .await
+        }
     }
+}
+
+/// Streams any reader into the tree and publishes it at the destination,
+/// which must name a file: there is no file name to complete a directory
+/// with.
+///
+/// The entry point for a caller that holds the payload as a stream rather
+/// than a path — and the one the tests drive with a reader that fails, since
+/// no file on disk fails to read on cue.
+pub async fn put_from<R: AsyncRead + Unpin>(
+    data_dir: &Path,
+    reader: R,
+    destination: &str,
+) -> Result<Written> {
+    let destination = Destination::parse(destination)?;
+    let Some(path) = destination.explicit_path() else {
+        anyhow::bail!(
+            "`{}/{}` names no file; a stream has no file name to complete a directory with",
+            destination.space,
+            destination.path
+        );
+    };
+    stream(data_dir, reader, &destination.space, &path, "the payload").await
 }
 
 /// Opens the file to stream, refusing what could never be one payload.
@@ -101,7 +141,7 @@ async fn open(file: &Path) -> Result<tokio::fs::File> {
         .with_context(|| format!("reading {}", file.display()))
 }
 
-/// Streams a reader into an opened write in protocol-sized chunks, and
+/// Opens the write, streams a reader into it in protocol-sized chunks, and
 /// commits it once the reader ends.
 ///
 /// The payload arrives in whatever pieces the reader chose — a pipe hands
@@ -110,26 +150,37 @@ async fn open(file: &Path) -> Result<tokio::fs::File> {
 /// do, so the message size is a property of the protocol rather than of the
 /// source's write pattern.
 async fn stream<R: AsyncRead + Unpin>(
+    data_dir: &Path,
     mut reader: R,
-    mut put: StreamedWrite<PutPart>,
+    space: &str,
+    path: &str,
     what: &str,
 ) -> Result<Written> {
+    // The daemon takes its gates — publishability, a resolvable target —
+    // before `put` returns, so a destination it refuses fails here, before
+    // a byte of the payload is read (§9.4).
+    let mut client = Client::connect(data_dir).await?;
+    let mut put: StreamedWrite<PutPart> = client.put(space, path).await?;
+
     let mut ended = false;
     while !ended {
-        let mut chunk = Vec::with_capacity(CHUNK_SIZE);
-        while chunk.len() < CHUNK_SIZE {
-            match reader.read_buf(&mut chunk).await {
+        // A fixed buffer filled to the brim, rather than a `Vec` grown by
+        // `read_buf`: the chunk is exactly `CHUNK_SIZE` by construction, not
+        // by an allocator's opinion of what "at least this capacity" means.
+        let mut chunk = vec![0u8; CHUNK_SIZE];
+        let mut filled = 0;
+        while filled < CHUNK_SIZE {
+            match reader.read(&mut chunk[filled..]).await {
                 Ok(0) => {
                     ended = true;
                     break;
                 }
-                Ok(_) => {}
-                // A payload that stopped early — a pipe whose writer died, a
-                // file on a disk that failed — aborts the write: a truncated
-                // payload must never be published as this node's own
-                // assertion (§9.4). The abort's answer is the daemon's own
-                // account of what it threw away, so it travels in the error
-                // rather than being discarded.
+                Ok(n) => filled += n,
+                // A read that fails — a disk that errored, a stream that
+                // broke — aborts the write: a truncated payload must never be
+                // published as this node's own assertion (§9.4). The abort's
+                // answer is the daemon's own account of what it threw away,
+                // so it travels in the error rather than being discarded.
                 Err(e) => {
                     let failed = format!("reading {what} failed");
                     let aborted = put.abort(format!("reading {what} failed: {e}")).await;
@@ -137,6 +188,7 @@ async fn stream<R: AsyncRead + Unpin>(
                 }
             }
         }
+        chunk.truncate(filled);
         if !chunk.is_empty() {
             put.chunk(chunk).await?;
         }
@@ -186,11 +238,11 @@ pub struct Destination {
 impl Destination {
     /// Parses `<space>/<path>` or `<space>/<dir>/`.
     pub fn parse(text: &str) -> Result<Destination> {
+        // The messages stay neutral about which command is asking: `put`
+        // and `fetch` also take `<space>/<dir>/`, `delete` does not, and
+        // each says so in its own `--help`.
         let Some((space, path)) = text.split_once('/') else {
-            anyhow::bail!(
-                "`{text}` is not a destination; use <space>/<path>, or <space>/<dir>/ to \
-                 keep the source's file name"
-            );
+            anyhow::bail!("`{text}` is not a destination; use <space>/<path>");
         };
         if space.is_empty() {
             anyhow::bail!("`{text}` names no space; use <space>/<path>");
@@ -199,7 +251,7 @@ impl Destination {
         // one cannot rather than failing on a space that does not exist.
         if space.contains(':') {
             anyhow::bail!(
-                "`{text}` names an origin, and a write publishes this node's own version; \
+                "`{text}` names an origin, and this command acts on this node's own version; \
                  use <space>/<path>"
             );
         }
