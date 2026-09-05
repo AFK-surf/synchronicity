@@ -367,10 +367,10 @@ theorem absent_joined_slot (tx : Transaction) (origin slot : String) :
   exact ⟨_, rfl, rfl⟩
 
 /-- Joined decoding admits typed rows of the established widths whose named
-origin is valid. Key-origin and cryptographic validation remain unfinished. -/
+origin syntax is valid. Cryptographic validation remains unfinished. -/
 theorem joined_shape_admitted (origin : String) (seq created received verified : Int64)
     (hash key sig : ByteArray) (hashSize : hash.size = 32) (keySize : key.size = 32)
-    (sigSize : sig.size = 64) (originValid : VerifiedCore.Origin.checkNamedText origin = .ok ()) :
+    (sigSize : sig.size = 64) (originValid : VerifiedCore.Origin.checkSyntax origin = .ok ()) :
     decodeJoinedHead [.text origin, .integer seq, .blob hash, .integer created,
       .blob key, .blob sig, .integer received, .integer verified] =
       .ok ⟨origin, ⟨seq.toUInt64, hash⟩, key⟩ := by
@@ -383,7 +383,7 @@ projected typed conversions and the signature-width check. -/
 theorem joined_origin_before_hash (origin : String) (seq created received verified : Int64)
     (hash key sig : ByteArray) (failure : VerifiedCore.Origin.Error)
     (sigSize : sig.size = 64)
-    (invalid : VerifiedCore.Origin.checkNamedText origin = .error failure) :
+    (invalid : VerifiedCore.Origin.checkSyntax origin = .error failure) :
     decodeJoinedHead [.text origin, .integer seq, .blob hash, .integer created,
       .blob key, .blob sig, .integer received, .integer verified] =
         .error (.origin failure) := by
@@ -419,7 +419,7 @@ private def receiptRow (seq : Int64) (byte : UInt8) (received : Int64) : Row :=
   pointerRow seq byte ++ [.integer received]
 
 private def headRow (seq : Int64) (byte : UInt8) : Row :=
-  [.text "origin", .integer seq, .blob (root byte), .integer 0, .blob (root 0),
+  [.text "node@example", .integer seq, .blob (root byte), .integer 0, .blob (root 0),
    .blob ⟨Array.replicate 64 0⟩, .integer 0, .integer 0]
 
 private structure Script where

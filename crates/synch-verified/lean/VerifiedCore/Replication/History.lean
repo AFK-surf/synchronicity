@@ -21,9 +21,9 @@ point the shared storage interpreter/algebra must preserve these contracts:
   The program now supplies this ordering explicitly.
 * Joined slot reads preserve orphan-pointer absence and check column/byte
   shapes with typed contextual errors in projection order. Named-origin syntax
-  is checked directly by the shared Lean Origin module, after signature width.
-  Key-origin decoding and cryptographic public keys are not yet validated.
-  Native terminal error encoding, key validation and scan-failure ordering remain required
+  and strict key-origin syntax are checked directly by the shared Lean Origin
+  module, after signature width. Cryptographic public keys are not yet validated.
+  Native terminal error encoding, key validity and scan-failure ordering remain required
   before cutover; full diagnostic compatibility is not claimed here.
 
 The generic predicate/order facilities are in Host, not a history-specific
@@ -118,8 +118,8 @@ structure JoinedHead where
   publicKey : ByteArray
 
 /-- Column conversion is sequenced explicitly, followed by record checks.
-Named-origin parsing is included; key-origin parsing and cryptographic
-public-key validity remain cutover gates. -/
+Origin syntax/decoding is included; cryptographic public-key validity remains
+a cutover gate. A syntactically valid key is not yet a validated curve point. -/
 def decodeJoinedHead : Row → Result JoinedHead
   | [origin, seq, root, created, key, sig, received, verified] => do
     let origin ← textField 0 "origin_id" origin
@@ -131,7 +131,7 @@ def decodeJoinedHead : Row → Result JoinedHead
     let _ ← integerField 6 "received_at" received
     let _ ← integerField 7 "verified_at" verified
     if sig.size != 64 then throw (.column "heads.sig" "not 64 bytes")
-    let _ ← (Origin.checkNamedText origin).mapError Error.origin
+    let _ ← (Origin.checkSyntax origin).mapError Error.origin
     let root ← hashField "heads.root" root
     if key.size != 32 then throw (.column "heads.signed_by" "not 32 bytes")
     return ⟨origin, ⟨seq.toUInt64, root⟩, key⟩

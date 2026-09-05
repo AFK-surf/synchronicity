@@ -253,8 +253,12 @@ Integration review has identified specific gates, not waived limitations:
   using a reusable Origin domain module with ASCII normalization, first-`@`
   separation, literal `key:` precedence and contextual label/domain failures.
   It follows signature-width validation and precedes root-width validation.
-  Key and bare forms are explicitly unchecked by this named-only gate.
-  Remaining gates are key-origin decoding, cryptographic key
+  Key and bare forms now pass strict Lean z-base-32 decoding: exact alphabet,
+  unpadded length classes, zero trailing bits and 32-byte key width. Bare
+  failures retain the original shape error; prefixed failures retain the key
+  error class. The complete Lean parser composes with a byte-level validation
+  action; this primitive is not wired into history yet. Syntax alone does not
+  establish curve-point validity. Remaining gates are cryptographic key
   validation, and malformed-storage error behavior. The Rust retention algorithm
   remains until those semantics and the complete native entry point are implemented.
   Specifically, read complete before pending; an orphan pointer without its
@@ -265,7 +269,7 @@ Integration review has identified specific gates, not waived limitations:
   Lean must consume raw storage records and invoke only genuine primitives.
   Raw cells now preserve REAL bits and invalid UTF-8 TEXT instead of rejecting
   them eagerly. Lean's staged history decoder selects contextual field/type
-  errors in projection order. Native terminal encoding and key-origin/key validation
+  errors in projection order. Native terminal encoding and cryptographic key validation
   remain unfinished. Eager materialization of all rows still requires review:
   a later SQLite scan failure must not preempt an earlier record-validation
   error when the existing reader would stop at that record.

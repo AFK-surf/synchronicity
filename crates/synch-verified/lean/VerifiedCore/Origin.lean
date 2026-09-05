@@ -1,13 +1,17 @@
 import Std
 
-/-! Origin syntax is domain logic, shared by Lean operations rather than supplied
-as a host validation service. Key decoding/curve validation is not implemented
-here yet; `checkNamedText` deliberately checks only the named branch. -/
+/-! Origin syntax and base32 decoding are Lean domain logic. `parse` composes
+them with a primitive Ed25519 point-validation action; it never asks the host
+to parse or normalize an origin. Production wiring of that primitive remains
+a migration gate. `parseSyntax` alone does not establish key validity. -/
 namespace VerifiedCore.Origin
 
 inductive Error where
   | label (original : String)
   | domain (original : String)
+  | keyDecode
+  | keyData
+  | shape (original : String)
   deriving BEq, DecidableEq
 
 structure Named where
@@ -46,15 +50,62 @@ def named (id domain : String) : Except Error Named := do
   let domain ← normalizeDomain domain
   return ⟨id, domain⟩
 
-/-- Preserve parser precedence: literal `key:` wins over an embedded `@`.
-Only the first `@` separates the member from its domain. Key and bare forms
-must additionally pass key decoding/validation before production cutover. -/
-def checkNamedText (s : String) : Except Error Unit :=
-  if ['k', 'e', 'y', ':'].isPrefixOf s.toList then .ok ()
+/-- Alphabet is case-sensitive, with no padding, ignored bytes or aliases. -/
+def alphabet : List Char := "ybndrfg8ejkmcpqxot1uwisza345h769".toList
+
+def decodeDigits : List Char → Nat → Nat → List UInt8 → Except Error (List UInt8)
+  | [], _, pending, output =>
+    if pending == 0 then .ok output.reverse else .error .keyDecode
+  | c :: rest, bits, pending, output =>
+    let digit := alphabet.idxOf c
+    if digit ≥ 32 then .error .keyDecode else
+    let bits := bits + 5
+    let pending := pending * 32 + digit
+    if bits ≥ 8 then
+      let remaining := bits - 8
+      let divisor := 2 ^ remaining
+      decodeDigits rest remaining (pending % divisor)
+        ((pending / divisor).toUInt8 :: output)
+    else decodeDigits rest bits pending output
+
+/-- Strict unpadded base32 lengths and zero trailing bits precede the key-width
+check, preserving malformed-encoding versus invalid-key diagnostics. -/
+def decodeKey (text : List Char) : Except Error (List UInt8) := do
+  if !([0, 2, 4, 5, 7].contains (text.length % 8)) then throw .keyDecode
+  let bytes ← decodeDigits text 0 0 []
+  if bytes.length != 32 then throw .keyData
+  return bytes
+
+inductive Parsed where
+  | named (value : Named)
+  | key (bytes : List UInt8)
+  deriving BEq, DecidableEq
+
+def prefixed (s : String) : Bool := ['k', 'e', 'y', ':'].isPrefixOf s.toList
+
+/-- Syntax only: key bytes still require primitive point validation. Literal
+`key:` wins over `@`; bare key failures are reported as original-input shape
+errors, unlike explicitly prefixed key failures. -/
+def parseSyntax (s : String) : Except Error Parsed :=
+  if prefixed s then (decodeKey (s.toList.drop 4)).map Parsed.key
   else
     let id := s.toList.takeWhile (· != '@')
     match s.toList.dropWhile (· != '@') with
-    | [] => .ok ()
-    | _ :: domain => (named (String.ofList id) (String.ofList domain)).map (fun _ => ())
+    | [] => ((decodeKey s.toList).mapError (fun _ => .shape s)).map Parsed.key
+    | _ :: domain => (named (String.ofList id) (String.ofList domain)).map Parsed.named
+
+/-- Complete origin parsing composed in Lean. Only byte-level point validity
+is delegated; syntax, normalization, diagnostic choice and sequencing stay here.
+Host I/O failures belong to the surrounding monad, not to a false key result. -/
+def parse [Monad m] (validate : List UInt8 → m Bool) (s : String) :
+    m (Except Error Parsed) := do
+  match parseSyntax s with
+  | .error error => return .error error
+  | .ok (.named value) => return .ok (.named value)
+  | .ok (.key bytes) =>
+    if ← validate bytes then return .ok (.key bytes)
+    else return .error (if prefixed s then .keyData else .shape s)
+
+def checkSyntax (s : String) : Except Error Unit := (parseSyntax s).map (fun _ => ())
 
 end VerifiedCore.Origin
