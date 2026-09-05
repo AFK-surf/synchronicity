@@ -1,4 +1,4 @@
-//! Private synchronous transport. Only raw storage effects are interpreted here.
+//! Private synchronous transport for raw storage/resource and crypto effects.
 use crate::host::{ByteStorage, Cell, Exclusion, Fields, Join, Order, Resources, Row, Storage};
 use std::{ffi::c_void, marker::PhantomData, ptr::NonNull, rc::Rc};
 
@@ -200,6 +200,7 @@ enum Frame {
     ReadCounter(String, Vec<u8>),
     RemoveFile(String, Vec<u8>),
     ExistsRows(u64, String, Fields),
+    ValidateEd25519(Vec<u8>),
 }
 
 fn decode(packet: &[u8]) -> Result<Frame, ()> {
@@ -257,6 +258,7 @@ fn decode(packet: &[u8]) -> Result<Frame, ()> {
         24 => Frame::ReadCounter(r.string()?, r.bytes()?),
         25 => Frame::RemoveFile(r.string()?, r.bytes()?),
         26 => Frame::ExistsRows(r.word()?, r.string()?, r.fields()?),
+        27 => Frame::ValidateEd25519(r.bytes()?),
         _ => return Err(()),
     };
     r.end()?;
@@ -290,11 +292,21 @@ fn execute<S: Storage>(
     storage: &mut S,
     inputs: &[&[u8]],
     mut resources: Option<&mut dyn Resources<Error = S::Error>>,
+    mut crypto: Option<&mut dyn crate::host::Crypto<Error = S::Error>>,
 ) -> Result<Vec<u8>, OperationError<S::Error>> {
     let mut errors = Vec::new();
     loop {
         let frame = decode(&state.packet()).map_err(|()| OperationError::Protocol)?;
         let response = match frame {
+            Frame::ValidateEd25519(bytes) => match crypto.as_deref_mut() {
+                Some(crypto) => reply(
+                    27,
+                    crypto.validate_ed25519(&bytes),
+                    &mut errors,
+                    |out, valid| out.push(u8::from(valid)),
+                ),
+                None => return Err(OperationError::Protocol),
+            },
             Frame::ReadCounter(space, key) => match resources.as_deref_mut() {
                 Some(resources) => {
                     reply(24, resources.read_counter(&space, &key), &mut errors, word)
@@ -392,7 +404,7 @@ fn execute<S: Storage>(
 /// Run a domain constructor without exposing continuations to its caller.
 ///
 /// # Safety
-/// `start` must return one fresh owned Lean Wire.State. It is called only after
+/// `start` must return one fresh owned Lean Wire.NativeState. It is called only after
 /// this thread's runtime is initialized; borrowed input buffers live until return.
 pub(crate) unsafe fn run<S: Storage>(
     storage: &mut S,
@@ -400,7 +412,7 @@ pub(crate) unsafe fn run<S: Storage>(
     start: impl FnOnce() -> *mut c_void,
 ) -> Result<Vec<u8>, OperationError<S::Error>> {
     crate::native::enter();
-    execute(Handle::new(start()), storage, inputs, None)
+    execute(Handle::new(start()), storage, inputs, None, None)
 }
 
 /// Run with separate raw resource capabilities.
@@ -413,7 +425,20 @@ pub(crate) unsafe fn run_with_resources<S: Storage>(
     start: impl FnOnce() -> *mut c_void,
 ) -> Result<Vec<u8>, OperationError<S::Error>> {
     crate::native::enter();
-    execute(Handle::new(start()), storage, &[], Some(resources))
+    execute(Handle::new(start()), storage, &[], Some(resources), None)
+}
+
+/// Run with separate primitive crypto capabilities.
+///
+/// # Safety
+/// `start` returns a fresh owned native program after runtime initialization.
+pub(crate) unsafe fn run_with_crypto<S: Storage>(
+    storage: &mut S,
+    crypto: &mut dyn crate::host::Crypto<Error = S::Error>,
+    start: impl FnOnce() -> *mut c_void,
+) -> Result<Vec<u8>, OperationError<S::Error>> {
+    crate::native::enter();
+    execute(Handle::new(start()), storage, &[], None, Some(crypto))
 }
 
 struct ReadOnly<'a, S>(&'a mut S);

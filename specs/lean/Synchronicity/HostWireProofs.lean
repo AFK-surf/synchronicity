@@ -166,4 +166,42 @@ theorem failed_rollback_preserves_primary_failure :
       (b [1, 0, 9, 0, 0, 0, 0, 0, 0, 0, 123, 0, 0, 0, 0, 0, 0, 0]) =
       .pure (.error protocolFailure) := by rfl
 
+/-- Capability injection changes neither existing packets nor reply behavior.
+These concern the actual native exports, not a separate transport model. -/
+theorem native_storage_packet (state : State) :
+    nativePacket (state.mapEffects EffectSum.left) = packet state := by
+  cases state with
+  | pure result => cases result <;> rfl
+  | request effect next => rfl
+
+theorem native_storage_resume (state : State) (input : ByteArray) :
+    nativeResume (state.mapEffects EffectSum.left) input =
+      (resume state input).mapEffects EffectSum.left := by
+  cases state <;> rfl
+
+theorem invalid_crypto_boolean_rejected :
+    cryptoReply (.validateEd25519 []) (b [1, 27, 2]) = .error protocolFailure := by decide
+
+theorem crypto_wrong_reply_kind_rejected :
+    cryptoReply (.validateEd25519 []) (b [1, 26, 1]) = .error protocolFailure := by decide
+
+theorem crypto_false_is_not_host_failure :
+    cryptoReply (.validateEd25519 []) (b [1, 27, 0]) = .ok false := by decide
+
+private def cryptoTransaction : NativeState :=
+  (transactionOver EffectSum.left id (fun _ => do
+    let _ ← performOver id (.right (.validateEd25519 []))
+    return ByteArray.empty) : OperationOver NativeEffects Failure ByteArray).run
+
+private def pendingCrypto : NativeState :=
+  nativeResume cryptoTransaction (b [1, 16, 7, 0, 0, 0, 0, 0, 0, 0])
+
+theorem malformed_crypto_requests_rollback :
+    ∃ next, nativeResume pendingCrypto (b [1, 27, 2]) =
+      .request (.left (.rollback 7)) next := ⟨_, rfl⟩
+
+theorem crypto_rollback_preserves_protocol_error :
+    nativeResume (nativeResume pendingCrypto (b [1, 27, 2])) (b [1, 18]) =
+      .pure (.error protocolFailure) := by rfl
+
 end Synchronicity.HostWireProofs

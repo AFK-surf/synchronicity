@@ -1,4 +1,5 @@
 import VerifiedCore.Host
+import VerifiedCore.Crypto
 
 /-! Private versioned transport for raw host effects, not domain snapshots.
 All lengths and integers are little-endian u64; replies must match the pending
@@ -172,7 +173,6 @@ def reply (effect : Storage A) (input : ByteArray) : A :=
 
 abbrev State := Program Storage (Reply ByteArray)
 
-@[export synch_lean_operation_packet]
 def packet : State → ByteArray
   | .pure (.ok result) => octet 1 ++ octet 0 ++ bytes result
   | .pure (.error error) => octet 1 ++ octet 1 ++ failure error
@@ -180,10 +180,41 @@ def packet : State → ByteArray
 
 /-- Invalid host packets become a failure reply to the *pending* operation,
 so its verified rollback continuation still runs. Terminal states cannot resume. -/
-@[export synch_lean_operation_resume]
 def resume (state : State) (input : ByteArray) : State :=
   match state with
   | .pure _ => .pure (.error protocolFailure)
   | .request effect next => next (reply effect input)
+
+/-- One native continuation transport, with storage and crypto kept as distinct
+typed capabilities. Existing storage packets retain their exact representation. -/
+abbrev NativeEffects := EffectSum Storage Crypto
+abbrev NativeState := Program NativeEffects (Reply ByteArray)
+
+def cryptoRequest : Crypto A → ByteArray
+  | .validateEd25519 key => octet 1 ++ octet 27 ++ bytes ⟨key.toArray⟩
+
+def cryptoReply (effect : Crypto A) (input : ByteArray) : A :=
+  match effect with
+  | .validateEd25519 _ => decodeReply 27 (do
+      match ← readByte with
+      | 0 => return false
+      | 1 => return true
+      | _ => throw ()) input
+
+@[export synch_lean_operation_packet]
+def nativePacket : NativeState → ByteArray
+  | .pure (.ok result) => octet 1 ++ octet 0 ++ bytes result
+  | .pure (.error error) => octet 1 ++ octet 1 ++ failure error
+  | .request effect _ => match effect with
+    | .left storage => request storage
+    | .right crypto => cryptoRequest crypto
+
+@[export synch_lean_operation_resume]
+def nativeResume (state : NativeState) (input : ByteArray) : NativeState :=
+  match state with
+  | .pure _ => .pure (.error protocolFailure)
+  | .request effect next => match effect with
+    | .left storage => next (reply storage input)
+    | .right crypto => next (cryptoReply crypto input)
 
 end VerifiedCore.Host.Wire

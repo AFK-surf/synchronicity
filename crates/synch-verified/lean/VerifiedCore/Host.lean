@@ -16,6 +16,12 @@ instance : Monad (Program E) where
   pure := Program.pure
   bind := Program.bind
 
+/-- Inject capabilities without interpreting effects or changing continuations. -/
+def Program.mapEffects (inject : {B : Type} → E B → F B) : Program E A → Program F A
+  | .pure value => .pure value
+  | .request effect resume => .request (inject effect)
+      (fun reply => (resume reply).mapEffects inject)
+
 /-- Capabilities compose without adding one subsystem's services to another's
 algebra. Injections preserve the requested reply type. -/
 inductive EffectSum (Left Right : Type → Type) : Type → Type where

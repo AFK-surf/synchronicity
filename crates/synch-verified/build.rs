@@ -27,8 +27,8 @@ fn main() {
         "Host/Wire",
         "Trie/Codec",
         "Trie/Program",
-        "Entry",
         "Replication/History",
+        "Entry",
     ];
     for module in modules {
         println!("cargo:rerun-if-changed=lean/VerifiedCore/{module}.lean");

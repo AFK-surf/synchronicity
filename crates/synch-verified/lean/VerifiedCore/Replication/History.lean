@@ -24,8 +24,8 @@ point the shared storage interpreter/algebra must preserve these contracts:
   shapes with typed contextual errors in projection order. Named-origin syntax
   and strict key-origin syntax are checked directly by the shared Lean Origin
   module, after signature width. The program requests primitive point validation
-  for key origins and signing keys. Native crypto interpretation, terminal error
-  encoding and scan-failure ordering remain required
+  for key origins and signing keys. Native transport and terminal error encoding
+  are implemented. Concrete Store crypto/error integration and scan-failure ordering remain required
   before cutover; full diagnostic compatibility is not claimed here.
 
 The generic predicate/order facilities are in Host, not a history-specific

@@ -116,3 +116,12 @@ pub trait Storage {
     /// Read opaque bytes by namespace and key, preserving absence versus empty.
     fn read_bytes(&mut self, space: &str, key: &[u8]) -> Result<Option<Vec<u8>>, Self::Error>;
 }
+
+/// Primitive cryptography, separate from storage and domain validation.
+pub trait Crypto {
+    /// Original host error, distinct from invalid key bytes.
+    type Error;
+    /// Check whether bytes represent a valid Ed25519 public key. Does not parse
+    /// origins, verify signatures, or validate a stored head.
+    fn validate_ed25519(&mut self, bytes: &[u8]) -> Result<bool, Self::Error>;
+}

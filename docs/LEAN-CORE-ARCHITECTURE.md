@@ -267,8 +267,11 @@ Integration review has identified specific gates, not waived limitations:
   action; history now requests it for key origins and signing keys at the
   appropriate validation positions. False and host failure both stop the
   operation and request rollback, retaining distinct diagnostics. These are
-  conditional execution proofs: native crypto interpretation and malformed-storage
-  error compatibility remain gates. The Rust retention algorithm
+  conditional execution proofs. The native runner now interprets the separate
+  crypto capability, and `history::prune` returns Lean-selected contextual
+  terminal errors. Native tests use scripted raw storage and crypto replies;
+  the Store's concrete crypto adapter and exact malformed-storage error mapping
+  remain integration gates. The Rust retention algorithm
   remains until those semantics and the complete native entry point are implemented.
   Specifically, read complete before pending; an orphan pointer without its
   signed-history row is absent under the existing inner join, not a malformed
@@ -278,8 +281,9 @@ Integration review has identified specific gates, not waived limitations:
   Lean must consume raw storage records and invoke only genuine primitives.
   Raw cells now preserve REAL bits and invalid UTF-8 TEXT instead of rejecting
   them eagerly. Lean's staged history decoder selects contextual field/type
-  errors in projection order. Native terminal encoding and crypto interpretation
-  remain unfinished. Eager materialization of all rows still requires review:
+  errors in projection order. Native terminal encoding and capability transport
+  are implemented; production Store error mapping remains unfinished.
+  Eager materialization of all rows still requires review:
   a later SQLite scan failure must not preempt an earlier record-validation
   error when the existing reader would stop at that record.
 - Trie lookup now has soundness/completeness proofs against a stable raw graph
@@ -302,6 +306,15 @@ relation/projection/equality/upsert values. Replies preserve raw signed cells,
 NULL, empty values, absence and original host failures. Decoders reject unknown
 versions/tags, wrong effect reply types, truncated or trailing data and lengths
 that cannot fit the remaining packet before allocation.
+
+The native state now carries the sum of storage and crypto effects. Storage-only
+commands inject their effects into that sum without changing their sequencing;
+same-source proofs establish that existing packets and resumptions are preserved.
+Crypto tag 27 carries length-delimited key bytes and returns a strict boolean or
+opaque failure. The host `Crypto` trait is independent of `Storage` and resource
+traits. History's domain facade builds the complete command and decodes terminal
+errors; it neither parses origins nor orchestrates validation. Malformed crypto
+replies become failures to the pending Lean program and follow its rollback path.
 
 Rust's private synchronous runner owns one thread-confined native continuation.
 It exposes no handles, polling or resume API to callers/host implementations,
