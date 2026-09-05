@@ -241,15 +241,19 @@ Integration review has identified specific gates, not waived limitations:
   `NOT EXISTS heads` exclusion through generic storage parameters. SQLite
   regressions cover ordering, binding and trigger-created protection between
   deletes; Lean's request proof and scripted fixtures include the exclusion.
-  The remaining cutover gate is joined signed-head/pointer validation and its
-  malformed-storage error behavior. The Rust retention algorithm remains until
-  those semantics and the complete native entry point are implemented.
+  Joined slot reads and column/byte-shape validation are now implemented in the
+  staged Lean program. Remaining gates are origin syntax, cryptographic key
+  validation, and malformed-storage error behavior. The Rust retention algorithm
+  remains until those semantics and the complete native entry point are implemented.
   Specifically, read complete before pending; an orphan pointer without its
   signed-history row is absent under the existing inner join, not a malformed
   joined head. Preserve projected column errors and the validation order
   (signature width, origin, root width, public key), then receipt decoding in
   requested order. Do not replace these with a Rust `validatedHeads` service;
   Lean must consume raw storage records and invoke only genuine primitives.
+  Raw eager cell conversion also needs care: a later REAL/invalid-UTF-8 cell
+  must not preempt an earlier typed-field or record-validation error when the
+  existing reader would stop at the earlier error.
 - Trie lookup now has soundness/completeness proofs against a stable raw graph
   interpreted by the actual decoder. Codec roundtripping/canonicality and
   mutable-host refinement remain separate obligations. Native commands must
@@ -308,6 +312,15 @@ deletion. Empty parameters retain the original primitive behavior. These extend
 existing read/delete effects; no history-specific service or second query
 language is exposed. The private packets are internal to the same statically
 linked runtime and are neither persisted nor a public compatibility protocol.
+
+Reads may additionally specify inner equality joins from base-table columns
+to distinct whitelisted relations. Projection/filter/order names can qualify
+their relation; unknown relations, columns, duplicate joins and unkeyed joins
+are rejected. The host constructs literal SQL and performs the join before
+returning raw cells. Lean selects the joins and validates the resulting domain
+records. This preserves orphan-pointer absence without introducing a
+host-computed “validated head” snapshot. Joined shape validation is not yet a
+claim of origin/key validity or complete corrupt-storage error compatibility.
 
 Only a host failure's opaque token crosses into Lean; Rust retains the original
 error object until Lean completes. Thus a later rollback failure cannot overwrite

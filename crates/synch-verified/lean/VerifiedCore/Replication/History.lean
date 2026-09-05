@@ -18,11 +18,11 @@ point the shared storage interpreter/algebra must preserve these contracts:
   current mutation/trigger/failure order. SQL ordering is signed Int64; Lean's
   retention comparisons deliberately reinterpret the stored bits as UInt64.
   The program now supplies this ordering explicitly.
-* Raw pointer reads protect orphan pointers, but no longer validate the joined
-  signed-head origin/key/signature as `head_in` does. Malformed cells currently
-  return code 2/token 0 rather than the existing contextual Rust column/decode
-  errors. Those error and corrupt-storage semantics need explicit resolution
-  and regression tests before cutover; they are not claimed equivalent here.
+* Joined slot reads now preserve orphan-pointer absence and check column/byte
+  shapes. They do not yet validate origin syntax or cryptographic public keys.
+  Malformed cells still return code 2/token 0 rather than the existing contextual
+  Rust column/decode errors. Error ordering, origin/key validation and diagnostic
+  preservation remain required before cutover; they are not claimed here.
 
 The generic predicate/order facilities are in Host, not a history-specific
 callback. Current scripted fixtures establish the normal storage protocol and
@@ -53,6 +53,39 @@ def decodeReceipt : Row → Reply Receipt
     let pointer ← decodePointer [.integer seq, .blob root]
     pure ⟨pointer, recordedAt⟩
   | _ => .error malformed
+
+/-- Joined storage fields retained for subsequent origin/key validation. -/
+structure JoinedHead where
+  origin : String
+  pointer : Pointer
+  publicKey : ByteArray
+
+/-- Validate the joined record's column and byte shapes in Lean. This is not
+yet full validation: origin parsing and public-key validity remain cutover gates. -/
+def decodeJoinedHead : Row → Reply JoinedHead
+  | [.text origin, .integer seq, .blob root, .integer _, .blob key, .blob sig,
+      .integer _, .integer _] =>
+    if sig.size != 64 || root.size != 32 || key.size != 32 then .error malformed
+    else .ok ⟨origin, ⟨seq.toUInt64, root⟩, key⟩
+  | _ => .error malformed
+
+def headColumns : List String :=
+  ["origin_id", "seq", "root", "head_history.created_at", "head_history.signed_by",
+   "head_history.sig", "received_at", "verified_at"]
+
+def headJoin : List Join :=
+  [⟨"head_history", [("origin_id", "origin_id"), ("seq", "seq"), ("root", "root")]⟩]
+
+/-- The raw inner join precedes all decoding. Orphan pointers are absent, just
+as in the existing storage reader. Slots are fetched in caller-selected order. -/
+def readSlot (tx : Transaction) (origin slot : String) : Operation (List JoinedHead) := do
+  let raw ← perform (.readRows tx "heads" headColumns
+    [("origin_id", .text origin), ("slot", .text slot)] [] headJoin)
+  match raw with
+  | [] => return []
+  | row :: _ =>
+    let head ← ExceptT.mk (pure (decodeJoinedHead row))
+    return [head]
 
 structure SequenceSummary where
   count : Nat := 0
@@ -141,8 +174,9 @@ def remove (tx : Transaction) (origin : String) (receipts : List Receipt) : Oper
 /-- This operation owns raw decoding and every retention decision in the same
 immediate transaction as its deletions. No host-computed fork or ceiling facts. -/
 def pruneIn (tx : Transaction) (origin : String) (before : Int64) : Operation Nat := do
-  let rawPointers ← perform (.readRows tx "heads" ["seq", "root"] [("origin_id", .text origin)])
-  let pointers ← ExceptT.mk (pure (rawPointers.mapM decodePointer))
+  let complete ← readSlot tx origin "complete"
+  let pending ← readSlot tx origin "pending"
+  let pointers := (complete ++ pending).map (·.pointer)
   let rawReceipts ← perform (.readRows tx "head_history" ["seq", "root", "recorded_at"]
     [("origin_id", .text origin)] [⟨"seq", true⟩, ⟨"root", true⟩])
   let receipts ← ExceptT.mk (pure (rawReceipts.mapM decodeReceipt))

@@ -136,6 +136,14 @@ fn projection(relation: &str, columns: &[String]) -> Result<String> {
         .map(|names| names.join(", "))
 }
 
+fn read_column(base: &str, joins: &[synch_verified::host::Join], name: &str) -> Result<String> {
+    let (relation, name) = name.split_once('.').unwrap_or((base, name));
+    if relation != base && !joins.iter().any(|join| join.relation == relation) {
+        return Err(StoreError::invalid("column outside storage query"));
+    }
+    Ok(format!("\"{relation}\".{}", column(relation, name)?))
+}
+
 fn values(fields: &Fields) -> Vec<Value> {
     fields
         .iter()
@@ -215,22 +223,61 @@ impl Storage for SqliteStorage<'_> {
         columns: &[String],
         equals: &Fields,
         order: &[synch_verified::host::Order],
+        joins: &[synch_verified::host::Join],
     ) -> Result<Vec<Row>> {
         self.require_live_transaction(tx)?;
         columns_for(relation)?;
         if columns.is_empty() {
             return Err(StoreError::invalid("empty storage projection"));
         }
-        let mut sql = format!(
-            "SELECT {} FROM \"{relation}\"{}",
-            projection(relation, columns)?,
-            predicate(relation, equals)?
-        );
+        let mut source = format!("\"{relation}\"");
+        for (index, join) in joins.iter().enumerate() {
+            columns_for(&join.relation)?;
+            if join.relation == relation
+                || joins[..index]
+                    .iter()
+                    .any(|prior| prior.relation == join.relation)
+                || join.keys.is_empty()
+            {
+                return Err(StoreError::invalid("duplicate or unkeyed storage join"));
+            }
+            let keys = join
+                .keys
+                .iter()
+                .map(|(left, right)| {
+                    Ok(format!(
+                        "\"{relation}\".{} = \"{}\".{}",
+                        column(relation, left)?,
+                        join.relation,
+                        column(&join.relation, right)?
+                    ))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            source.push_str(&format!(
+                " JOIN \"{}\" ON {}",
+                join.relation,
+                keys.join(" AND ")
+            ));
+        }
+        let projected = columns
+            .iter()
+            .map(|name| read_column(relation, joins, name))
+            .collect::<Result<Vec<_>>>()?;
+        let mut sql = format!("SELECT {} FROM {source}", projected.join(", "));
+        if !equals.is_empty() {
+            let terms = equals
+                .iter()
+                .map(|(name, _)| {
+                    read_column(relation, joins, name).map(|column| format!("{column} IS ?"))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            sql.push_str(&format!(" WHERE {}", terms.join(" AND ")));
+        }
         if !order.is_empty() {
             let terms = order
                 .iter()
                 .map(|term| {
-                    column(relation, &term.column).map(|column| {
+                    read_column(relation, joins, &term.column).map(|column| {
                         format!("{column} {}", if term.descending { "DESC" } else { "ASC" })
                     })
                 })
@@ -254,7 +301,7 @@ impl Storage for SqliteStorage<'_> {
                     rusqlite::types::ValueRef::Blob(value) => Ok(Cell::Blob(value.to_vec())),
                     rusqlite::types::ValueRef::Real(_) => Err(rusqlite::Error::InvalidColumnType(
                         index,
-                        name.clone(),
+                        name.rsplit('.').next().unwrap_or(name).to_owned(),
                         rusqlite::types::Type::Real,
                     )),
                 })
@@ -359,7 +406,102 @@ impl Storage for SqliteStorage<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use synch_verified::host::{Exclusion, Order};
+    use synch_verified::host::{Exclusion, Join, Order};
+
+    #[test]
+    fn raw_inner_join_skips_orphans_before_decoding_and_preserves_projection_order() {
+        let conn = connection();
+        conn.execute_batch("CREATE TABLE heads (origin_id TEXT, slot TEXT, seq INTEGER, root BLOB, received_at, verified_at);
+            CREATE TABLE head_history (origin_id TEXT, seq INTEGER, root BLOB, created_at, signed_by BLOB, sig BLOB, recorded_at INTEGER);
+            INSERT INTO heads VALUES ('origin', 'complete', 1, X'01', CAST(X'FF' AS TEXT), 2);
+            INSERT INTO head_history VALUES ('origin', 1, X'02', 3, X'', X'', 4);").unwrap();
+        let joins = [Join {
+            relation: "head_history".into(),
+            keys: vec![
+                ("origin_id".into(), "origin_id".into()),
+                ("seq".into(), "seq".into()),
+                ("root".into(), "root".into()),
+            ],
+        }];
+        let mut storage = SqliteStorage::new(&conn);
+        let tx = storage.begin().unwrap();
+        let equals = vec![
+            ("origin_id".into(), Cell::Text("origin".into())),
+            ("slot".into(), Cell::Text("complete".into())),
+        ];
+        let projection = names(&["received_at", "head_history.created_at", "seq"]);
+        assert!(storage
+            .read_rows(tx, "heads", &projection, &equals, &[], &joins)
+            .unwrap()
+            .is_empty());
+        conn.execute_batch("UPDATE head_history SET root = X'01'")
+            .unwrap();
+        assert!(matches!(
+            storage.read_rows(tx, "heads", &projection, &equals, &[], &joins),
+            Err(StoreError::Sqlite(rusqlite::Error::Utf8Error(_)))
+        ));
+        conn.execute_batch("UPDATE heads SET received_at = 7")
+            .unwrap();
+        assert_eq!(
+            storage
+                .read_rows(tx, "heads", &projection, &equals, &[], &joins)
+                .unwrap(),
+            vec![vec![Cell::Integer(7), Cell::Integer(3), Cell::Integer(1)]]
+        );
+        // Inner equality joins never match two SQL NULLs.
+        conn.execute_batch("UPDATE heads SET seq = NULL; UPDATE head_history SET seq = NULL")
+            .unwrap();
+        assert!(storage
+            .read_rows(tx, "heads", &projection, &equals, &[], &joins)
+            .unwrap()
+            .is_empty());
+        storage.rollback(tx).unwrap();
+    }
+
+    #[test]
+    fn joins_reject_unbound_columns_duplicate_relations_and_unkeyed_sources() {
+        let conn = connection();
+        let mut storage = SqliteStorage::new(&conn);
+        let tx = storage.begin().unwrap();
+        let good = Join {
+            relation: "pins".into(),
+            keys: vec![("root".into(), "root".into())],
+        };
+        for joins in [
+            vec![Join {
+                relation: "pins; --".into(),
+                keys: good.keys.clone(),
+            }],
+            vec![Join {
+                relation: "pins".into(),
+                keys: vec![],
+            }],
+            vec![Join {
+                relation: "blobs".into(),
+                keys: good.keys.clone(),
+            }],
+            vec![good.clone(), good.clone()],
+            vec![Join {
+                relation: "pins".into(),
+                keys: vec![("root".into(), "missing".into())],
+            }],
+        ] {
+            assert!(storage
+                .read_rows(tx, "blobs", &names(&["root"]), &vec![], &[], &joins)
+                .is_err());
+        }
+        assert!(storage
+            .read_rows(
+                tx,
+                "blobs",
+                &names(&["content_want.root"]),
+                &vec![],
+                &[],
+                &[good]
+            )
+            .is_err());
+        storage.rollback(tx).unwrap();
+    }
 
     #[test]
     fn ordered_reads_use_signed_storage_values_and_explicit_tiebreakers() {
@@ -385,7 +527,7 @@ mod tests {
         ];
         assert_eq!(
             storage
-                .read_rows(tx, "blobs", &names(&["root"]), &vec![], &order)
+                .read_rows(tx, "blobs", &names(&["root"]), &vec![], &order, &[])
                 .unwrap(),
             [4, 5, 3, 2, 1].map(|n| vec![Cell::Blob(vec![n])]).to_vec()
         );
@@ -398,7 +540,8 @@ mod tests {
                 &[Order {
                     column: "size; DROP TABLE blobs".into(),
                     descending: false
-                }]
+                }],
+                &[]
             )
             .is_err());
         storage.rollback(tx).unwrap();
@@ -551,6 +694,7 @@ mod tests {
                     "blobs",
                     &names(&["inline", "bitmap", "size", "durable"]),
                     &vec![],
+                    &[],
                     &[]
                 )
                 .unwrap(),
@@ -568,6 +712,7 @@ mod tests {
                     "blobs",
                     &names(&["root"]),
                     &vec![("bitmap".into(), Cell::Null)],
+                    &[],
                     &[]
                 )
                 .unwrap(),
@@ -579,6 +724,7 @@ mod tests {
                 "blobs",
                 &names(&["root"]),
                 &vec![("root".into(), Cell::Blob(vec![2]))],
+                &[],
                 &[]
             )
             .unwrap()
@@ -608,6 +754,7 @@ mod tests {
                     "pins",
                     &names(&["created_at", "release_after"]),
                     &vec![],
+                    &[],
                     &[]
                 )
                 .unwrap(),
@@ -724,16 +871,26 @@ mod tests {
                 "blobs; DROP TABLE pins",
                 &names(&["root"]),
                 &vec![],
+                &[],
                 &[]
             )
             .is_err());
         assert!(storage
-            .read_rows(tx, "blobs", &names(&["root FROM blobs; --"]), &vec![], &[])
+            .read_rows(
+                tx,
+                "blobs",
+                &names(&["root FROM blobs; --"]),
+                &vec![],
+                &[],
+                &[]
+            )
             .is_err());
         assert!(storage
-            .read_rows(tx, "blobs", &names(&["durable"]), &vec![], &[])
+            .read_rows(tx, "blobs", &names(&["durable"]), &vec![], &[], &[])
             .is_err());
-        assert!(storage.read_rows(tx, "blobs", &[], &vec![], &[]).is_err());
+        assert!(storage
+            .read_rows(tx, "blobs", &[], &vec![], &[], &[])
+            .is_err());
         storage.rollback(tx).unwrap();
         assert!(storage.read_bytes("trie_nodes; --", &[1]).is_err());
     }
@@ -755,7 +912,7 @@ mod tests {
         assert!(insert_pin(&mut storage, tx).is_err());
         assert!(storage.delete_rows(tx, "pins", &vec![], &[]).is_err());
         assert!(storage
-            .read_rows(tx, "pins", &names(&["root"]), &vec![], &[])
+            .read_rows(tx, "pins", &names(&["root"]), &vec![], &[], &[])
             .is_err());
         assert!(storage.commit(tx).is_err());
         storage.rollback(tx).unwrap();

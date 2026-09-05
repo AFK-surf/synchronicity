@@ -49,6 +49,13 @@ structure Exclusion where
   equals : Fields
   deriving BEq
 
+/-- Inner equality join from the base relation to another raw relation.
+Projected names may qualify a column with its relation; no SQL text is supplied. -/
+structure Join where
+  relation : String
+  keys : List (String × String)
+  deriving BEq
+
 /-- Identifiers are host-whitelisted storage names, never executable SQL.
 Read projections preserve absent rows, NULL, types and order of columns.
 An empty equality filter scans the relation; it does not infer domain policy. -/
@@ -57,7 +64,8 @@ inductive Storage : Type → Type where
   | commit (tx : Transaction) : Storage (Reply Unit)
   | rollback (tx : Transaction) : Storage (Reply Unit)
   | readRows (tx : Transaction) (relation : String)
-      (columns : List String) (equals : Fields) (order : List Order := []) : Storage (Reply (List Row))
+      (columns : List String) (equals : Fields) (order : List Order := [])
+      (joins : List Join := []) : Storage (Reply (List Row))
   | upsert (tx : Transaction) (relation : String) (values : Fields)
       (conflictColumns updateColumns : List String) : Storage (Reply Unit)
   | deleteRows (tx : Transaction) (relation : String)

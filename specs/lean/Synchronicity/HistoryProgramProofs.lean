@@ -5,6 +5,10 @@ import Synchronicity.Prelude
 
 /-! These properties concern the executable retention program, not a parallel model. -/
 namespace Synchronicity.HistoryProgramProofs
+-- The pinned compiler's asynchronous elaborator emits internal Option.get!
+-- diagnostics for these expanded scripted traces. Keep elaboration serial;
+-- kernel checks and warnings-as-errors are unchanged.
+set_option Elab.async false
 open VerifiedCore.Host VerifiedCore.Replication.History
 
 theorem summary_count_fold (pointers : List Pointer) (before : Int64)
@@ -345,7 +349,8 @@ theorem remove_next (tx : Transaction) (origin : String) (total : Nat)
 /-- Retention obtains raw pointers itself, within the caller's transaction. -/
 theorem prune_reads_pointers (tx : Transaction) (origin : String) (before : Int64) :
     ∃ resume, (pruneIn tx origin before).run = .request
-      (.readRows tx "heads" ["seq", "root"] [("origin_id", .text origin)]) resume := by
+      (.readRows tx "heads" headColumns
+        [("origin_id", .text origin), ("slot", .text "complete")] [] headJoin) resume := by
   exact ⟨_, rfl⟩
 
 /-- The public operation itself requests its snapshot lock, before any read. -/
@@ -353,12 +358,41 @@ theorem prune_begins_transaction (origin : String) (before : Int64) :
     ∃ resume, (prune origin before).run = .request .begin resume := by
   exact ⟨_, rfl⟩
 
+/-- An absent raw join is an absent slot, with no decoding or additional reads. -/
+theorem absent_joined_slot (tx : Transaction) (origin slot : String) :
+    ∃ resume, (readSlot tx origin slot).run = .request
+      (.readRows tx "heads" headColumns
+        [("origin_id", .text origin), ("slot", .text slot)] [] headJoin) resume ∧
+      resume (.ok []) = .pure (.ok []) := by
+  exact ⟨_, rfl, rfl⟩
+
+/-- Joined shape decoding admits all typed rows of the established widths.
+Origin syntax and cryptographic key validation are separate, unfinished gates. -/
+theorem joined_shape_admitted (origin : String) (seq created received verified : Int64)
+    (hash key sig : ByteArray) (hashSize : hash.size = 32) (keySize : key.size = 32)
+    (sigSize : sig.size = 64) :
+    decodeJoinedHead [.text origin, .integer seq, .blob hash, .integer created,
+      .blob key, .blob sig, .integer received, .integer verified] =
+      .ok ⟨origin, ⟨seq.toUInt64, hash⟩, key⟩ := by
+  simp [decodeJoinedHead, hashSize, keySize, sigSize]
+
+/-- A malformed signature width is rejected by Lean before retention. -/
+theorem joined_signature_width_required (origin : String) (seq created received verified : Int64)
+    (hash key sig : ByteArray) (bad : sig.size ≠ 64) :
+    decodeJoinedHead [.text origin, .integer seq, .blob hash, .integer created,
+      .blob key, .blob sig, .integer received, .integer verified] = .error malformed := by
+  simp [decodeJoinedHead, bad]
+
 /-! Scripted host fixtures run the actual free-monadic program. They deliberately
 return raw cells; no fork, age, current or ceiling decisions enter from the host. -/
 private def root (byte : UInt8) : ByteArray := ⟨Array.replicate 32 byte⟩
 private def pointerRow (seq : Int64) (byte : UInt8) : Row := [.integer seq, .blob (root byte)]
 private def receiptRow (seq : Int64) (byte : UInt8) (received : Int64) : Row :=
   pointerRow seq byte ++ [.integer received]
+
+private def headRow (seq : Int64) (byte : UInt8) : Row :=
+  [.text "origin", .integer seq, .blob (root byte), .integer 0, .blob (root 0),
+   .blob ⟨Array.replicate 64 0⟩, .integer 0, .integer 0]
 
 private structure Script where
   pointers : List Row := []
@@ -381,8 +415,9 @@ private def runScript (script : Script) : Nat → Nat →
     | .begin => step "begin" (resume (scriptReply script index 7))
     | .commit _ => step "commit" (resume (scriptReply script index ()))
     | .rollback _ => step "rollback" (resume (scriptReply script index ()))
-    | .readRows _ relation _ _ order => step relation (resume
-      (if relation == "heads" && order.isEmpty then scriptReply script index script.pointers
+    | .readRows _ relation columns equals order joined => step relation (resume
+      (if relation == "heads" && columns == headColumns && joined == headJoin && order.isEmpty then
+         scriptReply script index (if equals.contains ("slot", .text "complete") then script.pointers else [])
        else if relation == "head_history" && order == [⟨"seq", true⟩, ⟨"root", true⟩] then
          scriptReply script index script.receipts
        else .error failure))
@@ -402,30 +437,30 @@ private def forkScript : Script :=
 /-- Both expired fork roots are deleted, the ceiling survives, and success is
 returned only after the commit acknowledgement. -/
 example : runScript forkScript 12 0 (prune "origin" 20).run =
-    some (.ok 2, ["begin", "heads", "head_history", "delete", "delete", "commit"]) := by
+    some (.ok 2, ["begin", "heads", "heads", "head_history", "delete", "delete", "commit"]) := by
   decide
 
 /-- The current pointer preserves its whole fork and the next old witness. -/
-example : runScript { forkScript with pointers := [pointerRow 1 1] }
+example : runScript { forkScript with pointers := [headRow 1 1] }
     12 0 (prune "origin" 20).run =
-    some (.ok 0, ["begin", "heads", "head_history", "commit"]) := by
+    some (.ok 0, ["begin", "heads", "heads", "head_history", "commit"]) := by
   decide
 
 /-- A young side preserves the complete fork, never just one proof. -/
 example : runScript { forkScript with
       receipts := [receiptRow 1 1 10, receiptRow 1 2 30, receiptRow 2 3 10] }
     12 0 (prune "origin" 20).run =
-    some (.ok 0, ["begin", "heads", "head_history", "commit"]) := by
+    some (.ok 0, ["begin", "heads", "heads", "head_history", "commit"]) := by
   decide
 
 /-- Commit failure is not success, even after both delete acknowledgements. -/
-example : runScript { forkScript with failAt := some 5 } 12 0 (prune "origin" 20).run =
-    some (.error failure, ["begin", "heads", "head_history", "delete", "delete", "commit", "rollback"]) := by
+example : runScript { forkScript with failAt := some 6 } 12 0 (prune "origin" 20).run =
+    some (.error failure, ["begin", "heads", "heads", "head_history", "delete", "delete", "commit", "rollback"]) := by
   decide
 
 /-- A partial deletion failure stops immediately and rolls back the prefix. -/
-example : runScript { forkScript with failAt := some 4 } 12 0 (prune "origin" 20).run =
-    some (.error failure, ["begin", "heads", "head_history", "delete", "delete", "rollback"]) := by
+example : runScript { forkScript with failAt := some 5 } 12 0 (prune "origin" 20).run =
+    some (.error failure, ["begin", "heads", "heads", "head_history", "delete", "delete", "rollback"]) := by
   decide
 
 /-- Raw malformed pointers cause rollback before history reads or deletions. -/
@@ -435,8 +470,8 @@ example : runScript { forkScript with pointers := [[.integer 1, .blob ByteArray.
   decide
 
 /-- Every fallible position of the successful trace reports the original
-failure, including begin, both reads, both deletes, and commit. -/
-example : (List.range 6).all (fun index =>
+failure, including begin, all three reads, both deletes, and commit. -/
+example : (List.range 7).all (fun index =>
     ((runScript { forkScript with failAt := some index } 12 0 (prune "origin" 20).run).map
       (fun result => result.1)) == some (.error failure)) = true := by
   decide
@@ -446,14 +481,14 @@ is not itself the sequence ceiling. -/
 example : runScript { forkScript with receipts :=
       [receiptRow 1 1 10, receiptRow 1 2 30, receiptRow 2 3 10, receiptRow 3 4 10] }
     12 0 (prune "origin" 20).run =
-    some (.ok 0, ["begin", "heads", "head_history", "commit"]) := by
+    some (.ok 0, ["begin", "heads", "heads", "head_history", "commit"]) := by
   decide
 
 /-- Negative SQL sequence cells are unsigned high sequences, not zero. The
 maximum bit-pattern remains the ceiling, protecting recovery monotonicity. -/
 example : runScript { forkScript with receipts := [receiptRow 2 1 10, receiptRow (-1) 2 10] }
     12 0 (prune "origin" 20).run =
-    some (.ok 1, ["begin", "heads", "head_history", "delete", "commit"]) := by
+    some (.ok 1, ["begin", "heads", "heads", "head_history", "delete", "commit"]) := by
   decide
 
 end Synchronicity.HistoryProgramProofs

@@ -30,6 +30,10 @@ def ordering (orders : List Order) : ByteArray :=
 def exclusions (guards : List Exclusion) : ByteArray :=
   sequence (fun guard => string guard.relation ++ fields guard.equals) guards
 
+def joins (items : List Join) : ByteArray :=
+  sequence (fun item => string item.relation ++
+    sequence (fun (left, right) => string left ++ string right) item.keys) items
+
 def failure (f : Failure) : ByteArray := word f.code.toUInt64 ++ word f.token
 
 def tag : Storage A → UInt8
@@ -49,8 +53,8 @@ def request (effect : Storage A) : ByteArray := octet 1 ++ octet (tag effect) ++
   match effect with
   | .begin => .empty
   | .commit tx | .rollback tx => word tx
-  | .readRows tx table columns equals order =>
-    word tx ++ string table ++ sequence string columns ++ fields equals ++ ordering order
+  | .readRows tx table columns equals order joined =>
+    word tx ++ string table ++ sequence string columns ++ fields equals ++ ordering order ++ joins joined
   | .upsert tx table values conflict updates =>
     word tx ++ string table ++ fields values ++ sequence string conflict ++ sequence string updates
   | .deleteRows tx table equals blockers => word tx ++ string table ++ fields equals ++ exclusions blockers

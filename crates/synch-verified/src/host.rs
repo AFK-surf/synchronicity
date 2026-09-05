@@ -32,6 +32,13 @@ pub struct Exclusion {
     pub equals: Fields,
 }
 
+/// Inner equality join from base-table columns to the named relation's columns.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Join {
+    pub relation: String,
+    pub keys: Vec<(String, String)>,
+}
+
 /// Read-only byte storage capability, without relational or transaction policy.
 pub trait ByteStorage {
     /// Original backing-store failure.
@@ -74,6 +81,7 @@ pub trait Storage {
         columns: &[String],
         equals: &Fields,
         order: &[Order],
+        joins: &[Join],
     ) -> Result<Vec<Row>, Self::Error>;
     /// Existence query without materializing all matching rows.
     fn exists_rows(

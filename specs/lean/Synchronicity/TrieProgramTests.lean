@@ -32,7 +32,7 @@ private def run : List (Reply (Option ByteArray)) → Program Storage (Reply Loo
   | _ :: _, .request .begin _ => none
   | _ :: _, .request (.commit _) _ => none
   | _ :: _, .request (.rollback _) _ => none
-  | _ :: _, .request (.readRows _ _ _ _ _) _ => none
+  | _ :: _, .request (.readRows _ _ _ _ _ _) _ => none
   | _ :: _, .request (.upsert _ _ _ _ _) _ => none
   | _ :: _, .request (.deleteRows _ _ _ _) _ => none
   | _ :: _, .request (.readInput _ _ _) _ => none

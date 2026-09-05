@@ -12,7 +12,7 @@ inductive Event where
   | commit (tx : Transaction)
   | rollback (tx : Transaction)
   | readRows (tx : Transaction) (relation : String) (columns : List String) (equals : Fields)
-      (order : List Order := [])
+      (order : List Order := []) (joins : List Join := [])
   | upsert (tx : Transaction) (relation : String) (values : Fields)
       (conflictColumns updateColumns : List String)
   | deleteRows (tx : Transaction) (relation : String) (equals : Fields) (blockers : List Exclusion := [])
@@ -28,7 +28,7 @@ def event : Storage A → Event
   | .begin => .begin
   | .commit tx => .commit tx
   | .rollback tx => .rollback tx
-  | .readRows tx relation columns equals order => .readRows tx relation columns equals order
+  | .readRows tx relation columns equals order joined => .readRows tx relation columns equals order joined
   | .upsert tx relation values conflicts updates => .upsert tx relation values conflicts updates
   | .deleteRows tx relation equals blockers => .deleteRows tx relation equals blockers
   | .readBytes space key => .readBytes space key
@@ -69,7 +69,7 @@ def answer (script : Script) : Storage A → A
   | .begin => script.begin
   | .commit _ => script.commit
   | .rollback _ => script.rollback
-  | .readRows _ relation columns _ _ =>
+  | .readRows _ relation columns _ _ _ =>
     if relation == "blobs" then
       if columns == ["last_access"] then script.access else script.durable
     else if relation == "content_want" then script.wanted

@@ -1,5 +1,5 @@
 //! Private synchronous transport. Only raw storage effects are interpreted here.
-use crate::host::{ByteStorage, Cell, Exclusion, Fields, Order, Resources, Row, Storage};
+use crate::host::{ByteStorage, Cell, Exclusion, Fields, Join, Order, Resources, Row, Storage};
 use std::{ffi::c_void, marker::PhantomData, ptr::NonNull, rc::Rc};
 
 #[derive(Debug)]
@@ -182,7 +182,7 @@ enum Frame {
     Begin,
     Commit(u64),
     Rollback(u64),
-    ReadRows(u64, String, Vec<String>, Fields, Vec<Order>),
+    ReadRows(u64, String, Vec<String>, Fields, Vec<Order>, Vec<Join>),
     Upsert(u64, String, Fields, Vec<String>, Vec<String>),
     DeleteRows(u64, String, Fields, Vec<Exclusion>),
     ReadBytes(String, Vec<u8>),
@@ -216,6 +216,12 @@ fn decode(packet: &[u8]) -> Result<Frame, ()> {
                     _ => return Err(()),
                 };
                 Ok(Order { column, descending })
+            })?,
+            r.list(|r| {
+                Ok(Join {
+                    relation: r.string()?,
+                    keys: r.list(|r| Ok((r.string()?, r.string()?)))?,
+                })
             })?,
         ),
         20 => Frame::Upsert(
@@ -338,9 +344,9 @@ fn execute<S: Storage>(
             Frame::Begin => reply(16, storage.begin(), &mut errors, word),
             Frame::Commit(tx) => reply(17, storage.commit(tx), &mut errors, |_, ()| {}),
             Frame::Rollback(tx) => reply(18, storage.rollback(tx), &mut errors, |_, ()| {}),
-            Frame::ReadRows(tx, table, columns, equals, order) => reply(
+            Frame::ReadRows(tx, table, columns, equals, order, joins) => reply(
                 19,
-                storage.read_rows(tx, &table, &columns, &equals, &order),
+                storage.read_rows(tx, &table, &columns, &equals, &order, &joins),
                 &mut errors,
                 rows,
             ),
@@ -422,6 +428,7 @@ impl<S: ByteStorage> Storage for ReadOnly<'_, S> {
         _: &[String],
         _: &Fields,
         _order: &[crate::host::Order],
+        _joins: &[crate::host::Join],
     ) -> Result<Vec<Row>, Self::Error> {
         Err(OperationError::Protocol)
     }
@@ -479,8 +486,11 @@ mod tests {
         word(&mut read, 1); // order terms
         bytes(&mut read, b"seq");
         read.push(1);
+        let direction_offset = read.len() - 1;
+        word(&mut read, 0); // joins
         match decode(&read).unwrap() {
-            Frame::ReadRows(7, relation, columns, equals, order) => {
+            Frame::ReadRows(7, relation, columns, equals, order, joins) => {
+                assert!(joins.is_empty());
                 assert_eq!(relation, "head_history");
                 assert_eq!(columns, ["seq"]);
                 assert!(equals.is_empty());
@@ -494,7 +504,26 @@ mod tests {
             }
             _ => panic!("wrong request kind"),
         }
-        *read.last_mut().unwrap() = 2;
+        let mut joined = read[..read.len() - 8].to_vec();
+        word(&mut joined, 1);
+        bytes(&mut joined, b"pins");
+        word(&mut joined, 1);
+        bytes(&mut joined, b"root");
+        bytes(&mut joined, b"root");
+        match decode(&joined).unwrap() {
+            Frame::ReadRows(_, _, _, _, _, joins) => assert_eq!(
+                joins,
+                [Join {
+                    relation: "pins".into(),
+                    keys: vec![("root".into(), "root".into())],
+                }]
+            ),
+            _ => panic!("wrong request kind"),
+        }
+        for length in 0..joined.len() {
+            assert!(decode(&joined[..length]).is_err());
+        }
+        read[direction_offset] = 2;
         assert!(decode(&read).is_err());
         let mut delete = vec![1, 21];
         word(&mut delete, 7);
@@ -576,6 +605,7 @@ mod tests {
             columns: &[String],
             equals: &Fields,
             _order: &[crate::host::Order],
+            _joins: &[crate::host::Join],
         ) -> Result<Vec<Row>, Self::Error> {
             assert_eq!(tx, 42);
             assert_eq!(equals[0], ("root".into(), Cell::Blob(vec![9; 32])));
