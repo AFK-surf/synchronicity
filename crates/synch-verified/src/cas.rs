@@ -153,5 +153,30 @@ pub fn acquire<S: crate::host::Storage>(
     now: i64,
     possession: bool,
 ) -> Result<bool, OperationError<S::Error>> {
-    crate::operation::acquire(storage, root, holder, now, possession)
+    use crate::operation::Slice;
+    unsafe extern "C" {
+        fn synch_adapter_operation_acquire(
+            root: Slice,
+            holder: Slice,
+            now: u64,
+            possession: u8,
+        ) -> *mut std::ffi::c_void;
+    }
+    // SAFETY: constructor copies its arguments and returns a fresh owned program;
+    // the shared runner initializes the runtime before invoking it.
+    let result = unsafe {
+        crate::operation::run(storage, &[], || {
+            synch_adapter_operation_acquire(
+                root.as_slice().into(),
+                holder.as_bytes().into(),
+                now as u64,
+                u8::from(possession),
+            )
+        })
+    }?;
+    match result.as_slice() {
+        [0] => Ok(false),
+        [1] => Ok(true),
+        _ => Err(OperationError::Protocol),
+    }
 }

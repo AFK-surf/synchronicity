@@ -34,6 +34,7 @@ def tag : Storage A → UInt8
   | .upsert .. => 20
   | .deleteRows .. => 21
   | .readBytes .. => 22
+  | .readInput .. => 23
 
 def request (effect : Storage A) : ByteArray := octet 1 ++ octet (tag effect) ++
   match effect with
@@ -45,6 +46,7 @@ def request (effect : Storage A) : ByteArray := octet 1 ++ octet (tag effect) ++
     word tx ++ string table ++ fields values ++ sequence string conflict ++ sequence string updates
   | .deleteRows tx table equals => word tx ++ string table ++ fields equals
   | .readBytes space key => string space ++ bytes key
+  | .readInput handle offset count => word handle ++ word offset ++ word count
 
 structure Cursor where
   input : ByteArray
@@ -140,6 +142,7 @@ def reply (effect : Storage A) (input : ByteArray) : A :=
       | 0 => return none
       | 1 => return some (← readBytes)
       | _ => throw ()) input
+  | .readInput .. => decodeReply 23 readBytes input
 
 abbrev State := Program Storage (Reply ByteArray)
 

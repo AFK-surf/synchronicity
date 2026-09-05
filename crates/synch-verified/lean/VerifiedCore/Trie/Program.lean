@@ -68,4 +68,12 @@ def get (root key : ByteArray) : Operation LookupResult :=
   else lookup (maxKeyBytes * 2 + 1)
     (if root.data.all (· == 0) then none else some root) (keyNibbles key)
 
+/-- Native commands borrow their input rather than copying an unbounded key
+before Lean can enforce the key limit. Only admitted keys request raw bytes. -/
+def getInput (root : ByteArray) (handle keySize : UInt64) : Operation LookupResult := do
+  if keySize.toNat > maxKeyBytes then return .error (.keyTooLong keySize.toNat)
+  let key ← perform (.readInput handle 0 keySize)
+  if key.size != keySize.toNat then throw ⟨3, 0⟩
+  get root key
+
 end VerifiedCore.Trie

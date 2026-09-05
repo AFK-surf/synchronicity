@@ -386,6 +386,7 @@ private def runScript (script : Script) : Nat → Nat →
     | .deleteRows _ _ _ => step "delete" (resume (scriptReply script index 1))
     | .upsert _ _ _ _ _ => step "unexpected upsert" (resume (.error failure))
     | .readBytes _ _ => step "unexpected byte read" (resume (.error failure))
+    | .readInput .. => step "unexpected input read" (resume (.error failure))
 
 private def forkScript : Script :=
   ⟨[], [receiptRow 1 1 10, receiptRow 1 2 10, receiptRow 2 3 10], none⟩

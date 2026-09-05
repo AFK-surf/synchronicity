@@ -121,6 +121,7 @@ def executeReads (store : RawSnapshot) : Nat → Program Storage A → Option A
   | _ + 1, .request (.readRows _ _ _ _) _ => none
   | _ + 1, .request (.upsert _ _ _ _ _) _ => none
   | _ + 1, .request (.deleteRows _ _ _) _ => none
+  | _ + 1, .request (.readInput _ _ _) _ => none
 
 @[simp] theorem execute_pure (store : RawSnapshot) (fuel : Nat) (result : A) :
     executeReads store fuel (.pure result) = some result := by
@@ -422,6 +423,7 @@ theorem get_semantic_complete (path : GraphValue store root (keyNibbles key) byt
 /-- Exact lookup semantics over the stored decoded graph, at the concrete
 production budget. Neither direction assumes the result of a Rust algorithm.
 -/
+@[rust_justifies "mpt-trie-get"]
 theorem get_semantics_iff (store : RawSnapshot) (root key bytes : ByteArray)
     (bounded : key.size ≤ maxKeyBytes) (nonzero : root.data.all (· == 0) = false) :
     executeReads store (maxKeyBytes * 2 + 2) (Trie.get root key).run =
@@ -440,5 +442,32 @@ theorem graph_value_unique (first : GraphValue store root key left)
     (by omega) (by omega)
   have same := a.symm.trans b
   simpa using same
+
+/-- Oversized command keys are refused before even copying their raw bytes. -/
+theorem getInput_oversized (root : ByteArray) (handle size : UInt64)
+    (large : size.toNat > maxKeyBytes) :
+    (getInput root handle size).run = .pure (.ok (.error (.keyTooLong size.toNat))) := by
+  simp only [getInput, large, ↓reduceIte]
+  rfl
+
+/-- A bounded borrowed input is the sole preliminary request; host errors and
+length mismatches cannot reach lookup. An exact reply runs the proved get. -/
+@[rust_justifies "mpt-trie-get-input"]
+theorem getInput_admitted (root : ByteArray) (handle size : UInt64)
+    (bounded : size.toNat ≤ maxKeyBytes) :
+    (getInput root handle size).run = .request (.readInput handle 0 size) (fun response =>
+      match response with
+      | .error failure => .pure (.error failure)
+      | .ok key => if key.size != size.toNat then .pure (.error ⟨3, 0⟩)
+          else (get root key).run) := by
+  simp only [getInput, Nat.not_lt.mpr bounded, ↓reduceIte]
+  change Program.request _ _ = Program.request _ _
+  congr 1
+  funext response
+  cases response with
+  | error failure => rfl
+  | ok key =>
+    dsimp only [Program.bind, ExceptT.bindCont]
+    split <;> rfl
 
 end Synchronicity.TrieProgramProofs

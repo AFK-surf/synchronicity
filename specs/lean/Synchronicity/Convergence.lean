@@ -216,7 +216,6 @@ def CarriesKey (c : Content) (x : Hash) (p key : Path) (v : ValueRef) : Prop :=
 
 /-- `trie.rs::Trie::get`: the value of a key under a root is what the descent
 finds at the key's position. -/
-@[rust_impl "mpt-trie-get"]
 def HasValue (c : Content) (root : Hash) (key : Path) (v : ValueRef) : Prop :=
   ∃ p x, At c root p x ∧ CarriesKey c x p key v
 

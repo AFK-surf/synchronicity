@@ -209,7 +209,10 @@ preservation of the primary error across rollback failure.
 
 CAS pin/possession acquisition now uses the complete Lean operation in
 production. Its old snapshot/planner interface and Rust read/interpret/mutation
-orchestration have been deleted. Trie and history programs remain staged. The
+orchestration have been deleted. Trie lookup also runs the complete Lean
+operation in production: Rust supplies only raw node/value reads and maps the
+completed result. Its former Rust decoding/traversal loop is deleted. Other
+trie operations and history cutover remain unfinished. The
 integration sequence for each operation is:
 
 1. Implement the common native continuation transport with typed reply
@@ -268,6 +271,15 @@ guarded connection for the entire operation and rejects stale transaction IDs,
 including writes after SQLite has automatically rolled back. Its Drop path
 releases only its own abandoned transaction. Normal rollback and primary-error
 selection are requested by Lean, including for malformed reply packets.
+
+Command inputs may be borrowed immutable byte capabilities for the duration of
+the synchronous run. Lean requests a bounded range by handle, offset and count;
+the runner checks capability/range validity and copies only that range. In
+particular, lookup rejects oversized keys in Lean before requesting any bytes,
+preserving cheap rejection without duplicating the key-limit policy in Rust.
+Byte-only operations use a narrow `ByteStorage` host interface; they do not
+require SQL or transaction services. Domain command construction and terminal
+result decoding live in the domain facades, not the common continuation runner.
 
 Only a host failure's opaque token crosses into Lean; Rust retains the original
 error object until Lean completes. Thus a later rollback failure cannot overwrite

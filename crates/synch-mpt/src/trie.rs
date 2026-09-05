@@ -594,64 +594,17 @@ impl<'a, S: NodeStore + ?Sized> Trie<'a, S> {
     /// must agree about which keys exist — the whole of what
     /// [`TrieNode::check_invariants`](crate::TrieNode::check_invariants) and
     /// the ingest bound are for.
-    // LEAN-MODEL: mpt-trie-get (Convergence.HasValue)
-    // `Convergence.HasValue`; `view_deterministic` is why a key has one value
-    // under a root, given `check_invariants`' non-empty extension prefix.
+    // LEAN-MODEL: mpt-trie-get (TrieProgramProofs.get_semantics_iff)
+    // Lean owns input bounds, decoding, the depth budget and value resolution.
+    // Empty extensions remain dead ends; exact-boundary keys retain their
+    // final leaf/branch read. Rust supplies encoded storage bytes only.
     pub fn get(&self, root: Hash, key: &[u8]) -> Result<Option<Vec<u8>>, MptError> {
-        if key.len() > MAX_KEY_LEN {
-            return Err(MptError::KeyTooLong(key.len()));
-        }
-        let nibbles = Nibbles::from_bytes(key);
-        let mut rest = nibbles.as_slice();
-        let mut current = root_opt(root);
-        // Every iteration consumes at least one nibble except the last, so this
-        // is bounded by the key length — once an empty extension prefix is
-        // impossible. `hash_of_encoded` rejects those now; the guard stays
-        // because `get` is the one descent with no stack to bound it. A key of
-        // `n` nibbles needs up to `n + 1` loads, not `n` (the last is the leaf
-        // or branch holding the value), so the budget is `MAX_DEPTH_NIBBLES + 1`:
-        // counted without it, this refused a key of exactly `MAX_KEY_LEN` bytes
-        // that `iter` and `diff` yield.
-        let mut steps = 0usize;
-        loop {
-            steps += 1;
-            if steps > MAX_DEPTH_NIBBLES + 1 {
-                return Err(MptError::NonCanonical(
-                    "lookup descended further than any valid key is long".into(),
-                ));
-            }
-            let Some(hash) = current else { return Ok(None) };
-            match self.load(&hash)? {
-                TrieNode::Leaf { key_rest, value } => {
-                    return if key_rest.as_slice() == rest {
-                        Ok(Some(self.resolve(&value)?))
-                    } else {
-                        Ok(None)
-                    };
-                }
-                TrieNode::Ext { prefix, child } => {
-                    let p = prefix.as_slice();
-                    // An empty prefix would make this a dead end for every
-                    // structural walk (`cursor_child` can never match one) and
-                    // a transparent hop here — the two readers must agree.
-                    if p.is_empty() || !rest.starts_with(p) {
-                        return Ok(None);
-                    }
-                    rest = &rest[p.len()..];
-                    current = Some(child);
-                }
-                TrieNode::Branch { children, value } => {
-                    if rest.is_empty() {
-                        return match value {
-                            Some(v) => Ok(Some(self.resolve(&v)?)),
-                            None => Ok(None),
-                        };
-                    }
-                    current = children[rest[0] as usize];
-                    rest = &rest[1..];
-                }
-            }
-        }
+        synch_verified::trie::get(
+            &mut crate::lean_storage::Bytes(self.store),
+            root.as_bytes(),
+            key,
+        )
+        .map_err(crate::lean_storage::lookup_error)
     }
 
     /// True if the key is present.

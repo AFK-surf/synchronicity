@@ -23,9 +23,9 @@ fn main() {
         "Cas",
         "Cas/Program",
         "Host/Wire",
-        "Entry",
         "Trie/Codec",
         "Trie/Program",
+        "Entry",
         "Replication/History",
     ];
     for module in modules {

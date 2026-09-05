@@ -1,5 +1,5 @@
 //! Private synchronous transport. Only raw storage effects are interpreted here.
-use crate::host::{Cell, Fields, Row, Storage};
+use crate::host::{ByteStorage, Cell, Fields, Row, Storage};
 use std::{ffi::c_void, marker::PhantomData, ptr::NonNull, rc::Rc};
 
 #[derive(Debug)]
@@ -29,7 +29,7 @@ impl<E: std::error::Error + 'static> std::error::Error for OperationError<E> {
 }
 
 #[repr(C)]
-struct Slice {
+pub(crate) struct Slice {
     ptr: *const u8,
     len: usize,
 }
@@ -43,12 +43,6 @@ impl From<&[u8]> for Slice {
 }
 
 unsafe extern "C" {
-    fn synch_adapter_operation_acquire(
-        root: Slice,
-        holder: Slice,
-        now: u64,
-        possession: u8,
-    ) -> *mut c_void;
     fn synch_adapter_operation_packet(state: *mut c_void) -> *mut c_void;
     fn synch_adapter_operation_resume(state: *mut c_void, reply: Slice) -> *mut c_void;
     fn synch_adapter_bytes_len(bytes: *mut c_void) -> usize;
@@ -92,7 +86,7 @@ impl Drop for Handle {
     }
 }
 
-struct Reader<'a>(&'a [u8]);
+pub(crate) struct Reader<'a>(pub(crate) &'a [u8]);
 impl<'a> Reader<'a> {
     fn take(&mut self, count: usize) -> Result<&'a [u8], ()> {
         if count > self.0.len() {
@@ -102,10 +96,10 @@ impl<'a> Reader<'a> {
         self.0 = rest;
         Ok(value)
     }
-    fn byte(&mut self) -> Result<u8, ()> {
+    pub(crate) fn byte(&mut self) -> Result<u8, ()> {
         Ok(self.take(1)?[0])
     }
-    fn word(&mut self) -> Result<u64, ()> {
+    pub(crate) fn word(&mut self) -> Result<u64, ()> {
         Ok(u64::from_le_bytes(
             self.take(8)?.try_into().map_err(|_| ())?,
         ))
@@ -113,11 +107,11 @@ impl<'a> Reader<'a> {
     fn count(&mut self) -> Result<usize, ()> {
         usize::try_from(self.word()?).map_err(|_| ())
     }
-    fn bytes(&mut self) -> Result<Vec<u8>, ()> {
+    pub(crate) fn bytes(&mut self) -> Result<Vec<u8>, ()> {
         let count = self.count()?;
         Ok(self.take(count)?.to_vec())
     }
-    fn string(&mut self) -> Result<String, ()> {
+    pub(crate) fn string(&mut self) -> Result<String, ()> {
         String::from_utf8(self.bytes()?).map_err(|_| ())
     }
     fn list<T>(&mut self, read: impl Fn(&mut Self) -> Result<T, ()>) -> Result<Vec<T>, ()> {
@@ -139,7 +133,7 @@ impl<'a> Reader<'a> {
     fn fields(&mut self) -> Result<Fields, ()> {
         self.list(|r| Ok((r.string()?, r.cell()?)))
     }
-    fn end(&self) -> Result<(), ()> {
+    pub(crate) fn end(&self) -> Result<(), ()> {
         if self.0.is_empty() {
             Ok(())
         } else {
@@ -192,6 +186,7 @@ enum Frame {
     Upsert(u64, String, Fields, Vec<String>, Vec<String>),
     DeleteRows(u64, String, Fields),
     ReadBytes(String, Vec<u8>),
+    ReadInput(u64, u64, u64),
 }
 
 fn decode(packet: &[u8]) -> Result<Frame, ()> {
@@ -215,6 +210,7 @@ fn decode(packet: &[u8]) -> Result<Frame, ()> {
         ),
         21 => Frame::DeleteRows(r.word()?, r.string()?, r.fields()?),
         22 => Frame::ReadBytes(r.string()?, r.bytes()?),
+        23 => Frame::ReadInput(r.word()?, r.word()?, r.word()?),
         _ => return Err(()),
     };
     r.end()?;
@@ -246,11 +242,35 @@ fn reply<E, A>(
 fn execute<S: Storage>(
     mut state: Handle,
     storage: &mut S,
+    inputs: &[&[u8]],
 ) -> Result<Vec<u8>, OperationError<S::Error>> {
     let mut errors = Vec::new();
     loop {
         let frame = decode(&state.packet()).map_err(|()| OperationError::Protocol)?;
         let response = match frame {
+            Frame::ReadInput(handle, offset, count) => {
+                let selected = usize::try_from(handle)
+                    .ok()
+                    .and_then(|handle| inputs.get(handle))
+                    .and_then(|input| {
+                        let start = usize::try_from(offset).ok()?;
+                        let count = usize::try_from(count).ok()?;
+                        input.get(start..start.checked_add(count)?)
+                    });
+                match selected {
+                    Some(input) => {
+                        let mut out = vec![1, 23];
+                        bytes(&mut out, input);
+                        out
+                    }
+                    None => {
+                        let mut out = vec![1, 0];
+                        word(&mut out, 3);
+                        word(&mut out, 0);
+                        out
+                    }
+                }
+            }
             Frame::Done(result) => return Ok(result),
             Frame::Failure(code, token) => {
                 return Err(match (code, token) {
@@ -301,33 +321,85 @@ fn execute<S: Storage>(
     }
 }
 
-pub(crate) fn acquire<S: Storage>(
+/// Run a domain constructor without exposing continuations to its caller.
+///
+/// # Safety
+/// `start` must return one fresh owned Lean Wire.State. It is called only after
+/// this thread's runtime is initialized; borrowed input buffers live until return.
+pub(crate) unsafe fn run<S: Storage>(
     storage: &mut S,
-    root: &[u8; 32],
-    holder: &str,
-    now: i64,
-    possession: bool,
-) -> Result<bool, OperationError<S::Error>> {
+    inputs: &[&[u8]],
+    start: impl FnOnce() -> *mut c_void,
+) -> Result<Vec<u8>, OperationError<S::Error>> {
     crate::native::enter();
-    // SAFETY: initialized runtime; adapter copies live input slices and returns ownership.
-    let state = Handle::new(unsafe {
-        synch_adapter_operation_acquire(
-            root.as_slice().into(),
-            holder.as_bytes().into(),
-            now as u64,
-            u8::from(possession),
-        )
-    });
-    match execute(state, storage)?.as_slice() {
-        [0] => Ok(false),
-        [1] => Ok(true),
-        _ => Err(OperationError::Protocol),
+    execute(Handle::new(start()), storage, inputs)
+}
+
+struct ReadOnly<'a, S>(&'a mut S);
+impl<S: ByteStorage> Storage for ReadOnly<'_, S> {
+    type Error = OperationError<S::Error>;
+    fn begin(&mut self) -> Result<u64, Self::Error> {
+        Err(OperationError::Protocol)
     }
+    fn commit(&mut self, _: u64) -> Result<(), Self::Error> {
+        Err(OperationError::Protocol)
+    }
+    fn rollback(&mut self, _: u64) -> Result<(), Self::Error> {
+        Err(OperationError::Protocol)
+    }
+    fn read_rows(
+        &mut self,
+        _: u64,
+        _: &str,
+        _: &[String],
+        _: &Fields,
+    ) -> Result<Vec<Row>, Self::Error> {
+        Err(OperationError::Protocol)
+    }
+    fn upsert(
+        &mut self,
+        _: u64,
+        _: &str,
+        _: &Fields,
+        _: &[String],
+        _: &[String],
+    ) -> Result<(), Self::Error> {
+        Err(OperationError::Protocol)
+    }
+    fn delete_rows(&mut self, _: u64, _: &str, _: &Fields) -> Result<u64, Self::Error> {
+        Err(OperationError::Protocol)
+    }
+    fn read_bytes(&mut self, space: &str, key: &[u8]) -> Result<Option<Vec<u8>>, Self::Error> {
+        self.0.read_bytes(space, key).map_err(OperationError::Host)
+    }
+}
+
+/// Same ownership contract as `run`, narrowed to byte-reading capabilities.
+pub(crate) unsafe fn run_readonly<S: ByteStorage>(
+    storage: &mut S,
+    inputs: &[&[u8]],
+    start: impl FnOnce() -> *mut c_void,
+) -> Result<Vec<u8>, OperationError<S::Error>> {
+    // SAFETY: forwarded constructor contract; adapter cannot grant write capabilities.
+    unsafe { run(&mut ReadOnly(storage), inputs, start) }.map_err(|error| match error {
+        OperationError::Host(error) => error,
+        OperationError::MalformedMetadata(detail) => OperationError::MalformedMetadata(detail),
+        OperationError::Protocol => OperationError::Protocol,
+    })
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cas::acquire;
+    unsafe extern "C" {
+        fn synch_adapter_operation_acquire(
+            root: Slice,
+            holder: Slice,
+            now: u64,
+            possession: u8,
+        ) -> *mut c_void;
+    }
 
     #[derive(Default)]
     struct Script {

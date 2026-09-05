@@ -23,7 +23,10 @@ shared carrier. `CasProgramProofs` covers the native production acquisition
 operation. `TrieProgramProofs` proves lookup soundness/completeness against a
 stable raw graph interpreted by the actual codec; codec roundtrip/canonicality
 remains separate. History proofs derive fork, ceiling and witness protection
-from actual receipts. Trie/history operations remain staged, not native cutovers.
+from actual receipts. Trie lookup is a native cutover over raw byte storage;
+history retention remains staged. The borrowed-input wrapper is also proved to
+reject oversized keys before requesting their bytes and to run the proved
+lookup only after receiving an exact-sized input.
 
 ```sh
 cd specs/lean

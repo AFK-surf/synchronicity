@@ -35,6 +35,7 @@ private def run : List (Reply (Option ByteArray)) → Program Storage (Reply Loo
   | _ :: _, .request (.readRows _ _ _ _) _ => none
   | _ :: _, .request (.upsert _ _ _ _ _) _ => none
   | _ :: _, .request (.deleteRows _ _ _) _ => none
+  | _ :: _, .request (.readInput _ _ _) _ => none
 
 private def succeeds (key : List UInt8) (nodes : List ByteArray)
     (payload : List UInt8) (trace : List (String × ByteArray)) : Bool :=

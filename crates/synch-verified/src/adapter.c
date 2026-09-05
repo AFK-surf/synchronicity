@@ -72,6 +72,7 @@ static lean_object *bytes(synch_slice slice) {
 }
 
 extern lean_object *synch_lean_cas_acquire(lean_object *, lean_object *, uint64_t, uint8_t);
+extern lean_object *synch_lean_trie_get(lean_object *, uint64_t);
 extern lean_object *synch_lean_operation_packet(lean_object *);
 extern lean_object *synch_lean_operation_resume(lean_object *, lean_object *);
 
@@ -86,6 +87,10 @@ void *synch_adapter_operation_acquire(synch_slice root, synch_slice holder,
 void *synch_adapter_operation_packet(void *state) {
     lean_inc((lean_object *)state);
     return synch_lean_operation_packet((lean_object *)state);
+}
+
+void *synch_adapter_operation_trie_get(synch_slice root, uint64_t key_size) {
+    return synch_lean_trie_get(bytes(root), key_size);
 }
 
 void *synch_adapter_operation_resume(void *state, synch_slice reply) {

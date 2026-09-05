@@ -22,7 +22,8 @@ over raw storage effects. CAS pin/possession acquisition now uses that complete
 operation in production. The shared synchronous continuation interpreter asks
 Rust only for raw storage effects; Lean owns begin/read/mutate/commit/rollback.
 The old acquisition snapshot/planner API and Rust orchestration are deleted.
-Trie lookup and history retention remain staged, not production replacements.
+Trie lookup also runs as a complete native Lean operation over raw byte reads;
+the former Rust lookup traversal is removed. History retention remains staged.
 No selectable backend is added.
 
 The acquisition cutover is checked against real SQLite, including abandoned

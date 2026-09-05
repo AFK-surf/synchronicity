@@ -18,6 +18,14 @@ pub type Row = Vec<Cell>;
 /// Named raw cells used as equality predicates or explicit write values.
 pub type Fields = Vec<(String, Cell)>;
 
+/// Read-only byte storage capability, without relational or transaction policy.
+pub trait ByteStorage {
+    /// Original backing-store failure.
+    type Error;
+    /// Read opaque bytes by namespace/key, preserving absence versus empty.
+    fn read_bytes(&mut self, space: &str, key: &[u8]) -> Result<Option<Vec<u8>>, Self::Error>;
+}
+
 /// Host storage capabilities. The interpreter executes requests literally;
 /// algorithms, metadata interpretation and operation sequencing remain in Lean.
 ///

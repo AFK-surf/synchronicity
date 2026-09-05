@@ -18,6 +18,7 @@
 
 pub mod diff;
 pub mod error;
+mod lean_storage;
 pub mod nibbles;
 pub mod node;
 /// Merkle proofs of presence and absence for individual keys (§4.3).

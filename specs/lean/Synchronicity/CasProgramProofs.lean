@@ -16,6 +16,7 @@ inductive Event where
       (conflictColumns updateColumns : List String)
   | deleteRows (tx : Transaction) (relation : String) (equals : Fields)
   | readBytes (space : String) (key : ByteArray)
+  | readInput (handle offset count : UInt64)
   deriving BEq
 
 /-- Erase only the dependent reply type of a host request. -/
@@ -27,6 +28,7 @@ def event : Storage A → Event
   | .upsert tx relation values conflicts updates => .upsert tx relation values conflicts updates
   | .deleteRows tx relation equals => .deleteRows tx relation equals
   | .readBytes space key => .readBytes space key
+  | .readInput handle offset count => .readInput handle offset count
 
 /-- Independent storage observations, including failures at every boundary. -/
 structure Script where
@@ -57,6 +59,7 @@ def answer (script : Script) : Storage A → A
   | .upsert _ _ _ _ _ => script.upsert
   | .deleteRows _ _ _ => script.delete
   | .readBytes _ _ => .error malformedMetadata
+  | .readInput .. => .error malformedMetadata
 
 /-- Evaluate the actual free-monad constructors, not a second CAS algorithm. -/
 def execute (script : Script) : Program Storage A → A × List Event
