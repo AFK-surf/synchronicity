@@ -20,6 +20,16 @@ impl From<&[u8]> for Slice {
 }
 
 unsafe extern "C" {
+    fn synch_lean_deletion_start(
+        collect: u8,
+        row: u8,
+        writing: u8,
+        pinned: u8,
+        referenced: u8,
+        last_access: u64,
+        before: u64,
+    ) -> u8;
+    fn synch_lean_deletion_ack(step: u8) -> u8;
     fn synch_adapter_cas_plan(
         row: u8,
         durable: u8,
@@ -579,6 +589,77 @@ pub enum Settlement {
     Keep,
     Reset,
     Refuse,
+}
+
+/// An effect or terminal outcome selected by the Lean deletion protocol.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DeletionStep {
+    Skip,
+    Writing,
+    Protected,
+    DeleteRow,
+    Commit,
+    UnlinkPayload,
+    UnlinkOutboard,
+    Finished,
+}
+
+/// Lean-owned deletion policy and effect ordering, represented by a scalar tag.
+#[derive(Debug)]
+pub struct Deletion {
+    step: u8,
+}
+
+impl Deletion {
+    /// Snapshot facts must remain protected against writers and new references
+    /// until the protocol finishes. `None` selects explicit, age-independent deletion.
+    pub fn new(
+        row: bool,
+        writing: bool,
+        pinned: bool,
+        referenced: bool,
+        last_access: i64,
+        before: Option<i64>,
+    ) -> Self {
+        enter();
+        // SAFETY: generated C represents Int64 as uint64_t; casting preserves
+        // the signed timestamp bit pattern, interpreted as signed inside Lean.
+        let step = unsafe {
+            synch_lean_deletion_start(
+                before.is_some().into(),
+                row.into(),
+                writing.into(),
+                pinned.into(),
+                referenced.into(),
+                last_access as u64,
+                before.unwrap_or(0) as u64,
+            )
+        };
+        Self { step }
+    }
+
+    /// Read the next effect without advancing the protocol.
+    pub fn step(&self) -> DeletionStep {
+        match self.step {
+            0 => DeletionStep::Skip,
+            1 => DeletionStep::Writing,
+            2 => DeletionStep::Protected,
+            3 => DeletionStep::DeleteRow,
+            4 => DeletionStep::Commit,
+            5 => DeletionStep::UnlinkPayload,
+            6 => DeletionStep::UnlinkOutboard,
+            7 => DeletionStep::Finished,
+            _ => panic!("invalid Lean deletion step"),
+        }
+    }
+
+    /// Acknowledge successful SQL execution or a best-effort unlink attempt.
+    /// Never acknowledge a failed row deletion or failed transaction commit.
+    pub fn acknowledge(&mut self) {
+        enter();
+        // SAFETY: scalar ABI; all transition decisions remain in Lean.
+        self.step = unsafe { synch_lean_deletion_ack(self.step) };
+    }
 }
 
 /// Accepted CAS commit plan. Ranges are normalized and clamped by Lean.

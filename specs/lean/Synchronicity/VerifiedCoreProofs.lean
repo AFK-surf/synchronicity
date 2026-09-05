@@ -1224,6 +1224,73 @@ theorem cas_plan_encoding_roundtrip (row durable complete : Bool) (recorded clai
   simp only [UInt64.size]
   constructor <;> omega
 
+/-- The executed deletion planner authorizes exactly unprotected snapshots;
+collection additionally requires an existing strictly cold row. -/
+@[rust_justifies "cas-native-deletion-policy"]
+theorem deletion_start_authorized (collect row writing pinned referenced : Bool)
+    (lastAccess before : Int64) :
+    VerifiedCore.deletionStart collect row writing pinned referenced lastAccess before = 3 ↔
+      writing = false ∧ pinned = false ∧ referenced = false ∧
+      (collect = true → row = true ∧ lastAccess < before) := by
+  cases collect <;> cases row <;> cases writing <;> cases pinned <;> cases referenced <;>
+    simp [VerifiedCore.deletionStart]
+
+/-- The first filesystem effect can only follow acknowledgment of commit. -/
+theorem deletion_payload_requires_commit (step : UInt8) :
+    VerifiedCore.deletionAck step = 5 ↔ step = 4 := by
+  unfold VerifiedCore.deletionAck
+  split_ifs <;> simp_all
+
+/-- The second filesystem effect can only follow the first unlink attempt. -/
+theorem deletion_outboard_requires_payload (step : UInt8) :
+    VerifiedCore.deletionAck step = 6 ↔ step = 5 := by
+  unfold VerifiedCore.deletionAck
+  split_ifs <;> simp_all
+
+/-- An execution records acknowledged effects in reverse chronological order.
+Reading the next action alone never advances this relation. -/
+inductive DeletionRun (start : UInt8) : List UInt8 → UInt8 → Prop where
+  | initial : DeletionRun start [] start
+  | acknowledge {effects step} : DeletionRun start effects step →
+      DeletionRun start (step :: effects) (VerifiedCore.deletionAck step)
+
+/-- A fresh plan always starts with a refusal, skip, or row-deletion request. -/
+theorem deletion_start_initial (collect row writing pinned referenced : Bool)
+    (lastAccess before : Int64) :
+    let start := VerifiedCore.deletionStart collect row writing pinned referenced lastAccess before
+    start = 0 ∨ start = 1 ∨ start = 2 ∨ start = 3 := by
+  unfold VerifiedCore.deletionStart
+  split_ifs <;> simp
+
+/-- In the actual acknowledgment protocol, a payload unlink request has a
+previously acknowledged commit in its history. The I/O adapter acknowledges
+commit only on success; this theorem does not assume filesystem atomicity. -/
+@[rust_justifies "cas-native-deletion-order"]
+theorem deletion_run_payload_after_commit (collect row writing pinned referenced : Bool)
+    (lastAccess before : Int64) (effects : List UInt8)
+    (run : DeletionRun (VerifiedCore.deletionStart collect row writing pinned referenced lastAccess before)
+      effects 5) : (4 : UInt8) ∈ effects := by
+  have initial := deletion_start_initial collect row writing pinned referenced lastAccess before
+  generalize VerifiedCore.deletionStart collect row writing pinned referenced lastAccess before = start at run initial
+  generalize hs : (5 : UInt8) = step at run
+  cases run with
+  | initial =>
+    rcases initial with rfl | rfl | rfl | rfl <;> contradiction
+  | acknowledge prior =>
+    have step := (deletion_payload_requires_commit _).mp hs.symm
+    simp [step]
+
+/-- A refused plan never acquires a destructive action, even if erroneously
+acknowledged repeatedly. Starting a new snapshot is required to reconsider it. -/
+theorem deletion_run_refusal_sticky (start step : UInt8) (effects : List UInt8)
+    (blocked : start = 0 ∨ start = 1 ∨ start = 2)
+    (run : DeletionRun start effects step) : step = start := by
+  induction run with
+  | initial => rfl
+  | acknowledge prior ih =>
+    rw [ih]
+    rcases blocked with rfl | rfl | rfl <;> rfl
+
 end Synchronicity.VerifiedCoreProofs
 
 #lint

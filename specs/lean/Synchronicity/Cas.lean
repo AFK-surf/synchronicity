@@ -369,19 +369,19 @@ def RetireRole (holder : H) : Transition (Cell H) where
     replicaLive := c.replicaLive \ {holder} }
 
 /-- `cas.rs::delete_blob_if_collectable`, the row commit. -/
-@[transition, rust_impl "cas-gc-row-commit"]
+@[transition]
 def GcCommit : Transition (Cell H) where
   guard := Collectable
   post c := { c with row := False, held := ∅, durable := False, sweeping := True }
 
 /-- The unlink half of `delete_blob_if_collectable`. -/
-@[transition, rust_impl "cas-gc-unlink"]
+@[transition]
 def GcUnlink : Transition (Cell H) where
   guard c := c.sweeping
   post c := { c with bytes := False, sweeping := False }
 
 /-- `cas.rs::Store::delete_blob`. -/
-@[transition, rust_impl "cas-protected-delete"]
+@[transition]
 def ProtectedDelete : Transition (Cell H) where
   guard := Deletable
   post c := { c with row := False, held := ∅, durable := False, sweeping := True }

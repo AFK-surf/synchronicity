@@ -2,6 +2,6 @@
 
 mod native;
 pub use native::{
-    group_count, plan_cas_commit, settle_size, CasCommit, CertificateCache, ChildShape,
-    MissingWalk, Scope, Settlement, Shape, WalkError, WalkNode, WalkPosition,
+    group_count, plan_cas_commit, settle_size, CasCommit, CertificateCache, ChildShape, Deletion,
+    DeletionStep, MissingWalk, Scope, Settlement, Shape, WalkError, WalkNode, WalkPosition,
 };

@@ -2,6 +2,49 @@ use proptest::prelude::*;
 use synch_verified::{group_count, settle_size, CertificateCache, Scope, Settlement, Shape};
 
 #[test]
+fn deletion_protocol_checks_every_protection_and_orders_effects() {
+    use synch_verified::{Deletion, DeletionStep::*};
+    for row in [false, true] {
+        for writing in [false, true] {
+            for pinned in [false, true] {
+                for referenced in [false, true] {
+                    for last in [i64::MIN, -1, 0, 1, i64::MAX] {
+                        for before in [None, Some(i64::MIN), Some(-1), Some(0), Some(i64::MAX)] {
+                            let mut plan =
+                                Deletion::new(row, writing, pinned, referenced, last, before);
+                            let initial = if writing {
+                                Writing
+                            } else if pinned || referenced {
+                                Protected
+                            } else if before.is_some_and(|cutoff| !row || last >= cutoff) {
+                                Skip
+                            } else {
+                                DeleteRow
+                            };
+                            assert_eq!(plan.step(), initial);
+                            assert_eq!(plan.step(), initial, "polling is not acknowledgment");
+                            if initial == DeleteRow {
+                                for expected in
+                                    [Commit, UnlinkPayload, UnlinkOutboard, Finished, Finished]
+                                {
+                                    plan.acknowledge();
+                                    assert_eq!(plan.step(), expected);
+                                }
+                            } else {
+                                for _ in 0..5 {
+                                    plan.acknowledge();
+                                    assert_eq!(plan.step(), initial);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn cas_plan_handles_empty_objects_resets_and_unbounded_input_endpoints() {
     let plan =
         synch_verified::plan_cas_commit(false, false, false, 0, 0, &[], &[(0, u64::MAX)]).unwrap();

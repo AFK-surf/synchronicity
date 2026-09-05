@@ -84,6 +84,12 @@ Apple's system libc++. OS libraries remain dynamic dependencies.
   non-reference-equal positions; checks depth before shortcuts; preserves
   pending work on resume; refuses unadmitted child positions; and cannot report
   exhaustion while deferred work or a sticky depth fault remains.
+- CAS deletion authorizes only writer-free, unpinned, unreferenced snapshots;
+  collection additionally requires a strictly cold existing row. The executed
+  acknowledgment protocol orders row deletion, commit, payload unlink and
+  outboard unlink. Refusals remain sticky and payload unlink requires an
+  acknowledged commit. Rust acknowledges SQL effects only after success;
+  filesystem removal remains a best-effort attempt, not a proved atomic effect.
 
 `MissingWalk` also owns its frontier, seen set, deferred retries, per-batch
 payload request set and extension-child requirements in Lean. Its sets use
@@ -191,7 +197,9 @@ The following are still required:
   are now Lean; the cache still trusts a completed walk's validity. Other trie
   operations and ingestion-time canonical encoding checks also remain Rust.
 - CAS bitmap settlement now runs in Lean, with canonical output and lossless
-  endpoint serialization proved. Move accounting, GC and promotion decisions.
+  endpoint serialization proved. CAS row deletion policy and effect order also
+  run in Lean. Move remaining accounting, GC candidate selection, trie GC,
+  cache eviction/healing, and promotion decisions.
 - Move ingestion and materialization sequencing into Lean-generated effect
   plans; discharge the flush-before-advertise and publication invariants over
   those executed plans, not over independent abstract Rust descriptions.

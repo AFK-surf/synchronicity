@@ -556,4 +556,25 @@ def casPlanStatus (plan : CasPlan) : UInt8 :=
 def casPlanSpans (plan : CasPlan) : Array UInt64 :=
   (plan.spans.flatMap fun r => [UInt64.ofNat r.start, UInt64.ofNat r.stop]).toArray
 
+/-- Initial deletion action from one locked transaction snapshot. Tags:
+0 skip, 1 writer refusal, 2 protected refusal, 3 delete row, 4 commit,
+5 unlink payload, 6 unlink outboard, 7 finished. Explicit deletion also cleans
+orphan files; collection requires an existing cold row. Timestamps are signed. -/
+@[export synch_lean_deletion_start]
+def deletionStart (collect row writing pinned referenced : Bool)
+    (lastAccess before : Int64) : UInt8 :=
+  if writing then 1 else
+  if pinned || referenced then 2 else
+  if collect && (!row || !(lastAccess < before)) then 0 else 3
+
+/-- Acknowledge the requested effect only. SQL failure stops before this call;
+unlink acknowledgments mean attempts, since filesystem cleanup is best effort.
+Refusals and terminal states are sticky, including invalid input tags. -/
+@[export synch_lean_deletion_ack]
+def deletionAck (step : UInt8) : UInt8 :=
+  if step == 3 then 4 else
+  if step == 4 then 5 else
+  if step == 5 then 6 else
+  if step == 6 then 7 else step
+
 end VerifiedCore

@@ -1661,36 +1661,8 @@ impl Store {
         //
         // So the writer's own mark is consulted, under the same guard. A write
         // in flight is not a collectable object, whatever the row says.
-        let mut conn = self.conn();
-        let _ordered_against_writers = self.cas_order();
-        if self.is_being_written(root) {
-            return Ok(false);
-        }
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        // LEAN-MODEL: cas-gc-row-commit (Cas.GcCommit)
-        // `Cas.GcCommit` is this conditional row transition. Its guard is
-        // intentionally re-read here, not inherited from the candidate scan.
-        let rows = tx.execute(
-            "DELETE FROM blobs
-               WHERE root = ?1
-                 AND NOT EXISTS (SELECT 1 FROM pins WHERE pins.root = blobs.root)
-                 AND last_access < ?2
-                 AND NOT EXISTS (
-                   SELECT 1 FROM entries WHERE entries.content = blobs.root
-                 )",
-            params![root.as_bytes().to_vec(), before],
-        )?;
-        tx.commit()?;
-        let deleted = rows > 0;
-        if deleted {
-            // LEAN-MODEL: cas-gc-unlink (Cas.GcUnlink)
-            // `Cas.GcUnlink` is separate from the row commit because the
-            // filesystem cannot join SQLite; `conn` remains held between them.
-            let _ = std::fs::remove_file(self.blob_path(root));
-            let _ = std::fs::remove_file(self.outboard_path(root));
-        }
-        drop(conn);
-        Ok(deleted)
+        Ok(self.execute_blob_deletion(root, Some(before))?
+            == synch_verified::DeletionStep::Finished)
     }
 
     /// Deletes an unprotected object's payload, outboard, and index row.
@@ -1700,37 +1672,80 @@ impl Store {
     /// "delete" must not be a back door around a live entry or pin: callers
     /// remove those claims first, then delete the now-unprotected cache object.
     pub fn delete_blob(&self, root: &Hash) -> Result<()> {
+        use synch_verified::DeletionStep;
+        match self.execute_blob_deletion(root, None)? {
+            DeletionStep::Writing => Err(StoreError::invalid(format!(
+                "blob {root} is being written and cannot be deleted"
+            ))),
+            DeletionStep::Protected => Err(StoreError::invalid(format!(
+                "blob {root} is referenced or pinned and cannot be deleted"
+            ))),
+            DeletionStep::Finished => Ok(()),
+            _ => unreachable!("explicit Lean deletion returned a nonterminal outcome"),
+        }
+    }
+
+    /// Execute Lean's ordered deletion effects while holding both ordering
+    /// guards. The SQL only reads facts or performs unconditional keyed writes;
+    /// policy and the commit-before-unlink protocol live in the native core.
+    fn execute_blob_deletion(
+        &self,
+        root: &Hash,
+        before: Option<i64>,
+    ) -> Result<synch_verified::DeletionStep> {
+        use synch_verified::DeletionStep;
         let mut conn = self.conn();
         let _ordered_against_writers = self.cas_order();
-        if self.is_being_written(root) {
-            return Err(StoreError::invalid(format!(
-                "blob {root} is being written and cannot be deleted"
-            )));
-        }
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        // LEAN-MODEL: cas-protected-delete (Cas.ProtectedDelete)
-        // `Cas.ProtectedDelete` is this no-entry/no-pin/no-writer
-        // transition. The checks and row deletion are one write transaction.
-        let protected: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM pins WHERE root = ?1)
-                 OR EXISTS(SELECT 1 FROM entries WHERE content = ?1)",
+        let (pinned, referenced): (bool, bool) = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM pins WHERE root = ?1),
+                    EXISTS(SELECT 1 FROM entries WHERE content = ?1)",
             params![root.as_bytes().to_vec()],
-            |row| row.get(0),
+            |row| Ok((row.get(0)?, row.get(1)?)),
         )?;
-        if protected {
-            return Err(StoreError::invalid(format!(
-                "blob {root} is referenced or pinned and cannot be deleted"
-            )));
+        let accessed: Option<i64> = tx
+            .query_row(
+                "SELECT last_access FROM blobs WHERE root = ?1",
+                params![root.as_bytes().to_vec()],
+                |row| row.get(0),
+            )
+            .optional()?;
+        // LEAN-MODEL: cas-native-deletion-policy (VerifiedCoreProofs.deletion_start_authorized)
+        let mut plan = synch_verified::Deletion::new(
+            accessed.is_some(),
+            self.is_being_written(root),
+            pinned,
+            referenced,
+            accessed.unwrap_or(0),
+            before,
+        );
+        let mut tx = Some(tx);
+        // LEAN-MODEL: cas-native-deletion-order (VerifiedCoreProofs.deletion_run_payload_after_commit)
+        loop {
+            match plan.step() {
+                DeletionStep::DeleteRow => {
+                    tx.as_ref()
+                        .expect("Lean row deletion precedes commit")
+                        .execute(
+                            "DELETE FROM blobs WHERE root = ?1",
+                            params![root.as_bytes().to_vec()],
+                        )?;
+                }
+                DeletionStep::Commit => {
+                    tx.take().expect("Lean requests one commit").commit()?;
+                }
+                DeletionStep::UnlinkPayload => {
+                    let _ = std::fs::remove_file(self.blob_path(root));
+                }
+                DeletionStep::UnlinkOutboard => {
+                    let _ = std::fs::remove_file(self.outboard_path(root));
+                }
+                terminal => return Ok(terminal),
+            }
+            // SQL errors return above without acknowledging, so the native
+            // protocol cannot advance to file removal after a failed commit.
+            plan.acknowledge();
         }
-        tx.execute(
-            "DELETE FROM blobs WHERE root = ?1",
-            params![root.as_bytes().to_vec()],
-        )?;
-        tx.commit()?;
-        let _ = std::fs::remove_file(self.blob_path(root));
-        let _ = std::fs::remove_file(self.outboard_path(root));
-        drop(conn);
-        Ok(())
     }
 
     /// Simulates storage loss for recovery and race tests.
@@ -2657,6 +2672,54 @@ mod tests {
             store.read_all(&root),
             Err(StoreError::MissingBlob(_))
         ));
+    }
+
+    #[test]
+    fn deletion_sql_failures_never_advance_to_unlink() {
+        for fail_at_commit in [false, true] {
+            for collect in [false, true] {
+                let (_dir, store) = store();
+                let bytes = data(100_000);
+                let root = store.ingest_bytes(&bytes, 0).unwrap();
+                if fail_at_commit {
+                    // The DELETE succeeds, but its deferred constraint fails
+                    // COMMIT. No filesystem effect may have been requested yet.
+                    store
+                        .conn()
+                        .execute_batch(
+                            "CREATE TABLE deletion_parent (id INTEGER PRIMARY KEY);
+                         CREATE TABLE deletion_child (parent INTEGER REFERENCES deletion_parent(id)
+                           DEFERRABLE INITIALLY DEFERRED);
+                         CREATE TRIGGER fail_deletion_commit AFTER DELETE ON blobs
+                           BEGIN INSERT INTO deletion_child VALUES (1); END;",
+                        )
+                        .unwrap();
+                } else {
+                    store
+                        .conn()
+                        .execute_batch(
+                            "CREATE TRIGGER fail_deletion_row BEFORE DELETE ON blobs
+                           BEGIN SELECT RAISE(ABORT, 'injected deletion failure'); END;",
+                        )
+                        .unwrap();
+                }
+                let result = if collect {
+                    store
+                        .delete_blob_if_collectable(&root, i64::MAX)
+                        .map(|_| ())
+                } else {
+                    store.delete_blob(&root)
+                };
+                assert!(result.is_err());
+                assert!(
+                    store.blob(&root).unwrap().is_some(),
+                    "row deletion must roll back"
+                );
+                assert!(store.blob_path(&root).exists());
+                assert!(store.outboard_path(&root).exists());
+                assert_eq!(store.read_all(&root).unwrap(), bytes);
+            }
+        }
     }
 
     /// Two writers filling one object keep both halves of what they wrote: a
