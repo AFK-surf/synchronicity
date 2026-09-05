@@ -19,7 +19,7 @@ use synch_core::Hash;
 use crate::nibbles::Nibbles;
 
 /// The trie key prefixes a peer may be served.
-#[derive(Debug, Clone, PartialEq, Eq, Default)]
+#[derive(Debug, Clone)]
 pub struct Scope {
     /// Allowed nibble prefixes, or `None` for the whole keyspace.
     prefixes: Option<Vec<Vec<u8>>>,
@@ -29,7 +29,22 @@ pub struct Scope {
     /// read as one that bounds everything under it: `m:space/photos` used as a
     /// prefix would carry `m:space/photos-raw` with it.
     exact: Vec<Vec<u8>>,
+    #[cfg(feature = "verified-lean")]
+    native: synch_verified::Scope,
 }
+
+impl Default for Scope {
+    fn default() -> Self {
+        Self::full()
+    }
+}
+
+impl PartialEq for Scope {
+    fn eq(&self, other: &Self) -> bool {
+        self.prefixes == other.prefixes && self.exact == other.exact
+    }
+}
+impl Eq for Scope {}
 
 impl Scope {
     /// The whole keyspace: what a rooted member holds and serves.
@@ -37,6 +52,8 @@ impl Scope {
         Scope {
             prefixes: None,
             exact: Vec::new(),
+            #[cfg(feature = "verified-lean")]
+            native: synch_verified::Scope::new(None, &[]),
         }
     }
 
@@ -51,9 +68,13 @@ impl Scope {
                 .map(|p| Nibbles::from_bytes(p).as_slice().to_vec())
                 .collect()
         };
+        let prefixes = nibbles(&keys.prefixes);
+        let exact = nibbles(&keys.exact);
         Scope {
-            prefixes: Some(nibbles(&keys.prefixes)),
-            exact: nibbles(&keys.exact),
+            #[cfg(feature = "verified-lean")]
+            native: synch_verified::Scope::new(Some(&prefixes), &exact),
+            prefixes: Some(prefixes),
+            exact,
         }
     }
 
@@ -71,6 +92,12 @@ impl Scope {
     // LEAN-MODEL: mpt-scope-admits-path (Scope.AdmitsPath)
     // `Scope.AdmitsPath`; `admitsPath_of_append` is the spine property.
     pub fn admits_path(&self, path: &[u8]) -> bool {
+        #[cfg(feature = "verified-lean")]
+        {
+            // LEAN-MODEL: verified-native-path (VerifiedCoreProofs.exported_path_correct)
+            self.native.admits_path(path)
+        }
+        #[cfg(not(feature = "verified-lean"))]
         match &self.prefixes {
             None => true,
             Some(prefixes) => {
@@ -95,6 +122,11 @@ impl Scope {
     // `Scope.ContainsSubtree`; `containsSubtree_append` is the stop-at-the-
     // boundary property.
     pub fn contains_subtree(&self, path: &[u8]) -> bool {
+        #[cfg(feature = "verified-lean")]
+        {
+            self.native.contains_subtree(path)
+        }
+        #[cfg(not(feature = "verified-lean"))]
         match &self.prefixes {
             None => true,
             Some(prefixes) => prefixes.iter().any(|p| path.starts_with(p.as_slice())),
@@ -103,7 +135,14 @@ impl Scope {
 
     /// True if a key, given as a full nibble path, lies inside this scope.
     pub(crate) fn admits_key_path(&self, key: &[u8]) -> bool {
-        self.contains_subtree(key) || self.exact.iter().any(|k| k == key)
+        #[cfg(feature = "verified-lean")]
+        {
+            self.native.admits_key(key)
+        }
+        #[cfg(not(feature = "verified-lean"))]
+        {
+            self.contains_subtree(key) || self.exact.iter().any(|k| k == key)
+        }
     }
 
     /// True if a node at `path` may be served whole, given what it reveals.
@@ -122,30 +161,38 @@ impl Scope {
     // `ScopedSync.AdmitsNode`; `no_redaction_inside_grant` is why a position
     // inside a granted prefix is never refused.
     pub fn admits_node(&self, path: &[u8], node: &crate::node::TrieNode) -> bool {
-        if self.is_full() {
-            return true;
+        #[cfg(feature = "verified-lean")]
+        {
+            // LEAN-MODEL: verified-native-node (VerifiedCoreProofs.exported_node_correct)
+            self.native.admits_node(path, Self::native_shape(node))
         }
-        match node {
-            // A branch's child hashes are the spine itself, and one may lead
-            // into the grant — refusing the node whole over its value costs
-            // the peer every subtree below it. Only an `Inline` value forces
-            // that: its bytes are in the node, so it cannot travel. A `Hash`
-            // value contributes only a hash, like every redacted child; the
-            // payload is refused separately when the peer asks.
-            crate::node::TrieNode::Branch { value, .. } => match value {
-                None => true,
-                Some(crate::node::ValueRef::Hash(_)) => true,
-                Some(crate::node::ValueRef::Inline(_)) => self.admits_key_path(path),
-            },
-            crate::node::TrieNode::Ext { prefix, .. } => {
-                let mut covered = path.to_vec();
-                covered.extend_from_slice(prefix.as_slice());
-                self.admits_path(&covered)
+        #[cfg(not(feature = "verified-lean"))]
+        {
+            if self.is_full() {
+                return true;
             }
-            crate::node::TrieNode::Leaf { key_rest, .. } => {
-                let mut key = path.to_vec();
-                key.extend_from_slice(key_rest.as_slice());
-                self.admits_key_path(&key)
+            match node {
+                // A branch's child hashes are the spine itself, and one may lead
+                // into the grant — refusing the node whole over its value costs
+                // the peer every subtree below it. Only an `Inline` value forces
+                // that: its bytes are in the node, so it cannot travel. A `Hash`
+                // value contributes only a hash, like every redacted child; the
+                // payload is refused separately when the peer asks.
+                crate::node::TrieNode::Branch { value, .. } => match value {
+                    None => true,
+                    Some(crate::node::ValueRef::Hash(_)) => true,
+                    Some(crate::node::ValueRef::Inline(_)) => self.admits_key_path(path),
+                },
+                crate::node::TrieNode::Ext { prefix, .. } => {
+                    let mut covered = path.to_vec();
+                    covered.extend_from_slice(prefix.as_slice());
+                    self.admits_path(&covered)
+                }
+                crate::node::TrieNode::Leaf { key_rest, .. } => {
+                    let mut key = path.to_vec();
+                    key.extend_from_slice(key_rest.as_slice());
+                    self.admits_key_path(&key)
+                }
             }
         }
     }
@@ -153,6 +200,12 @@ impl Scope {
     /// Whether the value carried by a node belongs to a granted key. A branch
     /// may travel on the spine without granting the value at the branch itself.
     pub fn admits_value(&self, path: &[u8], node: &crate::node::TrieNode) -> bool {
+        #[cfg(feature = "verified-lean")]
+        {
+            // LEAN-MODEL: verified-native-value (VerifiedCoreProofs.exported_value_correct)
+            self.native.admits_value(path, Self::native_shape(node))
+        }
+        #[cfg(not(feature = "verified-lean"))]
         match node {
             crate::node::TrieNode::Leaf { key_rest, .. } => {
                 let mut key = path.to_vec();
@@ -161,6 +214,18 @@ impl Scope {
             }
             crate::node::TrieNode::Branch { .. } => self.admits_key_path(path),
             crate::node::TrieNode::Ext { .. } => false,
+        }
+    }
+
+    #[cfg(feature = "verified-lean")]
+    fn native_shape(node: &crate::node::TrieNode) -> synch_verified::Shape<'_> {
+        use crate::node::{TrieNode, ValueRef};
+        match node {
+            TrieNode::Branch { value, .. } => synch_verified::Shape::Branch {
+                inline_value: matches!(value, Some(ValueRef::Inline(_))),
+            },
+            TrieNode::Ext { prefix, .. } => synch_verified::Shape::Extension(prefix.as_slice()),
+            TrieNode::Leaf { key_rest, .. } => synch_verified::Shape::Leaf(key_rest.as_slice()),
         }
     }
 

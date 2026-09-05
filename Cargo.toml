@@ -24,6 +24,7 @@ print_stdout = "allow"
 [workspace.dependencies]
 synch-core = { path = "crates/synch-core", version = "0.1.0" }
 synch-mpt = { path = "crates/synch-mpt", version = "0.1.0" }
+synch-verified = { path = "crates/synch-verified", version = "0.1.0" }
 synch-store = { path = "crates/synch-store", version = "0.1.0" }
 synch-net = { path = "crates/synch-net", version = "0.1.0" }
 synch-cc = { path = "crates/synch-cc", version = "0.1.0" }

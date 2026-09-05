@@ -38,6 +38,12 @@ jobs:
         with:
           components: clippy
       - uses: Swatinem/rust-cache@v2
+      - uses: leanprover/lean-action@v1
+        with:
+          lake-package-directory: crates/synch-verified/lean
+          build: true
+          build-args: --wfail
+          test: false
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo clippy --workspace --all-features --all-targets -- -D warnings
       # And the configuration that actually ships. synch-net dev-depends on
@@ -69,9 +75,10 @@ jobs:
       # --no-fail-fast reports every platform's failures in one round-trip.
       # synch-engine is split into `test-engine` below: its real-network,
       # real-clock integration tests alone outrun the rest of the workspace.
-      # `--all-features` is a strict superset of a default-features run here —
-      # optional features are all purely additive — so there's no separate one.
-      - run: cargo test --workspace --all-features --all-targets --no-fail-fast --exclude synch-engine
+      # Portable features explicitly: verified-lean is a native Linux GNU
+      # integration milestone, tested separately below. Never silently select
+      # a Rust fallback when someone explicitly requests the Lean backend.
+      - run: cargo test --workspace --features synch-mpt/proofs,synch-net/sim,synch-store/test-utils,synch-monitor/testsupport --all-targets --no-fail-fast --exclude synch-engine
       - run: cargo test --workspace --doc --no-fail-fast --exclude synch-engine
       # `--lib --bins` resolves synch-net's `sim` dev-feature off, testing the
       # configuration that actually ships (the run above resolves it on).
@@ -123,6 +130,33 @@ jobs:
       - run: cargo check --target x86_64-unknown-linux-musl --bin synch --bin synch-s3 --bin synch-monitor
         env:
           CC_x86_64_unknown_linux_musl: musl-gcc
+
+  verified-core:
+    name: statically linked Lean core
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: verified-lean
+      - uses: leanprover/lean-action@v1
+        with:
+          lake-package-directory: crates/synch-verified/lean
+          build: true
+          build-args: --wfail
+          test: false
+      - run: cargo test -p synch-verified -p synch-mpt -p synch-store --features synch-store/verified-lean --all-targets
+      - run: cargo test -p synch-engine --features synch-store/verified-lean --test delegation --test convergence --test trust_boundaries --test replication
+      - run: cargo run --release -p synch-verified --features native --example decisions
+      - name: Verify Lean has no dynamic runtime dependency
+        run: |
+          ldd target/release/examples/decisions
+          if ldd target/release/examples/decisions | grep -E 'liblean|libInit|libc\+\+|libgmp|libuv'; then
+            echo '::error::Lean runtime dependency was not statically linked'
+            exit 1
+          fi
 
   cloud-providers:
     name: cloud CAS providers

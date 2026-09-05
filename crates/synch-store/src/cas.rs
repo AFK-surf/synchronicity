@@ -420,6 +420,7 @@ impl BlobRow {
 ///
 /// Taken as three loose values rather than off a [`BlobRow`] so that the commit
 /// path can ask the question of a row it read *inside* its own transaction.
+#[cfg(not(feature = "verified-lean"))]
 fn size_is_attested(size: u64, complete: bool, held: &ChunkRanges) -> bool {
     // LEAN-MODEL: cas-size-attested (Cas.Attested)
     // `Cas.Attested` is this predicate: complete, or the final group held.
@@ -442,7 +443,7 @@ pub(crate) struct Settlement {
 ///
 /// Three answers, and the order matters:
 ///
-/// 1. A size the disk attests to ([`size_is_attested`]) is a fact, and a writer
+/// 1. A size the disk attests to (complete or final-group-held) is a fact, and a writer
 ///    offering a different one is offering bytes for some other object: refused.
 /// 2. A size no group attests to is a peer's claim off an entry, and yields to
 ///    this writer's — that is what keeps an overstated entry from bricking an
@@ -482,32 +483,59 @@ pub(crate) fn settle_size(
     // LEAN-MODEL: cas-size-settlement (Cas.Settles)
     // `Cas.Settles` is this decision as the guard on every groups commit: no
     // row, or the recorded size, or a size neither durable nor attested.
-    let settled = |size| {
+    #[cfg(feature = "verified-lean")]
+    {
+        let (row, recorded, complete, durable, final_held) = match existing {
+            None => (false, 0, false, false, false),
+            Some((recorded, complete, durable, held)) => (
+                true,
+                recorded,
+                complete,
+                durable,
+                held.contains(synch_verified::group_count(recorded) - 1),
+            ),
+        };
+        // LEAN-MODEL: verified-size-settlement (VerifiedCoreProofs.settlement_refines_model)
+        match synch_verified::settle_size(row, durable, complete, final_held, recorded, claimed) {
+            synch_verified::Settlement::Refuse => Err(StoreError::Verification {
+                root: *root,
+                reason: format!("size mismatch: have {recorded}, offered {claimed}"),
+            }),
+            decision => Ok(Settlement {
+                size: claimed,
+                reset_held: decision == synch_verified::Settlement::Reset,
+            }),
+        }
+    }
+    #[cfg(not(feature = "verified-lean"))]
+    {
+        let settled = |size| {
+            Ok(Settlement {
+                size,
+                reset_held: false,
+            })
+        };
+        let Some((recorded, complete, durable, held)) = existing else {
+            return settled(claimed);
+        };
+        if recorded == claimed {
+            return settled(recorded);
+        }
+        if durable || size_is_attested(recorded, complete, held) {
+            // LEAN-MODEL: cas-size-refusal (Cas.settled_size_is_stable)
+            // `Cas.settled_size_is_stable` is what this refusal buys: no step of
+            // the model leaves a row standing under a different size once its
+            // size is durable or attested.
+            return Err(StoreError::Verification {
+                root: *root,
+                reason: format!("size mismatch: have {recorded}, offered {claimed}"),
+            });
+        }
         Ok(Settlement {
-            size,
-            reset_held: false,
+            size: claimed,
+            reset_held: group_count(claimed) != group_count(recorded),
         })
-    };
-    let Some((recorded, complete, durable, held)) = existing else {
-        return settled(claimed);
-    };
-    if recorded == claimed {
-        return settled(recorded);
     }
-    if durable || size_is_attested(recorded, complete, held) {
-        // LEAN-MODEL: cas-size-refusal (Cas.settled_size_is_stable)
-        // `Cas.settled_size_is_stable` is what this refusal buys: no step of
-        // the model leaves a row standing under a different size once its
-        // size is durable or attested.
-        return Err(StoreError::Verification {
-            root: *root,
-            reason: format!("size mismatch: have {recorded}, offered {claimed}"),
-        });
-    }
-    Ok(Settlement {
-        size: claimed,
-        reset_held: group_count(claimed) != group_count(recorded),
-    })
 }
 
 /// What a bitmap commit settled.
@@ -990,7 +1018,7 @@ impl Store {
     /// The one place a file in the CAS is ever made smaller, and it runs only
     /// after a commit that *completed* the object — at which point the final
     /// group is held and the size is a fact rather than a claim
-    /// ([`size_is_attested`]). What it cleans up is the overstatement
+    /// (the attestation predicate). What it cleans up is the overstatement
     /// case: an entry claimed a few bytes more than the object has, the sparse
     /// payload was grown to fit the claim, and the honest writer that finished
     /// the object replaced it. Best effort — a payload left long costs disk,

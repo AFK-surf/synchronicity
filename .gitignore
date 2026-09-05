@@ -1,3 +1,4 @@
 /target
 /specs/lean/.lake/
+/crates/synch-verified/lean/.lake/
 /.claude/worktrees/

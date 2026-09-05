@@ -1,0 +1,27 @@
+[package]
+name = "synch-verified"
+description = "Narrow Rust adapter to the statically linked, proved Lean decision core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+authors.workspace = true
+links = "synch_verified_lean"
+
+[features]
+default = []
+native = []
+
+[build-dependencies]
+cc = "1.4.2"
+
+[dev-dependencies]
+proptest.workspace = true
+
+[lints]
+workspace = true
+
+[[example]]
+name = "decisions"
+required-features = ["native"]

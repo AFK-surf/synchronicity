@@ -14,3 +14,4 @@ import Synchronicity.TrieGraph
 import Synchronicity.Completeness
 import Synchronicity.Materialization
 import Synchronicity.Ingestion
+import Synchronicity.VerifiedCoreProofs
