@@ -15,7 +15,7 @@
  * Landlock ruleset confines filesystem access to that directory (plus
  * /dev/urandom, which SQLite reads for randomness), then a seccomp
  * allowlist reduces the kernel surface to stdio + file I/O + memory;
- * Without the
+ * on OpenBSD the same shape via unveil(2) + pledge(2). Without the
  * argument the filesystem stays unconfined (a warning says so) but the
  * syscall filter still applies. OPEN/RESET are not re-checked in
  * userland: the kernel is the authority, and an out-of-directory path
@@ -98,8 +98,8 @@ _Static_assert(sizeof(size_t) >= 8, "csqlite assumes a 64-bit size_t");
  * best-effort-with-a-loud-warning rather than fatal, because a worker
  * that cannot start at all is an outage while a worker missing one
  * defense layer still has the others (and the message lands in the
- * journal, where it is not ignorable). Platforms other than Linux
- * get no confinement; the port still runs.
+ * journal, where it is not ignorable). Platforms other than Linux and
+ * OpenBSD get no confinement; the port still runs.
  */
 
 #if defined(__linux__)
@@ -488,6 +488,31 @@ static void sandbox(const char *datadir) {
           stderr);
   /* Last: the landlock setup above needs syscalls the filter denies. */
   confine_syscalls();
+}
+
+#elif defined(__OpenBSD__)
+
+static void sandbox(const char *datadir) {
+  if (datadir) {
+    if (unveil(datadir, "rwc") != 0)
+      fprintf(stderr, "csqlite: unveil %s: %s\n", datadir, strerror(errno));
+    /* Best-effort, as on Linux: absent /dev/urandom degrades SQLite's
+     * randomness source, it does not stop the worker. */
+    if (unveil("/dev/urandom", "r") != 0)
+      fprintf(stderr, "csqlite: unveil /dev/urandom: %s\n", strerror(errno));
+    if (unveil(NULL, NULL) != 0)
+      fprintf(stderr, "csqlite: unveil lock: %s\n", strerror(errno));
+  } else {
+    fputs("csqlite: no data directory argument; filesystem unconfined\n",
+          stderr);
+  }
+  /* stdio: frames, mmap, ftruncate, nanosleep. rpath/wpath/cpath: the
+   * database and its journal/WAL siblings. flock: SQLite's POSIX
+   * locks. fattr: journal/WAL fchmod-to-match-the-database. No chown
+   * promise: SQLite only fchowns journals when running as root, which
+   * this service never is. */
+  if (pledge("stdio rpath wpath cpath flock fattr", NULL) != 0)
+    fprintf(stderr, "csqlite: pledge: %s\n", strerror(errno));
 }
 
 #else

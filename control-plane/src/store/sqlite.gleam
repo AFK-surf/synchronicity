@@ -31,7 +31,7 @@ fn port_open(exe: String, args: List(String)) -> Result(Port, Nil)
 
 /// The directory part of the database path, handed to csqlite as its
 /// one argument so the worker can confine its filesystem access
-/// (Landlock on Linux) before reading any frames.
+/// (Landlock on Linux, unveil on OpenBSD) before reading any frames.
 @external(erlang, "filename", "dirname")
 fn dirname(path: String) -> String
 

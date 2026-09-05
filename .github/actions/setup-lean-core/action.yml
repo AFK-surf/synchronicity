@@ -10,16 +10,25 @@ runs:
         build-args: --wfail
         test: false
     - if: runner.os == 'Windows'
+      id: msys2
       uses: msys2/setup-msys2@v2
       with:
         msystem: CLANG64
         install: mingw-w64-clang-x86_64-toolchain
     - if: runner.os == 'Windows'
-      shell: bash
+      shell: pwsh
+      env:
+        MSYS_ROOT: ${{ steps.msys2.outputs.msys2-location }}
       run: |
         rustup target add x86_64-pc-windows-gnullvm
-        echo 'CARGO_BUILD_TARGET=x86_64-pc-windows-gnullvm' >> "$GITHUB_ENV"
-        echo 'CARGO_TARGET_X86_64_PC_WINDOWS_GNULLVM_LINKER=C:/msys64/clang64/bin/clang.exe' >> "$GITHUB_ENV"
-        echo 'CC_x86_64_pc_windows_gnullvm=C:/msys64/clang64/bin/clang.exe' >> "$GITHUB_ENV"
-        echo 'AR_x86_64_pc_windows_gnullvm=C:/msys64/clang64/bin/llvm-ar.exe' >> "$GITHUB_ENV"
-        echo 'C:/msys64/clang64/bin' >> "$GITHUB_PATH"
+        if ($LASTEXITCODE -ne 0) { throw 'Rust target installation failed' }
+        $bin = (Join-Path $env:MSYS_ROOT 'clang64/bin').Replace('\', '/')
+        if (!(Test-Path "$bin/clang.exe")) { throw "Missing CLANG64 compiler at $bin" }
+        "CARGO_BUILD_TARGET=x86_64-pc-windows-gnullvm" >> $env:GITHUB_ENV
+        "CARGO_TARGET_X86_64_PC_WINDOWS_GNULLVM_LINKER=$bin/clang.exe" >> $env:GITHUB_ENV
+        "CC_x86_64_pc_windows_gnullvm=$bin/clang.exe" >> $env:GITHUB_ENV
+        "AR_x86_64_pc_windows_gnullvm=$bin/llvm-ar.exe" >> $env:GITHUB_ENV
+        "$bin" >> $env:GITHUB_PATH
+    - if: runner.os == 'Windows'
+      shell: pwsh
+      run: cargo test -p synch-verified --lib --tests

@@ -75,18 +75,6 @@ dependencies = [
 ]
 
 [[package]]
-name = "ahash"
-version = "0.8.12"
-source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5a15f179cd60c4584b8a8c596927aadc462e27f2ca70c04e0071964a73ba7a75"
-dependencies = [
- "cfg-if",
- "once_cell",
- "version_check",
- "zerocopy",
-]
-
-[[package]]
 name = "aho-corasick"
 version = "1.1.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -160,9 +148,9 @@ checksum = "d3fb67a6e08acf24fdeccbac2cb6ac4305825bd1f117462e0e6f2f193345ad56"
 
 [[package]]
 name = "async-ebpf"
-version = "0.4.0-alpha.14"
+version = "0.4.0-alpha.12"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "4bb66670ccf1f1cd2ee65901c254f0fa9b3387594331ae8b65dd7c904b62d863"
+checksum = "a3d91a6a83d8d36bdd84bd914763528f69446e04f198d7dd48aa2f2969ca4844"
 dependencies = [
  "cfg-if",
  "elf",
@@ -1566,8 +1554,14 @@ name = "hashbrown"
 version = "0.14.5"
 source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "e5274423e17b7c9fc20b6e7e208532f9b19825d82dfd615708b70edd83df41f1"
+
+[[package]]
+name = "hashbrown"
+version = "0.16.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "841d1cc9bed7f9236f321df977030373f4a4163ae1a7dbfe1a51a2c1a51d9100"
 dependencies = [
- "ahash",
+ "foldhash",
 ]
 
 [[package]]
@@ -1583,11 +1577,11 @@ dependencies = [
 
 [[package]]
 name = "hashlink"
-version = "0.9.1"
+version = "0.12.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "6ba4ff7128dee98c7dc9794b6a411377e1404dba1c97deb8d1a55297bd25d8af"
+checksum = "32069d97bb81e38fa67eab65e3393bf804bb85969f2bc06bf13f64aef5aba248"
 dependencies = [
- "hashbrown 0.14.5",
+ "hashbrown 0.17.1",
 ]
 
 [[package]]
@@ -2428,9 +2422,9 @@ checksum = "b6d2cec3eae94f9f509c767b45932f1ada8350c4bdb85af2fcab4a3c14807981"
 
 [[package]]
 name = "libsqlite3-sys"
-version = "0.28.0"
+version = "0.38.2"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "0c10584274047cb335c23d3e61bcef8e323adae7c5c8c760540f73610177fc3f"
+checksum = "f1d20bef17f513b9b3004532233187769cd072d790971f4e4da0e346eb6401e8"
 dependencies = [
  "cc",
  "pkg-config",
@@ -4145,10 +4139,20 @@ dependencies = [
 ]
 
 [[package]]
-name = "rusqlite"
-version = "0.31.0"
+name = "rsqlite-vfs"
+version = "0.1.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "b838eba278d213a8beaf485bd313fd580ca4505a00d5871caeb1457c55322cae"
+checksum = "c51c9ae4df8a7fba42103df5c621fa3c37eccf3a3c650879e90fc48b11cc192c"
+dependencies = [
+ "hashbrown 0.16.1",
+ "thiserror 2.0.20",
+]
+
+[[package]]
+name = "rusqlite"
+version = "0.40.2"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "23f2a97da3e3873c73cb2a2e71b35c40ff95e0b1eefa8d72d8499a6928c3b5b3"
 dependencies = [
  "bitflags 2.13.1",
  "fallible-iterator",
@@ -4156,6 +4160,7 @@ dependencies = [
  "hashlink",
  "libsqlite3-sys",
  "smallvec",
+ "sqlite-wasm-rs",
 ]
 
 [[package]]
@@ -4825,6 +4830,18 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3a0219bd7d979d58245a4f41f695e1ac9f8befdffadd7f61f1bae9e39abc6620"
 
 [[package]]
+name = "sqlite-wasm-rs"
+version = "0.5.5"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "dc3efc0da82635d7e1ced0053bbbfa8c7ab9645d0bf36ceb4f7127bb85315d75"
+dependencies = [
+ "cc",
+ "js-sys",
+ "rsqlite-vfs",
+ "wasm-bindgen",
+]
+
+[[package]]
 name = "ssh-cipher"
 version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -4969,7 +4986,7 @@ dependencies = [
 
 [[package]]
 name = "synch-core"
-version = "0.1.8"
+version = "0.1.7"
 dependencies = [
  "blake3",
  "hex",
@@ -4977,7 +4994,6 @@ dependencies = [
  "postcard",
  "serde",
  "serde_json",
- "synch-verified",
  "thiserror 2.0.20",
  "tokio",
  "unicode-normalization",
@@ -4986,19 +5002,18 @@ dependencies = [
 
 [[package]]
 name = "synch-mpt"
-version = "0.1.8"
+version = "0.1.7"
 dependencies = [
  "blake3",
  "postcard",
  "serde",
  "synch-core",
- "synch-verified",
  "thiserror 2.0.20",
 ]
 
 [[package]]
 name = "synch-net"
-version = "0.1.8"
+version = "0.1.7"
 dependencies = [
  "async-trait",
  "aws-lc-rs",
@@ -5030,7 +5045,7 @@ dependencies = [
 
 [[package]]
 name = "synch-sock"
-version = "0.1.8"
+version = "0.1.7"
 dependencies = [
  "async-ebpf",
  "async-trait",
@@ -5044,7 +5059,6 @@ dependencies = [
  "rand 0.8.7",
  "russh",
  "russh-sftp",
- "serde_json",
  "synch-core",
  "thiserror 2.0.20",
  "tokio",
@@ -5053,7 +5067,7 @@ dependencies = [
 
 [[package]]
 name = "synch-store"
-version = "0.1.8"
+version = "0.1.7"
 dependencies = [
  "async-trait",
  "bao-tree",
@@ -5069,18 +5083,10 @@ dependencies = [
  "serde",
  "synch-core",
  "synch-mpt",
- "synch-verified",
  "thiserror 2.0.20",
  "tokio",
  "tracing",
  "windows-sys 0.61.2",
-]
-
-[[package]]
-name = "synch-verified"
-version = "0.1.8"
-dependencies = [
- "cc",
 ]
 
 [[package]]

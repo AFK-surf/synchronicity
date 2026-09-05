@@ -7,11 +7,11 @@
 #
 # With CSQLITE_SMOKE_REQUIRE=1, missing enforcement is a failure; CI
 # sets it on platforms whose kernels enforce the sandbox (ubuntu
-# runners ship Landlock).
+# runners ship Landlock; unveil/pledge are unconditional on OpenBSD).
 # Unset, missing enforcement only warns, so the script still passes on
 # dev hosts without Landlock while catching protocol regressions.
 #
-# Perl, core modules only: present on every CI
+# Perl, core modules only: present in OpenBSD base and on every CI
 # image this runs on, so the two platforms share one script.
 #
 # Usage: perl smoke.pl path/to/csqlite
