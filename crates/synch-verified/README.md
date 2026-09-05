@@ -111,6 +111,11 @@ read has an identified position throughout arbitrary finite operation sequences.
 Repeated polling preserves that position, and expansion preserves all work
 already on the frontier. These are intermediate invariants, not yet a proof
 that exhaustion implies complete graph coverage.
+Coverage lemmas additionally show that every admitted target edge is scheduled,
+every position removed by a successful poll is selected or explicitly skipped
+by the reference/seen-set guard, and the native observation export preserves
+the expanded frontier through payload handling and acknowledgement. Soundness
+of those shortcuts across the complete execution is still to be established.
 
 `Store` and `MemStore` use Lean's cache state and epoch guard. Rust owns the
 mutex and supplies byte keys, retained-root inputs, and storage effects; it

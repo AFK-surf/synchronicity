@@ -577,11 +577,127 @@ theorem enqueue_fold_retains (edges : List (Option (List Nat) × List Nat × Lis
   | cons edge rest ih =>
     exact ih _ (enqueue_retains_frontier s edge.1 edge.2.1 edge.2.2 p pending)
 
-/-- The actual exported expansion preserves every previously pending position. -/
+/-- The executable expansion preserves every previously pending position. -/
 theorem expansion_retains_frontier (s : VerifiedCore.MissingWalk)
     (reference node : VerifiedCore.WalkNode) (p : VerifiedCore.WalkPosition)
     (pending : p ∈ s.frontier) : p ∈ (VerifiedCore.walkExpand s reference node).frontier :=
   enqueue_fold_retains _ s p pending
+
+/-- Sibling expansion never changes the scope used to authorize later children. -/
+theorem enqueue_preserves_scope (s : VerifiedCore.MissingWalk)
+    (r : Option (List Nat)) (hash step : List Nat) :
+    (VerifiedCore.enqueueWalk s r hash step).scope = s.scope := by
+  unfold VerifiedCore.enqueueWalk
+  split
+  · rfl
+  · dsimp only
+    split <;> rfl
+
+/-- Every admitted edge in a sibling list is on the resulting frontier. This
+does not assume edge uniqueness or a particular sibling ordering. -/
+theorem enqueue_fold_schedules (edges : List (Option (List Nat) × List Nat × List Nat))
+    (s : VerifiedCore.MissingWalk) (parent : VerifiedCore.WalkPosition)
+    (r : Option (List Nat)) (hash step : List Nat)
+    (current : s.current = some parent)
+    (admitted : VerifiedCore.admitsPath s.scope (parent.path ++ step) = true)
+    (edge : (r, hash, step) ∈ edges) :
+    (⟨r, hash, parent.path ++ step⟩ : VerifiedCore.WalkPosition) ∈
+      (edges.foldl (fun s (r, hash, step) => VerifiedCore.enqueueWalk s r hash step) s).frontier := by
+  induction edges generalizing s with
+  | nil => simp at edge
+  | cons first rest ih =>
+    rcases List.mem_cons.mp edge with same | later
+    · subst first
+      apply enqueue_fold_retains rest (VerifiedCore.enqueueWalk s r hash step)
+      simp [VerifiedCore.enqueueWalk, current, admitted]
+    · apply ih _ (by rw [enqueue_preserves_current, current])
+        (by rw [enqueue_preserves_scope]; exact admitted) later
+
+/-- Actual child expansion schedules every admitted target edge, with exactly
+the reference selected by the executable pairing function. -/
+theorem expansion_schedules_all (s : VerifiedCore.MissingWalk)
+    (parent : VerifiedCore.WalkPosition) (reference node : VerifiedCore.WalkNode)
+    (hash step : List Nat) (current : s.current = some parent)
+    (admitted : VerifiedCore.admitsPath s.scope (parent.path ++ step) = true)
+    (edge : (step, hash) ∈ VerifiedCore.childEdges node) :
+    (⟨if VerifiedCore.compatibleNodes reference node then
+        (VerifiedCore.childEdges reference).lookup step else none,
+      hash, parent.path ++ step⟩ : VerifiedCore.WalkPosition) ∈
+      (VerifiedCore.walkExpand s reference node).frontier := by
+  apply enqueue_fold_schedules _ s parent _ hash step current admitted
+  exact (paired_edges_exact reference node _ hash step).mpr ⟨edge, rfl⟩
+
+/-- Every input position survives a successful poll as pending/selected work,
+unless the exact executable reference or seen-set shortcut justifies skipping it. -/
+theorem poll_frontier_accounts_for_all (scope : VerifiedCore.Scope) (limit : Nat)
+    (seen : Std.TreeSet (List Nat × Option (List Nat)))
+    (frontier : List VerifiedCore.WalkPosition) (p : VerifiedCore.WalkPosition)
+    (healthy : (VerifiedCore.pollFrontier scope limit seen frontier).fault = none)
+    (pending : p ∈ frontier) :
+    p ∈ (VerifiedCore.pollFrontier scope limit seen frontier).rest ∨
+    (VerifiedCore.pollFrontier scope limit seen frontier).current = some p ∨
+    (p.reference == some p.hash || seen.contains (VerifiedCore.walkVisit scope p)) = true := by
+  induction frontier with
+  | nil => simp at pending
+  | cons q rest ih =>
+    simp only [VerifiedCore.pollFrontier] at healthy ⊢
+    by_cases deep : q.path.length > limit
+    · simp [deep] at healthy
+    · simp only [if_neg deep] at healthy ⊢
+      by_cases skipped : (q.reference == some q.hash || seen.contains (VerifiedCore.walkVisit scope q)) = true
+      · simp only [if_pos skipped] at healthy ⊢
+        rcases List.mem_cons.mp pending with rfl | later
+        · exact Or.inr (Or.inr skipped)
+        · exact ih healthy later
+      · simp only [if_neg skipped] at healthy ⊢
+        rcases List.mem_cons.mp pending with rfl | later
+        · exact Or.inr (Or.inl rfl)
+        · exact Or.inl later
+
+/-- A drained successful poll skipped every original position by an explicit
+reference-equality or seen-set shortcut; none disappeared silently. -/
+theorem drained_frontier_shortcuts (scope : VerifiedCore.Scope) (limit : Nat)
+    (seen : Std.TreeSet (List Nat × Option (List Nat)))
+    (frontier : List VerifiedCore.WalkPosition)
+    (healthy : (VerifiedCore.pollFrontier scope limit seen frontier).fault = none)
+    (drained : (VerifiedCore.pollFrontier scope limit seen frontier).rest = [])
+    (idle : (VerifiedCore.pollFrontier scope limit seen frontier).current = none)
+    (p : VerifiedCore.WalkPosition) (pending : p ∈ frontier) :
+    (p.reference == some p.hash || seen.contains (VerifiedCore.walkVisit scope p)) = true := by
+  have accounted := poll_frontier_accounts_for_all scope limit seen frontier p healthy pending
+  simpa [drained, idle] using accounted
+
+/-- Payload request/deferral bookkeeping cannot discard scheduled children. -/
+theorem payload_preserves_frontier (s : VerifiedCore.MissingWalk)
+    (node : VerifiedCore.WalkNode) (payload : Option (List Nat)) (present : Bool) :
+    (VerifiedCore.observePayload s node payload present).frontier = s.frontier := by
+  unfold VerifiedCore.observePayload
+  split
+  · rfl
+  · split
+    · rfl
+    · split
+      · simp [VerifiedCore.deferWalk, *]
+      · rfl
+
+/-- The successful native observation export has exactly the expanded frontier:
+neither payload handling nor acknowledgement can silently remove children. -/
+theorem present_export_frontier (s : VerifiedCore.MissingWalk)
+    (reference node : VerifiedCore.WalkNode) (childShape : UInt8)
+    (payload : ByteArray) (present : Bool) (healthy : s.fault = none)
+    (pending : s.awaiting = true)
+    (valid : (VerifiedCore.validateWalk { s with requestKind := 0 } node childShape).fault = none) :
+    (VerifiedCore.walkPresent s reference node childShape payload present).frontier =
+      (VerifiedCore.expandWalk (VerifiedCore.validateWalk { s with requestKind := 0 } node childShape)
+        reference node).frontier := by
+  unfold VerifiedCore.walkPresent VerifiedCore.finishObservation
+  rw [if_neg (by simp [healthy]), if_pos pending]
+  change (VerifiedCore.observePresent s reference node childShape _ present).frontier = _
+  unfold VerifiedCore.observePresent
+  rw [if_neg (by simp [healthy])]
+  dsimp only
+  rw [if_neg (by simp only [valid, Option.isSome_none, Bool.false_eq_true, not_false_eq_true])]
+  exact payload_preserves_frontier _ _ _ _
 
 /-- A protocol state cannot claim a pending read without identifying its position. -/
 def ReadIdentified (s : VerifiedCore.MissingWalk) : Prop :=
