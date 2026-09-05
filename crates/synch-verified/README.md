@@ -99,6 +99,14 @@ sticky; neither polling, resuming nor later observations can clear them.
 Proofs cover refusals inside grants, refused spines, shared-payload deferral,
 authorization, leaf depth, pending extension obligations and fault persistence.
 
+Lean also enforces the observation sequence. A selected read remains pending
+until an absent/present observation acknowledges it. Poll and resume preserve
+that read across I/O or decoding failures; pending reads prohibit exhaustion.
+Unsolicited or duplicate observations fail closed. The Rust API exposes only
+poll, observations, resume and batch reset, not independent frontier/seen-set
+or obligation mutations. Native and Rust-adapter fault-injection tests exercise
+this protocol; the complete graph-coverage invariant is still pending.
+
 `Store` and `MemStore` use Lean's cache state and epoch guard. Rust owns the
 mutex and supplies byte keys, retained-root inputs, and storage effects; it
 does not update generations, decide retention, or implement certification.
@@ -152,7 +160,8 @@ not a manually reviewed correspondence between Rust and an abstract model.
 The following are still required:
 
 - Prove completeness of the executable trie walk across its storage-observation
-  protocol, including interruption/error handling and reference validity. Its
+  protocol, including graph coverage and reference validity. Interruption and
+  response-sequencing guards are now enforced and proved in Lean. Its
   scheduling, child pairing, walk canonicality and payload/boundary decisions
   are now Lean; the cache still trusts a completed walk's validity. Other trie
   operations and ingestion-time canonical encoding checks also remain Rust.

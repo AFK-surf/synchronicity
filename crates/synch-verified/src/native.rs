@@ -36,11 +36,6 @@ unsafe extern "C" {
         prefix: Slice,
         child: Slice,
     ) -> *mut c_void;
-    fn synch_adapter_walk_expand(
-        walk: *mut c_void,
-        reference: *mut c_void,
-        node: *mut c_void,
-    ) -> *mut c_void;
     fn synch_adapter_walk_new(
         scope: *mut c_void,
         reference: Slice,
@@ -169,6 +164,7 @@ pub struct MissingWalk(Arc<Handle>);
 /// Canonicality diagnostic emitted by Lean; the walk remains failed afterward.
 #[derive(Debug, PartialEq, Eq)]
 pub enum WalkError {
+    UnexpectedObservation,
     NodeDepth(u64),
     ValueDepth(u64),
     NotBranch([u8; 32]),
@@ -286,21 +282,9 @@ impl MissingWalk {
             0 => WalkError::NodeDepth(self.query(2, &[])),
             1 => WalkError::ValueDepth(self.query(2, &[])),
             2 => WalkError::NotBranch(self.field(3).try_into().expect("Lean fault hash width")),
+            3 => WalkError::UnexpectedObservation,
             _ => panic!("invalid Lean walk error tag"),
         })
-    }
-    /// Pair reference edges and schedule admitted children in the Lean implementation.
-    pub fn expand(&mut self, reference: WalkNode<'_>, node: WalkNode<'_>) {
-        let reference = reference.native();
-        let node = node.native();
-        // SAFETY: all three handles remain live; the adapter consumes fresh
-        // references and returns an independently owned MT walk state.
-        let ptr = unsafe {
-            synch_adapter_walk_expand(self.0 .0.as_ptr(), reference.0.as_ptr(), node.0.as_ptr())
-        };
-        self.0 = Arc::new(Handle(
-            NonNull::new(ptr).expect("Lean walk allocation failed"),
-        ));
     }
     /// Empty hashes are represented by `None`, never by a malformed short hash.
     pub fn new(
@@ -396,30 +380,6 @@ impl MissingWalk {
     /// Reset payload request deduplication at a batch boundary.
     pub fn start_batch(&mut self) {
         self.update(3, &[], &[], &[]);
-    }
-    /// Defer the current position after an absent node or payload.
-    pub fn defer(&mut self) {
-        self.update(1, &[], &[], &[]);
-    }
-    /// Extend the current path and schedule the child only if Lean admits it.
-    pub fn enqueue(&mut self, reference: Option<&[u8; 32]>, hash: &[u8; 32], step: &[u8]) {
-        self.update(4, reference.map_or(&[][..], |h| h.as_slice()), hash, step);
-    }
-    /// Require a future extension child to be a branch.
-    pub fn require_branch(&mut self, hash: &[u8; 32]) {
-        self.update(5, &[], hash, &[]);
-    }
-    /// Discharge a shape obligation, returning whether it existed.
-    pub fn take_branch_requirement(&mut self, hash: &[u8; 32]) -> bool {
-        let required = self.query(3, hash) != 0;
-        self.update(6, &[], hash, &[]);
-        required
-    }
-    /// Remember a payload request and report whether it is new in this batch.
-    pub fn ask(&mut self, hash: &[u8; 32]) -> bool {
-        let fresh = self.query(4, hash) != 0;
-        self.update(7, &[], hash, &[]);
-        fresh
     }
 }
 

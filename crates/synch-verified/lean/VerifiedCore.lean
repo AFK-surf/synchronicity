@@ -240,6 +240,8 @@ structure MissingWalk where
   current : Option WalkPosition := none
   /-- A canonicality failure is sticky, including across resume. -/
   fault : Option Nat := none
+  /-- A selected read must receive an observation before another read is selected. -/
+  awaiting : Bool := false
   /-- Error interpretation: node depth, value depth, or non-branch extension child. -/
   faultKind : UInt8 := 0
   /-- Offending hash for a shape error. -/
@@ -251,9 +253,10 @@ structure MissingWalk where
 
 /-- Select a storage read, recording its deduplication key exactly once. -/
 def pollWalk (s : MissingWalk) : MissingWalk :=
-  if s.fault.isSome then s else
+  if s.fault.isSome || s.awaiting then s else
     let polled := pollFrontier s.scope s.maxDepth s.seen s.frontier
     { s with frontier := polled.rest, current := polled.current, fault := polled.fault
+             awaiting := polled.current.isSome
              seen := match polled.current with
                | none => s.seen
                | some p => s.seen.insert (walkVisit s.scope p) }
@@ -266,7 +269,7 @@ def deferWalk (s : MissingWalk) : MissingWalk :=
 
 /-- Resume without restarting from the root. Other completed visits remain seen. -/
 def resumeWalk (s : MissingWalk) : MissingWalk :=
-  { s with frontier := s.deferred ++ s.frontier, deferred := [], current := none
+  { s with frontier := s.deferred ++ s.frontier, deferred := []
            seen := s.deferred.foldl (fun seen p => seen.erase (walkVisit s.scope p)) s.seen }
 
 /-- Push a child only at an admitted position; the absolute path is built here. -/
@@ -287,10 +290,10 @@ def walkNew (scope : Scope) (reference root : ByteArray) (maxDepth : UInt64) : M
     frontier := if root.isEmpty || !admitsPath scope [] then [] else
       [⟨if reference.isEmpty then none else some (pathOf reference), pathOf root, []⟩] }
 
-/-- The current state can be exhausted only without deferred work or a fault. -/
+/-- Exhaustion requires no frontier, deferred work, pending read or fault. -/
 @[export synch_lean_walk_exhausted]
 def walkExhausted (s : MissingWalk) : Bool :=
-  s.frontier.isEmpty && s.deferred.isEmpty && s.fault.isNone
+  s.frontier.isEmpty && s.deferred.isEmpty && s.fault.isNone && !s.awaiting
 
 /-- Exported polling transition. -/
 @[export synch_lean_walk_poll]
@@ -316,7 +319,6 @@ def walkField (s : MissingWalk) (field : UInt8) : ByteArray :=
 def walkDepth (s : MissingWalk) : UInt64 := UInt64.ofNat (s.fault.getD 0)
 
 /-- Exported defer transition. -/
-@[export synch_lean_walk_defer]
 def walkDefer (s : MissingWalk) : MissingWalk := deferWalk s
 
 /-- Exported resume transition. -/
@@ -328,28 +330,23 @@ def walkResume (s : MissingWalk) : MissingWalk := resumeWalk s
 def walkBatch (s : MissingWalk) : MissingWalk := { s with asked := {} }
 
 /-- Export child-path construction and authorization. -/
-@[export synch_lean_walk_enqueue]
 def walkEnqueue (s : MissingWalk) (reference hash step : ByteArray) : MissingWalk :=
   enqueueWalk s (if reference.isEmpty then none else some (pathOf reference))
     (pathOf hash) (pathOf step)
 
 /-- Test whether a future extension child has a pending shape obligation. -/
-@[export synch_lean_walk_requires_branch]
 def walkRequiresBranch (s : MissingWalk) (hash : ByteArray) : Bool :=
   s.branches.contains (pathOf hash)
 
 /-- Set or discharge an extension-child shape obligation. -/
-@[export synch_lean_walk_branch]
 def walkBranch (s : MissingWalk) (hash : ByteArray) (required : Bool) : MissingWalk :=
   { s with branches := if required then s.branches.insert (pathOf hash)
                       else s.branches.erase (pathOf hash) }
 
 /-- Whether a payload would be a new request within this batch. -/
-@[export synch_lean_walk_unasked]
 def walkUnasked (s : MissingWalk) (hash : ByteArray) : Bool := !s.asked.contains (pathOf hash)
 
 /-- Remember a payload request for this batch, independently of deferral. -/
-@[export synch_lean_walk_ask]
 def walkAsk (s : MissingWalk) (hash : ByteArray) : MissingWalk :=
   { s with asked := s.asked.insert (pathOf hash) }
 
@@ -393,7 +390,6 @@ def walkNode (tag : UInt8) (children : Array ByteArray) (segment child : ByteArr
   else .leaf (pathOf segment)
 
 /-- Production expansion export consumes decoded structural nodes. -/
-@[export synch_lean_walk_expand]
 def walkExpand (s : MissingWalk) (reference node : WalkNode) : MissingWalk :=
   expandWalk s reference node
 
@@ -461,16 +457,23 @@ def observePresent (s : MissingWalk) (reference node : WalkNode) (childShape : U
   if checked.fault.isSome then checked else
     observePayload (expandWalk checked reference node) node payload present
 
-/-- Export a positional refusal observation. -/
+/-- Acknowledge one pending read, rejecting unsolicited or duplicate observations. -/
+def finishObservation (s next : MissingWalk) : MissingWalk :=
+  if s.fault.isSome then s else
+  if s.awaiting then { next with awaiting := false }
+  else failWalk s 3 0 []
+
+/-- Export a positional refusal observation, acknowledging exactly one pending read. -/
 @[export synch_lean_walk_absent]
-def walkAbsent (s : MissingWalk) (redacted : Bool) : MissingWalk := observeAbsent s redacted
+def walkAbsent (s : MissingWalk) (redacted : Bool) : MissingWalk :=
+  finishObservation s (observeAbsent s redacted)
 
 /-- Export a decoded-node observation, with absent payload represented by empty bytes. -/
 @[export synch_lean_walk_present]
 def walkPresent (s : MissingWalk) (reference node : WalkNode) (childShape : UInt8)
     (payload : ByteArray) (present : Bool) : MissingWalk :=
-  observePresent s reference node childShape
-    (if payload.isEmpty then none else some (pathOf payload)) present
+  finishObservation s (observePresent s reference node childShape
+    (if payload.isEmpty then none else some (pathOf payload)) present)
 
 /-- Scalar diagnostics/output tag, with all decisions made by the transitions. -/
 @[export synch_lean_walk_result]

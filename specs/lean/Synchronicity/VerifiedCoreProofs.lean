@@ -292,7 +292,7 @@ theorem cache_transaction_depth (s : VerifiedCore.CertificateCache) (keep : Arra
 /-- Exhaustion rules out deferred work and a canonicality fault. -/
 theorem walk_exhaustion (s : VerifiedCore.MissingWalk)
     (done : VerifiedCore.walkExhausted s = true) :
-    s.frontier = [] ∧ s.deferred = [] ∧ s.fault = none := by
+    s.frontier = [] ∧ s.deferred = [] ∧ s.fault = none ∧ s.awaiting = false := by
   simpa [VerifiedCore.walkExhausted, Bool.and_eq_true, and_assoc] using done
 
 /-- A recorded payload cannot be requested a second time in the same batch. -/
@@ -426,19 +426,21 @@ theorem expand_preserves_current (s : VerifiedCore.MissingWalk)
 @[rust_justifies "verified-walk-absence"]
 theorem absent_inside_grant (s : VerifiedCore.MissingWalk) (p : VerifiedCore.WalkPosition)
     (current : s.current = some p) (healthy : s.fault = none)
+    (pending : s.awaiting = true)
     (granted : VerifiedCore.containsSubtree s.scope p.path = true) (redacted : Bool) :
     (VerifiedCore.walkAbsent s redacted).requestKind = 1 ∧
     (VerifiedCore.walkAbsent s redacted).deferred = p :: s.deferred := by
-  simp [VerifiedCore.walkAbsent, VerifiedCore.observeAbsent, VerifiedCore.deferWalk,
-    current, healthy, granted]
+  simp [VerifiedCore.walkAbsent, VerifiedCore.finishObservation, VerifiedCore.observeAbsent, VerifiedCore.deferWalk,
+    current, healthy, granted, pending]
 
 /-- An absent refused spine position is satisfied without requesting or deferring it. -/
 theorem absent_refused_spine (s : VerifiedCore.MissingWalk) (p : VerifiedCore.WalkPosition)
     (current : s.current = some p) (healthy : s.fault = none)
+    (pending : s.awaiting = true)
     (spine : VerifiedCore.containsSubtree s.scope p.path = false) :
     (VerifiedCore.walkAbsent s true).requestKind = 0 ∧
     (VerifiedCore.walkAbsent s true).deferred = s.deferred := by
-  simp [VerifiedCore.walkAbsent, VerifiedCore.observeAbsent, current, healthy, spine]
+  simp [VerifiedCore.walkAbsent, VerifiedCore.finishObservation, VerifiedCore.observeAbsent, current, healthy, spine, pending]
 
 /-- Every dependent node is deferred, independently of batch request deduplication. -/
 theorem payload_missing_defers (s : VerifiedCore.MissingWalk) (p : VerifiedCore.WalkPosition)
@@ -522,6 +524,37 @@ theorem observation_fault_sticky (s : VerifiedCore.MissingWalk)
     VerifiedCore.observePresent s reference node childShape payload present = s ∧
     VerifiedCore.observeAbsent s redacted = s := by
   simp [VerifiedCore.observePresent, VerifiedCore.observeAbsent, fault]
+
+/-- An interrupted read is retried, never consumed a second time by polling. -/
+theorem pending_poll_unchanged (s : VerifiedCore.MissingWalk) (pending : s.awaiting = true) :
+    VerifiedCore.walkPoll s = s := by
+  simp [VerifiedCore.walkPoll, VerifiedCore.pollWalk, pending]
+
+/-- Outstanding storage reads prevent completion independently of frontier size. -/
+theorem pending_not_exhausted (s : VerifiedCore.MissingWalk) (pending : s.awaiting = true) :
+    VerifiedCore.walkExhausted s = false := by
+  simp [VerifiedCore.walkExhausted, pending]
+
+/-- Neither retry scheduling nor a batch reset can discard an interrupted read. -/
+theorem pending_survives_resume (s : VerifiedCore.MissingWalk) :
+    (VerifiedCore.walkResume s).awaiting = s.awaiting ∧
+    (VerifiedCore.walkResume s).current = s.current ∧
+    (VerifiedCore.walkBatch s).awaiting = s.awaiting := by
+  simp [VerifiedCore.walkResume, VerifiedCore.resumeWalk, VerifiedCore.walkBatch]
+
+/-- Every accepted response acknowledges its selected read. -/
+theorem observation_acknowledged (s next : VerifiedCore.MissingWalk)
+    (healthy : s.fault = none) (pending : s.awaiting = true) :
+    (VerifiedCore.finishObservation s next).awaiting = false := by
+  simp [VerifiedCore.finishObservation, healthy, pending]
+
+/-- An unsolicited or duplicate response fails closed, rather than mutating the frontier. -/
+theorem unsolicited_observation_rejected (s next : VerifiedCore.MissingWalk)
+    (healthy : s.fault = none) (idle : s.awaiting = false) :
+    (VerifiedCore.finishObservation s next).fault = some 0 ∧
+    (VerifiedCore.finishObservation s next).faultKind = 3 ∧
+    (VerifiedCore.finishObservation s next).frontier = s.frontier := by
+  simp [VerifiedCore.finishObservation, VerifiedCore.failWalk, healthy, idle]
 
 end Synchronicity.VerifiedCoreProofs
 

@@ -28,16 +28,9 @@ extern uint8_t synch_lean_walk_status(lean_object *);
 extern uint64_t synch_lean_walk_depth(lean_object *);
 extern lean_object *synch_lean_walk_field(lean_object *, uint8_t);
 extern lean_object *synch_lean_walk_poll(lean_object *);
-extern lean_object *synch_lean_walk_defer(lean_object *);
 extern lean_object *synch_lean_walk_resume(lean_object *);
 extern lean_object *synch_lean_walk_batch(lean_object *);
-extern lean_object *synch_lean_walk_enqueue(lean_object *, lean_object *, lean_object *, lean_object *);
-extern uint8_t synch_lean_walk_requires_branch(lean_object *, lean_object *);
-extern lean_object *synch_lean_walk_branch(lean_object *, lean_object *, uint8_t);
-extern uint8_t synch_lean_walk_unasked(lean_object *, lean_object *);
-extern lean_object *synch_lean_walk_ask(lean_object *, lean_object *);
 extern lean_object *synch_lean_walk_node(uint8_t, lean_object *, lean_object *, lean_object *);
-extern lean_object *synch_lean_walk_expand(lean_object *, lean_object *, lean_object *);
 extern lean_object *synch_lean_walk_absent(lean_object *, uint8_t);
 extern lean_object *synch_lean_walk_present(lean_object *, lean_object *, lean_object *, uint8_t, lean_object *, uint8_t);
 extern uint8_t synch_lean_walk_result(lean_object *, uint8_t);
@@ -88,15 +81,6 @@ void *synch_adapter_walk_node(uint8_t tag, const synch_slice *children, size_t c
     return node;
 }
 
-void *synch_adapter_walk_expand(void *walk, void *reference, void *node) {
-    lean_inc((lean_object *)walk);
-    lean_inc((lean_object *)reference);
-    lean_inc((lean_object *)node);
-    lean_object *s = synch_lean_walk_expand(walk, reference, node);
-    lean_mark_mt(s);
-    return s;
-}
-
 void *synch_adapter_walk_absent(void *walk, uint8_t redacted) {
     lean_inc((lean_object *)walk);
     lean_object *s = synch_lean_walk_absent(walk, redacted);
@@ -128,8 +112,6 @@ uint64_t synch_adapter_walk_query(void *walk, uint8_t operation, synch_slice has
     case 0: return synch_lean_walk_exhausted(s);
     case 1: return synch_lean_walk_status(s);
     case 2: return synch_lean_walk_depth(s);
-    case 3: return synch_lean_walk_requires_branch(s, bytes(hash));
-    case 4: return synch_lean_walk_unasked(s, bytes(hash));
     case 5: return synch_lean_walk_result(s, 0);
     case 6: return synch_lean_walk_result(s, 1);
     default: lean_dec(s); return 0;
@@ -142,13 +124,8 @@ void *synch_adapter_walk_update(void *walk, uint8_t operation, synch_slice refer
     lean_inc(s);
     switch (operation) {
     case 0: s = synch_lean_walk_poll(s); break;
-    case 1: s = synch_lean_walk_defer(s); break;
     case 2: s = synch_lean_walk_resume(s); break;
     case 3: s = synch_lean_walk_batch(s); break;
-    case 4: s = synch_lean_walk_enqueue(s, bytes(reference), bytes(hash), bytes(step)); break;
-    case 5: s = synch_lean_walk_branch(s, bytes(hash), 1); break;
-    case 6: s = synch_lean_walk_branch(s, bytes(hash), 0); break;
-    case 7: s = synch_lean_walk_ask(s, bytes(hash)); break;
     default: break;
     }
     lean_mark_mt(s);

@@ -1,6 +1,50 @@
 use proptest::prelude::*;
 use synch_verified::{group_count, settle_size, CertificateCache, Scope, Settlement, Shape};
 
+fn observe(
+    walk: &mut synch_verified::MissingWalk,
+    reference: synch_verified::WalkNode<'_>,
+    node: synch_verified::WalkNode<'_>,
+) {
+    walk.observe_present(
+        reference,
+        node,
+        synch_verified::ChildShape::Branch,
+        None,
+        true,
+    )
+    .unwrap();
+}
+
+fn complete(walk: &mut synch_verified::MissingWalk) {
+    observe(
+        walk,
+        synch_verified::WalkNode::Leaf(&[]),
+        synch_verified::WalkNode::Leaf(&[]),
+    );
+}
+
+#[test]
+fn interrupted_read_remains_pending_across_poll_resume_and_batch_reset() {
+    let mut walk =
+        synch_verified::MissingWalk::new(&Scope::new(None, &[]), None, Some(&[1; 32]), 8);
+    let first = walk.poll().unwrap().unwrap();
+    assert!(!walk.is_exhausted());
+    walk.resume();
+    walk.start_batch();
+    let retry = walk.poll().unwrap().unwrap();
+    assert_eq!((retry.hash, retry.path), (first.hash, first.path));
+    assert!(!walk.is_exhausted());
+    complete(&mut walk);
+    assert!(walk.is_exhausted());
+    assert!(walk.poll().unwrap().is_none());
+    assert_eq!(
+        walk.observe_absent(false),
+        Err(synch_verified::WalkError::UnexpectedObservation)
+    );
+    assert!(!walk.is_exhausted());
+}
+
 #[test]
 fn observations_refuse_only_absent_spines_not_granted_subtrees() {
     for (scope, request) in [
@@ -144,14 +188,20 @@ fn walk_pairs_branch_slots_without_dropping_unmatched_children() {
     let mut walk =
         synch_verified::MissingWalk::new(&Scope::new(None, &[]), None, Some(&[1; 32]), 8);
     walk.poll().unwrap().unwrap();
-    walk.expand(WalkNode::Branch(&reference), WalkNode::Branch(&children));
+    observe(
+        &mut walk,
+        WalkNode::Branch(&reference),
+        WalkNode::Branch(&children),
+    );
     let p = walk.poll().unwrap().unwrap();
     assert_eq!((p.path, p.hash, p.reference), (vec![15], [4; 32], None));
+    complete(&mut walk);
     let p = walk.poll().unwrap().unwrap();
     assert_eq!(
         (p.path, p.hash, p.reference),
         (vec![7], [3; 32], Some([8; 32]))
     );
+    complete(&mut walk);
     assert!(walk.poll().unwrap().is_none());
     assert!(walk.is_exhausted());
 }
@@ -163,7 +213,8 @@ fn walk_pairs_extensions_only_with_identical_runs_and_filters_scope() {
         let mut walk =
             synch_verified::MissingWalk::new(&Scope::new(None, &[]), None, Some(&[1; 32]), 8);
         walk.poll().unwrap().unwrap();
-        walk.expand(
+        observe(
+            &mut walk,
             WalkNode::Extension {
                 prefix: run,
                 child: &[9; 32],
@@ -182,7 +233,8 @@ fn walk_pairs_extensions_only_with_identical_runs_and_filters_scope() {
     let scope = Scope::new(Some(&[vec![0]]), &[]);
     let mut walk = synch_verified::MissingWalk::new(&scope, None, Some(&[1; 32]), 8);
     walk.poll().unwrap().unwrap();
-    walk.expand(
+    observe(
+        &mut walk,
         WalkNode::Extension {
             prefix: &[0],
             child: &[2; 32],
@@ -191,34 +243,37 @@ fn walk_pairs_extensions_only_with_identical_runs_and_filters_scope() {
     );
     let p = walk.poll().unwrap().unwrap();
     assert_eq!((p.path, p.reference), (vec![0], None));
+    complete(&mut walk);
     assert!(walk.poll().unwrap().is_none());
 }
 
 #[test]
-fn walk_retries_lifo_and_resets_only_batch_payload_requests() {
+fn walk_retries_lifo_across_thread_migration() {
     let mut walk =
         synch_verified::MissingWalk::new(&Scope::new(None, &[]), None, Some(&[1; 32]), 8);
     assert_eq!(walk.poll().unwrap().unwrap().hash, [1; 32]);
-    walk.enqueue(None, &[2; 32], &[0]);
-    walk.enqueue(None, &[3; 32], &[1]);
+    let mut children = [None; 16];
+    children[0] = Some([2; 32]);
+    children[1] = Some([3; 32]);
+    observe(
+        &mut walk,
+        synch_verified::WalkNode::Leaf(&[]),
+        synch_verified::WalkNode::Branch(&children),
+    );
     assert_eq!(walk.poll().unwrap().unwrap().hash, [3; 32]);
-    walk.defer();
+    assert!(walk.observe_absent(false).unwrap());
     assert_eq!(walk.poll().unwrap().unwrap().hash, [2; 32]);
-    walk.defer();
+    assert!(walk.observe_absent(false).unwrap());
     assert!(walk.poll().unwrap().is_none());
     assert!(!walk.is_exhausted());
-    assert!(walk.ask(&[4; 32]));
-    assert!(!walk.ask(&[4; 32]));
-    walk.require_branch(&[2; 32]);
     walk.start_batch();
-    assert!(walk.ask(&[4; 32]));
     walk.resume();
     // Move an already populated Lean state to a fresh Rust thread.
     std::thread::spawn(move || {
         assert_eq!(walk.poll().unwrap().unwrap().hash, [2; 32]);
-        assert!(walk.take_branch_requirement(&[2; 32]));
-        assert!(!walk.take_branch_requirement(&[2; 32]));
+        complete(&mut walk);
         assert_eq!(walk.poll().unwrap().unwrap().hash, [3; 32]);
+        complete(&mut walk);
         assert!(walk.poll().unwrap().is_none());
         assert!(walk.is_exhausted());
     })
@@ -231,7 +286,17 @@ fn walk_checks_depth_before_reference_pruning_and_faults_stick() {
     let mut walk =
         synch_verified::MissingWalk::new(&Scope::new(None, &[]), None, Some(&[1; 32]), 1);
     walk.poll().unwrap().unwrap();
-    walk.enqueue(Some(&[2; 32]), &[2; 32], &[0, 1]);
+    observe(
+        &mut walk,
+        synch_verified::WalkNode::Extension {
+            prefix: &[0, 1],
+            child: &[2; 32],
+        },
+        synch_verified::WalkNode::Extension {
+            prefix: &[0, 1],
+            child: &[2; 32],
+        },
+    );
     assert_eq!(
         walk.poll().unwrap_err(),
         synch_verified::WalkError::NodeDepth(2)
@@ -253,11 +318,18 @@ fn walk_dedup_is_positional_on_scope_spines_and_hash_only_inside_grants() {
     ] {
         let mut walk = synch_verified::MissingWalk::new(&scope, None, Some(&[1; 32]), 8);
         walk.poll().unwrap().unwrap();
-        walk.enqueue(None, &[2; 32], &[0]);
-        walk.enqueue(None, &[2; 32], &[1]);
+        let mut children = [None; 16];
+        children[0] = Some([2; 32]);
+        children[1] = Some([2; 32]);
+        observe(
+            &mut walk,
+            synch_verified::WalkNode::Leaf(&[]),
+            synch_verified::WalkNode::Branch(&children),
+        );
         let mut count = 0;
         while walk.poll().unwrap().is_some() {
             count += 1;
+            complete(&mut walk);
         }
         assert_eq!(count, expected);
         assert!(walk.is_exhausted());

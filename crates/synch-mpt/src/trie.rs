@@ -484,6 +484,7 @@ impl WalkFields<'_> {
 /// Render Lean's diagnostic without reimplementing the decision that produced it.
 fn walk_error(error: synch_verified::WalkError) -> MptError {
     MptError::NonCanonical(match error {
+        synch_verified::WalkError::UnexpectedObservation => "walk observation without a pending read".into(),
         synch_verified::WalkError::NodeDepth(depth) => format!(
             "a trie node sits at nibble depth {depth}, past the {MAX_DEPTH_NIBBLES} any valid key reaches"),
         synch_verified::WalkError::ValueDepth(depth) => format!(
