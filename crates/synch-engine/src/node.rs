@@ -1589,6 +1589,7 @@ impl Node {
         let origin = self.origin().clone();
         let now = now_ns();
         let remote_upload_parts = self.cas_backend().remote_upload_parts();
+        let generation = synch_mpt::NodeStore::completeness_generation(self.store().as_ref())?;
 
         let head = self
             .store()
@@ -1708,7 +1709,7 @@ impl Node {
             // it whole by construction. Recording that here is what keeps the
             // first `Hello` after every publish from proving it again by
             // walking the entire trie (§5.1).
-            synch_mpt::NodeStore::note_complete(self.store().as_ref(), &head.root)?;
+            synch_mpt::NodeStore::note_complete_at(self.store().as_ref(), &head.root, generation)?;
             tracing::info!(
                 seq = head.seq,
                 changes = staged.len(),

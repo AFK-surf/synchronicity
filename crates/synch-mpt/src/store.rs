@@ -46,20 +46,39 @@ pub trait NodeStore {
     /// "Do I hold this whole trie?" has no cheap answer — it is a walk of
     /// everything reachable — and it is asked on every `Hello` (§5.1), which
     /// makes a converged cluster pay for the size of its metadata on every
-    /// anti-entropy round rather than for what changed. A root is immutable
-    /// and content-addressed, so the answer, once *computed*, cannot stop
-    /// being true: nothing rewrites a node under an existing hash, and GC
-    /// marks from every head it could be reached through. A store that can
-    /// remember the answer says so here; the default remembers nothing.
+    /// anti-entropy round rather than for what changed. Although a root is
+    /// immutable, the answer can change after GC or when learning a node
+    /// dissolves a redaction boundary. Implementations that cache answers must
+    /// invalidate them before such mutations; the default remembers nothing.
     fn is_known_complete(&self, _root: &Hash) -> Result<bool, Self::Error> {
         Ok(false)
     }
 
     /// Records that every node and value under `root` was found present.
     ///
-    /// Only ever called after a full walk has established it.
+    /// The caller must hold a stable snapshot through this operation. Resumed
+    /// or concurrent walks must use `note_complete_at` with their starting
+    /// generation instead.
     fn note_complete(&self, _root: &Hash) -> Result<(), Self::Error> {
         Ok(())
+    }
+
+    /// Changes whenever a mutation can invalidate a completed or in-flight
+    /// walk (including GC and newly held redaction boundaries). Implementations
+    /// with concurrent non-monotone mutations must override both generation
+    /// methods and prevent certification during an uncommitted mutation.
+    fn completeness_generation(&self) -> Result<u64, Self::Error> {
+        Ok(0)
+    }
+
+    /// Certifies a walk only if its generation is still current. The default
+    /// is for immutable/monotonically growing stores; it need not cache.
+    fn note_complete_at(&self, root: &Hash, generation: u64) -> Result<bool, Self::Error> {
+        if self.completeness_generation()? != generation {
+            return Ok(false);
+        }
+        self.note_complete(root)?;
+        Ok(true)
     }
 
     /// True if a peer has told this store it may not see the node `hash` at
@@ -122,6 +141,7 @@ pub struct MemStore {
     nodes: Mutex<HashMap<Hash, Vec<u8>>>,
     values: Mutex<HashMap<Hash, Vec<u8>>>,
     owned: Mutex<std::collections::HashSet<(OriginId, Hash)>>,
+    generation: Mutex<u64>,
 }
 
 impl MemStore {
@@ -141,24 +161,49 @@ impl MemStore {
     /// Forgets one node, for tests that need a held trie to go partial.
     #[cfg(test)]
     pub(crate) fn remove_node(&self, hash: &Hash) {
+        let mut generation = self
+            .generation
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         self.nodes
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(hash);
+        *generation = generation.saturating_add(1);
     }
 
     /// Drops every out-of-line value, keeping the nodes: a store that relayed
     /// the structure but GC'd (or never held) the payloads.
     pub fn clear_values(&self) {
+        let mut generation = self
+            .generation
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
         self.values
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clear();
+        *generation = generation.saturating_add(1);
     }
 }
 
 impl NodeStore for MemStore {
     type Error = Infallible;
+
+    fn completeness_generation(&self) -> Result<u64, Infallible> {
+        Ok(*self
+            .generation
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner))
+    }
+
+    fn note_complete_at(&self, _root: &Hash, generation: u64) -> Result<bool, Infallible> {
+        let current = self
+            .generation
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        Ok(*current == generation && generation != u64::MAX)
+    }
 
     fn get_node(&self, hash: &Hash) -> Result<Option<Vec<u8>>, Infallible> {
         Ok(self

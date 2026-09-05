@@ -422,8 +422,10 @@ impl MptProtocol {
                                     Some(Some(data)) => TrieNode::decode(&data)
                                         .map(|node| {
                                             // Coverage, not just position — the
-                                            // same second half `GetNodes`
-                                            // applies. A node sitting at an
+                                            // value-specific authorization.
+                                            // `GetNodes` may expose a spine
+                                            // branch's child hashes without
+                                            // granting its own value. A node at an
                                             // in-scope position can still
                                             // describe a key that runs out of
                                             // scope: a `Leaf` spells the rest
@@ -437,7 +439,7 @@ impl MptProtocol {
                                             // LEAN-MODEL: mpt-serve-value (ScopedSync.ServeValue)
                                             // `ScopedSync.ServeValue`.
                                             node.value_hashes().contains(&wanted.1)
-                                                && scope.admits_node(&wanted.0, &node)
+                                                && scope.admits_value(&wanted.0, &node)
                                         })
                                         .unwrap_or(false),
                                     _ => false,

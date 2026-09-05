@@ -150,6 +150,20 @@ impl Scope {
         }
     }
 
+    /// Whether the value carried by a node belongs to a granted key. A branch
+    /// may travel on the spine without granting the value at the branch itself.
+    pub fn admits_value(&self, path: &[u8], node: &crate::node::TrieNode) -> bool {
+        match node {
+            crate::node::TrieNode::Leaf { key_rest, .. } => {
+                let mut key = path.to_vec();
+                key.extend_from_slice(key_rest.as_slice());
+                self.admits_key_path(&key)
+            }
+            crate::node::TrieNode::Branch { .. } => self.admits_key_path(path),
+            crate::node::TrieNode::Ext { .. } => false,
+        }
+    }
+
     /// True if a whole byte key lies inside this scope.
     ///
     /// Stricter than [`Scope::admits_path`]: a key is a leaf position, so

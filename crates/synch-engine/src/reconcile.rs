@@ -825,10 +825,11 @@ impl Syncer {
         // and the walk is unchanged, for a delegated one a stop at the boundary
         // rather than a request it would be refused — and reading it is a store
         // read, which belongs on the same hop rather than on the runtime.
-        let (reference, scope, held, owner) = {
+        let (reference, scope, held, owner, mut generation) = {
             let store = self.store.clone();
             let origin = origin.clone();
             crate::blocking::offload(move || {
+                let generation = synch_mpt::NodeStore::completeness_generation(store.as_ref())?;
                 let trie = Trie::new(store.as_ref());
                 let scope = store.local_trie_scope()?;
                 let held = store.complete_head(&origin)?;
@@ -853,7 +854,7 @@ impl Syncer {
                     }
                     _ => None,
                 };
-                Ok((reference, scope, held, owner))
+                Ok((reference, scope, held, owner, generation))
             })
             .await?
         };
@@ -896,16 +897,49 @@ impl Syncer {
             // walk travels into the blocking pool and back so its position
             // survives each round trip.
             let store = self.store.clone();
-            let (missing, returned) = crate::blocking::offload(move || {
-                let trie = Trie::new(store.as_ref());
-                let missing = walk.next_batch(&trie, MAX_BATCH)?;
-                Ok((missing, walk))
-            })
-            .await?;
+            let walk_owner = owner.clone();
+            let walk_scope = scope.clone();
+            let (missing, returned, current_generation, certified) =
+                crate::blocking::offload(move || {
+                    store.transaction(|txn| -> Result<_> {
+                        let current = synch_mpt::NodeStore::completeness_generation(txn)?;
+                        if current != generation {
+                            // A boundary or the pruning reference changed. Start
+                            // from the target without trusting the old frontier.
+                            walk = synch_mpt::MissingWalk::for_origin(
+                                walk_owner.clone(),
+                                None,
+                                pending.root,
+                                walk_scope.clone(),
+                            );
+                        }
+                        let missing = walk.next_batch(&Trie::new(txn), MAX_BATCH)?;
+                        // LEAN-MODEL: mpt-complete-memo (ScopedSync.prune_sound)
+                        // Pruning is sound only while the reference and the
+                        // drained frontier belong to this same generation.
+                        let certified = walk.is_exhausted()
+                            && synch_mpt::NodeStore::note_complete_at(
+                                store.as_ref(),
+                                &walk_scope.memo_key_for(walk_owner.as_ref(), pending.root),
+                                current,
+                            )?;
+                        Ok((missing, walk, current, certified))
+                    })
+                })
+                .await?;
             walk = returned;
+            generation = current_generation;
             if missing.is_empty() {
-                if walk.is_exhausted() {
+                if certified {
                     break;
+                }
+                if walk.is_exhausted() {
+                    walk = synch_mpt::MissingWalk::for_origin(
+                        owner.clone(),
+                        None,
+                        pending.root,
+                        scope.clone(),
+                    );
                 }
                 walk.resume();
                 continue;
@@ -1183,25 +1217,13 @@ impl Syncer {
             walk.resume();
         }
 
-        // The walk drained with nothing missing, which *is* the answer to "do I
-        // hold all of this?" — so record it rather than let the promotion below
-        // and the next `Hello` each rediscover it by walking the trie again.
-        // The promotion that follows re-materializes every changed leaf in one
-        // transaction, so the pair stays off the runtime like the rest.
-        let store = self.store.clone();
+        // The drained walk was certified in its snapshot above. Promotion
+        // rechecks completeness in its own transaction in case that generation
+        // changed, and atomically materializes the diff with the head flip.
         let syncer = self.clone();
         let origin = origin.clone();
-        let promoted = crate::blocking::offload(move || {
-            // LEAN-MODEL: mpt-complete-memo (ScopedSync.prune_sound)
-            // `ScopedSync.prune_sound`: a walk that pruned against the
-            // reference above still establishes `CompleteWithin` for this root.
-            synch_mpt::NodeStore::note_complete(
-                store.as_ref(),
-                &scope.memo_key_for(owner.as_ref(), pending.root),
-            )?;
-            syncer.try_promote(&origin, now_ns())
-        })
-        .await?;
+        let promoted =
+            crate::blocking::offload(move || syncer.try_promote(&origin, now_ns())).await?;
         Ok(match promoted {
             Promotion::Flipped => FetchOutcome::Completed,
             Promotion::Refused => FetchOutcome::Refused,

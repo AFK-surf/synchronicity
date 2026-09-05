@@ -49,6 +49,7 @@ def HealRemote : Transition (Cell H) where
   guard c := c.durable
   post c := { c with
     durable := False
+    remoteClaim := False
     row := c.row ∧ ∃ g, g ∈ c.held
     pin := {holder ∈ c.pin | ¬IsRole holder}
     want := c.want ∪ {holder ∈ c.pin | IsRole holder} }
@@ -216,6 +217,13 @@ theorem operator_holds_no_leaf {s : State Holder} {root : Root} (reachable : Rea
     fun live => live_holders_are_roles reachable (Or.inr live) rfl⟩
 
 end Holder
+
+omit [Roles H] in
+/-- An unobserved remote loss does not disable Rust's legal cache eviction:
+the durable-tier acknowledgment remains until healing observes the loss. -/
+theorem eviction_after_unobserved_loss {c : Cell H}
+    (ack : c.remoteClaim) (durable : c.durable) :
+    CacheEvict.guard (LoseRemote.post c) := ⟨ack, durable⟩
 
 end Synchronicity.FaultTolerant
 

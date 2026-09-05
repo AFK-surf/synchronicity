@@ -2120,6 +2120,7 @@ impl Store {
             reason: e.to_string(),
         })?;
 
+        // LEAN-MODEL: cas-verified-groups-flush (Ingestion.Flush)
         // Persist the verified groups (payload and outboard) before the bitmap
         // in the index advances to cover them — otherwise a crash could leave
         // the index claiming groups the disk never received.

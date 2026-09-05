@@ -505,7 +505,7 @@ impl MissingWalk {
             // root.
             let mut awaiting_values = false;
             for value_hash in node.value_hashes() {
-                if !trie.has_value_raw(&value_hash)? {
+                if self.scope.admits_value(&path, &node) && !trie.has_value_raw(&value_hash)? {
                     // Deferred whether or not already asked this batch: another
                     // node reporting the same payload says nothing about *this*
                     // node being done with.
@@ -1358,11 +1358,14 @@ impl<'a, S: NodeStore + ?Sized> Trie<'a, S> {
         if Self::wrap(self.store.is_known_complete(&memo))? {
             return Ok(true);
         }
+        let generation = Self::wrap(self.store.completeness_generation())?;
         let complete = MissingWalk::for_origin(owner.cloned(), None, root, scope.clone())
             .next_batch(self, 1)?
             .is_empty();
         if complete {
-            Self::wrap(self.store.note_complete(&memo))?;
+            // A concurrent write may have dissolved a boundary while this walk
+            // ran. In that case the caller must retry on a fresh snapshot.
+            return Self::wrap(self.store.note_complete_at(&memo, generation));
         }
         Ok(complete)
     }

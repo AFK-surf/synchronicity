@@ -11,3 +11,6 @@ import Synchronicity.Scope
 import Synchronicity.ScopedSync
 import Synchronicity.SystemSafety
 import Synchronicity.TrieGraph
+import Synchronicity.Completeness
+import Synchronicity.Materialization
+import Synchronicity.Ingestion

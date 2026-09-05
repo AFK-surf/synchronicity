@@ -30,14 +30,11 @@ structure State where
   /-- The derived views were rebuilt from the root. -/
   materialized : Prop := False
 
-/-- What promotion needs and what the slots imply: an active head is retained,
-complete and materialized; a pending head is retained; only an active head is
-materialized. -/
+/-- Active heads are retained and materialized, but can become incomplete when
+a refused boundary dissolves. A slot is not a fresh completeness certificate. -/
 structure Invariant (s : State) : Prop where
   /-- An active head is retained. -/
   active_retained : s.active → s.retained
-  /-- An active head is complete. -/
-  active_complete : s.active → s.complete
   /-- An active head is materialized. -/
   active_materialized : s.active → s.materialized
   /-- A pending head is retained. -/
@@ -69,6 +66,14 @@ takes them; the invariant does not depend on the guard. -/
 def LearnBatch (learned : Bool) : Transition State where
   guard _ := True
   post s := { s with complete := learned ∨ s.complete }
+
+/-- Learning a formerly refused node can expose missing descendants without
+changing the active slot or its last materialization. Serving must recheck
+completeness; active is not a completeness certificate. -/
+@[transition]
+def Recheck (complete : Bool) : Transition State where
+  guard _ := True
+  post s := { s with complete := complete }
 
 /-- `reconcile.rs::try_promote` clearing an overtaken or refused pending head,
 `sweep_pending_heads`, and the read-scope demotion in `bindings.rs`.  The root
@@ -125,7 +130,7 @@ def OwnPublish : Transition State where
 /-- The transitions, named. -/
 inductive Kind where
   | offerPending | retain | learnBatch (learned : Bool) | dropPending | trieGc (complete : Bool)
-  | prune | supersede | promote | ownPublish
+  | prune | supersede | promote | ownPublish | recheck (complete : Bool)
   deriving DecidableEq
 
 /-- The transition each kind names. -/
@@ -140,6 +145,7 @@ def Trans : Kind → Transition State
   | .supersede => Supersede
   | .promote => Promote
   | .ownPublish => OwnPublish
+  | .recheck complete => Recheck complete
 
 /-- Which transitions flip or mint a head.  `Bridge` pairs these with the CAS
 cells they commit alongside; every other transition interleaves freely. -/
@@ -165,11 +171,11 @@ abbrev Reachable (s : State) : Prop := system.Reachable s
 
 theorem invariant_step {s s' : State} (hinv : Invariant s) (hstep : Step s s') : Invariant s' := by
   obtain ⟨k, h⟩ := hstep
-  obtain ⟨ar, ac, am, pr, ma⟩ := hinv
+  obtain ⟨ar, am, pr, ma⟩ := hinv
   cases k <;> simp only [transition] at h <;> obtain ⟨hg, rfl⟩ := h <;> constructor <;> grind
 
 theorem invariant : system.Invariant Invariant where
-  init := ⟨False.elim, False.elim, False.elim, False.elim, False.elim⟩
+  init := ⟨False.elim, False.elim, False.elim, False.elim⟩
   step := invariant_step
 
 theorem reachable_invariant {s : State} (h : Reachable s) : Invariant s :=

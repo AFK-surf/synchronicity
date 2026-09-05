@@ -79,7 +79,14 @@ impl<S: NodeStore + ?Sized> Trie<'_, S> {
         }
         let a = self.cursor_at(root_opt(old_root))?;
         let b = self.cursor_at(root_opt(new_root))?;
-        self.diff_walk(a, b, scope, &mut emit)
+        self.diff_walk(a, b, scope, &mut |change| {
+            // Traversing a grant's spine does not grant its branch value.
+            // Filter before resolving payloads during materialization.
+            if scope.admits_key_path(Nibbles::from_bytes(&change.key).as_slice()) {
+                emit(change)?;
+            }
+            Ok(())
+        })
     }
 
     /// Walks both tries in lockstep ([`Trie::descend`]), which is what holds

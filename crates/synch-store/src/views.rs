@@ -1182,6 +1182,9 @@ impl Txn<'_> {
         // building the whole resolved set first meant holding every changed
         // value in memory at once — inside the transaction the head flip runs
         // in (`Trie::for_each_resolved_change_scoped`).
+        // LEAN-MODEL: mpt-materialize-delta (Materialization.applyDiff)
+        // The functional delta's contract is proved by `applyDiff_exact`;
+        // decoding and this structural walk are the implementation boundary.
         Trie::new(self).for_each_resolved_change_scoped(old_root, new_root, &scope, |change| {
             apply_change(self.conn(), origin, &change, now, release_now, &replicas)
         })

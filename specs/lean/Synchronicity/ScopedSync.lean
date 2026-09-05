@@ -227,6 +227,17 @@ def AdmitsNode (s : Scope) (path : Path) : Node → Prop
   | .ext pre _ => s.AdmitsPath (path ++ pre)
   | .leaf keyRest _ => s.AdmitsKey (path ++ keyRest)
 
+/-- Payload permission is about the value's key, not the containing spine node. -/
+def AdmitsValue (s : Scope) (path : Path) : Node → Prop
+  | .branch _ _ => s.AdmitsKey path
+  | .leaf keyRest _ => s.AdmitsKey (path ++ keyRest)
+  | .ext _ _ => False
+
+/-- Every key whose payload is admitted is a granted key, including branch values. -/
+theorem admitted_value_key (h : AdmitsValue s path n) (hk : SpellsKey path n key) :
+    s.AdmitsKey key := by
+  cases hk <;> exact h
+
 theorem admitsNode_of_full (h : s.IsFull) (path : Path) (n : Node) : AdmitsNode s path n := by
   cases n with
   | leaf rest value => exact Scope.admitsKey_of_containsSubtree (Scope.containsSubtree_of_full h _)
@@ -385,11 +396,12 @@ theorem Reach.full (h : Reach c st s r path x) : Reach c st Scope.full r path x 
   Walk.mono_scope (fun p _ => Scope.admitsPath_of_full Scope.full_isFull p) h
 
 /-- A walk finishing with nothing missing: every position it reaches is held or
-a boundary, and every node it expands has its out-of-line value. -/
+a boundary, and every expanded node's key-authorized out-of-line value is held. -/
 def Drained (c : Content) (st : Store) (s : Scope) (W : Path → Hash → Prop) : Prop :=
   ∀ path x, W path x →
     (x ∈ st.held ∨ Boundary s st path x) ∧
-    (¬ Boundary s st path x → ∀ n v, c x = some n → n.valueHash = some v → v ∈ st.heldValue)
+    (¬ Boundary s st path x → ∀ n v, c x = some n → n.valueHash = some v →
+      AdmitsValue s path n → v ∈ st.heldValue)
 
 /-- `trie.rs::Trie::is_complete_scoped`.  The unguarded walk drains with
 nothing missing — the fact the memo records. -/
@@ -567,7 +579,7 @@ carries it, resolved at the claimed position and judged by what it reveals. -/
 def ServeValue (c : Content) (s : Scope) (heads : Hash → Prop) (w : Want) (v : Hash) : Prop :=
   v = w.claimed ∧
     (¬ s.IsFull → ∃ x n, Admit c s heads w x ∧ c x = some n ∧ n.valueHash = some v ∧
-      AdmitsNode s w.path n)
+      AdmitsValue s w.path n)
 
 theorem Redacts.not_full (h : Redacts c s heads w x) : ¬ s.IsFull :=
   fun full => let ⟨_, n, _, refused⟩ := h; refused (admitsNode_of_full full _ n)
@@ -705,11 +717,19 @@ served, at an admitted position. -/
 theorem held_value_within_scope (hs : ¬ s.IsFull) (h : Reachable c s heads st) {v : Hash}
     (hheld : v ∈ st.heldValue) :
     ∃ root path x n, heads root ∧ s.AdmitsPath path ∧ At c root path x ∧ c x = some n ∧
-      n.valueHash = some v ∧ AdmitsNode s path n := by
+      n.valueHash = some v ∧ AdmitsValue s path n := by
   obtain ⟨w, served⟩ := (reachable_confined h).values v hheld
   obtain ⟨x, n, hadmit, hc, hv, hnode⟩ := served.2 hs
   obtain ⟨hadm, hat⟩ := admit_resolves hs hadmit
   exact ⟨w.root, w.path, x, n, admit_requires_head hs hadmit, hadm, hat, hc, hv, hnode⟩
+
+/-- A held payload is authorized at its actual key, not merely on the spine. -/
+theorem held_payload_key_granted (hs : ¬ s.IsFull) (h : Reachable c s heads st)
+    (hheld : v ∈ st.heldValue) :
+    ∃ root path x n, heads root ∧ At c root path x ∧ c x = some n ∧
+      n.valueHash = some v ∧ ∀ key, SpellsKey path n key → s.AdmitsKey key := by
+  obtain ⟨root, path, x, n, hh, _, hat, hn, hv, ha⟩ := held_value_within_scope hs h hheld
+  exact ⟨root, path, x, n, hh, hat, hn, hv, fun _ hk => admitted_value_key ha hk⟩
 
 /-- Every redaction a delegate remembers was a refusal at an above-grant
 position, which is the only place the walk consults it. -/

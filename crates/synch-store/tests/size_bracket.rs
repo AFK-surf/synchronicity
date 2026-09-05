@@ -13,6 +13,53 @@ use synch_core::{ChunkRanges, CHUNK_GROUP_SIZE};
 use synch_store::Store;
 
 #[test]
+fn failed_verification_preserves_committed_groups_across_reopen() {
+    let bytes: Vec<u8> = (0..20 * CHUNK_GROUP_SIZE + 17)
+        .map(|i| (i % 251) as u8)
+        .collect();
+    let provider_dir = tempfile::tempdir().unwrap();
+    let provider = Store::open(provider_dir.path()).unwrap();
+    let root = provider.ingest_bytes(&bytes, 0).unwrap();
+    let dir = tempfile::tempdir().unwrap();
+    let fetcher = Store::open(dir.path()).unwrap();
+    let first = ChunkRanges::single(0, 4);
+    let (encoded, served) = provider.encode_slice(&root, &first).unwrap();
+    fetcher
+        .write_slice(&root, bytes.len() as u64, &served, &encoded, 0)
+        .unwrap();
+    let before = fetcher.blob(&root).unwrap().unwrap();
+
+    // A late failure can follow several successful verified writes, but must
+    // not advance claims or corrupt an already advertised group/outboard.
+    let all = ChunkRanges::single(0, 21);
+    let (mut encoded, served) = provider.encode_slice(&root, &all).unwrap();
+    *encoded.last_mut().unwrap() ^= 0xff;
+    assert!(fetcher
+        .write_slice(&root, bytes.len() as u64, &served, &encoded, 0)
+        .is_err());
+    drop(fetcher);
+    let fetcher = Store::open(dir.path()).unwrap();
+    let after = fetcher.blob(&root).unwrap().unwrap();
+    assert_eq!(after.size, before.size);
+    assert_eq!(after.verified_groups(), before.verified_groups());
+    assert!(!after.complete);
+    assert_eq!(fetcher.read_range(&root, 0, 100).unwrap(), bytes[..100]);
+    let (encoded, served) = fetcher.encode_slice(&root, &first).unwrap();
+    let verifier_dir = tempfile::tempdir().unwrap();
+    let verifier = Store::open(verifier_dir.path()).unwrap();
+    verifier
+        .write_slice(&root, bytes.len() as u64, &served, &encoded, 0)
+        .unwrap();
+
+    // The failed attempt does not poison later honest completion.
+    let (encoded, served) = provider.encode_slice(&root, &all).unwrap();
+    fetcher
+        .write_slice(&root, bytes.len() as u64, &served, &encoded, 0)
+        .unwrap();
+    assert_eq!(fetcher.read_all(&root).unwrap(), bytes);
+}
+
+#[test]
 fn a_size_lie_inside_one_power_of_two_bracket_does_not_brick_the_root() {
     let true_size = 20 * CHUNK_GROUP_SIZE;
     let lie_size = 24 * CHUNK_GROUP_SIZE;
