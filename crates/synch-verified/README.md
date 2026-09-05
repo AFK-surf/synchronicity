@@ -8,9 +8,24 @@ the functions agree with the abstract scope and CAS contracts.
 
 ## Mandatory integration
 
+### Architecture and staged operation migration
+
+The [Lean-core architecture](../../docs/LEAN-CORE-ARCHITECTURE.md) supersedes
+the snapshot/planner boundary below. Lean owns whole operations, including raw
+metadata decoding, sequencing and failure recovery; Rust supplies host effects.
+CAS, trie, authorization, replication and publication follow the same rule.
+
+`VerifiedCore/Host.lean` supplies a typed executable effect monad and transaction
+combinator. New `Cas/Program`, `Trie/Program` and `Replication/History` modules
+implement acquisition, lookup (including the postcard codec), and retention
+over raw storage effects. They are compiled by Cargo and imported by the proof
+package, but **not yet connected to production entry points**. Their shared
+native interpreter and real-storage failure tests are the next cutover gate;
+compilation alone does not count as migration. No selectable backend is added.
+
 ### Domain boundary
 
-CAS algorithms live in `lean/VerifiedCore/Cas.lean`, independently of the trie
+The currently integrated CAS algorithms live in `lean/VerifiedCore/Cas.lean`, independently of the trie
 module. `cas::plan_lifecycle` accepts a typed operation-specific snapshot and
 returns a complete atomic mutation batch plus a separate post-commit cleanup
 batch. Pin/possession and deletion use the same domain planner and storage

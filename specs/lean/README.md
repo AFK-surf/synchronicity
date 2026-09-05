@@ -16,6 +16,12 @@ entire Rust engine or its FFI/storage effects. The native package imports no
 Mathlib. Builds require the pinned Lean toolchain on Linux GNU, macOS, or
 Windows GNU/LLVM; there is no alternative Rust implementation.
 
+The [operation architecture](../../docs/LEAN-CORE-ARCHITECTURE.md) requires
+proofs over complete executable Lean programs, not host-prepared snapshots.
+`HostProgramProofs` proves composition and transaction failure traces of the
+shared carrier. New domain program proofs cover staged acquisition, lookup and
+history-retention operations; these are not yet native production cutovers.
+
 ```sh
 cd specs/lean
 lake build --wfail

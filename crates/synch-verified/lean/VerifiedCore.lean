@@ -1,5 +1,8 @@
 import Std.Data.TreeSet.Basic
 import VerifiedCore.Cas
+import VerifiedCore.Cas.Program
+import VerifiedCore.Trie.Program
+import VerifiedCore.Replication.History
 
 /-!
 Executable production decisions. This module imports Lean's standard library:

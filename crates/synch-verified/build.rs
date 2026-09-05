@@ -18,7 +18,17 @@ fn output(command: &mut Command) -> String {
 
 fn main() {
     println!("cargo:rerun-if-changed=lean/VerifiedCore.lean");
-    println!("cargo:rerun-if-changed=lean/VerifiedCore/Cas.lean");
+    let modules = [
+        "Host",
+        "Cas",
+        "Cas/Program",
+        "Trie/Codec",
+        "Trie/Program",
+        "Replication/History",
+    ];
+    for module in modules {
+        println!("cargo:rerun-if-changed=lean/VerifiedCore/{module}.lean");
+    }
     println!("cargo:rerun-if-changed=lean/lean-toolchain");
     println!("cargo:rerun-if-changed=src/adapter.c");
     let target = env::var("TARGET").unwrap();
@@ -70,20 +80,28 @@ fn main() {
             || (windows && triple.ends_with("-windows-gnu")),
         "Lean runtime {triple} is incompatible with Cargo target {target}"
     );
-    let cas_generated = out.join("Cas.c");
-    lean(&[
-        "-c",
-        cas_generated.to_str().unwrap(),
-        "-o",
-        out.join("VerifiedCore/Cas.olean").to_str().unwrap(),
-        "VerifiedCore/Cas.lean",
-    ]);
+    // Dependency order above is shared by the native compiler and proof imports.
+    // Domain modules remain separate; the ABI adapter does not implement policy.
+    let mut compiled_modules = Vec::new();
+    for module in modules {
+        let object = out.join(format!("VerifiedCore/{module}.olean"));
+        std::fs::create_dir_all(object.parent().unwrap()).unwrap();
+        let generated = out.join(format!("{}.c", module.replace('/', "_")));
+        lean(&[
+            "-c",
+            generated.to_str().unwrap(),
+            "-o",
+            object.to_str().unwrap(),
+            &format!("VerifiedCore/{module}.lean"),
+        ]);
+        compiled_modules.push(generated);
+    }
     let generated = out.join("VerifiedCore.c");
     lean(&["-c", generated.to_str().unwrap(), "VerifiedCore.lean"]);
     cc::Build::new()
         .include(sysroot.join("include"))
         .file(&generated)
-        .file(&cas_generated)
+        .files(&compiled_modules)
         .file(root.join("src/adapter.c"))
         .flag_if_supported("-Wno-unused-parameter")
         .compile("synch_verified_core");

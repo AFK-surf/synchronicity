@@ -1,0 +1,243 @@
+# Lean-owned domain operations and host effects
+
+Status: implementation architecture, 2026-09-05. This supersedes the incremental
+predicate/snapshot-planner approach in PR #127. It is a target and migration
+contract, not a claim that the repository already implements it everywhere.
+
+## Objective and boundary
+
+Lean implements the core system, not a second model consulted by a Rust core.
+The same executable Lean operations are compiled into the native library and
+checked by the proof package. Rust supplies host services and user-facing
+integration. A domain operation may suspend on a typed host effect and continue
+in Lean with its success or failure result.
+
+```
+CLI / RPC / scanner events
+            |
+     Lean domain command
+            |
+     executable Program
+       |             ^
+   host effect    host reply
+       v             |
+ Rust host interpreter
+ storage / transport / clock / primitive crypto
+```
+
+An operation is not migrated while Rust still decodes domain metadata,
+precomputes policy facts, selects its algorithmic steps, or determines recovery
+or publication ordering. Moving a predicate, namespace, DTO or batch across FFI
+does not satisfy this criterion. In particular, group counts, size settlement,
+CAS spans, decoded trie shapes, fork classifications and scope predicates must
+not be input services furnished by Rust to Lean.
+
+## Ownership and dependencies
+
+| Lean domain | Owns | Host services, not policy |
+|---|---|---|
+| CAS | Ingest/read/serve/import/promote; Bao tree and group arithmetic; metadata codecs; size attestation; holds/wants; healing, eviction and collection; durability ordering | Raw metadata records, object reads/writes, flush/truncate/remove, provider I/O, primitive hashes |
+| Trie | Node codec and canonicality; keys/nibbles; lookup/update/diff/proofs; scoped traversal; completeness and certificate validity; trie collection | Encoded node/value storage, raw ownership/redaction records, primitive hashes |
+| Authorization | Binding liveness, delegated closure, rootedness, scope and provenance rules | Raw binding/head records, authenticated transport identity, signature primitive, DNS response/clock inputs |
+| Replication | Head ordering/history, adoption/reconciliation, provider selection, retries, delta/fetch orchestration, retention | Raw records, send/receive, time and entropy, CAS/Trie/Authorization **Lean** interfaces |
+| Publication/materialization | Entry decoding, derived rows, row-to-content references, staged ingestion, flush-before-advertise, atomic head/view/hold transitions | Raw records, files/provider I/O and signing primitive; composed Lean domain operations |
+
+The shared foundation contains an effect carrier, raw storage types, failures,
+resource/transaction contracts and native transport. It contains no domain
+policy. CAS and Trie do not import each other. Replication and publication
+compose their Lean interfaces; composition must not bounce through Rust
+callbacks. Authorization is not a collection of Rust SQL predicates. UI,
+protocol transport engines, provider SDKs and platform adapters remain host
+integrations, not reasons to retain a second core implementation.
+
+The control plane is outside this core-language migration. Its behavior,
+protocols and OpenBSD support remain unchanged. Rust targets remain Linux GNU,
+macOS x86-64/arm64 and Windows gnullvm; no new opt-in or Rust fallback.
+
+## Executable effect carrier
+
+`VerifiedCore.Host.Program E A` is a typed free monad with two constructors:
+return `A`, or issue `E B` with a Lean continuation from `B`. Domain operations
+use `ExceptT Failure (Program E)` so errors are ordinary inputs to the same
+verified program. The carrier is executable and total; use structural bounds
+or explicit fuel for bounded work, not `sorry`, `unsafe` replacements or
+noncomputable algorithms. Long-lived protocols use successive finite commands.
+
+Effects are capabilities, not an application-wide command language. Initial
+storage capabilities include:
+
+- Read raw bytes by namespace/key; later extend with bounded offset reads,
+  writes, flush, truncate, rename and removal as complete operations require.
+- Begin a transaction, read projected raw rows, insert/upsert/update/delete
+  explicit raw values, commit or rollback. Replies distinguish absent rows,
+  NULL cells, empty blobs and failures. Transaction handles are host resources.
+- Row projections and equality/range/ordering scans are declarative storage
+  requests chosen by Lean, not host-side application queries. Batch requests
+  must preserve set-shaped behavior and index access for large collections.
+
+Raw cells are NULL, signed 64-bit integer, UTF-8 text or bytes. Lean owns the
+interpretation of durable flags, unsigned sequence numbers stored as signed
+integers, serialized bitmaps, head receipts and other metadata. SQL remains in
+the Rust storage adapter: it translates whitelisted relation/column identifiers
+and generic storage requests, binds values, and returns raw cells. It must not
+add `isDurable`, `isComplete`, `forkedSequences`, `applyValidatedEntry`,
+`settleSize` or similar policy operations. No Lean functions registered in SQL.
+
+Preserve the existing database and wire encodings. A storage adapter is not
+authorized to replace UPSERT with SQLite REPLACE, silently coerce malformed
+cells, strengthen a permissive local decoder, or change a bulk scan to one
+query per entry. Any necessary format migration needs a separately reviewed
+compatibility/recovery plan.
+
+Primitive crypto has a separate explicit trust contract: hashing/signing or
+signature checking bytes is a primitive; validating a Bao path, selecting
+attested lengths or checking a delegation chain is domain logic and stays in
+Lean. Do not use an entire current Rust subsystem as a supposed primitive.
+
+## Transactions, failures and concurrency
+
+Lean requests the resource/transaction scope before its relevant reads and
+decides all subsequent effects, commit, rollback and result. Rust preserves
+the scope, snapshot and lock guarantees while interpreting requests. It does
+not receive a snapshot prepared outside the operation. Operations sharing a
+transaction compose inside Lean with the same token; inner operations cannot
+commit the outer transaction accidentally.
+
+Every fallible effect returns a typed failure. A failed effect is never
+acknowledged as success. Commit failure is distinct from successful commit;
+cleanup and publication cannot run on the failure branch. Rollback failure
+must not erase the primary error or report success. Rust RAII releases locks,
+rolls back uncommitted transactions and destroys abandoned native handles on
+cancellation/panic; it is a host resource guarantee, not domain recovery policy.
+
+The runtime must reject mismatched, duplicate or stale replies and replies to
+terminal programs. It must preserve one pending request across polling. SQLite
+transactions stay on their owning interpreter thread/session. Do not use
+unsafe lifetime extension to move guards across awaits or threads. A dropped
+program cannot later publish or commit. Backend loss and durability failures
+remain explicit program observations; do not conflate claimed and physical
+availability or local cache and durable-tier acknowledgement.
+
+## Native boundary
+
+Public APIs accept domain commands and return domain results. While executing,
+the shared runtime transports host requests/replies and owns opaque Lean
+continuations. Creation/resumption/disposal is transport, not a new predicate
+API. Do not export codecs, intermediate ranges, cache flags or state-machine
+steps for Rust to orchestrate. Do not hide a sprawling semantic interface
+behind one `execute(bytes)` entry point.
+
+Use versioned, bounded request/reply records, validated discriminants, checked
+length arithmetic, documented ownership and explicit buffer lifetime rules.
+Large byte payloads should use bounded chunks or owned buffer capabilities,
+not copy entire blobs at every suspension. Batch storage requests when needed.
+Internal domain types and proof structure are not ABI. Keep domain Lean and
+Rust facade files separate; the shared runtime must not import their policies.
+
+## Proof obligations and non-regression gates
+
+Prove executions of the actual programs under the explicit host contract, not
+only pure decisions or an independently authored state machine. Required
+properties include:
+
+- Effects requested only after their guards hold on the operation's reads.
+- Successful results imply the required effects completed successfully.
+- Failed/cancelled operations cannot advertise success or advance durability.
+- Atomic updates preserve references, ownership and current-head protection.
+- Flush/provider acknowledgement precedes metadata advertisement/publication.
+- Traversal coverage, canonical decoding, depth and authorization belong to
+  the executed trie operation, including interrupted reads and retries.
+- Cross-domain publication safety follows from composed Lean programs.
+- ABI decoding/encoding and resource rules preserve the typed effect contract.
+
+For each vertical migration: record the existing behavior and regression tests;
+implement the whole program and its host interpreter; execute real storage
+tests including failures at each effect; replace the production entry point;
+delete its Rust algorithm and obsolete low-level exports; update proof anchors.
+Do not retain a selectable Rust backend. Staged, unintegrated code is allowed
+during development but must be identified as such, not counted as completion.
+
+Run Lean `lake build --wfail` and anchors, focused Rust tests and Clippy during
+development. Before merging run workspace tests/lints and relevant engine,
+cloud, recovery, hostile-input and native platform CI gates. Existing binary,
+DB, wire, filesystem, error and cancellation behavior are regression contracts.
+Benchmark batch cardinality, FFI calls, allocations, transferred bytes and
+representative large histories/tries; green unit tests alone do not show that
+performance or crash behavior was preserved. No new broad scrubbing that
+destroys delta-sync's cost model.
+
+## Current implementation and parallel work
+
+At `c21082a`, mandatory linked Lean owns selected scope/walk/CAS decisions and
+lifecycle plans, but Rust still prepares facts and orchestrates many complete
+operations. This is **not** the target architecture. Uncommitted SQLite-UDF and
+bitmap-adapter-only changes were withdrawn after review.
+
+First parallel slices, selected from production code and existing regressions:
+
+1. Shared foundation/runtime (primary): typed `Program`, failures and raw
+   storage algebra; common native transport/interpreter conventions; build and
+   proof wiring; integration review.
+2. CAS (CAS agent): complete pin/possession operation. Lean begins the
+   transaction, reads raw durable/want/pin records, interprets them, preserves
+   `created_at`, clears scheduled release, mutates, commits/rolls back and
+   returns the result. Delete Rust acquisition orchestration on cutover.
+3. Trie (trie agent): complete `get(root,key)`, including actual postcard node
+   decoding, nibble conversion, bound checking, traversal and inline/hash value
+   resolution over raw byte reads. Preserve permissive local decoding versus
+   strict ingress canonical validation; no exported codec predicates.
+4. Replication (replication agent): complete head-history pruning. Read raw
+   pointers/receipts, derive fork protection and retention/ceiling rules in
+   Lean, delete exact selected keys, commit/rollback and return the count.
+
+Agents own their domain files/proofs/tests. The primary owns this document,
+shared foundation, build/ABI wiring and integration. Cross-domain signatures
+must be agreed before use; no concurrent edits to shared glue without handoff.
+Subsequent slices include full CAS ingest/read/promotion and healing; complete
+trie mutation/sync/certification/GC; authorization; materialization/publication;
+fetch/retry and convergence composition. These remain required. Neither these
+first operations nor a working effect carrier redefine the overall end goal.
+
+### Implementation checkpoint
+
+The first slice now has source modules `VerifiedCore/Host.lean`,
+`Cas/Program.lean`, `Trie/Codec.lean`, `Trie/Program.lean` and
+`Replication/History.lean`. Cargo compiles them with the same pinned compiler;
+the proof package imports those exact modules. The shared carrier's laws and
+transaction traces cover begin failure, body failure, commit failure and
+preservation of the primary error across rollback failure.
+
+These programs are staged: the existing production entry points have not yet
+been switched to them. The immediate integration sequence is:
+
+1. Implement the common native continuation transport with typed reply
+   validation, single-use resume ownership and cancellation/resource tests.
+2. Implement raw SQLite/NodeStore storage interpretation, keeping each
+   transaction and its locks inside one owning session. Preserve original host
+   errors through opaque tokens; map domain failures explicitly at the facade.
+3. Connect each complete operation, run its existing real-storage regressions
+   and inject read/mutation/commit/rollback failures. Measure request counts and
+   large-input behavior; Lean fixture proofs do not replace these tests.
+4. Remove the corresponding Rust implementation and obsolete FFI after each
+   mandatory cutover. Do not remove a shared old helper until all its consumers
+   have migrated, and do not call a staged program a production replacement.
+
+The initial storage algebra intentionally contains only primitives used by
+these slices. Extend it with raw range scans, batches and file/transport
+capabilities when the next complete operation needs them, never by adding a
+domain-specific policy callback. The runtime remains independent of those
+domain implementations throughout migration.
+
+Integration review has identified specific gates, not waived limitations:
+
+- History deletion must retain the existing mutation-time `NOT EXISTS heads`
+  defense, including trigger-induced changes, and its receipt deletion order.
+  Add a generic raw relational predicate/ordered-read capability selected by
+  Lean, not a host `deleteUnreferencedHistory` operation. The staged equality-only
+  deletion is insufficient for cutover. Preserve or explicitly resolve existing
+  malformed signed-head/pointer decoding and error behavior as well.
+- Trie fixture and read-bound proofs do not yet establish full codec
+  roundtripping/canonicality or lookup/map semantics. Native commands must
+  enforce the existing 32-byte root type before constructing an operation.
+- Native continuation ownership, reply validation and physical storage effects
+  still need their contract tests. Compiling the carrier proves none of these.
