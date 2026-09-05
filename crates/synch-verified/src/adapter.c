@@ -71,6 +71,28 @@ static lean_object *bytes(synch_slice slice) {
     return result;
 }
 
+extern lean_object *synch_lean_cas_acquire(lean_object *, lean_object *, uint64_t, uint8_t);
+extern lean_object *synch_lean_operation_packet(lean_object *);
+extern lean_object *synch_lean_operation_resume(lean_object *, lean_object *);
+
+/* Operation handles are private, synchronous and thread-confined. Each call
+ * borrows the caller's reference and passes a fresh owned ref to Lean. Rust
+ * replaces/drops the old handle after resume; no continuation enters Rust. */
+void *synch_adapter_operation_acquire(synch_slice root, synch_slice holder,
+                                     uint64_t now, uint8_t possession) {
+    return synch_lean_cas_acquire(bytes(root), bytes(holder), now, possession);
+}
+
+void *synch_adapter_operation_packet(void *state) {
+    lean_inc((lean_object *)state);
+    return synch_lean_operation_packet((lean_object *)state);
+}
+
+void *synch_adapter_operation_resume(void *state, synch_slice reply) {
+    lean_inc((lean_object *)state);
+    return synch_lean_operation_resume((lean_object *)state, bytes(reply));
+}
+
 static lean_object *paths(const synch_slice *items, size_t count) {
     lean_object *result = lean_alloc_array(0, count);
     for (size_t i = 0; i < count; ++i) result = lean_array_push(result, bytes(items[i]));

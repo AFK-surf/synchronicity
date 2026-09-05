@@ -60,16 +60,20 @@ structure SequenceSummary where
 def current (pointers : List Pointer) (receipt : Receipt) : Bool :=
   pointers.contains receipt.pointer
 
-/-- Aggregate all rows of each sequence before deciding whether a fork can go.
-The storage primary key guarantees distinct roots within a sequence. -/
-def summarize (pointers : List Pointer) (before : Int64) (receipts : List Receipt) :
+def addReceipt (pointers : List Pointer) (before : Int64)
+    (summaries : Std.TreeMap UInt64 SequenceSummary) (receipt : Receipt) :
     Std.TreeMap UInt64 SequenceSummary :=
-  receipts.foldl (fun summaries receipt =>
     let prior := summaries.getD receipt.pointer.seq {}
     summaries.insert receipt.pointer.seq
       ⟨prior.count + 1,
        prior.pinned || before ≤ receipt.recordedAt || current pointers receipt,
-       prior.old || receipt.recordedAt < before⟩) {}
+       prior.old || receipt.recordedAt < before⟩
+
+/-- Aggregate all rows of each sequence before deciding whether a fork can go.
+The storage primary key guarantees distinct roots within a sequence. -/
+def summarize (pointers : List Pointer) (before : Int64) (receipts : List Receipt) :
+    Std.TreeMap UInt64 SequenceSummary :=
+  receipts.foldl (addReceipt pointers before) {}
 
 structure Retention where
   ceiling : Option UInt64
@@ -77,11 +81,25 @@ structure Retention where
   summaries : Std.TreeMap UInt64 SequenceSummary
   witnesses : Std.TreeSet UInt64
 
-def maximum (seqs : List UInt64) : Option UInt64 := seqs.foldl
-  (fun best seq => some (match best with | none => seq | some old => max old seq)) none
+def retainMaximum (best : Option UInt64) (seq : UInt64) : Option UInt64 :=
+  some (match best with
+    | none => seq
+    | some old => if seq ≤ old then old else seq)
+
+def maximum (seqs : List UInt64) : Option UInt64 := seqs.foldl retainMaximum none
 
 def expired (movedPast : Option UInt64) (seq : UInt64) (summary : SequenceSummary) : Bool :=
   movedPast.any (seq < ·) && !summary.pinned
+
+def witnessStep (movedPast : Option UInt64)
+    (state : Option UInt64 × Std.TreeSet UInt64) (entry : UInt64 × SequenceSummary) :
+    Option UInt64 × Std.TreeSet UInt64 :=
+  let (nextOld, witnesses) := state
+  let (seq, summary) := entry
+  let witnesses := if summary.count > 1 && !expired movedPast seq summary then
+    match nextOld with | none => witnesses | some witness => witnesses.insert witness
+    else witnesses
+  (if summary.old then some seq else nextOld, witnesses)
 
 def retention (pointers : List Pointer) (before : Int64) (receipts : List Receipt) : Retention :=
   let summaries := summarize pointers before receipts
@@ -89,11 +107,7 @@ def retention (pointers : List Pointer) (before : Int64) (receipts : List Receip
   let movedPast := maximum ((ordered.filter (·.2.old)).map (·.1))
   -- Reverse order keeps the least higher old sequence in `nextOld`, so finding
   -- every protected fork's witness is linear, not one history scan per fork.
-  let (_, witnesses) := ordered.reverse.foldl (fun (nextOld, witnesses) (seq, summary) =>
-    let witnesses := if summary.count > 1 && !expired movedPast seq summary then
-      match nextOld with | none => witnesses | some witness => witnesses.insert witness
-      else witnesses
-    (if summary.old then some seq else nextOld, witnesses))
+  let (_, witnesses) := ordered.reverse.foldl (witnessStep movedPast)
       (none, ({} : Std.TreeSet UInt64))
   ⟨maximum (ordered.map (·.1)), movedPast, summaries, witnesses⟩
 

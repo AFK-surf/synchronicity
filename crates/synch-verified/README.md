@@ -18,31 +18,46 @@ CAS, trie, authorization, replication and publication follow the same rule.
 `VerifiedCore/Host.lean` supplies a typed executable effect monad and transaction
 combinator. New `Cas/Program`, `Trie/Program` and `Replication/History` modules
 implement acquisition, lookup (including the postcard codec), and retention
-over raw storage effects. They are compiled by Cargo and imported by the proof
-package, but **not yet connected to production entry points**. Their shared
-native interpreter and real-storage failure tests are the next cutover gate;
-compilation alone does not count as migration. No selectable backend is added.
+over raw storage effects. CAS pin/possession acquisition now uses that complete
+operation in production. The shared synchronous continuation interpreter asks
+Rust only for raw storage effects; Lean owns begin/read/mutate/commit/rollback.
+The old acquisition snapshot/planner API and Rust orchestration are deleted.
+Trie lookup and history retention remain staged, not production replacements.
+No selectable backend is added.
+
+The acquisition cutover is checked against real SQLite, including abandoned
+transactions, automatic rollback, deferred commit failure, UPSERT timestamp
+preservation and the existing typed errors for corrupt durability cells.
+`HostWireProofs` checks Lean-side reply framing and continuation behavior;
+native tests check the C/Rust transport. Neither is a proof of physical I/O.
+
+Latest Linux cutover validation: all 475 tests across `synch-verified`,
+`synch-store` and `synch-engine`; focused all-target Clippy with warnings denied;
+the full Lean warnings-as-errors build and anchor check. Builds were run
+sequentially with bounded compiler memory after the development-session OOM.
+This does not claim the remaining domains or new cross-platform CI are complete.
 
 ### Domain boundary
 
 The currently integrated CAS algorithms live in `lean/VerifiedCore/Cas.lean`, independently of the trie
 module. `cas::plan_lifecycle` accepts a typed operation-specific snapshot and
-returns a complete atomic mutation batch plus a separate post-commit cleanup
-batch. Pin/possession and deletion use the same domain planner and storage
-executor. Their old public step/acknowledgment APIs and four scalar exports are
-removed. There are no Lean callbacks registered with SQLite.
+returns an atomic deletion mutation batch plus a separate post-commit cleanup
+batch. This snapshot planner now serves deletion only and remains a migration
+target. Pin/possession use the complete monadic operation described above.
+There are no Lean callbacks registered with SQLite.
 
 The executor holds snapshot ordering locks, applies the transaction batch,
 commits, and only then performs best-effort cleanup. SQL errors roll back and
 prevent cleanup. SQL semantics, locks, primitive I/O and ABI decoding remain
 explicit trust boundaries. `CasLifecycleProofs.lean` proves complete plans,
-including authorization, empty refusals, atomic possession, cleanup requiring
+including deletion authorization, empty refusals, cleanup requiring
 row deletion, and ABI capacity bounds.
 
 The private five-byte lifecycle record is a bounded encoding of these typed
 effects, not a generic command language or a serialization of Lean internals.
 Adding a domain operation requires revisiting its types, plan proofs and ABI
-bounds. Bulk operations must remain batched; do not add per-row SQL callbacks.
+bounds; new operations must use the shared effect runtime, not extend this
+legacy planner. Bulk operations must remain batched; do not add per-row SQL callbacks.
 
 This is a consolidation step, not the final API: bitmap planning/size helpers
 still have their earlier adapters; trie/sync and ingestion/publication need

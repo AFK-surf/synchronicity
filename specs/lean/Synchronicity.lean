@@ -17,6 +17,7 @@ import Synchronicity.Ingestion
 import Synchronicity.VerifiedCoreProofs
 import Synchronicity.CasLifecycleProofs
 import Synchronicity.HostProgramProofs
+import Synchronicity.HostWireProofs
 import Synchronicity.CasProgramProofs
 import Synchronicity.TrieProgramProofs
 import Synchronicity.TrieProgramTests

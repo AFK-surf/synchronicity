@@ -16,8 +16,9 @@ instance : Monad (Program E) where
   pure := Program.pure
   bind := Program.bind
 
-/-- Host error tokens identify original errors retained by the interpreter.
-Code 2 denotes malformed raw storage data; token zero is not a host error. -/
+/-- Code 1 tokens identify original host errors retained by the interpreter.
+Code 2 uses the token as domain error detail (zero for an unspecified malformed
+record), never as a host-error registry index. Code 3 is a protocol failure. -/
 structure Failure where
   code : UInt32
   token : UInt64

@@ -1,6 +1,7 @@
 import Std.Data.TreeSet.Basic
 import VerifiedCore.Cas
 import VerifiedCore.Cas.Program
+import VerifiedCore.Entry
 import VerifiedCore.Trie.Program
 import VerifiedCore.Replication.History
 

@@ -1448,7 +1448,7 @@ impl Store {
         self.acquire_pin(root, holder, now, false)
     }
 
-    /// Execute the native pin/possession plan against one immediate transaction.
+    /// Execute the complete Lean pin/possession operation over raw storage.
     /// A pin promises a durable claim, never merely a partial or staged cache
     /// row. Possession also needs the holder's uncancelled want, so a late fetch
     /// cannot resurrect an orphan role claim after role removal.
@@ -1461,32 +1461,38 @@ impl Store {
         now: i64,
         possession: bool,
     ) -> Result<bool> {
-        use synch_verified::cas::{AcquisitionSnapshot, LifecycleRequest, Outcome};
-        let outcome = self.execute_cas_lifecycle(root, Some(holder), now, |tx| {
-            // Read facts only. Lean decides which combination authorizes a pin.
-            let durable: Option<i64> = tx
-                .query_row(
-                    "SELECT durable FROM blobs WHERE root = ?1",
-                    params![root.as_bytes().to_vec()],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            let wanted: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM content_want WHERE root = ?1 AND holder = ?2)",
-                params![root.as_bytes().to_vec(), holder.render()],
-                |row| row.get(0),
-            )?;
-            // LEAN-MODEL: cas-lifecycle-acquisition (CasLifecycleProofs.acquisition_authorized)
-            Ok(LifecycleRequest::Acquire {
-                snapshot: AcquisitionSnapshot {
-                    row: durable.is_some(),
-                    durable: durable.unwrap_or(0) != 0,
-                    wanted,
-                },
-                possession,
-            })
-        })?;
-        Ok(outcome == Outcome::Applied)
+        use synch_verified::cas::{acquire, OperationError};
+        let conn = self.conn();
+        let _ordered_against_writers = self.cas_order();
+        let mut storage = crate::lean_storage::SqliteStorage::new(&conn);
+        // Lean requests begin before reading metadata and owns every normal
+        // completion/failure path. Rust holds host resources, not policy facts.
+        // LEAN-MODEL: cas-lifecycle-acquisition (CasProgramProofs.execution_authorized)
+        acquire(
+            &mut storage,
+            root.as_bytes(),
+            &holder.render(),
+            now,
+            possession,
+        )
+        .map_err(|error| match error {
+            OperationError::Host(error) => error,
+            OperationError::MalformedMetadata(detail @ 1..=3) => {
+                let kind = match detail {
+                    1 => rusqlite::types::Type::Null,
+                    2 => rusqlite::types::Type::Text,
+                    3 => rusqlite::types::Type::Blob,
+                    _ => unreachable!("matched native durable-column error detail"),
+                };
+                rusqlite::Error::InvalidColumnType(0, "durable".into(), kind).into()
+            }
+            OperationError::MalformedMetadata(_) => {
+                StoreError::Decode("invalid CAS acquisition metadata".into())
+            }
+            OperationError::Protocol => {
+                StoreError::invalid("invalid native storage-operation protocol")
+            }
+        })
     }
 
     /// Drops one holder's claim. Returns whether one was dropped.
@@ -1705,7 +1711,7 @@ impl Store {
         before: Option<i64>,
     ) -> Result<synch_verified::cas::Outcome> {
         use synch_verified::cas::{DeletionSnapshot, LifecycleRequest};
-        self.execute_cas_lifecycle(root, None, 0, |tx| {
+        self.execute_cas_lifecycle(root, |tx| {
             let (pinned, referenced): (bool, bool) = tx.query_row(
                 "SELECT EXISTS(SELECT 1 FROM pins WHERE root = ?1),
                     EXISTS(SELECT 1 FROM entries WHERE content = ?1)",
@@ -1738,8 +1744,6 @@ impl Store {
     fn execute_cas_lifecycle(
         &self,
         root: &Hash,
-        holder: Option<&PinHolder>,
-        now: i64,
         snapshot: impl FnOnce(
             &rusqlite::Transaction<'_>,
         ) -> Result<synch_verified::cas::LifecycleRequest>,
@@ -1756,27 +1760,6 @@ impl Store {
                     tx.execute(
                         "DELETE FROM blobs WHERE root = ?1",
                         params![root.as_bytes().to_vec()],
-                    )?;
-                }
-                Mutation::DeleteWant => {
-                    tx.execute(
-                        "DELETE FROM content_want WHERE root = ?1 AND holder = ?2",
-                        params![
-                            root.as_bytes().to_vec(),
-                            holder.expect("acquisition holder").render()
-                        ],
-                    )?;
-                }
-                Mutation::UpsertPin => {
-                    tx.execute(
-                        "INSERT INTO pins (root, holder, created_at, release_after)
-                        VALUES (?1, ?2, ?3, NULL)
-                        ON CONFLICT(root, holder) DO UPDATE SET release_after = NULL",
-                        params![
-                            root.as_bytes().to_vec(),
-                            holder.expect("acquisition holder").render(),
-                            now
-                        ],
                     )?;
                 }
             }
@@ -2291,6 +2274,59 @@ pub(crate) fn compute_outboard(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn acquisition_preserves_sqlite_column_errors_for_corrupt_durability() {
+        use rusqlite::types::Value;
+
+        for value in [
+            Value::Null,
+            Value::Text("1".into()),
+            Value::Text("not an integer".into()),
+            Value::Blob(vec![]),
+            Value::Blob(vec![1]),
+            Value::Real(1.5),
+        ] {
+            let (_dir, store) = crate::testutil::store();
+            let root = Hash::new(b"corrupt durability fixture");
+            let expected_type = {
+                let conn = store.conn();
+                // A temporary raw table models damaged column types without
+                // changing the persisted schema or bypassing NOT NULL checks.
+                conn.execute_batch("CREATE TEMP TABLE blobs (root BLOB PRIMARY KEY, durable)")
+                    .unwrap();
+                conn.execute(
+                    "INSERT INTO blobs (root, durable) VALUES (?1, ?2)",
+                    params![root.as_bytes().to_vec(), value],
+                )
+                .unwrap();
+                let old_error = conn
+                    .query_row("SELECT durable FROM blobs", [], |row| row.get::<_, i64>(0))
+                    .unwrap_err();
+                match old_error {
+                    rusqlite::Error::InvalidColumnType(0, column, kind) => {
+                        assert_eq!(column, "durable");
+                        kind
+                    }
+                    other => panic!("unexpected reference decoder error: {other:?}"),
+                }
+            };
+            for possession in [false, true] {
+                let error = store
+                    .acquire_pin(&root, &PinHolder::Operator, 1, possession)
+                    .unwrap_err();
+                match error {
+                    StoreError::Sqlite(rusqlite::Error::InvalidColumnType(0, column, kind)) => {
+                        assert_eq!(column, "durable");
+                        assert_eq!(kind, expected_type);
+                    }
+                    other => panic!("native acquisition changed the error: {other:?}"),
+                }
+                assert!(store.conn().is_autocommit());
+                assert!(store.pins_for(&root).unwrap().is_empty());
+            }
+        }
+    }
 
     #[test]
     fn durable_rows_survive_cold_scratch_and_heal_missing_objects() {

@@ -94,12 +94,6 @@ def casPlanSpans (plan : CasPlan) : Array UInt64 :=
 
 namespace Cas
 
-/-- Facts for acquisition of one holder's pin. -/
-structure AcquisitionSnapshot where
-  row : Bool
-  durable : Bool
-  wanted : Bool
-
 /-- Facts for deletion of one object's row and files. -/
 structure DeletionSnapshot where
   row : Bool
@@ -110,12 +104,11 @@ structure DeletionSnapshot where
 
 /-- Domain commands, not individual policy queries. -/
 inductive LifecycleRequest where
-  | acquire (snapshot : AcquisitionSnapshot) (possession : Bool)
   | delete (snapshot : DeletionSnapshot) (before : Option Int64)
 
 /-- Keyed storage actions executed together in one SQL transaction. -/
 inductive Mutation where
-  | deleteRow | deleteWant | upsertPin
+  | deleteRow
 
 /-- Best-effort actions permitted only after the transaction commits. -/
 inductive Cleanup where
@@ -134,10 +127,6 @@ structure LifecyclePlan where
 /-- The CAS lifecycle planning boundary. Rust never advances its internal
 algorithm one predicate or state-machine step at a time. -/
 def planLifecycle : LifecycleRequest → LifecyclePlan
-  | .acquire s possession =>
-    if s.row && s.durable && (!possession || s.wanted) then
-      ⟨.applied, (if possession then [.deleteWant] else []) ++ [.upsertPin], []⟩
-    else ⟨.skipped, [], []⟩
   | .delete s before =>
     if s.writing then ⟨.writing, [], []⟩ else
     if s.pinned || s.referenced then ⟨.protectedClaim, [], []⟩ else
@@ -150,7 +139,7 @@ def encodeLifecycle (plan : LifecyclePlan) : ByteArray :=
   let outcome : UInt8 := match plan.outcome with
     | .skipped => 0 | .writing => 1 | .protectedClaim => 2 | .applied => 3
   let mutation : Option Mutation → UInt8
-    | none => 0 | some .deleteRow => 1 | some .deleteWant => 2 | some .upsertPin => 3
+    | none => 0 | some .deleteRow => 1
   let cleanup : Option Cleanup → UInt8
     | none => 0 | some .payload => 1 | some .outboard => 2
   ⟨#[outcome, mutation plan.transaction[0]?, mutation plan.transaction[1]?,
@@ -159,10 +148,9 @@ def encodeLifecycle (plan : LifecyclePlan) : ByteArray :=
 /-- Narrow ABI marshalling for the typed domain request. Invalid commands fail closed. -/
 @[export synch_lean_cas_lifecycle]
 def lifecycleExport (command row a b c d : UInt8) (lastAccess before : Int64) : ByteArray :=
-  if command == 0 then encodeLifecycle (planLifecycle (.acquire ⟨row != 0, a != 0, b != 0⟩ (c != 0)))
-  else if command == 1 then encodeLifecycle (planLifecycle
+  if command == 1 then encodeLifecycle (planLifecycle
     (.delete ⟨row != 0, a != 0, b != 0, c != 0, lastAccess⟩ (if d != 0 then some before else none)))
-  else encodeLifecycle ⟨.skipped, [], []⟩
+  else ByteArray.empty
 
 end Cas
 end VerifiedCore

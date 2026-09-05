@@ -19,8 +19,11 @@ Windows GNU/LLVM; there is no alternative Rust implementation.
 The [operation architecture](../../docs/LEAN-CORE-ARCHITECTURE.md) requires
 proofs over complete executable Lean programs, not host-prepared snapshots.
 `HostProgramProofs` proves composition and transaction failure traces of the
-shared carrier. New domain program proofs cover staged acquisition, lookup and
-history-retention operations; these are not yet native production cutovers.
+shared carrier. `CasProgramProofs` covers the native production acquisition
+operation. `TrieProgramProofs` proves lookup soundness/completeness against a
+stable raw graph interpreted by the actual codec; codec roundtrip/canonicality
+remains separate. History proofs derive fork, ceiling and witness protection
+from actual receipts. Trie/history operations remain staged, not native cutovers.
 
 ```sh
 cd specs/lean

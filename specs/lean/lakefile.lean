@@ -4,6 +4,7 @@ open Lake DSL
 
 package synchronicity_specs where
   version := v!"0.1.0"
+  weakLeanArgs := #["-j1", "-M4096"]
 
 require mathlib from git
   "https://github.com/leanprover-community/mathlib4" @ "v4.30.0"

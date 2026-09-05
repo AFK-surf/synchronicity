@@ -3,35 +3,137 @@ use synch_verified::{group_count, settle_size, CertificateCache, Scope, Settleme
 
 #[test]
 fn pin_acquisition_requires_durability_and_orders_possession_effects() {
-    use synch_verified::cas::{
-        plan_lifecycle, AcquisitionSnapshot, LifecycleRequest, Mutation, Outcome,
-    };
-    for row in [false, true] {
-        for durable in [false, true] {
-            for wanted in [false, true] {
-                for possession in [false, true] {
-                    let plan = plan_lifecycle(LifecycleRequest::Acquire {
-                        snapshot: AcquisitionSnapshot {
-                            row,
-                            durable,
-                            wanted,
-                        },
-                        possession,
-                    });
-                    assert!(plan.after_commit().is_empty());
-                    if row && durable && (!possession || wanted) {
-                        assert_eq!(plan.outcome(), Outcome::Applied);
-                        let expected = if possession {
-                            vec![Mutation::DeleteWant, Mutation::UpsertPin]
-                        } else {
-                            vec![Mutation::UpsertPin]
-                        };
-                        assert_eq!(plan.transaction(), expected);
-                    } else {
-                        assert_eq!(plan.outcome(), Outcome::Skipped);
-                        assert!(plan.transaction().is_empty());
-                    }
+    use synch_verified::host::{Cell, Fields, Row, Storage};
+
+    struct Script {
+        durable: Option<i64>,
+        wanted: bool,
+        trace: Vec<&'static str>,
+    }
+
+    fn key() -> Fields {
+        vec![
+            ("root".into(), Cell::Blob(vec![0; 32])),
+            ("holder".into(), Cell::Text("replica:space".into())),
+        ]
+    }
+
+    impl Storage for Script {
+        type Error = &'static str;
+
+        fn begin(&mut self) -> Result<u64, Self::Error> {
+            self.trace.push("begin");
+            Ok(7)
+        }
+        fn commit(&mut self, tx: u64) -> Result<(), Self::Error> {
+            assert_eq!(tx, 7);
+            self.trace.push("commit");
+            Ok(())
+        }
+        fn rollback(&mut self, _tx: u64) -> Result<(), Self::Error> {
+            panic!("no failed storage reply in this script")
+        }
+        fn read_rows(
+            &mut self,
+            tx: u64,
+            relation: &str,
+            columns: &[String],
+            equals: &Fields,
+        ) -> Result<Vec<Row>, Self::Error> {
+            assert_eq!(tx, 7);
+            match relation {
+                "blobs" => {
+                    assert_eq!(columns, ["durable"]);
+                    assert_eq!(equals, &key()[..1]);
+                    self.trace.push("read durable");
+                    Ok(self
+                        .durable
+                        .map(|value| vec![Cell::Integer(value)])
+                        .into_iter()
+                        .collect())
                 }
+                "content_want" => {
+                    assert_eq!(columns, ["root"]);
+                    assert_eq!(equals, &key());
+                    self.trace.push("read want");
+                    Ok(if self.wanted {
+                        vec![vec![Cell::Blob(vec![0; 32])]]
+                    } else {
+                        vec![]
+                    })
+                }
+                _ => panic!("unexpected raw relation"),
+            }
+        }
+        fn upsert(
+            &mut self,
+            tx: u64,
+            relation: &str,
+            values: &Fields,
+            conflicts: &[String],
+            updates: &[String],
+        ) -> Result<(), Self::Error> {
+            assert_eq!(tx, 7);
+            assert_eq!(relation, "pins");
+            assert_eq!(conflicts, ["root", "holder"]);
+            assert_eq!(updates, ["release_after"]);
+            let mut expected = key();
+            expected.extend([
+                ("created_at".into(), Cell::Integer(-17)),
+                ("release_after".into(), Cell::Null),
+            ]);
+            assert_eq!(values, &expected);
+            self.trace.push("upsert pin");
+            Ok(())
+        }
+        fn delete_rows(
+            &mut self,
+            tx: u64,
+            relation: &str,
+            equals: &Fields,
+        ) -> Result<u64, Self::Error> {
+            assert_eq!(tx, 7);
+            assert_eq!(relation, "content_want");
+            assert_eq!(equals, &key());
+            self.trace.push("delete want");
+            Ok(1)
+        }
+        fn read_bytes(
+            &mut self,
+            _space: &str,
+            _key: &[u8],
+        ) -> Result<Option<Vec<u8>>, Self::Error> {
+            panic!("acquisition never reads payload bytes")
+        }
+    }
+
+    for durable in [None, Some(0), Some(1), Some(-7), Some(i64::MIN)] {
+        for wanted in [false, true] {
+            for possession in [false, true] {
+                let mut script = Script {
+                    durable,
+                    wanted,
+                    trace: vec![],
+                };
+                let accepted = synch_verified::cas::acquire(
+                    &mut script,
+                    &[0; 32],
+                    "replica:space",
+                    -17,
+                    possession,
+                )
+                .unwrap();
+                let expected = durable.is_some_and(|value| value != 0) && (!possession || wanted);
+                assert_eq!(accepted, expected);
+                let mut trace = vec!["begin", "read durable", "read want"];
+                if expected {
+                    if possession {
+                        trace.push("delete want");
+                    }
+                    trace.push("upsert pin");
+                }
+                trace.push("commit");
+                assert_eq!(script.trace, trace);
             }
         }
     }

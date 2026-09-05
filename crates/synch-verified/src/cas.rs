@@ -1,12 +1,4 @@
-//! CAS domain planning. No SQL, trie types, or per-predicate callbacks.
-
-/// Snapshot for one holder's acquisition, read under the transaction lock.
-#[derive(Debug, Clone, Copy)]
-pub struct AcquisitionSnapshot {
-    pub row: bool,
-    pub durable: bool,
-    pub wanted: bool,
-}
+//! CAS operations and the not-yet-migrated deletion planner.
 
 /// Snapshot for one object's deletion, protected through post-commit cleanup.
 #[derive(Debug, Clone, Copy)]
@@ -21,10 +13,6 @@ pub struct DeletionSnapshot {
 /// Supported lifecycle operations and their operation-specific facts.
 #[derive(Debug, Clone, Copy)]
 pub enum LifecycleRequest {
-    Acquire {
-        snapshot: AcquisitionSnapshot,
-        possession: bool,
-    },
     Delete {
         snapshot: DeletionSnapshot,
         before: Option<i64>,
@@ -35,8 +23,6 @@ pub enum LifecycleRequest {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Mutation {
     DeleteRow,
-    DeleteWant,
-    UpsertPin,
 }
 
 /// Best-effort file cleanup, executed only after a successful commit.
@@ -95,10 +81,6 @@ unsafe extern "C" {
 pub fn plan_lifecycle(request: LifecycleRequest) -> LifecyclePlan {
     super::native::enter();
     let (command, row, a, b, c, d, accessed, before) = match request {
-        LifecycleRequest::Acquire {
-            snapshot: s,
-            possession,
-        } => (0, s.row, s.durable, s.wanted, possession, false, 0, 0),
         LifecycleRequest::Delete {
             snapshot: s,
             before,
@@ -142,8 +124,6 @@ pub fn plan_lifecycle(request: LifecycleRequest) -> LifecyclePlan {
         .filter_map(|tag| match tag {
             0 => None,
             1 => Some(Mutation::DeleteRow),
-            2 => Some(Mutation::DeleteWant),
-            3 => Some(Mutation::UpsertPin),
             _ => panic!("invalid Lean transaction action"),
         })
         .collect();
@@ -161,4 +141,17 @@ pub fn plan_lifecycle(request: LifecycleRequest) -> LifecyclePlan {
         transaction,
         after_commit,
     }
+}
+pub use crate::operation::OperationError;
+
+/// Execute complete pin/possession acquisition over raw storage capabilities.
+/// Lean owns reads, interpretation, mutations, transaction completion and errors.
+pub fn acquire<S: crate::host::Storage>(
+    storage: &mut S,
+    root: &[u8; 32],
+    holder: &str,
+    now: i64,
+    possession: bool,
+) -> Result<bool, OperationError<S::Error>> {
+    crate::operation::acquire(storage, root, holder, now, possession)
 }

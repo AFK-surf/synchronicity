@@ -207,8 +207,10 @@ the proof package imports those exact modules. The shared carrier's laws and
 transaction traces cover begin failure, body failure, commit failure and
 preservation of the primary error across rollback failure.
 
-These programs are staged: the existing production entry points have not yet
-been switched to them. The immediate integration sequence is:
+CAS pin/possession acquisition now uses the complete Lean operation in
+production. Its old snapshot/planner interface and Rust read/interpret/mutation
+orchestration have been deleted. Trie and history programs remain staged. The
+integration sequence for each operation is:
 
 1. Implement the common native continuation transport with typed reply
    validation, single-use resume ownership and cancellation/resource tests.
@@ -236,8 +238,55 @@ Integration review has identified specific gates, not waived limitations:
   Lean, not a host `deleteUnreferencedHistory` operation. The staged equality-only
   deletion is insufficient for cutover. Preserve or explicitly resolve existing
   malformed signed-head/pointer decoding and error behavior as well.
-- Trie fixture and read-bound proofs do not yet establish full codec
-  roundtripping/canonicality or lookup/map semantics. Native commands must
+- Trie lookup now has soundness/completeness proofs against a stable raw graph
+  interpreted by the actual decoder. Codec roundtripping/canonicality and
+  mutable-host refinement remain separate obligations. Native commands must
   enforce the existing 32-byte root type before constructing an operation.
-- Native continuation ownership, reply validation and physical storage effects
-  still need their contract tests. Compiling the carrier proves none of these.
+- Native tests now cover acquisition transport, every effect-failure position,
+  repeated polling, malformed replies and terminal resume. Generic SQLite tests
+  cover UPSERT identity/time preservation, raw cells, failed commit, abandoned
+  sessions and automatic SQLite rollback. These are contract tests, not a proof
+  of the C/Rust implementation or physical storage behavior.
+
+### Current native transport
+
+`Host/Wire.lean` encodes raw requests and decodes replies. `Entry.lean` alone
+imports domains to construct commands; the shared transport imports no domain
+policy. Packets begin with version 1 and a discriminant, with little-endian u64
+integers/lengths and length-delimited UTF-8/bytes. Requests encode explicit
+relation/projection/equality/upsert values. Replies preserve raw signed cells,
+NULL, empty values, absence and original host failures. Decoders reject unknown
+versions/tags, wrong effect reply types, truncated or trailing data and lengths
+that cannot fit the remaining packet before allocation.
+
+Rust's private synchronous runner owns one thread-confined native continuation.
+It exposes no handles, polling or resume API to callers/host implementations,
+and consumes exactly one typed host result for each pending request. Repeated
+internal polling is inert; completed programs cannot restart. No SQLite guards
+move across awaits or threads. The raw SQLite interpreter borrows the caller's
+guarded connection for the entire operation and rejects stale transaction IDs,
+including writes after SQLite has automatically rolled back. Its Drop path
+releases only its own abandoned transaction. Normal rollback and primary-error
+selection are requested by Lean, including for malformed reply packets.
+
+Only a host failure's opaque token crosses into Lean; Rust retains the original
+error object until Lean completes. Thus a later rollback failure cannot overwrite
+the error the operation chose. This implementation does not yet expose an async
+resumption API; any such API needs explicit request identity and cancellation
+contracts rather than exporting the current private pointer operations.
+
+### Bounded development validation
+
+Native compilation and the repository's Lean packages limit each Lean compiler
+to one thread and 4 GiB. Cargo's job count alone does not constrain Lean's
+internal worker pool. After the development-session OOM, run heavy validation
+sequentially (`CARGO_BUILD_JOBS=1`, test threads 1), and check individual changed
+proof targets before the aggregate build. An OS process-group memory limit adds
+protection for the whole build; a virtual-address limit is not an equivalent
+measure for memory-mapped proof artifacts.
+
+The transport proofs import only their executable runtime modules, not the
+abstract model prelude. Fixed-width integer reads use one bounds check/state
+transition; literal raw-cell fixtures are checked independently. This avoids
+expanding large nests of state-monad reductions in the kernel. No proof uses
+`native_decide`, unchecked axioms, or a replacement executable to avoid the gate.

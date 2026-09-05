@@ -22,6 +22,8 @@ fn main() {
         "Host",
         "Cas",
         "Cas/Program",
+        "Host/Wire",
+        "Entry",
         "Trie/Codec",
         "Trie/Program",
         "Replication/History",
@@ -46,7 +48,13 @@ fn main() {
     std::fs::create_dir_all(out.join("VerifiedCore")).unwrap();
     let lean = |args: &[&str]| {
         let mut cmd = Command::new("lean");
-        cmd.current_dir(&lean_dir).env("LEAN_PATH", &out).args(args);
+        // Cargo's job count does not limit Lean's own worker pool. Native
+        // modules are small and compiled serially; bound each compiler's
+        // threads and memory instead of multiplying host-core-sized pools.
+        cmd.current_dir(&lean_dir)
+            .env("LEAN_PATH", &out)
+            .args(["-j1", "-M4096"])
+            .args(args);
         output(&mut cmd)
     };
     let version = lean(&["--version"]);

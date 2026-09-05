@@ -8,10 +8,15 @@ open Host
 def malformedMetadata : Failure := ⟨2, 0⟩
 
 /-- The existing database interprets every nonzero durable integer as true.
-Neither NULL nor another cell type is silently coerced into a claim. -/
+Neither NULL nor another cell type is silently coerced into a claim. Failure
+details 1/2/3 preserve the NULL/text/blob column-type error at the public API;
+they describe an error selected here, not metadata for Rust to interpret. -/
 def decodeDurability : List Row → Reply Bool
   | [] => .ok false
   | [[.integer value]] => .ok (value != 0)
+  | [[.null]] => .error ⟨2, 1⟩
+  | [[.text _]] => .error ⟨2, 2⟩
+  | [[.blob _]] => .error ⟨2, 3⟩
   | _ => .error malformedMetadata
 
 /-- Acquire one holder's pin inside an already-owned transaction. The database

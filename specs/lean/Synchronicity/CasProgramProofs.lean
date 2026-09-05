@@ -93,7 +93,15 @@ theorem durability_nonzero (value : Int64) :
 /-- Missing rows are not durable; malformed columns are errors, not absence. -/
 theorem missing_not_durable : decodeDurability [] = .ok false := rfl
 
-theorem null_not_durable : decodeDurability [[.null]] = .error malformedMetadata := rfl
+theorem null_not_durable : decodeDurability [[.null]] = .error ⟨2, 1⟩ := rfl
+
+/-- Text, including numeric-looking text, retains its column-type error. -/
+theorem text_not_durable (value : String) :
+    decodeDurability [[.text value]] = .error ⟨2, 2⟩ := rfl
+
+/-- Opaque bytes cannot be coerced into a durable integer. -/
+theorem blob_not_durable (value : ByteArray) :
+    decodeDurability [[.blob value]] = .error ⟨2, 3⟩ := rfl
 
 /-- With successful storage, the complete program requests exactly its guarded
 mutations between the raw reads and commit. A direct pin does not delete wants. -/
@@ -140,6 +148,7 @@ theorem decoded_execution (tx : Transaction) (root : ByteArray) (holder : String
 
 /-- Authorization is derived from the raw observations of the actual program:
 durability is required, and possession additionally requires a live want. -/
+@[rust_justifies "cas-lifecycle-acquisition"]
 theorem execution_authorized (tx : Transaction) (root : ByteArray) (holder : String)
     (now : Int64) (possession durable : Bool) (rows wanted : List Row)
     (decoded : decodeDurability rows = .ok durable) :
@@ -183,7 +192,7 @@ theorem malformed_row_failure (tx : Transaction) (rollback : Reply Unit)
     (root : ByteArray) (holder : String) (now : Int64) (possession : Bool) :
     run { begin := .ok tx, durable := .ok [[.null]], rollback := rollback }
         root holder now possession =
-      (.error malformedMetadata, [.begin,
+      (.error ⟨2, 1⟩, [.begin,
         .readRows tx "blobs" ["durable"] [("root", .blob root)], .rollback tx]) := rfl
 
 /-- A failed want read cannot be mistaken for an absent or still-live want. -/
