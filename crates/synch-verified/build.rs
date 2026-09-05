@@ -85,7 +85,7 @@ fn main() {
         "cargo:rustc-link-search=native={}",
         sysroot.join("lib").display()
     );
-    for lib in ["Init", "leanrt", "gmp", "uv"] {
+    for lib in ["Std", "Init", "leanrt", "gmp", "uv"] {
         println!("cargo:rustc-link-lib=static={lib}");
     }
     if macos {

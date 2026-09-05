@@ -1,6 +1,8 @@
+import Std.Data.TreeSet.Basic
+
 /-!
-Executable production decisions. This module imports only Lean's standard
-prelude: proofs in specs/lean import this exact source, never a copied model.
+Executable production decisions. This module imports Lean's standard library:
+proofs in specs/lean import this exact source, never a copied model.
 No unsafe replacement, external implementation, or noncomputable definition
 is used for a decision. Export wrappers are the only native entry points.
 -/
@@ -178,5 +180,167 @@ def cacheFinish (s : CertificateCache) : CertificateCache := finishMutation s
 @[export synch_lean_cache_certify]
 def cacheCertify (s : CertificateCache) (epoch : UInt64) (key : ByteArray) : CertificateCache :=
   certify s epoch (pathOf key)
+
+/-- Native byte output for paths/hashes previously read from byte arrays. -/
+def bytesOf (path : List Nat) : ByteArray := ⟨(path.map UInt8.ofNat).toArray⟩
+
+/-- A pending positional trie visit, including its complete-reference partner. -/
+structure WalkPosition where
+  /-- Hash at the same position in a known-complete reference, if present. -/
+  reference : Option (List Nat)
+  /-- Requested node hash. -/
+  hash : List Nat
+  /-- Nibble position, not merely a hash identity. -/
+  path : List Nat
+
+/-- Lexicographic visit order for persistent balanced sets. -/
+instance walkVisitOrd : Ord (List Nat × Option (List Nat)) := lexOrd
+
+/-- Deduplication is position-independent only below a complete prefix grant. -/
+def walkVisit (scope : Scope) (p : WalkPosition) : List Nat × Option (List Nat) :=
+  (p.hash, if containsSubtree scope p.path then none else some p.path)
+
+/-- Pure result of examining a finite frontier. -/
+structure WalkPoll where
+  /-- The part of the stack not yet examined. -/
+  rest : List WalkPosition
+  /-- Next node whose presence must be read. -/
+  current : Option WalkPosition := none
+  /-- Invalid positional depth; the walk must fail closed. -/
+  fault : Option Nat := none
+
+/-- Skip only reference-equal or already expanded positions, checking the
+depth before either shortcut. Recursion is structural in the finite stack. -/
+def pollFrontier (scope : Scope) (maxDepth : Nat)
+    (seen : Std.TreeSet (List Nat × Option (List Nat))) : List WalkPosition → WalkPoll
+  | [] => ⟨[], none, none⟩
+  | p :: rest =>
+    if p.path.length > maxDepth then ⟨rest, none, some p.path.length⟩
+    else if p.reference == some p.hash || seen.contains (walkVisit scope p) then
+      pollFrontier scope maxDepth seen rest
+    else ⟨rest, some p, none⟩
+
+/-- Executable resumable fetch control state. No frontier/set is mirrored in Rust. -/
+structure MissingWalk where
+  /-- Scope interpreted by the executable authorization functions. -/
+  scope : Scope
+  /-- Canonical key-depth ceiling. -/
+  maxDepth : Nat
+  /-- Stack of pending visits. -/
+  frontier : List WalkPosition := []
+  /-- Positional/hash visits already expanded. -/
+  seen : Std.TreeSet (List Nat × Option (List Nat)) := {}
+  /-- Absent nodes or nodes awaiting their payload, in reverse encounter order. -/
+  deferred : List WalkPosition := []
+  /-- Extension children whose shape must be checked when they arrive. -/
+  branches : Std.TreeSet (List Nat) := {}
+  /-- Payload hashes already requested in this batch. -/
+  asked : Std.TreeSet (List Nat) := {}
+  /-- The node currently being interpreted by the storage adapter. -/
+  current : Option WalkPosition := none
+  /-- A canonicality failure is sticky, including across resume. -/
+  fault : Option Nat := none
+
+/-- Select a storage read, recording its deduplication key exactly once. -/
+def pollWalk (s : MissingWalk) : MissingWalk :=
+  if s.fault.isSome then s else
+    let polled := pollFrontier s.scope s.maxDepth s.seen s.frontier
+    { s with frontier := polled.rest, current := polled.current, fault := polled.fault
+             seen := match polled.current with
+               | none => s.seen
+               | some p => s.seen.insert (walkVisit s.scope p) }
+
+/-- A missing node or payload must be revisited after the next fetch. -/
+def deferWalk (s : MissingWalk) : MissingWalk :=
+  match s.current with
+  | none => s
+  | some p => { s with deferred := p :: s.deferred }
+
+/-- Resume without restarting from the root. Other completed visits remain seen. -/
+def resumeWalk (s : MissingWalk) : MissingWalk :=
+  { s with frontier := s.deferred ++ s.frontier, deferred := [], current := none
+           seen := s.deferred.foldl (fun seen p => seen.erase (walkVisit s.scope p)) s.seen }
+
+/-- Push a child only at an admitted position; the absolute path is built here. -/
+def enqueueWalk (s : MissingWalk) (reference : Option (List Nat))
+    (hash step : List Nat) : MissingWalk :=
+  match s.current with
+  | none => s
+  | some p =>
+    let path := p.path ++ step
+    if admitsPath s.scope path then
+      { s with frontier := ⟨reference, hash, path⟩ :: s.frontier }
+    else s
+
+/-- Construct a walk; an empty root or unadmitted root has no frontier. -/
+@[export synch_lean_walk_new]
+def walkNew (scope : Scope) (reference root : ByteArray) (maxDepth : UInt64) : MissingWalk :=
+  { scope, maxDepth := maxDepth.toNat
+    frontier := if root.isEmpty || !admitsPath scope [] then [] else
+      [⟨if reference.isEmpty then none else some (pathOf reference), pathOf root, []⟩] }
+
+/-- The current state can be exhausted only without deferred work or a fault. -/
+@[export synch_lean_walk_exhausted]
+def walkExhausted (s : MissingWalk) : Bool :=
+  s.frontier.isEmpty && s.deferred.isEmpty && s.fault.isNone
+
+/-- Exported polling transition. -/
+@[export synch_lean_walk_poll]
+def walkPoll (s : MissingWalk) : MissingWalk := pollWalk s
+
+/-- Poll result tag: drained, current position, or canonicality failure. -/
+@[export synch_lean_walk_status]
+def walkStatus (s : MissingWalk) : UInt8 :=
+  if s.fault.isSome then 2 else if s.current.isSome then 1 else 0
+
+/-- Export a current-position field, without exposing Lean object layout. -/
+@[export synch_lean_walk_field]
+def walkField (s : MissingWalk) (field : UInt8) : ByteArray :=
+  match s.current with
+  | none => ByteArray.empty
+  | some p => bytesOf (if field == 0 then p.reference.getD [] else
+      if field == 1 then p.hash else p.path)
+
+/-- Diagnostic depth for a failed poll. -/
+@[export synch_lean_walk_depth]
+def walkDepth (s : MissingWalk) : UInt64 := UInt64.ofNat (s.fault.getD 0)
+
+/-- Exported defer transition. -/
+@[export synch_lean_walk_defer]
+def walkDefer (s : MissingWalk) : MissingWalk := deferWalk s
+
+/-- Exported resume transition. -/
+@[export synch_lean_walk_resume]
+def walkResume (s : MissingWalk) : MissingWalk := resumeWalk s
+
+/-- Start a batch with independent payload deduplication. -/
+@[export synch_lean_walk_batch]
+def walkBatch (s : MissingWalk) : MissingWalk := { s with asked := {} }
+
+/-- Export child-path construction and authorization. -/
+@[export synch_lean_walk_enqueue]
+def walkEnqueue (s : MissingWalk) (reference hash step : ByteArray) : MissingWalk :=
+  enqueueWalk s (if reference.isEmpty then none else some (pathOf reference))
+    (pathOf hash) (pathOf step)
+
+/-- Test whether a future extension child has a pending shape obligation. -/
+@[export synch_lean_walk_requires_branch]
+def walkRequiresBranch (s : MissingWalk) (hash : ByteArray) : Bool :=
+  s.branches.contains (pathOf hash)
+
+/-- Set or discharge an extension-child shape obligation. -/
+@[export synch_lean_walk_branch]
+def walkBranch (s : MissingWalk) (hash : ByteArray) (required : Bool) : MissingWalk :=
+  { s with branches := if required then s.branches.insert (pathOf hash)
+                      else s.branches.erase (pathOf hash) }
+
+/-- Whether a payload would be a new request within this batch. -/
+@[export synch_lean_walk_unasked]
+def walkUnasked (s : MissingWalk) (hash : ByteArray) : Bool := !s.asked.contains (pathOf hash)
+
+/-- Remember a payload request for this batch, independently of deferral. -/
+@[export synch_lean_walk_ask]
+def walkAsk (s : MissingWalk) (hash : ByteArray) : MissingWalk :=
+  { s with asked := s.asked.insert (pathOf hash) }
 
 end VerifiedCore

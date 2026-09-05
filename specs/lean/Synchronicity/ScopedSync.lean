@@ -317,7 +317,6 @@ theorem held_not_boundary (h : x ∈ st.held) : ¬ Boundary s st path x :=
 is admitted, so expanding a node there does not depend on which of its
 positions the walk met it at; one expansion per hash is one per subtree.
 Above the grant the key carries the position. -/
-@[rust_justifies "mpt-walk-seen"]
 theorem children_inside_grant_admitted (h : s.ContainsSubtree path) (stp : Path) :
     s.AdmitsPath (path ++ stp) :=
   Scope.admitsPath_of_containsSubtree (Scope.containsSubtree_append h stp)
@@ -412,7 +411,6 @@ def CompleteWithin (c : Content) (st : Store) (s : Scope) (root : Hash) : Prop :
 /-- `trie.rs::MissingWalk::next_batch`, `reference == Some(hash)`.  The walk
 with a reference: a position whose wanted hash the reference pairing also
 names is skipped, and nothing below it is visited. -/
-@[rust_impl "mpt-walk-prune-reference"]
 abbrev ReachRef (c : Content) (st : Store) (s : Scope) (prune : Path → Hash → Prop) (root : Hash) :
     Path → Hash → Prop :=
   Walk c st s (fun p x => ¬ prune p x) root

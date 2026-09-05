@@ -55,7 +55,7 @@ No generated C is checked in. Cargo generates it in its own `OUT_DIR`, so
 parallel target/profile builds do not race on shared generated artifacts.
 Mathlib is needed for the proof build, not the native build or runtime.
 The build checks the Lean version and runtime target triple before linking.
-The toolchain's Init, runtime, GMP and libuv archives are linked statically.
+The toolchain's Std, Init, runtime, GMP and libuv archives are linked statically.
 Linux and Windows also link the bundled C++ support statically; macOS uses
 Apple's system libc++. OS libraries remain dynamic dependencies.
 
@@ -74,6 +74,16 @@ Apple's system libc++. OS libraries remain dynamic dependencies.
   retained roots during mutations, retains only permitted roots at begin,
   advances nonterminal epochs, restores nesting depth at finish, and preserves
   certificate soundness when a completed walk supplies validity of its query.
+- the actual frontier scheduler selects only pending, depth-bounded, unseen,
+  non-reference-equal positions; checks depth before shortcuts; preserves
+  pending work on resume; refuses unadmitted child positions; and cannot report
+  exhaustion while deferred work or a sticky depth fault remains.
+
+`MissingWalk` also owns its frontier, seen set, deferred retries, per-batch
+payload request set and extension-child requirements in Lean. Its sets use
+persistent balanced trees: marking objects thread-shareable prevents exclusive
+array updates, so a hash table would copy its bucket array on each insertion.
+Rust still decodes nodes and supplies child/payload and storage observations.
 
 `Store` and `MemStore` use Lean's cache state and epoch guard. Rust owns the
 mutex and supplies byte keys, retained-root inputs, and storage effects; it
@@ -127,9 +137,9 @@ The end state is executable Lean core logic with proofs about that same Lean,
 not a manually reviewed correspondence between Rust and an abstract model.
 The following are still required:
 
-- Move trie traversal/frontiers, reference pairing, canonicality checks and
-  completeness derivation into Lean; the cache currently trusts a completed
-  walk's validity, and the walker remains Rust.
+- Finish moving trie expansion, reference pairing, canonicality checks and
+  completeness derivation into Lean. The scheduler is now Lean, but Rust still
+  interprets decoded nodes; the cache still trusts a completed walk's validity.
 - Move CAS bitmap settlement, accounting, GC and promotion decisions into Lean.
 - Move ingestion and materialization sequencing into Lean-generated effect
   plans; discharge the flush-before-advertise and publication invariants over

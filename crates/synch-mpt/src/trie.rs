@@ -216,20 +216,6 @@ impl Missing {
 /// A key/value pair as yielded by iteration and range scans.
 pub type Entry = (Vec<u8>, Vec<u8>);
 
-/// One position on the frontier: where a wanted node sits, what is wanted,
-/// and what stands at the same position in the reference trie.
-type Position = (Option<Hash>, Hash, Vec<u8>);
-
-/// What identifies a visit for deduplication: the node, and — only where the
-/// scope admits a position partially — the position too.
-///
-/// Under a full scope, or inside a granted prefix, a node's hash determines
-/// its whole subtree and the position adds nothing. On the spine it does: a
-/// node standing at two spine positions has children admitted under one and
-/// refused under the other, so a visit at the first cannot stand in for the
-/// second (§5.5).
-type Visit = (Hash, Option<Vec<u8>>);
-
 /// The §5.2 frontier, as a walk that keeps its place.
 ///
 /// **It resumes.** Restarting at the root for every batch makes a cold fetch
@@ -245,16 +231,10 @@ type Visit = (Hash, Option<Vec<u8>>);
 /// the tree (§5.2).
 #[derive(Debug)]
 pub struct MissingWalk {
-    /// `(the hash at this position in the reference trie, the hash wanted,
-    /// the nibble path of the position)`.
-    frontier: Vec<Position>,
-    seen: HashSet<Visit>,
-    /// Reported absent and awaiting the caller's fetch, so they can be
-    /// revisited — and their children discovered — once they land.
-    deferred: Vec<Position>,
-    /// Children of extension nodes that were not yet present when their parent
-    /// was walked, and so must be checked for being branches when they arrive.
-    must_be_branch: HashSet<Hash>,
+    /// Lean owns the frontier, positional seen set, deferred retries and
+    /// extension-child obligations. Hash-only deduplication is used only
+    /// inside a complete prefix grant; spine visits retain their positions.
+    state: synch_verified::MissingWalk,
     /// The part of the keyspace this walk may descend into (§5.5).
     ///
     /// A scoped walk stops at the boundary rather than asking for what it
@@ -311,18 +291,16 @@ impl MissingWalk {
         root: Hash,
         scope: Scope,
     ) -> MissingWalk {
-        let frontier = match root_opt(root) {
-            None => Vec::new(),
-            Some(root) if scope.admits_path(&[]) => {
-                vec![(known_complete.and_then(root_opt), root, Vec::new())]
-            }
-            Some(_) => Vec::new(),
-        };
+        let root = root_opt(root);
+        let reference = known_complete.and_then(root_opt);
+        let state = synch_verified::MissingWalk::new(
+            scope.native(),
+            reference.as_ref().map(Hash::as_bytes),
+            root.as_ref().map(Hash::as_bytes),
+            MAX_DEPTH_NIBBLES as u64,
+        );
         MissingWalk {
-            frontier,
-            seen: HashSet::new(),
-            deferred: Vec::new(),
-            must_be_branch: HashSet::new(),
+            state,
             scope,
             owner,
         }
@@ -330,7 +308,7 @@ impl MissingWalk {
 
     /// True once the walk has covered everything and nothing is outstanding.
     pub fn is_exhausted(&self) -> bool {
-        self.frontier.is_empty() && self.deferred.is_empty()
+        self.state.is_exhausted()
     }
 
     /// Re-queues everything reported absent, for after the caller has stored
@@ -338,12 +316,7 @@ impl MissingWalk {
     /// are reported again, which is what lets a caller notice it is making no
     /// progress.
     pub fn resume(&mut self) {
-        let deferred = std::mem::take(&mut self.deferred);
-        for (reference, hash, path) in deferred {
-            let visit = visit(&self.scope, hash, &path);
-            self.seen.remove(&visit);
-            self.frontier.push((reference, hash, path));
-        }
+        self.state.resume();
     }
 
     /// Walks until `max` absent hashes are found or the frontier drains.
@@ -361,12 +334,8 @@ impl MissingWalk {
         // blaming an honest peer for answering exactly what it was asked.
         // Local to the batch: an absent value must be reported again next round,
         // or the unproductive counter behind §5.2's abandonment never fires.
-        let mut asked: HashSet<Hash> = HashSet::new();
-        while let Some((reference, hash, path)) = self.frontier.pop() {
-            if missing.len() >= max {
-                self.frontier.push((reference, hash, path));
-                break;
-            }
+        self.state.start_batch();
+        while missing.len() < max {
             // The depth bound every walk carries, applied to the *fetch*, which
             // carried none: `hash_of_encoded` bounds one node's run at
             // `MAX_KEY_LEN * 2` and §12 read that as bounding ingest depth, but
@@ -383,24 +352,20 @@ impl MissingWalk {
             // being deduplicated — one node per *distinct* node served, no
             // leverage beyond what the member uploads (§12: `synch trust rm`).
             // An `MptError`, so it fails that origin and not the relaying peer.
-            if path.len() > MAX_DEPTH_NIBBLES {
-                return Err(MptError::NonCanonical(format!(
-                    "a trie node sits at nibble depth {}, past the \
+            // LEAN-MODEL: verified-walk-poll (VerifiedCoreProofs.walk_poll_selected)
+            let position = self.state.poll().map_err(|depth| {
+                MptError::NonCanonical(format!(
+                    "a trie node sits at nibble depth {depth}, past the \
                      {MAX_DEPTH_NIBBLES} any valid key reaches",
-                    path.len()
-                )));
-            }
-            // The same hash in a trie held whole: this subtree is already here,
-            // values and all.
-            // LEAN-MODEL: mpt-walk-prune-reference (ScopedSync.ReachRef)
-            // `ScopedSync.ReachRef`; `prune_sound` is why the memo written
-            // after a pruned walk is true, given `mpt-walk-paired-children`.
-            if reference == Some(hash) {
-                continue;
-            }
-            if !self.seen.insert(visit(&self.scope, hash, &path)) {
-                continue;
-            }
+                ))
+            })?;
+            let Some(position) = position else { break };
+            let reference = position.reference.map(Hash);
+            let hash = Hash(position.hash);
+            let path = position.path;
+            // Lean already skipped reference-equal positions. Connecting this
+            // executable pruning to completeness still requires migrating
+            // `paired_children` and its reference-validity invariant.
             let Some(data) = trie.load_owned_raw(self.owner.as_ref(), &hash)? else {
                 // A position a peer has refused holds nothing this node may
                 // see, so it is satisfied rather than missing (§5.5). Only
@@ -431,7 +396,7 @@ impl MissingWalk {
                     continue;
                 }
                 missing.nodes.push((path.clone(), hash));
-                self.deferred.push((reference, hash, path));
+                self.state.defer();
                 continue;
             };
             let node = TrieNode::decode(&data)?;
@@ -443,7 +408,9 @@ impl MissingWalk {
             // rely on not happening — making every peer's incremental sync cost
             // the whole tree. An `MptError`, so it fails its own origin and no
             // other (§12): the relaying peer served exactly what it was asked.
-            if self.must_be_branch.remove(&hash) && !matches!(node, TrieNode::Branch { .. }) {
+            if self.state.take_branch_requirement(hash.as_bytes())
+                && !matches!(node, TrieNode::Branch { .. })
+            {
                 return Err(MptError::NonCanonical(format!(
                     "node {hash} sits under an extension but is not a branch"
                 )));
@@ -462,7 +429,7 @@ impl MissingWalk {
                     }
                     Some(_) => {}
                     None => {
-                        self.must_be_branch.insert(*child);
+                        self.state.require_branch(child.as_bytes());
                     }
                 }
             }
@@ -486,15 +453,14 @@ impl MissingWalk {
                 }
             }
             for (child_reference, child, step) in paired_children(reference_node.as_ref(), &node) {
-                let mut child_path = path.clone();
-                child_path.extend_from_slice(&step);
                 // A child leading out of scope is not descended or asked for;
                 // its hash stays committed by the node just walked, keeping the
                 // root verifiable without it.
-                if !self.scope.admits_path(&child_path) {
-                    continue;
-                }
-                self.frontier.push((child_reference, child, child_path));
+                self.state.enqueue(
+                    child_reference.as_ref().map(Hash::as_bytes),
+                    child.as_bytes(),
+                    &step,
+                );
             }
             // A node whose out-of-line values have not arrived is not done
             // with, so it is deferred like a node that never loaded. Reporting
@@ -510,28 +476,16 @@ impl MissingWalk {
                     // node reporting the same payload says nothing about *this*
                     // node being done with.
                     awaiting_values = true;
-                    if asked.insert(value_hash) {
+                    if self.state.ask(value_hash.as_bytes()) {
                         missing.values.push((path.clone(), value_hash));
                     }
                 }
             }
             if awaiting_values {
-                self.deferred.push((reference, hash, path));
+                self.state.defer();
             }
         }
         Ok(missing)
-    }
-}
-
-/// The deduplication key for a node at a position ([`Visit`]).
-// LEAN-MODEL: mpt-walk-seen (ScopedSync.children_inside_grant_admitted)
-// `ScopedSync.children_inside_grant_admitted`: inside the grant expansion is
-// position-independent, which is what makes the hash alone a sound key there.
-// `Reach` is stated per position.
-fn visit(scope: &Scope, hash: Hash, path: &[u8]) -> Visit {
-    match scope.contains_subtree(path) {
-        true => (hash, None),
-        false => (hash, Some(path.to_vec())),
     }
 }
 

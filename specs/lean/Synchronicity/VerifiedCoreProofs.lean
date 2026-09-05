@@ -1,4 +1,5 @@
 import VerifiedCore
+import Std.Data.TreeSet.Lemmas
 import Synchronicity.ScopedSync
 import Synchronicity.Cas
 
@@ -287,6 +288,80 @@ theorem cache_transaction_depth (s : VerifiedCore.CertificateCache) (keep : Arra
     (VerifiedCore.cacheFinish (VerifiedCore.cacheBegin s keep)).mutating = s.mutating := by
   simp [VerifiedCore.cacheFinish, VerifiedCore.cacheBegin, VerifiedCore.finishMutation,
     VerifiedCore.beginMutation]
+
+/-- Exhaustion rules out deferred work and a canonicality fault. -/
+theorem walk_exhaustion (s : VerifiedCore.MissingWalk)
+    (done : VerifiedCore.walkExhausted s = true) :
+    s.frontier = [] ∧ s.deferred = [] ∧ s.fault = none := by
+  simpa [VerifiedCore.walkExhausted, Bool.and_eq_true, and_assoc] using done
+
+/-- A recorded payload cannot be requested a second time in the same batch. -/
+theorem walk_payload_once (s : VerifiedCore.MissingWalk) (hash : ByteArray) :
+    VerifiedCore.walkUnasked (VerifiedCore.walkAsk s hash) hash = false := by
+  simp [VerifiedCore.walkUnasked, VerifiedCore.walkAsk]
+
+/-- Batch reset permits a still-missing payload to be reported again. -/
+theorem walk_payload_retry (s : VerifiedCore.MissingWalk) (hash : ByteArray) :
+    VerifiedCore.walkUnasked (VerifiedCore.walkBatch s) hash = true := by
+  simp [VerifiedCore.walkUnasked, VerifiedCore.walkBatch]
+
+/-- Every selected read came from the frontier, is depth-bounded, and has
+neither a complete-reference shortcut nor an already-expanded visit key. -/
+@[rust_justifies "verified-walk-poll"]
+theorem walk_poll_selected (scope : VerifiedCore.Scope) (limit : Nat)
+    (seen : Std.TreeSet (List Nat × Option (List Nat)))
+    (frontier : List VerifiedCore.WalkPosition) (p : VerifiedCore.WalkPosition)
+    (selected : (VerifiedCore.pollFrontier scope limit seen frontier).current = some p) :
+    p ∈ frontier ∧ p.path.length ≤ limit ∧
+      (p.reference == some p.hash) = false ∧
+      seen.contains (VerifiedCore.walkVisit scope p) = false := by
+  induction frontier with
+  | nil => simp [VerifiedCore.pollFrontier] at selected
+  | cons q rest ih =>
+    simp only [VerifiedCore.pollFrontier] at selected
+    split at selected
+    · simp at selected
+    · rename_i bounded
+      split at selected
+      · exact ⟨List.mem_cons_of_mem q (ih selected).1, (ih selected).2⟩
+      · rename_i fresh
+        simp only [Option.some.injEq] at selected
+        subst p
+        simp only [Bool.or_eq_true, not_or, Bool.not_eq_true] at fresh
+        exact ⟨List.mem_cons_self, Nat.le_of_not_gt bounded, fresh⟩
+
+/-- Over-depth positions fail before reference pruning or deduplication. -/
+theorem walk_depth_before_shortcuts (scope : VerifiedCore.Scope) (limit : Nat)
+    (seen : Std.TreeSet (List Nat × Option (List Nat)))
+    (p : VerifiedCore.WalkPosition) (rest : List VerifiedCore.WalkPosition)
+    (deep : limit < p.path.length) :
+    (VerifiedCore.pollFrontier scope limit seen (p :: rest)).fault = some p.path.length := by
+  simp [VerifiedCore.pollFrontier, deep]
+
+/-- A canonicality fault cannot be cleared by polling or retrying. -/
+theorem walk_fault_sticky (s : VerifiedCore.MissingWalk) (fault : s.fault.isSome = true) :
+    VerifiedCore.pollWalk s = s ∧ (VerifiedCore.resumeWalk s).fault = s.fault := by
+  simp [VerifiedCore.pollWalk, VerifiedCore.resumeWalk, fault]
+
+/-- Retrying preserves all pending work in its stack order. -/
+theorem walk_resume_work (s : VerifiedCore.MissingWalk) :
+    (VerifiedCore.walkResume s).frontier = s.deferred ++ s.frontier ∧
+    (VerifiedCore.walkResume s).deferred = [] := by
+  simp [VerifiedCore.walkResume, VerifiedCore.resumeWalk]
+
+/-- A deferred current read prevents exhaustion, even with an empty frontier. -/
+theorem walk_deferred_not_exhausted (s : VerifiedCore.MissingWalk)
+    (p : VerifiedCore.WalkPosition) (current : s.current = some p) :
+    VerifiedCore.walkExhausted (VerifiedCore.walkDefer s) = false := by
+  simp [VerifiedCore.walkExhausted, VerifiedCore.walkDefer, VerifiedCore.deferWalk, current]
+
+/-- Child scheduling constructs the absolute path and refuses unadmitted work. -/
+theorem walk_enqueue_boundary (s : VerifiedCore.MissingWalk)
+    (p : VerifiedCore.WalkPosition) (reference : Option (List Nat)) (hash step : List Nat)
+    (current : s.current = some p)
+    (denied : VerifiedCore.admitsPath s.scope (p.path ++ step) = false) :
+    VerifiedCore.enqueueWalk s reference hash step = s := by
+  simp [VerifiedCore.enqueueWalk, current, denied]
 
 end Synchronicity.VerifiedCoreProofs
 

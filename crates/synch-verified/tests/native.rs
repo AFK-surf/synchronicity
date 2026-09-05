@@ -2,6 +2,73 @@ use proptest::prelude::*;
 use synch_verified::{group_count, settle_size, CertificateCache, Scope, Settlement, Shape};
 
 #[test]
+fn walk_retries_lifo_and_resets_only_batch_payload_requests() {
+    let mut walk =
+        synch_verified::MissingWalk::new(&Scope::new(None, &[]), None, Some(&[1; 32]), 8);
+    assert_eq!(walk.poll().unwrap().unwrap().hash, [1; 32]);
+    walk.enqueue(None, &[2; 32], &[0]);
+    walk.enqueue(None, &[3; 32], &[1]);
+    assert_eq!(walk.poll().unwrap().unwrap().hash, [3; 32]);
+    walk.defer();
+    assert_eq!(walk.poll().unwrap().unwrap().hash, [2; 32]);
+    walk.defer();
+    assert!(walk.poll().unwrap().is_none());
+    assert!(!walk.is_exhausted());
+    assert!(walk.ask(&[4; 32]));
+    assert!(!walk.ask(&[4; 32]));
+    walk.require_branch(&[2; 32]);
+    walk.start_batch();
+    assert!(walk.ask(&[4; 32]));
+    walk.resume();
+    // Move an already populated Lean state to a fresh Rust thread.
+    std::thread::spawn(move || {
+        assert_eq!(walk.poll().unwrap().unwrap().hash, [2; 32]);
+        assert!(walk.take_branch_requirement(&[2; 32]));
+        assert!(!walk.take_branch_requirement(&[2; 32]));
+        assert_eq!(walk.poll().unwrap().unwrap().hash, [3; 32]);
+        assert!(walk.poll().unwrap().is_none());
+        assert!(walk.is_exhausted());
+    })
+    .join()
+    .unwrap();
+}
+
+#[test]
+fn walk_checks_depth_before_reference_pruning_and_faults_stick() {
+    let mut walk =
+        synch_verified::MissingWalk::new(&Scope::new(None, &[]), None, Some(&[1; 32]), 1);
+    walk.poll().unwrap().unwrap();
+    walk.enqueue(Some(&[2; 32]), &[2; 32], &[0, 1]);
+    assert_eq!(walk.poll().unwrap_err(), 2);
+    walk.resume();
+    walk.start_batch();
+    assert_eq!(walk.poll().unwrap_err(), 2);
+    assert!(!walk.is_exhausted());
+}
+
+#[test]
+fn walk_dedup_is_positional_on_scope_spines_and_hash_only_inside_grants() {
+    for (scope, expected) in [
+        (Scope::new(None, &[]), 1),
+        (Scope::new(Some(&[vec![0, 5], vec![1, 5]]), &[]), 2),
+    ] {
+        let mut walk = synch_verified::MissingWalk::new(&scope, None, Some(&[1; 32]), 8);
+        walk.poll().unwrap().unwrap();
+        walk.enqueue(None, &[2; 32], &[0]);
+        walk.enqueue(None, &[2; 32], &[1]);
+        let mut count = 0;
+        while walk.poll().unwrap().is_some() {
+            count += 1;
+        }
+        assert_eq!(count, expected);
+        assert!(walk.is_exhausted());
+    }
+    let denied = Scope::new(Some(&[]), &[]);
+    let walk = synch_verified::MissingWalk::new(&denied, None, Some(&[1; 32]), 8);
+    assert!(walk.is_exhausted());
+}
+
+#[test]
 fn certificate_cache_owns_nested_invalidation_and_bounded_retention() {
     let mut cache = CertificateCache::new(2);
     assert!(cache.certify(0, b"a"));

@@ -20,6 +20,23 @@ impl From<&[u8]> for Slice {
 }
 
 unsafe extern "C" {
+    fn synch_adapter_walk_new(
+        scope: *mut c_void,
+        reference: Slice,
+        root: Slice,
+        max_depth: u64,
+    ) -> *mut c_void;
+    fn synch_adapter_walk_query(walk: *mut c_void, operation: u8, hash: Slice) -> u64;
+    fn synch_adapter_walk_update(
+        walk: *mut c_void,
+        operation: u8,
+        reference: Slice,
+        hash: Slice,
+        step: Slice,
+    ) -> *mut c_void;
+    fn synch_adapter_walk_field(walk: *mut c_void, field: u8) -> *mut c_void;
+    fn synch_adapter_bytes_len(value: *mut c_void) -> usize;
+    fn synch_adapter_bytes_data(value: *mut c_void) -> *const u8;
     fn synch_adapter_cache_new(capacity: u64) -> *mut c_void;
     fn synch_adapter_cache_epoch(cache: *mut c_void) -> u64;
     fn synch_adapter_cache_can_certify(cache: *mut c_void, epoch: u64) -> u8;
@@ -90,7 +107,7 @@ fn enter() {
 
 #[derive(Debug)]
 struct Handle(NonNull<c_void>);
-// SAFETY: the C adapter marks the entire immutable Lean scope graph MT before
+// SAFETY: the C adapter marks the entire immutable Lean object graph MT before
 // returning it. Calls only borrow the Rust handle and consume a new Lean ref.
 unsafe impl Send for Handle {}
 unsafe impl Sync for Handle {}
@@ -115,6 +132,140 @@ impl Drop for Handle {
 /// An immutable, thread-shareable scope owned by Lean, not a Rust reimplementation.
 #[derive(Debug, Clone)]
 pub struct Scope(Arc<Handle>);
+
+/// A storage read selected by the Lean frontier scheduler.
+#[derive(Debug)]
+pub struct WalkPosition {
+    pub reference: Option<[u8; 32]>,
+    pub hash: [u8; 32],
+    pub path: Vec<u8>,
+}
+
+/// Resumable frontier, deduplication, retries and shape obligations owned by Lean.
+#[derive(Debug)]
+pub struct MissingWalk(Arc<Handle>);
+
+impl MissingWalk {
+    /// Empty hashes are represented by `None`, never by a malformed short hash.
+    pub fn new(
+        scope: &Scope,
+        reference: Option<&[u8; 32]>,
+        root: Option<&[u8; 32]>,
+        max_depth: u64,
+    ) -> Self {
+        enter();
+        // SAFETY: the scope stays alive and all input byte arrays are copied.
+        let ptr = unsafe {
+            synch_adapter_walk_new(
+                scope.0 .0.as_ptr(),
+                reference.map_or(&[][..], |h| h.as_slice()).into(),
+                root.map_or(&[][..], |h| h.as_slice()).into(),
+                max_depth,
+            )
+        };
+        Self(Arc::new(Handle(
+            NonNull::new(ptr).expect("Lean walk allocation failed"),
+        )))
+    }
+
+    fn query(&self, operation: u8, hash: &[u8]) -> u64 {
+        enter();
+        // SAFETY: the adapter consumes a fresh reference and copies input bytes.
+        unsafe { synch_adapter_walk_query(self.0 .0.as_ptr(), operation, hash.into()) }
+    }
+
+    fn update(&mut self, operation: u8, reference: &[u8], hash: &[u8], step: &[u8]) {
+        enter();
+        // SAFETY: the immutable old state and buffers remain live throughout;
+        // the adapter returns an independently owned MT replacement state.
+        let ptr = unsafe {
+            synch_adapter_walk_update(
+                self.0 .0.as_ptr(),
+                operation,
+                reference.into(),
+                hash.into(),
+                step.into(),
+            )
+        };
+        self.0 = Arc::new(Handle(
+            NonNull::new(ptr).expect("Lean walk allocation failed"),
+        ));
+    }
+
+    fn field(&self, field: u8) -> Vec<u8> {
+        enter();
+        // SAFETY: the exported getter constructs a ByteArray. The owned handle
+        // keeps its backing allocation live until the bytes have been copied.
+        unsafe {
+            let ptr = synch_adapter_walk_field(self.0 .0.as_ptr(), field);
+            let value = Handle(NonNull::new(ptr).expect("Lean field allocation failed"));
+            let len = synch_adapter_bytes_len(value.0.as_ptr());
+            if len == 0 {
+                return Vec::new();
+            }
+            std::slice::from_raw_parts(synch_adapter_bytes_data(value.0.as_ptr()), len).to_vec()
+        }
+    }
+
+    /// Select the next read; an error is its invalid depth and remains sticky.
+    pub fn poll(&mut self) -> Result<Option<WalkPosition>, u64> {
+        self.update(0, &[], &[], &[]);
+        match self.query(1, &[]) {
+            0 => Ok(None),
+            1 => {
+                let reference = self.field(0);
+                Ok(Some(WalkPosition {
+                    reference: if reference.is_empty() {
+                        None
+                    } else {
+                        Some(reference.try_into().expect("Lean reference hash width"))
+                    },
+                    hash: self.field(1).try_into().expect("Lean node hash width"),
+                    path: self.field(2),
+                }))
+            }
+            2 => Err(self.query(2, &[])),
+            _ => panic!("invalid Lean walk status"),
+        }
+    }
+
+    /// Whether all frontier and deferred work has drained without a fault.
+    pub fn is_exhausted(&self) -> bool {
+        self.query(0, &[]) != 0
+    }
+    /// Retry deferred positions without restarting completed work.
+    pub fn resume(&mut self) {
+        self.update(2, &[], &[], &[]);
+    }
+    /// Reset payload request deduplication at a batch boundary.
+    pub fn start_batch(&mut self) {
+        self.update(3, &[], &[], &[]);
+    }
+    /// Defer the current position after an absent node or payload.
+    pub fn defer(&mut self) {
+        self.update(1, &[], &[], &[]);
+    }
+    /// Extend the current path and schedule the child only if Lean admits it.
+    pub fn enqueue(&mut self, reference: Option<&[u8; 32]>, hash: &[u8; 32], step: &[u8]) {
+        self.update(4, reference.map_or(&[][..], |h| h.as_slice()), hash, step);
+    }
+    /// Require a future extension child to be a branch.
+    pub fn require_branch(&mut self, hash: &[u8; 32]) {
+        self.update(5, &[], hash, &[]);
+    }
+    /// Discharge a shape obligation, returning whether it existed.
+    pub fn take_branch_requirement(&mut self, hash: &[u8; 32]) -> bool {
+        let required = self.query(3, hash) != 0;
+        self.update(6, &[], hash, &[]);
+        required
+    }
+    /// Remember a payload request and report whether it is new in this batch.
+    pub fn ask(&mut self, hash: &[u8; 32]) -> bool {
+        let fresh = self.query(4, hash) != 0;
+        self.update(7, &[], hash, &[]);
+        fresh
+    }
+}
 
 /// Completeness certificate state owned and updated exclusively by Lean.
 /// Callers synchronize storage effects and these transitions with their mutex.

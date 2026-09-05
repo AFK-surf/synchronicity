@@ -46,6 +46,10 @@ impl PartialEq for Scope {
 impl Eq for Scope {}
 
 impl Scope {
+    pub(crate) fn native(&self) -> &synch_verified::Scope {
+        &self.native
+    }
+
     /// The whole keyspace: what a rooted member holds and serves.
     pub fn full() -> Scope {
         Scope {
