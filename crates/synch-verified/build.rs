@@ -23,6 +23,10 @@ fn main() {
     let linux = target.ends_with("-linux-gnu");
     let macos = target.ends_with("-apple-darwin");
     let windows = target == "x86_64-pc-windows-gnullvm";
+    assert!(
+        target.starts_with("x86_64-") || target.starts_with("aarch64-"),
+        "the Lean core supports x86-64 and arm64 only"
+    );
     assert!(linux || macos || windows, "supported targets are Linux GNU, macOS, and Windows GNU/LLVM; OpenBSD, Linux musl, and Windows MSVC are not supported");
     let root = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let lean_dir = root.join("lean");

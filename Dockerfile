@@ -33,10 +33,10 @@ FROM rust:${RUST_VERSION}-bookworm AS build
 ARG TARGETARCH
 ENV ELAN_HOME=/opt/elan
 ENV PATH="/opt/elan/bin:${PATH}"
-RUN set -eux; \\
-    apt-get update; \\
-    apt-get install -y --no-install-recommends curl ca-certificates; \\
-    rm -rf /var/lib/apt/lists/*; \\
+RUN set -eux; \
+    apt-get update; \
+    apt-get install -y --no-install-recommends curl ca-certificates; \
+    rm -rf /var/lib/apt/lists/*; \
     curl --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y --default-toolchain none
 COPY crates/synch-verified/lean/lean-toolchain /tmp/synch-lean/lean-toolchain
 RUN cd /tmp/synch-lean && lean --version
