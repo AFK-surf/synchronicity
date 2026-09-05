@@ -20,6 +20,18 @@ impl From<&[u8]> for Slice {
 }
 
 unsafe extern "C" {
+    fn synch_adapter_cache_new(capacity: u64) -> *mut c_void;
+    fn synch_adapter_cache_epoch(cache: *mut c_void) -> u64;
+    fn synch_adapter_cache_can_certify(cache: *mut c_void, epoch: u64) -> u8;
+    fn synch_adapter_cache_known(cache: *mut c_void, key: Slice) -> u8;
+    fn synch_adapter_cache_update(
+        cache: *mut c_void,
+        operation: u8,
+        epoch: u64,
+        key: Slice,
+        keep: *const Slice,
+        count: usize,
+    ) -> *mut c_void;
     fn synch_adapter_initialize() -> u8;
     fn synch_adapter_thread_initialize();
     fn synch_adapter_thread_finalize();
@@ -103,6 +115,82 @@ impl Drop for Handle {
 /// An immutable, thread-shareable scope owned by Lean, not a Rust reimplementation.
 #[derive(Debug, Clone)]
 pub struct Scope(Arc<Handle>);
+
+/// Completeness certificate state owned and updated exclusively by Lean.
+/// Callers synchronize storage effects and these transitions with their mutex.
+#[derive(Debug)]
+pub struct CertificateCache(Arc<Handle>);
+
+impl CertificateCache {
+    /// Start with no certificates, no mutations, and epoch zero.
+    pub fn new(capacity: u64) -> Self {
+        enter();
+        // SAFETY: exact scalar ABI; the adapter returns one owned MT reference.
+        let ptr = unsafe { synch_adapter_cache_new(capacity) };
+        Self(Arc::new(Handle(
+            NonNull::new(ptr).expect("Lean cache allocation failed"),
+        )))
+    }
+
+    /// Snapshot epoch, computed by the same state used by certification.
+    pub fn epoch(&self) -> u64 {
+        enter();
+        // SAFETY: this handle remains live; the adapter consumes a fresh ref.
+        unsafe { synch_adapter_cache_epoch(self.0 .0.as_ptr()) }
+    }
+
+    /// Whether a certificate is usable in the current state.
+    pub fn contains(&self, key: &[u8]) -> bool {
+        enter();
+        // SAFETY: the call copies the key and borrows the live MT cache.
+        unsafe { synch_adapter_cache_known(self.0 .0.as_ptr(), key.into()) != 0 }
+    }
+
+    fn update(&mut self, operation: u8, epoch: u64, key: &[u8], keep: &[&[u8]]) {
+        enter();
+        let keep: Vec<Slice> = keep.iter().map(|key| (*key).into()).collect();
+        // SAFETY: all inputs remain live during this copying call; the result
+        // owns an independent MT reference. Dropping the old state is safe.
+        let ptr = unsafe {
+            synch_adapter_cache_update(
+                self.0 .0.as_ptr(),
+                operation,
+                epoch,
+                key.into(),
+                keep.as_ptr(),
+                keep.len(),
+            )
+        };
+        self.0 = Arc::new(Handle(
+            NonNull::new(ptr).expect("Lean cache allocation failed"),
+        ));
+    }
+
+    /// Invalidate before a storage mutation, retaining only eligible keys.
+    pub fn begin(&mut self, keep: &[&[u8]]) {
+        self.update(0, 0, &[], keep);
+    }
+
+    /// Invalidate again after storage commit or rollback.
+    pub fn finish(&mut self) {
+        self.update(1, 0, &[], &[]);
+    }
+
+    /// Certify a completed walk's snapshot. The decision and update both use
+    /// Lean's guard; the exclusive Rust borrow prevents a mutation between them.
+    pub fn certify(&mut self, epoch: u64, key: &[u8]) -> bool {
+        let accepted = self.can_certify(epoch);
+        self.update(2, epoch, key, &[]);
+        accepted
+    }
+
+    /// Test a snapshot ticket without storing a certificate (for non-caching stores).
+    pub fn can_certify(&self, epoch: u64) -> bool {
+        enter();
+        // SAFETY: the adapter borrows the live MT state with a fresh reference.
+        unsafe { synch_adapter_cache_can_certify(self.0 .0.as_ptr(), epoch) != 0 }
+    }
+}
 
 /// The node fields relevant to authorization. Hash bytes never authorize a key.
 #[derive(Debug, Clone, Copy)]

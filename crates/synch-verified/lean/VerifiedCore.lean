@@ -108,4 +108,75 @@ def groupCountExport (size : UInt64) : UInt64 := groupCount size
 def settleSizeExport (row durable complete finalHeld : Bool) (recorded claimed : UInt64) : UInt8 :=
   settleSize row durable complete finalHeld recorded claimed
 
+/-- Executable completeness certificate cache. The mutation depth is unbounded;
+the externally visible epoch saturates and permanently disables certification. -/
+structure CertificateCache where
+  /-- Cache keys are the exact bytes provided by the storage adapter. -/
+  roots : List (List Nat) := []
+  /-- Snapshot identifier, with the maximum reserved as a terminal epoch. -/
+  epoch : UInt64 := 0
+  /-- Number of transactions whose invalidation has not finished. -/
+  mutating : Nat := 0
+  /-- Maximum number of certificates retained before clearing. -/
+  capacity : Nat
+
+/-- Advance without wrapping an epoch back to a previously issued ticket. -/
+def advanceEpoch (epoch : UInt64) : UInt64 :=
+  if epoch == 18446744073709551615 then epoch else epoch + 1
+
+/-- The sole certification guard, shared by the query and state update. -/
+def canCertify (s : CertificateCache) (epoch : UInt64) : Bool :=
+  s.mutating == 0 && s.epoch == epoch && epoch != 18446744073709551615
+
+/-- Begin invalidation before storage visibility, retaining only supplied keys. -/
+def beginMutation (s : CertificateCache) (keep : List (List Nat)) : CertificateCache :=
+  { s with roots := s.roots.filter (fun q => keep.contains q)
+           epoch := advanceEpoch s.epoch, mutating := s.mutating + 1 }
+
+/-- Finish an invalidation. An unmatched finish leaves the cache unchanged. -/
+def finishMutation (s : CertificateCache) : CertificateCache :=
+  if s.mutating == 0 then s else
+    { s with epoch := advanceEpoch s.epoch, mutating := s.mutating - 1 }
+
+/-- Certify a completed snapshot, bounded by the configured cache capacity. -/
+def certify (s : CertificateCache) (epoch : UInt64) (key : List Nat) : CertificateCache :=
+  if canCertify s epoch then
+    let roots := if s.roots.length >= s.capacity then [] else s.roots
+    { s with roots := if roots.contains key then roots else key :: roots }
+  else s
+
+/-- An uncommitted transaction never exposes a retained certificate. -/
+def knownComplete (s : CertificateCache) (key : List Nat) : Bool :=
+  s.mutating == 0 && s.roots.contains key
+
+/-- Create an empty cache. -/
+@[export synch_lean_cache_new]
+def cacheNew (capacity : UInt64) : CertificateCache := ⟨[], 0, 0, capacity.toNat⟩
+
+/-- Read a snapshot epoch. -/
+@[export synch_lean_cache_epoch]
+def cacheEpoch (s : CertificateCache) : UInt64 := s.epoch
+
+/-- Export the exact certification guard. -/
+@[export synch_lean_cache_can_certify]
+def cacheCanCertify (s : CertificateCache) (epoch : UInt64) : Bool := canCertify s epoch
+
+/-- Export the certificate lookup using the same byte interpretation as scope. -/
+@[export synch_lean_cache_known]
+def cacheKnown (s : CertificateCache) (key : ByteArray) : Bool := knownComplete s (pathOf key)
+
+/-- Export the mutation-begin transition. -/
+@[export synch_lean_cache_begin]
+def cacheBegin (s : CertificateCache) (keep : Array ByteArray) : CertificateCache :=
+  beginMutation s (keep.toList.map pathOf)
+
+/-- Export the mutation-finish transition. -/
+@[export synch_lean_cache_finish]
+def cacheFinish (s : CertificateCache) : CertificateCache := finishMutation s
+
+/-- Export the certification transition. -/
+@[export synch_lean_cache_certify]
+def cacheCertify (s : CertificateCache) (epoch : UInt64) (key : ByteArray) : CertificateCache :=
+  certify s epoch (pathOf key)
+
 end VerifiedCore

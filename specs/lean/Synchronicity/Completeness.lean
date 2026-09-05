@@ -40,7 +40,7 @@ def Issue (valid : D → Q → Prop) (q : Q) : Transition (State D Q) where
   post s := { s with tickets := insert (s.generation, q) s.tickets }
 
 /-- `Store::note_complete_at`: epoch comparison and insertion share one lock. -/
-@[transition, rust_impl "mpt-memo-certify"]
+@[transition]
 def Certify (e : Nat) (q : Q) : Transition (State D Q) where
   guard s := s.mutating = 0 ∧ e = s.generation ∧ (e, q) ∈ s.tickets
   post s := { s with memo := insert q s.memo }
@@ -53,7 +53,7 @@ def Monotone (valid : D → Q → Prop) (data : D) : Transition (State D Q) wher
 
 /-- Invalidate before visibility. GC may keep only its retained-root memos;
 node and ownership insertions keep none. -/
-@[transition, rust_impl "mpt-memo-invalidate"]
+@[transition]
 def Begin (keep : Set Q) : Transition (State D Q) where
   guard _ := True
   post s := { s with
@@ -64,7 +64,7 @@ def Begin (keep : Set Q) : Transition (State D Q) where
 /-- Commit or rollback, after which a snapshot from inside the transaction
 must fail its epoch check. `valid` for retained GC certificates is justified
 by `TrieGraph.gcSweep_complete_iff`; other invalidations clear the cache. -/
-@[transition, rust_impl "mpt-memo-finish"]
+@[transition]
 def Finish (valid : D → Q → Prop) (data : D) : Transition (State D Q) where
   guard s := 0 < s.mutating ∧ ∀ q ∈ s.memo, valid data q
   post s := { s with data := data, generation := s.generation + 1, mutating := s.mutating - 1 }

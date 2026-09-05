@@ -253,11 +253,17 @@ struct CasCoord {
 /// Completeness answers avoid a full trie walk on every Hello. They remain
 /// valid only until a non-monotone mutation, including adding a formerly
 /// refused node to a provenance view. Lost certificates cost a fresh walk.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 struct Completeness {
-    roots: std::collections::HashSet<Hash>,
-    generation: u64,
-    mutating: usize,
+    state: synch_verified::CertificateCache,
+}
+
+impl Default for Completeness {
+    fn default() -> Self {
+        Self {
+            state: synch_verified::CertificateCache::new(COMPLETE_ROOTS_MAX as u64),
+        }
+    }
 }
 
 /// Keeps certification disabled until the invalidating transaction has either
@@ -268,14 +274,13 @@ struct MemoMutation(Arc<CasCoord>);
 
 impl Drop for MemoMutation {
     fn drop(&mut self) {
-        // LEAN-MODEL: mpt-memo-finish (Completeness.Finish)
+        // LEAN-MODEL: verified-memo-finish (VerifiedCoreProofs.cache_finish)
         let mut memo = self
             .0
             .completeness
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        memo.generation = memo.generation.saturating_add(1);
-        memo.mutating -= 1;
+        memo.state.finish();
     }
 }
 
@@ -835,13 +840,12 @@ impl Txn<'_> {
         &self,
         keep: &std::collections::HashSet<Hash>,
     ) {
-        // LEAN-MODEL: mpt-memo-invalidate (Completeness.Begin)
+        // LEAN-MODEL: verified-memo-begin (VerifiedCoreProofs.cache_begin_retains)
         let mut guard = self.invalidation.borrow_mut();
         if guard.is_none() {
             let mut memo = self.store.completeness();
-            memo.generation = memo.generation.saturating_add(1);
-            memo.mutating += 1;
-            memo.roots.retain(|root| keep.contains(root));
+            let keep: Vec<&[u8]> = keep.iter().map(|root| root.as_bytes().as_slice()).collect();
+            memo.state.begin(&keep);
             *guard = Some(MemoMutation(self.store.cas_coord.clone()));
         }
     }
@@ -1199,8 +1203,9 @@ impl NodeStore for Store {
     }
 
     fn is_known_complete(&self, root: &Hash) -> Result<bool> {
+        // LEAN-MODEL: verified-memo-known (VerifiedCoreProofs.cache_known)
         let memo = self.completeness();
-        Ok(memo.mutating == 0 && memo.roots.contains(root))
+        Ok(memo.state.contains(root.as_bytes()))
     }
 
     fn note_complete(&self, root: &Hash) -> Result<()> {
@@ -1209,22 +1214,13 @@ impl NodeStore for Store {
     }
 
     fn completeness_generation(&self) -> Result<u64> {
-        Ok(self.completeness().generation)
+        Ok(self.completeness().state.epoch())
     }
 
     fn note_complete_at(&self, root: &Hash, generation: u64) -> Result<bool> {
-        // LEAN-MODEL: mpt-memo-certify (Completeness.Certify)
+        // LEAN-MODEL: verified-memo-certify (VerifiedCoreProofs.cache_certify_sound)
         let mut memo = self.completeness();
-        // Saturation disables certification instead of allowing an ABA after
-        // wraparound. It cannot be reached in a process lifetime.
-        if memo.mutating != 0 || memo.generation != generation || generation == u64::MAX {
-            return Ok(false);
-        }
-        if memo.roots.len() >= COMPLETE_ROOTS_MAX {
-            memo.roots.clear();
-        }
-        memo.roots.insert(*root);
-        Ok(true)
+        Ok(memo.state.certify(generation, root.as_bytes()))
     }
 
     /// Redaction is durable, unlike the completeness memo above.

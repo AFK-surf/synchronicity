@@ -9,7 +9,7 @@ the functions agree with the abstract scope and CAS contracts.
 ## Mandatory integration
 
 Every build uses Lean 4.30.0 for scope/path/key/node/payload decisions and CAS
-size settlement. The corresponding Rust implementations and feature flags
+size settlement, plus completeness certificate state transitions. The corresponding Rust implementations and feature flags
 have been deleted. The shared `synch-core::group_count` API also delegates to
 Lean. Rust code in the native tests/example is an independent test oracle,
 not a selectable production backend.
@@ -70,6 +70,16 @@ Apple's system libc++. OS libraries remain dynamic dependencies.
   zero and `u64::MAX`, without overflow;
 - settlement accepts exactly the allowed claims, resets bits exactly when
   required, and implements `Cas.Settles` given the row's representation facts.
+- the executable certificate cache rejects stale/terminal tickets, hides
+  retained roots during mutations, retains only permitted roots at begin,
+  advances nonterminal epochs, restores nesting depth at finish, and preserves
+  certificate soundness when a completed walk supplies validity of its query.
+
+`Store` and `MemStore` use Lean's cache state and epoch guard. Rust owns the
+mutex and supplies byte keys, retained-root inputs, and storage effects; it
+does not update generations, decide retention, or implement certification.
+The cache currently uses finite lists; optimizing that representation must
+preserve the executable proofs rather than introduce a second Rust backend.
 
 This does not prove the C adapter, Rust node-to-shape mapping, SQL row decoding,
 or that the caller holds the transaction lock. Those remain explicit trust
@@ -110,3 +120,26 @@ Next: optimize/batch the boundary, benchmark real trie walks, and expand the
 source-based proofs as the incremental walker and promotion planner move.
 Moving a policy into Lean does not by itself verify the external effects that
 Rust performs in response.
+
+## Remaining migration (goal not complete)
+
+The end state is executable Lean core logic with proofs about that same Lean,
+not a manually reviewed correspondence between Rust and an abstract model.
+The following are still required:
+
+- Move trie traversal/frontiers, reference pairing, canonicality checks and
+  completeness derivation into Lean; the cache currently trusts a completed
+  walk's validity, and the walker remains Rust.
+- Move CAS bitmap settlement, accounting, GC and promotion decisions into Lean.
+- Move ingestion and materialization sequencing into Lean-generated effect
+  plans; discharge the flush-before-advertise and publication invariants over
+  those executed plans, not over independent abstract Rust descriptions.
+- Move head adoption, fetch progress/retry and provenance decision logic into
+  Lean, connecting the executable transitions to system safety/liveness proofs.
+- Replace remaining manually paired `LEAN-MODEL`/`rust_impl` sites as their
+  algorithms move. Keep only explicit ABI, serialization, cryptographic primitive
+  and I/O trust boundaries, with tests and contracts for the narrow adapters.
+
+The abstract `Completeness` module remains useful for reasoning about changing
+stores, but its old Rust-transition anchors were removed. Production cache
+sites now point to theorems about the actual exported Lean implementation.

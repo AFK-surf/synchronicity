@@ -171,6 +171,123 @@ theorem settlement_refines_model {c : Cas.Cell H}
   rw [sizes]
   cases row <;> cases durable <;> cases complete <;> cases finalHeld <;> simp_all
 
+/-- Exact guard of the production cache, including terminal-epoch refusal. -/
+theorem cache_can_certify (s : VerifiedCore.CertificateCache) (epoch : UInt64) :
+    VerifiedCore.canCertify s epoch = true ↔
+      s.mutating = 0 ∧ s.epoch = epoch ∧ epoch ≠ 18446744073709551615 := by
+  simp [VerifiedCore.canCertify, and_assoc]
+
+/-- A usable exported certificate is present and no mutation is outstanding. -/
+@[rust_justifies "verified-memo-known"]
+theorem cache_known (s : VerifiedCore.CertificateCache) (key : ByteArray) :
+    VerifiedCore.cacheKnown s key = true ↔
+      s.mutating = 0 ∧ VerifiedCore.pathOf key ∈ s.roots := by
+  simp [VerifiedCore.cacheKnown, VerifiedCore.knownComplete]
+
+/-- Invalid tickets leave the entire executable cache unchanged. -/
+theorem cache_rejected_unchanged (s : VerifiedCore.CertificateCache) (epoch : UInt64)
+    (key : ByteArray) (rejected : VerifiedCore.canCertify s epoch = false) :
+    VerifiedCore.cacheCertify s epoch key = s := by
+  simp [VerifiedCore.cacheCertify, VerifiedCore.certify, rejected]
+
+/-- Invalidation masks retained certificates even with nested transactions. -/
+theorem cache_begin_hides (s : VerifiedCore.CertificateCache) (keep : Array ByteArray)
+    (key : ByteArray) : VerifiedCore.cacheKnown (VerifiedCore.cacheBegin s keep) key = false := by
+  simp [VerifiedCore.cacheKnown, VerifiedCore.knownComplete, VerifiedCore.cacheBegin,
+    VerifiedCore.beginMutation]
+
+/-- Beginning a transaction cannot invent a certificate. -/
+@[rust_justifies "verified-memo-begin"]
+theorem cache_begin_retains (s : VerifiedCore.CertificateCache) (keep : Array ByteArray)
+    (key : List Nat) : key ∈ (VerifiedCore.cacheBegin s keep).roots ↔
+      key ∈ s.roots ∧ key ∈ keep.toList.map VerifiedCore.pathOf := by
+  simp [VerifiedCore.cacheBegin, VerifiedCore.beginMutation]
+
+/-- Certification only retains prior roots or inserts the supplied key. -/
+theorem cache_certify_roots (s : VerifiedCore.CertificateCache) (epoch : UInt64)
+    (key q : List Nat) (h : q ∈ (VerifiedCore.certify s epoch key).roots) :
+    q = key ∨ q ∈ s.roots := by
+  unfold VerifiedCore.certify at h
+  split_ifs at h <;> simp_all
+  all_goals grind
+
+/-- Soundness is proved about the executable update, not a Rust lookalike.
+The completed walk must supply validity of the newly certified query. -/
+@[rust_justifies "verified-memo-certify"]
+theorem cache_certify_sound (valid : List Nat → Prop) (s : VerifiedCore.CertificateCache)
+    (epoch : UInt64) (key : List Nat) (prior : ∀ q ∈ s.roots, valid q)
+    (completed : valid key) : ∀ q ∈ (VerifiedCore.certify s epoch key).roots, valid q := by
+  intro q h
+  rcases cache_certify_roots s epoch key q h with rfl | old
+  · exact completed
+  · exact prior q old
+
+/-- An accepted exported certification makes its requested key usable. -/
+theorem cache_certify_inserts (s : VerifiedCore.CertificateCache) (epoch : UInt64)
+    (key : ByteArray) (accepted : VerifiedCore.canCertify s epoch = true) :
+    VerifiedCore.cacheKnown (VerifiedCore.cacheCertify s epoch key) key = true := by
+  have idle := (cache_can_certify s epoch).mp accepted |>.1
+  simp only [VerifiedCore.cacheKnown, VerifiedCore.cacheCertify, VerifiedCore.certify,
+    accepted, ↓reduceIte, VerifiedCore.knownComplete]
+  split_ifs <;> simp_all
+
+/-- Certification stays bounded; capacity zero retains only the latest key. -/
+theorem cache_capacity_preserved (s : VerifiedCore.CertificateCache) (epoch : UInt64)
+    (key : List Nat) (bounded : s.roots.length ≤ max s.capacity 1) :
+    (VerifiedCore.certify s epoch key).roots.length ≤ max s.capacity 1 := by
+  unfold VerifiedCore.certify
+  split_ifs <;> simp_all
+  all_goals split_ifs <;> simp_all
+  omega
+
+/-- The cache remains a finite set even though its executable representation
+is currently a list. -/
+theorem cache_unique (s : VerifiedCore.CertificateCache) (epoch : UInt64)
+    (key : List Nat) (unique : s.roots.Nodup) :
+    (VerifiedCore.certify s epoch key).roots.Nodup := by
+  unfold VerifiedCore.certify
+  split_ifs <;> simp_all
+  all_goals split_ifs <;> simp_all
+
+/-- A stale snapshot cannot add any root through the actual exported update. -/
+theorem cache_stale_rejected (s : VerifiedCore.CertificateCache) (epoch : UInt64)
+    (key : ByteArray) (stale : s.epoch ≠ epoch) :
+    VerifiedCore.cacheCertify s epoch key = s := by
+  apply cache_rejected_unchanged
+  simp [VerifiedCore.canCertify, stale]
+
+/-- Saturation cannot enable an ABA certification, even at quiescence. -/
+theorem cache_terminal_rejected (s : VerifiedCore.CertificateCache) (key : ByteArray) :
+    VerifiedCore.cacheCertify s 18446744073709551615 key = s := by
+  apply cache_rejected_unchanged
+  simp [VerifiedCore.canCertify]
+
+/-- Every nonterminal epoch advances strictly, so prior tickets cannot recur. -/
+theorem cache_epoch_advances (epoch : UInt64) (h : epoch ≠ 18446744073709551615) :
+    epoch.toNat < (VerifiedCore.advanceEpoch epoch).toNat := by
+  have bound := epoch.toNat_lt
+  have notMax : epoch.toNat ≠ 18446744073709551615 := by
+    intro eq
+    apply h
+    exact UInt64.toNat_inj.mp eq
+  simp [VerifiedCore.advanceEpoch, h, UInt64.toNat_add]
+  omega
+
+/-- Finishing a real mutation decrements exactly one nesting level and
+advances the epoch; the cache cannot manufacture or drop a retained query. -/
+@[rust_justifies "verified-memo-finish"]
+theorem cache_finish (s : VerifiedCore.CertificateCache) (active : s.mutating ≠ 0) :
+    (VerifiedCore.cacheFinish s).roots = s.roots ∧
+    (VerifiedCore.cacheFinish s).mutating = s.mutating - 1 ∧
+    (VerifiedCore.cacheFinish s).epoch = VerifiedCore.advanceEpoch s.epoch := by
+  simp [VerifiedCore.cacheFinish, VerifiedCore.finishMutation, active]
+
+/-- The paired transaction edges restore the prior nesting level. -/
+theorem cache_transaction_depth (s : VerifiedCore.CertificateCache) (keep : Array ByteArray) :
+    (VerifiedCore.cacheFinish (VerifiedCore.cacheBegin s keep)).mutating = s.mutating := by
+  simp [VerifiedCore.cacheFinish, VerifiedCore.cacheBegin, VerifiedCore.finishMutation,
+    VerifiedCore.beginMutation]
+
 end Synchronicity.VerifiedCoreProofs
 
 #lint

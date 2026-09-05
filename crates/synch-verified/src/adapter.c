@@ -15,6 +15,13 @@ extern uint8_t synch_lean_scope_subtree(lean_object *, lean_object *);
 extern uint8_t synch_lean_scope_key(lean_object *, lean_object *);
 extern uint8_t synch_lean_scope_node(lean_object *, lean_object *, uint8_t, uint8_t, lean_object *);
 extern uint8_t synch_lean_scope_value(lean_object *, lean_object *, uint8_t, lean_object *);
+extern lean_object *synch_lean_cache_new(uint64_t);
+extern uint64_t synch_lean_cache_epoch(lean_object *);
+extern uint8_t synch_lean_cache_can_certify(lean_object *, uint64_t);
+extern uint8_t synch_lean_cache_known(lean_object *, lean_object *);
+extern lean_object *synch_lean_cache_begin(lean_object *, lean_object *);
+extern lean_object *synch_lean_cache_finish(lean_object *);
+extern lean_object *synch_lean_cache_certify(lean_object *, uint64_t, lean_object *);
 
 /* Matches the private Rust repr(C) slice. A zero length never dereferences ptr. */
 typedef struct { const uint8_t *ptr; size_t len; } synch_slice;
@@ -54,6 +61,43 @@ void *synch_adapter_scope_new(uint8_t full, const synch_slice *prefixes, size_t 
 }
 
 void synch_adapter_scope_drop(void *scope) { lean_dec((lean_object *)scope); }
+
+void *synch_adapter_cache_new(uint64_t capacity) {
+    lean_object *s = synch_lean_cache_new(capacity);
+    lean_mark_mt(s);
+    return s;
+}
+
+uint64_t synch_adapter_cache_epoch(void *cache) {
+    lean_inc((lean_object *)cache);
+    return synch_lean_cache_epoch((lean_object *)cache);
+}
+
+uint8_t synch_adapter_cache_can_certify(void *cache, uint64_t epoch) {
+    lean_inc((lean_object *)cache);
+    return synch_lean_cache_can_certify((lean_object *)cache, epoch);
+}
+
+uint8_t synch_adapter_cache_known(void *cache, synch_slice key) {
+    lean_inc((lean_object *)cache);
+    return synch_lean_cache_known((lean_object *)cache, bytes(key));
+}
+
+/* Supply a fresh reference to each pure state transition. Mark its result
+ * before Rust publishes the replacement under the caller's mutex. */
+void *synch_adapter_cache_update(void *cache, uint8_t operation, uint64_t epoch,
+                                synch_slice key, const synch_slice *keep, size_t count) {
+    lean_object *s = (lean_object *)cache;
+    lean_inc(s);
+    switch (operation) {
+    case 0: s = synch_lean_cache_begin(s, paths(keep, count)); break;
+    case 1: s = synch_lean_cache_finish(s); break;
+    case 2: s = synch_lean_cache_certify(s, epoch, bytes(key)); break;
+    default: break;
+    }
+    lean_mark_mt(s);
+    return s;
+}
 
 uint8_t synch_adapter_scope_query(void *scope, uint8_t operation, synch_slice path,
                                   uint8_t tag, uint8_t inline_value, synch_slice suffix) {

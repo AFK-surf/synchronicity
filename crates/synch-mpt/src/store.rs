@@ -136,12 +136,23 @@ pub trait NodeStore {
 
 /// An in-memory node store, for tests and for verifying a proof against a
 /// root without touching any durable store.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct MemStore {
     nodes: Mutex<HashMap<Hash, Vec<u8>>>,
     values: Mutex<HashMap<Hash, Vec<u8>>>,
     owned: Mutex<std::collections::HashSet<(OriginId, Hash)>>,
-    generation: Mutex<u64>,
+    generation: Mutex<synch_verified::CertificateCache>,
+}
+
+impl Default for MemStore {
+    fn default() -> Self {
+        Self {
+            nodes: Mutex::default(),
+            values: Mutex::default(),
+            owned: Mutex::default(),
+            generation: Mutex::new(synch_verified::CertificateCache::new(0)),
+        }
+    }
 }
 
 impl MemStore {
@@ -165,11 +176,12 @@ impl MemStore {
             .generation
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
+        generation.begin(&[]);
         self.nodes
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(hash);
-        *generation = generation.saturating_add(1);
+        generation.finish();
     }
 
     /// Drops every out-of-line value, keeping the nodes: a store that relayed
@@ -179,11 +191,12 @@ impl MemStore {
             .generation
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
+        generation.begin(&[]);
         self.values
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clear();
-        *generation = generation.saturating_add(1);
+        generation.finish();
     }
 }
 
@@ -191,10 +204,11 @@ impl NodeStore for MemStore {
     type Error = Infallible;
 
     fn completeness_generation(&self) -> Result<u64, Infallible> {
-        Ok(*self
+        Ok(self
             .generation
             .lock()
-            .unwrap_or_else(PoisonError::into_inner))
+            .unwrap_or_else(PoisonError::into_inner)
+            .epoch())
     }
 
     fn note_complete_at(&self, _root: &Hash, generation: u64) -> Result<bool, Infallible> {
@@ -202,7 +216,7 @@ impl NodeStore for MemStore {
             .generation
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        Ok(*current == generation && generation != u64::MAX)
+        Ok(current.can_certify(generation))
     }
 
     fn get_node(&self, hash: &Hash) -> Result<Option<Vec<u8>>, Infallible> {

@@ -1,5 +1,54 @@
 use proptest::prelude::*;
-use synch_verified::{group_count, settle_size, Scope, Settlement, Shape};
+use synch_verified::{group_count, settle_size, CertificateCache, Scope, Settlement, Shape};
+
+#[test]
+fn certificate_cache_owns_nested_invalidation_and_bounded_retention() {
+    let mut cache = CertificateCache::new(2);
+    assert!(cache.certify(0, b"a"));
+    assert!(cache.certify(0, b"b"));
+    cache.begin(&[b"a"]);
+    assert_eq!(cache.epoch(), 1);
+    assert!(!cache.contains(b"a"));
+    assert!(!cache.certify(1, b"c"));
+    cache.begin(&[b"a"]);
+    cache.finish();
+    assert!(!cache.contains(b"a"));
+    cache.finish();
+    assert_eq!(cache.epoch(), 4);
+    assert!(cache.contains(b"a"));
+    assert!(!cache.contains(b"b"));
+    assert!(!cache.certify(0, b"stale"));
+    assert!(!cache.certify(u64::MAX, b"terminal"));
+    assert!(cache.certify(4, b"b"));
+    assert!(cache.certify(4, b"c"));
+    assert!(!cache.contains(b"a"));
+    assert!(!cache.contains(b"b"));
+    assert!(cache.contains(b"c"));
+}
+
+#[test]
+fn certificate_updates_can_move_between_foreign_threads() {
+    let cache = std::sync::Arc::new(std::sync::Mutex::new(CertificateCache::new(32)));
+    let threads: Vec<_> = (0u8..8)
+        .map(|key| {
+            let cache = cache.clone();
+            std::thread::spawn(move || {
+                for _ in 0..100 {
+                    let mut cache = cache.lock().unwrap();
+                    cache.begin(&[]);
+                    cache.finish();
+                    let epoch = cache.epoch();
+                    assert!(cache.certify(epoch, &[key]));
+                    assert!(cache.contains(&[key]));
+                }
+            })
+        })
+        .collect();
+    for thread in threads {
+        thread.join().unwrap();
+    }
+    assert_eq!(cache.lock().unwrap().epoch(), 1600);
+}
 
 #[test]
 fn scalar_exports_cover_zero_group_edges_and_maximum_size() {
