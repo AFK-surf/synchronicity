@@ -26,6 +26,16 @@ pub trait ByteStorage {
     fn read_bytes(&mut self, space: &str, key: &[u8]) -> Result<Option<Vec<u8>>, Self::Error>;
 }
 
+/// Non-transactional raw resources, separate from the relational capability.
+/// Callers retain any required ordering guards for the entire operation.
+pub trait Resources {
+    type Error;
+    /// Read a keyed counter; an absent key has count zero.
+    fn read_counter(&mut self, space: &str, key: &[u8]) -> Result<u64, Self::Error>;
+    /// Remove one keyed file. The requesting program selects failure handling.
+    fn remove_file(&mut self, space: &str, key: &[u8]) -> Result<(), Self::Error>;
+}
+
 /// Host storage capabilities. The interpreter executes requests literally;
 /// algorithms, metadata interpretation and operation sequencing remain in Lean.
 ///
@@ -50,6 +60,13 @@ pub trait Storage {
         columns: &[String],
         equals: &Fields,
     ) -> Result<Vec<Row>, Self::Error>;
+    /// Existence query without materializing all matching rows.
+    fn exists_rows(
+        &mut self,
+        tx: u64,
+        relation: &str,
+        equals: &Fields,
+    ) -> Result<bool, Self::Error>;
     /// Insert explicit values; on the named conflict, update only the named
     /// columns from those values. An empty update list means do nothing.
     fn upsert(

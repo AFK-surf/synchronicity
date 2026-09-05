@@ -1,4 +1,5 @@
 import VerifiedCore.Host
+import VerifiedCore.Cas
 
 /-! Complete CAS operations over raw storage effects. No host policy snapshots. -/
 namespace VerifiedCore.Cas
@@ -49,5 +50,46 @@ transaction program. Other Lean operations can compose `acquireIn` directly. -/
 def acquire (root : ByteArray) (holder : String) (now : Int64)
     (possession : Bool) : Operation Bool :=
   transaction fun tx => acquireIn tx root holder now possession
+
+/-- Preserve absence and signed access time; do not coerce malformed cells. -/
+def decodeAccess : List Row → Reply (Option Int64)
+  | [] => .ok none
+  | [[.integer value]] => .ok (some value)
+  | [[.null]] => .error ⟨2, 4⟩
+  | [[.text _]] => .error ⟨2, 5⟩
+  | [[.blob _]] => .error ⟨2, 6⟩
+  | _ => .error malformedMetadata
+
+/-- All protection observations occur within the immediate transaction and
+the host's surrounding ordering session. Existence reads are bounded queries,
+not host-supplied protection decisions. -/
+def deleteIn (tx : Transaction) (root : ByteArray) (before : Option Int64) : Operation Outcome := do
+  let pinned ← perform (.existsRows tx "pins" [("root", .blob root)])
+  let referenced ← perform (.existsRows tx "entries" [("content", .blob root)])
+  let rows ← perform (.readRows tx "blobs" ["last_access"] [("root", .blob root)])
+  let accessed ← match decodeAccess rows with
+    | .ok value => pure value
+    | .error failure => throw failure
+  let writers ← perform (.readCounter "cas_writers" root)
+  let plan := planLifecycle (.delete
+    ⟨accessed.isSome, writers != 0, pinned, referenced, accessed.getD 0⟩ before)
+  for mutation in plan.transaction do
+    match mutation with
+    | .deleteRow => let _ ← perform (.deleteRows tx "blobs" [("root", .blob root)])
+  return plan.outcome
+
+/-- Best-effort cleanup is requested only after successful transaction
+completion. Failure of one unlink does not prevent the second attempt. -/
+def cleanup (root : ByteArray) : Operation Unit := do
+  try perform (.removeFile "cas_payload" root) catch _ => pure ()
+  try perform (.removeFile "cas_outboard" root) catch _ => pure ()
+
+/-- Complete deletion, including cleanup. No mutation plan leaves Lean. -/
+def delete (root : ByteArray) (before : Option Int64) : Operation Outcome := do
+  let outcome ← transaction fun tx => deleteIn tx root before
+  match outcome with
+  | .applied => cleanup root
+  | _ => pure ()
+  return outcome
 
 end VerifiedCore.Cas

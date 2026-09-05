@@ -1,14 +1,15 @@
 import VerifiedCore.Cas
+import VerifiedCore.Cas.Program
+import Synchronicity.CasProgramProofs
 import Synchronicity.Prelude
 import Synchronicity.Anchors
 
 /-! Proofs of complete CAS lifecycle plans. No trie or sync model imports. -/
 namespace Synchronicity.CasLifecycleProofs
-open VerifiedCore.Cas
+open VerifiedCore.Cas VerifiedCore.Host
 
 /-- Deletion's accepted plan requires no active writer, pin or reference;
 collection additionally needs an existing row strictly before its horizon. -/
-@[rust_justifies "cas-lifecycle-deletion"]
 theorem deletion_authorized (s : DeletionSnapshot) (before : Option Int64) :
     (planLifecycle (.delete s before)).outcome = .applied ↔
       s.writing = false ∧ s.pinned = false ∧ s.referenced = false ∧
@@ -19,7 +20,6 @@ theorem deletion_authorized (s : DeletionSnapshot) (before : Option Int64) :
   split_ifs <;> simp_all
 
 /-- Failed lifecycle requests have no mutation or cleanup effects. -/
-@[rust_justifies "cas-lifecycle-refusal"]
 theorem refusal_effect_free (request : LifecycleRequest)
     (refused : (planLifecycle request).outcome ≠ .applied) :
     (planLifecycle request).transaction = [] ∧ (planLifecycle request).afterCommit = [] := by
@@ -28,8 +28,7 @@ theorem refusal_effect_free (request : LifecycleRequest)
   split_ifs at refused ⊢ <;> simp_all
 
 /-- Every nonempty cleanup phase follows a transaction deleting exactly the
-object row. Rust's phase executor commits that whole transaction before cleanup. -/
-@[rust_justifies "cas-lifecycle-cleanup"]
+object row. The plan is now consumed only inside Lean's deletion program. -/
 theorem cleanup_requires_row_deletion (request : LifecycleRequest)
     (cleanup : (planLifecycle request).afterCommit ≠ []) :
     (planLifecycle request).transaction = [.deleteRow] ∧
@@ -47,14 +46,115 @@ theorem lifecycle_plan_bounds (request : LifecycleRequest) :
   simp only [planLifecycle]
   split_ifs <;> simp
 
-/-- Native records always contain exactly the agreed five bytes. -/
-theorem lifecycle_encoding_width (plan : LifecyclePlan) : (encodeLifecycle plan).size = 5 := by
+
+/-- Any failed transactional execution terminates deletion without requesting
+file cleanup. The transaction's own proofs cover rollback and primary errors. -/
+theorem failed_transaction_has_no_cleanup (root : ByteArray) (before : Option Int64)
+    (failure : Failure)
+    (failed : (transaction (fun tx => deleteIn tx root before)).run =
+      Program.pure (.error failure)) :
+    (delete root before).run = Program.pure (.error failure) := by
+  unfold delete
+  change Program.bind (transaction (fun tx => deleteIn tx root before)).run _ = _
+  rw [failed]
   rfl
 
-/-- The retired acquisition command is not a callable snapshot-planner path.
-The adapter rejects its empty response rather than treating it as a plan. -/
-theorem acquisition_export_retired (row a b c d : UInt8) (lastAccess before : Int64) :
-    lifecycleExport 0 row a b c d lastAccess before = ByteArray.empty := rfl
+/-- Cleanup has exactly two raw requests, regardless of either host result.
+Ignoring errors is Lean's policy, not a best-effort host callback. -/
+theorem cleanup_attempts_both_files (root : ByteArray) :
+    (cleanup root).run = Program.request (.removeFile "cas_payload" root) (fun _ =>
+      Program.request (.removeFile "cas_outboard" root) (fun _ =>
+        Program.pure (.ok ()))) := by
+  change Program.request _ _ = Program.request _ _
+  congr 1
+  funext first
+  cases first with
+  | error failure =>
+    change Program.request _ _ = Program.request _ _
+    congr 1
+    funext second
+    cases second <;> rfl
+  | ok value =>
+    cases value
+    change Program.request _ _ = Program.request _ _
+    congr 1
+    funext second
+    cases second <;> rfl
+
+/-- File effects are downstream of successful transaction completion. -/
+theorem committed_deletion_runs_cleanup (root : ByteArray) (before : Option Int64)
+    (committed : (transaction (fun tx => deleteIn tx root before)).run =
+      Program.pure (.ok .applied)) :
+    (delete root before).run = Program.request (.removeFile "cas_payload" root) (fun _ =>
+      Program.request (.removeFile "cas_outboard" root) (fun _ =>
+        Program.pure (.ok .applied))) := by
+  unfold delete
+  change Program.bind (transaction (fun tx => deleteIn tx root before)).run _ = _
+  rw [committed]
+  change Program.bind (cleanup root).run _ = _
+  rw [cleanup_attempts_both_files]
+  rfl
+
+open CasProgramProofs in
+/-- The actual production program performs every observation before mutation,
+then commit, then both unlinks. This includes explicit deletion of a missing
+row, which still cleans orphan files. No Rust phase executor is assumed. -/
+theorem explicit_deletion_trace (root : ByteArray) (accessed : Option Int64) :
+    execute { access := .ok (accessed.toList.map fun n => [.integer n]) }
+      (delete root none).run =
+    (.ok .applied,
+      [.begin,
+       .existsRows 7 "pins" [("root", .blob root)],
+       .existsRows 7 "entries" [("content", .blob root)],
+       .readRows 7 "blobs" ["last_access"] [("root", .blob root)],
+       .readCounter "cas_writers" root,
+       .deleteRows 7 "blobs" [("root", .blob root)],
+       .commit 7,
+       .removeFile "cas_payload" root,
+       .removeFile "cas_outboard" root]) := by
+  cases accessed <;> rfl
+
+-- Keep this case-heavy proof serial: asynchronous elaboration in the pinned
+-- compiler emits an internal Option.get! diagnostic despite accepting it.
+-- This changes scheduling only; all kernel and lint checks remain enabled.
+set_option Elab.async false in
+open CasProgramProofs in
+/-- The completed operation's outcome is the internal proved decision for
+every well-typed access row, not merely for the successful fixture above. -/
+theorem deletion_execution_outcome (root : ByteArray) (accessed : Option Int64)
+    (pinned referenced : Bool) (writers : UInt64) (before : Option Int64) :
+    (execute
+      { access := .ok (accessed.toList.map fun n => [.integer n])
+        pinned := .ok pinned
+        referenced := .ok referenced
+        writers := .ok writers }
+      (delete root before).run).1 =
+    .ok (planLifecycle (.delete
+      ⟨accessed.isSome, writers != 0, pinned, referenced, accessed.getD 0⟩ before)).outcome := by
+  cases accessed <;> cases before <;> cases pinned <;> cases referenced <;>
+    by_cases writing : writers = 0 <;>
+    simp [delete, deleteIn, cleanup, transaction, perform, execute, answer, event,
+      bind, pure, Program.bind, ExceptT.bind, ExceptT.bindCont, ExceptT.pure,
+      ExceptT.run, ExceptT.mk, decodeAccess, planLifecycle, writing]
+  all_goals (try split_ifs) <;> rfl
+
+open CasProgramProofs in
+/-- Authorization of the executed operation follows from the internal decision
+theorem through the checked execution equality, with no Rust model premise. -/
+@[rust_justifies "cas-lifecycle-deletion"]
+theorem executed_deletion_authorized (root : ByteArray) (accessed : Option Int64)
+    (pinned referenced : Bool) (writers : UInt64) (before : Option Int64) :
+    (execute
+      { access := .ok (accessed.toList.map fun n => [.integer n])
+        pinned := .ok pinned
+        referenced := .ok referenced
+        writers := .ok writers }
+      (delete root before).run).1 = .ok .applied ↔
+    (writers != 0) = false ∧ pinned = false ∧ referenced = false ∧
+      (∀ cutoff ∈ before, accessed.isSome = true ∧ accessed.getD 0 < cutoff) := by
+  rw [deletion_execution_outcome]
+  simpa using deletion_authorized
+    ⟨accessed.isSome, writers != 0, pinned, referenced, accessed.getD 0⟩ before
 
 end Synchronicity.CasLifecycleProofs
 

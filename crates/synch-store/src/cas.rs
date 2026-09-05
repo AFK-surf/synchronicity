@@ -1710,73 +1710,30 @@ impl Store {
         root: &Hash,
         before: Option<i64>,
     ) -> Result<synch_verified::cas::Outcome> {
-        use synch_verified::cas::{DeletionSnapshot, LifecycleRequest};
-        self.execute_cas_lifecycle(root, |tx| {
-            let (pinned, referenced): (bool, bool) = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM pins WHERE root = ?1),
-                    EXISTS(SELECT 1 FROM entries WHERE content = ?1)",
-                params![root.as_bytes().to_vec()],
-                |row| Ok((row.get(0)?, row.get(1)?)),
-            )?;
-            let accessed: Option<i64> = tx
-                .query_row(
-                    "SELECT last_access FROM blobs WHERE root = ?1",
-                    params![root.as_bytes().to_vec()],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            // LEAN-MODEL: cas-lifecycle-deletion (CasLifecycleProofs.deletion_authorized)
-            Ok(LifecycleRequest::Delete {
-                snapshot: DeletionSnapshot {
-                    row: accessed.is_some(),
-                    writing: self.is_being_written(root),
-                    pinned,
-                    referenced,
-                    last_access: accessed.unwrap_or(0),
-                },
-                before,
-            })
-        })
-    }
-
-    /// One CAS-domain executor: snapshot under locks, atomic mutation batch,
-    /// successful commit, then cleanup. No internal Lean phases cross the ABI.
-    fn execute_cas_lifecycle(
-        &self,
-        root: &Hash,
-        snapshot: impl FnOnce(
-            &rusqlite::Transaction<'_>,
-        ) -> Result<synch_verified::cas::LifecycleRequest>,
-    ) -> Result<synch_verified::cas::Outcome> {
-        use synch_verified::cas::{plan_lifecycle, Cleanup, Mutation};
-        let mut conn = self.conn();
+        use synch_verified::cas::{delete, OperationError};
+        let conn = self.conn();
         let _ordered_against_writers = self.cas_order();
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        // LEAN-MODEL: cas-lifecycle-refusal (CasLifecycleProofs.refusal_effect_free)
-        let plan = plan_lifecycle(snapshot(&tx)?);
-        for mutation in plan.transaction() {
-            match mutation {
-                Mutation::DeleteRow => {
-                    tx.execute(
-                        "DELETE FROM blobs WHERE root = ?1",
-                        params![root.as_bytes().to_vec()],
-                    )?;
-                }
+        let mut storage = crate::lean_storage::SqliteStorage::new(&conn);
+        let mut resources = crate::lean_storage::Resources(self);
+        // LEAN-MODEL: cas-lifecycle-deletion (CasLifecycleProofs.executed_deletion_authorized)
+        delete(&mut storage, &mut resources, root.as_bytes(), before).map_err(|error| match error {
+            OperationError::Host(error) => error,
+            OperationError::MalformedMetadata(detail @ 4..=6) => {
+                let kind = match detail {
+                    4 => rusqlite::types::Type::Null,
+                    5 => rusqlite::types::Type::Text,
+                    6 => rusqlite::types::Type::Blob,
+                    _ => unreachable!("matched native access-column error detail"),
+                };
+                rusqlite::Error::InvalidColumnType(0, "last_access".into(), kind).into()
             }
-        }
-        // LEAN-MODEL: cas-lifecycle-cleanup (CasLifecycleProofs.cleanup_requires_row_deletion)
-        tx.commit()?;
-        for cleanup in plan.after_commit() {
-            match cleanup {
-                Cleanup::Payload => {
-                    let _ = std::fs::remove_file(self.blob_path(root));
-                }
-                Cleanup::Outboard => {
-                    let _ = std::fs::remove_file(self.outboard_path(root));
-                }
+            OperationError::MalformedMetadata(_) => {
+                StoreError::Decode("invalid CAS deletion metadata".into())
             }
-        }
-        Ok(plan.outcome())
+            OperationError::Protocol => {
+                StoreError::invalid("invalid native storage-operation protocol")
+            }
+        })
     }
 
     /// Simulates storage loss for recovery and race tests.
@@ -2802,6 +2759,59 @@ mod tests {
                 assert!(store.blob_path(&root).exists());
                 assert!(store.outboard_path(&root).exists());
                 assert_eq!(store.read_all(&root).unwrap(), bytes);
+            }
+        }
+    }
+
+    #[test]
+    fn deletion_preserves_corrupt_access_errors_and_never_unlinks() {
+        use rusqlite::types::Value;
+        for value in [
+            Value::Null,
+            Value::Text("not a timestamp".into()),
+            Value::Blob(vec![]),
+            Value::Real(1.5),
+        ] {
+            let (_dir, store) = store();
+            let root = store.ingest_bytes(&data(100_000), 0).unwrap();
+            let expected_type = {
+                let conn = store.conn();
+                conn.execute_batch("CREATE TEMP TABLE blobs (root BLOB PRIMARY KEY, last_access)")
+                    .unwrap();
+                conn.execute(
+                    "INSERT INTO blobs VALUES (?1, ?2)",
+                    params![root.as_bytes().to_vec(), value],
+                )
+                .unwrap();
+                match conn
+                    .query_row("SELECT last_access FROM blobs", [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .unwrap_err()
+                {
+                    rusqlite::Error::InvalidColumnType(0, _, kind) => kind,
+                    other => panic!("unexpected decoder error: {other:?}"),
+                }
+            };
+            for collect in [false, true] {
+                let error = if collect {
+                    store
+                        .delete_blob_if_collectable(&root, i64::MAX)
+                        .map(|_| ())
+                } else {
+                    store.delete_blob(&root)
+                }
+                .unwrap_err();
+                match error {
+                    StoreError::Sqlite(rusqlite::Error::InvalidColumnType(0, column, kind)) => {
+                        assert_eq!(column, "last_access");
+                        assert_eq!(kind, expected_type);
+                    }
+                    other => panic!("deletion changed the original column error: {other:?}"),
+                }
+                assert!(store.conn().is_autocommit());
+                assert!(store.blob_path(&root).exists());
+                assert!(store.outboard_path(&root).exists());
             }
         }
     }

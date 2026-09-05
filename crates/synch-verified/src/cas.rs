@@ -1,38 +1,6 @@
-//! CAS operations and the not-yet-migrated deletion planner.
+//! Complete CAS operations; no host policy snapshots or mutation plans.
 
-/// Snapshot for one object's deletion, protected through post-commit cleanup.
-#[derive(Debug, Clone, Copy)]
-pub struct DeletionSnapshot {
-    pub row: bool,
-    pub writing: bool,
-    pub pinned: bool,
-    pub referenced: bool,
-    pub last_access: i64,
-}
-
-/// Supported lifecycle operations and their operation-specific facts.
-#[derive(Debug, Clone, Copy)]
-pub enum LifecycleRequest {
-    Delete {
-        snapshot: DeletionSnapshot,
-        before: Option<i64>,
-    },
-}
-
-/// Keyed mutations; apply the entire slice in one atomic transaction.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Mutation {
-    DeleteRow,
-}
-
-/// Best-effort file cleanup, executed only after a successful commit.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum Cleanup {
-    Payload,
-    Outboard,
-}
-
-/// Semantic result; not an internal state-machine tag.
+/// Completed deletion result.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Outcome {
     Skipped,
@@ -41,108 +9,41 @@ pub enum Outcome {
     Applied,
 }
 
-/// A complete operation plan. The executor must preserve phase order and keep
-/// the snapshot's ordering locks until post-commit cleanup finishes.
-#[derive(Debug)]
-pub struct LifecyclePlan {
-    outcome: Outcome,
-    transaction: Vec<Mutation>,
-    after_commit: Vec<Cleanup>,
-}
-
-impl LifecyclePlan {
-    pub fn outcome(&self) -> Outcome {
-        self.outcome
-    }
-    pub fn transaction(&self) -> &[Mutation] {
-        &self.transaction
-    }
-    pub fn after_commit(&self) -> &[Cleanup] {
-        &self.after_commit
-    }
-}
-
-unsafe extern "C" {
-    fn synch_adapter_cas_lifecycle(
-        command: u8,
-        row: u8,
-        a: u8,
-        b: u8,
-        c: u8,
-        d: u8,
-        accessed: u64,
-        before: u64,
-        output: *mut u8,
-    ) -> u8;
-}
-
-/// Plan an operation in Lean with one native call. The fixed-width private ABI
-/// is only encoding; callers use the typed domain command and effect slices.
-pub fn plan_lifecycle(request: LifecycleRequest) -> LifecyclePlan {
-    super::native::enter();
-    let (command, row, a, b, c, d, accessed, before) = match request {
-        LifecycleRequest::Delete {
-            snapshot: s,
-            before,
-        } => (
-            1,
-            s.row,
-            s.writing,
-            s.pinned,
-            s.referenced,
-            before.is_some(),
-            s.last_access,
-            before.unwrap_or(0),
-        ),
-    };
-    let mut bytes = [0u8; 5];
-    // SAFETY: exact scalar ABI, normalized Booleans, five writable bytes.
-    // Int64's generated uint64_t ABI preserves signed timestamp bits.
-    let valid = unsafe {
-        synch_adapter_cas_lifecycle(
-            command,
-            row.into(),
-            a.into(),
-            b.into(),
-            c.into(),
-            d.into(),
-            accessed as u64,
-            before as u64,
-            bytes.as_mut_ptr(),
-        )
-    };
-    assert_eq!(valid, 1, "invalid Lean lifecycle record width");
-    let outcome = match bytes[0] {
-        0 => Outcome::Skipped,
-        1 => Outcome::Writing,
-        2 => Outcome::Protected,
-        3 => Outcome::Applied,
-        _ => panic!("invalid Lean lifecycle outcome"),
-    };
-    let transaction = bytes[1..3]
-        .iter()
-        .filter_map(|tag| match tag {
-            0 => None,
-            1 => Some(Mutation::DeleteRow),
-            _ => panic!("invalid Lean transaction action"),
-        })
-        .collect();
-    let after_commit = bytes[3..5]
-        .iter()
-        .filter_map(|tag| match tag {
-            0 => None,
-            1 => Some(Cleanup::Payload),
-            2 => Some(Cleanup::Outboard),
-            _ => panic!("invalid Lean cleanup action"),
-        })
-        .collect();
-    LifecyclePlan {
-        outcome,
-        transaction,
-        after_commit,
-    }
-}
 pub use crate::operation::OperationError;
+
+/// Delete one object through its complete Lean storage/resource program.
+pub fn delete<S: crate::host::Storage>(
+    storage: &mut S,
+    resources: &mut dyn crate::host::Resources<Error = S::Error>,
+    root: &[u8; 32],
+    before: Option<i64>,
+) -> Result<Outcome, OperationError<S::Error>> {
+    use crate::operation::Slice;
+    unsafe extern "C" {
+        fn synch_adapter_operation_delete(
+            root: Slice,
+            has_before: u8,
+            before: u64,
+        ) -> *mut std::ffi::c_void;
+    }
+    // SAFETY: constructor returns a fresh owned program; runner initializes Lean first.
+    let result = unsafe {
+        crate::operation::run_with_resources(storage, resources, || {
+            synch_adapter_operation_delete(
+                root.as_slice().into(),
+                u8::from(before.is_some()),
+                before.unwrap_or(0) as u64,
+            )
+        })
+    }?;
+    match result.as_slice() {
+        [0] => Ok(Outcome::Skipped),
+        [1] => Ok(Outcome::Writing),
+        [2] => Ok(Outcome::Protected),
+        [3] => Ok(Outcome::Applied),
+        _ => Err(OperationError::Protocol),
+    }
+}
 
 /// Execute complete pin/possession acquisition over raw storage capabilities.
 /// Lean owns reads, interpretation, mutations, transaction completion and errors.

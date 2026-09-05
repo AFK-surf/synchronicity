@@ -1306,6 +1306,11 @@ impl Store {
         self.writing().contains_key(root)
     }
 
+    /// Raw registry observation for a caller holding the CAS ordering session.
+    pub(crate) fn writer_count(&self, root: &Hash) -> usize {
+        self.writing().get(root).copied().unwrap_or(0)
+    }
+
     /// Installs the pause described by [`WriteWindow`].
     #[cfg(test)]
     pub(crate) fn set_write_window(&self, window: std::sync::Arc<WriteWindow>) {

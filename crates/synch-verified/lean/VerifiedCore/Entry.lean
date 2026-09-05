@@ -5,6 +5,15 @@ import VerifiedCore.Trie.Program
 /-! Domain command constructors. The transport itself imports no domain policy. -/
 namespace VerifiedCore.Entry
 
+@[export synch_lean_cas_delete]
+def delete (root : ByteArray) (hasBefore : Bool) (before : Int64) : Host.Wire.State :=
+  if root.size != 32 then .pure (.error ⟨2, 0⟩)
+  else (do
+    let outcome ← Cas.delete root (if hasBefore then some before else none)
+    return Host.Wire.octet (match outcome with
+      | .skipped => 0 | .writing => 1 | .protectedClaim => 2 | .applied => 3)
+    : Host.Operation ByteArray).run
+
 @[export synch_lean_cas_acquire]
 def acquire (root holder : ByteArray) (now : Int64) (possession : Bool) : Host.Wire.State :=
   if root.size != 32 then .pure (.error ⟨2, 0⟩)

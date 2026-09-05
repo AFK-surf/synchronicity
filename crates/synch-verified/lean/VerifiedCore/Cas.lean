@@ -124,8 +124,8 @@ structure LifecyclePlan where
   transaction : List Mutation := []
   afterCommit : List Cleanup := []
 
-/-- The CAS lifecycle planning boundary. Rust never advances its internal
-algorithm one predicate or state-machine step at a time. -/
+/-- Internal Lean deletion decision, consumed by the complete storage program.
+Neither its observations nor its mutation/cleanup lists cross the native ABI. -/
 def planLifecycle : LifecycleRequest → LifecyclePlan
   | .delete s before =>
     if s.writing then ⟨.writing, [], []⟩ else
@@ -133,24 +133,6 @@ def planLifecycle : LifecycleRequest → LifecyclePlan
     if before.isSome && (!s.row || !(s.lastAccess < before.getD 0)) then ⟨.skipped, [], []⟩ else
       ⟨.applied, [.deleteRow], [.payload, .outboard]⟩
 
-/-- Fixed five-byte ABI record: outcome, two transaction slots, two cleanup
-slots. Zero action slots are padding; no SQL, handles, or runtime layout crosses. -/
-def encodeLifecycle (plan : LifecyclePlan) : ByteArray :=
-  let outcome : UInt8 := match plan.outcome with
-    | .skipped => 0 | .writing => 1 | .protectedClaim => 2 | .applied => 3
-  let mutation : Option Mutation → UInt8
-    | none => 0 | some .deleteRow => 1
-  let cleanup : Option Cleanup → UInt8
-    | none => 0 | some .payload => 1 | some .outboard => 2
-  ⟨#[outcome, mutation plan.transaction[0]?, mutation plan.transaction[1]?,
-      cleanup plan.afterCommit[0]?, cleanup plan.afterCommit[1]?]⟩
-
-/-- Narrow ABI marshalling for the typed domain request. Invalid commands fail closed. -/
-@[export synch_lean_cas_lifecycle]
-def lifecycleExport (command row a b c d : UInt8) (lastAccess before : Int64) : ByteArray :=
-  if command == 1 then encodeLifecycle (planLifecycle
-    (.delete ⟨row != 0, a != 0, b != 0, c != 0, lastAccess⟩ (if d != 0 then some before else none)))
-  else ByteArray.empty
 
 end Cas
 end VerifiedCore

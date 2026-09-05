@@ -1,5 +1,5 @@
 //! Private synchronous transport. Only raw storage effects are interpreted here.
-use crate::host::{ByteStorage, Cell, Fields, Row, Storage};
+use crate::host::{ByteStorage, Cell, Fields, Resources, Row, Storage};
 use std::{ffi::c_void, marker::PhantomData, ptr::NonNull, rc::Rc};
 
 #[derive(Debug)]
@@ -187,6 +187,9 @@ enum Frame {
     DeleteRows(u64, String, Fields),
     ReadBytes(String, Vec<u8>),
     ReadInput(u64, u64, u64),
+    ReadCounter(String, Vec<u8>),
+    RemoveFile(String, Vec<u8>),
+    ExistsRows(u64, String, Fields),
 }
 
 fn decode(packet: &[u8]) -> Result<Frame, ()> {
@@ -211,6 +214,9 @@ fn decode(packet: &[u8]) -> Result<Frame, ()> {
         21 => Frame::DeleteRows(r.word()?, r.string()?, r.fields()?),
         22 => Frame::ReadBytes(r.string()?, r.bytes()?),
         23 => Frame::ReadInput(r.word()?, r.word()?, r.word()?),
+        24 => Frame::ReadCounter(r.string()?, r.bytes()?),
+        25 => Frame::RemoveFile(r.string()?, r.bytes()?),
+        26 => Frame::ExistsRows(r.word()?, r.string()?, r.fields()?),
         _ => return Err(()),
     };
     r.end()?;
@@ -243,11 +249,33 @@ fn execute<S: Storage>(
     mut state: Handle,
     storage: &mut S,
     inputs: &[&[u8]],
+    mut resources: Option<&mut dyn Resources<Error = S::Error>>,
 ) -> Result<Vec<u8>, OperationError<S::Error>> {
     let mut errors = Vec::new();
     loop {
         let frame = decode(&state.packet()).map_err(|()| OperationError::Protocol)?;
         let response = match frame {
+            Frame::ReadCounter(space, key) => match resources.as_deref_mut() {
+                Some(resources) => {
+                    reply(24, resources.read_counter(&space, &key), &mut errors, word)
+                }
+                None => return Err(OperationError::Protocol),
+            },
+            Frame::RemoveFile(space, key) => match resources.as_deref_mut() {
+                Some(resources) => reply(
+                    25,
+                    resources.remove_file(&space, &key),
+                    &mut errors,
+                    |_, ()| {},
+                ),
+                None => return Err(OperationError::Protocol),
+            },
+            Frame::ExistsRows(tx, table, equals) => reply(
+                26,
+                storage.exists_rows(tx, &table, &equals),
+                &mut errors,
+                |out, exists| out.push(u8::from(exists)),
+            ),
             Frame::ReadInput(handle, offset, count) => {
                 let selected = usize::try_from(handle)
                     .ok()
@@ -332,12 +360,28 @@ pub(crate) unsafe fn run<S: Storage>(
     start: impl FnOnce() -> *mut c_void,
 ) -> Result<Vec<u8>, OperationError<S::Error>> {
     crate::native::enter();
-    execute(Handle::new(start()), storage, inputs)
+    execute(Handle::new(start()), storage, inputs, None)
+}
+
+/// Run with separate raw resource capabilities.
+///
+/// # Safety
+/// `start` obeys the fresh owned constructor contract of `run`.
+pub(crate) unsafe fn run_with_resources<S: Storage>(
+    storage: &mut S,
+    resources: &mut dyn Resources<Error = S::Error>,
+    start: impl FnOnce() -> *mut c_void,
+) -> Result<Vec<u8>, OperationError<S::Error>> {
+    crate::native::enter();
+    execute(Handle::new(start()), storage, &[], Some(resources))
 }
 
 struct ReadOnly<'a, S>(&'a mut S);
 impl<S: ByteStorage> Storage for ReadOnly<'_, S> {
     type Error = OperationError<S::Error>;
+    fn exists_rows(&mut self, _: u64, _: &str, _: &Fields) -> Result<bool, Self::Error> {
+        Err(OperationError::Protocol)
+    }
     fn begin(&mut self) -> Result<u64, Self::Error> {
         Err(OperationError::Protocol)
     }
@@ -420,6 +464,9 @@ mod tests {
     }
     impl Storage for Script {
         type Error = &'static str;
+        fn exists_rows(&mut self, _: u64, _: &str, _: &Fields) -> Result<bool, Self::Error> {
+            panic!("unexpected existence query")
+        }
         fn begin(&mut self) -> Result<u64, Self::Error> {
             self.step("begin")?;
             Ok(42)

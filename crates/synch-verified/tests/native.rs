@@ -20,6 +20,9 @@ fn pin_acquisition_requires_durability_and_orders_possession_effects() {
 
     impl Storage for Script {
         type Error = &'static str;
+        fn exists_rows(&mut self, _: u64, _: &str, _: &Fields) -> Result<bool, Self::Error> {
+            panic!("unexpected existence query")
+        }
 
         fn begin(&mut self) -> Result<u64, Self::Error> {
             self.trace.push("begin");
@@ -141,26 +144,156 @@ fn pin_acquisition_requires_durability_and_orders_possession_effects() {
 
 #[test]
 fn deletion_protocol_checks_every_protection_and_orders_effects() {
-    use synch_verified::cas::{
-        plan_lifecycle, Cleanup, DeletionSnapshot, LifecycleRequest, Mutation, Outcome::*,
+    use std::{cell::RefCell, rc::Rc};
+    use synch_verified::{
+        cas::{delete, Outcome::*},
+        host::{Cell, Fields, Resources, Row, Storage},
     };
+    fn step(
+        trace: &RefCell<Vec<&'static str>>,
+        fail_at: Option<usize>,
+        label: &'static str,
+    ) -> Result<(), &'static str> {
+        let mut trace = trace.borrow_mut();
+        let index = trace.len();
+        trace.push(label);
+        if fail_at == Some(index) {
+            Err("primary failure")
+        } else {
+            Ok(())
+        }
+    }
+    struct Sql {
+        fail_at: Option<usize>,
+        trace: Rc<RefCell<Vec<&'static str>>>,
+        accessed: Option<i64>,
+        pinned: bool,
+        referenced: bool,
+    }
+    struct Files {
+        fail_at: Option<usize>,
+        trace: Rc<RefCell<Vec<&'static str>>>,
+        writing: bool,
+    }
+    impl Storage for Sql {
+        type Error = &'static str;
+        fn begin(&mut self) -> Result<u64, Self::Error> {
+            step(&self.trace, self.fail_at, "begin")?;
+            Ok(7)
+        }
+        fn commit(&mut self, tx: u64) -> Result<(), Self::Error> {
+            assert_eq!(tx, 7);
+            step(&self.trace, self.fail_at, "commit")?;
+            Ok(())
+        }
+        fn rollback(&mut self, _: u64) -> Result<(), Self::Error> {
+            self.trace.borrow_mut().push("rollback");
+            Err("rollback failure")
+        }
+        fn exists_rows(
+            &mut self,
+            tx: u64,
+            table: &str,
+            equals: &Fields,
+        ) -> Result<bool, Self::Error> {
+            assert_eq!(tx, 7);
+            let (column, exists) = match table {
+                "pins" => {
+                    step(&self.trace, self.fail_at, "pins")?;
+                    ("root", self.pinned)
+                }
+                "entries" => {
+                    step(&self.trace, self.fail_at, "entries")?;
+                    ("content", self.referenced)
+                }
+                _ => panic!("unexpected table"),
+            };
+            assert_eq!(equals, &vec![(column.into(), Cell::Blob(vec![9; 32]))]);
+            Ok(exists)
+        }
+        fn read_rows(
+            &mut self,
+            tx: u64,
+            table: &str,
+            columns: &[String],
+            equals: &Fields,
+        ) -> Result<Vec<Row>, Self::Error> {
+            assert_eq!(tx, 7);
+            assert_eq!(table, "blobs");
+            assert_eq!(columns, &["last_access"]);
+            assert_eq!(equals, &vec![("root".into(), Cell::Blob(vec![9; 32]))]);
+            step(&self.trace, self.fail_at, "access")?;
+            Ok(self
+                .accessed
+                .map(|n| vec![vec![Cell::Integer(n)]])
+                .unwrap_or_default())
+        }
+        fn upsert(
+            &mut self,
+            _: u64,
+            _: &str,
+            _: &Fields,
+            _: &[String],
+            _: &[String],
+        ) -> Result<(), Self::Error> {
+            panic!("unexpected upsert")
+        }
+        fn delete_rows(
+            &mut self,
+            tx: u64,
+            table: &str,
+            equals: &Fields,
+        ) -> Result<u64, Self::Error> {
+            assert_eq!(tx, 7);
+            assert_eq!(table, "blobs");
+            assert_eq!(equals, &vec![("root".into(), Cell::Blob(vec![9; 32]))]);
+            step(&self.trace, self.fail_at, "delete")?;
+            Ok(u64::from(self.accessed.is_some()))
+        }
+        fn read_bytes(&mut self, _: &str, _: &[u8]) -> Result<Option<Vec<u8>>, Self::Error> {
+            panic!("unexpected byte read")
+        }
+    }
+    impl Resources for Files {
+        type Error = &'static str;
+        fn read_counter(&mut self, space: &str, key: &[u8]) -> Result<u64, Self::Error> {
+            assert_eq!(space, "cas_writers");
+            assert_eq!(key, &[9; 32]);
+            step(&self.trace, self.fail_at, "writers")?;
+            Ok(if self.writing { 3 } else { 0 })
+        }
+        fn remove_file(&mut self, space: &str, key: &[u8]) -> Result<(), Self::Error> {
+            assert_eq!(key, &[9; 32]);
+            self.trace.borrow_mut().push(match space {
+                "cas_payload" => "payload",
+                "cas_outboard" => "outboard",
+                _ => panic!("unexpected namespace"),
+            });
+            // Both removals must be attempted even when they fail.
+            Err("injected unlink failure")
+        }
+    }
     for row in [false, true] {
         for writing in [false, true] {
             for pinned in [false, true] {
                 for referenced in [false, true] {
                     for last in [i64::MIN, -1, 0, 1, i64::MAX] {
                         for before in [None, Some(i64::MIN), Some(-1), Some(0), Some(i64::MAX)] {
-                            let plan = plan_lifecycle(LifecycleRequest::Delete {
-                                snapshot: DeletionSnapshot {
-                                    row,
-                                    writing,
-                                    pinned,
-                                    referenced,
-                                    last_access: last,
-                                },
-                                before,
-                            });
-                            let initial = if writing {
+                            let trace = Rc::new(RefCell::new(Vec::new()));
+                            let mut sql = Sql {
+                                fail_at: None,
+                                trace: trace.clone(),
+                                accessed: row.then_some(last),
+                                pinned,
+                                referenced,
+                            };
+                            let mut files = Files {
+                                fail_at: None,
+                                trace: trace.clone(),
+                                writing,
+                            };
+                            let outcome = delete(&mut sql, &mut files, &[9; 32], before).unwrap();
+                            let expected = if writing {
                                 Writing
                             } else if pinned || referenced {
                                 Protected
@@ -169,22 +302,51 @@ fn deletion_protocol_checks_every_protection_and_orders_effects() {
                             } else {
                                 Applied
                             };
-                            assert_eq!(plan.outcome(), initial);
-                            if initial == Applied {
-                                assert_eq!(plan.transaction(), [Mutation::DeleteRow]);
-                                assert_eq!(
-                                    plan.after_commit(),
-                                    [Cleanup::Payload, Cleanup::Outboard]
-                                );
-                            } else {
-                                assert!(plan.transaction().is_empty());
-                                assert!(plan.after_commit().is_empty());
+                            assert_eq!(outcome, expected);
+                            let mut expected_trace =
+                                vec!["begin", "pins", "entries", "access", "writers"];
+                            if expected == Applied {
+                                expected_trace.push("delete");
                             }
+                            expected_trace.push("commit");
+                            if expected == Applied {
+                                expected_trace.extend(["payload", "outboard"]);
+                            }
+                            assert_eq!(*trace.borrow(), expected_trace);
                         }
                     }
                 }
             }
         }
+    }
+
+    for fail_at in 0..7 {
+        let trace = Rc::new(RefCell::new(Vec::new()));
+        let mut sql = Sql {
+            trace: trace.clone(),
+            accessed: Some(-1),
+            pinned: false,
+            referenced: false,
+            fail_at: Some(fail_at),
+        };
+        let mut files = Files {
+            trace: trace.clone(),
+            writing: false,
+            fail_at: Some(fail_at),
+        };
+        let result = delete(&mut sql, &mut files, &[9; 32], None);
+        assert!(matches!(
+            result,
+            Err(synch_verified::cas::OperationError::Host("primary failure"))
+        ));
+        let success = [
+            "begin", "pins", "entries", "access", "writers", "delete", "commit",
+        ];
+        let mut expected = success[..=fail_at].to_vec();
+        if fail_at > 0 {
+            expected.push("rollback");
+        }
+        assert_eq!(*trace.borrow(), expected);
     }
 }
 

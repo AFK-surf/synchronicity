@@ -53,6 +53,9 @@ inductive Storage : Type → Type where
   | readBytes (space : String) (key : ByteArray) : Storage (Reply (Option ByteArray))
   /-- Bounded access to an immutable command input, borrowed for this run. -/
   | readInput (handle offset count : UInt64) : Storage (Reply ByteArray)
+  | readCounter (space : String) (key : ByteArray) : Storage (Reply UInt64)
+  | removeFile (space : String) (key : ByteArray) : Storage (Reply Unit)
+  | existsRows (tx : Transaction) (relation : String) (equals : Fields) : Storage (Reply Bool)
 
 abbrev Operation (A : Type) := ExceptT Failure (Program Storage) A
 

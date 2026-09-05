@@ -387,6 +387,9 @@ private def runScript (script : Script) : Nat → Nat →
     | .upsert _ _ _ _ _ => step "unexpected upsert" (resume (.error failure))
     | .readBytes _ _ => step "unexpected byte read" (resume (.error failure))
     | .readInput .. => step "unexpected input read" (resume (.error failure))
+    | .readCounter .. => step "unexpected counter read" (resume (.error failure))
+    | .removeFile .. => step "unexpected file removal" (resume (.error failure))
+    | .existsRows .. => step "unexpected existence query" (resume (.error failure))
 
 private def forkScript : Script :=
   ⟨[], [receiptRow 1 1 10, receiptRow 1 2 10, receiptRow 2 3 10], none⟩

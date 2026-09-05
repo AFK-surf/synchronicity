@@ -5,6 +5,31 @@ use synch_verified::host::{Cell, Fields, Row, Storage};
 
 use crate::{Result, StoreError};
 
+/// Raw keyed resources; no CAS protection or cleanup policy is interpreted here.
+pub(crate) struct Resources<'a>(pub(crate) &'a crate::Store);
+
+impl synch_verified::host::Resources for Resources<'_> {
+    type Error = StoreError;
+    fn read_counter(&mut self, space: &str, key: &[u8]) -> Result<u64> {
+        let root = synch_core::Hash::from_slice(key)
+            .map_err(|error| StoreError::invalid(error.to_string()))?;
+        match space {
+            "cas_writers" => Ok(self.0.writer_count(&root) as u64),
+            _ => Err(StoreError::invalid("unsupported counter namespace")),
+        }
+    }
+    fn remove_file(&mut self, space: &str, key: &[u8]) -> Result<()> {
+        let root = synch_core::Hash::from_slice(key)
+            .map_err(|error| StoreError::invalid(error.to_string()))?;
+        let path = match space {
+            "cas_payload" => self.0.blob_path(&root),
+            "cas_outboard" => self.0.outboard_path(&root),
+            _ => return Err(StoreError::invalid("unsupported file namespace")),
+        };
+        std::fs::remove_file(path).map_err(Into::into)
+    }
+}
+
 /// One synchronous interpreter session borrowing its caller's guarded connection.
 /// The caller retains connection and applicable ordering guards until the program
 /// finishes or is dropped. No borrowed transaction/guard lifetime is extended.
@@ -63,6 +88,7 @@ fn columns_for(relation: &str) -> Result<&'static [&'static str]> {
             "durable",
         ]),
         "pins" => Ok(&["root", "holder", "created_at", "release_after"]),
+        "entries" => Ok(&["content"]),
         "content_want" => Ok(&[
             "root",
             "holder",
@@ -136,6 +162,18 @@ fn predicate(relation: &str, equals: &Fields) -> Result<String> {
 
 impl Storage for SqliteStorage<'_> {
     type Error = StoreError;
+
+    fn exists_rows(&mut self, tx: u64, relation: &str, equals: &Fields) -> Result<bool> {
+        self.require_live_transaction(tx)?;
+        columns_for(relation)?;
+        let sql = format!(
+            "SELECT EXISTS(SELECT 1 FROM \"{relation}\"{})",
+            predicate(relation, equals)?
+        );
+        self.conn
+            .query_row(&sql, params_from_iter(values(equals)), |row| row.get(0))
+            .map_err(Into::into)
+    }
 
     fn begin(&mut self) -> Result<u64> {
         if self.active.is_some() || !self.conn.is_autocommit() {

@@ -17,6 +17,9 @@ inductive Event where
   | deleteRows (tx : Transaction) (relation : String) (equals : Fields)
   | readBytes (space : String) (key : ByteArray)
   | readInput (handle offset count : UInt64)
+  | readCounter (space : String) (key : ByteArray)
+  | removeFile (space : String) (key : ByteArray)
+  | existsRows (tx : Transaction) (relation : String) (equals : Fields)
   deriving BEq
 
 /-- Erase only the dependent reply type of a host request. -/
@@ -29,9 +32,22 @@ def event : Storage A → Event
   | .deleteRows tx relation equals => .deleteRows tx relation equals
   | .readBytes space key => .readBytes space key
   | .readInput handle offset count => .readInput handle offset count
+  | .readCounter space key => .readCounter space key
+  | .removeFile space key => .removeFile space key
+  | .existsRows tx relation equals => .existsRows tx relation equals
 
 /-- Independent storage observations, including failures at every boundary. -/
 structure Script where
+  /-- Raw replies used by deletion; no derived protection snapshot. -/
+  access : Reply (List Row) := .ok []
+  /-- Existence query on raw pin rows. -/
+  pinned : Reply Bool := .ok false
+  /-- Existence query on raw entry rows. -/
+  referenced : Reply Bool := .ok false
+  /-- Raw active-writer counter read. -/
+  writers : Reply UInt64 := .ok 0
+  /-- Acknowledgement of either individual file removal. -/
+  unlink : Reply Unit := .ok ()
   /-- Reply to the immediate transaction request. -/
   begin : Reply Transaction := .ok 7
   /-- Raw projected durable column or its storage failure. -/
@@ -52,14 +68,19 @@ def answer (script : Script) : Storage A → A
   | .begin => script.begin
   | .commit _ => script.commit
   | .rollback _ => script.rollback
-  | .readRows _ relation _ _ =>
-    if relation == "blobs" then script.durable
+  | .readRows _ relation columns _ =>
+    if relation == "blobs" then
+      if columns == ["last_access"] then script.access else script.durable
     else if relation == "content_want" then script.wanted
     else .error malformedMetadata
   | .upsert _ _ _ _ _ => script.upsert
   | .deleteRows _ _ _ => script.delete
   | .readBytes _ _ => .error malformedMetadata
   | .readInput .. => .error malformedMetadata
+  | .readCounter .. => script.writers
+  | .removeFile .. => script.unlink
+  | .existsRows _ relation _ =>
+    if relation == "pins" then script.pinned else script.referenced
 
 /-- Evaluate the actual free-monad constructors, not a second CAS algorithm. -/
 def execute (script : Script) : Program Storage A → A × List Event

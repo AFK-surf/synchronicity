@@ -207,9 +207,11 @@ the proof package imports those exact modules. The shared carrier's laws and
 transaction traces cover begin failure, body failure, commit failure and
 preservation of the primary error across rollback failure.
 
-CAS pin/possession acquisition now uses the complete Lean operation in
-production. Its old snapshot/planner interface and Rust read/interpret/mutation
-orchestration have been deleted. Trie lookup also runs the complete Lean
+CAS pin/possession acquisition and deletion now use complete Lean operations in
+production. Their old snapshot/planner interfaces and Rust read/interpret/mutation
+orchestration have been deleted. Deletion also owns post-commit file cleanup:
+unlink failures are returned to Lean, which attempts both files and ignores
+those failures only after committing the row deletion. Trie lookup also runs the complete Lean
 operation in production: Rust supplies only raw node/value reads and maps the
 completed result. Its former Rust decoding/traversal loop is deleted. Other
 trie operations and history cutover remain unfinished. The
@@ -280,6 +282,15 @@ preserving cheap rejection without duplicating the key-limit policy in Rust.
 Byte-only operations use a narrow `ByteStorage` host interface; they do not
 require SQL or transaction services. Domain command construction and terminal
 result decoding live in the domain facades, not the common continuation runner.
+
+Deletion extends the host algebra with raw relational existence, keyed counter
+reads and keyed file removal. Existence queries avoid materializing every pin
+or reference. Counters and files use a separate `Resources` capability from
+SQL, supplied only to operations that need it. The CAS facade retains connection
+and cross-Store ordering guards until the complete Lean call returns. Rust
+copies the active-writer registry count; Lean interprets it. Resource namespaces
+are whitelisted host mappings, not policies such as “collectable object” or
+“best-effort cleanup.” There is no snapshot or mutation-plan ABI for deletion.
 
 Only a host failure's opaque token crosses into Lean; Rust retains the original
 error object until Lean completes. Thus a later rollback failure cannot overwrite

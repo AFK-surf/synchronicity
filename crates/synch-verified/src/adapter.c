@@ -37,17 +37,6 @@ extern uint8_t synch_lean_walk_result(lean_object *, uint8_t);
 extern lean_object *synch_lean_cas_plan(uint8_t, uint8_t, uint8_t, uint64_t, uint64_t, lean_object *, lean_object *);
 extern uint8_t synch_lean_cas_plan_status(lean_object *);
 extern lean_object *synch_lean_cas_plan_spans(lean_object *);
-extern lean_object *synch_lean_cas_lifecycle(uint8_t, uint8_t, uint8_t, uint8_t, uint8_t, uint8_t, uint64_t, uint64_t);
-
-uint8_t synch_adapter_cas_lifecycle(uint8_t command, uint8_t row, uint8_t a,
-                                  uint8_t b, uint8_t c, uint8_t d,
-                                  uint64_t accessed, uint64_t before, uint8_t *output) {
-    lean_object *plan = synch_lean_cas_lifecycle(command, row, a, b, c, d, accessed, before);
-    uint8_t valid = lean_sarray_size(plan) == 5;
-    if (valid) memcpy(output, lean_sarray_cptr(plan), 5);
-    lean_dec(plan);
-    return valid;
-}
 
 /* Matches the private Rust repr(C) slice. A zero length never dereferences ptr. */
 typedef struct { const uint8_t *ptr; size_t len; } synch_slice;
@@ -72,6 +61,7 @@ static lean_object *bytes(synch_slice slice) {
 }
 
 extern lean_object *synch_lean_cas_acquire(lean_object *, lean_object *, uint64_t, uint8_t);
+extern lean_object *synch_lean_cas_delete(lean_object *, uint8_t, uint64_t);
 extern lean_object *synch_lean_trie_get(lean_object *, uint64_t);
 extern lean_object *synch_lean_operation_packet(lean_object *);
 extern lean_object *synch_lean_operation_resume(lean_object *, lean_object *);
@@ -82,6 +72,10 @@ extern lean_object *synch_lean_operation_resume(lean_object *, lean_object *);
 void *synch_adapter_operation_acquire(synch_slice root, synch_slice holder,
                                      uint64_t now, uint8_t possession) {
     return synch_lean_cas_acquire(bytes(root), bytes(holder), now, possession);
+}
+
+void *synch_adapter_operation_delete(synch_slice root, uint8_t has_before, uint64_t before) {
+    return synch_lean_cas_delete(bytes(root), has_before, before);
 }
 
 void *synch_adapter_operation_packet(void *state) {

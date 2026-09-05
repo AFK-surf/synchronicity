@@ -20,7 +20,9 @@ The [operation architecture](../../docs/LEAN-CORE-ARCHITECTURE.md) requires
 proofs over complete executable Lean programs, not host-prepared snapshots.
 `HostProgramProofs` proves composition and transaction failure traces of the
 shared carrier. `CasProgramProofs` covers the native production acquisition
-operation. `TrieProgramProofs` proves lookup soundness/completeness against a
+operation. `CasLifecycleProofs` also checks the executed deletion trace and
+proves transaction failure prevents cleanup while committed deletion attempts
+both files regardless of unlink errors. `TrieProgramProofs` proves lookup soundness/completeness against a
 stable raw graph interpreted by the actual codec; codec roundtrip/canonicality
 remains separate. History proofs derive fork, ceiling and witness protection
 from actual receipts. Trie lookup is a native cutover over raw byte storage;
