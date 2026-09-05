@@ -10,6 +10,12 @@ runs:
         build-args: --wfail
         test: false
     - if: runner.os == 'Windows'
+      shell: bash
+      run: |
+        # lean-action registers a Git Bash path; native Windows subprocesses
+        # need the drive-qualified spelling to find elan's executable shims.
+        cygpath -w "$HOME/.elan/bin" >> "$GITHUB_PATH"
+    - if: runner.os == 'Windows'
       id: msys2
       uses: msys2/setup-msys2@v2
       with:
