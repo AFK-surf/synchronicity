@@ -1477,11 +1477,12 @@ impl Store {
         )
         .map_err(|error| match error {
             OperationError::Host(error) => error,
-            OperationError::MalformedMetadata(detail @ 1..=3) => {
+            OperationError::MalformedMetadata(detail @ (1..=3 | 7)) => {
                 let kind = match detail {
                     1 => rusqlite::types::Type::Null,
                     2 => rusqlite::types::Type::Text,
                     3 => rusqlite::types::Type::Blob,
+                    7 => rusqlite::types::Type::Real,
                     _ => unreachable!("matched native durable-column error detail"),
                 };
                 rusqlite::Error::InvalidColumnType(0, "durable".into(), kind).into()
@@ -1718,11 +1719,12 @@ impl Store {
         // LEAN-MODEL: cas-lifecycle-deletion (CasLifecycleProofs.executed_deletion_authorized)
         delete(&mut storage, &mut resources, root.as_bytes(), before).map_err(|error| match error {
             OperationError::Host(error) => error,
-            OperationError::MalformedMetadata(detail @ 4..=6) => {
+            OperationError::MalformedMetadata(detail @ (4..=6 | 8)) => {
                 let kind = match detail {
                     4 => rusqlite::types::Type::Null,
                     5 => rusqlite::types::Type::Text,
                     6 => rusqlite::types::Type::Blob,
+                    8 => rusqlite::types::Type::Real,
                     _ => unreachable!("matched native access-column error detail"),
                 };
                 rusqlite::Error::InvalidColumnType(0, "last_access".into(), kind).into()
@@ -2231,6 +2233,43 @@ pub(crate) fn compute_outboard(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn integer_metadata_reports_text_type_before_invalid_utf8() {
+        let (_dir, store) = crate::testutil::store();
+        let root = Hash::new(b"raw text integer metadata");
+        {
+            let conn = store.conn();
+            conn.execute_batch(
+                "CREATE TEMP TABLE blobs (root BLOB PRIMARY KEY, durable, last_access)",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO blobs VALUES (?1, CAST(X'FF' AS TEXT), CAST(X'FE' AS TEXT))",
+                params![root.as_bytes().to_vec()],
+            )
+            .unwrap();
+        }
+        for (column, result) in [
+            (
+                "durable",
+                store
+                    .acquire_pin(&root, &PinHolder::Operator, 1, false)
+                    .map(|_| ()),
+            ),
+            ("last_access", store.delete_blob(&root)),
+        ] {
+            match result.unwrap_err() {
+                StoreError::Sqlite(rusqlite::Error::InvalidColumnType(
+                    0,
+                    name,
+                    rusqlite::types::Type::Text,
+                )) => assert_eq!(name, column),
+                other => panic!("raw text preempted the integer field error: {other:?}"),
+            }
+            assert!(store.conn().is_autocommit());
+        }
+    }
 
     #[test]
     fn acquisition_preserves_sqlite_column_errors_for_corrupt_durability() {

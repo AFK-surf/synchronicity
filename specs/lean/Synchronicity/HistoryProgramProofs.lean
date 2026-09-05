@@ -339,7 +339,7 @@ theorem remove_next (tx : Transaction) (origin : String) (total : Nat)
       .request (.deleteRows tx "head_history"
         (receiptKey origin receipt) [⟨"heads", receiptKey origin receipt⟩])
         (fun reply => match reply with
-          | .error failure => .pure (.error failure)
+          | .error failure => .pure (.error (.host failure))
           | .ok count => (removeLoop tx origin (total + count) rest).run) := by
   change Program.request _ _ = Program.request _ _
   congr 1
@@ -374,14 +374,29 @@ theorem joined_shape_admitted (origin : String) (seq created received verified :
     decodeJoinedHead [.text origin, .integer seq, .blob hash, .integer created,
       .blob key, .blob sig, .integer received, .integer verified] =
       .ok ⟨origin, ⟨seq.toUInt64, hash⟩, key⟩ := by
-  simp [decodeJoinedHead, hashSize, keySize, sigSize]
+  simp [decodeJoinedHead, textField, integerField, blobField, hashField,
+    bind, Except.bind, pure, Except.pure, hashSize, keySize, sigSize]
 
 /-- A malformed signature width is rejected by Lean before retention. -/
 theorem joined_signature_width_required (origin : String) (seq created received verified : Int64)
     (hash key sig : ByteArray) (bad : sig.size ≠ 64) :
     decodeJoinedHead [.text origin, .integer seq, .blob hash, .integer created,
-      .blob key, .blob sig, .integer received, .integer verified] = .error malformed := by
-  simp [decodeJoinedHead, bad]
+      .blob key, .blob sig, .integer received, .integer verified] =
+        .error (.column "heads.sig" "not 64 bytes") := by
+  simp [decodeJoinedHead, textField, integerField, blobField, bind,
+    Except.bind, bad]
+
+/-- Later raw storage anomalies cannot replace the first projected field error. -/
+theorem joined_first_field_error (seq root created key sig received verified : Cell) :
+    decodeJoinedHead [.null, seq, root, created, key, sig, received, verified] =
+      .error (.columnType 0 "origin_id" .null) := by
+  rfl
+
+/-- Typed conversion of recorded_at precedes checking the root's byte width. -/
+theorem receipt_type_before_width (seq : Int64) (root : ByteArray) :
+    decodeReceipt [.integer seq, .blob root, .real 0] =
+      .error (.columnType 2 "recorded_at" .real) := by
+  rfl
 
 /-! Scripted host fixtures run the actual free-monadic program. They deliberately
 return raw cells; no fork, age, current or ceiling decisions enter from the host. -/
@@ -405,11 +420,11 @@ private def scriptReply (script : Script) (index : Nat) (value : A) : Reply A :=
   if script.failAt == some index then .error failure else .ok value
 
 private def runScript (script : Script) : Nat → Nat →
-    Program Storage (Reply Nat) → Option (Reply Nat × List String)
+    Program Storage (Result Nat) → Option (Result Nat × List String)
   | 0, _, _ => none
   | _ + 1, _, .pure value => some (value, [])
   | fuel + 1, index, .request effect resume =>
-    let step (label : String) (next : Program Storage (Reply Nat)) :=
+    let step (label : String) (next : Program Storage (Result Nat)) :=
       (runScript script fuel (index + 1) next).map fun (result, trace) => (result, label :: trace)
     match effect with
     | .begin => step "begin" (resume (scriptReply script index 7))
@@ -455,12 +470,12 @@ example : runScript { forkScript with
 
 /-- Commit failure is not success, even after both delete acknowledgements. -/
 example : runScript { forkScript with failAt := some 6 } 12 0 (prune "origin" 20).run =
-    some (.error failure, ["begin", "heads", "heads", "head_history", "delete", "delete", "commit", "rollback"]) := by
+    some (.error (.host failure), ["begin", "heads", "heads", "head_history", "delete", "delete", "commit", "rollback"]) := by
   decide
 
 /-- A partial deletion failure stops immediately and rolls back the prefix. -/
 example : runScript { forkScript with failAt := some 5 } 12 0 (prune "origin" 20).run =
-    some (.error failure, ["begin", "heads", "heads", "head_history", "delete", "delete", "rollback"]) := by
+    some (.error (.host failure), ["begin", "heads", "heads", "head_history", "delete", "delete", "rollback"]) := by
   decide
 
 /-- Raw malformed pointers cause rollback before history reads or deletions. -/
@@ -473,7 +488,7 @@ example : runScript { forkScript with pointers := [[.integer 1, .blob ByteArray.
 failure, including begin, all three reads, both deletes, and commit. -/
 example : (List.range 7).all (fun index =>
     ((runScript { forkScript with failAt := some index } 12 0 (prune "origin" 20).run).map
-      (fun result => result.1)) == some (.error failure)) = true := by
+      (fun result => result.1)) == some (.error (.host failure))) = true := by
   decide
 
 /-- An exempt fork retains its least higher old witness even when that witness

@@ -17,7 +17,9 @@ def decodeDurability : List Row → Reply Bool
   | [[.integer value]] => .ok (value != 0)
   | [[.null]] => .error ⟨2, 1⟩
   | [[.text _]] => .error ⟨2, 2⟩
+  | [[.rawText _]] => .error ⟨2, 2⟩
   | [[.blob _]] => .error ⟨2, 3⟩
+  | [[.real _]] => .error ⟨2, 7⟩
   | _ => .error malformedMetadata
 
 /-- Acquire one holder's pin inside an already-owned transaction. The database
@@ -57,7 +59,9 @@ def decodeAccess : List Row → Reply (Option Int64)
   | [[.integer value]] => .ok (some value)
   | [[.null]] => .error ⟨2, 4⟩
   | [[.text _]] => .error ⟨2, 5⟩
+  | [[.rawText _]] => .error ⟨2, 5⟩
   | [[.blob _]] => .error ⟨2, 6⟩
+  | [[.real _]] => .error ⟨2, 8⟩
   | _ => .error malformedMetadata
 
 /-- All protection observations occur within the immediate transaction and

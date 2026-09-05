@@ -105,6 +105,8 @@ private def cellView : Cell → Nat × Int × List UInt8
   | .integer n => (1, n.toInt, [])
   | .text s => (2, 0, s.toUTF8.toList)
   | .blob bytes => (3, 0, bytes.toList)
+  | .real bits => (4, bits.toNat, [])
+  | .rawText bytes => (5, 0, bytes.data.toList)
 
 private def cellReplyView : Reply (List Row) → Option (List (List (Nat × Int × List UInt8)))
   | .error _ => none
@@ -128,6 +130,18 @@ theorem raw_cell_distinctions_preserved :
     rw [ByteArray.toList_empty]
   · change some [[(2, 0, "".toUTF8.toList)]] = some [[(2, 0, [])]]
     simp
+
+theorem real_bits_preserved :
+    oneCell [4, 255, 255, 255, 255, 255, 255, 255, 255] =
+      some [[(4, 18446744073709551615, [])]] := by rfl
+
+theorem invalid_text_bytes_preserved :
+    oneCell [5, 3, 0, 0, 0, 0, 0, 0, 0, 255, 0, 254] =
+      some [[(5, 0, [255, 0, 254])]] := by
+  change some [[(5, 0, ((b [1, 19, 1, 0, 0, 0, 0, 0, 0, 0,
+    1, 0, 0, 0, 0, 0, 0, 0, 5, 3, 0, 0, 0, 0, 0, 0, 0,
+    255, 0, 254]).extract 27 30).data.toList)]] = _
+  simp [ByteArray.data_extract, b]
 
 private def transactionalRead : State :=
   (transaction (fun _ => do

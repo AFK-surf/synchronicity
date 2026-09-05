@@ -1,6 +1,10 @@
 //! Literal raw-storage interpreter for Lean programs. No domain predicates.
 
-use rusqlite::{params_from_iter, types::Value, Connection, OptionalExtension};
+use rusqlite::{
+    params_from_iter,
+    types::{ToSqlOutput, ValueRef},
+    Connection, OptionalExtension, ToSql,
+};
 use synch_verified::host::{Cell, Fields, Row, Storage};
 
 use crate::{Result, StoreError};
@@ -144,16 +148,23 @@ fn read_column(base: &str, joins: &[synch_verified::host::Join], name: &str) -> 
     Ok(format!("\"{relation}\".{}", column(relation, name)?))
 }
 
-fn values(fields: &Fields) -> Vec<Value> {
-    fields
-        .iter()
-        .map(|(_, cell)| match cell {
-            Cell::Null => Value::Null,
-            Cell::Integer(value) => Value::Integer(*value),
-            Cell::Text(value) => Value::Text(value.clone()),
-            Cell::Blob(value) => Value::Blob(value.clone()),
-        })
-        .collect()
+struct BoundCell<'a>(&'a Cell);
+
+impl ToSql for BoundCell<'_> {
+    fn to_sql(&self) -> rusqlite::Result<ToSqlOutput<'_>> {
+        Ok(ToSqlOutput::Borrowed(match self.0 {
+            Cell::Null => ValueRef::Null,
+            Cell::Integer(value) => ValueRef::Integer(*value),
+            Cell::Text(value) => ValueRef::Text(value.as_bytes()),
+            Cell::RawText(value) => ValueRef::Text(value),
+            Cell::Blob(value) => ValueRef::Blob(value),
+            Cell::Real(bits) => ValueRef::Real(f64::from_bits(*bits)),
+        }))
+    }
+}
+
+fn values(fields: &Fields) -> Vec<BoundCell<'_>> {
+    fields.iter().map(|(_, cell)| BoundCell(cell)).collect()
 }
 
 fn predicate(relation: &str, equals: &Fields) -> Result<String> {
@@ -290,20 +301,17 @@ impl Storage for SqliteStorage<'_> {
             columns
                 .iter()
                 .enumerate()
-                .map(|(index, name)| match row.get_ref(index)? {
+                .map(|(index, _)| match row.get_ref(index)? {
                     rusqlite::types::ValueRef::Null => Ok(Cell::Null),
                     rusqlite::types::ValueRef::Integer(value) => Ok(Cell::Integer(value)),
-                    rusqlite::types::ValueRef::Text(value) => Ok(Cell::Text(
-                        std::str::from_utf8(value)
-                            .map_err(rusqlite::Error::Utf8Error)?
-                            .to_owned(),
-                    )),
+                    rusqlite::types::ValueRef::Text(value) => {
+                        Ok(match std::str::from_utf8(value) {
+                            Ok(text) => Cell::Text(text.to_owned()),
+                            Err(_) => Cell::RawText(value.to_vec()),
+                        })
+                    }
                     rusqlite::types::ValueRef::Blob(value) => Ok(Cell::Blob(value.to_vec())),
-                    rusqlite::types::ValueRef::Real(_) => Err(rusqlite::Error::InvalidColumnType(
-                        index,
-                        name.rsplit('.').next().unwrap_or(name).to_owned(),
-                        rusqlite::types::Type::Real,
-                    )),
+                    rusqlite::types::ValueRef::Real(value) => Ok(Cell::Real(value.to_bits())),
                 })
                 .collect::<rusqlite::Result<Row>>()
         })?;
@@ -409,6 +417,50 @@ mod tests {
     use synch_verified::host::{Exclusion, Join, Order};
 
     #[test]
+    fn raw_text_and_real_values_keep_their_storage_classes() {
+        let conn = connection();
+        let mut storage = SqliteStorage::new(&conn);
+        let tx = storage.begin().unwrap();
+        let raw = vec![255, 0, 254];
+        storage
+            .upsert(
+                tx,
+                "blobs",
+                &vec![
+                    ("root".into(), Cell::Blob(vec![1])),
+                    ("inline".into(), Cell::RawText(raw.clone())),
+                    ("durable".into(), Cell::Real(1.5f64.to_bits())),
+                ],
+                &names(&["root"]),
+                &[],
+            )
+            .unwrap();
+        assert_eq!(
+            storage
+                .read_rows(
+                    tx,
+                    "blobs",
+                    &names(&["inline", "durable"]),
+                    &vec![("inline".into(), Cell::RawText(raw.clone()))],
+                    &[],
+                    &[]
+                )
+                .unwrap(),
+            vec![vec![Cell::RawText(raw), Cell::Real(1.5f64.to_bits())]]
+        );
+        assert_eq!(
+            conn.query_row(
+                "SELECT typeof(inline), typeof(durable) FROM blobs",
+                [],
+                |row| { Ok((row.get::<_, String>(0)?, row.get::<_, String>(1)?)) }
+            )
+            .unwrap(),
+            ("text".into(), "real".into())
+        );
+        storage.rollback(tx).unwrap();
+    }
+
+    #[test]
     fn raw_inner_join_skips_orphans_before_decoding_and_preserves_projection_order() {
         let conn = connection();
         conn.execute_batch("CREATE TABLE heads (origin_id TEXT, slot TEXT, seq INTEGER, root BLOB, received_at, verified_at);
@@ -436,10 +488,16 @@ mod tests {
             .is_empty());
         conn.execute_batch("UPDATE head_history SET root = X'01'")
             .unwrap();
-        assert!(matches!(
-            storage.read_rows(tx, "heads", &projection, &equals, &[], &joins),
-            Err(StoreError::Sqlite(rusqlite::Error::Utf8Error(_)))
-        ));
+        assert_eq!(
+            storage
+                .read_rows(tx, "heads", &projection, &equals, &[], &joins)
+                .unwrap(),
+            vec![vec![
+                Cell::RawText(vec![255]),
+                Cell::Integer(3),
+                Cell::Integer(1)
+            ]]
+        );
         conn.execute_batch("UPDATE heads SET received_at = 7")
             .unwrap();
         assert_eq!(
@@ -859,7 +917,7 @@ mod tests {
     }
 
     #[test]
-    fn unsupported_identifiers_and_cell_types_fail_without_coercion() {
+    fn unsupported_identifiers_fail_and_real_cells_remain_raw() {
         let conn = connection();
         conn.execute_batch("INSERT INTO blobs (root, durable) VALUES (X'01', 1.5)")
             .unwrap();
@@ -885,9 +943,12 @@ mod tests {
                 &[]
             )
             .is_err());
-        assert!(storage
-            .read_rows(tx, "blobs", &names(&["durable"]), &vec![], &[], &[])
-            .is_err());
+        assert_eq!(
+            storage
+                .read_rows(tx, "blobs", &names(&["durable"]), &vec![], &[], &[])
+                .unwrap(),
+            vec![vec![Cell::Real(1.5f64.to_bits())]]
+        );
         assert!(storage
             .read_rows(tx, "blobs", &[], &vec![], &[], &[])
             .is_err());

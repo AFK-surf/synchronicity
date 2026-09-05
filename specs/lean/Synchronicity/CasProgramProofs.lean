@@ -128,6 +128,15 @@ theorem text_not_durable (value : String) :
 theorem blob_not_durable (value : ByteArray) :
     decodeDurability [[.blob value]] = .error ⟨2, 3⟩ := rfl
 
+/-- Raw malformed text is still a text-type error for an integer projection;
+attempting UTF-8 conversion first would change the original field error. -/
+theorem raw_text_not_durable (value : ByteArray) :
+    decodeDurability [[.rawText value]] = .error ⟨2, 2⟩ := rfl
+
+/-- REAL cells remain distinguishable until the domain selects its type error. -/
+theorem real_not_durable (bits : UInt64) :
+    decodeDurability [[.real bits]] = .error ⟨2, 7⟩ := rfl
+
 /-- With successful storage, the complete program requests exactly its guarded
 mutations between the raw reads and commit. A direct pin does not delete wants. -/
 theorem successful_execution (tx : Transaction) (root : ByteArray) (holder : String)
@@ -167,7 +176,7 @@ theorem decoded_execution (tx : Transaction) (root : ByteArray) (holder : String
           (if durable && (!possession || !wanted.isEmpty)
             then writes tx root holder now possession else []) ++ [.commit tx]) := by
   cases durable <;> cases possession <;> cases wanted <;>
-    simp [run, acquire, transaction, acquireIn, perform, execute, answer, event,
+    simp [run, acquire, transaction, transactionWith, acquireIn, perform, execute, answer, event,
       bind, pure, Program.bind, ExceptT.bind, ExceptT.bindCont, ExceptT.pure,
       ExceptT.run, ExceptT.mk, decoded, reads, writes]
 

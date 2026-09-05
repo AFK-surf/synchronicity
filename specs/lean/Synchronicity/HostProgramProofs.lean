@@ -39,7 +39,19 @@ theorem transaction_begin (body : Transaction → Operation A) :
           match committed with
           | .ok () => .pure (.ok value)
           | .error failure => .request (.rollback tx) (fun _ => .pure (.error failure))))) := by
-  rfl
+  simp only [transaction, transactionWith, perform, ExceptT.run, ExceptT.mk,
+    bind, Program.bind, pure, id]
+  congr 1
+  funext reply
+  cases reply with
+  | error failure => rfl
+  | ok tx =>
+    dsimp only
+    apply congrArg (Program.bind (body tx).run)
+    funext result
+    cases result with
+    | error failure => rfl
+    | ok value => rfl
 
 /-- A successful body is not enough: only a successful commit returns success.
 Commit failure requests rollback and preserves its error, even if rollback fails. -/
@@ -62,5 +74,33 @@ theorem transaction_failed_body (failure : Failure) :
         | .error beginFailure => .pure (.error beginFailure)
         | .ok tx => .request (.rollback tx) (fun _ => .pure (.error failure))) := by
   rfl
+
+/-- A typed domain error follows the same rollback protocol as a host error;
+it is never encoded as a successful body or replaced by a rollback failure. -/
+theorem transactionWith_failed_body (hostError : Failure → Error) (error : Error) :
+    (transactionWith hostError (fun _ => (throw error : OperationWith Error A))).run =
+      Program.request Storage.begin (fun reply =>
+        match reply with
+        | .error beginFailure => .pure (.error (hostError beginFailure))
+        | .ok tx => .request (.rollback tx) (fun _ => .pure (.error error))) := by
+  rfl
+
+/-- Host begin/commit failures are lifted exactly once. A successful typed
+body still cannot report success before the commit acknowledgement. -/
+theorem transactionWith_success_body (hostError : Failure → Error) (value : A) :
+    (transactionWith hostError (fun _ => pure value)).run =
+      Program.request Storage.begin (fun reply =>
+        match reply with
+        | .error failure => .pure (.error (hostError failure))
+        | .ok tx => .request (.commit tx) (fun committed =>
+          match committed with
+          | .ok () => .pure (.ok value)
+          | .error failure => .request (.rollback tx)
+              (fun _ => .pure (.error (hostError failure))))) := by
+  rfl
+
+/-- Adding domain error types does not create a second transaction algorithm. -/
+theorem transaction_specialization (body : Transaction → Operation A) :
+    transaction body = transactionWith id body := rfl
 
 end Synchronicity.HostProgramProofs

@@ -32,6 +32,10 @@ inductive Cell where
   | integer (value : Int64)
   | text (value : String)
   | blob (value : ByteArray)
+  /-- Observed IEEE-754 bits; interpretation belongs to the domain decoder. -/
+  | real (bits : UInt64)
+  /-- Text bytes that have not been converted to a Lean string. -/
+  | rawText (bytes : ByteArray)
   deriving BEq
 
 abbrev Row := List Cell
@@ -77,17 +81,24 @@ inductive Storage : Type → Type where
   | removeFile (space : String) (key : ByteArray) : Storage (Reply Unit)
   | existsRows (tx : Transaction) (relation : String) (equals : Fields) : Storage (Reply Bool)
 
-abbrev Operation (A : Type) := ExceptT Failure (Program Storage) A
+abbrev OperationWith (Error A : Type) := ExceptT Error (Program Storage) A
+abbrev Operation (A : Type) := OperationWith Failure A
 
 def perform (effect : Storage (Reply A)) : Operation A :=
   ExceptT.mk (.request effect .pure)
 
+/-- Lift a raw host failure into the domain's own error type, without losing
+the original failure token or exposing domain errors to the host interpreter. -/
+def performWith (hostError : Failure → Error) (effect : Storage (Reply A)) : OperationWith Error A :=
+  ExceptT.mk (.request effect (fun result => .pure (result.mapError hostError)))
+
 /-- Immediate transaction. A failed body or commit requests rollback, whose
 failure must not replace the primary failure. Host RAII handles abandonment;
 it does not choose domain recovery or report a failed commit as success. -/
-def transaction (body : Transaction → Operation A) : Operation A := ExceptT.mk do
+def transactionWith (hostError : Failure → Error)
+    (body : Transaction → OperationWith Error A) : OperationWith Error A := ExceptT.mk do
   match ← (perform .begin).run with
-  | .error failure => pure (.error failure)
+  | .error failure => pure (.error (hostError failure))
   | .ok tx =>
     match ← (body tx).run with
     | .error failure =>
@@ -98,6 +109,10 @@ def transaction (body : Transaction → Operation A) : Operation A := ExceptT.mk
       | .ok () => pure (.ok value)
       | .error failure =>
         let _ ← (perform (.rollback tx)).run
-        pure (.error failure)
+        pure (.error (hostError failure))
+
+/-- Host-error-only specialization of the shared transaction program. -/
+def transaction (body : Transaction → Operation A) : Operation A :=
+  transactionWith id body
 
 end VerifiedCore.Host

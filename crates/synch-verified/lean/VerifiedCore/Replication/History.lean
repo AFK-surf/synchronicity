@@ -18,11 +18,11 @@ point the shared storage interpreter/algebra must preserve these contracts:
   current mutation/trigger/failure order. SQL ordering is signed Int64; Lean's
   retention comparisons deliberately reinterpret the stored bits as UInt64.
   The program now supplies this ordering explicitly.
-* Joined slot reads now preserve orphan-pointer absence and check column/byte
-  shapes. They do not yet validate origin syntax or cryptographic public keys.
-  Malformed cells still return code 2/token 0 rather than the existing contextual
-  Rust column/decode errors. Error ordering, origin/key validation and diagnostic
-  preservation remain required before cutover; they are not claimed here.
+* Joined slot reads preserve orphan-pointer absence and check column/byte
+  shapes with typed contextual errors in projection order. They do not yet
+  validate origin syntax or cryptographic public keys. Native terminal error
+  encoding, origin/key validation and scan-failure ordering remain required
+  before cutover; full diagnostic compatibility is not claimed here.
 
 The generic predicate/order facilities are in Host, not a history-specific
 callback. Current scripted fixtures establish the normal storage protocol and
@@ -40,18 +40,72 @@ structure Receipt where
   pointer : Pointer
   recordedAt : Int64
 
-def malformed : Failure := ⟨2, 0⟩
+/-- SQL storage classes, independent of a domain's expected field type. -/
+inductive CellType where
+  | null | integer | real | text | blob
+  deriving BEq, DecidableEq
+
+/-- Rich validation failures remain in Lean until the operation completes.
+Host tokens are retained unchanged; the native entry will encode domain errors
+as terminal results, not feed them back through the storage interface. -/
+inductive Error where
+  | host (failure : Failure)
+  | malformed
+  | columnType (index : Nat) (column : String) (actual : CellType)
+  | invalidText (bytes : List UInt8)
+  | column (column : String) (reason : String)
+  deriving BEq, DecidableEq
+
+abbrev Result (A : Type) := Except Error A
+abbrev Action (A : Type) := Host.OperationWith Error A
+
+def malformed : Error := .malformed
+
+def request (effect : Storage (Reply A)) : Action A := performWith Error.host effect
+
+def cellType : Cell → CellType
+  | .null => .null
+  | .integer _ => .integer
+  | .real _ => .real
+  | .text _ | .rawText _ => .text
+  | .blob _ => .blob
+
+def integerField (index : Nat) (column : String) : Cell → Result Int64
+  | .integer value => .ok value
+  | value => .error (.columnType index column (cellType value))
+
+def blobField (index : Nat) (column : String) : Cell → Result ByteArray
+  | .blob value => .ok value
+  | value => .error (.columnType index column (cellType value))
+
+def textField (index : Nat) (column : String) : Cell → Result String
+  | .text value => .ok value
+  | .rawText bytes => match String.fromUTF8? bytes with
+    | some text => .ok text
+    | none => .error (.invalidText bytes.toList)
+  | value => .error (.columnType index column (cellType value))
+
+def hashField (column : String) (bytes : ByteArray) : Result ByteArray :=
+  if bytes.size == 32 then .ok bytes
+  else .error (.column column (toString bytes.size ++ " bytes, not 32"))
 
 /-- SQL stores sequence bits in signed integers. Do not clamp negative cells. -/
-def decodePointer : Row → Reply Pointer
-  | [.integer seq, .blob root] =>
-    if root.size == 32 then .ok ⟨seq.toUInt64, root⟩ else .error malformed
+def decodePointer : Row → Result Pointer
+  | [seq, root] => do
+    let seq ← integerField 0 "seq" seq
+    let root ← blobField 1 "root" root
+    return ⟨seq.toUInt64, ← hashField "heads.root" root⟩
   | _ => .error malformed
 
-def decodeReceipt : Row → Reply Receipt
-  | [.integer seq, .blob root, .integer recordedAt] => do
-    let pointer ← decodePointer [.integer seq, .blob root]
-    pure ⟨pointer, recordedAt⟩
+/-- Decode typed columns in projection order before checking the hash width,
+matching the original stored-record reader's first-error behavior. -/
+def decodeReceipt : Row → Result Receipt
+  | [seq, root, recordedAt] => do
+    let seq ← integerField 0 "seq" seq
+    let root ← blobField 1 "root" root
+    let recordedAt ← integerField 2 "recorded_at" recordedAt
+    let root ← hashField "head_history.root" root
+    return ⟨⟨seq.toUInt64, root⟩, recordedAt⟩
   | _ => .error malformed
 
 /-- Joined storage fields retained for subsequent origin/key validation. -/
@@ -60,13 +114,22 @@ structure JoinedHead where
   pointer : Pointer
   publicKey : ByteArray
 
-/-- Validate the joined record's column and byte shapes in Lean. This is not
-yet full validation: origin parsing and public-key validity remain cutover gates. -/
-def decodeJoinedHead : Row → Reply JoinedHead
-  | [.text origin, .integer seq, .blob root, .integer _, .blob key, .blob sig,
-      .integer _, .integer _] =>
-    if sig.size != 64 || root.size != 32 || key.size != 32 then .error malformed
-    else .ok ⟨origin, ⟨seq.toUInt64, root⟩, key⟩
+/-- Column conversion is sequenced explicitly, followed by record checks.
+Origin parsing and cryptographic public-key validity remain cutover gates. -/
+def decodeJoinedHead : Row → Result JoinedHead
+  | [origin, seq, root, created, key, sig, received, verified] => do
+    let origin ← textField 0 "origin_id" origin
+    let seq ← integerField 1 "seq" seq
+    let root ← blobField 2 "root" root
+    let _ ← integerField 3 "created_at" created
+    let key ← blobField 4 "signed_by" key
+    let sig ← blobField 5 "sig" sig
+    let _ ← integerField 6 "received_at" received
+    let _ ← integerField 7 "verified_at" verified
+    if sig.size != 64 then throw (.column "heads.sig" "not 64 bytes")
+    let root ← hashField "heads.root" root
+    if key.size != 32 then throw (.column "heads.signed_by" "not 32 bytes")
+    return ⟨origin, ⟨seq.toUInt64, root⟩, key⟩
   | _ => .error malformed
 
 def headColumns : List String :=
@@ -78,8 +141,8 @@ def headJoin : List Join :=
 
 /-- The raw inner join precedes all decoding. Orphan pointers are absent, just
 as in the existing storage reader. Slots are fetched in caller-selected order. -/
-def readSlot (tx : Transaction) (origin slot : String) : Operation (List JoinedHead) := do
-  let raw ← perform (.readRows tx "heads" headColumns
+def readSlot (tx : Transaction) (origin slot : String) : Action (List JoinedHead) := do
+  let raw ← request (.readRows tx "heads" headColumns
     [("origin_id", .text origin), ("slot", .text slot)] [] headJoin)
   match raw with
   | [] => return []
@@ -161,29 +224,29 @@ def receiptKey (origin : String) (receipt : Receipt) : Fields :=
   [("origin_id", .text origin), ("seq", .integer receipt.pointer.seq.toInt64),
    ("root", .blob receipt.pointer.root)]
 
-def removeLoop (tx : Transaction) (origin : String) : Nat → List Receipt → Operation Nat
+def removeLoop (tx : Transaction) (origin : String) : Nat → List Receipt → Action Nat
   | total, [] => pure total
   | total, receipt :: rest => do
-    let count ← perform (.deleteRows tx "head_history"
+    let count ← request (.deleteRows tx "head_history"
       (receiptKey origin receipt) [⟨"heads", receiptKey origin receipt⟩])
     removeLoop tx origin (total + count) rest
 
-def remove (tx : Transaction) (origin : String) (receipts : List Receipt) : Operation Nat :=
+def remove (tx : Transaction) (origin : String) (receipts : List Receipt) : Action Nat :=
   removeLoop tx origin 0 receipts
 
 /-- This operation owns raw decoding and every retention decision in the same
 immediate transaction as its deletions. No host-computed fork or ceiling facts. -/
-def pruneIn (tx : Transaction) (origin : String) (before : Int64) : Operation Nat := do
+def pruneIn (tx : Transaction) (origin : String) (before : Int64) : Action Nat := do
   let complete ← readSlot tx origin "complete"
   let pending ← readSlot tx origin "pending"
   let pointers := (complete ++ pending).map (·.pointer)
-  let rawReceipts ← perform (.readRows tx "head_history" ["seq", "root", "recorded_at"]
+  let rawReceipts ← request (.readRows tx "head_history" ["seq", "root", "recorded_at"]
     [("origin_id", .text origin)] [⟨"seq", true⟩, ⟨"root", true⟩])
   let receipts ← ExceptT.mk (pure (rawReceipts.mapM decodeReceipt))
   remove tx origin (selected pointers before receipts)
 
 /-- Public domain command: origin and retention horizon, returning committed deletions. -/
-def prune (origin : String) (before : Int64) : Operation Nat :=
-  transaction (fun tx => pruneIn tx origin before)
+def prune (origin : String) (before : Int64) : Action Nat :=
+  transactionWith Error.host (fun tx => pruneIn tx origin before)
 
 end VerifiedCore.Replication.History

@@ -127,6 +127,8 @@ impl<'a> Reader<'a> {
             1 => Cell::Integer(self.word()? as i64),
             2 => Cell::Text(self.string()?),
             3 => Cell::Blob(self.bytes()?),
+            4 => Cell::Real(self.word()?),
+            5 => Cell::RawText(self.bytes()?),
             _ => return Err(()),
         })
     }
@@ -162,6 +164,14 @@ fn cell(out: &mut Vec<u8>, value: &Cell) {
         }
         Cell::Blob(value) => {
             out.push(3);
+            bytes(out, value);
+        }
+        Cell::Real(bits) => {
+            out.push(4);
+            word(out, *bits);
+        }
+        Cell::RawText(value) => {
+            out.push(5);
             bytes(out, value);
         }
     }
@@ -474,6 +484,21 @@ pub(crate) unsafe fn run_readonly<S: ByteStorage>(
 mod tests {
     use super::*;
     use crate::cas::acquire;
+
+    #[test]
+    fn cell_packets_preserve_real_bits_and_unvalidated_text() {
+        for value in [
+            Cell::Real(1.5f64.to_bits()),
+            Cell::Real(u64::MAX),
+            Cell::RawText(vec![255, 0, 254]),
+        ] {
+            let mut encoded = Vec::new();
+            cell(&mut encoded, &value);
+            let mut reader = Reader(&encoded);
+            assert_eq!(reader.cell().unwrap(), value);
+            reader.end().unwrap();
+        }
+    }
 
     #[test]
     fn ordered_and_guarded_packets_are_exact_and_fail_closed() {

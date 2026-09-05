@@ -20,6 +20,8 @@ def cell : Cell → ByteArray
   | .integer n => octet 1 ++ word n.toUInt64
   | .text s => octet 2 ++ string s
   | .blob b => octet 3 ++ bytes b
+  | .real bits => octet 4 ++ word bits
+  | .rawText b => octet 5 ++ bytes b
 
 def fields (values : Fields) : ByteArray :=
   sequence (fun (name, value) => string name ++ cell value) values
@@ -122,6 +124,8 @@ def readCell : Reader Cell := do
   | 1 => return .integer (← readWord).toInt64
   | 2 => return .text (← readString)
   | 3 => return .blob (← readBytes)
+  | 4 => return .real (← readWord)
+  | 5 => return .rawText (← readBytes)
   | _ => throw ()
 
 def readFailure : Reader Failure := do

@@ -58,7 +58,7 @@ macOS x86-64/arm64 and Windows gnullvm; no new opt-in or Rust fallback.
 
 `VerifiedCore.Host.Program E A` is a typed free monad with two constructors:
 return `A`, or issue `E B` with a Lean continuation from `B`. Domain operations
-use `ExceptT Failure (Program E)` so errors are ordinary inputs to the same
+use `ExceptT Error (Program E)` so errors are ordinary inputs to the same
 verified program. The carrier is executable and total; use structural bounds
 or explicit fuel for bounded work, not `sorry`, `unsafe` replacements or
 noncomputable algorithms. Long-lived protocols use successive finite commands.
@@ -75,7 +75,8 @@ storage capabilities include:
   requests chosen by Lean, not host-side application queries. Batch requests
   must preserve set-shaped behavior and index access for large collections.
 
-Raw cells are NULL, signed 64-bit integer, UTF-8 text or bytes. Lean owns the
+Raw cells preserve all SQLite storage classes: NULL, signed 64-bit integer,
+REAL bits, text (including invalid UTF-8 bytes), and blobs. Lean owns the
 interpretation of durable flags, unsigned sequence numbers stored as signed
 integers, serialized bitmaps, head receipts and other metadata. SQL remains in
 the Rust storage adapter: it translates whitelisted relation/column identifiers
@@ -109,6 +110,12 @@ cleanup and publication cannot run on the failure branch. Rollback failure
 must not erase the primary error or report success. Rust RAII releases locks,
 rolls back uncommitted transactions and destroys abandoned native handles on
 cancellation/panic; it is a host resource guarantee, not domain recovery policy.
+
+The shared `transactionWith` helper lifts opaque host failures into a domain's
+error type and preserves domain validation errors unchanged through rollback.
+The host-error-only `transaction` is its specialization, not another algorithm.
+Domain diagnostics are terminal results; storage never receives a domain
+validation callback or interprets a domain error to choose recovery.
 
 The runtime must reject mismatched, duplicate or stale replies and replies to
 terminal programs. It must preserve one pending request across polling. SQLite
@@ -251,9 +258,12 @@ Integration review has identified specific gates, not waived limitations:
   (signature width, origin, root width, public key), then receipt decoding in
   requested order. Do not replace these with a Rust `validatedHeads` service;
   Lean must consume raw storage records and invoke only genuine primitives.
-  Raw eager cell conversion also needs care: a later REAL/invalid-UTF-8 cell
-  must not preempt an earlier typed-field or record-validation error when the
-  existing reader would stop at the earlier error.
+  Raw cells now preserve REAL bits and invalid UTF-8 TEXT instead of rejecting
+  them eagerly. Lean's staged history decoder selects contextual field/type
+  errors in projection order. Native terminal encoding and origin/key validation
+  remain unfinished. Eager materialization of all rows still requires review:
+  a later SQLite scan failure must not preempt an earlier record-validation
+  error when the existing reader would stop at that record.
 - Trie lookup now has soundness/completeness proofs against a stable raw graph
   interpreted by the actual decoder. Codec roundtripping/canonicality and
   mutable-host refinement remain separate obligations. Native commands must

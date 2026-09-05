@@ -11,6 +11,10 @@ pub enum Cell {
     Text(String),
     /// Opaque stored bytes.
     Blob(Vec<u8>),
+    /// Observed IEEE-754 bits, without numeric/domain coercion.
+    Real(u64),
+    /// SQLite text bytes retained without requiring valid UTF-8.
+    RawText(Vec<u8>),
 }
 
 /// A projected row, in the requested column order.
