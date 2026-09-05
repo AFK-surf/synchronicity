@@ -20,18 +20,6 @@ impl From<&[u8]> for Slice {
 }
 
 unsafe extern "C" {
-    fn synch_lean_pin_acquisition_start(row: u8, durable: u8, wanted: u8, possession: u8) -> u8;
-    fn synch_lean_pin_acquisition_ack(step: u8) -> u8;
-    fn synch_lean_deletion_start(
-        collect: u8,
-        row: u8,
-        writing: u8,
-        pinned: u8,
-        referenced: u8,
-        last_access: u64,
-        before: u64,
-    ) -> u8;
-    fn synch_lean_deletion_ack(step: u8) -> u8;
     fn synch_adapter_cas_plan(
         row: u8,
         durable: u8,
@@ -136,7 +124,7 @@ thread_local! { static THREAD: Thread = {
     Thread
 }; }
 
-fn enter() {
+pub(crate) fn enter() {
     INITIALIZE.call_once(|| {
         // SAFETY: exactly once per process, before any exported decision call.
         assert_eq!(
@@ -591,127 +579,6 @@ pub enum Settlement {
     Keep,
     Reset,
     Refuse,
-}
-
-/// SQL effects and terminal outcomes of a Lean pin-acquisition plan.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum PinAcquisitionStep {
-    Refused,
-    DeleteWant,
-    UpsertPin,
-    Finished,
-}
-
-/// The native acquisition protocol. Execute it within one write transaction.
-#[derive(Debug)]
-pub struct PinAcquisition {
-    step: u8,
-}
-
-impl PinAcquisition {
-    /// Start from current row, durable-claim and holder-specific want facts.
-    pub fn new(row: bool, durable: bool, wanted: bool, possession: bool) -> Self {
-        enter();
-        // SAFETY: exact scalar ABI with normalized Bool arguments.
-        let step = unsafe {
-            synch_lean_pin_acquisition_start(
-                row.into(),
-                durable.into(),
-                wanted.into(),
-                possession.into(),
-            )
-        };
-        Self { step }
-    }
-
-    /// Observe the requested effect; polling does not advance the plan.
-    pub fn step(&self) -> PinAcquisitionStep {
-        match self.step {
-            0 => PinAcquisitionStep::Refused,
-            1 => PinAcquisitionStep::DeleteWant,
-            2 => PinAcquisitionStep::UpsertPin,
-            3 => PinAcquisitionStep::Finished,
-            _ => panic!("invalid Lean pin acquisition step"),
-        }
-    }
-
-    /// Acknowledge a successful effect, never a SQL error.
-    pub fn acknowledge(&mut self) {
-        enter();
-        // SAFETY: exact scalar ABI; transitions are implemented only in Lean.
-        self.step = unsafe { synch_lean_pin_acquisition_ack(self.step) };
-    }
-}
-
-/// An effect or terminal outcome selected by the Lean deletion protocol.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum DeletionStep {
-    Skip,
-    Writing,
-    Protected,
-    DeleteRow,
-    Commit,
-    UnlinkPayload,
-    UnlinkOutboard,
-    Finished,
-}
-
-/// Lean-owned deletion policy and effect ordering, represented by a scalar tag.
-#[derive(Debug)]
-pub struct Deletion {
-    step: u8,
-}
-
-impl Deletion {
-    /// Snapshot facts must remain protected against writers and new references
-    /// until the protocol finishes. `None` selects explicit, age-independent deletion.
-    pub fn new(
-        row: bool,
-        writing: bool,
-        pinned: bool,
-        referenced: bool,
-        last_access: i64,
-        before: Option<i64>,
-    ) -> Self {
-        enter();
-        // SAFETY: generated C represents Int64 as uint64_t; casting preserves
-        // the signed timestamp bit pattern, interpreted as signed inside Lean.
-        let step = unsafe {
-            synch_lean_deletion_start(
-                before.is_some().into(),
-                row.into(),
-                writing.into(),
-                pinned.into(),
-                referenced.into(),
-                last_access as u64,
-                before.unwrap_or(0) as u64,
-            )
-        };
-        Self { step }
-    }
-
-    /// Read the next effect without advancing the protocol.
-    pub fn step(&self) -> DeletionStep {
-        match self.step {
-            0 => DeletionStep::Skip,
-            1 => DeletionStep::Writing,
-            2 => DeletionStep::Protected,
-            3 => DeletionStep::DeleteRow,
-            4 => DeletionStep::Commit,
-            5 => DeletionStep::UnlinkPayload,
-            6 => DeletionStep::UnlinkOutboard,
-            7 => DeletionStep::Finished,
-            _ => panic!("invalid Lean deletion step"),
-        }
-    }
-
-    /// Acknowledge successful SQL execution or a best-effort unlink attempt.
-    /// Never acknowledge a failed row deletion or failed transaction commit.
-    pub fn acknowledge(&mut self) {
-        enter();
-        // SAFETY: scalar ABI; all transition decisions remain in Lean.
-        self.step = unsafe { synch_lean_deletion_ack(self.step) };
-    }
 }
 
 /// Accepted CAS commit plan. Ranges are normalized and clamped by Lean.

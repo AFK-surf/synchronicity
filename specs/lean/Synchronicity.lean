@@ -15,3 +15,4 @@ import Synchronicity.Completeness
 import Synchronicity.Materialization
 import Synchronicity.Ingestion
 import Synchronicity.VerifiedCoreProofs
+import Synchronicity.CasLifecycleProofs

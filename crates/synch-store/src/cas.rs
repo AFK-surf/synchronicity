@@ -1461,8 +1461,8 @@ impl Store {
         now: i64,
         possession: bool,
     ) -> Result<bool> {
-        use synch_verified::PinAcquisitionStep;
-        self.with_immediate_tx(|tx| {
+        use synch_verified::cas::{AcquisitionSnapshot, LifecycleRequest, Outcome};
+        let outcome = self.execute_cas_lifecycle(root, Some(holder), now, |tx| {
             // Read facts only. Lean decides which combination authorizes a pin.
             let durable: Option<i64> = tx
                 .query_row(
@@ -1476,37 +1476,17 @@ impl Store {
                 params![root.as_bytes().to_vec(), holder.render()],
                 |row| row.get(0),
             )?;
-            // LEAN-MODEL: cas-native-pin-policy (VerifiedCoreProofs.pin_acquisition_authorized)
-            let mut plan = synch_verified::PinAcquisition::new(
-                durable.is_some(),
-                durable.unwrap_or(0) != 0,
-                wanted,
+            // LEAN-MODEL: cas-lifecycle-acquisition (CasLifecycleProofs.acquisition_authorized)
+            Ok(LifecycleRequest::Acquire {
+                snapshot: AcquisitionSnapshot {
+                    row: durable.is_some(),
+                    durable: durable.unwrap_or(0) != 0,
+                    wanted,
+                },
                 possession,
-            );
-            // LEAN-MODEL: cas-native-possession-order (VerifiedCoreProofs.possession_removes_want_before_pin)
-            loop {
-                match plan.step() {
-                    PinAcquisitionStep::Refused => return Ok(false),
-                    PinAcquisitionStep::Finished => return Ok(true),
-                    PinAcquisitionStep::DeleteWant => {
-                        tx.execute(
-                            "DELETE FROM content_want WHERE root = ?1 AND holder = ?2",
-                            params![root.as_bytes().to_vec(), holder.render()],
-                        )?;
-                    }
-                    PinAcquisitionStep::UpsertPin => {
-                        tx.execute(
-                            "INSERT INTO pins (root, holder, created_at, release_after)
-                             VALUES (?1, ?2, ?3, NULL)
-                             ON CONFLICT(root, holder) DO UPDATE SET release_after = NULL",
-                            params![root.as_bytes().to_vec(), holder.render(), now],
-                        )?;
-                    }
-                }
-                // An error above aborts the transaction without advancing.
-                plan.acknowledge();
-            }
-        })
+            })
+        })?;
+        Ok(outcome == Outcome::Applied)
     }
 
     /// Drops one holder's claim. Returns whether one was dropped.
@@ -1690,8 +1670,10 @@ impl Store {
         //
         // So the writer's own mark is consulted, under the same guard. A write
         // in flight is not a collectable object, whatever the row says.
-        Ok(self.execute_blob_deletion(root, Some(before))?
-            == synch_verified::DeletionStep::Finished)
+        Ok(
+            self.execute_blob_deletion(root, Some(before))?
+                == synch_verified::cas::Outcome::Applied,
+        )
     }
 
     /// Deletes an unprotected object's payload, outboard, and index row.
@@ -1701,15 +1683,15 @@ impl Store {
     /// "delete" must not be a back door around a live entry or pin: callers
     /// remove those claims first, then delete the now-unprotected cache object.
     pub fn delete_blob(&self, root: &Hash) -> Result<()> {
-        use synch_verified::DeletionStep;
+        use synch_verified::cas::Outcome;
         match self.execute_blob_deletion(root, None)? {
-            DeletionStep::Writing => Err(StoreError::invalid(format!(
+            Outcome::Writing => Err(StoreError::invalid(format!(
                 "blob {root} is being written and cannot be deleted"
             ))),
-            DeletionStep::Protected => Err(StoreError::invalid(format!(
+            Outcome::Protected => Err(StoreError::invalid(format!(
                 "blob {root} is referenced or pinned and cannot be deleted"
             ))),
-            DeletionStep::Finished => Ok(()),
+            Outcome::Applied => Ok(()),
             _ => unreachable!("explicit Lean deletion returned a nonterminal outcome"),
         }
     }
@@ -1721,60 +1703,97 @@ impl Store {
         &self,
         root: &Hash,
         before: Option<i64>,
-    ) -> Result<synch_verified::DeletionStep> {
-        use synch_verified::DeletionStep;
+    ) -> Result<synch_verified::cas::Outcome> {
+        use synch_verified::cas::{DeletionSnapshot, LifecycleRequest};
+        self.execute_cas_lifecycle(root, None, 0, |tx| {
+            let (pinned, referenced): (bool, bool) = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pins WHERE root = ?1),
+                    EXISTS(SELECT 1 FROM entries WHERE content = ?1)",
+                params![root.as_bytes().to_vec()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            let accessed: Option<i64> = tx
+                .query_row(
+                    "SELECT last_access FROM blobs WHERE root = ?1",
+                    params![root.as_bytes().to_vec()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            // LEAN-MODEL: cas-lifecycle-deletion (CasLifecycleProofs.deletion_authorized)
+            Ok(LifecycleRequest::Delete {
+                snapshot: DeletionSnapshot {
+                    row: accessed.is_some(),
+                    writing: self.is_being_written(root),
+                    pinned,
+                    referenced,
+                    last_access: accessed.unwrap_or(0),
+                },
+                before,
+            })
+        })
+    }
+
+    /// One CAS-domain executor: snapshot under locks, atomic mutation batch,
+    /// successful commit, then cleanup. No internal Lean phases cross the ABI.
+    fn execute_cas_lifecycle(
+        &self,
+        root: &Hash,
+        holder: Option<&PinHolder>,
+        now: i64,
+        snapshot: impl FnOnce(
+            &rusqlite::Transaction<'_>,
+        ) -> Result<synch_verified::cas::LifecycleRequest>,
+    ) -> Result<synch_verified::cas::Outcome> {
+        use synch_verified::cas::{plan_lifecycle, Cleanup, Mutation};
         let mut conn = self.conn();
         let _ordered_against_writers = self.cas_order();
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        let (pinned, referenced): (bool, bool) = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM pins WHERE root = ?1),
-                    EXISTS(SELECT 1 FROM entries WHERE content = ?1)",
-            params![root.as_bytes().to_vec()],
-            |row| Ok((row.get(0)?, row.get(1)?)),
-        )?;
-        let accessed: Option<i64> = tx
-            .query_row(
-                "SELECT last_access FROM blobs WHERE root = ?1",
-                params![root.as_bytes().to_vec()],
-                |row| row.get(0),
-            )
-            .optional()?;
-        // LEAN-MODEL: cas-native-deletion-policy (VerifiedCoreProofs.deletion_start_authorized)
-        let mut plan = synch_verified::Deletion::new(
-            accessed.is_some(),
-            self.is_being_written(root),
-            pinned,
-            referenced,
-            accessed.unwrap_or(0),
-            before,
-        );
-        let mut tx = Some(tx);
-        // LEAN-MODEL: cas-native-deletion-order (VerifiedCoreProofs.deletion_run_payload_after_commit)
-        loop {
-            match plan.step() {
-                DeletionStep::DeleteRow => {
-                    tx.as_ref()
-                        .expect("Lean row deletion precedes commit")
-                        .execute(
-                            "DELETE FROM blobs WHERE root = ?1",
-                            params![root.as_bytes().to_vec()],
-                        )?;
+        // LEAN-MODEL: cas-lifecycle-refusal (CasLifecycleProofs.refusal_effect_free)
+        let plan = plan_lifecycle(snapshot(&tx)?);
+        for mutation in plan.transaction() {
+            match mutation {
+                Mutation::DeleteRow => {
+                    tx.execute(
+                        "DELETE FROM blobs WHERE root = ?1",
+                        params![root.as_bytes().to_vec()],
+                    )?;
                 }
-                DeletionStep::Commit => {
-                    tx.take().expect("Lean requests one commit").commit()?;
+                Mutation::DeleteWant => {
+                    tx.execute(
+                        "DELETE FROM content_want WHERE root = ?1 AND holder = ?2",
+                        params![
+                            root.as_bytes().to_vec(),
+                            holder.expect("acquisition holder").render()
+                        ],
+                    )?;
                 }
-                DeletionStep::UnlinkPayload => {
+                Mutation::UpsertPin => {
+                    tx.execute(
+                        "INSERT INTO pins (root, holder, created_at, release_after)
+                        VALUES (?1, ?2, ?3, NULL)
+                        ON CONFLICT(root, holder) DO UPDATE SET release_after = NULL",
+                        params![
+                            root.as_bytes().to_vec(),
+                            holder.expect("acquisition holder").render(),
+                            now
+                        ],
+                    )?;
+                }
+            }
+        }
+        // LEAN-MODEL: cas-lifecycle-cleanup (CasLifecycleProofs.cleanup_requires_row_deletion)
+        tx.commit()?;
+        for cleanup in plan.after_commit() {
+            match cleanup {
+                Cleanup::Payload => {
                     let _ = std::fs::remove_file(self.blob_path(root));
                 }
-                DeletionStep::UnlinkOutboard => {
+                Cleanup::Outboard => {
                     let _ = std::fs::remove_file(self.outboard_path(root));
                 }
-                terminal => return Ok(terminal),
             }
-            // SQL errors return above without acknowledging, so the native
-            // protocol cannot advance to file removal after a failed commit.
-            plan.acknowledge();
         }
+        Ok(plan.outcome())
     }
 
     /// Simulates storage loss for recovery and race tests.

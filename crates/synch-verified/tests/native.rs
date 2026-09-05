@@ -3,28 +3,33 @@ use synch_verified::{group_count, settle_size, CertificateCache, Scope, Settleme
 
 #[test]
 fn pin_acquisition_requires_durability_and_orders_possession_effects() {
-    use synch_verified::{PinAcquisition, PinAcquisitionStep::*};
+    use synch_verified::cas::{
+        plan_lifecycle, AcquisitionSnapshot, LifecycleRequest, Mutation, Outcome,
+    };
     for row in [false, true] {
         for durable in [false, true] {
             for wanted in [false, true] {
                 for possession in [false, true] {
-                    let mut plan = PinAcquisition::new(row, durable, wanted, possession);
+                    let plan = plan_lifecycle(LifecycleRequest::Acquire {
+                        snapshot: AcquisitionSnapshot {
+                            row,
+                            durable,
+                            wanted,
+                        },
+                        possession,
+                    });
+                    assert!(plan.after_commit().is_empty());
                     if row && durable && (!possession || wanted) {
-                        if possession {
-                            assert_eq!(plan.step(), DeleteWant);
-                            assert_eq!(plan.step(), DeleteWant, "polling must not advance");
-                            plan.acknowledge();
-                        }
-                        assert_eq!(plan.step(), UpsertPin);
-                        plan.acknowledge();
-                        assert_eq!(plan.step(), Finished);
-                        plan.acknowledge();
-                        assert_eq!(plan.step(), Finished);
+                        assert_eq!(plan.outcome(), Outcome::Applied);
+                        let expected = if possession {
+                            vec![Mutation::DeleteWant, Mutation::UpsertPin]
+                        } else {
+                            vec![Mutation::UpsertPin]
+                        };
+                        assert_eq!(plan.transaction(), expected);
                     } else {
-                        for _ in 0..5 {
-                            assert_eq!(plan.step(), Refused);
-                            plan.acknowledge();
-                        }
+                        assert_eq!(plan.outcome(), Outcome::Skipped);
+                        assert!(plan.transaction().is_empty());
                     }
                 }
             }
@@ -34,38 +39,44 @@ fn pin_acquisition_requires_durability_and_orders_possession_effects() {
 
 #[test]
 fn deletion_protocol_checks_every_protection_and_orders_effects() {
-    use synch_verified::{Deletion, DeletionStep::*};
+    use synch_verified::cas::{
+        plan_lifecycle, Cleanup, DeletionSnapshot, LifecycleRequest, Mutation, Outcome::*,
+    };
     for row in [false, true] {
         for writing in [false, true] {
             for pinned in [false, true] {
                 for referenced in [false, true] {
                     for last in [i64::MIN, -1, 0, 1, i64::MAX] {
                         for before in [None, Some(i64::MIN), Some(-1), Some(0), Some(i64::MAX)] {
-                            let mut plan =
-                                Deletion::new(row, writing, pinned, referenced, last, before);
+                            let plan = plan_lifecycle(LifecycleRequest::Delete {
+                                snapshot: DeletionSnapshot {
+                                    row,
+                                    writing,
+                                    pinned,
+                                    referenced,
+                                    last_access: last,
+                                },
+                                before,
+                            });
                             let initial = if writing {
                                 Writing
                             } else if pinned || referenced {
                                 Protected
                             } else if before.is_some_and(|cutoff| !row || last >= cutoff) {
-                                Skip
+                                Skipped
                             } else {
-                                DeleteRow
+                                Applied
                             };
-                            assert_eq!(plan.step(), initial);
-                            assert_eq!(plan.step(), initial, "polling is not acknowledgment");
-                            if initial == DeleteRow {
-                                for expected in
-                                    [Commit, UnlinkPayload, UnlinkOutboard, Finished, Finished]
-                                {
-                                    plan.acknowledge();
-                                    assert_eq!(plan.step(), expected);
-                                }
+                            assert_eq!(plan.outcome(), initial);
+                            if initial == Applied {
+                                assert_eq!(plan.transaction(), [Mutation::DeleteRow]);
+                                assert_eq!(
+                                    plan.after_commit(),
+                                    [Cleanup::Payload, Cleanup::Outboard]
+                                );
                             } else {
-                                for _ in 0..5 {
-                                    plan.acknowledge();
-                                    assert_eq!(plan.step(), initial);
-                                }
+                                assert!(plan.transaction().is_empty());
+                                assert!(plan.after_commit().is_empty());
                             }
                         }
                     }

@@ -8,6 +8,31 @@ the functions agree with the abstract scope and CAS contracts.
 
 ## Mandatory integration
 
+### Domain boundary
+
+CAS algorithms live in `lean/VerifiedCore/Cas.lean`, independently of the trie
+module. `cas::plan_lifecycle` accepts a typed operation-specific snapshot and
+returns a complete atomic mutation batch plus a separate post-commit cleanup
+batch. Pin/possession and deletion use the same domain planner and storage
+executor. Their old public step/acknowledgment APIs and four scalar exports are
+removed. There are no Lean callbacks registered with SQLite.
+
+The executor holds snapshot ordering locks, applies the transaction batch,
+commits, and only then performs best-effort cleanup. SQL errors roll back and
+prevent cleanup. SQL semantics, locks, primitive I/O and ABI decoding remain
+explicit trust boundaries. `CasLifecycleProofs.lean` proves complete plans,
+including authorization, empty refusals, atomic possession, cleanup requiring
+row deletion, and ABI capacity bounds.
+
+The private five-byte lifecycle record is a bounded encoding of these typed
+effects, not a generic command language or a serialization of Lean internals.
+Adding a domain operation requires revisiting its types, plan proofs and ABI
+bounds. Bulk operations must remain batched; do not add per-row SQL callbacks.
+
+This is a consolidation step, not the final API: bitmap planning/size helpers
+still have their earlier adapters; trie/sync and ingestion/publication need
+their own cohesive domain boundaries rather than expansion of this CAS API.
+
 Every build uses Lean 4.30.0 for scope/path/key/node/payload decisions and CAS
 size settlement and bitmap commit planning, plus completeness certificate state transitions. The corresponding Rust implementations and feature flags
 have been deleted. The shared `synch-core::group_count` API also delegates to
@@ -84,18 +109,8 @@ Apple's system libc++. OS libraries remain dynamic dependencies.
   non-reference-equal positions; checks depth before shortcuts; preserves
   pending work on resume; refuses unadmitted child positions; and cannot report
   exhaustion while deferred work or a sticky depth fault remains.
-- CAS deletion authorizes only writer-free, unpinned, unreferenced snapshots;
-  collection additionally requires a strictly cold existing row. The executed
-  acknowledgment protocol orders row deletion, commit, payload unlink and
-  outboard unlink. Refusals remain sticky and payload unlink requires an
-  acknowledged commit. Rust acknowledges SQL effects only after success;
-  filesystem removal remains a best-effort attempt, not a proved atomic effect.
-- Pin acquisition requires an existing durable row; possession additionally
-  requires an uncancelled holder-specific want. Both APIs execute one shared
-  Lean protocol. Its proofs cover exact authorization, sticky refusal, and
-  acknowledgment of want removal before possession's pin upsert. The SQL
-  transaction atomically commits the actions or rolls them back, including
-  clearing scheduled releases on successful re-pinning.
+- CAS lifecycle plan proofs are in the independent `CasLifecycleProofs` module
+  described above. The obsolete per-step implementations and proofs are removed.
 
 `MissingWalk` also owns its frontier, seen set, deferred retries, per-batch
 payload request set and extension-child requirements in Lean. Its sets use

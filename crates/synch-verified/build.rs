@@ -6,7 +6,8 @@ fn output(command: &mut Command) -> String {
     });
     assert!(
         out.status.success(),
-        "{command:?} failed:\n{}",
+        "{command:?} failed:\n{}\n{}",
+        String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
     String::from_utf8(out.stdout)
@@ -17,6 +18,7 @@ fn output(command: &mut Command) -> String {
 
 fn main() {
     println!("cargo:rerun-if-changed=lean/VerifiedCore.lean");
+    println!("cargo:rerun-if-changed=lean/VerifiedCore/Cas.lean");
     println!("cargo:rerun-if-changed=lean/lean-toolchain");
     println!("cargo:rerun-if-changed=src/adapter.c");
     let target = env::var("TARGET").unwrap();
@@ -30,11 +32,11 @@ fn main() {
     assert!(linux || macos || windows, "supported targets are Linux GNU, macOS, and Windows GNU/LLVM; OpenBSD, Linux musl, and Windows MSVC are not supported");
     let root = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let lean_dir = root.join("lean");
+    let out = PathBuf::from(env::var_os("OUT_DIR").unwrap());
+    std::fs::create_dir_all(out.join("VerifiedCore")).unwrap();
     let lean = |args: &[&str]| {
         let mut cmd = Command::new("lean");
-        cmd.current_dir(&lean_dir)
-            .env_remove("LEAN_PATH")
-            .args(args);
+        cmd.current_dir(&lean_dir).env("LEAN_PATH", &out).args(args);
         output(&mut cmd)
     };
     let version = lean(&["--version"]);
@@ -68,12 +70,20 @@ fn main() {
             || (windows && triple.ends_with("-windows-gnu")),
         "Lean runtime {triple} is incompatible with Cargo target {target}"
     );
-    let out = PathBuf::from(env::var_os("OUT_DIR").unwrap());
+    let cas_generated = out.join("Cas.c");
+    lean(&[
+        "-c",
+        cas_generated.to_str().unwrap(),
+        "-o",
+        out.join("VerifiedCore/Cas.olean").to_str().unwrap(),
+        "VerifiedCore/Cas.lean",
+    ]);
     let generated = out.join("VerifiedCore.c");
     lean(&["-c", generated.to_str().unwrap(), "VerifiedCore.lean"]);
     cc::Build::new()
         .include(sysroot.join("include"))
         .file(&generated)
+        .file(&cas_generated)
         .file(root.join("src/adapter.c"))
         .flag_if_supported("-Wno-unused-parameter")
         .compile("synch_verified_core");
