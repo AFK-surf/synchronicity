@@ -410,10 +410,10 @@ requests, with no per-pin loop or precomputed expired/protected snapshot.
 
 Subsequent CAS work is ordered by cohesive operation requirements:
 
-- Migrate local reads with raw metadata decoding, bounds/coverage, positioned
-  file reads and healing composed inside Lean. Preserve original I/O errors
-  unless healing fails. Host callbacks cannot supply verified groups or heal
-  domain state on Lean's behalf.
+- Local reads now compose raw metadata decoding, bounds/coverage, positioned
+  file reads and healing inside Lean. Preserve original I/O errors unless
+  healing fails. Host callbacks cannot supply verified groups or heal domain
+  state on Lean's behalf. See the local-read boundary below.
 - Ingest needs bounded file capabilities, unique staging, rename, flush,
   truncate, directory durability and writer leases. Lean owns Bao construction
   and publication ordering. Preserve streaming and keep expensive I/O outside
@@ -422,19 +422,19 @@ Subsequent CAS work is ordered by cohesive operation requirements:
   transitions. Moving only a durable-flag setter leaves the core ordering in
   Rust; provider pair validation/upload is likewise CAS policy, not a primitive.
 
-The next local-read implementation should share a Lean internal `all | range`
-request, with row decoding, saturating bounds, permissive bitmap decoding,
+Local reads share a Lean internal `all | range` request, with row decoding,
+saturating bounds, permissive bitmap decoding,
 coverage and inline/positioned reads inside that operation. These trusted local
 reads do not currently verify hashes. Missing/truncated payloads invoke Lean
 healing and then return the original I/O error; if healing fails, its error
 takes precedence. Preserve the absent-row healing no-op, operator claims and
 existing wants. Healing re-reads size transactionally and selects standing roles
 using current SQLite ASCII-insensitive `LIKE` semantics, not typed-holder parsing.
-It needs generic updates, conflict-ignore inserts and an on-demand clock, not a
+It uses generic updates, conflict-ignore inserts and an on-demand clock, not a
 Rust `heal` callback. Ordinary filesystem reads must not hold an immediate SQL
-transaction. Consolidating `read_all`'s current two metadata reads removes a
-race and needs explicit concurrency coverage; corrupt short inline payloads
-need an explicit failure instead of the current slicing panic.
+transaction. `read_all` now makes one metadata observation, removing the old
+two-read race. Corrupt short inline payloads return an explicit failure instead
+of the old slicing panic.
 
 Local read migration alone does not complete cloud reads. The cloud wrapper
 still owns adoption, missing-group hydration and success-only access touch;
@@ -442,44 +442,62 @@ eventually compose those in Lean over raw provider ranges. Bao slice serving
 and import additionally require Lean traversal/verification. Do not relabel the
 existing Rust range hydrator or Bao encoder/decoder as a raw host capability.
 
-#### Staged local read/healing program
+#### Local read/healing operation and bounded output
 
-`Cas/ReadCodec.lean` and `Cas/Read.lean` now implement the proposed complete
-local read and transactional repair in the shared Lean source. They are compiled
-by Cargo and imported by the proof package, but **not yet called by production
-Rust**. The old Rust read/healing paths must be removed on native cutover; these
-definitions do not count as that cutover or as completed CAS verification.
+`Cas/ReadCodec.lean` and `Cas/Read.lean` implement complete local reads and
+transactional repair in shared executable Lean source. `Store::read_range` and
+`Store::read_all` call this native command; the old Rust range algorithm and
+`heal_missing_local_blob` transaction are deleted. The store adapter implements
+raw file resources, diagnostics and a scoped SQLite session. This completes
+only the local-read operation, not the surrounding cloud or Bao operations.
 
 The program owns ordered raw row validation, postcard bitmap decoding and
 coverage, range arithmetic, inline validation, physical reads and repair/error
 ordering. Reads retain one open file handle across at-most-64-KiB transfers and
-close it before repair or return. Chunks accumulate in a list and flatten once
-after I/O; appending a growing buffer across suspended continuations could
-otherwise repeatedly copy retained prefixes. Native allocation benchmarks are
-still required. A malformed successful file reply is an error,
+close it before repair or return. A separate raw `Output.append(bytes)` effect
+emits bounded chunks into a private, command-owned Rust buffer. Lean does not
+retain or serialize a whole-object result. The terminal success carries only
+the byte count; the facade checks framing and count before moving the buffer
+to the caller. No partially emitted bytes escape on domain, host, protocol,
+close or repair failure. The output service has no CAS metadata, range or
+recovery concepts and no buffer IDs or domain-specific finalization callback.
+Allocation failure is returned through the effect reply so Lean still closes
+opened files. Rust owns allocation; Lean owns which bytes to emit and when.
+A malformed successful file reply is an error,
 not a silently shortened result. Missing/truncated data triggers repair;
 unrelated I/O failures do not. Successful repair returns the original I/O error,
 whereas repair failure takes precedence. The on-demand clock follows metadata
 invalidation, preserving the existing ordering.
 
-`Host/Access.lean` describes missing **raw** capabilities separately from domain
+`Host/Access.lean` describes **raw** capabilities separately from domain
 commands: statement-scoped snapshot scans, literal updates, atomic INSERT SELECT
 with conflict-ignore behavior, and selected bulk deletes. A selection supplies
 literal equality fields plus an optional disjunction of SQL LIKE terms. The
-file capability provides open, exact positioned reads and close; the clock is a
-separate algebra. Native integration must share the existing whitelisted query
-construction and transaction handling, not grow a second SQL policy engine.
+file capability provides open, exact positioned reads and close; clock and
+output are separate algebras. Native integration shares the existing
+whitelisted query construction and transaction handling, not a second SQL
+policy engine.
 Snapshot connections end at statement completion; only the healing transaction
-retains its connection scope. File handles need abandonment cleanup and original
-error tokens with truthful generic I/O classifications.
+retains its connection scope. File handles have abandonment cleanup and original
+error tokens with generic I/O classifications. Failed commits retain the lease
+for rollback; failed rollback leaves final cleanup to session destruction.
 
-Remaining cutover gates include native packet/terminal encoding, interpreting
-these raw capabilities with scoped SQLite/file resources, real-storage failure
-and concurrency tests, large-input allocation/transfer checks, replacing both
-public reads and local healing, and deleting the obsolete Rust algorithms and
-their old abstract-model pairing anchor. Current proofs check actual Lean
-decoder fixtures and operation executions; they do not establish the pending
-native interpreter or physical storage guarantees.
+Validation covers exact native effect traces, original-error and rollback
+precedence, malformed replies, SQLite statement atomicity, real missing and
+truncated files, retained open-file identity, and released connection scopes
+during chunked I/O. Isolated ignored 64-MiB read probes compare native output
+allocation against a raw-file baseline; run each in a fresh memory-capped
+process. Small chunk requests alone are not evidence of bounded memory: the
+first buffered-terminal implementation still made whole-object copies.
+On this Linux development host, fresh debug test processes reading 64 MiB
+reported 661,820 KiB peak RSS with the buffered terminal, 83,128 KiB with bounded
+output, and 83,000 KiB for the raw-file baseline. Each probe ran alone under a
+1-GiB OS memory cap. Native read time was about 371 ms versus 16 ms for the raw
+file call; these diagnostic runs establish the allocation improvement, not
+throughput parity or release-build/platform performance guarantees.
+Proofs check actual Lean decoder fixtures and operation executions. They do
+not establish the native interpreter, allocator or physical storage contracts;
+those remain explicit trusted host services tested independently.
 
 Subagents may edit disjoint domain/proof/test files, but only the primary runs
 heavy validation. Inspect surviving processes after interruption; never launch

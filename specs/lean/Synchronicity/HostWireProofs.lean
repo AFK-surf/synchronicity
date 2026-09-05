@@ -190,7 +190,7 @@ theorem crypto_false_is_not_host_failure :
 
 private def cryptoTransaction : NativeState :=
   (transactionOver EffectSum.left id (fun _ => do
-    let _ ← performOver id (.right (.validateEd25519 []))
+    let _ ← performOver id (.right (.left (.validateEd25519 [])))
     return ByteArray.empty) : OperationOver NativeEffects Failure ByteArray).run
 
 private def pendingCrypto : NativeState :=
@@ -203,5 +203,58 @@ theorem malformed_crypto_requests_rollback :
 theorem crypto_rollback_preserves_protocol_error :
     nativeResume (nativeResume pendingCrypto (b [1, 27, 2])) (b [1, 18]) =
       .pure (.error protocolFailure) := by rfl
+
+theorem file_missing_preserves_original_error :
+    fileReply (.open "cas_payload" .empty)
+      (b [1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0, 0]) =
+      .error ⟨⟨1, 9⟩, .missing⟩ := by rfl
+
+theorem invalid_file_classification_is_protocol_failure :
+    fileReply (.open "cas_payload" .empty)
+      (b [1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0, 3]) =
+      .error ⟨protocolFailure, .other⟩ := by rfl
+
+theorem file_reply_rejects_storage_failure_without_classification :
+    fileReply (.readAt 7 0 1)
+      (b [1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0]) =
+      .error ⟨protocolFailure, .other⟩ := by rfl
+
+theorem file_close_requires_exact_acknowledgement :
+    fileReply (.close 7) (b [1, 35, 0]) = .error protocolFailure := by decide
+
+theorem file_close_accepts_acknowledgement :
+    fileReply (.close 7) (b [1, 35]) = .ok () := by decide
+
+theorem snapshot_rejects_invalid_trailing_failure_flag :
+    accessReply (.snapshot ⟨"blobs", [], []⟩ [])
+      (b [1, 29, 0, 0, 0, 0, 0, 0, 0, 0, 2]) = .error protocolFailure := by rfl
+
+theorem update_rejects_copy_reply :
+    accessReply (.update 7 ⟨"blobs", [], []⟩ [])
+      (b [1, 31, 0, 0, 0, 0, 0, 0, 0, 0]) = .error protocolFailure := by decide
+
+theorem clock_rejects_wrong_reply_kind :
+    clockReply .nowNs (b [1, 33, 0, 0, 0, 0, 0, 0, 0, 0]) = .error protocolFailure := by decide
+
+theorem output_append_requires_exact_acknowledgement :
+    outputReply (.append (b [41, 42])) (b [1, 37, 0]) = .error protocolFailure := by decide
+
+theorem output_append_accepts_acknowledgement :
+    outputReply (.append (b [41, 42])) (b [1, 37]) = .ok () := by decide
+
+theorem output_append_rejects_wrong_reply_kind :
+    outputReply (.append (b [41, 42])) (b [1, 35]) = .error protocolFailure := by decide
+
+theorem output_append_rejects_truncated_acknowledgement :
+    outputReply (.append (b [41, 42])) (b [1]) = .error protocolFailure := by decide
+
+theorem output_append_preserves_original_failure :
+    outputReply (.append (b [41, 42]))
+      (b [1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0]) =
+      .error ⟨1, 9⟩ := by rfl
+
+theorem output_append_packet_carries_only_raw_bytes :
+    outputRequest (.append (b [41, 42])) =
+      b [1, 37, 2, 0, 0, 0, 0, 0, 0, 0, 41, 42] := by rfl
 
 end Synchronicity.HostWireProofs

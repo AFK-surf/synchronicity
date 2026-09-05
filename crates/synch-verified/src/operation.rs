@@ -1,5 +1,8 @@
 //! Private synchronous transport for raw storage/resource and crypto effects.
-use crate::host::{ByteStorage, Cell, Exclusion, Fields, Join, Order, Resources, Row, Storage};
+use crate::host::{
+    Access, ByteStorage, Cell, Clock, Exclusion, Fields, FileFailure, FileFailureKind, FileIO,
+    Join, Order, Resources, Row, Scan, Selection, SourceValue, Storage,
+};
 use std::{ffi::c_void, marker::PhantomData, ptr::NonNull, rc::Rc};
 
 #[derive(Debug)]
@@ -60,23 +63,34 @@ impl Handle {
             PhantomData,
         )
     }
-    fn packet(&self) -> Vec<u8> {
+    fn packet(&self) -> Packet {
         // SAFETY: live thread-confined handle; adapter returns a fresh owned byte array.
-        let bytes = Self::new(unsafe { synch_adapter_operation_packet(self.0.as_ptr()) });
-        // SAFETY: byte array ownership keeps its immutable storage live through the copy.
-        unsafe {
-            let count = synch_adapter_bytes_len(bytes.0.as_ptr());
-            if count == 0 {
-                return Vec::new();
-            }
-            std::slice::from_raw_parts(synch_adapter_bytes_data(bytes.0.as_ptr()), count).to_vec()
-        }
+        Packet(Self::new(unsafe {
+            synch_adapter_operation_packet(self.0.as_ptr())
+        }))
     }
     fn resume(&mut self, reply: &[u8]) {
         // SAFETY: adapter borrows state and copies reply; returned continuation is owned.
         let next =
             Self::new(unsafe { synch_adapter_operation_resume(self.0.as_ptr(), reply.into()) });
         *self = next;
+    }
+}
+
+// Owns the adapter's immutable Lean ByteArray reference. A borrowed packet view
+// cannot outlive this owner, and ownership retains Handle's thread confinement.
+struct Packet(Handle);
+impl Packet {
+    fn as_bytes(&self) -> &[u8] {
+        // SAFETY: this live owned ByteArray keeps its immutable data allocated;
+        // the returned slice borrows self and no mutable view is exposed.
+        unsafe {
+            let count = synch_adapter_bytes_len(self.0 .0.as_ptr());
+            if count == 0 {
+                return &[];
+            }
+            std::slice::from_raw_parts(synch_adapter_bytes_data(self.0 .0.as_ptr()), count)
+        }
     }
 }
 impl Drop for Handle {
@@ -108,8 +122,11 @@ impl<'a> Reader<'a> {
         usize::try_from(self.word()?).map_err(|_| ())
     }
     pub(crate) fn bytes(&mut self) -> Result<Vec<u8>, ()> {
+        Ok(self.byte_slice()?.to_vec())
+    }
+    pub(crate) fn byte_slice(&mut self) -> Result<&'a [u8], ()> {
         let count = self.count()?;
-        Ok(self.take(count)?.to_vec())
+        self.take(count)
     }
     pub(crate) fn string(&mut self) -> Result<String, ()> {
         String::from_utf8(self.bytes()?).map_err(|_| ())
@@ -134,6 +151,13 @@ impl<'a> Reader<'a> {
     }
     fn fields(&mut self) -> Result<Fields, ()> {
         self.list(|r| Ok((r.string()?, r.cell()?)))
+    }
+    fn selection(&mut self) -> Result<Selection, ()> {
+        Ok(Selection {
+            relation: self.string()?,
+            equals: self.fields()?,
+            like_any: self.list(|r| Ok((r.string()?, r.string()?)))?,
+        })
     }
     pub(crate) fn end(&self) -> Result<(), ()> {
         if self.0.is_empty() {
@@ -186,8 +210,8 @@ fn rows(out: &mut Vec<u8>, values: Vec<Row>) {
     }
 }
 
-enum Frame {
-    Done(Vec<u8>),
+enum Frame<'a> {
+    Done(&'a [u8]),
     Failure(u64, u64),
     Begin,
     Commit(u64),
@@ -202,15 +226,34 @@ enum Frame {
     ExistsRows(u64, String, Fields),
     ValidateEd25519(Vec<u8>),
     ScanRows(u64, String, Vec<String>, Fields, Vec<Order>, Vec<Join>),
+    Access(AccessFrame),
+    Open(String, Vec<u8>),
+    ReadAt(u64, u64, u64),
+    Close(u64),
+    Now,
+    Append(&'a [u8]),
 }
 
-fn decode(packet: &[u8]) -> Result<Frame, ()> {
+enum AccessFrame {
+    Snapshot(Selection, Vec<String>),
+    Update(u64, Selection, Fields),
+    CopyRows(
+        u64,
+        String,
+        Selection,
+        Vec<(String, SourceValue)>,
+        Vec<String>,
+    ),
+    DeleteSelected(u64, Selection),
+}
+
+fn decode(packet: &[u8]) -> Result<Frame<'_>, ()> {
     let mut r = Reader(packet);
     if r.byte()? != 1 {
         return Err(());
     }
     let frame = match r.byte()? {
-        0 => Frame::Done(r.bytes()?),
+        0 => Frame::Done(r.byte_slice()?),
         1 => Frame::Failure(r.word()?, r.word()?),
         16 => Frame::Begin,
         17 => Frame::Commit(r.word()?),
@@ -270,6 +313,32 @@ fn decode(packet: &[u8]) -> Result<Frame, ()> {
         25 => Frame::RemoveFile(r.string()?, r.bytes()?),
         26 => Frame::ExistsRows(r.word()?, r.string()?, r.fields()?),
         27 => Frame::ValidateEd25519(r.bytes()?),
+        29 => Frame::Access(AccessFrame::Snapshot(
+            r.selection()?,
+            r.list(Reader::string)?,
+        )),
+        30 => Frame::Access(AccessFrame::Update(r.word()?, r.selection()?, r.fields()?)),
+        31 => Frame::Access(AccessFrame::CopyRows(
+            r.word()?,
+            r.string()?,
+            r.selection()?,
+            r.list(|r| {
+                let target = r.string()?;
+                let value = match r.byte()? {
+                    0 => SourceValue::Literal(r.cell()?),
+                    1 => SourceValue::Column(r.string()?),
+                    _ => return Err(()),
+                };
+                Ok((target, value))
+            })?,
+            r.list(Reader::string)?,
+        )),
+        32 => Frame::Access(AccessFrame::DeleteSelected(r.word()?, r.selection()?)),
+        33 => Frame::Open(r.string()?, r.bytes()?),
+        34 => Frame::ReadAt(r.word()?, r.word()?, r.word()?),
+        35 => Frame::Close(r.word()?),
+        36 => Frame::Now,
+        37 => Frame::Append(r.byte_slice()?),
         _ => return Err(()),
     };
     r.end()?;
@@ -298,36 +367,156 @@ fn reply<E, A>(
     }
 }
 
+fn scan_reply<E>(tag: u8, scan: Result<Scan<E>, E>, errors: &mut Vec<Option<E>>) -> Vec<u8> {
+    match scan {
+        Err(error) => reply(tag, Err::<(), _>(error), errors, |_, ()| {}),
+        Ok(scan) => {
+            let mut out = vec![1, tag];
+            rows(&mut out, scan.rows);
+            if let Some(error) = scan.failure {
+                errors.push(Some(error));
+                out.push(1);
+                word(&mut out, 1);
+                word(&mut out, errors.len() as u64);
+            } else {
+                out.push(0);
+            }
+            out
+        }
+    }
+}
+
+fn file_reply<E, A>(
+    tag: u8,
+    value: Result<A, FileFailure<E>>,
+    errors: &mut Vec<Option<E>>,
+    encode: impl FnOnce(&mut Vec<u8>, A),
+) -> Vec<u8> {
+    match value {
+        Ok(value) => reply(tag, Ok(value), errors, encode),
+        Err(FileFailure { error, kind }) => {
+            let mut out = reply(tag, Err::<A, _>(error), errors, encode);
+            out.push(match kind {
+                FileFailureKind::Missing => 0,
+                FileFailureKind::ShortRead => 1,
+                FileFailureKind::Other => 2,
+            });
+            out
+        }
+    }
+}
+
+fn dispatch_access<S: Access>(
+    storage: &mut S,
+    frame: AccessFrame,
+    errors: &mut Vec<Option<S::Error>>,
+) -> Vec<u8> {
+    match frame {
+        AccessFrame::Snapshot(selection, columns) => {
+            scan_reply(29, storage.snapshot(&selection, &columns), errors)
+        }
+        AccessFrame::Update(tx, selection, values) => {
+            reply(30, storage.update(tx, &selection, &values), errors, word)
+        }
+        AccessFrame::CopyRows(tx, target, source, values, conflicts) => reply(
+            31,
+            storage.copy_rows(tx, &target, &source, &values, &conflicts),
+            errors,
+            word,
+        ),
+        AccessFrame::DeleteSelected(tx, selection) => {
+            reply(32, storage.delete_selected(tx, &selection), errors, word)
+        }
+    }
+}
+
+type AccessDispatch<S> =
+    fn(&mut S, AccessFrame, &mut Vec<Option<<S as Storage>::Error>>) -> Vec<u8>;
+
+struct Capabilities<'a, S: Storage> {
+    resources: Option<&'a mut dyn Resources<Error = S::Error>>,
+    crypto: Option<&'a mut dyn crate::host::Crypto<Error = S::Error>>,
+    access: Option<AccessDispatch<S>>,
+    files: Option<&'a mut dyn FileIO<Error = S::Error>>,
+    clock: Option<&'a mut dyn Clock<Error = S::Error>>,
+    output: Option<&'a mut dyn crate::host::Output<Error = OperationError<S::Error>>>,
+}
+
+impl<S: Storage> Default for Capabilities<'_, S> {
+    fn default() -> Self {
+        Self {
+            resources: None,
+            crypto: None,
+            access: None,
+            files: None,
+            clock: None,
+            output: None,
+        }
+    }
+}
+
 fn execute<S: Storage>(
     mut state: Handle,
     storage: &mut S,
     inputs: &[&[u8]],
-    mut resources: Option<&mut dyn Resources<Error = S::Error>>,
-    mut crypto: Option<&mut dyn crate::host::Crypto<Error = S::Error>>,
+    mut capabilities: Capabilities<'_, S>,
 ) -> Result<Vec<u8>, OperationError<S::Error>> {
     let mut errors = Vec::new();
     loop {
-        let frame = decode(&state.packet()).map_err(|()| OperationError::Protocol)?;
+        let packet = state.packet();
+        let frame = decode(packet.as_bytes()).map_err(|()| OperationError::Protocol)?;
         let response = match frame {
-            Frame::ScanRows(tx, table, columns, equals, order, joins) => {
-                match storage.scan_rows(tx, &table, &columns, &equals, &order, &joins) {
-                    Err(error) => reply(28, Err::<(), _>(error), &mut errors, |_, ()| {}),
-                    Ok(scan) => {
-                        let mut out = vec![1, 28];
-                        rows(&mut out, scan.rows);
-                        if let Some(error) = scan.failure {
-                            errors.push(Some(error));
-                            out.push(1);
-                            word(&mut out, 1);
-                            word(&mut out, errors.len() as u64);
-                        } else {
-                            out.push(0);
-                        }
+            Frame::Append(bytes) => match capabilities.output.as_deref_mut() {
+                Some(output) => match output.append(bytes) {
+                    Ok(()) => vec![1, 37],
+                    Err(OperationError::Host(error)) => {
+                        reply(37, Err::<(), _>(error), &mut errors, |_, ()| {})
+                    }
+                    // An allocation/capacity failure is not an invented backing
+                    // store error. Deliver protocol failure into Lean so its
+                    // resource cleanup executes before the operation terminates.
+                    Err(_) => {
+                        let mut out = vec![1, 0];
+                        word(&mut out, 3);
+                        word(&mut out, 0);
                         out
                     }
-                }
-            }
-            Frame::ValidateEd25519(bytes) => match crypto.as_deref_mut() {
+                },
+                None => return Err(OperationError::Protocol),
+            },
+            Frame::Access(frame) => match capabilities.access {
+                Some(dispatch) => dispatch(storage, frame, &mut errors),
+                None => return Err(OperationError::Protocol),
+            },
+            Frame::Open(space, key) => match capabilities.files.as_deref_mut() {
+                Some(files) => file_reply(33, files.open(&space, &key), &mut errors, word),
+                None => return Err(OperationError::Protocol),
+            },
+            Frame::ReadAt(handle, offset, count) => match capabilities.files.as_deref_mut() {
+                Some(files) => file_reply(
+                    34,
+                    files.read_at(handle, offset, count),
+                    &mut errors,
+                    |out, value| bytes(out, &value),
+                ),
+                None => return Err(OperationError::Protocol),
+            },
+            Frame::Close(handle) => match capabilities.files.as_deref_mut() {
+                Some(files) => reply(35, files.close(handle), &mut errors, |_, ()| {}),
+                None => return Err(OperationError::Protocol),
+            },
+            Frame::Now => match capabilities.clock.as_deref_mut() {
+                Some(clock) => reply(36, clock.now_ns(), &mut errors, |out, value| {
+                    word(out, value as u64)
+                }),
+                None => return Err(OperationError::Protocol),
+            },
+            Frame::ScanRows(tx, table, columns, equals, order, joins) => scan_reply(
+                28,
+                storage.scan_rows(tx, &table, &columns, &equals, &order, &joins),
+                &mut errors,
+            ),
+            Frame::ValidateEd25519(bytes) => match capabilities.crypto.as_deref_mut() {
                 Some(crypto) => reply(
                     27,
                     crypto.validate_ed25519(&bytes),
@@ -336,13 +525,13 @@ fn execute<S: Storage>(
                 ),
                 None => return Err(OperationError::Protocol),
             },
-            Frame::ReadCounter(space, key) => match resources.as_deref_mut() {
+            Frame::ReadCounter(space, key) => match capabilities.resources.as_deref_mut() {
                 Some(resources) => {
                     reply(24, resources.read_counter(&space, &key), &mut errors, word)
                 }
                 None => return Err(OperationError::Protocol),
             },
-            Frame::RemoveFile(space, key) => match resources.as_deref_mut() {
+            Frame::RemoveFile(space, key) => match capabilities.resources.as_deref_mut() {
                 Some(resources) => reply(
                     25,
                     resources.remove_file(&space, &key),
@@ -380,7 +569,7 @@ fn execute<S: Storage>(
                     }
                 }
             }
-            Frame::Done(result) => return Ok(result),
+            Frame::Done(result) => return Ok(result.to_vec()),
             Frame::Failure(code, token) => {
                 return Err(match (code, token) {
                     (1, token) if token > 0 => errors
@@ -426,6 +615,9 @@ fn execute<S: Storage>(
                 },
             ),
         };
+        // No request borrows packet data past this point. Release the packet
+        // before constructing the next continuation to limit peak retention.
+        drop(packet);
         state.resume(&response);
     }
 }
@@ -441,7 +633,12 @@ pub(crate) unsafe fn run<S: Storage>(
     start: impl FnOnce() -> *mut c_void,
 ) -> Result<Vec<u8>, OperationError<S::Error>> {
     crate::native::enter();
-    execute(Handle::new(start()), storage, inputs, None, None)
+    execute(
+        Handle::new(start()),
+        storage,
+        inputs,
+        Capabilities::default(),
+    )
 }
 
 /// Run with separate raw resource capabilities.
@@ -454,7 +651,15 @@ pub(crate) unsafe fn run_with_resources<S: Storage>(
     start: impl FnOnce() -> *mut c_void,
 ) -> Result<Vec<u8>, OperationError<S::Error>> {
     crate::native::enter();
-    execute(Handle::new(start()), storage, &[], Some(resources), None)
+    execute(
+        Handle::new(start()),
+        storage,
+        &[],
+        Capabilities {
+            resources: Some(resources),
+            ..Capabilities::default()
+        },
+    )
 }
 
 /// Run with separate primitive crypto capabilities.
@@ -467,7 +672,41 @@ pub(crate) unsafe fn run_with_crypto<S: Storage>(
     start: impl FnOnce() -> *mut c_void,
 ) -> Result<Vec<u8>, OperationError<S::Error>> {
     crate::native::enter();
-    execute(Handle::new(start()), storage, &[], None, Some(crypto))
+    execute(
+        Handle::new(start()),
+        storage,
+        &[],
+        Capabilities {
+            crypto: Some(crypto),
+            ..Capabilities::default()
+        },
+    )
+}
+
+/// Run with raw relational access, file I/O and clock capabilities.
+///
+/// # Safety
+/// `start` returns one fresh owned native program after runtime initialization.
+pub(crate) unsafe fn run_read<S: Access>(
+    storage: &mut S,
+    files: &mut dyn FileIO<Error = S::Error>,
+    clock: &mut dyn Clock<Error = S::Error>,
+    output: &mut dyn crate::host::Output<Error = OperationError<S::Error>>,
+    start: impl FnOnce() -> *mut c_void,
+) -> Result<Vec<u8>, OperationError<S::Error>> {
+    crate::native::enter();
+    execute(
+        Handle::new(start()),
+        storage,
+        &[],
+        Capabilities {
+            access: Some(dispatch_access::<S>),
+            files: Some(files),
+            clock: Some(clock),
+            output: Some(output),
+            ..Capabilities::default()
+        },
+    )
 }
 
 struct ReadOnly<'a, S>(&'a mut S);
@@ -555,6 +794,348 @@ pub(crate) unsafe fn run_readonly<S: ByteStorage>(
 mod tests {
     use super::*;
     use crate::cas::acquire;
+
+    #[test]
+    fn terminal_frame_borrows_payload_and_rejects_nonexact_lengths() {
+        let mut packet = vec![1, 0];
+        word(&mut packet, 3);
+        packet.extend_from_slice(&[3, 5, 7]);
+        match decode(&packet).unwrap() {
+            Frame::Done(payload) => {
+                assert_eq!(payload, [3, 5, 7]);
+                assert_eq!(payload.as_ptr(), packet[10..].as_ptr());
+            }
+            _ => panic!("expected terminal frame"),
+        }
+        for length in 0..packet.len() {
+            assert!(decode(&packet[..length]).is_err());
+        }
+        packet.push(0);
+        assert!(decode(&packet).is_err());
+    }
+
+    #[test]
+    fn output_request_borrows_bounded_bytes_with_exact_framing() {
+        let mut packet = vec![1, 37];
+        bytes(&mut packet, &[9, 8, 7]);
+        match decode(&packet).unwrap() {
+            Frame::Append(payload) => {
+                assert_eq!(payload, [9, 8, 7]);
+                assert_eq!(payload.as_ptr(), packet[10..].as_ptr());
+            }
+            _ => panic!("expected output request"),
+        }
+        for length in 0..packet.len() {
+            assert!(decode(&packet[..length]).is_err());
+        }
+        packet.push(0);
+        assert!(decode(&packet).is_err());
+    }
+
+    impl Access for Script {
+        fn snapshot(
+            &mut self,
+            _: &Selection,
+            _: &[String],
+        ) -> Result<Scan<Self::Error>, Self::Error> {
+            self.step("snapshot")?;
+            Ok(Scan {
+                rows: vec![vec![
+                    Cell::Blob(vec![7; 32]),
+                    Cell::Integer(65540),
+                    Cell::Integer(1),
+                    Cell::Null,
+                    Cell::Null,
+                    Cell::Integer(0),
+                    Cell::Integer(1),
+                ]],
+                failure: None,
+            })
+        }
+        fn update(&mut self, _: u64, _: &Selection, _: &Fields) -> Result<u64, Self::Error> {
+            panic!("unexpected update")
+        }
+        fn copy_rows(
+            &mut self,
+            _: u64,
+            _: &str,
+            _: &Selection,
+            _: &[(String, SourceValue)],
+            _: &[String],
+        ) -> Result<u64, Self::Error> {
+            panic!("unexpected copy")
+        }
+        fn delete_selected(&mut self, _: u64, _: &Selection) -> Result<u64, Self::Error> {
+            panic!("unexpected delete")
+        }
+    }
+
+    struct OutputTestFiles(Vec<&'static str>);
+    impl FileIO for OutputTestFiles {
+        type Error = &'static str;
+        fn open(&mut self, _: &str, _: &[u8]) -> Result<u64, FileFailure<Self::Error>> {
+            self.0.push("open");
+            Ok(9)
+        }
+        fn read_at(
+            &mut self,
+            handle: u64,
+            offset: u64,
+            count: u64,
+        ) -> Result<Vec<u8>, FileFailure<Self::Error>> {
+            assert_eq!(handle, 9);
+            assert!(matches!((offset, count), (0, 65536) | (65536, 4)));
+            self.0.push("read");
+            Ok(vec![7; count as usize])
+        }
+        fn close(&mut self, handle: u64) -> Result<(), Self::Error> {
+            assert_eq!(handle, 9);
+            self.0.push("close");
+            Ok(())
+        }
+    }
+    impl Clock for OutputTestFiles {
+        type Error = &'static str;
+        fn now_ns(&mut self) -> Result<i64, Self::Error> {
+            panic!("unexpected clock")
+        }
+    }
+    struct FailingOutput {
+        host: bool,
+        calls: usize,
+        fail_on: usize,
+    }
+    impl crate::host::Output for FailingOutput {
+        type Error = OperationError<&'static str>;
+        fn append(&mut self, bytes: &[u8]) -> Result<(), Self::Error> {
+            assert_eq!(bytes.len(), if self.calls == 0 { 65536 } else { 4 });
+            assert!(bytes.iter().all(|byte| *byte == 7));
+            self.calls += 1;
+            if self.calls != self.fail_on {
+                return Ok(());
+            }
+            Err(if self.host {
+                OperationError::Host("sink")
+            } else {
+                OperationError::Protocol
+            })
+        }
+    }
+    #[test]
+    fn output_failures_resume_lean_and_close_before_termination() {
+        unsafe extern "C" {
+            fn synch_adapter_operation_read(
+                root: Slice,
+                all: u8,
+                offset: u64,
+                length: u64,
+            ) -> *mut c_void;
+        }
+        for host in [true, false] {
+            for fail_on in [1, 2] {
+                let mut storage = Script::default();
+                let mut files = OutputTestFiles(vec![]);
+                let mut clock = OutputTestFiles(vec![]);
+                let mut output = FailingOutput {
+                    host,
+                    calls: 0,
+                    fail_on,
+                };
+                // SAFETY: the runner initializes this thread before the adapter
+                // copies its input and returns a fresh owned read continuation.
+                let result = unsafe {
+                    run_read(&mut storage, &mut files, &mut clock, &mut output, || {
+                        synch_adapter_operation_read([7; 32].as_slice().into(), 1, 0, 0)
+                    })
+                };
+                if host {
+                    assert!(matches!(result, Err(OperationError::Host("sink"))));
+                } else {
+                    assert!(matches!(result, Err(OperationError::Protocol)));
+                }
+                assert_eq!(storage.calls, ["snapshot"]);
+                assert_eq!(
+                    files.0,
+                    if fail_on == 1 {
+                        vec!["open", "read", "close"]
+                    } else {
+                        vec!["open", "read", "read", "close"]
+                    }
+                );
+                assert_eq!(output.calls, fail_on);
+            }
+        }
+    }
+
+    fn selection_packet(out: &mut Vec<u8>) {
+        bytes(out, b"raw_table");
+        word(out, 1);
+        bytes(out, b"id");
+        cell(out, &Cell::Blob(vec![0, 255]));
+        word(out, 1);
+        bytes(out, b"name");
+        bytes(out, b"prefix/%");
+    }
+
+    #[test]
+    fn access_and_file_requests_have_exact_closed_framing() {
+        let mut packets = Vec::new();
+        let mut snapshot = vec![1, 29];
+        selection_packet(&mut snapshot);
+        word(&mut snapshot, 1);
+        bytes(&mut snapshot, b"value");
+        match decode(&snapshot).unwrap() {
+            Frame::Access(AccessFrame::Snapshot(selection, columns)) => {
+                assert_eq!(selection.relation, "raw_table");
+                assert_eq!(selection.equals, [("id".into(), Cell::Blob(vec![0, 255]))]);
+                assert_eq!(selection.like_any, [("name".into(), "prefix/%".into())]);
+                assert_eq!(columns, ["value"]);
+            }
+            _ => panic!("unexpected snapshot frame"),
+        }
+        packets.push(snapshot);
+        let mut update = vec![1, 30];
+        word(&mut update, 9);
+        selection_packet(&mut update);
+        word(&mut update, 1);
+        bytes(&mut update, b"value");
+        cell(&mut update, &Cell::Integer(i64::MIN));
+        assert!(matches!(
+            decode(&update),
+            Ok(Frame::Access(AccessFrame::Update(9, _, _)))
+        ));
+        packets.push(update);
+        let mut copy = vec![1, 31];
+        word(&mut copy, 9);
+        bytes(&mut copy, b"destination");
+        selection_packet(&mut copy);
+        word(&mut copy, 2);
+        bytes(&mut copy, b"literal");
+        let source_tag = copy.len();
+        copy.push(0);
+        cell(&mut copy, &Cell::RawText(vec![255]));
+        bytes(&mut copy, b"projected");
+        copy.push(1);
+        bytes(&mut copy, b"source_column");
+        word(&mut copy, 1);
+        bytes(&mut copy, b"literal");
+        match decode(&copy).unwrap() {
+            Frame::Access(AccessFrame::CopyRows(9, target, _, values, conflicts)) => {
+                assert_eq!(target, "destination");
+                assert_eq!(
+                    values,
+                    [
+                        (
+                            "literal".into(),
+                            SourceValue::Literal(Cell::RawText(vec![255]))
+                        ),
+                        (
+                            "projected".into(),
+                            SourceValue::Column("source_column".into())
+                        ),
+                    ]
+                );
+                assert_eq!(conflicts, ["literal"]);
+            }
+            _ => panic!("unexpected copy frame"),
+        }
+        let mut invalid = copy.clone();
+        invalid[source_tag] = 2;
+        assert!(decode(&invalid).is_err());
+        packets.push(copy);
+        let mut delete = vec![1, 32];
+        word(&mut delete, 9);
+        selection_packet(&mut delete);
+        assert!(matches!(
+            decode(&delete),
+            Ok(Frame::Access(AccessFrame::DeleteSelected(9, _)))
+        ));
+        packets.push(delete);
+        let mut open = vec![1, 33];
+        bytes(&mut open, b"files");
+        bytes(&mut open, &[0, 255]);
+        assert!(matches!(decode(&open), Ok(Frame::Open(_, _))));
+        packets.push(open);
+        let mut read = vec![1, 34];
+        for value in [42, u64::MAX, 0] {
+            word(&mut read, value);
+        }
+        assert!(matches!(decode(&read), Ok(Frame::ReadAt(42, u64::MAX, 0))));
+        packets.push(read);
+        let mut close = vec![1, 35];
+        word(&mut close, 42);
+        assert!(matches!(decode(&close), Ok(Frame::Close(42))));
+        packets.push(close);
+        assert!(matches!(decode(&[1, 36]), Ok(Frame::Now)));
+        packets.push(vec![1, 36]);
+        for mut packet in packets {
+            for length in 0..packet.len() {
+                assert!(decode(&packet[..length]).is_err());
+            }
+            packet.push(0);
+            assert!(decode(&packet).is_err());
+        }
+    }
+
+    #[test]
+    fn file_failures_keep_original_errors_and_classification_separate() {
+        let mut errors = vec![Some("earlier")];
+        for (kind, expected) in [
+            (FileFailureKind::Missing, 0),
+            (FileFailureKind::ShortRead, 1),
+            (FileFailureKind::Other, 2),
+        ] {
+            let encoded = file_reply(
+                33,
+                Err::<u64, _>(FileFailure {
+                    error: "original",
+                    kind,
+                }),
+                &mut errors,
+                word,
+            );
+            let mut reader = Reader(&encoded);
+            assert_eq!(reader.byte(), Ok(1));
+            assert_eq!(reader.byte(), Ok(0));
+            assert_eq!(reader.word(), Ok(1));
+            let token = reader.word().unwrap();
+            assert_eq!(errors[(token - 1) as usize], Some("original"));
+            assert_eq!(reader.byte(), Ok(expected));
+            reader.end().unwrap();
+        }
+        assert_eq!(errors[0], Some("earlier"));
+        let encoded = file_reply(33, Ok(42), &mut errors, word);
+        let mut reader = Reader(&encoded);
+        assert_eq!(reader.byte(), Ok(1));
+        assert_eq!(reader.byte(), Ok(33));
+        assert_eq!(reader.word(), Ok(42));
+        reader.end().unwrap();
+        assert_eq!(errors.len(), 4);
+    }
+
+    #[test]
+    fn snapshot_scan_encodes_prefix_before_original_trailing_failure() {
+        let mut errors = Vec::new();
+        let packet = scan_reply(
+            29,
+            Ok(Scan {
+                rows: vec![vec![Cell::Null]],
+                failure: Some("step"),
+            }),
+            &mut errors,
+        );
+        let mut reader = Reader(&packet);
+        assert_eq!(reader.byte(), Ok(1));
+        assert_eq!(reader.byte(), Ok(29));
+        assert_eq!(reader.word(), Ok(1));
+        assert_eq!(reader.word(), Ok(1));
+        assert_eq!(reader.cell(), Ok(Cell::Null));
+        assert_eq!(reader.byte(), Ok(1));
+        assert_eq!(reader.word(), Ok(1));
+        assert_eq!(reader.word(), Ok(1));
+        reader.end().unwrap();
+        assert_eq!(errors, [Some("step")]);
+    }
 
     #[test]
     fn cell_packets_preserve_real_bits_and_unvalidated_text() {
@@ -828,23 +1409,48 @@ mod tests {
     }
 
     #[test]
+    fn packet_owner_keeps_bytes_live_after_state_resume_and_drop() {
+        let mut state = state();
+        let first = state.packet();
+        let mut begun = vec![1, 16];
+        word(&mut begun, 42);
+        state.resume(&begun);
+        let second = state.packet();
+        drop(state);
+        assert_eq!(first.as_bytes(), [1, 16]);
+        assert!(matches!(
+            decode(second.as_bytes()),
+            Ok(Frame::ReadRows(42, ..))
+        ));
+    }
+
+    #[test]
     fn malformed_reply_runs_lean_rollback_and_polling_does_not_advance() {
         let mut state = state();
-        assert_eq!(state.packet(), [1, 16]);
-        assert_eq!(state.packet(), [1, 16]);
+        assert_eq!(state.packet().as_bytes(), [1, 16]);
+        assert_eq!(state.packet().as_bytes(), [1, 16]);
         let mut begun = vec![1, 16];
         word(&mut begun, 42);
         state.resume(&begun);
         assert!(matches!(
-            decode(&state.packet()),
+            decode(state.packet().as_bytes()),
             Ok(Frame::ReadRows(42, ..))
         ));
         state.resume(&[1, 17]); // Wrong success variant for the outstanding read.
-        assert!(matches!(decode(&state.packet()), Ok(Frame::Rollback(42))));
+        assert!(matches!(
+            decode(state.packet().as_bytes()),
+            Ok(Frame::Rollback(42))
+        ));
         state.resume(&[1, 18]);
-        assert!(matches!(decode(&state.packet()), Ok(Frame::Failure(3, 0))));
+        assert!(matches!(
+            decode(state.packet().as_bytes()),
+            Ok(Frame::Failure(3, 0))
+        ));
         state.resume(&begun); // A terminal operation cannot be restarted.
-        assert!(matches!(decode(&state.packet()), Ok(Frame::Failure(3, 0))));
+        assert!(matches!(
+            decode(state.packet().as_bytes()),
+            Ok(Frame::Failure(3, 0))
+        ));
     }
 
     #[test]

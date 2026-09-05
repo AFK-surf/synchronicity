@@ -11,6 +11,7 @@ pub mod error;
 pub mod gc;
 pub mod heads;
 mod lean_history;
+mod lean_read;
 mod lean_storage;
 pub mod proof;
 pub mod recovery;

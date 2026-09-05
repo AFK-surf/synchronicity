@@ -2,8 +2,8 @@ import VerifiedCore.Cas.Read
 import Synchronicity.Prelude
 
 /-! The actual repair program requests raw storage operations. These fixtures
-interpret its constructors, not a duplicate repair policy. Native cutover and
-host refinement remain separate obligations while this command is staged. -/
+interpret its constructors, not a duplicate repair policy. Raw host contracts
+remain the explicit execution boundary. -/
 namespace Synchronicity.CasReadHealingProofs
 open VerifiedCore.Host VerifiedCore.Cas.Read
 set_option Elab.async false
@@ -82,7 +82,9 @@ private def execute (script : Script) : Nat → Nat →
       | .right effect => match effect with
         | .left _ => none
         | .right effect => match effect with
-          | .nowNs => step "clock" (resume (reply script index 123))
+          | .left effect => match effect with
+            | .nowNs => step "clock" (resume (reply script index 123))
+          | .right _ => none
 
 private def run (script : Script) := execute script 20 0 (heal root).run
 

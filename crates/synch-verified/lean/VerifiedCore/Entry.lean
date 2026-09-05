@@ -1,5 +1,6 @@
 import VerifiedCore.Host.Wire
 import VerifiedCore.Cas.Program
+import VerifiedCore.Cas.Read
 import VerifiedCore.Trie.Program
 import VerifiedCore.Replication.History
 
@@ -94,7 +95,39 @@ def pruneHistory (origin : ByteArray) (before : Int64) : Host.Wire.NativeState :
   match String.fromUTF8? origin with
   | none => .pure (.error Host.Wire.protocolFailure)
   | some origin => do
-    let result ← (Replication.History.prune origin before).run
+    let result ← (Replication.History.prune origin before).run.mapEffects (fun effect =>
+      match effect with
+      | .left storage => .left storage
+      | .right crypto => .right (.left crypto))
     return encodeHistory result
+
+private def encodeRead (result : Except Cas.Read.Error UInt64) : Host.Reply ByteArray :=
+  open Host.Wire in
+  match result with
+  | .ok count => .ok (octet 0 ++ word count)
+  | .error (.host hostFailure) => .error hostFailure
+  | .error .missingBlob => .ok (octet 1)
+  | .error (.range start stop size) => .ok (octet 2 ++ word start ++ word stop ++ word size)
+  | .error .unavailable => .ok (octet 3)
+  | .error .shortInline => .ok (octet 4)
+  | .error .malformed => .ok (octet 5)
+  | .error (.columnType index column actual) => .ok
+      (octet 6 ++ word index.toUInt64 ++ string column ++ octet (match actual with
+        | .null => 0 | .integer => 1 | .real => 2 | .text => 3 | .blob => 4))
+  | .error (.column column reason) => .ok (octet 7 ++ string column ++ string reason)
+  | .error .protocol => .ok (octet 8)
+
+/-- One complete local read, including metadata admission, physical reads and
+repair. Effect injection preserves capability separation without exposing any
+CAS policy or intermediate availability state to the native caller. -/
+@[export synch_lean_cas_read]
+def readRoot (root : ByteArray) (all : Bool) (offset length : UInt64) : Host.Wire.NativeState :=
+  if root.size != 32 then .pure (.error Host.Wire.protocolFailure)
+  else do
+    let result ← (Cas.Read.read root (if all then .all else .range offset length)).run.mapEffects
+      (fun effect => match effect with
+        | .left storage => .left storage
+        | .right other => .right (.right other))
+    return encodeRead result
 
 end VerifiedCore.Entry

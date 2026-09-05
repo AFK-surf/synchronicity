@@ -31,6 +31,18 @@ Rust retention loop and receipt/fork helpers are removed. Raw scans retain
 rows before a trailing host failure so Lean owns first-error selection.
 No selectable backend is added.
 
+Local CAS reads now execute `Cas/Read.lean`, including metadata/bitmap decoding,
+bounds, coverage, inline/file reads and transactional missing/truncated-file
+repair. Both Rust read algorithms and the local healing transaction are removed.
+Raw snapshots release their connection before file I/O; one file handle survives
+bounded positioned reads. Separate `Output.append` effects fill a private Rust
+buffer, published only after a successful terminal byte count. Lean never
+serializes a whole-object return buffer. File, clock, output and relational
+capabilities remain independent of CAS policy. Same-source read/codec/healing
+proofs and native/SQLite fault tests cover this boundary; cloud hydration and
+Bao serving/import remain separate unfinished operations. See the architecture
+document for isolated allocation measurements and remaining performance gates.
+
 The acquisition cutover is checked against real SQLite, including abandoned
 transactions, automatic rollback, deferred commit failure, UPSERT timestamp
 preservation and the existing typed errors for corrupt durability cells.
@@ -251,9 +263,10 @@ The following are still required:
   operations and ingestion-time canonical encoding checks also remain Rust.
 - CAS bitmap settlement now runs in Lean, with canonical output and lossless
   endpoint serialization proved. CAS row deletion policy and effect order also
-  run in Lean, as do pin acquisition and want-to-pin possession. Move remaining
-  accounting (including unpin/expiry), GC candidate selection, trie GC,
-  cache eviction/healing, and publication/promotion decisions.
+  run in Lean, as do pin acquisition, want-to-pin possession, explicit unpin,
+  scheduled expiry, and local reads/repair. Move remaining accounting,
+  GC candidate selection, trie GC, remote cache eviction/healing, Bao
+  serving/import, and publication/promotion decisions.
 - Move ingestion and materialization sequencing into Lean-generated effect
   plans; discharge the flush-before-advertise and publication invariants over
   those executed plans, not over independent abstract Rust descriptions.

@@ -5,7 +5,7 @@ use rusqlite::{
     types::{ToSqlOutput, ValueRef},
     Connection, OptionalExtension, ToSql,
 };
-use synch_verified::host::{Cell, Fields, Row, Storage};
+use synch_verified::host::{Access, Cell, Fields, Row, Scan, Selection, SourceValue, Storage};
 
 use crate::{Result, StoreError};
 
@@ -39,15 +39,31 @@ impl synch_verified::host::Resources for Resources<'_> {
 /// finishes or is dropped. No borrowed transaction/guard lifetime is extended.
 #[derive(Debug)]
 pub(crate) struct SqliteStorage<'a> {
-    conn: &'a Connection,
+    conn: ConnectionSource<'a>,
     active: Option<u64>,
     next: u64,
+}
+
+#[derive(Debug)]
+enum ConnectionSource<'a> {
+    Borrowed(&'a Connection),
+    Owned(crate::db::ConnectionLease<'a>),
+}
+
+impl std::ops::Deref for ConnectionSource<'_> {
+    type Target = Connection;
+    fn deref(&self) -> &Self::Target {
+        match self {
+            Self::Borrowed(conn) => conn,
+            Self::Owned(conn) => conn,
+        }
+    }
 }
 
 impl<'a> SqliteStorage<'a> {
     pub(crate) fn new(conn: &'a Connection) -> Self {
         Self {
-            conn,
+            conn: ConnectionSource::Borrowed(conn),
             active: None,
             next: 1,
         }
@@ -66,6 +82,151 @@ impl<'a> SqliteStorage<'a> {
             return Err(StoreError::invalid("storage transaction was rolled back"));
         }
         Ok(())
+    }
+}
+
+/// Acquires connection/reentry guards only for a raw snapshot or an explicitly
+/// requested transaction. No connection guard survives a completed transaction.
+#[derive(Debug)]
+pub(crate) struct Session<'a> {
+    store: &'a crate::Store,
+    active: Option<SqliteStorage<'a>>,
+    next: u64,
+}
+
+impl<'a> Session<'a> {
+    pub(crate) fn new(store: &'a crate::Store) -> Self {
+        Self {
+            store,
+            active: None,
+            next: 1,
+        }
+    }
+
+    fn transaction(&mut self) -> Result<&mut SqliteStorage<'a>> {
+        self.active
+            .as_mut()
+            .ok_or_else(|| StoreError::invalid("no active storage transaction"))
+    }
+
+    fn snapshot_storage(&self) -> Result<SqliteStorage<'a>> {
+        if self.active.is_some() {
+            return Err(StoreError::invalid("snapshot during storage transaction"));
+        }
+        Ok(SqliteStorage {
+            conn: ConnectionSource::Owned(self.store.connection_lease()),
+            active: None,
+            next: self.next,
+        })
+    }
+}
+
+impl Storage for Session<'_> {
+    type Error = StoreError;
+
+    fn begin(&mut self) -> Result<u64> {
+        let mut storage = self.snapshot_storage()?;
+        let tx = storage.begin()?;
+        self.next = storage.next;
+        self.active = Some(storage);
+        Ok(tx)
+    }
+
+    fn commit(&mut self, tx: u64) -> Result<()> {
+        self.transaction()?.commit(tx)?;
+        self.active = None;
+        Ok(())
+    }
+
+    fn rollback(&mut self, tx: u64) -> Result<()> {
+        self.transaction()?.rollback(tx)?;
+        self.active = None;
+        Ok(())
+    }
+
+    fn exists_rows(&mut self, tx: u64, relation: &str, equals: &Fields) -> Result<bool> {
+        self.transaction()?.exists_rows(tx, relation, equals)
+    }
+
+    fn read_rows(
+        &mut self,
+        tx: u64,
+        relation: &str,
+        columns: &[String],
+        equals: &Fields,
+        order: &[synch_verified::host::Order],
+        joins: &[synch_verified::host::Join],
+    ) -> Result<Vec<Row>> {
+        self.transaction()?
+            .read_rows(tx, relation, columns, equals, order, joins)
+    }
+
+    fn scan_rows(
+        &mut self,
+        tx: u64,
+        relation: &str,
+        columns: &[String],
+        equals: &Fields,
+        order: &[synch_verified::host::Order],
+        joins: &[synch_verified::host::Join],
+    ) -> Result<Scan<StoreError>> {
+        self.transaction()?
+            .scan_rows(tx, relation, columns, equals, order, joins)
+    }
+
+    fn upsert(
+        &mut self,
+        tx: u64,
+        relation: &str,
+        fields: &Fields,
+        conflicts: &[String],
+        updates: &[String],
+    ) -> Result<()> {
+        self.transaction()?
+            .upsert(tx, relation, fields, conflicts, updates)
+    }
+
+    fn delete_rows(
+        &mut self,
+        tx: u64,
+        relation: &str,
+        equals: &Fields,
+        unless: &[synch_verified::host::Exclusion],
+        at_most: &Fields,
+    ) -> Result<u64> {
+        self.transaction()?
+            .delete_rows(tx, relation, equals, unless, at_most)
+    }
+
+    fn read_bytes(&mut self, space: &str, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        if let Some(storage) = self.active.as_mut() {
+            storage.read_bytes(space, key)
+        } else {
+            self.snapshot_storage()?.read_bytes(space, key)
+        }
+    }
+}
+
+impl Access for Session<'_> {
+    fn snapshot(&mut self, selection: &Selection, columns: &[String]) -> Result<Scan<StoreError>> {
+        self.snapshot_storage()?.snapshot(selection, columns)
+    }
+    fn update(&mut self, tx: u64, selection: &Selection, fields: &Fields) -> Result<u64> {
+        self.transaction()?.update(tx, selection, fields)
+    }
+    fn copy_rows(
+        &mut self,
+        tx: u64,
+        target: &str,
+        source: &Selection,
+        fields: &[(String, SourceValue)],
+        conflicts: &[String],
+    ) -> Result<u64> {
+        self.transaction()?
+            .copy_rows(tx, target, source, fields, conflicts)
+    }
+    fn delete_selected(&mut self, tx: u64, selection: &Selection) -> Result<u64> {
+        self.transaction()?.delete_selected(tx, selection)
     }
 }
 
@@ -177,6 +338,175 @@ fn predicate(relation: &str, equals: &Fields) -> Result<String> {
     } else {
         format!(" WHERE {}", terms.join(" AND "))
     })
+}
+
+/// Build only whitelisted identifiers; every literal remains a bound cell.
+/// WHERE 1 also disambiguates SQLite's INSERT SELECT ... ON CONFLICT grammar.
+fn selection_sql(selection: &Selection) -> Result<(String, Vec<Cell>)> {
+    columns_for(&selection.relation)?;
+    let mut terms = Vec::new();
+    let mut bindings = Vec::new();
+    for (name, value) in &selection.equals {
+        terms.push(format!("{} IS ?", column(&selection.relation, name)?));
+        bindings.push(value.clone());
+    }
+    if !selection.like_any.is_empty() {
+        let mut alternatives = Vec::new();
+        for (name, pattern) in &selection.like_any {
+            alternatives.push(format!("{} LIKE ?", column(&selection.relation, name)?));
+            bindings.push(Cell::Text(pattern.clone()));
+        }
+        terms.push(format!("({})", alternatives.join(" OR ")));
+    }
+    Ok((
+        format!(
+            " WHERE {}",
+            if terms.is_empty() {
+                "1".to_owned()
+            } else {
+                terms.join(" AND ")
+            }
+        ),
+        bindings,
+    ))
+}
+
+fn raw_scan(
+    conn: &Connection,
+    sql: &str,
+    bindings: &[Cell],
+    width: usize,
+) -> Result<Scan<StoreError>> {
+    let mut statement = conn.prepare(sql)?;
+    let rows = statement.query_map(params_from_iter(bindings.iter().map(BoundCell)), |row| {
+        (0..width)
+            .map(|index| {
+                Ok(match row.get_ref(index)? {
+                    ValueRef::Null => Cell::Null,
+                    ValueRef::Integer(value) => Cell::Integer(value),
+                    ValueRef::Text(value) => match std::str::from_utf8(value) {
+                        Ok(text) => Cell::Text(text.to_owned()),
+                        Err(_) => Cell::RawText(value.to_vec()),
+                    },
+                    ValueRef::Blob(value) => Cell::Blob(value.to_vec()),
+                    ValueRef::Real(value) => Cell::Real(value.to_bits()),
+                })
+            })
+            .collect::<rusqlite::Result<Row>>()
+    })?;
+    let mut scan = Scan {
+        rows: Vec::new(),
+        failure: None,
+    };
+    for row in rows {
+        match row {
+            Ok(row) => scan.rows.push(row),
+            Err(error) => {
+                scan.failure = Some(error.into());
+                break;
+            }
+        }
+    }
+    Ok(scan)
+}
+
+impl Access for SqliteStorage<'_> {
+    fn snapshot(&mut self, selection: &Selection, columns: &[String]) -> Result<Scan<StoreError>> {
+        if self.active.is_some() || !self.conn.is_autocommit() {
+            return Err(StoreError::invalid("snapshot during storage transaction"));
+        }
+        if columns.is_empty() {
+            return Err(StoreError::invalid("empty storage projection"));
+        }
+        let (predicate, bindings) = selection_sql(selection)?;
+        let sql = format!(
+            "SELECT {} FROM \"{}\"{predicate}",
+            projection(&selection.relation, columns)?,
+            selection.relation
+        );
+        raw_scan(&self.conn, &sql, &bindings, columns.len())
+    }
+
+    fn update(&mut self, tx: u64, selection: &Selection, fields: &Fields) -> Result<u64> {
+        self.require_live_transaction(tx)?;
+        if fields.is_empty() {
+            return Err(StoreError::invalid("empty storage write"));
+        }
+        let mut assignments = Vec::new();
+        let mut bindings = Vec::new();
+        for (index, (name, value)) in fields.iter().enumerate() {
+            if fields[..index].iter().any(|(prior, _)| prior == name) {
+                return Err(StoreError::invalid("duplicate storage write column"));
+            }
+            assignments.push(format!("{} = ?", column(&selection.relation, name)?));
+            bindings.push(value.clone());
+        }
+        let (predicate, selected) = selection_sql(selection)?;
+        bindings.extend(selected);
+        let sql = format!(
+            "UPDATE \"{}\" SET {}{predicate}",
+            selection.relation,
+            assignments.join(", ")
+        );
+        Ok(self
+            .conn
+            .execute(&sql, params_from_iter(bindings.iter().map(BoundCell)))? as u64)
+    }
+
+    fn copy_rows(
+        &mut self,
+        tx: u64,
+        target: &str,
+        source: &Selection,
+        fields: &[(String, SourceValue)],
+        conflicts: &[String],
+    ) -> Result<u64> {
+        self.require_live_transaction(tx)?;
+        columns_for(target)?;
+        if fields.is_empty() {
+            return Err(StoreError::invalid("empty storage write"));
+        }
+        let mut names = Vec::new();
+        let mut projected = Vec::new();
+        let mut bindings = Vec::new();
+        for (name, value) in fields {
+            if names.contains(name) {
+                return Err(StoreError::invalid("duplicate storage write column"));
+            }
+            names.push(name.clone());
+            projected.push(match value {
+                SourceValue::Column(name) => column(&source.relation, name)?,
+                SourceValue::Literal(value) => {
+                    bindings.push(value.clone());
+                    "?".to_owned()
+                }
+            });
+        }
+        if conflicts.iter().any(|name| !names.contains(name)) {
+            return Err(StoreError::invalid("UPSERT names a column without a value"));
+        }
+        let (predicate, selected) = selection_sql(source)?;
+        bindings.extend(selected);
+        let conflict = if conflicts.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", projection(target, conflicts)?)
+        };
+        let sql = format!("INSERT INTO \"{target}\" ({}) SELECT {} FROM \"{}\"{predicate} ON CONFLICT{conflict} DO NOTHING",
+            projection(target, &names)?, projected.join(", "), source.relation);
+        Ok(self
+            .conn
+            .execute(&sql, params_from_iter(bindings.iter().map(BoundCell)))? as u64)
+    }
+
+    fn delete_selected(&mut self, tx: u64, selection: &Selection) -> Result<u64> {
+        self.require_live_transaction(tx)?;
+        let (predicate, bindings) = selection_sql(selection)?;
+        let sql = format!("DELETE FROM \"{}\"{predicate}", selection.relation);
+        Ok(self
+            .conn
+            .execute(&sql, params_from_iter(bindings.iter().map(BoundCell)))? as u64)
+    }
 }
 
 impl Storage for SqliteStorage<'_> {
@@ -478,6 +808,281 @@ impl Storage for SqliteStorage<'_> {
 mod tests {
     use super::*;
     use synch_verified::host::{Exclusion, Join, Order};
+
+    fn selected(relation: &str) -> Selection {
+        Selection {
+            relation: relation.into(),
+            equals: vec![],
+            like_any: vec![],
+        }
+    }
+
+    #[test]
+    fn access_like_alternatives_are_grouped_with_equalities_and_keep_sqlite_case_rules() {
+        let conn = connection();
+        conn.execute_batch(
+            "INSERT INTO pins VALUES
+            (X'01', 'SOURCE:a', 1, NULL), (X'01', 'replica:b', 2, NULL),
+            (X'01', 'operator:c', 3, NULL), (X'02', 'replica:d', 4, NULL)",
+        )
+        .unwrap();
+        let selection = Selection {
+            relation: "pins".into(),
+            equals: vec![("root".into(), Cell::Blob(vec![1]))],
+            like_any: vec![
+                ("holder".into(), "source:%".into()),
+                ("holder".into(), "replica:%".into()),
+            ],
+        };
+        let mut storage = SqliteStorage::new(&conn);
+        assert_eq!(
+            storage
+                .snapshot(&selection, &names(&["holder"]))
+                .unwrap()
+                .rows
+                .len(),
+            2
+        );
+        let tx = storage.begin().unwrap();
+        assert_eq!(
+            storage
+                .update(
+                    tx,
+                    &selection,
+                    &vec![("release_after".into(), Cell::Integer(9))]
+                )
+                .unwrap(),
+            2
+        );
+        assert_eq!(storage.delete_selected(tx, &selection).unwrap(), 2);
+        storage.commit(tx).unwrap();
+        assert_eq!(
+            storage
+                .snapshot(&selected("pins"), &names(&["holder"]))
+                .unwrap()
+                .rows
+                .len(),
+            2
+        );
+    }
+
+    fn copy_fields() -> Vec<(String, SourceValue)> {
+        vec![
+            ("root".into(), SourceValue::Column("root".into())),
+            ("holder".into(), SourceValue::Column("holder".into())),
+            ("size".into(), SourceValue::Literal(Cell::Integer(-7))),
+            ("prev".into(), SourceValue::Literal(Cell::Null)),
+            (
+                "first_wanted".into(),
+                SourceValue::Literal(Cell::Integer(11)),
+            ),
+        ]
+    }
+
+    #[test]
+    fn access_copy_conflict_preserves_existing_fields_and_empty_selection_is_valid() {
+        let conn = connection();
+        conn.execute_batch("INSERT INTO pins VALUES (X'01', 'a', 0, NULL), (X'02', 'b', 0, NULL);
+            INSERT INTO content_want(root, holder, size, prev, first_wanted) VALUES (X'01', 'a', 99, X'03', 4)").unwrap();
+        let mut storage = SqliteStorage::new(&conn);
+        let tx = storage.begin().unwrap();
+        assert_eq!(
+            storage
+                .copy_rows(
+                    tx,
+                    "content_want",
+                    &selected("pins"),
+                    &copy_fields(),
+                    &names(&["root", "holder"])
+                )
+                .unwrap(),
+            1
+        );
+        let none = Selection {
+            relation: "pins".into(),
+            equals: vec![],
+            like_any: vec![("holder".into(), "absent:%".into())],
+        };
+        assert_eq!(
+            storage
+                .copy_rows(
+                    tx,
+                    "content_want",
+                    &none,
+                    &copy_fields(),
+                    &names(&["root", "holder"])
+                )
+                .unwrap(),
+            0
+        );
+        storage.commit(tx).unwrap();
+        let existing = conn
+            .query_row(
+                "SELECT size, prev, first_wanted FROM content_want WHERE root = X'01'",
+                [],
+                |row| {
+                    Ok((
+                        row.get::<_, i64>(0)?,
+                        row.get::<_, Vec<u8>>(1)?,
+                        row.get::<_, i64>(2)?,
+                    ))
+                },
+            )
+            .unwrap();
+        assert_eq!(existing, (99, vec![3], 4));
+        assert_eq!(
+            conn.query_row(
+                "SELECT size FROM content_want WHERE root = X'02'",
+                [],
+                |row| row.get::<_, i64>(0)
+            )
+            .unwrap(),
+            -7
+        );
+    }
+
+    #[test]
+    fn access_copy_failure_is_one_atomic_statement() {
+        let conn = connection();
+        conn.execute_batch(
+            "INSERT INTO pins VALUES (X'01', 'a', 0, NULL), (X'02', 'b', 0, NULL);
+            CREATE TRIGGER fail_copy BEFORE INSERT ON content_want WHEN NEW.root = X'02'
+            BEGIN SELECT RAISE(ABORT, 'copy failed'); END",
+        )
+        .unwrap();
+        let mut storage = SqliteStorage::new(&conn);
+        let tx = storage.begin().unwrap();
+        assert!(storage
+            .copy_rows(
+                tx,
+                "content_want",
+                &selected("pins"),
+                &copy_fields(),
+                &names(&["root", "holder"])
+            )
+            .is_err());
+        assert!(!storage.exists_rows(tx, "content_want", &vec![]).unwrap());
+        storage.rollback(tx).unwrap();
+    }
+
+    #[test]
+    fn access_rejects_untrusted_identifiers_and_duplicate_assignments() {
+        let conn = connection();
+        let mut storage = SqliteStorage::new(&conn);
+        assert!(storage
+            .snapshot(&selected("pins; DELETE FROM pins"), &names(&["root"]))
+            .is_err());
+        let invalid = Selection {
+            relation: "pins".into(),
+            equals: vec![],
+            like_any: vec![("holder OR 1".into(), "%".into())],
+        };
+        assert!(storage.snapshot(&invalid, &names(&["root"])).is_err());
+        let tx = storage.begin().unwrap();
+        assert!(storage
+            .update(
+                tx,
+                &selected("pins"),
+                &vec![("holder".into(), Cell::Null), ("holder".into(), Cell::Null)]
+            )
+            .is_err());
+        assert!(storage
+            .copy_rows(
+                tx,
+                "content_want",
+                &selected("pins"),
+                &[("root".into(), SourceValue::Column("root; --".into()))],
+                &[]
+            )
+            .is_err());
+        assert!(storage.delete_selected(tx, &invalid).is_err());
+        storage.rollback(tx).unwrap();
+    }
+
+    #[test]
+    fn access_snapshot_keeps_rows_before_step_failure() {
+        let conn = connection();
+        conn.execute_batch(
+            "CREATE TEMP TABLE scan_source(id INTEGER PRIMARY KEY);
+            INSERT INTO scan_source VALUES (1), (2);
+            CREATE TEMP VIEW blobs AS SELECT id AS root,
+            CASE WHEN id = 2 THEN abs(-9223372036854775808) ELSE 1 END AS durable FROM scan_source",
+        )
+        .unwrap();
+        let mut storage = SqliteStorage::new(&conn);
+        let scan = storage
+            .snapshot(&selected("blobs"), &names(&["root", "durable"]))
+            .unwrap();
+        assert_eq!(scan.rows, [vec![Cell::Integer(1), Cell::Integer(1)]]);
+        assert!(matches!(scan.failure, Some(StoreError::Sqlite(_))));
+        assert!(conn.is_autocommit());
+    }
+
+    #[test]
+    fn session_releases_snapshot_commit_rollback_and_drop_leases() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::Store::open(dir.path()).unwrap();
+        let mut session = Session::new(&store);
+        assert!(session
+            .snapshot(&selected("blobs"), &names(&["root"]))
+            .unwrap()
+            .rows
+            .is_empty());
+        assert!(store.conn().is_autocommit());
+        let first = session.begin().unwrap();
+        assert!(session
+            .snapshot(&selected("blobs"), &names(&["root"]))
+            .is_err());
+        session.commit(first).unwrap();
+        assert!(store.conn().is_autocommit());
+        let second = session.begin().unwrap();
+        assert_ne!(first, second);
+        assert!(session.commit(first).is_err());
+        session.rollback(second).unwrap();
+        assert!(store.conn().is_autocommit());
+        let _ = session.begin().unwrap();
+        drop(session);
+        assert!(store.conn().is_autocommit());
+    }
+
+    #[test]
+    fn session_failed_commit_retains_rollback_capability() {
+        let dir = tempfile::tempdir().unwrap();
+        let store = crate::Store::open(dir.path()).unwrap();
+        store.conn().execute_batch(
+            "CREATE TABLE test_parent (id INTEGER PRIMARY KEY);
+             CREATE TABLE test_child (parent INTEGER REFERENCES test_parent(id) DEFERRABLE INITIALLY DEFERRED);
+             CREATE TRIGGER fail_session_pin AFTER INSERT ON pins
+               BEGIN INSERT INTO test_child VALUES (1); END;",
+        ).unwrap();
+        let mut session = Session::new(&store);
+        let tx = session.begin().unwrap();
+        session
+            .upsert(
+                tx,
+                "pins",
+                &vec![
+                    ("root".into(), Cell::Blob(vec![1; 32])),
+                    ("holder".into(), Cell::Text("test".into())),
+                    ("created_at".into(), Cell::Integer(0)),
+                    ("release_after".into(), Cell::Null),
+                ],
+                &names(&["root", "holder"]),
+                &[],
+            )
+            .unwrap();
+        assert!(session.commit(tx).is_err());
+        assert!(session
+            .snapshot(&selected("pins"), &names(&["root"]))
+            .is_err());
+        session.rollback(tx).unwrap();
+        assert!(store.conn().is_autocommit());
+        assert!(session
+            .snapshot(&selected("pins"), &names(&["root"]))
+            .unwrap()
+            .rows
+            .is_empty());
+    }
 
     #[test]
     fn raw_scan_retains_prefix_before_sqlite_step_failure() {

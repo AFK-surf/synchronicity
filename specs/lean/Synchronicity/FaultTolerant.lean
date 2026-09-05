@@ -54,10 +54,11 @@ def HealRemote : Transition (Cell H) where
     pin := {holder ∈ c.pin | ¬IsRole holder}
     want := c.want ∪ {holder ∈ c.pin | IsRole holder} }
 
-/-- `cas.rs::Store::heal_missing_local_blob`.  A local read found the payload
+/-- Abstract local-loss transition. The production read now composes the
+executable Lean healing program directly. A local read found the payload
 missing or short.  The row stays and forgets what it held, the durable claim
 is withdrawn, and pins convert as above. -/
-@[transition, rust_impl "cas-heal-missing-local"]
+@[transition]
 def HealLocal : Transition (Cell H) where
   guard c := c.row
   post c := { c with

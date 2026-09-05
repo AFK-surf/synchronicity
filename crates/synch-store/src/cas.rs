@@ -16,7 +16,7 @@ use std::{
 use bao_tree::{
     io::{
         outboard::PreOrderOutboard,
-        sync::{decode_ranges, encode_ranges, ReadAt, WriteAt},
+        sync::{decode_ranges, encode_ranges, WriteAt},
     },
     BaoTree, BlockSize, ChunkNum,
 };
@@ -1192,48 +1192,6 @@ impl Store {
         })
     }
 
-    /// Invalidates a local complete claim after the payload is missing or
-    /// truncated, preserving every standing role as a repair intent.
-    fn heal_missing_local_blob(&self, root: &Hash) -> Result<()> {
-        // LEAN-MODEL: cas-heal-missing-local (FaultTolerant.HealLocal)
-        // `FaultTolerant.HealLocal` is this transaction, the local-bytes twin
-        // of the one above.
-        self.with_immediate_tx(|tx| {
-            let key = root.as_bytes().to_vec();
-            let size: Option<i64> = tx
-                .query_row(
-                    "SELECT size FROM blobs WHERE root = ?1",
-                    params![key.clone()],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            let Some(size) = size else {
-                return Ok(());
-            };
-            tx.execute(
-                "UPDATE blobs
-                    SET complete = 0, durable = 0, bitmap = NULL, inline = NULL
-                  WHERE root = ?1",
-                params![key.clone()],
-            )?;
-            tx.execute(
-                "INSERT INTO content_want (root, holder, size, prev, first_wanted)
-                 SELECT p.root, p.holder, ?2, NULL, ?3
-                   FROM pins p
-                  WHERE p.root = ?1
-                    AND (p.holder LIKE 'source:%' OR p.holder LIKE 'replica:%')
-                 ON CONFLICT(root, holder) DO NOTHING",
-                params![key.clone(), size, synch_core::now_ns()],
-            )?;
-            tx.execute(
-                "DELETE FROM pins WHERE root = ?1
-                   AND (holder LIKE 'source:%' OR holder LIKE 'replica:%')",
-                params![key],
-            )?;
-            Ok(())
-        })
-    }
-
     /// Reconciles database cache claims with an ephemeral scratch generation.
     ///
     /// A changed marker drops staged-only rows and clears cached groups on
@@ -1784,51 +1742,19 @@ impl Store {
 
     /// Reads a byte range from the trusted storage backend.
     pub fn read_range(&self, root: &Hash, offset: u64, len: u64) -> Result<Vec<u8>> {
-        let blob = self.blob(root)?.ok_or(StoreError::MissingBlob(*root))?;
-        let end = offset.saturating_add(len).min(blob.size);
-        if offset > blob.size {
-            return Err(StoreError::RangeOutOfBounds {
-                start: offset,
-                end,
-                size: blob.size,
-            });
-        }
-        if offset == end {
-            return Ok(Vec::new());
-        }
-        let wanted = ChunkRanges::from_ranges([groups_for_byte_range(offset, end)]);
-        let available = blob.verified_groups();
-        if !wanted.difference(&available).is_empty() {
-            return Err(StoreError::Verification {
-                root: *root,
-                reason: "requested range is not fully present locally".into(),
-            });
-        }
-
-        let mut out = vec![0u8; (end - offset) as usize];
-        match &blob.inline {
-            Some(data) => out.copy_from_slice(&data[offset as usize..end as usize]),
-            None => {
-                let result = File::open(self.blob_path(root))
-                    .and_then(|file| file.read_exact_at(offset, &mut out));
-                if let Err(error) = result {
-                    if matches!(
-                        error.kind(),
-                        std::io::ErrorKind::NotFound | std::io::ErrorKind::UnexpectedEof
-                    ) {
-                        self.heal_missing_local_blob(root)?;
-                    }
-                    return Err(error.into());
-                }
-            }
-        }
-        Ok(out)
+        crate::lean_read::read(
+            self,
+            root,
+            synch_verified::cas::ReadRequest::Range {
+                offset,
+                length: len,
+            },
+        )
     }
 
     /// Reads a whole object from the trusted storage backend.
     pub fn read_all(&self, root: &Hash) -> Result<Vec<u8>> {
-        let blob = self.blob(root)?.ok_or(StoreError::MissingBlob(*root))?;
-        self.read_range(root, 0, blob.size)
+        crate::lean_read::read(self, root, synch_verified::cas::ReadRequest::All)
     }
 
     // ---- slice serving and receiving --------------------------------------

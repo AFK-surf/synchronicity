@@ -1,5 +1,6 @@
 import VerifiedCore.Host
 import VerifiedCore.Crypto
+import VerifiedCore.Host.Access
 
 /-! Private versioned transport for raw host effects, not domain snapshots.
 All lengths and integers are little-endian u64; replies must match the pending
@@ -199,7 +200,8 @@ def resume (state : State) (input : ByteArray) : State :=
 
 /-- One native continuation transport, with storage and crypto kept as distinct
 typed capabilities. Existing storage packets retain their exact representation. -/
-abbrev NativeEffects := EffectSum Storage Crypto
+abbrev NativeEffects := EffectSum Storage (EffectSum Crypto
+  (EffectSum Access (EffectSum FileIO (EffectSum Clock Output))))
 abbrev NativeState := Program NativeEffects (Reply ByteArray)
 
 def cryptoRequest : Crypto A → ByteArray
@@ -213,20 +215,116 @@ def cryptoReply (effect : Crypto A) (input : ByteArray) : A :=
       | 1 => return true
       | _ => throw ()) input
 
+def selection (selected : Selection) : ByteArray :=
+  string selected.relation ++ fields selected.equals ++
+    sequence (fun (column, pattern) => string column ++ string pattern) selected.likeAny
+
+def sourceValue : SourceValue → ByteArray
+  | .literal value => octet 0 ++ cell value
+  | .column name => octet 1 ++ string name
+
+def accessRequest : Access A → ByteArray
+  | .snapshot selected columns => octet 1 ++ octet 29 ++ selection selected ++ sequence string columns
+  | .update tx selected values => octet 1 ++ octet 30 ++ word tx ++ selection selected ++ fields values
+  | .copyRows tx target source values conflicts => octet 1 ++ octet 31 ++ word tx ++
+      string target ++ selection source ++
+      sequence (fun (name, value) => string name ++ sourceValue value) values ++ sequence string conflicts
+  | .delete tx selected => octet 1 ++ octet 32 ++ word tx ++ selection selected
+
+def accessReply (effect : Access A) (input : ByteArray) : A :=
+  match effect with
+  | .snapshot .. => decodeReply 29 (do
+      let rows ← readList (readList readCell)
+      match ← readByte with
+      | 0 => return ⟨rows, none⟩
+      | 1 => return ⟨rows, some (← readFailure)⟩
+      | _ => throw ()) input
+  | .update .. => decodeReply 30 (do return (← readWord).toNat) input
+  | .copyRows .. => decodeReply 31 (do return (← readWord).toNat) input
+  | .delete .. => decodeReply 32 (do return (← readWord).toNat) input
+
+def fileRequest : FileIO A → ByteArray
+  | .open space key => octet 1 ++ octet 33 ++ string space ++ bytes key
+  | .readAt handle offset count => octet 1 ++ octet 34 ++ word handle ++ word offset ++ word count
+  | .close handle => octet 1 ++ octet 35 ++ word handle
+
+def readFileReply (expected : UInt8) (read : Reader A) : Reader (FileReply A) := do
+  if (← readByte) != 1 then throw ()
+  let kind ← readByte
+  if kind == 0 then
+    let failure ← readFailure
+    let classification ← readByte
+    let kind ← match classification with
+      | 0 => pure FileFailureKind.missing
+      | 1 => pure FileFailureKind.shortRead
+      | 2 => pure FileFailureKind.other
+      | _ => throw ()
+    return .error ⟨failure, kind⟩
+  if kind != expected then throw ()
+  return .ok (← read)
+
+def decodeFileReply (expected : UInt8) (read : Reader A) (input : ByteArray) : FileReply A :=
+  match (readFileReply expected read).run ⟨input, 0⟩ with
+  | .error () => .error ⟨protocolFailure, .other⟩
+  | .ok (result, cursor) =>
+    if cursor.offset == input.size then result else .error ⟨protocolFailure, .other⟩
+
+def fileReply (effect : FileIO A) (input : ByteArray) : A :=
+  match effect with
+  | .open .. => decodeFileReply 33 readWord input
+  | .readAt .. => decodeFileReply 34 readBytes input
+  | .close .. => decodeReply 35 (pure ()) input
+
+def clockRequest : Clock A → ByteArray
+  | .nowNs => octet 1 ++ octet 36
+
+def clockReply (effect : Clock A) (input : ByteArray) : A :=
+  match effect with
+  | .nowNs => decodeReply 36 (do return (← readWord).toInt64) input
+
+def outputRequest : Output A → ByteArray
+  | .append chunk => octet 1 ++ octet 37 ++ bytes chunk
+
+def outputReply (effect : Output A) (input : ByteArray) : A :=
+  match effect with
+  | .append _ => decodeReply 37 (pure ()) input
+
+def nativeRequest (effect : NativeEffects A) : ByteArray :=
+  match effect with
+  | .left storage => request storage
+  | .right effect => match effect with
+    | .left crypto => cryptoRequest crypto
+    | .right effect => match effect with
+      | .left access => accessRequest access
+      | .right effect => match effect with
+        | .left file => fileRequest file
+        | .right effect => match effect with
+          | .left clock => clockRequest clock
+          | .right output => outputRequest output
+
+def nativeReply (effect : NativeEffects A) (input : ByteArray) : A :=
+  match effect with
+  | .left storage => reply storage input
+  | .right effect => match effect with
+    | .left crypto => cryptoReply crypto input
+    | .right effect => match effect with
+      | .left access => accessReply access input
+      | .right effect => match effect with
+        | .left file => fileReply file input
+        | .right effect => match effect with
+          | .left clock => clockReply clock input
+          | .right output => outputReply output input
+
 @[export synch_lean_operation_packet]
 def nativePacket : NativeState → ByteArray
   | .pure (.ok result) => octet 1 ++ octet 0 ++ bytes result
   | .pure (.error error) => octet 1 ++ octet 1 ++ failure error
-  | .request effect _ => match effect with
-    | .left storage => request storage
-    | .right crypto => cryptoRequest crypto
+  | .request effect _ => nativeRequest effect
 
 @[export synch_lean_operation_resume]
 def nativeResume (state : NativeState) (input : ByteArray) : NativeState :=
   match state with
   | .pure _ => .pure (.error protocolFailure)
-  | .request effect next => match effect with
-    | .left storage => next (reply storage input)
-    | .right crypto => next (cryptoReply crypto input)
+  | .request effect next => next (nativeReply effect input)
 
 end VerifiedCore.Host.Wire

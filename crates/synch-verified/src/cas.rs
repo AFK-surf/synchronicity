@@ -11,6 +11,154 @@ pub enum Outcome {
 
 pub use crate::operation::OperationError;
 
+/// Whole-object or bounded local read. Lean owns admission and repair.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ReadRequest {
+    All,
+    Range { offset: u64, length: u64 },
+}
+
+/// Raw storage class named by a completed Lean validation error.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum CellType {
+    Null,
+    Integer,
+    Real,
+    Text,
+    Blob,
+}
+
+/// Domain failure selected by the complete Lean local-read operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ReadDomainError {
+    MissingBlob,
+    Range {
+        start: u64,
+        stop: u64,
+        size: u64,
+    },
+    Unavailable,
+    ShortInline,
+    Malformed,
+    ColumnType {
+        index: u64,
+        column: String,
+        actual: CellType,
+    },
+    Column {
+        column: String,
+        reason: String,
+    },
+}
+
+/// Completed read failure, preserving original host errors.
+#[derive(Debug)]
+pub enum ReadError<E> {
+    Operation(OperationError<E>),
+    Domain(ReadDomainError),
+}
+
+fn decode_read(bytes: &[u8]) -> Result<Result<u64, ReadDomainError>, ()> {
+    let mut reader = crate::operation::Reader(bytes);
+    let result = match reader.byte()? {
+        0 => Ok(reader.word()?),
+        1 => Err(ReadDomainError::MissingBlob),
+        2 => Err(ReadDomainError::Range {
+            start: reader.word()?,
+            stop: reader.word()?,
+            size: reader.word()?,
+        }),
+        3 => Err(ReadDomainError::Unavailable),
+        4 => Err(ReadDomainError::ShortInline),
+        5 => Err(ReadDomainError::Malformed),
+        6 => Err(ReadDomainError::ColumnType {
+            index: reader.word()?,
+            column: reader.string()?,
+            actual: match reader.byte()? {
+                0 => CellType::Null,
+                1 => CellType::Integer,
+                2 => CellType::Real,
+                3 => CellType::Text,
+                4 => CellType::Blob,
+                _ => return Err(()),
+            },
+        }),
+        7 => Err(ReadDomainError::Column {
+            column: reader.string()?,
+            reason: reader.string()?,
+        }),
+        // Tag 8 is Lean's explicit protocol failure, never a domain error.
+        _ => return Err(()),
+    };
+    reader.end()?;
+    Ok(result)
+}
+
+// Private and provisional: no caller can observe partial output. This is only
+// a growable byte sink, not a second implementation of read/range policy.
+struct ReadOutput<E> {
+    bytes: Vec<u8>,
+    error: std::marker::PhantomData<fn() -> E>,
+}
+impl<E> crate::host::Output for ReadOutput<E> {
+    type Error = OperationError<E>;
+    fn append(&mut self, bytes: &[u8]) -> Result<(), Self::Error> {
+        self.bytes
+            .try_reserve(bytes.len())
+            .map_err(|_| OperationError::Protocol)?;
+        self.bytes.extend_from_slice(bytes);
+        Ok(())
+    }
+}
+
+fn finish_read<E>(result: &[u8], output: ReadOutput<E>) -> Result<Vec<u8>, ReadError<E>> {
+    let count = decode_read(result)
+        .map_err(|()| ReadError::Operation(OperationError::Protocol))?
+        .map_err(ReadError::Domain)?;
+    if usize::try_from(count).ok() != Some(output.bytes.len()) {
+        return Err(ReadError::Operation(OperationError::Protocol));
+    }
+    Ok(output.bytes)
+}
+
+/// Execute one complete local read with raw storage, file and clock services.
+/// The constructor copies its command inputs; no CAS metadata or mutation plan
+/// is interpreted by this facade.
+pub fn read<S: crate::host::Access>(
+    storage: &mut S,
+    files: &mut dyn crate::host::FileIO<Error = S::Error>,
+    clock: &mut dyn crate::host::Clock<Error = S::Error>,
+    root: &[u8; 32],
+    request: ReadRequest,
+) -> Result<Vec<u8>, ReadError<S::Error>> {
+    use crate::operation::Slice;
+    unsafe extern "C" {
+        fn synch_adapter_operation_read(
+            root: Slice,
+            all: u8,
+            offset: u64,
+            length: u64,
+        ) -> *mut std::ffi::c_void;
+    }
+    let (all, offset, length) = match request {
+        ReadRequest::All => (1, 0, 0),
+        ReadRequest::Range { offset, length } => (0, offset, length),
+    };
+    let mut output = ReadOutput {
+        bytes: Vec::new(),
+        error: std::marker::PhantomData,
+    };
+    // SAFETY: the shared runner initializes Lean before constructing one fresh
+    // owned continuation. The constructor copies the borrowed root bytes.
+    let result = unsafe {
+        crate::operation::run_read(storage, files, clock, &mut output, || {
+            synch_adapter_operation_read(root.as_slice().into(), all, offset, length)
+        })
+    }
+    .map_err(ReadError::Operation)?;
+    finish_read(&result, output)
+}
+
 /// Holder identity supplied with a domain command. Opaque spellings remain
 /// opaque even when they resemble a known role; Lean owns storage rendering
 /// and the live-reference guard.
@@ -157,5 +305,101 @@ pub fn acquire<S: crate::host::Storage>(
         [0] => Ok(false),
         [1] => Ok(true),
         _ => Err(OperationError::Protocol),
+    }
+}
+
+#[cfg(test)]
+mod read_terminal_tests {
+    use super::{decode_read, finish_read, OperationError, ReadDomainError, ReadError, ReadOutput};
+    use crate::host::Output;
+
+    #[test]
+    fn read_terminal_errors_are_strictly_framed() {
+        assert_eq!(decode_read(&[1]), Ok(Err(ReadDomainError::MissingBlob)));
+        assert_eq!(decode_read(&[3]), Ok(Err(ReadDomainError::Unavailable)));
+        assert_eq!(decode_read(&[4]), Ok(Err(ReadDomainError::ShortInline)));
+        assert_eq!(decode_read(&[5]), Ok(Err(ReadDomainError::Malformed)));
+        for invalid in [&[][..], &[1, 0], &[8], &[9], &[0], &[2], &[6], &[7]] {
+            assert_eq!(decode_read(invalid), Err(()));
+        }
+    }
+
+    #[test]
+    fn read_terminal_range_preserves_unsigned_endpoints() {
+        let mut packet = vec![2];
+        for value in [u64::MAX - 1, u64::MAX, 7] {
+            packet.extend_from_slice(&value.to_le_bytes());
+        }
+        assert_eq!(
+            decode_read(&packet),
+            Ok(Err(ReadDomainError::Range {
+                start: u64::MAX - 1,
+                stop: u64::MAX,
+                size: 7,
+            }))
+        );
+        packet.push(0);
+        assert_eq!(decode_read(&packet), Err(()));
+    }
+
+    #[test]
+    fn read_terminal_count_is_exactly_framed() {
+        let mut packet = vec![0];
+        packet.extend_from_slice(&2_u64.to_le_bytes());
+        assert_eq!(decode_read(&packet), Ok(Ok(2)));
+        packet.push(0);
+        assert_eq!(decode_read(&packet), Err(()));
+        packet.pop();
+        packet.pop();
+        assert_eq!(decode_read(&packet), Err(()));
+    }
+
+    #[test]
+    fn read_terminal_count_releases_the_private_output_without_copying() {
+        for size in [0_usize, 2, 65543] {
+            let mut packet = vec![0];
+            packet.extend_from_slice(&(size as u64).to_le_bytes());
+            let mut output = ReadOutput::<()> {
+                bytes: vec![],
+                error: std::marker::PhantomData,
+            };
+            output
+                .append(&(0..size).map(|n| (n % 251) as u8).collect::<Vec<_>>())
+                .unwrap();
+            let pointer = output.bytes.as_ptr();
+            let capacity = output.bytes.capacity();
+            let payload = finish_read(&packet, output).unwrap();
+            assert_eq!(payload.as_ptr(), pointer);
+            assert_eq!(payload.capacity(), capacity);
+            assert_eq!(payload.len(), size);
+            assert!(payload
+                .iter()
+                .enumerate()
+                .all(|(n, byte)| *byte == (n % 251) as u8));
+        }
+    }
+
+    #[test]
+    fn failed_or_inconsistent_terminal_never_releases_private_prefix() {
+        let make_output = || ReadOutput::<()> {
+            bytes: vec![1, 2, 3],
+            error: std::marker::PhantomData,
+        };
+        for count in [0_u64, 2, 4, u64::MAX] {
+            let mut packet = vec![0];
+            packet.extend_from_slice(&count.to_le_bytes());
+            assert!(matches!(
+                finish_read(&packet, make_output()),
+                Err(ReadError::Operation(OperationError::Protocol))
+            ));
+        }
+        assert!(matches!(
+            finish_read(&[3], make_output()),
+            Err(ReadError::Domain(ReadDomainError::Unavailable))
+        ));
+        assert!(matches!(
+            finish_read(&[8], make_output()),
+            Err(ReadError::Operation(OperationError::Protocol))
+        ));
     }
 }

@@ -1,7 +1,6 @@
 import VerifiedCore.Host
 
 /-! Additional raw capabilities needed by complete local reads and repair.
-These typed capabilities are staged: they have no native interpreter yet.
 No callback parses domain metadata or decides recovery policy. -/
 namespace VerifiedCore.Host
 
@@ -50,9 +49,15 @@ Successful read replies contain exactly the requested byte count. -/
 inductive FileIO : Type → Type where
   | open (space : String) (key : ByteArray) : FileIO (FileReply UInt64)
   | readAt (handle offset count : UInt64) : FileIO (FileReply ByteArray)
-  | close (handle : UInt64) : FileIO Unit
+  | close (handle : UInt64) : FileIO (Reply Unit)
 
 inductive Clock : Type → Type where
   | nowNs : Clock (Reply Int64)
+
+/-- Append to one invocation-private result buffer. The host keeps this buffer
+unpublished until the command terminates successfully, and discards it on any
+failure or abandonment. This is raw byte storage, not CAS read policy. -/
+inductive Output : Type → Type where
+  | append (bytes : ByteArray) : Output (Reply Unit)
 
 end VerifiedCore.Host

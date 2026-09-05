@@ -192,6 +192,26 @@ fn in_transaction() -> bool {
     reentry::active()
 }
 
+/// A synchronous connection lease, including its reentry guard. Owning the
+/// guard directly avoids self-referential transaction storage or lifetime casts.
+pub(crate) struct ConnectionLease<'a> {
+    conn: MutexGuard<'a, Connection>,
+    _scope: reentry::Scope,
+}
+
+impl std::fmt::Debug for ConnectionLease<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnectionLease").finish_non_exhaustive()
+    }
+}
+
+impl std::ops::Deref for ConnectionLease<'_> {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        &self.conn
+    }
+}
+
 /// The node's metadata store.
 ///
 /// All writes funnel through one mutex-guarded connection, which is how the
@@ -518,6 +538,16 @@ impl Store {
         // blocking pool and the invariant is checked here.
         synch_core::assert_off_runtime("a Store connection acquisition");
         self.conn.lock().unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Lease the raw connection for one statement or an explicitly requested
+    /// transaction. Dropping it releases both the mutex and reentry scope.
+    pub(crate) fn connection_lease(&self) -> ConnectionLease<'_> {
+        let conn = self.conn();
+        ConnectionLease {
+            conn,
+            _scope: reentry::Scope::enter(),
+        }
     }
 
     /// Runs `f` against the raw transaction handle, committing on `Ok`.

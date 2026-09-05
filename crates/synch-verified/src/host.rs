@@ -22,6 +22,97 @@ pub type Row = Vec<Cell>;
 /// Named raw cells used as equality predicates or explicit write values.
 pub type Fields = Vec<(String, Cell)>;
 
+/// Literal equality predicates AND an optional disjunction of SQL LIKE predicates.
+/// An empty `like_any` adds no restriction. Equality compares raw stored cells;
+/// the adapter must not parse or reinterpret domain fields.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Selection {
+    pub relation: String,
+    pub equals: Fields,
+    pub like_any: Vec<(String, String)>,
+}
+
+/// An explicit value or a raw source-column projection for INSERT SELECT.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum SourceValue {
+    Literal(Cell),
+    Column(String),
+}
+
+/// Raw relational access, without metadata interpretation or healing policy.
+pub trait Access: Storage {
+    /// Read outside an explicitly requested transaction, preserving a successful
+    /// raw row prefix and any trailing stepping error.
+    fn snapshot(
+        &mut self,
+        selection: &Selection,
+        columns: &[String],
+    ) -> Result<Scan<Self::Error>, Self::Error>;
+    /// Update explicit raw values for the matching rows in the named transaction.
+    fn update(
+        &mut self,
+        tx: u64,
+        selection: &Selection,
+        values: &Fields,
+    ) -> Result<u64, Self::Error>;
+    /// INSERT SELECT with literal values or source-column projections, ignoring
+    /// only conflicts on the specified target columns.
+    fn copy_rows(
+        &mut self,
+        tx: u64,
+        target: &str,
+        source: &Selection,
+        values: &[(String, SourceValue)],
+        conflicts: &[String],
+    ) -> Result<u64, Self::Error>;
+    /// Delete selected rows in one statement, returning the affected row count.
+    fn delete_selected(&mut self, tx: u64, selection: &Selection) -> Result<u64, Self::Error>;
+}
+
+/// Mechanical I/O classification; interpretation remains in Lean.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum FileFailureKind {
+    Missing,
+    ShortRead,
+    Other,
+}
+
+/// Original I/O error paired with its mechanical classification.
+#[derive(Debug)]
+pub struct FileFailure<E> {
+    pub error: E,
+    pub kind: FileFailureKind,
+}
+
+/// Session-local raw file handles. Dropping the host releases outstanding handles.
+pub trait FileIO {
+    type Error;
+    /// Open one keyed file and retain its handle for this interpreter session.
+    fn open(&mut self, space: &str, key: &[u8]) -> Result<u64, FileFailure<Self::Error>>;
+    /// Read exactly `count` bytes at `offset`, returning `ShortRead` at EOF.
+    /// The host checks representability and must not truncate offset/count.
+    fn read_at(
+        &mut self,
+        handle: u64,
+        offset: u64,
+        count: u64,
+    ) -> Result<Vec<u8>, FileFailure<Self::Error>>;
+    fn close(&mut self, handle: u64) -> Result<(), Self::Error>;
+}
+
+/// Wall-clock input; the operation chooses when to observe it.
+pub trait Clock {
+    type Error;
+    fn now_ns(&mut self) -> Result<i64, Self::Error>;
+}
+
+/// Operation-local byte sink. Appended bytes are provisional until the whole
+/// operation succeeds; the caller discards the sink on failure.
+pub trait Output {
+    type Error;
+    fn append(&mut self, bytes: &[u8]) -> Result<(), Self::Error>;
+}
+
 /// Ordering by the column's stored type, not a domain reinterpretation.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Order {
