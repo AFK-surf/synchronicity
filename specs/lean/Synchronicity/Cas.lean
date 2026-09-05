@@ -321,7 +321,7 @@ def Pin (holder : H) : Transition (Cell H) where
   post c := { c with pin := insert holder c.pin }
 
 /-- `cas.rs::Store::unpin`. -/
-@[transition, rust_impl "cas-unpin"]
+@[transition]
 def Unpin (holder : H) : Transition (Cell H) where
   guard c := holder ∉ c.sourceLive ∧ holder ∉ c.replicaLive
   post c := { c with pin := c.pin \ {holder} }

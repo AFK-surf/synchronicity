@@ -221,7 +221,7 @@ the proof package imports those exact modules. The shared carrier's laws and
 transaction traces cover begin failure, body failure, commit failure and
 preservation of the primary error across rollback failure.
 
-CAS pin/possession acquisition and deletion now use complete Lean operations in
+CAS pin/possession acquisition, explicit pin release and deletion now use complete Lean operations in
 production. Their old snapshot/planner interfaces and Rust read/interpret/mutation
 orchestration have been deleted. Deletion also owns post-commit file cleanup:
 unlink failures are returned to Lean, which attempts both files and ignores
@@ -377,6 +377,42 @@ error object until Lean completes. Thus a later rollback failure cannot overwrit
 the error the operation chose. This implementation does not yet expose an async
 resumption API; any such API needs explicit request identity and cancellation
 contracts rather than exporting the current private pointer operations.
+
+### Next CAS operation slices
+
+Explicit pin release now runs in Lean in production. Its command carries the typed
+holder identity, not a rendered string plus a Rust-computed role space. Lean
+renders the storage key and selects the atomic live-reference exclusion.
+`Other("source:x")` must remain opaque and `Source("")` must remain a role;
+reparsing their rendered spellings would change the public API's behavior.
+No read-before-delete protection check or intermediate release plan crosses
+the boundary. A surrounding transaction uses the shared failure contract.
+The old Rust release SQL and guard selection are deleted. Same-source proofs
+cover the exact guarded request and success/failure traces; native tests cover
+all holder variants and each effect failure, and SQLite regressions cover live
+references, opaque role-like spellings, empty spaces and rollback on mutation
+failure. The host adapter only adds `entries.space` to its raw column allowlist.
+
+Subsequent CAS work is ordered by cohesive operation requirements:
+
+- Migrate both expiry commands together with generic comparison predicates and
+  correlated column references. Preserve the single set-shaped DELETE; do not
+  replace it with a pin scan and per-row FFI calls.
+- Migrate local reads with raw metadata decoding, bounds/coverage, positioned
+  file reads and healing composed inside Lean. Preserve original I/O errors
+  unless healing fails. Host callbacks cannot supply verified groups or heal
+  domain state on Lean's behalf.
+- Ingest needs bounded file capabilities, unique staging, rename, flush,
+  truncate, directory durability and writer leases. Lean owns Bao construction
+  and publication ordering. Preserve streaming and keep expensive I/O outside
+  SQL transactions; a whole outboard builder is not a primitive hash service.
+- Remote adoption/finalization must compose raw provider I/O around metadata
+  transitions. Moving only a durable-flag setter leaves the core ordering in
+  Rust; provider pair validation/upload is likewise CAS policy, not a primitive.
+
+Subagents may edit disjoint domain/proof/test files, but only the primary runs
+heavy validation. Inspect surviving processes after interruption; never launch
+a replacement build while its original process is still alive.
 
 ### Bounded development validation
 

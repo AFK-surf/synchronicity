@@ -11,6 +11,51 @@ pub enum Outcome {
 
 pub use crate::operation::OperationError;
 
+/// Holder identity supplied with a domain command. Opaque spellings remain
+/// opaque even when they resemble a known role; Lean owns storage rendering
+/// and the live-reference guard.
+#[derive(Debug, Clone, Copy)]
+pub enum PinHolder<'a> {
+    Operator,
+    Source(&'a str),
+    Replica(&'a str),
+    Other(&'a str),
+}
+
+/// Release one explicit claim through the complete Lean operation.
+pub fn unpin<S: crate::host::Storage>(
+    storage: &mut S,
+    root: &[u8; 32],
+    holder: PinHolder<'_>,
+) -> Result<bool, OperationError<S::Error>> {
+    use crate::operation::Slice;
+    unsafe extern "C" {
+        fn synch_adapter_operation_unpin(
+            root: Slice,
+            payload: Slice,
+            kind: u8,
+        ) -> *mut std::ffi::c_void;
+    }
+    let (kind, payload) = match holder {
+        PinHolder::Operator => (0, ""),
+        PinHolder::Source(space) => (1, space),
+        PinHolder::Replica(space) => (2, space),
+        PinHolder::Other(text) => (3, text),
+    };
+    // SAFETY: the constructor copies borrowed arguments into a fresh owned
+    // program; the shared runner initializes Lean before invoking it.
+    let result = unsafe {
+        crate::operation::run(storage, &[], || {
+            synch_adapter_operation_unpin(root.as_slice().into(), payload.as_bytes().into(), kind)
+        })
+    }?;
+    match result.as_slice() {
+        [0] => Ok(false),
+        [1] => Ok(true),
+        _ => Err(OperationError::Protocol),
+    }
+}
+
 /// Delete one object through its complete Lean storage/resource program.
 pub fn delete<S: crate::host::Storage>(
     storage: &mut S,

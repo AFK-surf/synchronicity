@@ -92,7 +92,7 @@ fn columns_for(relation: &str) -> Result<&'static [&'static str]> {
             "durable",
         ]),
         "pins" => Ok(&["root", "holder", "created_at", "release_after"]),
-        "entries" => Ok(&["content"]),
+        "entries" => Ok(&["content", "space"]),
         "content_want" => Ok(&[
             "root",
             "holder",

@@ -6,6 +6,26 @@ import VerifiedCore.Replication.History
 /-! Domain command constructors. The transport itself imports no domain policy. -/
 namespace VerifiedCore.Entry
 
+/-- Decode the holder constructor, not its rendered storage spelling. In
+particular an opaque future holder can resemble a known role's spelling. -/
+private def decodeHolder (kind : UInt8) (payload : ByteArray) : Option Cas.PinHolder := do
+  let text ← String.fromUTF8? payload
+  match kind.toNat with
+  | 0 => if text.isEmpty then some .operator else none
+  | 1 => some (.source text)
+  | 2 => some (.replica text)
+  | 3 => some (.other text)
+  | _ => none
+
+@[export synch_lean_cas_unpin]
+def unpin (root payload : ByteArray) (kind : UInt8) : Host.Wire.NativeState :=
+  if root.size != 32 then .pure (.error Host.Wire.protocolFailure)
+  else match decodeHolder kind payload with
+  | none => .pure (.error Host.Wire.protocolFailure)
+  | some holder => (do
+      let dropped ← Cas.unpin root holder
+      return Host.Wire.octet (if dropped then 1 else 0) : Host.Operation ByteArray).run.mapEffects Host.EffectSum.left
+
 @[export synch_lean_cas_delete]
 def delete (root : ByteArray) (hasBefore : Bool) (before : Int64) : Host.Wire.NativeState :=
   if root.size != 32 then .pure (.error ⟨2, 0⟩)

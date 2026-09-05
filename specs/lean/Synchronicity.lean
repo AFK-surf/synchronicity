@@ -19,6 +19,7 @@ import Synchronicity.CasLifecycleProofs
 import Synchronicity.HostProgramProofs
 import Synchronicity.HostWireProofs
 import Synchronicity.CasProgramProofs
+import Synchronicity.CasReleaseProofs
 import Synchronicity.TrieProgramProofs
 import Synchronicity.TrieProgramTests
 import Synchronicity.HistoryProgramProofs

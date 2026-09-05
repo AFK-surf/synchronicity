@@ -53,6 +53,45 @@ def acquire (root : ByteArray) (holder : String) (now : Int64)
     (possession : Bool) : Operation Bool :=
   transaction fun tx => acquireIn tx root holder now possession
 
+/-- A public holder value, not a parsed database spelling. In particular an
+unknown holder whose spelling resembles a role does not acquire that role's
+meaning, and an explicitly constructed role may name the empty space. -/
+inductive PinHolder where
+  | operator
+  | source (space : String)
+  | replica (space : String)
+  | other (text : String)
+  deriving DecidableEq, BEq
+
+/-- Preserve the persisted holder format at the command boundary. -/
+def PinHolder.render : PinHolder → String
+  | .operator => "operator"
+  | .source space => "source:" ++ space
+  | .replica space => "replica:" ++ space
+  | .other text => text
+
+/-- Only typed standing roles are protected by their space's live entries. -/
+def PinHolder.space : PinHolder → Option String
+  | .source space | .replica space => some space
+  | .operator | .other _ => none
+
+/-- Release precisely one holder's claim. The exclusion is part of the same
+raw DELETE as the mutation: there is no separate protection read whose answer
+could become stale. The host performs no role interpretation. -/
+def unpinIn (tx : Transaction) (root : ByteArray) (holder : PinHolder) : Operation Bool := do
+  let blockers : List Exclusion := match holder.space with
+    | none => []
+    | some space => [⟨"entries", [("space", .text space), ("content", .blob root)]⟩]
+  let count ← perform (.deleteRows tx "pins"
+    [("root", .blob root), ("holder", .text holder.render)] blockers)
+  return count != 0
+
+/-- A complete explicit release, acknowledged only after transaction commit.
+Failure of deletion or commit rolls back through the shared transaction
+program, preserving the original failure even if rollback also fails. -/
+def unpin (root : ByteArray) (holder : PinHolder) : Operation Bool :=
+  transaction fun tx => unpinIn tx root holder
+
 /-- Preserve absence and signed access time; do not coerce malformed cells. -/
 def decodeAccess : List Row → Reply (Option Int64)
   | [] => .ok none

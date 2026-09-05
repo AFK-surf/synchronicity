@@ -1504,25 +1504,23 @@ impl Store {
     /// model forbids. The operator's claim has no leaf behind it and goes
     /// unconditionally.
     pub fn unpin(&self, root: &Hash, holder: &PinHolder) -> Result<bool> {
-        // LEAN-MODEL: cas-unpin (Cas.Unpin)
-        // `Cas.Unpin` requires this holder's live role to have ended;
-        // for a role holder that guard is the entry check in this DELETE.
-        let dropped = match holder.space() {
-            None => self.conn().execute(
-                "DELETE FROM pins WHERE root = ?1 AND holder = ?2",
-                params![root.as_bytes().to_vec(), holder.render()],
-            )?,
-            Some(space) => self.conn().execute(
-                "DELETE FROM pins
-                  WHERE root = ?1 AND holder = ?2
-                    AND NOT EXISTS (
-                      SELECT 1 FROM entries
-                       WHERE entries.space = ?3 AND entries.content = pins.root
-                    )",
-                params![root.as_bytes().to_vec(), holder.render(), space],
-            )?,
+        use synch_verified::cas::{unpin, OperationError, PinHolder as Holder};
+        let holder = match holder {
+            PinHolder::Operator => Holder::Operator,
+            PinHolder::Source(space) => Holder::Source(space),
+            PinHolder::Replica(space) => Holder::Replica(space),
+            PinHolder::Other(text) => Holder::Other(text),
         };
-        Ok(dropped > 0)
+        self.with_connection_scope(|conn| {
+            let mut storage = crate::lean_storage::SqliteStorage::new(conn);
+            // LEAN-MODEL: cas-release-operation (CasReleaseProofs.successful_execution)
+            unpin(&mut storage, root.as_bytes(), holder).map_err(|error| match error {
+                OperationError::Host(error) => error,
+                OperationError::MalformedMetadata(_) | OperationError::Protocol => {
+                    StoreError::invalid("invalid native release-operation protocol")
+                }
+            })
+        })
     }
 
     /// Schedules one holder's claim to end, without ending it yet
@@ -2480,6 +2478,48 @@ mod tests {
             .unwrap();
         assert!(store.unpin(&root, &replica).unwrap());
         assert!(store.pinned_blobs().unwrap().is_empty());
+    }
+
+    #[test]
+    fn unpin_preserves_typed_holder_identity_and_empty_role_space() {
+        let (_d, store) = store();
+        let root = store.ingest_bytes(&data(100), 0).unwrap();
+        for space in ["media", "", "odd:space'雪"] {
+            let role = PinHolder::Source(space.into());
+            assert!(store.pin(&root, &role, 1).unwrap());
+            store
+                .put_entry(
+                    &crate::testutil::origin(),
+                    space,
+                    "a",
+                    &synch_core::FileEntry::file(100, 0, root, 1),
+                )
+                .unwrap();
+            assert!(!store.unpin(&root, &role).unwrap());
+            // Public Other values intentionally remain opaque: reparsing the
+            // identical stored spelling would invent a role guard.
+            let opaque = PinHolder::Other(role.render());
+            assert!(store.unpin(&root, &opaque).unwrap());
+            assert!(!store.unpin(&root, &opaque).unwrap());
+        }
+    }
+
+    #[test]
+    fn failed_unpin_rolls_back_and_preserves_the_claim() {
+        let (_d, store) = store();
+        let root = store.ingest_bytes(&data(100), 0).unwrap();
+        assert!(store.pin(&root, &PinHolder::Operator, 1).unwrap());
+        store
+            .conn()
+            .execute_batch(
+                "CREATE TEMP TRIGGER reject_pin_release BEFORE DELETE ON pins
+                 BEGIN SELECT RAISE(ABORT, 'release denied'); END;",
+            )
+            .unwrap();
+        let error = store.unpin(&root, &PinHolder::Operator).unwrap_err();
+        assert!(error.to_string().contains("release denied"));
+        assert!(store.conn().is_autocommit());
+        assert_eq!(store.pins_for(&root).unwrap().len(), 1);
     }
 
     use crate::testutil::{data, store};
