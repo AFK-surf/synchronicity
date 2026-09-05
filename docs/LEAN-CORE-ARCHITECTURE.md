@@ -75,6 +75,13 @@ storage capabilities include:
   requests chosen by Lean, not host-side application queries. Batch requests
   must preserve set-shaped behavior and index access for large collections.
 
+`EffectSum` composes typed capabilities without merging their algebras. History
+uses storage plus a separate `Crypto.validateEd25519` primitive. Its requests
+carry only key bytes and return validity or an opaque host failure, never a
+decoded origin/head. `transactionOver` injects storage requests into the chosen
+composition; storage-only `transactionWith` remains a specialization of that
+same algorithm. Adding crypto does not add crypto methods to storage services.
+
 Raw cells preserve all SQLite storage classes: NULL, signed 64-bit integer,
 REAL bits, text (including invalid UTF-8 bytes), and blobs. Lean owns the
 interpretation of durable flags, unsigned sequence numbers stored as signed
@@ -257,9 +264,11 @@ Integration review has identified specific gates, not waived limitations:
   unpadded length classes, zero trailing bits and 32-byte key width. Bare
   failures retain the original shape error; prefixed failures retain the key
   error class. The complete Lean parser composes with a byte-level validation
-  action; this primitive is not wired into history yet. Syntax alone does not
-  establish curve-point validity. Remaining gates are cryptographic key
-  validation, and malformed-storage error behavior. The Rust retention algorithm
+  action; history now requests it for key origins and signing keys at the
+  appropriate validation positions. False and host failure both stop the
+  operation and request rollback, retaining distinct diagnostics. These are
+  conditional execution proofs: native crypto interpretation and malformed-storage
+  error compatibility remain gates. The Rust retention algorithm
   remains until those semantics and the complete native entry point are implemented.
   Specifically, read complete before pending; an orphan pointer without its
   signed-history row is absent under the existing inner join, not a malformed
@@ -269,7 +278,7 @@ Integration review has identified specific gates, not waived limitations:
   Lean must consume raw storage records and invoke only genuine primitives.
   Raw cells now preserve REAL bits and invalid UTF-8 TEXT instead of rejecting
   them eagerly. Lean's staged history decoder selects contextual field/type
-  errors in projection order. Native terminal encoding and cryptographic key validation
+  errors in projection order. Native terminal encoding and crypto interpretation
   remain unfinished. Eager materialization of all rows still requires review:
   a later SQLite scan failure must not preempt an earlier record-validation
   error when the existing reader would stop at that record.

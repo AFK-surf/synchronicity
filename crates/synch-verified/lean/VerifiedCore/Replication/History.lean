@@ -1,4 +1,5 @@
 import VerifiedCore.Host
+import VerifiedCore.Crypto
 import VerifiedCore.Origin
 import Std.Data.TreeMap.Basic
 import Std.Data.TreeSet.Basic
@@ -22,8 +23,9 @@ point the shared storage interpreter/algebra must preserve these contracts:
 * Joined slot reads preserve orphan-pointer absence and check column/byte
   shapes with typed contextual errors in projection order. Named-origin syntax
   and strict key-origin syntax are checked directly by the shared Lean Origin
-  module, after signature width. Cryptographic public keys are not yet validated.
-  Native terminal error encoding, key validity and scan-failure ordering remain required
+  module, after signature width. The program requests primitive point validation
+  for key origins and signing keys. Native crypto interpretation, terminal error
+  encoding and scan-failure ordering remain required
   before cutover; full diagnostic compatibility is not claimed here.
 
 The generic predicate/order facilities are in Host, not a history-specific
@@ -60,11 +62,15 @@ inductive Error where
   deriving BEq, DecidableEq
 
 abbrev Result (A : Type) := Except Error A
-abbrev Action (A : Type) := Host.OperationWith Error A
+abbrev Effects := EffectSum Storage Crypto
+abbrev Action (A : Type) := Host.OperationOver Effects Error A
 
 def malformed : Error := .malformed
 
-def request (effect : Storage (Reply A)) : Action A := performWith Error.host effect
+def request (effect : Storage (Reply A)) : Action A := performOver Error.host (.left effect)
+
+def validateKey (bytes : List UInt8) : Action Bool :=
+  performOver Error.host (.right (.validateEd25519 bytes))
 
 def cellType : Cell → CellType
   | .null => .null
@@ -117,10 +123,9 @@ structure JoinedHead where
   pointer : Pointer
   publicKey : ByteArray
 
-/-- Column conversion is sequenced explicitly, followed by record checks.
-Origin syntax/decoding is included; cryptographic public-key validity remains
-a cutover gate. A syntactically valid key is not yet a validated curve point. -/
-def decodeJoinedHead : Row → Result JoinedHead
+/-- Pure projected-field conversion and signature width. All remaining record
+validation is sequenced by `decodeJoinedHead`, including primitive effects. -/
+def decodeJoinedFields : Row → Result JoinedHead
   | [origin, seq, root, created, key, sig, received, verified] => do
     let origin ← textField 0 "origin_id" origin
     let seq ← integerField 1 "seq" seq
@@ -131,11 +136,21 @@ def decodeJoinedHead : Row → Result JoinedHead
     let _ ← integerField 6 "received_at" received
     let _ ← integerField 7 "verified_at" verified
     if sig.size != 64 then throw (.column "heads.sig" "not 64 bytes")
-    let _ ← (Origin.checkSyntax origin).mapError Error.origin
-    let root ← hashField "heads.root" root
-    if key.size != 32 then throw (.column "heads.signed_by" "not 32 bytes")
     return ⟨origin, ⟨seq.toUInt64, root⟩, key⟩
   | _ => .error malformed
+
+/-- Entire stored-head validation, including primitive point checks. Origin
+validation precedes root/key widths; the signing key is checked only after its
+width. The host does not decode or validate a head on Lean's behalf. -/
+def decodeJoinedHead (row : Row) : Action JoinedHead := do
+  let fields ← ExceptT.mk (pure (decodeJoinedFields row))
+  let origin ← Origin.parse validateKey fields.origin
+  let _ ← ExceptT.mk (pure (origin.mapError Error.origin))
+  let _ ← ExceptT.mk (pure (hashField "heads.root" fields.pointer.root))
+  if fields.publicKey.size != 32 then throw (.column "heads.signed_by" "not 32 bytes")
+  if !(← validateKey fields.publicKey.data.toList) then
+    throw (.column "heads.signed_by" "data is not a valid public key")
+  return fields
 
 def headColumns : List String :=
   ["origin_id", "seq", "root", "head_history.created_at", "head_history.signed_by",
@@ -152,7 +167,7 @@ def readSlot (tx : Transaction) (origin slot : String) : Action (List JoinedHead
   match raw with
   | [] => return []
   | row :: _ =>
-    let head ← ExceptT.mk (pure (decodeJoinedHead row))
+    let head ← decodeJoinedHead row
     return [head]
 
 structure SequenceSummary where
@@ -252,6 +267,6 @@ def pruneIn (tx : Transaction) (origin : String) (before : Int64) : Action Nat :
 
 /-- Public domain command: origin and retention horizon, returning committed deletions. -/
 def prune (origin : String) (before : Int64) : Action Nat :=
-  transactionWith Error.host (fun tx => pruneIn tx origin before)
+  transactionOver EffectSum.left Error.host (fun tx => pruneIn tx origin before)
 
 end VerifiedCore.Replication.History

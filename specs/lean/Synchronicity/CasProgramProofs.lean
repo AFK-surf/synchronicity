@@ -176,7 +176,7 @@ theorem decoded_execution (tx : Transaction) (root : ByteArray) (holder : String
           (if durable && (!possession || !wanted.isEmpty)
             then writes tx root holder now possession else []) ++ [.commit tx]) := by
   cases durable <;> cases possession <;> cases wanted <;>
-    simp [run, acquire, transaction, transactionWith, acquireIn, perform, execute, answer, event,
+    simp [run, acquire, transaction, transactionWith, transactionOver, acquireIn, perform, execute, answer, event,
       bind, pure, Program.bind, ExceptT.bind, ExceptT.bindCont, ExceptT.pure,
       ExceptT.run, ExceptT.mk, decoded, reads, writes]
 

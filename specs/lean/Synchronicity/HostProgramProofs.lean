@@ -39,7 +39,7 @@ theorem transaction_begin (body : Transaction → Operation A) :
           match committed with
           | .ok () => .pure (.ok value)
           | .error failure => .request (.rollback tx) (fun _ => .pure (.error failure))))) := by
-  simp only [transaction, transactionWith, perform, ExceptT.run, ExceptT.mk,
+  simp only [transaction, transactionWith, transactionOver, ExceptT.run, ExceptT.mk,
     bind, Program.bind, pure, id]
   congr 1
   funext reply
@@ -102,5 +102,17 @@ theorem transactionWith_success_body (hostError : Failure → Error) (value : A)
 /-- Adding domain error types does not create a second transaction algorithm. -/
 theorem transaction_specialization (body : Transaction → Operation A) :
     transaction body = transactionWith id body := rfl
+
+/-- Composing another capability does not alter transaction failure semantics.
+In particular, a crypto failure in the body cannot commit or lose its error. -/
+theorem transactionOver_failed_body {E : Type → Type} (storage : {B : Type} → Storage B → E B)
+    (hostError : Failure → Error) (error : Error) :
+    (transactionOver storage hostError
+      (fun _ => (throw error : OperationOver E Error A))).run =
+      Program.request (storage .begin) (fun reply =>
+        match reply with
+        | .error failure => .pure (.error (hostError failure))
+        | .ok tx => .request (storage (.rollback tx)) (fun _ => .pure (.error error))) := by
+  rfl
 
 end Synchronicity.HostProgramProofs

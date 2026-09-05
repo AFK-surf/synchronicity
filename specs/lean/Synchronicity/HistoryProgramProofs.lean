@@ -336,8 +336,8 @@ can attempt another deletion or return success. -/
 theorem remove_next (tx : Transaction) (origin : String) (total : Nat)
     (receipt : Receipt) (rest : List Receipt) :
     (removeLoop tx origin total (receipt :: rest)).run =
-      .request (.deleteRows tx "head_history"
-        (receiptKey origin receipt) [⟨"heads", receiptKey origin receipt⟩])
+      .request (.left (.deleteRows tx "head_history"
+        (receiptKey origin receipt) [⟨"heads", receiptKey origin receipt⟩]))
         (fun reply => match reply with
           | .error failure => .pure (.error (.host failure))
           | .ok count => (removeLoop tx origin (total + count) rest).run) := by
@@ -349,60 +349,57 @@ theorem remove_next (tx : Transaction) (origin : String) (total : Nat)
 /-- Retention obtains raw pointers itself, within the caller's transaction. -/
 theorem prune_reads_pointers (tx : Transaction) (origin : String) (before : Int64) :
     ∃ resume, (pruneIn tx origin before).run = .request
-      (.readRows tx "heads" headColumns
-        [("origin_id", .text origin), ("slot", .text "complete")] [] headJoin) resume := by
+      (.left (.readRows tx "heads" headColumns
+        [("origin_id", .text origin), ("slot", .text "complete")] [] headJoin)) resume := by
   exact ⟨_, rfl⟩
 
 /-- The public operation itself requests its snapshot lock, before any read. -/
 theorem prune_begins_transaction (origin : String) (before : Int64) :
-    ∃ resume, (prune origin before).run = .request .begin resume := by
+    ∃ resume, (prune origin before).run = .request (.left .begin) resume := by
   exact ⟨_, rfl⟩
 
 /-- An absent raw join is an absent slot, with no decoding or additional reads. -/
 theorem absent_joined_slot (tx : Transaction) (origin slot : String) :
     ∃ resume, (readSlot tx origin slot).run = .request
-      (.readRows tx "heads" headColumns
-        [("origin_id", .text origin), ("slot", .text slot)] [] headJoin) resume ∧
+      (.left (.readRows tx "heads" headColumns
+        [("origin_id", .text origin), ("slot", .text slot)] [] headJoin)) resume ∧
       resume (.ok []) = .pure (.ok []) := by
   exact ⟨_, rfl, rfl⟩
 
-/-- Joined decoding admits typed rows of the established widths whose named
-origin syntax is valid. Cryptographic validation remains unfinished. -/
-theorem joined_shape_admitted (origin : String) (seq created received verified : Int64)
-    (hash key sig : ByteArray) (hashSize : hash.size = 32) (keySize : key.size = 32)
-    (sigSize : sig.size = 64) (originValid : VerifiedCore.Origin.checkSyntax origin = .ok ()) :
-    decodeJoinedHead [.text origin, .integer seq, .blob hash, .integer created,
+/-- Field conversion and signature width precede origin and key validation. -/
+theorem joined_fields_admitted (origin : String) (seq created received verified : Int64)
+    (hash key sig : ByteArray) (sigSize : sig.size = 64) :
+    decodeJoinedFields [.text origin, .integer seq, .blob hash, .integer created,
       .blob key, .blob sig, .integer received, .integer verified] =
       .ok ⟨origin, ⟨seq.toUInt64, hash⟩, key⟩ := by
-  simp [decodeJoinedHead, textField, integerField, blobField, hashField,
-    bind, Except.bind, pure, Except.pure, hashSize, keySize, sigSize,
-    originValid, Except.mapError]
+  simp [decodeJoinedFields, textField, integerField, blobField,
+    bind, Except.bind, pure, Except.pure, sigSize]
 
-/-- Named-origin rejection precedes root/key width checks, but follows all
-projected typed conversions and the signature-width check. -/
+/-- Syntax errors precede root/key widths without requesting crypto. -/
 theorem joined_origin_before_hash (origin : String) (seq created received verified : Int64)
     (hash key sig : ByteArray) (failure : VerifiedCore.Origin.Error)
     (sigSize : sig.size = 64)
-    (invalid : VerifiedCore.Origin.checkSyntax origin = .error failure) :
-    decodeJoinedHead [.text origin, .integer seq, .blob hash, .integer created,
-      .blob key, .blob sig, .integer received, .integer verified] =
-        .error (.origin failure) := by
-  simp [decodeJoinedHead, textField, integerField, blobField, bind,
-    Except.bind, pure, Except.pure, sigSize, invalid, Except.mapError]
+    (invalid : VerifiedCore.Origin.parseSyntax origin = .error failure) :
+    (decodeJoinedHead [.text origin, .integer seq, .blob hash, .integer created,
+      .blob key, .blob sig, .integer received, .integer verified]).run =
+        .pure (.error (.origin failure)) := by
+  simp [decodeJoinedHead, joined_fields_admitted origin seq created received verified hash key sig sigSize,
+    VerifiedCore.Origin.parse, invalid, ExceptT.run, ExceptT.mk,
+    bind, ExceptT.bind, ExceptT.bindCont, pure, ExceptT.pure, Program.bind, Except.mapError]
 
-/-- A malformed signature width is rejected by Lean before retention. -/
+/-- A malformed signature is rejected before any primitive or storage effect. -/
 theorem joined_signature_width_required (origin : String) (seq created received verified : Int64)
     (hash key sig : ByteArray) (bad : sig.size ≠ 64) :
-    decodeJoinedHead [.text origin, .integer seq, .blob hash, .integer created,
-      .blob key, .blob sig, .integer received, .integer verified] =
-        .error (.column "heads.sig" "not 64 bytes") := by
-  simp [decodeJoinedHead, textField, integerField, blobField, bind,
-    Except.bind, bad]
+    (decodeJoinedHead [.text origin, .integer seq, .blob hash, .integer created,
+      .blob key, .blob sig, .integer received, .integer verified]).run =
+        .pure (.error (.column "heads.sig" "not 64 bytes")) := by
+  simp [decodeJoinedHead, decodeJoinedFields, textField, integerField, blobField,
+    bind, Except.bind, bad, ExceptT.run, ExceptT.mk, ExceptT.bind, ExceptT.bindCont, Program.bind, pure]
 
-/-- Later raw storage anomalies cannot replace the first projected field error. -/
+/-- Later raw anomalies cannot replace the first field error or invoke crypto. -/
 theorem joined_first_field_error (seq root created key sig received verified : Cell) :
-    decodeJoinedHead [.null, seq, root, created, key, sig, received, verified] =
-      .error (.columnType 0 "origin_id" .null) := by
+    (decodeJoinedHead [.null, seq, root, created, key, sig, received, verified]).run =
+      .pure (.error (.columnType 0 "origin_id" .null)) := by
   rfl
 
 /-- Typed conversion of recorded_at precedes checking the root's byte width. -/
@@ -426,6 +423,7 @@ private structure Script where
   pointers : List Row := []
   receipts : List Row := []
   failAt : Option Nat := none
+  invalidKey : Bool := false
 
 private def failure : Failure := ⟨1, 99⟩
 
@@ -433,34 +431,37 @@ private def scriptReply (script : Script) (index : Nat) (value : A) : Reply A :=
   if script.failAt == some index then .error failure else .ok value
 
 private def runScript (script : Script) : Nat → Nat →
-    Program Storage (Result Nat) → Option (Result Nat × List String)
+    Program Effects (Result Nat) → Option (Result Nat × List String)
   | 0, _, _ => none
   | _ + 1, _, .pure value => some (value, [])
   | fuel + 1, index, .request effect resume =>
-    let step (label : String) (next : Program Storage (Result Nat)) :=
+    let step (label : String) (next : Program Effects (Result Nat)) :=
       (runScript script fuel (index + 1) next).map fun (result, trace) => (result, label :: trace)
     match effect with
-    | .begin => step "begin" (resume (scriptReply script index 7))
-    | .commit _ => step "commit" (resume (scriptReply script index ()))
-    | .rollback _ => step "rollback" (resume (scriptReply script index ()))
-    | .readRows _ relation columns equals order joined => step relation (resume
-      (if relation == "heads" && columns == headColumns && joined == headJoin && order.isEmpty then
-         scriptReply script index (if equals.contains ("slot", .text "complete") then script.pointers else [])
-       else if relation == "head_history" && order == [⟨"seq", true⟩, ⟨"root", true⟩] then
-         scriptReply script index script.receipts
-       else .error failure))
-    | .deleteRows _ relation equals blockers => step "delete" (resume
-      (if relation == "head_history" && blockers == [⟨"heads", equals⟩] then
-        scriptReply script index 1 else .error failure))
-    | .upsert _ _ _ _ _ => step "unexpected upsert" (resume (.error failure))
-    | .readBytes _ _ => step "unexpected byte read" (resume (.error failure))
-    | .readInput .. => step "unexpected input read" (resume (.error failure))
-    | .readCounter .. => step "unexpected counter read" (resume (.error failure))
-    | .removeFile .. => step "unexpected file removal" (resume (.error failure))
-    | .existsRows .. => step "unexpected existence query" (resume (.error failure))
+    | .right effect => match effect with
+      | .validateEd25519 _ => step "crypto" (resume (scriptReply script index (!script.invalidKey)))
+    | .left effect => match effect with
+      | .begin => step "begin" (resume (scriptReply script index 7))
+      | .commit _ => step "commit" (resume (scriptReply script index ()))
+      | .rollback _ => step "rollback" (resume (scriptReply script index ()))
+      | .readRows _ relation columns equals order joined => step relation (resume
+        (if relation == "heads" && columns == headColumns && joined == headJoin && order.isEmpty then
+           scriptReply script index (if equals.contains ("slot", .text "complete") then script.pointers else [])
+         else if relation == "head_history" && order == [⟨"seq", true⟩, ⟨"root", true⟩] then
+           scriptReply script index script.receipts
+         else .error failure))
+      | .deleteRows _ relation equals blockers => step "delete" (resume
+        (if relation == "head_history" && blockers == [⟨"heads", equals⟩] then
+          scriptReply script index 1 else .error failure))
+      | .upsert _ _ _ _ _ => step "unexpected upsert" (resume (.error failure))
+      | .readBytes _ _ => step "unexpected byte read" (resume (.error failure))
+      | .readInput .. => step "unexpected input read" (resume (.error failure))
+      | .readCounter .. => step "unexpected counter read" (resume (.error failure))
+      | .removeFile .. => step "unexpected file removal" (resume (.error failure))
+      | .existsRows .. => step "unexpected existence query" (resume (.error failure))
 
 private def forkScript : Script :=
-  ⟨[], [receiptRow 1 1 10, receiptRow 1 2 10, receiptRow 2 3 10], none⟩
+  { receipts := [receiptRow 1 1 10, receiptRow 1 2 10, receiptRow 2 3 10] }
 
 /-- Both expired fork roots are deleted, the ceiling survives, and success is
 returned only after the commit acknowledgement. -/
@@ -471,8 +472,19 @@ example : runScript forkScript 12 0 (prune "origin" 20).run =
 /-- The current pointer preserves its whole fork and the next old witness. -/
 example : runScript { forkScript with pointers := [headRow 1 1] }
     12 0 (prune "origin" 20).run =
-    some (.ok 0, ["begin", "heads", "heads", "head_history", "commit"]) := by
+    some (.ok 0, ["begin", "heads", "crypto", "heads", "head_history", "commit"]) := by
   decide
+
+/-- Invalid signing-key bytes stop the operation and roll back its transaction. -/
+example : runScript { forkScript with pointers := [headRow 1 1], invalidKey := true }
+    12 0 (prune "origin" 20).run =
+    some (.error (.column "heads.signed_by" "data is not a valid public key"),
+      ["begin", "heads", "crypto", "rollback"]) := by decide
+
+/-- A primitive host failure retains its token and prevents any further reads. -/
+example : runScript { forkScript with pointers := [headRow 1 1], failAt := some 2 }
+    12 0 (prune "origin" 20).run =
+    some (.error (.host failure), ["begin", "heads", "crypto", "rollback"]) := by decide
 
 /-- A young side preserves the complete fork, never just one proof. -/
 example : runScript { forkScript with

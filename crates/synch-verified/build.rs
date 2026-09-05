@@ -20,6 +20,7 @@ fn main() {
     println!("cargo:rerun-if-changed=lean/VerifiedCore.lean");
     let modules = [
         "Host",
+        "Crypto",
         "Origin",
         "Cas",
         "Cas/Program",

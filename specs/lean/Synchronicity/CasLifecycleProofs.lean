@@ -133,7 +133,7 @@ theorem deletion_execution_outcome (root : ByteArray) (accessed : Option Int64)
       ⟨accessed.isSome, writers != 0, pinned, referenced, accessed.getD 0⟩ before)).outcome := by
   cases accessed <;> cases before <;> cases pinned <;> cases referenced <;>
     by_cases writing : writers = 0 <;>
-    simp [delete, deleteIn, cleanup, transaction, transactionWith, perform, execute, answer, event,
+    simp [delete, deleteIn, cleanup, transaction, transactionWith, transactionOver, perform, execute, answer, event,
       bind, pure, Program.bind, ExceptT.bind, ExceptT.bindCont, ExceptT.pure,
       ExceptT.run, ExceptT.mk, decodeAccess, planLifecycle, writing]
   all_goals (try split_ifs) <;> rfl

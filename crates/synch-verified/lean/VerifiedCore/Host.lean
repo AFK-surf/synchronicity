@@ -16,6 +16,12 @@ instance : Monad (Program E) where
   pure := Program.pure
   bind := Program.bind
 
+/-- Capabilities compose without adding one subsystem's services to another's
+algebra. Injections preserve the requested reply type. -/
+inductive EffectSum (Left Right : Type → Type) : Type → Type where
+  | left {A : Type} (effect : Left A) : EffectSum Left Right A
+  | right {A : Type} (effect : Right A) : EffectSum Left Right A
+
 /-- Code 1 tokens identify original host errors retained by the interpreter.
 Code 2 uses the token as domain error detail (zero for an unspecified malformed
 record), never as a host-error registry index. Code 3 is a protocol failure. -/
@@ -81,7 +87,8 @@ inductive Storage : Type → Type where
   | removeFile (space : String) (key : ByteArray) : Storage (Reply Unit)
   | existsRows (tx : Transaction) (relation : String) (equals : Fields) : Storage (Reply Bool)
 
-abbrev OperationWith (Error A : Type) := ExceptT Error (Program Storage) A
+abbrev OperationOver (E : Type → Type) (Error A : Type) := ExceptT Error (Program E) A
+abbrev OperationWith (Error A : Type) := OperationOver Storage Error A
 abbrev Operation (A : Type) := OperationWith Failure A
 
 def perform (effect : Storage (Reply A)) : Operation A :=
@@ -92,24 +99,32 @@ the original failure token or exposing domain errors to the host interpreter. -/
 def performWith (hostError : Failure → Error) (effect : Storage (Reply A)) : OperationWith Error A :=
   ExceptT.mk (.request effect (fun result => .pure (result.mapError hostError)))
 
+def performOver (hostError : Failure → Error) (effect : E (Reply A)) : OperationOver E Error A :=
+  ExceptT.mk (.request effect (fun result => .pure (result.mapError hostError)))
+
 /-- Immediate transaction. A failed body or commit requests rollback, whose
 failure must not replace the primary failure. Host RAII handles abandonment;
 it does not choose domain recovery or report a failed commit as success. -/
-def transactionWith (hostError : Failure → Error)
-    (body : Transaction → OperationWith Error A) : OperationWith Error A := ExceptT.mk do
-  match ← (perform .begin).run with
+def transactionOver (storage : {B : Type} → Storage B → E B) (hostError : Failure → Error)
+    (body : Transaction → OperationOver E Error A) : OperationOver E Error A := ExceptT.mk do
+  match ← Program.request (storage .begin) Program.pure with
   | .error failure => pure (.error (hostError failure))
   | .ok tx =>
     match ← (body tx).run with
     | .error failure =>
-      let _ ← (perform (.rollback tx)).run
+      let _ ← Program.request (storage (.rollback tx)) Program.pure
       pure (.error failure)
     | .ok value =>
-      match ← (perform (.commit tx)).run with
+      match ← Program.request (storage (.commit tx)) Program.pure with
       | .ok () => pure (.ok value)
       | .error failure =>
-        let _ ← (perform (.rollback tx)).run
+        let _ ← Program.request (storage (.rollback tx)) Program.pure
         pure (.error (hostError failure))
+
+/-- Storage-only specialization; composition uses the same transaction algorithm. -/
+def transactionWith (hostError : Failure → Error)
+    (body : Transaction → OperationWith Error A) : OperationWith Error A :=
+  transactionOver (fun effect => effect) hostError body
 
 /-- Host-error-only specialization of the shared transaction program. -/
 def transaction (body : Transaction → Operation A) : Operation A :=
