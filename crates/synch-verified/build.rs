@@ -20,10 +20,13 @@ fn main() {
     println!("cargo:rerun-if-changed=lean/VerifiedCore.lean");
     let modules = [
         "Host",
+        "Host/Access",
         "Crypto",
         "Origin",
         "Cas",
         "Cas/Program",
+        "Cas/ReadCodec",
+        "Cas/Read",
         "Host/Wire",
         "Trie/Codec",
         "Trie/Program",

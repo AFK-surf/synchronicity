@@ -442,6 +442,45 @@ eventually compose those in Lean over raw provider ranges. Bao slice serving
 and import additionally require Lean traversal/verification. Do not relabel the
 existing Rust range hydrator or Bao encoder/decoder as a raw host capability.
 
+#### Staged local read/healing program
+
+`Cas/ReadCodec.lean` and `Cas/Read.lean` now implement the proposed complete
+local read and transactional repair in the shared Lean source. They are compiled
+by Cargo and imported by the proof package, but **not yet called by production
+Rust**. The old Rust read/healing paths must be removed on native cutover; these
+definitions do not count as that cutover or as completed CAS verification.
+
+The program owns ordered raw row validation, postcard bitmap decoding and
+coverage, range arithmetic, inline validation, physical reads and repair/error
+ordering. Reads retain one open file handle across at-most-64-KiB transfers and
+close it before repair or return. Chunks accumulate in a list and flatten once
+after I/O; appending a growing buffer across suspended continuations could
+otherwise repeatedly copy retained prefixes. Native allocation benchmarks are
+still required. A malformed successful file reply is an error,
+not a silently shortened result. Missing/truncated data triggers repair;
+unrelated I/O failures do not. Successful repair returns the original I/O error,
+whereas repair failure takes precedence. The on-demand clock follows metadata
+invalidation, preserving the existing ordering.
+
+`Host/Access.lean` describes missing **raw** capabilities separately from domain
+commands: statement-scoped snapshot scans, literal updates, atomic INSERT SELECT
+with conflict-ignore behavior, and selected bulk deletes. A selection supplies
+literal equality fields plus an optional disjunction of SQL LIKE terms. The
+file capability provides open, exact positioned reads and close; the clock is a
+separate algebra. Native integration must share the existing whitelisted query
+construction and transaction handling, not grow a second SQL policy engine.
+Snapshot connections end at statement completion; only the healing transaction
+retains its connection scope. File handles need abandonment cleanup and original
+error tokens with truthful generic I/O classifications.
+
+Remaining cutover gates include native packet/terminal encoding, interpreting
+these raw capabilities with scoped SQLite/file resources, real-storage failure
+and concurrency tests, large-input allocation/transfer checks, replacing both
+public reads and local healing, and deleting the obsolete Rust algorithms and
+their old abstract-model pairing anchor. Current proofs check actual Lean
+decoder fixtures and operation executions; they do not establish the pending
+native interpreter or physical storage guarantees.
+
 Subagents may edit disjoint domain/proof/test files, but only the primary runs
 heavy validation. Inspect surviving processes after interruption; never launch
 a replacement build while its original process is still alive.

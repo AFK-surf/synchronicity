@@ -21,6 +21,9 @@ import Synchronicity.HostWireProofs
 import Synchronicity.CasProgramProofs
 import Synchronicity.CasReleaseProofs
 import Synchronicity.CasExpiryProofs
+import Synchronicity.CasReadCodecProofs
+import Synchronicity.CasReadHealingProofs
+import Synchronicity.CasReadProgramProofs
 import Synchronicity.TrieProgramProofs
 import Synchronicity.TrieProgramTests
 import Synchronicity.HistoryProgramProofs
