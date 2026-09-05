@@ -18,7 +18,7 @@
 //! admissions happen, a co-resident invocation's echo round-trips stall.
 
 #![cfg(all(
-    any(target_os = "linux", target_os = "macos", target_os = "openbsd"),
+    any(target_os = "linux", target_os = "macos"),
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 

@@ -19,13 +19,11 @@ fn main() {
     println!("cargo:rerun-if-changed=lean/VerifiedCore.lean");
     println!("cargo:rerun-if-changed=lean/lean-toolchain");
     println!("cargo:rerun-if-changed=src/adapter.c");
-    if env::var_os("CARGO_FEATURE_NATIVE").is_none() {
-        return;
-    }
     let target = env::var("TARGET").unwrap();
-    let host = env::var("HOST").unwrap();
-    assert_eq!(target, host, "the Lean native backend requires a target-native build; never link host Lean archives into a cross-target binary");
-    assert!(target.ends_with("-linux-gnu"), "this first Lean native backend supports native Linux GNU builds only; other release targets require validated Lean runtime packaging");
+    let linux = target.ends_with("-linux-gnu");
+    let macos = target.ends_with("-apple-darwin");
+    let windows = target == "x86_64-pc-windows-gnullvm";
+    assert!(linux || macos || windows, "supported targets are Linux GNU, macOS, and Windows GNU/LLVM; OpenBSD, Linux musl, and Windows MSVC are not supported");
     let root = PathBuf::from(env::var_os("CARGO_MANIFEST_DIR").unwrap());
     let lean_dir = root.join("lean");
     let lean = |args: &[&str]| {
@@ -46,9 +44,25 @@ fn main() {
             .current_dir(&lean_dir)
             .arg("-dumpmachine"),
     );
+    let arch = if target.starts_with("aarch64-") {
+        "aarch64"
+    } else {
+        "x86_64"
+    };
+    let runtime_arch = if triple.starts_with("arm64-") {
+        "aarch64"
+    } else {
+        triple.split('-').next().unwrap()
+    };
     assert_eq!(
-        triple, target,
-        "Lean's runtime target must match Cargo's target"
+        runtime_arch, arch,
+        "Lean's runtime architecture must match Cargo's target; use a native runner"
+    );
+    assert!(
+        (linux && triple.ends_with("-linux-gnu"))
+            || (macos && triple.contains("-apple-darwin"))
+            || (windows && triple.ends_with("-windows-gnu")),
+        "Lean runtime {triple} is incompatible with Cargo target {target}"
     );
     let out = PathBuf::from(env::var_os("OUT_DIR").unwrap());
     let generated = out.join("VerifiedCore.c");
@@ -67,10 +81,32 @@ fn main() {
         "cargo:rustc-link-search=native={}",
         sysroot.join("lib").display()
     );
-    for lib in ["Init", "leanrt", "c++", "c++abi", "gmp", "uv"] {
+    for lib in ["Init", "leanrt", "gmp", "uv"] {
         println!("cargo:rustc-link-lib=static={lib}");
     }
-    for lib in ["m", "pthread", "dl"] {
-        println!("cargo:rustc-link-lib={lib}");
+    if macos {
+        // Apple's libc++ is a system library, not a bundled static archive.
+        println!("cargo:rustc-link-lib=c++");
+    } else {
+        for lib in ["c++", "c++abi"] {
+            println!("cargo:rustc-link-lib=static={lib}");
+        }
+    }
+    if windows {
+        for lib in ["unwind", "pthread"] {
+            println!("cargo:rustc-link-lib=static={lib}");
+        }
+        for lib in [
+            "bcrypt", "ws2_32", "userenv", "iphlpapi", "psapi", "dbghelp", "ole32", "icu",
+        ] {
+            println!("cargo:rustc-link-lib={lib}");
+        }
+    } else {
+        for lib in ["m", "pthread"] {
+            println!("cargo:rustc-link-lib={lib}");
+        }
+        if linux {
+            println!("cargo:rustc-link-lib=dl");
+        }
     }
 }

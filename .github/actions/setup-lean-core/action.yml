@@ -1,0 +1,25 @@
+name: Set up mandatory Lean core
+description: Install the pinned Lean runtime and the matching Windows C ABI toolchain
+runs:
+  using: composite
+  steps:
+    - uses: leanprover/lean-action@v1
+      with:
+        lake-package-directory: crates/synch-verified/lean
+        build: true
+        build-args: --wfail
+        test: false
+    - if: runner.os == 'Windows'
+      uses: msys2/setup-msys2@v2
+      with:
+        msystem: CLANG64
+        install: mingw-w64-clang-x86_64-toolchain
+    - if: runner.os == 'Windows'
+      shell: bash
+      run: |
+        rustup target add x86_64-pc-windows-gnullvm
+        echo 'CARGO_BUILD_TARGET=x86_64-pc-windows-gnullvm' >> "$GITHUB_ENV"
+        echo 'CARGO_TARGET_X86_64_PC_WINDOWS_GNULLVM_LINKER=C:/msys64/clang64/bin/clang.exe' >> "$GITHUB_ENV"
+        echo 'CC_x86_64_pc_windows_gnullvm=C:/msys64/clang64/bin/clang.exe' >> "$GITHUB_ENV"
+        echo 'AR_x86_64_pc_windows_gnullvm=C:/msys64/clang64/bin/llvm-ar.exe' >> "$GITHUB_ENV"
+        echo 'C:/msys64/clang64/bin' >> "$GITHUB_PATH"

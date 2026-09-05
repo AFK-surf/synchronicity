@@ -25,40 +25,21 @@ ARG RUST_VERSION=1.94
 
 # --- the binaries ------------------------------------------------------
 #
-# Pinned to $BUILDPLATFORM and cross-compiled, not emulated: a QEMU'd
-# rustc building this workspace — aws-lc-rs, the bundled SQLite, the whole
-# dependency graph — costs hours where `zig cc` as the cross-linker costs
-# the same as a native build. `cargo-zigbuild` is the same cross-compiler
-# release.yml uses for its Linux artifacts.
-#
-# glibc, pinned to the runtime image's 2.36 (bookworm), rather than the
-# static musl the release tarballs carry: the three programs here are
-# long-running servers, and musl's allocator under a many-threaded load is
-# the one thing that would differ from the configuration every test in CI
-# runs against. The pin is what keeps that honest — a target of
-# `…-linux-gnu.2.36` links against 2.36 symbols whatever the builder's own
-# glibc is, so the binaries cannot depend on something bookworm does not
-# have.
-FROM --platform=$BUILDPLATFORM rust:${RUST_VERSION}-bookworm AS build
+# Build on the target platform so the pinned Lean runtime and the Rust/C
+# objects always have the same architecture and libc. Multi-platform builds
+# need native builders for speed; emulation is supported but slower.
+# Both builder and runtime use bookworm, fixing the glibc baseline at 2.36.
+FROM rust:${RUST_VERSION}-bookworm AS build
 ARG TARGETARCH
-
-# `cargo-zigbuild` pinned like every other build input here; `ziglang` is
-# the zig toolchain as a wheel, which is how release.yml installs it too.
-# Bump the two together — cargo-zigbuild tracks zig's command line, which
-# is not stable across zig releases.
-ARG CARGO_ZIGBUILD_VERSION=0.23.3
-ARG ZIG_VERSION=0.16.0
-# The runtime image's glibc. Bump it with the runtime base, never above
-# it: this is the oldest glibc the binaries are allowed to need.
-ARG GLIBC_VERSION=2.36
-
-RUN set -eux; \
-    apt-get update; \
-    apt-get install -y --no-install-recommends python3-pip; \
-    rm -rf /var/lib/apt/lists/*; \
-    pip3 install --break-system-packages --no-cache-dir "ziglang==${ZIG_VERSION}"; \
-    cargo install cargo-zigbuild --locked --version "${CARGO_ZIGBUILD_VERSION}"; \
-    rustup target add x86_64-unknown-linux-gnu aarch64-unknown-linux-gnu
+ENV ELAN_HOME=/opt/elan
+ENV PATH="/opt/elan/bin:${PATH}"
+RUN set -eux; \\
+    apt-get update; \\
+    apt-get install -y --no-install-recommends curl ca-certificates; \\
+    rm -rf /var/lib/apt/lists/*; \\
+    curl --proto '=https' --tlsv1.2 -sSf https://raw.githubusercontent.com/leanprover/elan/master/elan-init.sh | sh -s -- -y --default-toolchain none
+COPY crates/synch-verified/lean/lean-toolchain /tmp/synch-lean/lean-toolchain
+RUN cd /tmp/synch-lean && lean --version
 
 WORKDIR /src
 
@@ -76,8 +57,7 @@ COPY vendor/ ./vendor/
 # multi-arch build run this stage at once, and one shared target/ would
 # serialize them behind the lock for no benefit — they share no artifacts.
 # The binaries are then copied out of it, because a cache mount is not
-# part of the layer it ran in. They land under the *unsuffixed* triple:
-# the glibc version is an instruction to the linker, not a directory.
+# part of the layer it ran in.
 RUN --mount=type=cache,target=/usr/local/cargo/registry,id=synch-cargo-registry,sharing=locked \
     --mount=type=cache,target=/src/target,id=synch-target-$TARGETARCH,sharing=locked \
     set -eux; \
@@ -86,7 +66,7 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry,id=synch-cargo-registry,
       arm64) target=aarch64-unknown-linux-gnu ;; \
       *) echo "unsupported TARGETARCH=$TARGETARCH" >&2; exit 1 ;; \
     esac; \
-    cargo zigbuild --release --locked --target "$target.$GLIBC_VERSION" \
+    cargo build --release --locked --target "$target" \
       --bin synch --bin synch-s3 --bin synch-dp; \
     mkdir -p /out; \
     cp "target/$target/release/synch" \

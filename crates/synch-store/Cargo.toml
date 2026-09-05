@@ -10,7 +10,6 @@ authors.workspace = true
 
 [features]
 test-utils = []
-verified-lean = ["dep:synch-verified", "synch-mpt/verified-lean"]
 
 [dependencies]
 async-trait.workspace = true
@@ -26,7 +25,7 @@ rusqlite.workspace = true
 serde.workspace = true
 synch-core.workspace = true
 synch-mpt.workspace = true
-synch-verified = { workspace = true, optional = true, features = ["native"] }
+synch-verified.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true

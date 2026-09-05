@@ -569,7 +569,7 @@ would boot, serve, and pass every other check.
   stdio protocol, one OS process per connection, so the BEAM never loads
   SQLite (no NIFs; links against the system libsqlite3). Each worker
   sandboxes itself before reading its first frame: Landlock + a seccomp
-  allowlist + rlimits on Linux, pledge + unveil on OpenBSD, confining
+  allowlist + rlimits on Linux, confining
   it to stdio and the database's own directory. Zones are pre-signed at
   mutation time and served straight from SQLite through a pool of
   reset-on-checkout workers (one read transaction per answer).

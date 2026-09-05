@@ -37,13 +37,8 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+      - uses: ./.github/actions/setup-lean-core
       - uses: Swatinem/rust-cache@v2
-      - uses: leanprover/lean-action@v1
-        with:
-          lake-package-directory: crates/synch-verified/lean
-          build: true
-          build-args: --wfail
-          test: false
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo clippy --workspace --all-features --all-targets -- -D warnings
       # And the configuration that actually ships. synch-net dev-depends on
@@ -70,15 +65,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/setup-lean-core
       - uses: Swatinem/rust-cache@v2
       # No network access needed: loopback only, relays and discovery off.
       # --no-fail-fast reports every platform's failures in one round-trip.
       # synch-engine is split into `test-engine` below: its real-network,
       # real-clock integration tests alone outrun the rest of the workspace.
-      # Portable features explicitly: verified-lean is a native Linux GNU
-      # integration milestone, tested separately below. Never silently select
-      # a Rust fallback when someone explicitly requests the Lean backend.
-      - run: cargo test --workspace --features synch-mpt/proofs,synch-net/sim,synch-store/test-utils,synch-monitor/testsupport --all-targets --no-fail-fast --exclude synch-engine
+      - run: cargo test --workspace --all-features --all-targets --no-fail-fast --exclude synch-engine
       - run: cargo test --workspace --doc --no-fail-fast --exclude synch-engine
       # `--lib --bins` resolves synch-net's `sim` dev-feature off, testing the
       # configuration that actually ships (the run above resolves it on).
@@ -98,6 +91,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/setup-lean-core
       - uses: Swatinem/rust-cache@v2
       # Split from `test`: real network + real clock per test makes this
       # crate alone slower than the rest of the workspace combined.
@@ -105,31 +99,6 @@ jobs:
       - run: cargo test -p synch-engine --doc --no-fail-fast
       - run: cargo test -p synch-engine --lib --bins --no-fail-fast
 
-  musl:
-    name: musl (release binaries)
-    runs-on: ubuntu-latest
-    timeout-minutes: 30
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-unknown-linux-musl
-      - uses: Swatinem/rust-cache@v2
-        with:
-          key: musl
-      # musl's libc typedefs are not glibc's — `ioctl`'s request argument is
-      # `c_int` there and `c_ulong` here — so code that compiles on every host
-      # in `test` above can still fail to compile for the static Linux binaries
-      # the release workflow ships, and the first sign of it is a broken tag.
-      # Type-check the released binaries against musl here instead, where the
-      # break costs a red pull request. This checks x86_64 only: the aarch64
-      # musl build differs from it in target-specific constants, not in the
-      # libc typedefs that make glibc-only code fail, and cross-compiling C
-      # dependencies for it would need the release workflow's zig toolchain.
-      - run: sudo apt-get update && sudo apt-get install -y musl-tools
-      - run: cargo check --target x86_64-unknown-linux-musl --bin synch --bin synch-s3 --bin synch-monitor
-        env:
-          CC_x86_64_unknown_linux_musl: musl-gcc
 
   verified-core:
     name: statically linked Lean core
@@ -138,18 +107,13 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/setup-lean-core
       - uses: Swatinem/rust-cache@v2
         with:
           key: verified-lean
-      - uses: leanprover/lean-action@v1
-        with:
-          lake-package-directory: crates/synch-verified/lean
-          build: true
-          build-args: --wfail
-          test: false
-      - run: cargo test -p synch-verified -p synch-mpt -p synch-store --features synch-store/verified-lean --all-targets
-      - run: cargo test -p synch-engine --features synch-store/verified-lean --test delegation --test convergence --test trust_boundaries --test replication
-      - run: cargo run --release -p synch-verified --features native --example decisions
+      - run: cargo test -p synch-verified -p synch-mpt -p synch-store --all-targets
+      - run: cargo test -p synch-engine --test delegation --test convergence --test trust_boundaries --test replication
+      - run: cargo run --release -p synch-verified --example decisions
       - name: Verify Lean has no dynamic runtime dependency
         run: |
           ldd target/release/examples/decisions
@@ -168,6 +132,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/setup-lean-core
       - uses: Swatinem/rust-cache@v2
       - name: Start MinIO, fake-gcs-server, and Azurite
         run: |
@@ -223,6 +188,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/setup-lean-core
       - uses: Swatinem/rust-cache@v2
       - run: cargo doc --workspace --no-deps
         env:
@@ -288,6 +254,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/setup-lean-core
       - uses: Swatinem/rust-cache@v2
       # A correctness check on the benchmark, not a performance gate: a shared
       # CI runner's timings are too noisy to threshold, and a benchmark nobody

@@ -5887,6 +5887,7 @@ dependencies = [
  "proptest",
  "serde",
  "serde_json",
+ "synch-verified",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",

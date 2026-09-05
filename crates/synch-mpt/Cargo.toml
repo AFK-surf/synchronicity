@@ -13,7 +13,7 @@ blake3.workspace = true
 postcard.workspace = true
 serde.workspace = true
 synch-core.workspace = true
-synch-verified = { workspace = true, optional = true, features = ["native"] }
+synch-verified.workspace = true
 thiserror.workspace = true
 
 [dev-dependencies]
@@ -26,4 +26,3 @@ workspace = true
 # Merkle proofs for individual keys: a §13 capability with no v1 caller, kept
 # out of the default surface so it is not something every build maintains.
 proofs = []
-verified-lean = ["dep:synch-verified"]

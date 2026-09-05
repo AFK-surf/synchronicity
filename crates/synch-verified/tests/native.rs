@@ -1,5 +1,3 @@
-#![cfg(feature = "native")]
-
 use proptest::prelude::*;
 use synch_verified::{group_count, settle_size, Scope, Settlement, Shape};
 

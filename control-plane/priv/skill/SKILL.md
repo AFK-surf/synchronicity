@@ -317,7 +317,7 @@ source add`. Activation is the one local gate:
   deployer. In-flight invocations keep the root snapshot they started with; a
   deployment changes what the next connection runs.
 
-Serving sockets requires Linux, macOS or OpenBSD on x86-64 or arm64, where the
+Serving sockets requires Linux or macOS on x86-64 or arm64, where the
 async-ebpf runtime is available. Connecting works on every platform supported
 by `synch` because the connecting side executes nothing.
 

@@ -57,8 +57,8 @@ stranger and the machine. Under this one the sandbox is defence in depth and
 the *gate* is that the callee already chose to publish the program at a path
 it activated.
 
-It also buys portability where it matters. async-ebpf runs on Linux, macOS and
-OpenBSD, on x86-64 and arm64. Serving sockets is gated to those targets.
+It also buys portability where it matters. this project enables async-ebpf on Linux and macOS,
+on x86-64 and arm64. Serving sockets is gated to those targets.
 `synch socket connect` is not, because it executes nothing.
 
 ## 2. What a socket is in the tree

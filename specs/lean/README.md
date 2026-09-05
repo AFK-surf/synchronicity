@@ -6,14 +6,15 @@ implementation sites and are checked in both directions; they do not prove
 the correspondence. Regression tests exercise the security and concurrency
 boundaries against the implementation.
 
-An opt-in production core now lives in
+A mandatory production core now lives in
 [`crates/synch-verified`](../../crates/synch-verified/README.md). Its executable
 Lean source is compiled and statically linked from Rust; this proof package
 imports that same source and proves its decisions match the abstract models
 in `VerifiedCoreProofs`. This closes the handwritten implementation/model gap
-for those decisions when `synch-store/verified-lean` is enabled, not for the
+for those decisions, not for the
 entire Rust engine or its FFI/storage effects. The native package imports no
-Mathlib and is currently supported on native Linux GNU only.
+Mathlib. Builds require the pinned Lean toolchain on Linux GNU, macOS, or
+Windows GNU/LLVM; there is no alternative Rust implementation.
 
 ```sh
 cd specs/lean

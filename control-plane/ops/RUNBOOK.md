@@ -156,8 +156,7 @@ a download.
 | `CP_DNSSEC_CHAIN_RESOLVER` | primary | DoH endpoint the log entry's DNSSEC chain is collected from, default `https://cloudflare-dns.com/dns-query`. In external mode it must be a **validating** resolver: the key watcher refuses answers without the AD bit. |
 
 > **Why the database gets its own directory.** Each SQLite connection
-> runs in a `csqlite` worker sandboxed (Landlock on Linux, `unveil`/
-> `pledge` on OpenBSD) to exactly the *directory* holding `CP_DB_PATH` —
+> runs in a `csqlite` worker sandboxed on Linux with Landlock to exactly the *directory* holding `CP_DB_PATH` —
 > the kernel primitives grant a directory, not a single file. So the
 > zone signing key (`CP_KEY_FILE`) must live **outside** that directory,
 > or a compromised worker's grant would cover it. Put the database in a

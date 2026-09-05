@@ -400,33 +400,6 @@ impl BlobRow {
     }
 }
 
-/// True if the groups on this disk actually attest to a recorded size.
-///
-/// Only the last group can. Every other group's chaining value is the same
-/// whatever the object's total length, so holding the first half of an object
-/// says a great deal about its content and nothing at all about where it ends;
-/// the final group is short by exactly the amount the size determines, and is
-/// the one place a wrong size cannot survive.
-///
-/// This is what keeps a peer from bricking a root. An object's tree has the same
-/// shape for every size inside its last 16 KiB **group** — the group is this
-/// store's leaf, and nothing above it moves while the group count stays put — so
-/// an entry that overstates an honest root by a few bytes yields a proof that
-/// verifies, and the row it creates would then refuse every honest writer of
-/// that root forever with "size mismatch", on every node that ever touched the
-/// poisoned path, with nothing to collect the row because the honest entry still
-/// references it. A size no group attests to is a claim, not a fact, and the
-/// next writer's claim replaces it (§5.1, §6.2).
-///
-/// Taken as three loose values rather than off a [`BlobRow`] so that the commit
-/// path can ask the question of a row it read *inside* its own transaction.
-#[cfg(not(feature = "verified-lean"))]
-fn size_is_attested(size: u64, complete: bool, held: &ChunkRanges) -> bool {
-    // LEAN-MODEL: cas-size-attested (Cas.Attested)
-    // `Cas.Attested` is this predicate: complete, or the final group held.
-    complete || held.contains(group_count(size) - 1)
-}
-
 /// What a size claim settled to, and what that costs the bits already held.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Settlement {
@@ -483,58 +456,30 @@ pub(crate) fn settle_size(
     // LEAN-MODEL: cas-size-settlement (Cas.Settles)
     // `Cas.Settles` is this decision as the guard on every groups commit: no
     // row, or the recorded size, or a size neither durable nor attested.
-    #[cfg(feature = "verified-lean")]
-    {
-        let (row, recorded, complete, durable, final_held) = match existing {
-            None => (false, 0, false, false, false),
-            Some((recorded, complete, durable, held)) => (
-                true,
-                recorded,
-                complete,
-                durable,
-                held.contains(synch_verified::group_count(recorded) - 1),
-            ),
-        };
-        // LEAN-MODEL: verified-size-settlement (VerifiedCoreProofs.settlement_refines_model)
-        match synch_verified::settle_size(row, durable, complete, final_held, recorded, claimed) {
-            synch_verified::Settlement::Refuse => Err(StoreError::Verification {
-                root: *root,
-                reason: format!("size mismatch: have {recorded}, offered {claimed}"),
-            }),
-            decision => Ok(Settlement {
-                size: claimed,
-                reset_held: decision == synch_verified::Settlement::Reset,
-            }),
-        }
-    }
-    #[cfg(not(feature = "verified-lean"))]
-    {
-        let settled = |size| {
-            Ok(Settlement {
-                size,
-                reset_held: false,
-            })
-        };
-        let Some((recorded, complete, durable, held)) = existing else {
-            return settled(claimed);
-        };
-        if recorded == claimed {
-            return settled(recorded);
-        }
-        if durable || size_is_attested(recorded, complete, held) {
-            // LEAN-MODEL: cas-size-refusal (Cas.settled_size_is_stable)
-            // `Cas.settled_size_is_stable` is what this refusal buys: no step of
-            // the model leaves a row standing under a different size once its
-            // size is durable or attested.
-            return Err(StoreError::Verification {
-                root: *root,
-                reason: format!("size mismatch: have {recorded}, offered {claimed}"),
-            });
-        }
-        Ok(Settlement {
+    let (row, recorded, complete, durable, final_held) = match existing {
+        None => (false, 0, false, false, false),
+        Some((recorded, complete, durable, held)) => (
+            true,
+            recorded,
+            complete,
+            durable,
+            held.contains(synch_verified::group_count(recorded) - 1),
+        ),
+    };
+    // Only complete or final-group evidence attests the recorded size; every
+    // earlier group can verify for multiple lengths in the same tree shape.
+    // LEAN-MODEL: cas-size-attested (Cas.Attested)
+    // LEAN-MODEL: cas-size-refusal (Cas.settled_size_is_stable)
+    // LEAN-MODEL: verified-size-settlement (VerifiedCoreProofs.settlement_refines_model)
+    match synch_verified::settle_size(row, durable, complete, final_held, recorded, claimed) {
+        synch_verified::Settlement::Refuse => Err(StoreError::Verification {
+            root: *root,
+            reason: format!("size mismatch: have {recorded}, offered {claimed}"),
+        }),
+        decision => Ok(Settlement {
             size: claimed,
-            reset_held: group_count(claimed) != group_count(recorded),
-        })
+            reset_held: decision == synch_verified::Settlement::Reset,
+        }),
     }
 }
 

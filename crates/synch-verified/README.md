@@ -6,38 +6,58 @@ settlement functions. Cargo compiles that source to C and statically links it
 with Lean's runtime. `specs/lean` imports the **same source package** and proves
 the functions agree with the abstract scope and CAS contracts.
 
-## Opt-in integration
+## Mandatory integration
 
-The backend currently supports **native Linux GNU** builds with the pinned
-Lean 4.30.0 toolchain. It is not a default-feature change: existing musl,
-macOS and Windows releases continue using the Rust backend. Enabling `native`
-on an unsupported or cross target fails explicitly; no fallback is selected
-behind the caller's back. All-features builds therefore require this native
-toolchain. Portable CI lists portable features separately.
+Every build uses Lean 4.30.0 for scope/path/key/node/payload decisions and CAS
+size settlement. The corresponding Rust implementations and feature flags
+have been deleted. The shared `synch-core::group_count` API also delegates to
+Lean. Rust code in the native tests/example is an independent test oracle,
+not a selectable production backend.
+
+Supported targets are native Linux GNU and macOS (x86-64/arm64), and Windows
+x86-64 GNU/LLVM. OpenBSD and Linux musl support has been removed. The build
+rejects incompatible runtime architecture/ABI instead of linking host archives
+into a cross-target binary. Release CI uses architecture-matched runners.
 
 Install Lean 4.30.0 through elan, then from the repository root:
 
 ```sh
-cargo test -p synch-verified --features native
-cargo test -p synch-mpt -p synch-store --features synch-store/verified-lean
-cargo test -p synch-engine --features synch-store/verified-lean --test delegation
-cargo build --release --bin synch --features synch-store/verified-lean
-cargo run --release -p synch-verified --features native --example decisions
+cargo test -p synch-verified
+cargo test -p synch-mpt -p synch-store
+cargo test -p synch-engine --test delegation
+cargo build --release --bin synch
+cargo run --release -p synch-verified --example decisions
 cd specs/lean && lake build --wfail && ./check-anchors.sh
 ```
 
-`synch-mpt/verified-lean` replaces scope/path/key/node/payload decisions.
-`synch-store/verified-lean` enables that feature and replaces CAS size
-settlement. The alternative Rust bodies are compiled out of those functions
-when the feature is enabled; they remain the portable implementation and
-differential reference during this migration.
+### Windows
+
+Lean ships an LLVM/MinGW UCRT runtime, not an MSVC C++ runtime. Install the
+MSYS2 CLANG64 toolchain and `rustup target add x86_64-pc-windows-gnullvm`.
+In PowerShell (adjust the MSYS2 installation prefix if needed):
+
+```powershell
+$env:CARGO_BUILD_TARGET = "x86_64-pc-windows-gnullvm"
+$env:CARGO_TARGET_X86_64_PC_WINDOWS_GNULLVM_LINKER = "C:/msys64/clang64/bin/clang.exe"
+$env:CC_x86_64_pc_windows_gnullvm = "C:/msys64/clang64/bin/clang.exe"
+$env:AR_x86_64_pc_windows_gnullvm = "C:/msys64/clang64/bin/llvm-ar.exe"
+$env:PATH = "C:/msys64/clang64/bin;" + $env:PATH
+cargo test -p synch-verified
+cargo build --release --bin synch
+```
+
+Windows artifacts now use the `x86_64-pc-windows-gnullvm` suffix instead of
+`x86_64-pc-windows-msvc`. They remain native Windows executables. CI installs
+the same toolchain through `.github/actions/setup-lean-core`. Linux release
+artifacts use `linux-gnu` instead of `linux-musl` and require system glibc.
 
 No generated C is checked in. Cargo generates it in its own `OUT_DIR`, so
 parallel target/profile builds do not race on shared generated artifacts.
 Mathlib is needed for the proof build, not the native build or runtime.
 The build checks the Lean version and runtime target triple before linking.
-The toolchain's Init, runtime, C++ support, GMP and libuv archives are linked
-statically; the Linux GNU executable still uses the system libc.
+The toolchain's Init, runtime, GMP and libuv archives are linked statically.
+Linux and Windows also link the bundled C++ support statically; macOS uses
+Apple's system libc++. OS libraries remain dynamic dependencies.
 
 ## What is proved
 
@@ -86,8 +106,7 @@ native benchmark executable was 2.9 MiB and had no dynamic Lean dependencies.
 These are workload/machine-specific observations, not production guarantees.
 Per-call byte copies and conversion to lists dominate small predicates.
 
-Before making Lean mandatory: validate runtime packaging for all release
-targets, optimize/batch the boundary, benchmark real trie walks, and expand
-the source-based proofs as the incremental walker and promotion planner move.
+Next: optimize/batch the boundary, benchmark real trie walks, and expand the
+source-based proofs as the incremental walker and promotion planner move.
 Moving a policy into Lean does not by itself verify the external effects that
 Rust performs in response.
