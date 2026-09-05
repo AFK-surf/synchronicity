@@ -309,7 +309,7 @@ theorem walk_payload_retry (s : VerifiedCore.MissingWalk) (hash : ByteArray) :
 neither a complete-reference shortcut nor an already-expanded visit key. -/
 @[rust_justifies "verified-walk-poll"]
 theorem walk_poll_selected (scope : VerifiedCore.Scope) (limit : Nat)
-    (seen : Std.TreeSet (List Nat × Option (List Nat)))
+    (seen : Std.TreeSet VerifiedCore.WalkVisit)
     (frontier : List VerifiedCore.WalkPosition) (p : VerifiedCore.WalkPosition)
     (selected : (VerifiedCore.pollFrontier scope limit seen frontier).current = some p) :
     p ∈ frontier ∧ p.path.length ≤ limit ∧
@@ -332,7 +332,7 @@ theorem walk_poll_selected (scope : VerifiedCore.Scope) (limit : Nat)
 
 /-- Over-depth positions fail before reference pruning or deduplication. -/
 theorem walk_depth_before_shortcuts (scope : VerifiedCore.Scope) (limit : Nat)
-    (seen : Std.TreeSet (List Nat × Option (List Nat)))
+    (seen : Std.TreeSet VerifiedCore.WalkVisit)
     (p : VerifiedCore.WalkPosition) (rest : List VerifiedCore.WalkPosition)
     (deep : limit < p.path.length) :
     (VerifiedCore.pollFrontier scope limit seen (p :: rest)).fault = some p.path.length := by
@@ -630,7 +630,7 @@ theorem expansion_schedules_all (s : VerifiedCore.MissingWalk)
 /-- Every input position survives a successful poll as pending/selected work,
 unless the exact executable reference or seen-set shortcut justifies skipping it. -/
 theorem poll_frontier_accounts_for_all (scope : VerifiedCore.Scope) (limit : Nat)
-    (seen : Std.TreeSet (List Nat × Option (List Nat)))
+    (seen : Std.TreeSet VerifiedCore.WalkVisit)
     (frontier : List VerifiedCore.WalkPosition) (p : VerifiedCore.WalkPosition)
     (healthy : (VerifiedCore.pollFrontier scope limit seen frontier).fault = none)
     (pending : p ∈ frontier) :
@@ -657,7 +657,7 @@ theorem poll_frontier_accounts_for_all (scope : VerifiedCore.Scope) (limit : Nat
 /-- A drained successful poll skipped every original position by an explicit
 reference-equality or seen-set shortcut; none disappeared silently. -/
 theorem drained_frontier_shortcuts (scope : VerifiedCore.Scope) (limit : Nat)
-    (seen : Std.TreeSet (List Nat × Option (List Nat)))
+    (seen : Std.TreeSet VerifiedCore.WalkVisit)
     (frontier : List VerifiedCore.WalkPosition)
     (healthy : (VerifiedCore.pollFrontier scope limit seen frontier).fault = none)
     (drained : (VerifiedCore.pollFrontier scope limit seen frontier).rest = [])
@@ -752,6 +752,77 @@ theorem repeated_pending_poll (s : VerifiedCore.MissingWalk) (pending : s.awaiti
   | zero => rfl
   | succ count ih =>
     rw [Function.iterate_succ_apply', ih, pending_poll_unchanged s pending]
+
+/-- The concrete visit key retains both content identity and depth. Its only
+positional quotient is between positions entirely inside granted subtrees. -/
+theorem equal_visit_classification (scope : VerifiedCore.Scope)
+    (p q : VerifiedCore.WalkPosition) (same : VerifiedCore.walkVisit scope p = VerifiedCore.walkVisit scope q) :
+    p.hash = q.hash ∧ p.path.length = q.path.length ∧
+    (p.path = q.path ∨ (VerifiedCore.containsSubtree scope p.path = true ∧
+      VerifiedCore.containsSubtree scope q.path = true)) := by
+  refine ⟨congrArg (fun k => k.2.1) same, congrArg Prod.fst same, ?_⟩
+  have positions := congrArg (fun k => k.2.2) same
+  by_cases hp : VerifiedCore.containsSubtree scope p.path = true
+  · by_cases hq : VerifiedCore.containsSubtree scope q.path = true
+    · exact Or.inr ⟨hp, hq⟩
+    · simp [VerifiedCore.walkVisit, hp, hq] at positions
+  · by_cases hq : VerifiedCore.containsSubtree scope q.path = true
+    · simp [VerifiedCore.walkVisit, hp, hq] at positions
+    · exact Or.inl (by simpa [VerifiedCore.walkVisit, hp, hq] using positions)
+
+/-- Runtime subtree grants remain grants after every finite child step. -/
+theorem runtime_grant_append (scope : VerifiedCore.Scope) (path step : List Nat)
+    (granted : VerifiedCore.containsSubtree scope path = true) :
+    VerifiedCore.containsSubtree scope (path ++ step) = true :=
+  (containsSubtree_correct scope _).mpr
+    (Scope.containsSubtree_append ((containsSubtree_correct scope _).mp granted) step)
+
+/-- Hash/depth deduplication cannot change the authorization of a child step. -/
+theorem equal_visit_child_admission (scope : VerifiedCore.Scope)
+    (p q : VerifiedCore.WalkPosition) (same : VerifiedCore.walkVisit scope p = VerifiedCore.walkVisit scope q)
+    (step : List Nat) : VerifiedCore.admitsPath scope (p.path ++ step) =
+      VerifiedCore.admitsPath scope (q.path ++ step) := by
+  rcases (equal_visit_classification scope p q same).2.2 with paths | ⟨hp, hq⟩
+  · rw [paths]
+  · have admitted (path : List Nat) (h : VerifiedCore.containsSubtree scope path = true) :
+        VerifiedCore.admitsPath scope (path ++ step) = true :=
+      (admitsPath_correct scope _).mpr (Scope.admitsPath_of_containsSubtree
+        ((containsSubtree_correct scope _).mp (runtime_grant_append scope path step h)))
+    rw [admitted p.path hp, admitted q.path hq]
+
+/-- Two equivalent parent visits yield equivalent child visits for identical
+content edges, preserving both their depth budget and positional scope quotient. -/
+theorem equal_visit_children (scope : VerifiedCore.Scope)
+    (p q : VerifiedCore.WalkPosition) (same : VerifiedCore.walkVisit scope p = VerifiedCore.walkVisit scope q)
+    (hash step : List Nat) (rp rq : Option (List Nat)) :
+    VerifiedCore.walkVisit scope ⟨rp, hash, p.path ++ step⟩ =
+      VerifiedCore.walkVisit scope ⟨rq, hash, q.path ++ step⟩ := by
+  obtain ⟨_, depth, paths | ⟨hp, hq⟩⟩ := equal_visit_classification scope p q same
+  · simp [VerifiedCore.walkVisit, paths]
+  · simp [VerifiedCore.walkVisit, runtime_grant_append scope p.path step hp,
+      runtime_grant_append scope q.path step hq, depth]
+
+/-- The payload permission of identical content is invariant under visit-key
+equivalence; exact-key grants do not get promoted into subtree grants. -/
+theorem equal_visit_payload_admission (scope : VerifiedCore.Scope)
+    (p q : VerifiedCore.WalkPosition) (same : VerifiedCore.walkVisit scope p = VerifiedCore.walkVisit scope q)
+    (node : VerifiedCore.WalkNode) :
+    VerifiedCore.admitsValue scope p.path (VerifiedCore.walkShape node) =
+      VerifiedCore.admitsValue scope q.path (VerifiedCore.walkShape node) := by
+  rcases (equal_visit_classification scope p q same).2.2 with paths | ⟨hp, hq⟩
+  · rw [paths]
+  · cases node with
+    | branch children => simp [VerifiedCore.walkShape, VerifiedCore.admitsValue, VerifiedCore.admitsKey, hp, hq]
+    | extension segment child => rfl
+    | leaf suffix =>
+      simp [VerifiedCore.walkShape, VerifiedCore.admitsValue, VerifiedCore.admitsKey,
+        runtime_grant_append scope p.path suffix hp, runtime_grant_append scope q.path suffix hq]
+
+/-- Equivalent visits cannot disagree on a leaf's absolute-depth validation. -/
+theorem equal_visit_leaf_depth (scope : VerifiedCore.Scope)
+    (p q : VerifiedCore.WalkPosition) (same : VerifiedCore.walkVisit scope p = VerifiedCore.walkVisit scope q)
+    (suffix : List Nat) : p.path.length + suffix.length = q.path.length + suffix.length := by
+  rw [(equal_visit_classification scope p q same).2.1]
 
 end Synchronicity.VerifiedCoreProofs
 

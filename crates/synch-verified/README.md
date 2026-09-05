@@ -117,6 +117,15 @@ by the reference/seen-set guard, and the native observation export preserves
 the expanded frontier through payload handling and acknowledgement. Soundness
 of those shortcuts across the complete execution is still to be established.
 
+Visit keys include absolute depth as well as hash, including inside grants.
+Without depth, a shallow visit could suppress validation of the same leaf at
+an invalid deeper position. Within grants, shared nodes deduplicate at the
+same depth; different depths require separate validation. Outside grants the
+full position is retained. Proofs show equivalent keys preserve child and
+payload authorization, child visit equivalence, and leaf-depth validation.
+This adds a depth factor to worst-case shared-DAG traversal, bounded by the
+canonical depth ceiling; existing cold-fetch/incremental read-cost tests pass.
+
 `Store` and `MemStore` use Lean's cache state and epoch guard. Rust owns the
 mutex and supplies byte keys, retained-root inputs, and storage effects; it
 does not update generations, decide retention, or implement certification.

@@ -232,8 +232,8 @@ pub type Entry = (Vec<u8>, Vec<u8>);
 #[derive(Debug)]
 pub struct MissingWalk {
     /// Lean owns the frontier, positional seen set, deferred retries and
-    /// extension-child obligations. Hash-only deduplication is used only
-    /// inside a complete prefix grant; spine visits retain their positions.
+    /// extension-child obligations. Hash-and-depth deduplication is used only
+    /// inside a complete prefix grant; spine visits retain their positions too.
     state: synch_verified::MissingWalk,
     /// The origin whose trie this is, when presence must carry provenance.
     ///
@@ -334,13 +334,11 @@ impl MissingWalk {
             // vouched for, and served on to every peer — marked by no GC pass,
             // reflected in no `entries` row.
             //
-            // It refuses a *position* no valid key reaches (a canonicality rule
-            // costing nothing honest) and is **not** a bound on how much a
-            // member can make a peer store: `seen` expands a node at whichever
-            // depth it is popped first, so one extra branch per rung makes the
-            // whole chain reachable at depth 1. Storage is bounded by the walk
-            // being deduplicated — one node per *distinct* node served, no
-            // leverage beyond what the member uploads (§12: `synch trust rm`).
+            // It refuses a position no valid key reaches, not the total number
+            // of nodes a member can publish. Deduplication retains depth even
+            // inside grants: deeper reuse can invalidate a leaf previously
+            // checked at a shallower position. Reads can therefore repeat at
+            // distinct depths, bounded by the canonical depth ceiling.
             // An `MptError`, so it fails that origin and not the relaying peer.
             // LEAN-MODEL: verified-walk-poll (VerifiedCoreProofs.walk_poll_selected)
             let position = self.state.poll().map_err(walk_error)?;

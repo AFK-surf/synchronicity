@@ -36,7 +36,7 @@ The model is positional, and so is Rust: `note_redacted` remembers a refusal
 by hash *and position*, `next_batch` treats a refused position as a boundary
 only when the node is absent — a held node, whatever a peer refused at some
 position, is expanded wherever the walk meets it (`Boundary`) — and
-`MissingWalk::seen` deduplicates expansions by hash inside the grant, where
+The executable Lean walk deduplicates expansions by hash and depth inside the grant, where
 `children_inside_grant_admitted` makes expansion position-independent, and by
 hash and position above it.
 -/

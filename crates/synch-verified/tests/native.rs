@@ -25,6 +25,48 @@ fn complete(walk: &mut synch_verified::MissingWalk) {
 }
 
 #[test]
+fn shared_leaf_must_be_validated_again_when_reached_deeper() {
+    use synch_verified::{ChildShape, WalkError, WalkNode};
+    let mut root_children = [None; 16];
+    root_children[1] = Some([2; 32]); // LIFO visits the shared leaf at depth 1 first.
+    root_children[0] = Some([3; 32]);
+    let mut nested_children = [None; 16];
+    nested_children[0] = Some([2; 32]);
+    let mut walk =
+        synch_verified::MissingWalk::new(&Scope::new(None, &[]), None, Some(&[1; 32]), 2);
+    walk.poll().unwrap().unwrap();
+    observe(
+        &mut walk,
+        WalkNode::Leaf(&[]),
+        WalkNode::Branch(&root_children),
+    );
+    assert_eq!(walk.poll().unwrap().unwrap().hash, [2; 32]);
+    observe(&mut walk, WalkNode::Leaf(&[]), WalkNode::Leaf(&[5])); // key depth 2 is legal.
+    assert_eq!(walk.poll().unwrap().unwrap().hash, [3; 32]);
+    observe(
+        &mut walk,
+        WalkNode::Leaf(&[]),
+        WalkNode::Branch(&nested_children),
+    );
+    let deeper = walk
+        .poll()
+        .unwrap()
+        .expect("different-depth visit cannot be deduplicated");
+    assert_eq!((deeper.hash, deeper.path), ([2; 32], vec![0, 0]));
+    assert_eq!(
+        walk.observe_present(
+            WalkNode::Leaf(&[]),
+            WalkNode::Leaf(&[5]),
+            ChildShape::Absent,
+            None,
+            true
+        ),
+        Err(WalkError::ValueDepth(3))
+    );
+    assert!(!walk.is_exhausted());
+}
+
+#[test]
 fn interrupted_read_remains_pending_across_poll_resume_and_batch_reset() {
     let mut walk =
         synch_verified::MissingWalk::new(&Scope::new(None, &[]), None, Some(&[1; 32]), 8);

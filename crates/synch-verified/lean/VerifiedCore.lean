@@ -196,9 +196,16 @@ structure WalkPosition where
 /-- Lexicographic visit order for persistent balanced sets. -/
 instance walkVisitOrd : Ord (List Nat × Option (List Nat)) := lexOrd
 
-/-- Deduplication is position-independent only below a complete prefix grant. -/
-def walkVisit (scope : Scope) (p : WalkPosition) : List Nat × Option (List Nat) :=
-  (p.hash, if containsSubtree scope p.path then none else some p.path)
+/-- Depth remains relevant to canonicality even inside a complete prefix grant. -/
+abbrev WalkVisit := Nat × (List Nat × Option (List Nat))
+
+/-- Lexicographic order including the canonicality budget at a position. -/
+instance walkDepthOrd : Ord WalkVisit := lexOrd
+
+/-- Only same-depth visits can share validation. Inside a grant the exact path
+does not affect authorization, but deeper reuse can violate the leaf-depth bound. -/
+def walkVisit (scope : Scope) (p : WalkPosition) : WalkVisit :=
+  (p.path.length, p.hash, if containsSubtree scope p.path then none else some p.path)
 
 /-- Pure result of examining a finite frontier. -/
 structure WalkPoll where
@@ -212,7 +219,7 @@ structure WalkPoll where
 /-- Skip only reference-equal or already expanded positions, checking the
 depth before either shortcut. Recursion is structural in the finite stack. -/
 def pollFrontier (scope : Scope) (maxDepth : Nat)
-    (seen : Std.TreeSet (List Nat × Option (List Nat))) : List WalkPosition → WalkPoll
+    (seen : Std.TreeSet WalkVisit) : List WalkPosition → WalkPoll
   | [] => ⟨[], none, none⟩
   | p :: rest =>
     if p.path.length > maxDepth then ⟨rest, none, some p.path.length⟩
@@ -229,7 +236,7 @@ structure MissingWalk where
   /-- Stack of pending visits. -/
   frontier : List WalkPosition := []
   /-- Positional/hash visits already expanded. -/
-  seen : Std.TreeSet (List Nat × Option (List Nat)) := {}
+  seen : Std.TreeSet WalkVisit := {}
   /-- Absent nodes or nodes awaiting their payload, in reverse encounter order. -/
   deferred : List WalkPosition := []
   /-- Extension children whose shape must be checked when they arrive. -/
