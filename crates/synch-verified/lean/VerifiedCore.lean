@@ -240,6 +240,14 @@ structure MissingWalk where
   current : Option WalkPosition := none
   /-- A canonicality failure is sticky, including across resume. -/
   fault : Option Nat := none
+  /-- Error interpretation: node depth, value depth, or non-branch extension child. -/
+  faultKind : UInt8 := 0
+  /-- Offending hash for a shape error. -/
+  faultHash : List Nat := []
+  /-- Observation output: no request, node request, or payload request. -/
+  requestKind : UInt8 := 0
+  /-- Hash of a requested payload. -/
+  requestHash : List Nat := []
 
 /-- Select a storage read, recording its deduplication key exactly once. -/
 def pollWalk (s : MissingWalk) : MissingWalk :=
@@ -296,6 +304,8 @@ def walkStatus (s : MissingWalk) : UInt8 :=
 /-- Export a current-position field, without exposing Lean object layout. -/
 @[export synch_lean_walk_field]
 def walkField (s : MissingWalk) (field : UInt8) : ByteArray :=
+  if field == 3 then bytesOf s.faultHash else
+  if field == 4 then bytesOf s.requestHash else
   match s.current with
   | none => ByteArray.empty
   | some p => bytesOf (if field == 0 then p.reference.getD [] else
@@ -347,14 +357,14 @@ def walkAsk (s : MissingWalk) (hash : ByteArray) : MissingWalk :=
 inductive WalkNode where
   | branch (children : List (Option (List Nat)))
   | extension (segment child : List Nat)
-  | leaf
+  | leaf (suffix : List Nat)
 
 /-- Every edge, in branch-slot order or the single extension direction. -/
 def childEdges : WalkNode → List (List Nat × List Nat)
   | .branch children => children.zipIdx.filterMap fun (child, slot) =>
       child.map fun hash => ([slot], hash)
   | .extension segment child => [(segment, child)]
-  | .leaf => []
+  | .leaf _ => []
 
 /-- Reference pruning is enabled only for matching structural shapes. -/
 def compatibleNodes : WalkNode → WalkNode → Bool
@@ -380,11 +390,91 @@ def walkNode (tag : UInt8) (children : Array ByteArray) (segment child : ByteArr
   if tag == 0 then .branch (children.toList.map fun h =>
     if h.isEmpty then none else some (pathOf h))
   else if tag == 1 then .extension (pathOf segment) (pathOf child)
-  else .leaf
+  else .leaf (pathOf segment)
 
 /-- Production expansion export consumes decoded structural nodes. -/
 @[export synch_lean_walk_expand]
 def walkExpand (s : MissingWalk) (reference node : WalkNode) : MissingWalk :=
   expandWalk s reference node
+
+/-- A decoded shape for the already shared authorization implementation. -/
+def walkShape : WalkNode → Shape
+  | .branch _ => .branch false
+  | .extension segment _ => .extension segment
+  | .leaf suffix => .leaf suffix
+
+/-- Record a canonicality failure so subsequent polling cannot claim completion. -/
+def failWalk (s : MissingWalk) (kind : UInt8) (depth : Nat) (hash : List Nat) : MissingWalk :=
+  { s with fault := some depth, faultKind := kind, faultHash := hash, requestKind := 0 }
+
+/-- An absent position is satisfied only by a refusal strictly above a full grant. -/
+def observeAbsent (s : MissingWalk) (redacted : Bool) : MissingWalk :=
+  if s.fault.isSome then s else
+  let s := { s with requestKind := 0 }
+  match s.current with
+  | none => s
+  | some p =>
+    if redacted && !containsSubtree s.scope p.path then s
+    else { deferWalk s with requestKind := 1 }
+
+/-- Missing authorized payloads defer every dependent node, even when the hash
+was already requested by a sibling in this batch. -/
+def observePayload (s : MissingWalk) (node : WalkNode)
+    (payload : Option (List Nat)) (present : Bool) : MissingWalk :=
+  match s.current with
+  | none => s
+  | some p => match payload with
+    | none => s
+    | some hash =>
+      if !present && admitsValue s.scope p.path (walkShape node) then
+        { deferWalk s with asked := s.asked.insert hash
+                           requestKind := if s.asked.contains hash then 0 else 2
+                           requestHash := hash }
+      else s
+
+/-- Validate a loaded node and its extension-child observation before expansion.
+Child observation tags: absent, branch, or other decoded shape. -/
+def validateWalk (s : MissingWalk) (node : WalkNode) (childShape : UInt8) : MissingWalk :=
+  match s.current with
+  | none => s
+  | some p =>
+    if s.branches.contains p.hash && (match node with
+      | .branch _ => false | .extension _ _ => true | .leaf _ => true) then
+      failWalk s 2 0 p.hash
+    else
+      let s := { s with branches := s.branches.erase p.hash }
+      match node with
+      | .extension _ child =>
+        if childShape == 0 then { s with branches := s.branches.insert child }
+        else if childShape == 1 then s else failWalk s 2 0 child
+      | .leaf suffix =>
+        let depth := p.path.length + suffix.length
+        if depth > s.maxDepth then failWalk s 1 depth p.hash else s
+      | .branch _ => s
+
+/-- The production response to a decoded node. Canonicality, expansion,
+authorization, request deduplication and retry bookkeeping are one Lean transition. -/
+def observePresent (s : MissingWalk) (reference node : WalkNode) (childShape : UInt8)
+    (payload : Option (List Nat)) (present : Bool) : MissingWalk :=
+  if s.fault.isSome then s else
+  let checked := validateWalk { s with requestKind := 0 } node childShape
+  if checked.fault.isSome then checked else
+    observePayload (expandWalk checked reference node) node payload present
+
+/-- Export a positional refusal observation. -/
+@[export synch_lean_walk_absent]
+def walkAbsent (s : MissingWalk) (redacted : Bool) : MissingWalk := observeAbsent s redacted
+
+/-- Export a decoded-node observation, with absent payload represented by empty bytes. -/
+@[export synch_lean_walk_present]
+def walkPresent (s : MissingWalk) (reference node : WalkNode) (childShape : UInt8)
+    (payload : ByteArray) (present : Bool) : MissingWalk :=
+  observePresent s reference node childShape
+    (if payload.isEmpty then none else some (pathOf payload)) present
+
+/-- Scalar diagnostics/output tag, with all decisions made by the transitions. -/
+@[export synch_lean_walk_result]
+def walkResult (s : MissingWalk) (field : UInt8) : UInt8 :=
+  if field == 0 then s.faultKind else s.requestKind
 
 end VerifiedCore

@@ -20,6 +20,15 @@ impl From<&[u8]> for Slice {
 }
 
 unsafe extern "C" {
+    fn synch_adapter_walk_absent(walk: *mut c_void, redacted: u8) -> *mut c_void;
+    fn synch_adapter_walk_present(
+        walk: *mut c_void,
+        reference: *mut c_void,
+        node: *mut c_void,
+        child_shape: u8,
+        payload: Slice,
+        present: u8,
+    ) -> *mut c_void;
     fn synch_adapter_walk_node(
         tag: u8,
         children: *const Slice,
@@ -157,6 +166,22 @@ pub struct WalkPosition {
 #[derive(Debug)]
 pub struct MissingWalk(Arc<Handle>);
 
+/// Canonicality diagnostic emitted by Lean; the walk remains failed afterward.
+#[derive(Debug, PartialEq, Eq)]
+pub enum WalkError {
+    NodeDepth(u64),
+    ValueDepth(u64),
+    NotBranch([u8; 32]),
+}
+
+/// Storage observation for an extension child, without a canonicality decision.
+#[derive(Debug, Clone, Copy)]
+pub enum ChildShape {
+    Absent,
+    Branch,
+    Other,
+}
+
 /// Decoded node structure. Hashes and paths are copied without interpreting edges.
 #[derive(Debug)]
 pub enum WalkNode<'a> {
@@ -165,7 +190,7 @@ pub enum WalkNode<'a> {
         prefix: &'a [u8],
         child: &'a [u8; 32],
     },
-    Leaf,
+    Leaf(&'a [u8]),
 }
 
 impl WalkNode<'_> {
@@ -182,7 +207,7 @@ impl WalkNode<'_> {
                 &[][..],
             ),
             Self::Extension { prefix, child } => (1, Vec::new(), *prefix, child.as_slice()),
-            Self::Leaf => (2, Vec::new(), &[][..], &[][..]),
+            Self::Leaf(suffix) => (2, Vec::new(), *suffix, &[][..]),
         };
         // SAFETY: all fields remain live during this copying call; the result
         // is an owned MT Lean object and is released by Handle.
@@ -200,6 +225,70 @@ impl WalkNode<'_> {
 }
 
 impl MissingWalk {
+    /// Report absence/refusal. Lean decides whether to request and defer the node.
+    pub fn observe_absent(&mut self, redacted: bool) -> Result<bool, WalkError> {
+        enter();
+        // SAFETY: the adapter consumes a fresh reference to the live MT state.
+        let ptr = unsafe { synch_adapter_walk_absent(self.0 .0.as_ptr(), redacted.into()) };
+        self.0 = Arc::new(Handle(
+            NonNull::new(ptr).expect("Lean walk allocation failed"),
+        ));
+        self.check_error()?;
+        Ok(self.query(6, &[]) == 1)
+    }
+
+    /// Apply decoded storage facts. The optional result is a payload to request.
+    pub fn observe_present(
+        &mut self,
+        reference: WalkNode<'_>,
+        node: WalkNode<'_>,
+        child: ChildShape,
+        payload: Option<&[u8; 32]>,
+        present: bool,
+    ) -> Result<Option<[u8; 32]>, WalkError> {
+        let reference = reference.native();
+        let node = node.native();
+        let child = match child {
+            ChildShape::Absent => 0,
+            ChildShape::Branch => 1,
+            ChildShape::Other => 2,
+        };
+        // SAFETY: borrowed handles and payload bytes remain live during this
+        // copying call; the replacement owns an independent MT reference.
+        let ptr = unsafe {
+            synch_adapter_walk_present(
+                self.0 .0.as_ptr(),
+                reference.0.as_ptr(),
+                node.0.as_ptr(),
+                child,
+                payload.map_or(&[][..], |h| h.as_slice()).into(),
+                present.into(),
+            )
+        };
+        self.0 = Arc::new(Handle(
+            NonNull::new(ptr).expect("Lean walk allocation failed"),
+        ));
+        self.check_error()?;
+        match self.query(6, &[]) {
+            0 => Ok(None),
+            2 => Ok(Some(
+                self.field(4).try_into().expect("Lean payload hash width"),
+            )),
+            _ => panic!("invalid Lean present observation result"),
+        }
+    }
+
+    fn check_error(&self) -> Result<(), WalkError> {
+        if self.query(1, &[]) != 2 {
+            return Ok(());
+        }
+        Err(match self.query(5, &[]) {
+            0 => WalkError::NodeDepth(self.query(2, &[])),
+            1 => WalkError::ValueDepth(self.query(2, &[])),
+            2 => WalkError::NotBranch(self.field(3).try_into().expect("Lean fault hash width")),
+            _ => panic!("invalid Lean walk error tag"),
+        })
+    }
     /// Pair reference edges and schedule admitted children in the Lean implementation.
     pub fn expand(&mut self, reference: WalkNode<'_>, node: WalkNode<'_>) {
         let reference = reference.native();
@@ -274,9 +363,10 @@ impl MissingWalk {
         }
     }
 
-    /// Select the next read; an error is its invalid depth and remains sticky.
-    pub fn poll(&mut self) -> Result<Option<WalkPosition>, u64> {
+    /// Select the next read; canonicality errors remain sticky across retries.
+    pub fn poll(&mut self) -> Result<Option<WalkPosition>, WalkError> {
         self.update(0, &[], &[], &[]);
+        self.check_error()?;
         match self.query(1, &[]) {
             0 => Ok(None),
             1 => {
@@ -291,7 +381,6 @@ impl MissingWalk {
                     path: self.field(2),
                 }))
             }
-            2 => Err(self.query(2, &[])),
             _ => panic!("invalid Lean walk status"),
         }
     }

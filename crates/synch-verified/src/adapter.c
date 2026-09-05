@@ -38,6 +38,9 @@ extern uint8_t synch_lean_walk_unasked(lean_object *, lean_object *);
 extern lean_object *synch_lean_walk_ask(lean_object *, lean_object *);
 extern lean_object *synch_lean_walk_node(uint8_t, lean_object *, lean_object *, lean_object *);
 extern lean_object *synch_lean_walk_expand(lean_object *, lean_object *, lean_object *);
+extern lean_object *synch_lean_walk_absent(lean_object *, uint8_t);
+extern lean_object *synch_lean_walk_present(lean_object *, lean_object *, lean_object *, uint8_t, lean_object *, uint8_t);
+extern uint8_t synch_lean_walk_result(lean_object *, uint8_t);
 
 /* Matches the private Rust repr(C) slice. A zero length never dereferences ptr. */
 typedef struct { const uint8_t *ptr; size_t len; } synch_slice;
@@ -94,6 +97,23 @@ void *synch_adapter_walk_expand(void *walk, void *reference, void *node) {
     return s;
 }
 
+void *synch_adapter_walk_absent(void *walk, uint8_t redacted) {
+    lean_inc((lean_object *)walk);
+    lean_object *s = synch_lean_walk_absent(walk, redacted);
+    lean_mark_mt(s);
+    return s;
+}
+
+void *synch_adapter_walk_present(void *walk, void *reference, void *node,
+                                uint8_t child_shape, synch_slice payload, uint8_t present) {
+    lean_inc((lean_object *)walk);
+    lean_inc((lean_object *)reference);
+    lean_inc((lean_object *)node);
+    lean_object *s = synch_lean_walk_present(walk, reference, node, child_shape, bytes(payload), present);
+    lean_mark_mt(s);
+    return s;
+}
+
 void *synch_adapter_walk_new(void *scope, synch_slice reference, synch_slice root, uint64_t max_depth) {
     lean_inc((lean_object *)scope);
     lean_object *s = synch_lean_walk_new((lean_object *)scope, bytes(reference), bytes(root), max_depth);
@@ -110,6 +130,8 @@ uint64_t synch_adapter_walk_query(void *walk, uint8_t operation, synch_slice has
     case 2: return synch_lean_walk_depth(s);
     case 3: return synch_lean_walk_requires_branch(s, bytes(hash));
     case 4: return synch_lean_walk_unasked(s, bytes(hash));
+    case 5: return synch_lean_walk_result(s, 0);
+    case 6: return synch_lean_walk_result(s, 1);
     default: lean_dec(s); return 0;
     }
 }

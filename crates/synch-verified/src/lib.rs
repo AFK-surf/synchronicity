@@ -2,6 +2,6 @@
 
 mod native;
 pub use native::{
-    group_count, settle_size, CertificateCache, MissingWalk, Scope, Settlement, Shape, WalkNode,
-    WalkPosition,
+    group_count, settle_size, CertificateCache, ChildShape, MissingWalk, Scope, Settlement, Shape,
+    WalkError, WalkNode, WalkPosition,
 };

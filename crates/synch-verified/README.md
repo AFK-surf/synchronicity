@@ -90,6 +90,15 @@ show pairing preserves every target edge, invents none, and any retained
 reference follows the exact same step. Expansion retains the parent across all
 siblings. There is no production Rust child-pairing implementation.
 
+The loaded-node observation transition also validates extension-child shapes
+and absolute leaf depth before expansion, then handles payload authorization,
+deduplication and deferral. The absent-node transition decides whether a
+positional refusal satisfies the walk. Rust only supplies decoded shapes,
+optional payload hashes and storage observations. Shape and depth failures are
+sticky; neither polling, resuming nor later observations can clear them.
+Proofs cover refusals inside grants, refused spines, shared-payload deferral,
+authorization, leaf depth, pending extension obligations and fault persistence.
+
 `Store` and `MemStore` use Lean's cache state and epoch guard. Rust owns the
 mutex and supplies byte keys, retained-root inputs, and storage effects; it
 does not update generations, decide retention, or implement certification.
@@ -142,10 +151,11 @@ The end state is executable Lean core logic with proofs about that same Lean,
 not a manually reviewed correspondence between Rust and an abstract model.
 The following are still required:
 
-- Finish moving trie canonicality and payload/boundary decisions and
-  completeness derivation into Lean. Scheduling and child/reference expansion
-  are Lean, but Rust still interprets other decoded fields and storage results;
-  the cache still trusts a completed walk's validity.
+- Prove completeness of the executable trie walk across its storage-observation
+  protocol, including interruption/error handling and reference validity. Its
+  scheduling, child pairing, walk canonicality and payload/boundary decisions
+  are now Lean; the cache still trusts a completed walk's validity. Other trie
+  operations and ingestion-time canonical encoding checks also remain Rust.
 - Move CAS bitmap settlement, accounting, GC and promotion decisions into Lean.
 - Move ingestion and materialization sequencing into Lean-generated effect
   plans; discharge the flush-before-advertise and publication invariants over

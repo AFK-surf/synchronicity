@@ -422,6 +422,107 @@ theorem expand_preserves_current (s : VerifiedCore.MissingWalk)
     simp only [List.foldl_cons]
     rw [ih, enqueue_preserves_current]
 
+/-- Refusals cannot hide an absent node inside a granted subtree. -/
+@[rust_justifies "verified-walk-absence"]
+theorem absent_inside_grant (s : VerifiedCore.MissingWalk) (p : VerifiedCore.WalkPosition)
+    (current : s.current = some p) (healthy : s.fault = none)
+    (granted : VerifiedCore.containsSubtree s.scope p.path = true) (redacted : Bool) :
+    (VerifiedCore.walkAbsent s redacted).requestKind = 1 ∧
+    (VerifiedCore.walkAbsent s redacted).deferred = p :: s.deferred := by
+  simp [VerifiedCore.walkAbsent, VerifiedCore.observeAbsent, VerifiedCore.deferWalk,
+    current, healthy, granted]
+
+/-- An absent refused spine position is satisfied without requesting or deferring it. -/
+theorem absent_refused_spine (s : VerifiedCore.MissingWalk) (p : VerifiedCore.WalkPosition)
+    (current : s.current = some p) (healthy : s.fault = none)
+    (spine : VerifiedCore.containsSubtree s.scope p.path = false) :
+    (VerifiedCore.walkAbsent s true).requestKind = 0 ∧
+    (VerifiedCore.walkAbsent s true).deferred = s.deferred := by
+  simp [VerifiedCore.walkAbsent, VerifiedCore.observeAbsent, current, healthy, spine]
+
+/-- Every dependent node is deferred, independently of batch request deduplication. -/
+theorem payload_missing_defers (s : VerifiedCore.MissingWalk) (p : VerifiedCore.WalkPosition)
+    (node : VerifiedCore.WalkNode) (hash : List Nat) (current : s.current = some p)
+    (authorized : VerifiedCore.admitsValue s.scope p.path (VerifiedCore.walkShape node) = true) :
+    (VerifiedCore.observePayload s node (some hash) false).deferred = p :: s.deferred ∧
+    (VerifiedCore.observePayload s node (some hash) false).asked.contains hash = true := by
+  simp [VerifiedCore.observePayload, VerifiedCore.deferWalk, current, authorized]
+
+/-- Shared payloads are requested once without losing any dependent node's retry. -/
+theorem payload_deduplicated_retry (s : VerifiedCore.MissingWalk) (p : VerifiedCore.WalkPosition)
+    (node : VerifiedCore.WalkNode) (hash : List Nat) (current : s.current = some p)
+    (authorized : VerifiedCore.admitsValue s.scope p.path (VerifiedCore.walkShape node) = true)
+    (asked : s.asked.contains hash = true) :
+    (VerifiedCore.observePayload s node (some hash) false).requestKind = 0 ∧
+    (VerifiedCore.observePayload s node (some hash) false).deferred = p :: s.deferred := by
+  simp [VerifiedCore.observePayload, VerifiedCore.deferWalk, current, authorized, asked]
+
+/-- An already held payload introduces no outstanding work. -/
+theorem payload_present_unchanged (s : VerifiedCore.MissingWalk)
+    (node : VerifiedCore.WalkNode) (hash : Option (List Nat)) :
+    VerifiedCore.observePayload s node hash true = s := by
+  cases current : s.current <;> cases hash <;> simp [VerifiedCore.observePayload, current]
+
+/-- Payloads outside the granted keyspace introduce no request or retry. -/
+theorem payload_denied_unchanged (s : VerifiedCore.MissingWalk) (p : VerifiedCore.WalkPosition)
+    (node : VerifiedCore.WalkNode) (hash : List Nat) (current : s.current = some p)
+    (denied : VerifiedCore.admitsValue s.scope p.path (VerifiedCore.walkShape node) = false)
+    (present : Bool) : VerifiedCore.observePayload s node (some hash) present = s := by
+  simp [VerifiedCore.observePayload, current, denied]
+
+/-- Leaf runs are charged to their absolute key depth using unbounded arithmetic. -/
+theorem validate_leaf_depth (s : VerifiedCore.MissingWalk) (p : VerifiedCore.WalkPosition)
+    (suffix : List Nat) (current : s.current = some p)
+    (noObligation : s.branches.contains p.hash = false)
+    (deep : s.maxDepth < p.path.length + suffix.length) (childShape : UInt8) :
+    (VerifiedCore.validateWalk s (.leaf suffix) childShape).fault =
+      some (p.path.length + suffix.length) ∧
+    (VerifiedCore.validateWalk s (.leaf suffix) childShape).faultKind = 1 := by
+  simp [VerifiedCore.validateWalk, VerifiedCore.failWalk, current, noObligation, deep]
+
+/-- An absent extension child carries its shape obligation into later batches. -/
+theorem validate_extension_obligation (s : VerifiedCore.MissingWalk)
+    (p : VerifiedCore.WalkPosition) (segment child : List Nat)
+    (current : s.current = some p) (noObligation : s.branches.contains p.hash = false) :
+    (VerifiedCore.validateWalk s (.extension segment child) 0).branches.contains child = true := by
+  simp [VerifiedCore.validateWalk, current, noObligation]
+
+/-- A child already held as a non-branch is rejected even if it was visited earlier. -/
+theorem validate_bad_extension_child (s : VerifiedCore.MissingWalk)
+    (p : VerifiedCore.WalkPosition) (segment child : List Nat)
+    (current : s.current = some p) (noObligation : s.branches.contains p.hash = false) :
+    (VerifiedCore.validateWalk s (.extension segment child) 2).fault = some 0 ∧
+    (VerifiedCore.validateWalk s (.extension segment child) 2).faultHash = child := by
+  simp [VerifiedCore.validateWalk, VerifiedCore.failWalk, current, noObligation]
+
+/-- A deferred extension child cannot later arrive as a leaf. -/
+theorem validate_required_branch (s : VerifiedCore.MissingWalk)
+    (p : VerifiedCore.WalkPosition) (suffix : List Nat) (childShape : UInt8)
+    (current : s.current = some p) (required : s.branches.contains p.hash = true) :
+    (VerifiedCore.validateWalk s (.leaf suffix) childShape).fault = some 0 ∧
+    (VerifiedCore.validateWalk s (.leaf suffix) childShape).faultHash = p.hash := by
+  simp [VerifiedCore.validateWalk, VerifiedCore.failWalk, current, required]
+
+/-- A rejected node cannot expand children or request payloads. -/
+theorem present_rejected_before_expansion (s : VerifiedCore.MissingWalk)
+    (reference node : VerifiedCore.WalkNode) (childShape : UInt8)
+    (payload : Option (List Nat)) (present : Bool) (healthy : s.fault = none)
+    (rejected : (VerifiedCore.validateWalk { s with requestKind := 0 } node childShape).fault.isSome = true) :
+    VerifiedCore.observePresent s reference node childShape payload present =
+      VerifiedCore.validateWalk { s with requestKind := 0 } node childShape := by
+  unfold VerifiedCore.observePresent
+  rw [if_neg (by simp [healthy])]
+  dsimp only
+  rw [if_pos rejected]
+
+/-- Neither storage observation can resurrect a faulted walk. -/
+theorem observation_fault_sticky (s : VerifiedCore.MissingWalk)
+    (reference node : VerifiedCore.WalkNode) (childShape : UInt8)
+    (payload : Option (List Nat)) (present redacted : Bool) (fault : s.fault.isSome = true) :
+    VerifiedCore.observePresent s reference node childShape payload present = s ∧
+    VerifiedCore.observeAbsent s redacted = s := by
+  simp [VerifiedCore.observePresent, VerifiedCore.observeAbsent, fault]
+
 end Synchronicity.VerifiedCoreProofs
 
 #lint

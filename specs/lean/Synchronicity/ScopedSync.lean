@@ -306,7 +306,6 @@ skip on a failed load.  An absent hash refused at this position is satisfied
 rather than missing, but only above the grant.  A held node is never a
 boundary: a node refused at one position may be held from another it shares
 by structure, and holding it is what the walk is establishing. -/
-@[rust_impl "mpt-walk-boundary"]
 def Boundary (s : Scope) (st : Store) (path : Path) (x : Hash) : Prop :=
   x ∉ st.held ∧ ¬ s.ContainsSubtree path ∧ (path, x) ∈ st.redacted
 

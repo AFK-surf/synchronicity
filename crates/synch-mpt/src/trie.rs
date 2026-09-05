@@ -235,12 +235,6 @@ pub struct MissingWalk {
     /// extension-child obligations. Hash-only deduplication is used only
     /// inside a complete prefix grant; spine visits retain their positions.
     state: synch_verified::MissingWalk,
-    /// The part of the keyspace this walk may descend into (§5.5).
-    ///
-    /// A scoped walk stops at the boundary rather than asking for what it
-    /// would be refused — the serving peer applies the same predicate, so an
-    /// out-of-scope request is a probe, never a race.
-    scope: Scope,
     /// The origin whose trie this is, when presence must carry provenance.
     ///
     /// `Some` for a confined origin's root: a node counts as present only if
@@ -299,11 +293,7 @@ impl MissingWalk {
             root.as_ref().map(Hash::as_bytes),
             MAX_DEPTH_NIBBLES as u64,
         );
-        MissingWalk {
-            state,
-            scope,
-            owner,
-        }
+        MissingWalk { state, owner }
     }
 
     /// True once the walk has covered everything and nothing is outstanding.
@@ -353,12 +343,7 @@ impl MissingWalk {
             // leverage beyond what the member uploads (§12: `synch trust rm`).
             // An `MptError`, so it fails that origin and not the relaying peer.
             // LEAN-MODEL: verified-walk-poll (VerifiedCoreProofs.walk_poll_selected)
-            let position = self.state.poll().map_err(|depth| {
-                MptError::NonCanonical(format!(
-                    "a trie node sits at nibble depth {depth}, past the \
-                     {MAX_DEPTH_NIBBLES} any valid key reaches",
-                ))
-            })?;
+            let position = self.state.poll().map_err(walk_error)?;
             let Some(position) = position else { break };
             let reference = position.reference.map(Hash);
             let hash = Hash(position.hash);
@@ -387,16 +372,11 @@ impl MissingWalk {
                 // subtree it never fetched, and Lean's edge pairing, which
                 // follows held reference nodes, would prune against that
                 // subtree under the next root.
-                // LEAN-MODEL: mpt-walk-boundary (ScopedSync.Boundary)
-                // `ScopedSync.Boundary`: an absent hash refused at this
-                // position is satisfied, not missing, only above the grant.
-                if !self.scope.contains_subtree(&path)
-                    && trie.is_redacted_raw(&hash, Some(&path))?
-                {
-                    continue;
+                let redacted = trie.is_redacted_raw(&hash, Some(&path))?;
+                // LEAN-MODEL: verified-walk-absence (VerifiedCoreProofs.absent_inside_grant)
+                if self.state.observe_absent(redacted).map_err(walk_error)? {
+                    missing.nodes.push((path, hash));
                 }
-                missing.nodes.push((path.clone(), hash));
-                self.state.defer();
                 continue;
             };
             let node = TrieNode::decode(&data)?;
@@ -408,31 +388,20 @@ impl MissingWalk {
             // rely on not happening — making every peer's incremental sync cost
             // the whole tree. An `MptError`, so it fails its own origin and no
             // other (§12): the relaying peer served exactly what it was asked.
-            if self.state.take_branch_requirement(hash.as_bytes())
-                && !matches!(node, TrieNode::Branch { .. })
-            {
-                return Err(MptError::NonCanonical(format!(
-                    "node {hash} sits under an extension but is not a branch"
-                )));
-            }
-            if let TrieNode::Ext { child, .. } = &node {
+            let child_shape = if let TrieNode::Ext { child, .. } = &node {
                 // Checked now if the child is already here: a DAG means it may
                 // have been visited under another parent, and `seen` would keep
                 // it from being revisited.
                 match trie.load_raw(child)? {
-                    Some(bytes)
-                        if !matches!(TrieNode::decode(&bytes)?, TrieNode::Branch { .. }) =>
-                    {
-                        return Err(MptError::NonCanonical(format!(
-                            "node {child} sits under an extension but is not a branch"
-                        )));
-                    }
-                    Some(_) => {}
-                    None => {
-                        self.state.require_branch(child.as_bytes());
-                    }
+                    Some(bytes) => match TrieNode::decode(&bytes)? {
+                        TrieNode::Branch { .. } => synch_verified::ChildShape::Branch,
+                        _ => synch_verified::ChildShape::Other,
+                    },
+                    None => synch_verified::ChildShape::Absent,
                 }
-            }
+            } else {
+                synch_verified::ChildShape::Absent
+            };
             let reference_node = match reference {
                 Some(reference) => trie
                     .load_raw(&reference)?
@@ -440,23 +409,8 @@ impl MissingWalk {
                     .transpose()?,
                 None => None,
             };
-            // A leaf's value sits at the end of its own run, which is the
-            // position a key would have to be that long to name, and nothing
-            // below charges this depth. Checked here or not at all.
-            if let TrieNode::Leaf { key_rest, .. } = &node {
-                let depth = path.len().saturating_add(key_rest.len());
-                if depth > MAX_DEPTH_NIBBLES {
-                    return Err(MptError::NonCanonical(format!(
-                        "a trie value sits at nibble depth {depth}, past the \
-                         {MAX_DEPTH_NIBBLES} any valid key reaches"
-                    )));
-                }
-            }
             let reference_fields = WalkFields::from(reference_node.as_ref());
             let node_fields = WalkFields::from(Some(&node));
-            // LEAN-MODEL: verified-walk-pairing (VerifiedCoreProofs.paired_reference_same_step)
-            self.state
-                .expand(reference_fields.native(), node_fields.native());
             // A node whose out-of-line values have not arrived is not done
             // with, so it is deferred like a node that never loaded. Reporting
             // the value once and moving on would have the walk claim exhaustion
@@ -464,20 +418,28 @@ impl MissingWalk {
             // deferred and `seen` never revisits it — and the §5.2 abandonment
             // counter would sit at one while `note_complete` vouched for the
             // root.
-            let mut awaiting_values = false;
-            for value_hash in node.value_hashes() {
-                if self.scope.admits_value(&path, &node) && !trie.has_value_raw(&value_hash)? {
-                    // Deferred whether or not already asked this batch: another
-                    // node reporting the same payload says nothing about *this*
-                    // node being done with.
-                    awaiting_values = true;
-                    if self.state.ask(value_hash.as_bytes()) {
-                        missing.values.push((path.clone(), value_hash));
-                    }
-                }
-            }
-            if awaiting_values {
-                self.state.defer();
+            let payload = match &node {
+                TrieNode::Branch { value, .. } => value.as_ref().and_then(ValueRef::out_of_line),
+                TrieNode::Leaf { value, .. } => value.out_of_line(),
+                TrieNode::Ext { .. } => None,
+            };
+            let present = match payload {
+                Some(hash) => trie.has_value_raw(&hash)?,
+                None => false,
+            };
+            // LEAN-MODEL: verified-walk-pairing (VerifiedCoreProofs.paired_reference_same_step)
+            if let Some(value) = self
+                .state
+                .observe_present(
+                    reference_fields.native(),
+                    node_fields.native(),
+                    child_shape,
+                    payload.as_ref().map(Hash::as_bytes),
+                    present,
+                )
+                .map_err(walk_error)?
+            {
+                missing.values.push((path, Hash(value)));
             }
         }
         Ok(missing)
@@ -491,7 +453,7 @@ impl MissingWalk {
 enum WalkFields<'a> {
     Branch([Option<[u8; 32]>; 16]),
     Extension(&'a [u8], &'a [u8; 32]),
-    Leaf,
+    Leaf(&'a [u8]),
 }
 
 impl<'a> From<Option<&'a TrieNode>> for WalkFields<'a> {
@@ -503,7 +465,8 @@ impl<'a> From<Option<&'a TrieNode>> for WalkFields<'a> {
             Some(TrieNode::Ext { prefix, child }) => {
                 Self::Extension(prefix.as_slice(), child.as_bytes())
             }
-            Some(TrieNode::Leaf { .. }) | None => Self::Leaf,
+            Some(TrieNode::Leaf { key_rest, .. }) => Self::Leaf(key_rest.as_slice()),
+            None => Self::Leaf(&[]),
         }
     }
 }
@@ -513,9 +476,21 @@ impl WalkFields<'_> {
         match self {
             Self::Branch(children) => synch_verified::WalkNode::Branch(children),
             Self::Extension(prefix, child) => synch_verified::WalkNode::Extension { prefix, child },
-            Self::Leaf => synch_verified::WalkNode::Leaf,
+            Self::Leaf(suffix) => synch_verified::WalkNode::Leaf(suffix),
         }
     }
+}
+
+/// Render Lean's diagnostic without reimplementing the decision that produced it.
+fn walk_error(error: synch_verified::WalkError) -> MptError {
+    MptError::NonCanonical(match error {
+        synch_verified::WalkError::NodeDepth(depth) => format!(
+            "a trie node sits at nibble depth {depth}, past the {MAX_DEPTH_NIBBLES} any valid key reaches"),
+        synch_verified::WalkError::ValueDepth(depth) => format!(
+            "a trie value sits at nibble depth {depth}, past the {MAX_DEPTH_NIBBLES} any valid key reaches"),
+        synch_verified::WalkError::NotBranch(hash) => format!(
+            "node {} sits under an extension but is not a branch", Hash(hash)),
+    })
 }
 
 /// Everything reachable from a root, for mark-and-sweep GC (§5.4).

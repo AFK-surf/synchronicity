@@ -2,6 +2,135 @@ use proptest::prelude::*;
 use synch_verified::{group_count, settle_size, CertificateCache, Scope, Settlement, Shape};
 
 #[test]
+fn observations_refuse_only_absent_spines_not_granted_subtrees() {
+    for (scope, request) in [
+        (Scope::new(None, &[]), true),
+        (Scope::new(Some(&[vec![1, 2]]), &[]), false),
+    ] {
+        let mut walk = synch_verified::MissingWalk::new(&scope, None, Some(&[1; 32]), 8);
+        walk.poll().unwrap().unwrap();
+        assert_eq!(walk.observe_absent(true).unwrap(), request);
+        assert_eq!(walk.is_exhausted(), !request);
+        if request {
+            walk.resume();
+            walk.poll().unwrap().unwrap();
+            assert!(walk.observe_absent(false).unwrap());
+        }
+    }
+}
+
+#[test]
+fn observations_defer_every_node_waiting_for_a_shared_payload() {
+    use synch_verified::{ChildShape, WalkNode};
+    let mut children = [None; 16];
+    children[0] = Some([2; 32]);
+    children[1] = Some([3; 32]);
+    let mut walk =
+        synch_verified::MissingWalk::new(&Scope::new(None, &[]), None, Some(&[1; 32]), 8);
+    walk.poll().unwrap().unwrap();
+    assert!(walk
+        .observe_present(
+            WalkNode::Leaf(&[]),
+            WalkNode::Branch(&children),
+            ChildShape::Absent,
+            None,
+            false
+        )
+        .unwrap()
+        .is_none());
+    for expected in [Some([9; 32]), None] {
+        walk.poll().unwrap().unwrap();
+        assert_eq!(
+            walk.observe_present(
+                WalkNode::Leaf(&[]),
+                WalkNode::Leaf(&[]),
+                ChildShape::Absent,
+                Some(&[9; 32]),
+                false
+            )
+            .unwrap(),
+            expected
+        );
+    }
+    assert!(walk.poll().unwrap().is_none());
+    assert!(!walk.is_exhausted());
+    walk.start_batch();
+    walk.resume();
+    for _ in 0..2 {
+        walk.poll().unwrap().unwrap();
+        assert!(walk
+            .observe_present(
+                WalkNode::Leaf(&[]),
+                WalkNode::Leaf(&[]),
+                ChildShape::Absent,
+                Some(&[9; 32]),
+                true
+            )
+            .unwrap()
+            .is_none());
+    }
+    assert!(walk.poll().unwrap().is_none());
+    assert!(walk.is_exhausted());
+}
+
+#[test]
+fn observations_validate_leaf_depth_and_deferred_extension_children() {
+    use synch_verified::{ChildShape, WalkError, WalkNode};
+    let mut deep =
+        synch_verified::MissingWalk::new(&Scope::new(None, &[]), None, Some(&[1; 32]), 1);
+    deep.poll().unwrap().unwrap();
+    assert_eq!(
+        deep.observe_present(
+            WalkNode::Leaf(&[]),
+            WalkNode::Leaf(&[1, 2]),
+            ChildShape::Absent,
+            None,
+            true
+        ),
+        Err(WalkError::ValueDepth(2))
+    );
+    deep.resume();
+    assert_eq!(deep.poll().unwrap_err(), WalkError::ValueDepth(2));
+    assert!(!deep.is_exhausted());
+
+    let mut walk =
+        synch_verified::MissingWalk::new(&Scope::new(None, &[]), None, Some(&[1; 32]), 8);
+    walk.poll().unwrap().unwrap();
+    walk.observe_present(
+        WalkNode::Leaf(&[]),
+        WalkNode::Extension {
+            prefix: &[0],
+            child: &[2; 32],
+        },
+        ChildShape::Absent,
+        None,
+        false,
+    )
+    .unwrap();
+    walk.poll().unwrap().unwrap();
+    assert!(walk.observe_absent(false).unwrap());
+    walk.resume();
+    walk.poll().unwrap().unwrap();
+    assert_eq!(
+        walk.observe_present(
+            WalkNode::Leaf(&[]),
+            WalkNode::Leaf(&[]),
+            ChildShape::Absent,
+            None,
+            true
+        ),
+        Err(WalkError::NotBranch([2; 32]))
+    );
+    walk.resume();
+    assert_eq!(walk.poll().unwrap_err(), WalkError::NotBranch([2; 32]));
+    assert_eq!(
+        walk.observe_absent(true),
+        Err(WalkError::NotBranch([2; 32]))
+    );
+    assert!(!walk.is_exhausted());
+}
+
+#[test]
 fn walk_pairs_branch_slots_without_dropping_unmatched_children() {
     use synch_verified::WalkNode;
     let mut children = [None; 16];
@@ -103,10 +232,16 @@ fn walk_checks_depth_before_reference_pruning_and_faults_stick() {
         synch_verified::MissingWalk::new(&Scope::new(None, &[]), None, Some(&[1; 32]), 1);
     walk.poll().unwrap().unwrap();
     walk.enqueue(Some(&[2; 32]), &[2; 32], &[0, 1]);
-    assert_eq!(walk.poll().unwrap_err(), 2);
+    assert_eq!(
+        walk.poll().unwrap_err(),
+        synch_verified::WalkError::NodeDepth(2)
+    );
     walk.resume();
     walk.start_batch();
-    assert_eq!(walk.poll().unwrap_err(), 2);
+    assert_eq!(
+        walk.poll().unwrap_err(),
+        synch_verified::WalkError::NodeDepth(2)
+    );
     assert!(!walk.is_exhausted());
 }
 
