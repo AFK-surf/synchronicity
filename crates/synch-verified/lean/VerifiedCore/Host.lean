@@ -69,6 +69,8 @@ structure Order where
 structure Exclusion where
   relation : String
   equals : Fields
+  /-- Base-column to excluded-column equality, evaluated for each candidate row. -/
+  keys : List (String × String) := []
   deriving BEq
 
 /-- Inner equality join from the base relation to another raw relation.
@@ -94,7 +96,8 @@ inductive Storage : Type → Type where
   | upsert (tx : Transaction) (relation : String) (values : Fields)
       (conflictColumns updateColumns : List String) : Storage (Reply Unit)
   | deleteRows (tx : Transaction) (relation : String)
-      (equals : Fields) (blockers : List Exclusion := []) : Storage (Reply Nat)
+      (equals : Fields) (blockers : List Exclusion := [])
+      (atMost : Fields := []) : Storage (Reply Nat)
   | readBytes (space : String) (key : ByteArray) : Storage (Reply (Option ByteArray))
   /-- Bounded access to an immutable command input, borrowed for this run. -/
   | readInput (handle offset count : UInt64) : Storage (Reply ByteArray)

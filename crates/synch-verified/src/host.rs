@@ -34,6 +34,8 @@ pub struct Order {
 pub struct Exclusion {
     pub relation: String,
     pub equals: Fields,
+    /// Base-column to excluded-column SQL equality, per candidate row.
+    pub keys: Vec<(String, String)>,
 }
 
 /// Inner equality join from base-table columns to the named relation's columns.
@@ -118,13 +120,16 @@ pub trait Storage {
         update_columns: &[String],
     ) -> Result<(), Self::Error>;
     /// Delete matching rows only if every exclusion is absent in the same
-    /// statement, not by a preceding read. Return the affected row count.
+    /// statement, not by a preceding read. `at_most` adds column <= bound
+    /// predicates using the stored SQL types (NULL does not satisfy <=).
+    /// Return the affected row count.
     fn delete_rows(
         &mut self,
         tx: u64,
         relation: &str,
         equals: &Fields,
         unless: &[Exclusion],
+        at_most: &Fields,
     ) -> Result<u64, Self::Error>;
     /// Read opaque bytes by namespace and key, preserving absence versus empty.
     fn read_bytes(&mut self, space: &str, key: &[u8]) -> Result<Option<Vec<u8>>, Self::Error>;

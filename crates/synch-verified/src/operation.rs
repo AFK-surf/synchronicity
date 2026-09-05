@@ -194,7 +194,7 @@ enum Frame {
     Rollback(u64),
     ReadRows(u64, String, Vec<String>, Fields, Vec<Order>, Vec<Join>),
     Upsert(u64, String, Fields, Vec<String>, Vec<String>),
-    DeleteRows(u64, String, Fields, Vec<Exclusion>),
+    DeleteRows(u64, String, Fields, Vec<Exclusion>, Fields),
     ReadBytes(String, Vec<u8>),
     ReadInput(u64, u64, u64),
     ReadCounter(String, Vec<u8>),
@@ -259,8 +259,10 @@ fn decode(packet: &[u8]) -> Result<Frame, ()> {
                 Ok(Exclusion {
                     relation: r.string()?,
                     equals: r.fields()?,
+                    keys: r.list(|r| Ok((r.string()?, r.string()?)))?,
                 })
             })?,
+            r.fields()?,
         ),
         22 => Frame::ReadBytes(r.string()?, r.bytes()?),
         23 => Frame::ReadInput(r.word()?, r.word()?, r.word()?),
@@ -405,9 +407,9 @@ fn execute<S: Storage>(
                 &mut errors,
                 |_, ()| {},
             ),
-            Frame::DeleteRows(tx, table, equals, unless) => reply(
+            Frame::DeleteRows(tx, table, equals, unless, at_most) => reply(
                 21,
-                storage.delete_rows(tx, &table, &equals, &unless),
+                storage.delete_rows(tx, &table, &equals, &unless, &at_most),
                 &mut errors,
                 word,
             ),
@@ -526,6 +528,7 @@ impl<S: ByteStorage> Storage for ReadOnly<'_, S> {
         _: &str,
         _: &Fields,
         _unless: &[crate::host::Exclusion],
+        _at_most: &Fields,
     ) -> Result<u64, Self::Error> {
         Err(OperationError::Protocol)
     }
@@ -627,14 +630,24 @@ mod tests {
         word(&mut delete, 1);
         bytes(&mut delete, b"seq");
         cell(&mut delete, &Cell::Integer(-1));
+        word(&mut delete, 1);
+        bytes(&mut delete, b"root");
+        bytes(&mut delete, b"root");
+        word(&mut delete, 1);
+        bytes(&mut delete, b"seq");
+        cell(&mut delete, &Cell::Integer(i64::MIN));
         match decode(&delete).unwrap() {
-            Frame::DeleteRows(7, _, _, blockers) => assert_eq!(
-                blockers,
-                [Exclusion {
-                    relation: "heads".into(),
-                    equals: vec![("seq".into(), Cell::Integer(-1))],
-                }]
-            ),
+            Frame::DeleteRows(7, _, _, blockers, at_most) => {
+                assert_eq!(at_most, vec![("seq".into(), Cell::Integer(i64::MIN))]);
+                assert_eq!(
+                    blockers,
+                    [Exclusion {
+                        relation: "heads".into(),
+                        equals: vec![("seq".into(), Cell::Integer(-1))],
+                        keys: vec![("root".into(), "root".into())],
+                    }]
+                );
+            }
             _ => panic!("wrong request kind"),
         }
         for length in 0..delete.len() {
@@ -754,7 +767,9 @@ mod tests {
             relation: &str,
             equals: &Fields,
             _unless: &[crate::host::Exclusion],
+            at_most: &Fields,
         ) -> Result<u64, Self::Error> {
+            assert!(at_most.is_empty());
             assert_eq!(tx, 42);
             assert_eq!(relation, "content_want");
             assert_eq!(equals[1], ("holder".into(), Cell::Text("holder".into())));

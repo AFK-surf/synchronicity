@@ -113,7 +113,9 @@ fn pin_acquisition_requires_durability_and_orders_possession_effects() {
             relation: &str,
             equals: &Fields,
             _unless: &[synch_verified::host::Exclusion],
+            at_most: &Fields,
         ) -> Result<u64, Self::Error> {
+            assert!(at_most.is_empty());
             assert_eq!(tx, 7);
             assert_eq!(relation, "content_want");
             assert_eq!(equals, &key());
@@ -281,7 +283,9 @@ fn deletion_protocol_checks_every_protection_and_orders_effects() {
             table: &str,
             equals: &Fields,
             _unless: &[synch_verified::host::Exclusion],
+            at_most: &synch_verified::host::Fields,
         ) -> Result<u64, Self::Error> {
+            assert!(at_most.is_empty());
             assert_eq!(tx, 7);
             assert_eq!(table, "blobs");
             assert_eq!(equals, &vec![("root".into(), Cell::Blob(vec![9; 32]))]);

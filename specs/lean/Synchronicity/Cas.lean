@@ -327,7 +327,7 @@ def Unpin (holder : H) : Transition (Cell H) where
   post c := { c with pin := c.pin \ {holder} }
 
 /-- `cas.rs::Store::expire_pins_of` / `expire_pins`. -/
-@[transition, rust_impl "cas-expire-pin"]
+@[transition]
 def ExpirePin (holder : H) : Transition (Cell H) := Unpin holder
 
 /-- `replica.rs::Store::drop_want`. -/

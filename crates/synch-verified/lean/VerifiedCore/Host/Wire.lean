@@ -31,7 +31,8 @@ def ordering (orders : List Order) : ByteArray :=
   sequence (fun order => string order.column ++ octet (if order.descending then 1 else 0)) orders
 
 def exclusions (guards : List Exclusion) : ByteArray :=
-  sequence (fun guard => string guard.relation ++ fields guard.equals) guards
+  sequence (fun guard => string guard.relation ++ fields guard.equals ++
+    sequence (fun (left, right) => string left ++ string right) guard.keys) guards
 
 def joins (items : List Join) : ByteArray :=
   sequence (fun item => string item.relation ++
@@ -63,7 +64,8 @@ def request (effect : Storage A) : ByteArray := octet 1 ++ octet (tag effect) ++
     word tx ++ string table ++ sequence string columns ++ fields equals ++ ordering order ++ joins joined
   | .upsert tx table values conflict updates =>
     word tx ++ string table ++ fields values ++ sequence string conflict ++ sequence string updates
-  | .deleteRows tx table equals blockers => word tx ++ string table ++ fields equals ++ exclusions blockers
+  | .deleteRows tx table equals blockers atMost =>
+    word tx ++ string table ++ fields equals ++ exclusions blockers ++ fields atMost
   | .readBytes space key => string space ++ bytes key
   | .readInput handle offset count => word handle ++ word offset ++ word count
   | .readCounter space key | .removeFile space key => string space ++ bytes key

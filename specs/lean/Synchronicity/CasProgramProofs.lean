@@ -17,7 +17,8 @@ inductive Event where
       (order : List Order := []) (joins : List Join := [])
   | upsert (tx : Transaction) (relation : String) (values : Fields)
       (conflictColumns updateColumns : List String)
-  | deleteRows (tx : Transaction) (relation : String) (equals : Fields) (blockers : List Exclusion := [])
+  | deleteRows (tx : Transaction) (relation : String) (equals : Fields)
+      (blockers : List Exclusion := []) (atMost : Fields := [])
   | readBytes (space : String) (key : ByteArray)
   | readInput (handle offset count : UInt64)
   | readCounter (space : String) (key : ByteArray)
@@ -33,7 +34,7 @@ def event : Storage A → Event
   | .readRows tx relation columns equals order joined => .readRows tx relation columns equals order joined
   | .scanRows tx relation columns equals order joined => .scanRows tx relation columns equals order joined
   | .upsert tx relation values conflicts updates => .upsert tx relation values conflicts updates
-  | .deleteRows tx relation equals blockers => .deleteRows tx relation equals blockers
+  | .deleteRows tx relation equals blockers atMost => .deleteRows tx relation equals blockers atMost
   | .readBytes space key => .readBytes space key
   | .readInput handle offset count => .readInput handle offset count
   | .readCounter space key => .readCounter space key
@@ -79,7 +80,7 @@ def answer (script : Script) : Storage A → A
     else if relation == "content_want" then script.wanted
     else .error malformedMetadata
   | .upsert _ _ _ _ _ => script.upsert
-  | .deleteRows _ _ _ _ => script.delete
+  | .deleteRows _ _ _ _ _ => script.delete
   | .readBytes _ _ => .error malformedMetadata
   | .readInput .. => .error malformedMetadata
   | .readCounter .. => script.writers

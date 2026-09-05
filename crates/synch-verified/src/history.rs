@@ -226,6 +226,7 @@ mod tests {
             _: &str,
             _: &Fields,
             _: &[Exclusion],
+            _: &Fields,
         ) -> Result<u64, Self::Error> {
             panic!("unexpected delete")
         }

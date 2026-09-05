@@ -1552,32 +1552,35 @@ impl Store {
     /// sweep visits any more: a space removed with its pins kept still has
     /// claims that were scheduled before it went.
     pub fn expire_pins_of(&self, holder: &PinHolder, now: i64) -> Result<usize> {
-        // LEAN-MODEL: cas-expire-pin (Cas.ExpirePin)
-        // `Cas.ExpirePin` covers this holder-specific path and the
-        // node-wide variant below. Both re-check that no live entry returned.
-        Ok(self.conn().execute(
-            "DELETE FROM pins
-              WHERE holder = ?1 AND release_after IS NOT NULL AND release_after <= ?2
-                AND NOT EXISTS (
-                  SELECT 1 FROM entries WHERE entries.content = pins.root
-                )",
-            params![holder.render(), now],
-        )?)
+        self.expire_claims(Some(holder), now)
     }
 
     /// Drops claims whose scheduled release has arrived, so that every other
     /// predicate over `pins` can stay free of the clock. Returns how many went.
     pub fn expire_pins(&self, now: i64) -> Result<usize> {
-        // As above, the entry predicate is re-checked here so a stale schedule
-        // is harmless.
-        Ok(self.conn().execute(
-            "DELETE FROM pins
-              WHERE release_after IS NOT NULL AND release_after <= ?1
-                AND NOT EXISTS (
-                  SELECT 1 FROM entries WHERE entries.content = pins.root
-                )",
-            params![now],
-        )?)
+        self.expire_claims(None, now)
+    }
+
+    fn expire_claims(&self, holder: Option<&PinHolder>, now: i64) -> Result<usize> {
+        use synch_verified::cas::{expire, OperationError, PinHolder as Holder};
+        let holder = holder.map(|holder| match holder {
+            PinHolder::Operator => Holder::Operator,
+            PinHolder::Source(space) => Holder::Source(space),
+            PinHolder::Replica(space) => Holder::Replica(space),
+            PinHolder::Other(text) => Holder::Other(text),
+        });
+        self.with_connection_scope(|conn| {
+            let mut storage = crate::lean_storage::SqliteStorage::new(conn);
+            // LEAN-MODEL: cas-expiry-operation (CasExpiryProofs.successful_execution)
+            let count = expire(&mut storage, holder, now).map_err(|error| match error {
+                OperationError::Host(error) => error,
+                OperationError::MalformedMetadata(_) | OperationError::Protocol => {
+                    StoreError::invalid("invalid native expiry-operation protocol")
+                }
+            })?;
+            usize::try_from(count)
+                .map_err(|_| StoreError::invalid("native expiry count exceeds address space"))
+        })
     }
 
     /// Every claim on one object, oldest first.
@@ -2520,6 +2523,75 @@ mod tests {
         assert!(error.to_string().contains("release denied"));
         assert!(store.conn().is_autocommit());
         assert_eq!(store.pins_for(&root).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn expiry_preserves_sqlite_time_ordering_and_cross_space_protection() {
+        let (_d, store) = store();
+        let root = store.ingest_bytes(&data(100), 0).unwrap();
+        for (holder, time) in [
+            ("minimum", rusqlite::types::Value::Integer(i64::MIN)),
+            ("due", rusqlite::types::Value::Integer(0)),
+            ("future", rusqlite::types::Value::Integer(i64::MAX)),
+            ("real_due", rusqlite::types::Value::Real(-0.5)),
+            ("real_future", rusqlite::types::Value::Real(0.5)),
+            ("text", rusqlite::types::Value::Text("corrupt".into())),
+            ("blob", rusqlite::types::Value::Blob(vec![0])),
+            ("unscheduled", rusqlite::types::Value::Null),
+        ] {
+            store.conn().execute(
+                "INSERT INTO pins (root, holder, created_at, release_after) VALUES (?1, ?2, 0, ?3)",
+                params![root.as_bytes().as_slice(), holder, time],
+            ).unwrap();
+        }
+        let origin = crate::testutil::origin();
+        store
+            .put_entry(
+                &origin,
+                "other",
+                "live",
+                &synch_core::FileEntry::file(100, 0, root, 1),
+            )
+            .unwrap();
+        assert_eq!(store.expire_pins(0).unwrap(), 0);
+        store.delete_entry(&origin, "other", "live").unwrap();
+        assert_eq!(
+            store
+                .expire_pins_of(&PinHolder::Other("due".into()), 0)
+                .unwrap(),
+            1
+        );
+        assert_eq!(store.expire_pins(0).unwrap(), 2);
+        assert_eq!(store.expire_pins(0).unwrap(), 0);
+        let count: i64 = store
+            .conn()
+            .query_row("SELECT COUNT(*) FROM pins", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 5);
+        assert!(store.conn().is_autocommit());
+    }
+
+    #[test]
+    fn failed_expiry_rolls_back_earlier_deletes_in_the_same_statement() {
+        let (_d, store) = store();
+        let root = store.ingest_bytes(&data(100), 0).unwrap();
+        for name in ["first", "second"] {
+            let holder = PinHolder::Other(name.into());
+            assert!(store.pin(&root, &holder, 0).unwrap());
+            assert!(store.schedule_release(&root, &holder, 1).unwrap());
+        }
+        store
+            .conn()
+            .execute_batch(
+                "CREATE TEMP TRIGGER reject_second_expiry BEFORE DELETE ON pins
+             WHEN (SELECT COUNT(*) FROM pins) = 1
+             BEGIN SELECT RAISE(ABORT, 'expiry denied'); END;",
+            )
+            .unwrap();
+        let error = store.expire_pins(1).unwrap_err();
+        assert!(error.to_string().contains("expiry denied"));
+        assert!(store.conn().is_autocommit());
+        assert_eq!(store.pins_for(&root).unwrap().len(), 2);
     }
 
     use crate::testutil::{data, store};

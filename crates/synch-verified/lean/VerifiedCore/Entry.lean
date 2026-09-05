@@ -26,6 +26,17 @@ def unpin (root payload : ByteArray) (kind : UInt8) : Host.Wire.NativeState :=
       let dropped ← Cas.unpin root holder
       return Host.Wire.octet (if dropped then 1 else 0) : Host.Operation ByteArray).run.mapEffects Host.EffectSum.left
 
+@[export synch_lean_cas_expire]
+def expire (payload : ByteArray) (kind : UInt8) (now : Int64) : Host.Wire.NativeState :=
+  let holder : Option (Option Cas.PinHolder) :=
+    if kind == 4 then (if payload.size == 0 then some none else none)
+    else (decodeHolder kind payload).map some
+  match holder with
+  | none => .pure (.error Host.Wire.protocolFailure)
+  | some holder => (do
+      let count ← Cas.expire holder now
+      return Host.Wire.word count.toUInt64 : Host.Operation ByteArray).run.mapEffects Host.EffectSum.left
+
 @[export synch_lean_cas_delete]
 def delete (root : ByteArray) (hasBefore : Bool) (before : Int64) : Host.Wire.NativeState :=
   if root.size != 32 then .pure (.error ⟨2, 0⟩)

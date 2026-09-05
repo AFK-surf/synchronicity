@@ -63,6 +63,7 @@ static lean_object *bytes(synch_slice slice) {
 extern lean_object *synch_lean_cas_acquire(lean_object *, lean_object *, uint64_t, uint8_t);
 extern lean_object *synch_lean_cas_delete(lean_object *, uint8_t, uint64_t);
 extern lean_object *synch_lean_cas_unpin(lean_object *, lean_object *, uint8_t);
+extern lean_object *synch_lean_cas_expire(lean_object *, uint8_t, uint64_t);
 extern lean_object *synch_lean_trie_get(lean_object *, uint64_t);
 extern lean_object *synch_lean_history_prune(lean_object *, uint64_t);
 extern lean_object *synch_lean_operation_packet(lean_object *);
@@ -82,6 +83,10 @@ void *synch_adapter_operation_delete(synch_slice root, uint8_t has_before, uint6
 
 void *synch_adapter_operation_unpin(synch_slice root, synch_slice payload, uint8_t kind) {
     return synch_lean_cas_unpin(bytes(root), bytes(payload), kind);
+}
+
+void *synch_adapter_operation_expire(synch_slice payload, uint8_t kind, uint64_t now) {
+    return synch_lean_cas_expire(bytes(payload), kind, now);
 }
 
 void *synch_adapter_operation_packet(void *state) {

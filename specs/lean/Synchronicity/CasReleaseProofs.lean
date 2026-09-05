@@ -16,7 +16,7 @@ def mutation (tx : Transaction) (root : ByteArray) (holder : PinHolder) : Event 
   .deleteRows tx "pins" [("root", .blob root), ("holder", .text holder.render)]
     (match holder.space with
       | none => []
-      | some space => [⟨"entries", [("space", .text space), ("content", .blob root)]⟩])
+      | some space => [⟨"entries", [("space", .text space), ("content", .blob root)], []⟩])
 
 /-- There are no metadata reads or secondary mutations: the single DELETE
 carries the guard, and its affected-row count is returned only after commit. -/

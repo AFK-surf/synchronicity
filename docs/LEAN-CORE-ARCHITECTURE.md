@@ -221,7 +221,7 @@ the proof package imports those exact modules. The shared carrier's laws and
 transaction traces cover begin failure, body failure, commit failure and
 preservation of the primary error across rollback failure.
 
-CAS pin/possession acquisition, explicit pin release and deletion now use complete Lean operations in
+CAS pin/possession acquisition, explicit pin release, scheduled expiry and deletion now use complete Lean operations in
 production. Their old snapshot/planner interfaces and Rust read/interpret/mutation
 orchestration have been deleted. Deletion also owns post-commit file cleanup:
 unlink failures are returned to Lean, which attempts both files and ignores
@@ -355,7 +355,10 @@ are whitelisted host mappings, not policies such as “collectable object” or
 
 Relational reads carry an optional list of column/direction order terms.
 Deletes carry optional raw exclusion queries, each consisting of a whitelisted
-relation and literal equality fields. The interpreter executes all exclusions
+relation, literal equality fields and optional base-to-excluded column equality
+keys. Deletes also carry inclusive upper bounds on raw stored columns. The
+interpreter qualifies both sides of each correlation with distinct aliases,
+including for self-correlations, and executes all exclusions
 as `NOT EXISTS` subqueries in the DELETE itself, never as preceding checks.
 Thus changes caused by an earlier deletion's trigger are visible to the next
 deletion. Empty parameters retain the original primitive behavior. These extend
@@ -393,11 +396,20 @@ all holder variants and each effect failure, and SQLite regressions cover live
 references, opaque role-like spellings, empty spaces and rollback on mutation
 failure. The host adapter only adds `entries.space` to its raw column allowlist.
 
+Both scheduled expiry commands now use a single Lean-owned bulk deletion.
+Lean supplies the optional holder equality, `release_after <= now` and an
+atomic `entries.content = pins.root` exclusion. The inequality already rejects
+NULL schedules, so no separate non-NULL check is needed. Unlike explicit unpin,
+any live reference protects an expiring claim regardless of its holder's space.
+Rust does not decode schedule values: native signed integer bounds and SQLite's
+raw comparison semantics preserve malformed REAL/TEXT/BLOB behavior too. The
+operation uses the shared transaction/error program and returns the host's
+affected count only after commit. Both old Rust expiry SQL paths are deleted.
+The native boundary remains one complete domain command and generic storage
+requests, with no per-pin loop or precomputed expired/protected snapshot.
+
 Subsequent CAS work is ordered by cohesive operation requirements:
 
-- Migrate both expiry commands together with generic comparison predicates and
-  correlated column references. Preserve the single set-shaped DELETE; do not
-  replace it with a pin scan and per-row FFI calls.
 - Migrate local reads with raw metadata decoding, bounds/coverage, positioned
   file reads and healing composed inside Lean. Preserve original I/O errors
   unless healing fails. Host callbacks cannot supply verified groups or heal
@@ -409,6 +421,26 @@ Subsequent CAS work is ordered by cohesive operation requirements:
 - Remote adoption/finalization must compose raw provider I/O around metadata
   transitions. Moving only a durable-flag setter leaves the core ordering in
   Rust; provider pair validation/upload is likewise CAS policy, not a primitive.
+
+The next local-read implementation should share a Lean internal `all | range`
+request, with row decoding, saturating bounds, permissive bitmap decoding,
+coverage and inline/positioned reads inside that operation. These trusted local
+reads do not currently verify hashes. Missing/truncated payloads invoke Lean
+healing and then return the original I/O error; if healing fails, its error
+takes precedence. Preserve the absent-row healing no-op, operator claims and
+existing wants. Healing re-reads size transactionally and selects standing roles
+using current SQLite ASCII-insensitive `LIKE` semantics, not typed-holder parsing.
+It needs generic updates, conflict-ignore inserts and an on-demand clock, not a
+Rust `heal` callback. Ordinary filesystem reads must not hold an immediate SQL
+transaction. Consolidating `read_all`'s current two metadata reads removes a
+race and needs explicit concurrency coverage; corrupt short inline payloads
+need an explicit failure instead of the current slicing panic.
+
+Local read migration alone does not complete cloud reads. The cloud wrapper
+still owns adoption, missing-group hydration and success-only access touch;
+eventually compose those in Lean over raw provider ranges. Bao slice serving
+and import additionally require Lean traversal/verification. Do not relabel the
+existing Rust range hydrator or Bao encoder/decoder as a raw host capability.
 
 Subagents may edit disjoint domain/proof/test files, but only the primary runs
 heavy validation. Inspect surviving processes after interruption; never launch

@@ -81,7 +81,7 @@ could become stale. The host performs no role interpretation. -/
 def unpinIn (tx : Transaction) (root : ByteArray) (holder : PinHolder) : Operation Bool := do
   let blockers : List Exclusion := match holder.space with
     | none => []
-    | some space => [⟨"entries", [("space", .text space), ("content", .blob root)]⟩]
+    | some space => [{ relation := "entries", equals := [("space", .text space), ("content", .blob root)] }]
   let count ← perform (.deleteRows tx "pins"
     [("root", .blob root), ("holder", .text holder.render)] blockers)
   return count != 0
@@ -91,6 +91,26 @@ Failure of deletion or commit rolls back through the shared transaction
 program, preserving the original failure even if rollback also fails. -/
 def unpin (root : ByteArray) (holder : PinHolder) : Operation Bool :=
   transaction fun tx => unpinIn tx root holder
+
+/-- Expire scheduled claims with one atomic bulk mutation. The optional holder
+is an exact persisted key, not a role-based protection policy. Every live entry
+protects its content, independently of holder or space. SQL's ordinary `<=`
+comparison excludes unscheduled NULL releases and includes the deadline itself.
+The correlated exclusion is evaluated as part of the DELETE, never as a stale
+snapshot or a per-pin host decision. -/
+def expireIn (tx : Transaction) (holder : Option PinHolder) (now : Int64) : Operation Nat := do
+  let equals := match holder with
+    | none => []
+    | some holder => [("holder", .text holder.render)]
+  perform (.deleteRows tx "pins" equals
+    [{ relation := "entries", equals := [], keys := [("root", "content")] }]
+    [("release_after", .integer now)])
+
+/-- Complete global or holder-specific scheduled expiry. The number of deleted
+claims becomes observable only after commit; any primary failure is preserved
+by the shared transaction program, including when rollback also fails. -/
+def expire (holder : Option PinHolder) (now : Int64) : Operation Nat :=
+  transaction fun tx => expireIn tx holder now
 
 /-- Preserve absence and signed access time; do not coerce malformed cells. -/
 def decodeAccess : List Row → Reply (Option Int64)

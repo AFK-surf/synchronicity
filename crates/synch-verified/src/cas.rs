@@ -22,6 +22,39 @@ pub enum PinHolder<'a> {
     Other(&'a str),
 }
 
+/// Expire due claims, optionally for one holder, through Lean's complete
+/// transaction. Storage performs only the requested atomic mutation.
+pub fn expire<S: crate::host::Storage>(
+    storage: &mut S,
+    holder: Option<PinHolder<'_>>,
+    now: i64,
+) -> Result<u64, OperationError<S::Error>> {
+    use crate::operation::Slice;
+    unsafe extern "C" {
+        fn synch_adapter_operation_expire(
+            payload: Slice,
+            kind: u8,
+            now: u64,
+        ) -> *mut std::ffi::c_void;
+    }
+    let (kind, payload) = match holder {
+        Some(PinHolder::Operator) => (0, ""),
+        Some(PinHolder::Source(space)) => (1, space),
+        Some(PinHolder::Replica(space)) => (2, space),
+        Some(PinHolder::Other(text)) => (3, text),
+        None => (4, ""),
+    };
+    // SAFETY: constructor copies borrowed arguments into a fresh owned program;
+    // the shared runner initializes Lean before invoking it.
+    let result = unsafe {
+        crate::operation::run(storage, &[], || {
+            synch_adapter_operation_expire(payload.as_bytes().into(), kind, now as u64)
+        })
+    }?;
+    let bytes = result.try_into().map_err(|_| OperationError::Protocol)?;
+    Ok(u64::from_le_bytes(bytes))
+}
+
 /// Release one explicit claim through the complete Lean operation.
 pub fn unpin<S: crate::host::Storage>(
     storage: &mut S,

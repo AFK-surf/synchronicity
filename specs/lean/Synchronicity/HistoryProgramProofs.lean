@@ -337,7 +337,7 @@ theorem remove_next (tx : Transaction) (origin : String) (total : Nat)
     (receipt : Receipt) (rest : List Receipt) :
     (removeLoop tx origin total (receipt :: rest)).run =
       .request (.left (.deleteRows tx "head_history"
-        (receiptKey origin receipt) [⟨"heads", receiptKey origin receipt⟩]))
+        (receiptKey origin receipt) [⟨"heads", receiptKey origin receipt, []⟩]))
         (fun reply => match reply with
           | .error failure => .pure (.error (.host failure))
           | .ok count => (removeLoop tx origin (total + count) rest).run) := by
@@ -452,8 +452,8 @@ private def runScript (script : Script) : Nat → Nat →
          else if relation == "head_history" && order == [⟨"seq", true⟩, ⟨"root", true⟩] then
            scriptReply script index ⟨script.receipts, script.scanFailure⟩
          else .error failure))
-      | .deleteRows _ relation equals blockers => step "delete" (resume
-        (if relation == "head_history" && blockers == [⟨"heads", equals⟩] then
+      | .deleteRows _ relation equals blockers atMost => step "delete" (resume
+        (if relation == "head_history" && blockers == [⟨"heads", equals, []⟩] && atMost.isEmpty then
           scriptReply script index 1 else .error failure))
       | .readRows .. => step "unexpected eager read" (resume (.error failure))
       | .upsert _ _ _ _ _ => step "unexpected upsert" (resume (.error failure))

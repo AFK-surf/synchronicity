@@ -251,7 +251,7 @@ def removeLoop (tx : Transaction) (origin : String) : Nat → List Receipt → A
   | total, [] => pure total
   | total, receipt :: rest => do
     let count ← request (.deleteRows tx "head_history"
-      (receiptKey origin receipt) [⟨"heads", receiptKey origin receipt⟩])
+      (receiptKey origin receipt) [⟨"heads", receiptKey origin receipt, []⟩])
     removeLoop tx origin (total + count) rest
 
 def remove (tx : Transaction) (origin : String) (receipts : List Receipt) : Action Nat :=
