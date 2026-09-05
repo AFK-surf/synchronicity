@@ -36,6 +36,8 @@ extern uint8_t synch_lean_walk_requires_branch(lean_object *, lean_object *);
 extern lean_object *synch_lean_walk_branch(lean_object *, lean_object *, uint8_t);
 extern uint8_t synch_lean_walk_unasked(lean_object *, lean_object *);
 extern lean_object *synch_lean_walk_ask(lean_object *, lean_object *);
+extern lean_object *synch_lean_walk_node(uint8_t, lean_object *, lean_object *, lean_object *);
+extern lean_object *synch_lean_walk_expand(lean_object *, lean_object *, lean_object *);
 
 /* Matches the private Rust repr(C) slice. A zero length never dereferences ptr. */
 typedef struct { const uint8_t *ptr; size_t len; } synch_slice;
@@ -75,6 +77,22 @@ void *synch_adapter_scope_new(uint8_t full, const synch_slice *prefixes, size_t 
 }
 
 void synch_adapter_scope_drop(void *scope) { lean_dec((lean_object *)scope); }
+
+void *synch_adapter_walk_node(uint8_t tag, const synch_slice *children, size_t count,
+                             synch_slice prefix, synch_slice child) {
+    lean_object *node = synch_lean_walk_node(tag, paths(children, count), bytes(prefix), bytes(child));
+    lean_mark_mt(node);
+    return node;
+}
+
+void *synch_adapter_walk_expand(void *walk, void *reference, void *node) {
+    lean_inc((lean_object *)walk);
+    lean_inc((lean_object *)reference);
+    lean_inc((lean_object *)node);
+    lean_object *s = synch_lean_walk_expand(walk, reference, node);
+    lean_mark_mt(s);
+    return s;
+}
 
 void *synch_adapter_walk_new(void *scope, synch_slice reference, synch_slice root, uint64_t max_depth) {
     lean_inc((lean_object *)scope);

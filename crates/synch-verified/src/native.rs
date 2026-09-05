@@ -20,6 +20,18 @@ impl From<&[u8]> for Slice {
 }
 
 unsafe extern "C" {
+    fn synch_adapter_walk_node(
+        tag: u8,
+        children: *const Slice,
+        count: usize,
+        prefix: Slice,
+        child: Slice,
+    ) -> *mut c_void;
+    fn synch_adapter_walk_expand(
+        walk: *mut c_void,
+        reference: *mut c_void,
+        node: *mut c_void,
+    ) -> *mut c_void;
     fn synch_adapter_walk_new(
         scope: *mut c_void,
         reference: Slice,
@@ -145,7 +157,62 @@ pub struct WalkPosition {
 #[derive(Debug)]
 pub struct MissingWalk(Arc<Handle>);
 
+/// Decoded node structure. Hashes and paths are copied without interpreting edges.
+#[derive(Debug)]
+pub enum WalkNode<'a> {
+    Branch(&'a [Option<[u8; 32]>; 16]),
+    Extension {
+        prefix: &'a [u8],
+        child: &'a [u8; 32],
+    },
+    Leaf,
+}
+
+impl WalkNode<'_> {
+    fn native(&self) -> Handle {
+        enter();
+        let (tag, children, prefix, child) = match self {
+            Self::Branch(children) => (
+                0,
+                children
+                    .iter()
+                    .map(|h| h.as_ref().map_or(&[][..], |h| h.as_slice()).into())
+                    .collect::<Vec<Slice>>(),
+                &[][..],
+                &[][..],
+            ),
+            Self::Extension { prefix, child } => (1, Vec::new(), *prefix, child.as_slice()),
+            Self::Leaf => (2, Vec::new(), &[][..], &[][..]),
+        };
+        // SAFETY: all fields remain live during this copying call; the result
+        // is an owned MT Lean object and is released by Handle.
+        let ptr = unsafe {
+            synch_adapter_walk_node(
+                tag,
+                children.as_ptr(),
+                children.len(),
+                prefix.into(),
+                child.into(),
+            )
+        };
+        Handle(NonNull::new(ptr).expect("Lean node allocation failed"))
+    }
+}
+
 impl MissingWalk {
+    /// Pair reference edges and schedule admitted children in the Lean implementation.
+    pub fn expand(&mut self, reference: WalkNode<'_>, node: WalkNode<'_>) {
+        let reference = reference.native();
+        let node = node.native();
+        // SAFETY: all three handles remain live; the adapter consumes fresh
+        // references and returns an independently owned MT walk state.
+        let ptr = unsafe {
+            synch_adapter_walk_expand(self.0 .0.as_ptr(), reference.0.as_ptr(), node.0.as_ptr())
+        };
+        self.0 = Arc::new(Handle(
+            NonNull::new(ptr).expect("Lean walk allocation failed"),
+        ));
+    }
     /// Empty hashes are represented by `None`, never by a malformed short hash.
     pub fn new(
         scope: &Scope,

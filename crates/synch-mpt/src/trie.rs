@@ -364,8 +364,8 @@ impl MissingWalk {
             let hash = Hash(position.hash);
             let path = position.path;
             // Lean already skipped reference-equal positions. Connecting this
-            // executable pruning to completeness still requires migrating
-            // `paired_children` and its reference-validity invariant.
+            // executable pruning to completeness still requires proving the
+            // full walk's reference-validity invariant.
             let Some(data) = trie.load_owned_raw(self.owner.as_ref(), &hash)? else {
                 // A position a peer has refused holds nothing this node may
                 // see, so it is satisfied rather than missing (§5.5). Only
@@ -384,7 +384,7 @@ impl MissingWalk {
                 // served at another position it shares by structure, whatever
                 // a peer refused here — is expanded wherever the walk meets it.
                 // A held boundary would stop the walk above an in-grant
-                // subtree it never fetched, and `paired_children`, which
+                // subtree it never fetched, and Lean's edge pairing, which
                 // follows held reference nodes, would prune against that
                 // subtree under the next root.
                 // LEAN-MODEL: mpt-walk-boundary (ScopedSync.Boundary)
@@ -452,16 +452,11 @@ impl MissingWalk {
                     )));
                 }
             }
-            for (child_reference, child, step) in paired_children(reference_node.as_ref(), &node) {
-                // A child leading out of scope is not descended or asked for;
-                // its hash stays committed by the node just walked, keeping the
-                // root verifiable without it.
-                self.state.enqueue(
-                    child_reference.as_ref().map(Hash::as_bytes),
-                    child.as_bytes(),
-                    &step,
-                );
-            }
+            let reference_fields = WalkFields::from(reference_node.as_ref());
+            let node_fields = WalkFields::from(Some(&node));
+            // LEAN-MODEL: verified-walk-pairing (VerifiedCoreProofs.paired_reference_same_step)
+            self.state
+                .expand(reference_fields.native(), node_fields.native());
             // A node whose out-of-line values have not arrived is not done
             // with, so it is deferred like a node that never loaded. Reporting
             // the value once and moving on would have the walk claim exhaustion
@@ -489,52 +484,37 @@ impl MissingWalk {
     }
 }
 
-/// Pairs a node's children with the ones at the same positions in the
-/// reference trie, so the walk can prune where the two agree.
-///
-/// Pairing is only attempted where the two nodes have the same shape; elsewhere
-/// children are walked with no reference — pruning is an optimization, and
-/// declining to prune is always safe. Each child carries the nibbles that lead
-/// to it (one for a branch slot, the whole prefix for an extension), the
-/// position a scoped fetch is authorized on (§5.5), which costs the walk
-/// nothing to keep.
-// LEAN-MODEL: mpt-walk-paired-children (ScopedSync.Paired)
-// `ScopedSync.Paired`: the reference descended through held nodes along the
-// same steps. `paired_reaches` shows those are positions the reference root's
-// own scoped walk reached, because a held node is never a boundary.
-fn paired_children(
-    reference: Option<&TrieNode>,
-    node: &TrieNode,
-) -> Vec<(Option<Hash>, Hash, Vec<u8>)> {
-    match (reference, node) {
-        (
-            Some(TrieNode::Branch {
-                children: theirs, ..
-            }),
-            TrieNode::Branch { children, .. },
-        ) => children
-            .iter()
-            .enumerate()
-            .filter_map(|(i, child)| child.map(|child| (theirs[i], child, vec![i as u8])))
-            .collect(),
-        (
-            Some(TrieNode::Ext {
-                prefix: their_prefix,
-                child: their_child,
-            }),
-            TrieNode::Ext { prefix, child },
-        ) if their_prefix == prefix => {
-            vec![(Some(*their_child), *child, prefix.as_slice().to_vec())]
+/// Structural ABI fields only: no child enumeration, pairing or authorization.
+// Short-lived stack marshalling buffer, never stored in a collection. Boxing
+// the fixed 16-slot array would allocate for every branch visited by a fetch.
+#[allow(clippy::large_enum_variant)]
+enum WalkFields<'a> {
+    Branch([Option<[u8; 32]>; 16]),
+    Extension(&'a [u8], &'a [u8; 32]),
+    Leaf,
+}
+
+impl<'a> From<Option<&'a TrieNode>> for WalkFields<'a> {
+    fn from(node: Option<&'a TrieNode>) -> Self {
+        match node {
+            Some(TrieNode::Branch { children, .. }) => {
+                Self::Branch(children.map(|h| h.map(|h| h.0)))
+            }
+            Some(TrieNode::Ext { prefix, child }) => {
+                Self::Extension(prefix.as_slice(), child.as_bytes())
+            }
+            Some(TrieNode::Leaf { .. }) | None => Self::Leaf,
         }
-        (_, TrieNode::Branch { children, .. }) => children
-            .iter()
-            .enumerate()
-            .filter_map(|(i, child)| child.map(|child| (None, child, vec![i as u8])))
-            .collect(),
-        (_, TrieNode::Ext { prefix, child }) => {
-            vec![(None, *child, prefix.as_slice().to_vec())]
+    }
+}
+
+impl WalkFields<'_> {
+    fn native(&self) -> synch_verified::WalkNode<'_> {
+        match self {
+            Self::Branch(children) => synch_verified::WalkNode::Branch(children),
+            Self::Extension(prefix, child) => synch_verified::WalkNode::Extension { prefix, child },
+            Self::Leaf => synch_verified::WalkNode::Leaf,
         }
-        (_, TrieNode::Leaf { .. }) => Vec::new(),
     }
 }
 
@@ -1761,7 +1741,7 @@ mod tests {
     /// A node this store holds is expanded wherever the walk meets it, even if
     /// a peer once refused the same hash at this position. Treating a *held*
     /// node as a boundary would let the walk stop above an absent in-grant
-    /// subtree and call the trie complete — and would let `paired_children`
+    /// subtree and call the trie complete — and would let Lean's edge pairing
     /// follow, as a reference, a node whose subtree the reference root's own
     /// walk never fetched (`ScopedSync.paired_reaches`).
     #[test]

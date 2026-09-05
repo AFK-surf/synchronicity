@@ -2,6 +2,70 @@ use proptest::prelude::*;
 use synch_verified::{group_count, settle_size, CertificateCache, Scope, Settlement, Shape};
 
 #[test]
+fn walk_pairs_branch_slots_without_dropping_unmatched_children() {
+    use synch_verified::WalkNode;
+    let mut children = [None; 16];
+    let mut reference = [None; 16];
+    children[0] = Some([2; 32]);
+    children[7] = Some([3; 32]);
+    children[15] = Some([4; 32]);
+    reference[0] = children[0]; // Only this target edge can be pruned.
+    reference[7] = Some([8; 32]);
+    reference[8] = Some([4; 32]); // Equal hash, wrong position: must not prune slot 15.
+    let mut walk =
+        synch_verified::MissingWalk::new(&Scope::new(None, &[]), None, Some(&[1; 32]), 8);
+    walk.poll().unwrap().unwrap();
+    walk.expand(WalkNode::Branch(&reference), WalkNode::Branch(&children));
+    let p = walk.poll().unwrap().unwrap();
+    assert_eq!((p.path, p.hash, p.reference), (vec![15], [4; 32], None));
+    let p = walk.poll().unwrap().unwrap();
+    assert_eq!(
+        (p.path, p.hash, p.reference),
+        (vec![7], [3; 32], Some([8; 32]))
+    );
+    assert!(walk.poll().unwrap().is_none());
+    assert!(walk.is_exhausted());
+}
+
+#[test]
+fn walk_pairs_extensions_only_with_identical_runs_and_filters_scope() {
+    use synch_verified::WalkNode;
+    for (run, expected) in [(&[1, 2][..], Some([9; 32])), (&[1, 3][..], None)] {
+        let mut walk =
+            synch_verified::MissingWalk::new(&Scope::new(None, &[]), None, Some(&[1; 32]), 8);
+        walk.poll().unwrap().unwrap();
+        walk.expand(
+            WalkNode::Extension {
+                prefix: run,
+                child: &[9; 32],
+            },
+            WalkNode::Extension {
+                prefix: &[1, 2],
+                child: &[2; 32],
+            },
+        );
+        let p = walk.poll().unwrap().unwrap();
+        assert_eq!((p.path, p.reference), (vec![1, 2], expected));
+    }
+    let mut children = [None; 16];
+    children[0] = Some([2; 32]);
+    children[1] = Some([3; 32]);
+    let scope = Scope::new(Some(&[vec![0]]), &[]);
+    let mut walk = synch_verified::MissingWalk::new(&scope, None, Some(&[1; 32]), 8);
+    walk.poll().unwrap().unwrap();
+    walk.expand(
+        WalkNode::Extension {
+            prefix: &[0],
+            child: &[2; 32],
+        },
+        WalkNode::Branch(&children),
+    );
+    let p = walk.poll().unwrap().unwrap();
+    assert_eq!((p.path, p.reference), (vec![0], None));
+    assert!(walk.poll().unwrap().is_none());
+}
+
+#[test]
 fn walk_retries_lifo_and_resets_only_batch_payload_requests() {
     let mut walk =
         synch_verified::MissingWalk::new(&Scope::new(None, &[]), None, Some(&[1; 32]), 8);

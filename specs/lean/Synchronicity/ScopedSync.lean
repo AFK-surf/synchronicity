@@ -470,7 +470,6 @@ prefix); a shape mismatch or an absent node ends the pairing.  That is
 exactly the reference root's own scoped walk, so `Paired` *is* `Reach` — and a
 held node is never a boundary, which is why the code's boundary check on the
 reference side is not a separate premise. -/
-@[rust_impl "mpt-walk-paired-children"]
 abbrev Paired (c : Content) (st : Store) (s : Scope) (R : Hash) : Path → Hash → Prop :=
   Reach c st s R
 

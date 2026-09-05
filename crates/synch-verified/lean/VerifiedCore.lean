@@ -343,4 +343,48 @@ def walkUnasked (s : MissingWalk) (hash : ByteArray) : Bool := !s.asked.contains
 def walkAsk (s : MissingWalk) (hash : ByteArray) : MissingWalk :=
   { s with asked := s.asked.insert (pathOf hash) }
 
+/-- Decoded structural fields; byte decoding and hashing remain at the ABI boundary. -/
+inductive WalkNode where
+  | branch (children : List (Option (List Nat)))
+  | extension (segment child : List Nat)
+  | leaf
+
+/-- Every edge, in branch-slot order or the single extension direction. -/
+def childEdges : WalkNode → List (List Nat × List Nat)
+  | .branch children => children.zipIdx.filterMap fun (child, slot) =>
+      child.map fun hash => ([slot], hash)
+  | .extension segment child => [(segment, child)]
+  | .leaf => []
+
+/-- Reference pruning is enabled only for matching structural shapes. -/
+def compatibleNodes : WalkNode → WalkNode → Bool
+  | .branch _, .branch _ => true
+  | .extension a _, .extension b _ => a == b
+  | _, _ => false
+
+/-- Pair only an edge with the reference edge at the exact same relative path. -/
+def pairedEdges (reference node : WalkNode) :
+    List (Option (List Nat) × List Nat × List Nat) :=
+  (childEdges node).map fun (step, hash) =>
+    (if compatibleNodes reference node then (childEdges reference).lookup step else none,
+     hash, step)
+
+/-- Expand decoded nodes with all pairing, path construction and admission in Lean. -/
+def expandWalk (s : MissingWalk) (reference node : WalkNode) : MissingWalk :=
+  (pairedEdges reference node).foldl
+    (fun s (reference, hash, step) => enqueueWalk s reference hash step) s
+
+/-- Marshal decoded fields; empty branch slots are absent hashes, not empty children. -/
+@[export synch_lean_walk_node]
+def walkNode (tag : UInt8) (children : Array ByteArray) (segment child : ByteArray) : WalkNode :=
+  if tag == 0 then .branch (children.toList.map fun h =>
+    if h.isEmpty then none else some (pathOf h))
+  else if tag == 1 then .extension (pathOf segment) (pathOf child)
+  else .leaf
+
+/-- Production expansion export consumes decoded structural nodes. -/
+@[export synch_lean_walk_expand]
+def walkExpand (s : MissingWalk) (reference node : WalkNode) : MissingWalk :=
+  expandWalk s reference node
+
 end VerifiedCore

@@ -83,7 +83,12 @@ Apple's system libc++. OS libraries remain dynamic dependencies.
 payload request set and extension-child requirements in Lean. Its sets use
 persistent balanced trees: marking objects thread-shareable prevents exclusive
 array updates, so a hash table would copy its bucket array on each insertion.
-Rust still decodes nodes and supplies child/payload and storage observations.
+Rust still decodes nodes and supplies structural fields, payload and storage
+observations. Lean enumerates children, pairs reference edges only at identical
+relative paths in compatible shapes, and schedules admitted children. Proofs
+show pairing preserves every target edge, invents none, and any retained
+reference follows the exact same step. Expansion retains the parent across all
+siblings. There is no production Rust child-pairing implementation.
 
 `Store` and `MemStore` use Lean's cache state and epoch guard. Rust owns the
 mutex and supplies byte keys, retained-root inputs, and storage effects; it
@@ -137,9 +142,10 @@ The end state is executable Lean core logic with proofs about that same Lean,
 not a manually reviewed correspondence between Rust and an abstract model.
 The following are still required:
 
-- Finish moving trie expansion, reference pairing, canonicality checks and
-  completeness derivation into Lean. The scheduler is now Lean, but Rust still
-  interprets decoded nodes; the cache still trusts a completed walk's validity.
+- Finish moving trie canonicality and payload/boundary decisions and
+  completeness derivation into Lean. Scheduling and child/reference expansion
+  are Lean, but Rust still interprets other decoded fields and storage results;
+  the cache still trusts a completed walk's validity.
 - Move CAS bitmap settlement, accounting, GC and promotion decisions into Lean.
 - Move ingestion and materialization sequencing into Lean-generated effect
   plans; discharge the flush-before-advertise and publication invariants over

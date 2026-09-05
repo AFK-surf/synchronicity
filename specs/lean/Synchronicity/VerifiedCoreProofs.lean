@@ -363,6 +363,65 @@ theorem walk_enqueue_boundary (s : VerifiedCore.MissingWalk)
     VerifiedCore.enqueueWalk s reference hash step = s := by
   simp [VerifiedCore.enqueueWalk, current, denied]
 
+/-- Pairing preserves every target edge and invents no target edges. -/
+theorem paired_edges_exact (reference node : VerifiedCore.WalkNode)
+    (r : Option (List Nat)) (hash step : List Nat) :
+    (r, hash, step) ∈ VerifiedCore.pairedEdges reference node ↔
+      (step, hash) ∈ VerifiedCore.childEdges node ∧
+      r = (if VerifiedCore.compatibleNodes reference node then
+        (VerifiedCore.childEdges reference).lookup step else none) := by
+  simp only [VerifiedCore.pairedEdges, List.mem_map, Prod.exists, Prod.mk.injEq]
+  constructor
+  · rintro ⟨a, b, edge, pair⟩
+    obtain ⟨rfl, rfl⟩ := pair.2
+    exact ⟨edge, pair.1.symm⟩
+  · rintro ⟨edge, rfl⟩
+    exact ⟨step, hash, edge, rfl, rfl, rfl⟩
+
+/-- Any retained reference hash is reached by exactly the target edge's step. -/
+@[rust_justifies "verified-walk-pairing"]
+theorem paired_reference_same_step (reference node : VerifiedCore.WalkNode)
+    (r hash step : List Nat)
+    (paired : (some r, hash, step) ∈ VerifiedCore.pairedEdges reference node) :
+    (step, hash) ∈ VerifiedCore.childEdges node ∧
+    (step, r) ∈ VerifiedCore.childEdges reference := by
+  obtain ⟨target, paired⟩ := (paired_edges_exact reference node (some r) hash step).mp paired
+  refine ⟨target, ?_⟩
+  split at paired
+  · obtain ⟨before, after, edges, _⟩ := List.lookup_eq_some_iff.mp paired.symm
+    simp [edges]
+  · simp at paired
+
+/-- Incompatible structures cannot supply a pruning reference. -/
+theorem paired_incompatible (reference node : VerifiedCore.WalkNode)
+    (r : Option (List Nat)) (hash step : List Nat)
+    (incompatible : VerifiedCore.compatibleNodes reference node = false)
+    (paired : (r, hash, step) ∈ VerifiedCore.pairedEdges reference node) : r = none := by
+  simpa [incompatible] using
+    ((paired_edges_exact reference node r hash step).mp paired).2
+
+/-- Scheduling children never changes the parent used to construct their paths. -/
+theorem enqueue_preserves_current (s : VerifiedCore.MissingWalk)
+    (r : Option (List Nat)) (hash step : List Nat) :
+    (VerifiedCore.enqueueWalk s r hash step).current = s.current := by
+  unfold VerifiedCore.enqueueWalk
+  split
+  · rfl
+  · dsimp only
+    split <;> rfl
+
+/-- Expansion retains the current parent across every sibling, not just the first. -/
+theorem expand_preserves_current (s : VerifiedCore.MissingWalk)
+    (reference node : VerifiedCore.WalkNode) :
+    (VerifiedCore.walkExpand s reference node).current = s.current := by
+  unfold VerifiedCore.walkExpand VerifiedCore.expandWalk
+  generalize VerifiedCore.pairedEdges reference node = edges
+  induction edges generalizing s with
+  | nil => rfl
+  | cons edge rest ih =>
+    simp only [List.foldl_cons]
+    rw [ih, enqueue_preserves_current]
+
 end Synchronicity.VerifiedCoreProofs
 
 #lint
