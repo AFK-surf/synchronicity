@@ -90,6 +90,12 @@ Apple's system libc++. OS libraries remain dynamic dependencies.
   outboard unlink. Refusals remain sticky and payload unlink requires an
   acknowledged commit. Rust acknowledges SQL effects only after success;
   filesystem removal remains a best-effort attempt, not a proved atomic effect.
+- Pin acquisition requires an existing durable row; possession additionally
+  requires an uncancelled holder-specific want. Both APIs execute one shared
+  Lean protocol. Its proofs cover exact authorization, sticky refusal, and
+  acknowledgment of want removal before possession's pin upsert. The SQL
+  transaction atomically commits the actions or rolls them back, including
+  clearing scheduled releases on successful re-pinning.
 
 `MissingWalk` also owns its frontier, seen set, deferred retries, per-batch
 payload request set and extension-child requirements in Lean. Its sets use
@@ -198,8 +204,9 @@ The following are still required:
   operations and ingestion-time canonical encoding checks also remain Rust.
 - CAS bitmap settlement now runs in Lean, with canonical output and lossless
   endpoint serialization proved. CAS row deletion policy and effect order also
-  run in Lean. Move remaining accounting, GC candidate selection, trie GC,
-  cache eviction/healing, and promotion decisions.
+  run in Lean, as do pin acquisition and want-to-pin possession. Move remaining
+  accounting (including unpin/expiry), GC candidate selection, trie GC,
+  cache eviction/healing, and publication/promotion decisions.
 - Move ingestion and materialization sequencing into Lean-generated effect
   plans; discharge the flush-before-advertise and publication invariants over
   those executed plans, not over independent abstract Rust descriptions.

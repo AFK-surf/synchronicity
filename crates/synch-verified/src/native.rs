@@ -20,6 +20,8 @@ impl From<&[u8]> for Slice {
 }
 
 unsafe extern "C" {
+    fn synch_lean_pin_acquisition_start(row: u8, durable: u8, wanted: u8, possession: u8) -> u8;
+    fn synch_lean_pin_acquisition_ack(step: u8) -> u8;
     fn synch_lean_deletion_start(
         collect: u8,
         row: u8,
@@ -589,6 +591,56 @@ pub enum Settlement {
     Keep,
     Reset,
     Refuse,
+}
+
+/// SQL effects and terminal outcomes of a Lean pin-acquisition plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum PinAcquisitionStep {
+    Refused,
+    DeleteWant,
+    UpsertPin,
+    Finished,
+}
+
+/// The native acquisition protocol. Execute it within one write transaction.
+#[derive(Debug)]
+pub struct PinAcquisition {
+    step: u8,
+}
+
+impl PinAcquisition {
+    /// Start from current row, durable-claim and holder-specific want facts.
+    pub fn new(row: bool, durable: bool, wanted: bool, possession: bool) -> Self {
+        enter();
+        // SAFETY: exact scalar ABI with normalized Bool arguments.
+        let step = unsafe {
+            synch_lean_pin_acquisition_start(
+                row.into(),
+                durable.into(),
+                wanted.into(),
+                possession.into(),
+            )
+        };
+        Self { step }
+    }
+
+    /// Observe the requested effect; polling does not advance the plan.
+    pub fn step(&self) -> PinAcquisitionStep {
+        match self.step {
+            0 => PinAcquisitionStep::Refused,
+            1 => PinAcquisitionStep::DeleteWant,
+            2 => PinAcquisitionStep::UpsertPin,
+            3 => PinAcquisitionStep::Finished,
+            _ => panic!("invalid Lean pin acquisition step"),
+        }
+    }
+
+    /// Acknowledge a successful effect, never a SQL error.
+    pub fn acknowledge(&mut self) {
+        enter();
+        // SAFETY: exact scalar ABI; transitions are implemented only in Lean.
+        self.step = unsafe { synch_lean_pin_acquisition_ack(self.step) };
+    }
 }
 
 /// An effect or terminal outcome selected by the Lean deletion protocol.

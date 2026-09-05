@@ -577,4 +577,19 @@ def deletionAck (step : UInt8) : UInt8 :=
   if step == 5 then 6 else
   if step == 6 then 7 else step
 
+/-- Plan acquisition from an atomic snapshot. A durable row is required for
+every pin; possession additionally requires a still-live want. Tags: 0 refused,
+1 delete want, 2 upsert pin (clearing its release), 3 finished. -/
+@[export synch_lean_pin_acquisition_start]
+def pinAcquisitionStart (row durable wanted possession : Bool) : UInt8 :=
+  if row && durable && (!possession || wanted) then
+    if possession then 1 else 2
+  else 0
+
+/-- Advance only after a successful SQL effect. All effects run in one atomic
+transaction; failure rolls back the want removal as well as pin changes. -/
+@[export synch_lean_pin_acquisition_ack]
+def pinAcquisitionAck (step : UInt8) : UInt8 :=
+  if step == 1 then 2 else if step == 2 then 3 else step
+
 end VerifiedCore

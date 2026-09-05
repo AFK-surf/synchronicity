@@ -1291,6 +1291,72 @@ theorem deletion_run_refusal_sticky (start step : UInt8) (effects : List UInt8)
     rw [ih]
     rcases blocked with rfl | rfl | rfl <;> rfl
 
+/-- Pin acquisition accepts exactly durable existing rows, with an additional
+uncancelled-want requirement in possession mode. These are the native decisions. -/
+@[rust_justifies "cas-native-pin-policy"]
+theorem pin_acquisition_authorized (row durable wanted possession : Bool) :
+    VerifiedCore.pinAcquisitionStart row durable wanted possession ≠ 0 ↔
+      row = true ∧ durable = true ∧ (possession = true → wanted = true) := by
+  cases row <;> cases durable <;> cases wanted <;> cases possession <;>
+    simp [VerifiedCore.pinAcquisitionStart]
+
+/-- Every initialized acquisition reaches refusal or completion within two
+successful acknowledgments; no other terminal tag or infinite loop is possible. -/
+theorem pin_acquisition_finishes (row durable wanted possession : Bool) :
+    VerifiedCore.pinAcquisitionAck (VerifiedCore.pinAcquisitionAck
+      (VerifiedCore.pinAcquisitionStart row durable wanted possession)) =
+      if row && durable && (!possession || wanted) then 3 else 0 := by
+  cases row <;> cases durable <;> cases wanted <;> cases possession <;> rfl
+
+/-- Acknowledged acquisition effects, recorded in reverse order. -/
+inductive PinAcquisitionRun (start : UInt8) : List UInt8 → UInt8 → Prop where
+  | initial : PinAcquisitionRun start [] start
+  | acknowledge {effects step} : PinAcquisitionRun start effects step →
+      PinAcquisitionRun start (step :: effects) (VerifiedCore.pinAcquisitionAck step)
+
+/-- Refusal remains effect-free under arbitrarily many acknowledgments. -/
+theorem pin_acquisition_refusal_sticky (effects : List UInt8) (step : UInt8)
+    (run : PinAcquisitionRun 0 effects step) : step = 0 := by
+  induction run with
+  | initial => rfl
+  | acknowledge prior ih => rw [ih]; rfl
+
+/-- No execution can request a pin over missing/non-durable data, or resurrect
+a cancelled possession request. Storage facts are read within one transaction. -/
+theorem pin_acquisition_upsert_authorized (row durable wanted possession : Bool)
+    (effects : List UInt8)
+    (run : PinAcquisitionRun (VerifiedCore.pinAcquisitionStart row durable wanted possession) effects 2) :
+    row = true ∧ durable = true ∧ (possession = true → wanted = true) := by
+  apply (pin_acquisition_authorized row durable wanted possession).mp
+  intro refused
+  rw [refused] at run
+  have impossible := pin_acquisition_refusal_sticky effects 2 run
+  contradiction
+
+/-- A pin-upsert acknowledgment can only be requested after want removal,
+unless it was the initial direct-pin action. -/
+theorem pin_acquisition_upsert_predecessor (step : UInt8) :
+    VerifiedCore.pinAcquisitionAck step = 2 ↔ step = 1 := by
+  unfold VerifiedCore.pinAcquisitionAck
+  split_ifs <;> simp_all
+
+/-- Possession's upsert cannot precede acknowledgment of want removal. The
+transaction executor rolls both actions back together on any SQL failure. -/
+@[rust_justifies "cas-native-possession-order"]
+theorem possession_removes_want_before_pin (row durable wanted : Bool) (effects : List UInt8)
+    (run : PinAcquisitionRun (VerifiedCore.pinAcquisitionStart row durable wanted true) effects 2) :
+    (1 : UInt8) ∈ effects := by
+  have initial : VerifiedCore.pinAcquisitionStart row durable wanted true = 0 ∨
+      VerifiedCore.pinAcquisitionStart row durable wanted true = 1 := by
+    cases row <;> cases durable <;> cases wanted <;> simp [VerifiedCore.pinAcquisitionStart]
+  generalize VerifiedCore.pinAcquisitionStart row durable wanted true = start at run initial
+  generalize hs : (2 : UInt8) = step at run
+  cases run with
+  | initial => rcases initial with rfl | rfl <;> contradiction
+  | acknowledge prior =>
+    have step := (pin_acquisition_upsert_predecessor _).mp hs.symm
+    simp [step]
+
 end Synchronicity.VerifiedCoreProofs
 
 #lint

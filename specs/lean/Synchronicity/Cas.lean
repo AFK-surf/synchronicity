@@ -315,7 +315,7 @@ def DropEntry : Transition (Cell H) where
 /-- `cas.rs::Store::pin`.  The predicate is `durable` alone: a pin is a
 promise about the durable tier, and under `NoLoss` a durable claim is backed
 by a remote copy or a complete row, so the pin stands on available content. -/
-@[transition, rust_impl "cas-pin"]
+@[transition]
 def Pin (holder : H) : Transition (Cell H) where
   guard c := ¬c.sweeping ∧ Durable c
   post c := { c with pin := insert holder c.pin }
@@ -337,7 +337,7 @@ def DropWant (holder : H) : Transition (Cell H) where
   post c := { c with want := c.want \ {holder} }
 
 /-- `replica.rs::take_possession`, with `Store::pin`'s predicate. -/
-@[transition, rust_impl "cas-take-possession"]
+@[transition]
 def TakePossession (holder : H) : Transition (Cell H) where
   guard c := ¬c.sweeping ∧ holder ∈ c.want ∧ Durable c
   post c := { c with pin := insert holder c.pin, want := c.want \ {holder} }

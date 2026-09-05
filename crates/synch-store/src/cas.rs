@@ -1445,38 +1445,67 @@ impl Store {
     /// under a live entry is exactly the evidence that the release was decided
     /// against a tree that has since changed its mind.
     pub fn pin(&self, root: &Hash, holder: &PinHolder, now: i64) -> Result<bool> {
-        // LEAN-MODEL: cas-pin (Cas.Pin)
-        // `Cas.Pin` includes the held-object check and pin insertion
-        // in this immediate transaction.
+        self.acquire_pin(root, holder, now, false)
+    }
+
+    /// Execute the native pin/possession plan against one immediate transaction.
+    /// A pin promises a durable claim, never merely a partial or staged cache
+    /// row. Possession also needs the holder's uncancelled want, so a late fetch
+    /// cannot resurrect an orphan role claim after role removal.
+    /// This durable-only contract is why staged-row eviction need not consult
+    /// pins: scratch copies cannot acquire promises about durable availability.
+    pub(crate) fn acquire_pin(
+        &self,
+        root: &Hash,
+        holder: &PinHolder,
+        now: i64,
+        possession: bool,
+    ) -> Result<bool> {
+        use synch_verified::PinAcquisitionStep;
         self.with_immediate_tx(|tx| {
-            // Held *durably*, not merely known or cached: a `blobs` row exists
-            // for a partial fetch too, and on a cloud backend a complete row
-            // is only a scratch copy until the backend has taken it
-            // (`durable=1`). A pin is a promise about the durable tier, so the
-            // predicate is `durable` alone, which is `Cas.Durable`
-            // and the fact the whole GC argument rests on: every path that
-            // drops a staged row without consulting `pins` — cache eviction,
-            // a scratch-generation reset, a backend migration — is safe only
-            // because a non-durable row can never be pinned. On the local
-            // backend a complete row is durable by construction, so nothing
-            // changes there. `take_possession` enforces the same thing on the
-            // other entry point, and a promise about bytes belongs in the
-            // store rather than in the discipline of every caller.
-            let held: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM blobs WHERE root = ?1 AND durable != 0)",
-                params![root.as_bytes().to_vec()],
+            // Read facts only. Lean decides which combination authorizes a pin.
+            let durable: Option<i64> = tx
+                .query_row(
+                    "SELECT durable FROM blobs WHERE root = ?1",
+                    params![root.as_bytes().to_vec()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let wanted: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM content_want WHERE root = ?1 AND holder = ?2)",
+                params![root.as_bytes().to_vec(), holder.render()],
                 |row| row.get(0),
             )?;
-            if !held {
-                return Ok(false);
+            // LEAN-MODEL: cas-native-pin-policy (VerifiedCoreProofs.pin_acquisition_authorized)
+            let mut plan = synch_verified::PinAcquisition::new(
+                durable.is_some(),
+                durable.unwrap_or(0) != 0,
+                wanted,
+                possession,
+            );
+            // LEAN-MODEL: cas-native-possession-order (VerifiedCoreProofs.possession_removes_want_before_pin)
+            loop {
+                match plan.step() {
+                    PinAcquisitionStep::Refused => return Ok(false),
+                    PinAcquisitionStep::Finished => return Ok(true),
+                    PinAcquisitionStep::DeleteWant => {
+                        tx.execute(
+                            "DELETE FROM content_want WHERE root = ?1 AND holder = ?2",
+                            params![root.as_bytes().to_vec(), holder.render()],
+                        )?;
+                    }
+                    PinAcquisitionStep::UpsertPin => {
+                        tx.execute(
+                            "INSERT INTO pins (root, holder, created_at, release_after)
+                             VALUES (?1, ?2, ?3, NULL)
+                             ON CONFLICT(root, holder) DO UPDATE SET release_after = NULL",
+                            params![root.as_bytes().to_vec(), holder.render(), now],
+                        )?;
+                    }
+                }
+                // An error above aborts the transaction without advancing.
+                plan.acknowledge();
             }
-            tx.execute(
-                "INSERT INTO pins (root, holder, created_at, release_after)
-                 VALUES (?1, ?2, ?3, NULL)
-                 ON CONFLICT(root, holder) DO UPDATE SET release_after = NULL",
-                params![root.as_bytes().to_vec(), holder.render(), now],
-            )?;
-            Ok(true)
         })
     }
 

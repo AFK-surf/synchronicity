@@ -2,6 +2,37 @@ use proptest::prelude::*;
 use synch_verified::{group_count, settle_size, CertificateCache, Scope, Settlement, Shape};
 
 #[test]
+fn pin_acquisition_requires_durability_and_orders_possession_effects() {
+    use synch_verified::{PinAcquisition, PinAcquisitionStep::*};
+    for row in [false, true] {
+        for durable in [false, true] {
+            for wanted in [false, true] {
+                for possession in [false, true] {
+                    let mut plan = PinAcquisition::new(row, durable, wanted, possession);
+                    if row && durable && (!possession || wanted) {
+                        if possession {
+                            assert_eq!(plan.step(), DeleteWant);
+                            assert_eq!(plan.step(), DeleteWant, "polling must not advance");
+                            plan.acknowledge();
+                        }
+                        assert_eq!(plan.step(), UpsertPin);
+                        plan.acknowledge();
+                        assert_eq!(plan.step(), Finished);
+                        plan.acknowledge();
+                        assert_eq!(plan.step(), Finished);
+                    } else {
+                        for _ in 0..5 {
+                            assert_eq!(plan.step(), Refused);
+                            plan.acknowledge();
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+#[test]
 fn deletion_protocol_checks_every_protection_and_orders_effects() {
     use synch_verified::{Deletion, DeletionStep::*};
     for row in [false, true] {
