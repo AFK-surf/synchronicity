@@ -34,6 +34,9 @@ extern lean_object *synch_lean_walk_node(uint8_t, lean_object *, lean_object *, 
 extern lean_object *synch_lean_walk_absent(lean_object *, uint8_t);
 extern lean_object *synch_lean_walk_present(lean_object *, lean_object *, lean_object *, uint8_t, lean_object *, uint8_t);
 extern uint8_t synch_lean_walk_result(lean_object *, uint8_t);
+extern lean_object *synch_lean_cas_plan(uint8_t, uint8_t, uint8_t, uint64_t, uint64_t, lean_object *, lean_object *);
+extern uint8_t synch_lean_cas_plan_status(lean_object *);
+extern lean_object *synch_lean_cas_plan_spans(lean_object *);
 
 /* Matches the private Rust repr(C) slice. A zero length never dereferences ptr. */
 typedef struct { const uint8_t *ptr; size_t len; } synch_slice;
@@ -73,6 +76,39 @@ void *synch_adapter_scope_new(uint8_t full, const synch_slice *prefixes, size_t 
 }
 
 void synch_adapter_scope_drop(void *scope) { lean_dec((lean_object *)scope); }
+
+static lean_object *words(const uint64_t *items, size_t count) {
+    lean_object *result = lean_alloc_array(0, count);
+    for (size_t i = 0; i < count; ++i) result = lean_array_push(result, lean_box_uint64(items[i]));
+    return result;
+}
+
+void *synch_adapter_cas_plan(uint8_t row, uint8_t durable, uint8_t complete,
+                           uint64_t recorded, uint64_t claimed,
+                           const uint64_t *old, size_t old_count,
+                           const uint64_t *incoming, size_t incoming_count) {
+    lean_object *plan = synch_lean_cas_plan(row, durable, complete, recorded, claimed,
+                                          words(old, old_count), words(incoming, incoming_count));
+    lean_mark_mt(plan);
+    return plan;
+}
+
+uint8_t synch_adapter_cas_plan_status(void *plan) {
+    lean_inc((lean_object *)plan);
+    return synch_lean_cas_plan_status(plan);
+}
+
+void *synch_adapter_cas_plan_spans(void *plan) {
+    lean_inc((lean_object *)plan);
+    lean_object *spans = synch_lean_cas_plan_spans(plan);
+    lean_mark_mt(spans);
+    return spans;
+}
+
+size_t synch_adapter_words_len(void *words) { return lean_array_size(words); }
+uint64_t synch_adapter_words_get(void *words, size_t index) {
+    return lean_unbox_uint64(lean_array_get_core(words, index));
+}
 
 void *synch_adapter_walk_node(uint8_t tag, const synch_slice *children, size_t count,
                              synch_slice prefix, synch_slice child) {

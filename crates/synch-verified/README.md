@@ -9,7 +9,7 @@ the functions agree with the abstract scope and CAS contracts.
 ## Mandatory integration
 
 Every build uses Lean 4.30.0 for scope/path/key/node/payload decisions and CAS
-size settlement, plus completeness certificate state transitions. The corresponding Rust implementations and feature flags
+size settlement and bitmap commit planning, plus completeness certificate state transitions. The corresponding Rust implementations and feature flags
 have been deleted. The shared `synch-core::group_count` API also delegates to
 Lean. Rust code in the native tests/example is an independent test oracle,
 not a selectable production backend.
@@ -70,6 +70,10 @@ Apple's system libc++. OS libraries remain dynamic dependencies.
   zero and `u64::MAX`, without overflow;
 - settlement accepts exactly the allowed claims, resets bits exactly when
   required, and implements `Cas.Settles` given the row's representation facts.
+- CAS bitmap normalization preserves exactly the in-bound input groups; the
+  production commit planner represents exactly retained plus incoming groups,
+  rejects conflicting durable/complete sizes, and reports complete only when
+  every group is covered. Sorting and merging operate on runs, not blob bytes.
 - the executable certificate cache rejects stale/terminal tickets, hides
   retained roots during mutations, retains only permitted roots at begin,
   advances nonterminal epochs, restores nesting depth at finish, and preserves
@@ -184,7 +188,8 @@ The following are still required:
   scheduling, child pairing, walk canonicality and payload/boundary decisions
   are now Lean; the cache still trusts a completed walk's validity. Other trie
   operations and ingestion-time canonical encoding checks also remain Rust.
-- Move CAS bitmap settlement, accounting, GC and promotion decisions into Lean.
+- CAS bitmap settlement now runs in Lean. Prove canonical output ordering and
+  endpoint serialization, then move accounting, GC and promotion decisions.
 - Move ingestion and materialization sequencing into Lean-generated effect
   plans; discharge the flush-before-advertise and publication invariants over
   those executed plans, not over independent abstract Rust descriptions.

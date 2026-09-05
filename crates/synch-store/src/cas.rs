@@ -497,7 +497,7 @@ struct RowClaim {
     size: u64,
     complete: bool,
     durable: bool,
-    held: ChunkRanges,
+    ranges: Vec<(u64, u64)>,
 }
 
 /// Extends a file to at least `len`, and never shortens it.
@@ -628,8 +628,8 @@ fn upsert_blob_row(conn: &rusqlite::Connection, row: BlobRowWrite<'_>) -> Result
 
 /// What an object's row currently claims, read on a given connection.
 ///
-/// The bitmap is read against the row's *own* size, not the caller's: the two
-/// can differ, and that difference is the whole subject of [`settle_size`].
+/// Decode raw claims only; the Lean planner interprets them against the row's
+/// own size before deciding whether the caller's size may replace it.
 fn read_claim(conn: &rusqlite::Connection, root: &Hash) -> Result<Option<RowClaim>> {
     let row: Option<(i64, i64, i64, Option<Vec<u8>>)> = conn
         .query_row(
@@ -640,22 +640,18 @@ fn read_claim(conn: &rusqlite::Connection, root: &Hash) -> Result<Option<RowClai
         .optional()?;
     Ok(row.map(|(size, complete, durable, bitmap)| {
         let size = size as u64;
-        let total = group_count(size);
         let complete = complete != 0;
-        // LEAN-MODEL: cas-row-complete (Cas.Complete)
-        // `Cas.Complete` is what `complete` means when a row is read: every
-        // group of the row's own size is held. A bitmap row holds the groups
-        // it names and nothing more.
-        let held = match (complete, &bitmap) {
-            (true, _) => ChunkRanges::single(0, total),
-            (false, Some(bytes)) => blob_to_ranges(bytes, total),
-            (false, None) => ChunkRanges::empty(),
-        };
+        // Lean interprets complete rows, settles the size, and normalizes the
+        // retained and incoming ranges against the accepted size.
+        let ranges = bitmap
+            .as_deref()
+            .and_then(|bytes| postcard::from_bytes(bytes).ok())
+            .unwrap_or_default();
         RowClaim {
             size,
             complete,
             durable: durable != 0,
-            held,
+            ranges,
         }
     }))
 }
@@ -906,36 +902,38 @@ impl Store {
         inline: Option<Vec<u8>>,
         now: i64,
     ) -> Result<Commit> {
-        // LEAN-MODEL: cas-write-groups-commit (Cas.CommitGroups)
-        // `Cas.CommitGroups` abstracts both partial and completing bitmap
-        // commits; durability rises only when this commit completes locally.
         self.with_immediate_tx(|tx| {
             let claim = read_claim(tx, root)?;
-            let settlement = settle_size(
-                root,
-                claim
-                    .as_ref()
-                    .map(|c| (c.size, c.complete, c.durable, &c.held)),
+            let incoming: Vec<_> = groups.ranges.iter().map(|r| (r.start, r.end)).collect();
+            let (recorded, complete, durable, old) =
+                claim.as_ref().map_or((0, false, false, &[][..]), |c| {
+                    (c.size, c.complete, c.durable, c.ranges.as_slice())
+                });
+            // LEAN-MODEL: cas-native-plan-membership (VerifiedCoreProofs.cas_plan_membership)
+            // LEAN-MODEL: cas-native-plan-complete (VerifiedCoreProofs.cas_plan_complete_covers)
+            // Lean owns settlement, bitmap reset/union/clipping and completion.
+            // Rust executes the returned plan within this same SQL transaction.
+            let plan = synch_verified::plan_cas_commit(
+                claim.is_some(),
+                durable,
+                complete,
+                recorded,
                 size,
-            )?;
-            let size = settlement.size;
-            let total = group_count(size);
-            // A settlement that moved the group count invalidates the bitmap:
-            // those bits were verified against a tree of a different shape, and
-            // the size that gave them that shape was only ever a claim. Start
-            // the bitmap again rather than carry bits describing a tree nobody
-            // is writing any more.
-            // LEAN-MODEL: cas-size-reset (Cas.dropped_bit_was_a_claim)
-            // `Cas.dropped_bit_was_a_claim` is why this loses nothing that was
-            // a fact: a bit goes only when the row's size was neither durable
-            // nor attested, and `Cas.Invariant.held_within_size` is what
-            // keeping the bits under an unchanged group count preserves.
-            let held = match (settlement.reset_held, claim) {
-                (false, Some(claim)) => claim.held,
-                _ => ChunkRanges::empty(),
+                old,
+                &incoming,
+            )
+            .ok_or_else(|| StoreError::Verification {
+                root: *root,
+                reason: format!("size mismatch: have {recorded}, offered {size}"),
+            })?;
+            let verified = ChunkRanges {
+                ranges: plan
+                    .ranges
+                    .into_iter()
+                    .map(|(start, end)| GroupRange { start, end })
+                    .collect(),
             };
-            let verified = held.union(groups).intersect(&ChunkRanges::single(0, total));
-            let complete = verified.count() >= total;
+            let complete = plan.complete;
             let durable = self.complete_is_durable();
             upsert_blob_row(
                 tx,

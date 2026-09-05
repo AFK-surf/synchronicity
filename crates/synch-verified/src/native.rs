@@ -20,6 +20,21 @@ impl From<&[u8]> for Slice {
 }
 
 unsafe extern "C" {
+    fn synch_adapter_cas_plan(
+        row: u8,
+        durable: u8,
+        complete: u8,
+        recorded: u64,
+        claimed: u64,
+        old: *const u64,
+        old_count: usize,
+        incoming: *const u64,
+        incoming_count: usize,
+    ) -> *mut c_void;
+    fn synch_adapter_cas_plan_status(plan: *mut c_void) -> u8;
+    fn synch_adapter_cas_plan_spans(plan: *mut c_void) -> *mut c_void;
+    fn synch_adapter_words_len(words: *mut c_void) -> usize;
+    fn synch_adapter_words_get(words: *mut c_void, index: usize) -> u64;
     fn synch_adapter_walk_absent(walk: *mut c_void, redacted: u8) -> *mut c_void;
     fn synch_adapter_walk_present(
         walk: *mut c_void,
@@ -564,6 +579,68 @@ pub enum Settlement {
     Keep,
     Reset,
     Refuse,
+}
+
+/// Accepted CAS commit plan. Ranges are normalized and clamped by Lean.
+#[derive(Debug, PartialEq, Eq)]
+pub struct CasCommit {
+    pub complete: bool,
+    pub ranges: Vec<(u64, u64)>,
+}
+
+/// Plan a CAS row update from transaction-local facts and verified incoming runs.
+/// `None` means the offered size conflicts with durable or attested data.
+pub fn plan_cas_commit(
+    row: bool,
+    durable: bool,
+    complete: bool,
+    recorded: u64,
+    claimed: u64,
+    old: &[(u64, u64)],
+    incoming: &[(u64, u64)],
+) -> Option<CasCommit> {
+    enter();
+    let old: Vec<u64> = old.iter().flat_map(|&(a, b)| [a, b]).collect();
+    let incoming: Vec<u64> = incoming.iter().flat_map(|&(a, b)| [a, b]).collect();
+    // SAFETY: scalar ABI and copied endpoints; both returned objects own MT refs.
+    unsafe {
+        let plan = Handle(
+            NonNull::new(synch_adapter_cas_plan(
+                row.into(),
+                durable.into(),
+                complete.into(),
+                recorded,
+                claimed,
+                old.as_ptr(),
+                old.len(),
+                incoming.as_ptr(),
+                incoming.len(),
+            ))
+            .expect("Lean CAS plan allocation failed"),
+        );
+        let complete = match synch_adapter_cas_plan_status(plan.0.as_ptr()) {
+            0 => return None,
+            1 => false,
+            2 => true,
+            _ => panic!("invalid Lean CAS plan status"),
+        };
+        let spans = Handle(
+            NonNull::new(synch_adapter_cas_plan_spans(plan.0.as_ptr()))
+                .expect("Lean CAS spans allocation failed"),
+        );
+        let len = synch_adapter_words_len(spans.0.as_ptr());
+        assert_eq!(len % 2, 0, "Lean CAS endpoint pairs");
+        let ranges = (0..len)
+            .step_by(2)
+            .map(|i| {
+                (
+                    synch_adapter_words_get(spans.0.as_ptr(), i),
+                    synch_adapter_words_get(spans.0.as_ptr(), i + 1),
+                )
+            })
+            .collect();
+        Some(CasCommit { complete, ranges })
+    }
 }
 
 /// Overflow-free group count computed by the linked Lean implementation.

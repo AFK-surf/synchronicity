@@ -1,5 +1,6 @@
 import VerifiedCore
 import Std.Data.TreeSet.Lemmas
+import Mathlib.Order.MinMax
 import Synchronicity.ScopedSync
 import Synchronicity.Cas
 
@@ -823,6 +824,158 @@ theorem equal_visit_leaf_depth (scope : VerifiedCore.Scope)
     (p q : VerifiedCore.WalkPosition) (same : VerifiedCore.walkVisit scope p = VerifiedCore.walkVisit scope q)
     (suffix : List Nat) : p.path.length + suffix.length = q.path.length + suffix.length := by
   rw [(equal_visit_classification scope p q same).2.1]
+
+/-- Merging touching intervals preserves their exact represented groups. -/
+theorem merge_spans_membership (head : VerifiedCore.GroupSpan)
+    (rest : List VerifiedCore.GroupSpan) (group : Nat) :
+    VerifiedCore.spansContain (VerifiedCore.mergeSpans head rest) group =
+      (VerifiedCore.spansContain [head] group || VerifiedCore.spansContain rest group) := by
+  induction rest generalizing head with
+  | nil => simp [VerifiedCore.mergeSpans, VerifiedCore.spansContain]
+  | cons next rest ih =>
+    simp only [VerifiedCore.mergeSpans]
+    split
+    · rename_i touching
+      rw [ih]
+      simp only [Bool.and_eq_true, decide_eq_true_eq] at touching
+      apply Bool.eq_iff_iff.mpr
+      simp only [VerifiedCore.spansContain, List.any_cons, List.any_nil, Bool.or_false,
+        Bool.or_eq_true, Bool.and_eq_true, decide_eq_true_eq]
+      simp only [min_le_iff, lt_max_iff]
+      by_cases tail : VerifiedCore.spansContain rest group = true
+      · simp only [VerifiedCore.spansContain] at tail
+        simp [tail]
+      · simp only [VerifiedCore.spansContain] at tail
+        simp [tail]
+        omega
+    · simp only [VerifiedCore.spansContain, List.any_cons] at ih ⊢
+      rw [ih]
+      simp
+
+/-- Normalization cannot report any group outside the requested bound. -/
+theorem spans_clipping_membership (total group : Nat) (spans : List VerifiedCore.GroupSpan) :
+    VerifiedCore.spansContain (spans.filterMap fun r =>
+      if r.start < min r.stop total then some (⟨r.start, min r.stop total⟩ : VerifiedCore.GroupSpan) else none) group = true ↔
+      VerifiedCore.spansContain spans group = true ∧ group < total := by
+  induction spans with
+  | nil => simp [VerifiedCore.spansContain]
+  | cons r rest ih =>
+    by_cases valid : r.start < min r.stop total
+    · simp only [List.filterMap_cons, if_pos valid]
+      simp only [VerifiedCore.spansContain, List.any_cons, Bool.or_eq_true,
+        Bool.and_eq_true, decide_eq_true_eq] at ih ⊢
+      rw [ih]
+      simp only [lt_min_iff] at valid ⊢
+      by_cases tail : VerifiedCore.spansContain rest group = true <;>
+        (simp only [VerifiedCore.spansContain] at tail; simp [tail]; all_goals omega)
+    · simp only [List.filterMap_cons, if_neg valid]
+      simp only [VerifiedCore.spansContain, List.any_cons, Bool.or_eq_true,
+        Bool.and_eq_true, decide_eq_true_eq] at ih ⊢
+      rw [ih]
+      simp only [lt_min_iff] at valid
+      by_cases tail : VerifiedCore.spansContain rest group = true <;>
+        (simp only [VerifiedCore.spansContain] at tail; simp [tail]; all_goals omega)
+
+/-- Coalescing any interval sequence preserves membership; sorting is needed
+for canonical output, not for this safety property. -/
+theorem coalesce_spans_membership (spans : List VerifiedCore.GroupSpan) (group : Nat) :
+    VerifiedCore.spansContain (match spans with | [] => [] | h :: t => VerifiedCore.mergeSpans h t) group =
+      VerifiedCore.spansContain spans group := by
+  cases spans with
+  | nil => rfl
+  | cons head rest =>
+    simpa [VerifiedCore.spansContain] using merge_spans_membership head rest group
+
+/-- The production normalization represents exactly the input groups below
+the bound. It never invents verified groups or loses an in-bound input group. -/
+theorem normalize_spans_membership (total group : Nat) (spans : List VerifiedCore.GroupSpan) :
+    VerifiedCore.spansContain (VerifiedCore.normalizeSpans total spans) group = true ↔
+      VerifiedCore.spansContain spans group = true ∧ group < total := by
+  have sorted (rs : List VerifiedCore.GroupSpan) :
+      VerifiedCore.spansContain (rs.mergeSort (fun a b => a.start ≤ b.start)) group =
+        VerifiedCore.spansContain rs group := by
+    apply Bool.eq_iff_iff.mpr
+    simp [VerifiedCore.spansContain, List.any_eq_true]
+  let clipped := spans.filterMap fun r =>
+    if r.start < min r.stop total then some (⟨r.start, min r.stop total⟩ : VerifiedCore.GroupSpan) else none
+  have merged : VerifiedCore.spansContain (VerifiedCore.normalizeSpans total spans) group =
+      VerifiedCore.spansContain clipped group := by
+    unfold VerifiedCore.normalizeSpans
+    change VerifiedCore.spansContain (match clipped.mergeSort (fun a b => a.start ≤ b.start) with
+      | [] => [] | h :: t => VerifiedCore.mergeSpans h t) group = _
+    cases hs : clipped.mergeSort (fun a b => a.start ≤ b.start) with
+    | nil => simpa [hs] using sorted clipped
+    | cons head rest =>
+      rw [merge_spans_membership]
+      simpa [hs, VerifiedCore.spansContain] using sorted clipped
+  rw [merged]
+  exact spans_clipping_membership total group spans
+
+/-- A durable row cannot be rewritten under a conflicting size by any incoming ranges. -/
+theorem cas_plan_durable_refusal (recorded claimed : UInt64)
+    (different : recorded ≠ claimed) (complete : Bool) (old incoming : List VerifiedCore.GroupSpan) :
+    (VerifiedCore.planCasCommit true true complete recorded claimed old incoming).accepted = false := by
+  simp [VerifiedCore.planCasCommit, VerifiedCore.settleSize, different]
+
+/-- A row already locally complete also rejects a conflicting size. -/
+theorem cas_plan_complete_refusal (recorded claimed : UInt64)
+    (different : recorded ≠ claimed) (durable : Bool) (old incoming : List VerifiedCore.GroupSpan) :
+    (VerifiedCore.planCasCommit true durable true recorded claimed old incoming).accepted = false := by
+  simp [VerifiedCore.planCasCommit, VerifiedCore.settleSize, different]
+
+/-- The actual commit planner retains exactly the authorized old groups plus
+incoming verified groups, clipped to the claimed size. A refusal holds none. -/
+@[rust_justifies "cas-native-plan-membership"]
+theorem cas_plan_membership (row durable complete : Bool) (recorded claimed : UInt64)
+    (old incoming : List VerifiedCore.GroupSpan) (group : Nat) :
+    let prior := if row then
+      if complete then [(⟨0, (VerifiedCore.groupCount recorded).toNat⟩ : VerifiedCore.GroupSpan)] else old
+      else []
+    let decision := VerifiedCore.settleSize row durable complete
+      (VerifiedCore.spansContain prior ((VerifiedCore.groupCount recorded).toNat - 1)) recorded claimed
+    VerifiedCore.spansContain
+      (VerifiedCore.planCasCommit row durable complete recorded claimed old incoming).spans group = true ↔
+      decision ≠ 0 ∧
+      VerifiedCore.spansContain ((if decision == 2 then [] else prior) ++ incoming) group = true ∧
+      group < (VerifiedCore.groupCount claimed).toNat := by
+  dsimp only
+  unfold VerifiedCore.planCasCommit
+  generalize (if row then
+    if complete then [(⟨0, (VerifiedCore.groupCount recorded).toNat⟩ : VerifiedCore.GroupSpan)] else old
+    else []) = prior
+  dsimp only
+  split
+  · rename_i refused
+    simp_all [VerifiedCore.spansContain]
+  · rename_i accepted
+    simp only [beq_iff_eq] at accepted
+    simp only [accepted, ne_eq, not_false_eq_true, true_and]
+    exact normalize_spans_membership (VerifiedCore.groupCount claimed).toNat group _
+
+/-- A planner's complete result actually covers every group of the claimed
+object, including the one-group representation of an empty object. -/
+@[rust_justifies "cas-native-plan-complete"]
+theorem cas_plan_complete_covers (row durable complete : Bool) (recorded claimed : UInt64)
+    (old incoming : List VerifiedCore.GroupSpan)
+    (done : (VerifiedCore.planCasCommit row durable complete recorded claimed old incoming).complete = true)
+    (group : Nat) (inside : group < (VerifiedCore.groupCount claimed).toNat) :
+    VerifiedCore.spansContain
+      (VerifiedCore.planCasCommit row durable complete recorded claimed old incoming).spans group = true := by
+  unfold VerifiedCore.planCasCommit at done ⊢
+  generalize (if row then
+    if complete then [(⟨0, (VerifiedCore.groupCount recorded).toNat⟩ : VerifiedCore.GroupSpan)] else old
+    else []) = prior at done ⊢
+  dsimp only at done ⊢
+  split at done <;> simp only at done
+  · contradiction
+  · rename_i accepted
+    simp only [accepted]
+    simp only [Bool.and_eq_true] at done
+    obtain ⟨_, witness⟩ := done
+    obtain ⟨r, member, endpoints⟩ := List.any_eq_true.mp witness
+    simp only [Bool.and_eq_true, beq_iff_eq] at endpoints
+    apply List.any_eq_true.mpr
+    exact ⟨r, member, by simp [endpoints.1, endpoints.2, inside]⟩
 
 end Synchronicity.VerifiedCoreProofs
 

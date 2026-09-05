@@ -487,4 +487,73 @@ def walkPresent (s : MissingWalk) (reference node : WalkNode) (childShape : UInt
 def walkResult (s : MissingWalk) (field : UInt8) : UInt8 :=
   if field == 0 then s.faultKind else s.requestKind
 
+/-- Half-open CAS group interval, interpreted with unbounded arithmetic. -/
+structure GroupSpan where
+  start : Nat
+  stop : Nat
+
+/-- Merge a sorted sequence of touching intervals in one linear pass. -/
+def mergeSpans (head : GroupSpan) : List GroupSpan → List GroupSpan
+  | [] => [head]
+  | next :: rest =>
+    if next.start ≤ head.stop && head.start ≤ next.stop then
+      mergeSpans ⟨min head.start next.start, max head.stop next.stop⟩ rest
+    else head :: mergeSpans next rest
+
+/-- Clamp first, then sort and merge. Work depends on runs, never on blob size. -/
+def normalizeSpans (total : Nat) (spans : List GroupSpan) : List GroupSpan :=
+  let clipped := spans.filterMap fun r =>
+    let stop := min r.stop total
+    if r.start < stop then some (⟨r.start, stop⟩ : GroupSpan) else none
+  match clipped.mergeSort (fun a b => a.start ≤ b.start) with
+  | [] => []
+  | head :: rest => mergeSpans head rest
+
+/-- Membership in a finite range representation. -/
+def spansContain (spans : List GroupSpan) (group : Nat) : Bool :=
+  spans.any fun r => r.start ≤ group && group < r.stop
+
+/-- The complete CAS row plan, before SQL and without any storage effects. -/
+structure CasPlan where
+  accepted : Bool
+  complete : Bool
+  spans : List GroupSpan
+
+/-- Size attestation, retention/reset, union, clipping and completion are one
+decision. A complete old row denotes every group even with no bitmap column. -/
+def planCasCommit (row durable complete : Bool) (recorded claimed : UInt64)
+    (old incoming : List GroupSpan) : CasPlan :=
+  let prior := if row then
+    if complete then [⟨0, (groupCount recorded).toNat⟩] else old
+    else []
+  let decision := settleSize row durable complete
+    (spansContain prior ((groupCount recorded).toNat - 1)) recorded claimed
+  if decision == 0 then ⟨false, false, []⟩ else
+    let retained := if decision == 2 then [] else prior
+    let total := (groupCount claimed).toNat
+    let spans := normalizeSpans total (retained ++ incoming)
+    ⟨true, spansContain spans 0 && spans.any (fun r => r.start == 0 && r.stop == total), spans⟩
+
+/-- Decode paired UInt64 endpoints; an unmatched final endpoint contributes nothing. -/
+def spansOf : List UInt64 → List GroupSpan
+  | start :: stop :: rest => ⟨start.toNat, stop.toNat⟩ :: spansOf rest
+  | [] => []
+  | [_] => []
+
+/-- Native entry point for the pure CAS plan. -/
+@[export synch_lean_cas_plan]
+def casPlan (row durable complete : Bool) (recorded claimed : UInt64)
+    (old incoming : Array UInt64) : CasPlan :=
+  planCasCommit row durable complete recorded claimed (spansOf old.toList) (spansOf incoming.toList)
+
+/-- Scalar plan outcome: refused, partial, or complete. -/
+@[export synch_lean_cas_plan_status]
+def casPlanStatus (plan : CasPlan) : UInt8 :=
+  if !plan.accepted then 0 else if plan.complete then 2 else 1
+
+/-- Export normalized endpoints without exposing the runtime's object layout. -/
+@[export synch_lean_cas_plan_spans]
+def casPlanSpans (plan : CasPlan) : Array UInt64 :=
+  (plan.spans.flatMap fun r => [UInt64.ofNat r.start, UInt64.ofNat r.stop]).toArray
+
 end VerifiedCore

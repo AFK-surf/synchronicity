@@ -119,7 +119,6 @@ structure Cell (H : Type) where
 
 /-- `cas.rs::read_claim`: what a row claims held.  A complete row is read as
 holding every group of its size; a bitmap row holds the groups it names. -/
-@[rust_impl "cas-row-complete"]
 def Complete (c : Cell H) : Prop := ∀ g, g < groupCount c.size → g ∈ c.held
 
 /-- `cas.rs::size_is_attested`.  Only the final group attests to a size: every
@@ -220,7 +219,7 @@ a complete commit a local backend acknowledges (`durable`, from
 `complete_is_durable`).  `upsert_blob_row` keeps `durable` at
 `max(old, new)`.  With `durable = false` a complete commit is the staged row a
 cloud backend leaves until `finalize`, which `DropStaged` may later discard. -/
-@[transition, rust_impl "cas-write-groups-commit"]
+@[transition]
 def CommitGroups (durable : Bool) (size : Nat) (groups : Set Nat) : Transition (Cell H) where
   guard c := ¬c.sweeping ∧ Settles c size
   post c :=
@@ -641,7 +640,6 @@ theorem settled_size_is_stable (h : (Trans k).rel c c') (row : c.row) (settled :
 /-- A bit a commit dropped was only ever a claim: the row's size was neither
 durable nor attested, so the tree it was verified under was the claim's, and
 the claim has yielded (`settle_size`, rule 3). -/
-@[rust_justifies "cas-size-reset"]
 theorem dropped_bit_was_a_claim {durable : Bool} {size : Nat} {groups : Set Nat} {g : Nat}
     (hinv : Invariant c) (h : (CommitGroups durable size groups).rel c c')
     (was : g ∈ c.held) (gone : g ∉ c'.held) : ¬Settled c := by

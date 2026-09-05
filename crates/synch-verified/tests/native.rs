@@ -1,6 +1,59 @@
 use proptest::prelude::*;
 use synch_verified::{group_count, settle_size, CertificateCache, Scope, Settlement, Shape};
 
+#[test]
+fn cas_plan_handles_empty_objects_resets_and_unbounded_input_endpoints() {
+    let plan =
+        synch_verified::plan_cas_commit(false, false, false, 0, 0, &[], &[(0, u64::MAX)]).unwrap();
+    assert!(plan.complete);
+    assert_eq!(plan.ranges, vec![(0, 1)]);
+    assert!(synch_verified::plan_cas_commit(true, true, false, 1, 2, &[], &[(0, 1)]).is_none());
+    let plan = synch_verified::plan_cas_commit(
+        true,
+        false,
+        false,
+        16384 * 4,
+        16384 * 8,
+        &[(0, 2)],
+        &[(7, u64::MAX)],
+    )
+    .unwrap();
+    assert_eq!(plan.ranges, vec![(7, 8)]);
+    assert!(!plan.complete);
+    let plan =
+        synch_verified::plan_cas_commit(true, false, true, u64::MAX, u64::MAX, &[], &[]).unwrap();
+    assert!(plan.complete);
+    assert_eq!(plan.ranges, vec![(0, group_count(u64::MAX))]);
+}
+
+proptest! {
+    #[test]
+    fn cas_plan_matches_pointwise_group_membership(
+        row in any::<bool>(), durable in any::<bool>(), complete in any::<bool>(),
+        recorded in 0u64..(128 * 16384), claimed in 0u64..(128 * 16384),
+        old in prop::collection::vec((0u64..150, 0u64..150), 0..32),
+        incoming in prop::collection::vec((0u64..150, 0u64..150), 0..32),
+    ) {
+        let contains = |rs: &[(u64,u64)], g| rs.iter().any(|&(a,b)| a <= g && g < b);
+        let prior = |g| row && (if complete { g < group_count(recorded) } else { contains(&old, g) });
+        let decision = settle_size(row, durable, complete, prior(group_count(recorded)-1), recorded, claimed);
+        let plan = synch_verified::plan_cas_commit(row, durable, complete, recorded, claimed, &old, &incoming);
+        if decision == Settlement::Refuse {
+            prop_assert!(plan.is_none());
+        } else {
+            let plan = plan.unwrap();
+            let total = group_count(claimed);
+            let expected = |g| g < total && (contains(&incoming, g) || (decision != Settlement::Reset && prior(g)));
+            for g in 0..151 {
+                prop_assert_eq!(contains(&plan.ranges, g), expected(g));
+            }
+            prop_assert_eq!(plan.complete, (0..total).all(expected));
+            prop_assert!(plan.ranges.iter().all(|&(a,b)| a < b && b <= total));
+            prop_assert!(plan.ranges.windows(2).all(|rs| rs[0].1 < rs[1].0));
+        }
+    }
+}
+
 fn observe(
     walk: &mut synch_verified::MissingWalk,
     reference: synch_verified::WalkNode<'_>,
