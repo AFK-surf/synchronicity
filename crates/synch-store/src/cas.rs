@@ -400,32 +400,6 @@ impl BlobRow {
     }
 }
 
-/// True if the groups on this disk actually attest to a recorded size.
-///
-/// Only the last group can. Every other group's chaining value is the same
-/// whatever the object's total length, so holding the first half of an object
-/// says a great deal about its content and nothing at all about where it ends;
-/// the final group is short by exactly the amount the size determines, and is
-/// the one place a wrong size cannot survive.
-///
-/// This is what keeps a peer from bricking a root. An object's tree has the same
-/// shape for every size inside its last 16 KiB **group** — the group is this
-/// store's leaf, and nothing above it moves while the group count stays put — so
-/// an entry that overstates an honest root by a few bytes yields a proof that
-/// verifies, and the row it creates would then refuse every honest writer of
-/// that root forever with "size mismatch", on every node that ever touched the
-/// poisoned path, with nothing to collect the row because the honest entry still
-/// references it. A size no group attests to is a claim, not a fact, and the
-/// next writer's claim replaces it (§5.1, §6.2).
-///
-/// Taken as three loose values rather than off a [`BlobRow`] so that the commit
-/// path can ask the question of a row it read *inside* its own transaction.
-fn size_is_attested(size: u64, complete: bool, held: &ChunkRanges) -> bool {
-    // LEAN-MODEL: cas-size-attested (Cas.Attested)
-    // `Cas.Attested` is this predicate: complete, or the final group held.
-    complete || held.contains(group_count(size) - 1)
-}
-
 /// What a size claim settled to, and what that costs the bits already held.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub(crate) struct Settlement {
@@ -442,7 +416,7 @@ pub(crate) struct Settlement {
 ///
 /// Three answers, and the order matters:
 ///
-/// 1. A size the disk attests to ([`size_is_attested`]) is a fact, and a writer
+/// 1. A size the disk attests to (complete or final-group-held) is a fact, and a writer
 ///    offering a different one is offering bytes for some other object: refused.
 /// 2. A size no group attests to is a peer's claim off an entry, and yields to
 ///    this writer's — that is what keeps an overstated entry from bricking an
@@ -482,32 +456,31 @@ pub(crate) fn settle_size(
     // LEAN-MODEL: cas-size-settlement (Cas.Settles)
     // `Cas.Settles` is this decision as the guard on every groups commit: no
     // row, or the recorded size, or a size neither durable nor attested.
-    let settled = |size| {
-        Ok(Settlement {
-            size,
-            reset_held: false,
-        })
+    let (row, recorded, complete, durable, final_held) = match existing {
+        None => (false, 0, false, false, false),
+        Some((recorded, complete, durable, held)) => (
+            true,
+            recorded,
+            complete,
+            durable,
+            held.contains(synch_verified::group_count(recorded) - 1),
+        ),
     };
-    let Some((recorded, complete, durable, held)) = existing else {
-        return settled(claimed);
-    };
-    if recorded == claimed {
-        return settled(recorded);
-    }
-    if durable || size_is_attested(recorded, complete, held) {
-        // LEAN-MODEL: cas-size-refusal (Cas.settled_size_is_stable)
-        // `Cas.settled_size_is_stable` is what this refusal buys: no step of
-        // the model leaves a row standing under a different size once its
-        // size is durable or attested.
-        return Err(StoreError::Verification {
+    // Only complete or final-group evidence attests the recorded size; every
+    // earlier group can verify for multiple lengths in the same tree shape.
+    // LEAN-MODEL: cas-size-attested (Cas.Attested)
+    // LEAN-MODEL: cas-size-refusal (Cas.settled_size_is_stable)
+    // LEAN-MODEL: verified-size-settlement (VerifiedCoreProofs.settlement_refines_model)
+    match synch_verified::settle_size(row, durable, complete, final_held, recorded, claimed) {
+        synch_verified::Settlement::Refuse => Err(StoreError::Verification {
             root: *root,
             reason: format!("size mismatch: have {recorded}, offered {claimed}"),
-        });
+        }),
+        decision => Ok(Settlement {
+            size: claimed,
+            reset_held: decision == synch_verified::Settlement::Reset,
+        }),
     }
-    Ok(Settlement {
-        size: claimed,
-        reset_held: group_count(claimed) != group_count(recorded),
-    })
 }
 
 /// What a bitmap commit settled.
@@ -524,7 +497,7 @@ struct RowClaim {
     size: u64,
     complete: bool,
     durable: bool,
-    held: ChunkRanges,
+    ranges: Vec<(u64, u64)>,
 }
 
 /// Extends a file to at least `len`, and never shortens it.
@@ -655,8 +628,8 @@ fn upsert_blob_row(conn: &rusqlite::Connection, row: BlobRowWrite<'_>) -> Result
 
 /// What an object's row currently claims, read on a given connection.
 ///
-/// The bitmap is read against the row's *own* size, not the caller's: the two
-/// can differ, and that difference is the whole subject of [`settle_size`].
+/// Decode raw claims only; the Lean planner interprets them against the row's
+/// own size before deciding whether the caller's size may replace it.
 fn read_claim(conn: &rusqlite::Connection, root: &Hash) -> Result<Option<RowClaim>> {
     let row: Option<(i64, i64, i64, Option<Vec<u8>>)> = conn
         .query_row(
@@ -667,22 +640,18 @@ fn read_claim(conn: &rusqlite::Connection, root: &Hash) -> Result<Option<RowClai
         .optional()?;
     Ok(row.map(|(size, complete, durable, bitmap)| {
         let size = size as u64;
-        let total = group_count(size);
         let complete = complete != 0;
-        // LEAN-MODEL: cas-row-complete (Cas.Complete)
-        // `Cas.Complete` is what `complete` means when a row is read: every
-        // group of the row's own size is held. A bitmap row holds the groups
-        // it names and nothing more.
-        let held = match (complete, &bitmap) {
-            (true, _) => ChunkRanges::single(0, total),
-            (false, Some(bytes)) => blob_to_ranges(bytes, total),
-            (false, None) => ChunkRanges::empty(),
-        };
+        // Lean interprets complete rows, settles the size, and normalizes the
+        // retained and incoming ranges against the accepted size.
+        let ranges = bitmap
+            .as_deref()
+            .and_then(|bytes| postcard::from_bytes(bytes).ok())
+            .unwrap_or_default();
         RowClaim {
             size,
             complete,
             durable: durable != 0,
-            held,
+            ranges,
         }
     }))
 }
@@ -933,36 +902,41 @@ impl Store {
         inline: Option<Vec<u8>>,
         now: i64,
     ) -> Result<Commit> {
-        // LEAN-MODEL: cas-write-groups-commit (Cas.CommitGroups)
-        // `Cas.CommitGroups` abstracts both partial and completing bitmap
-        // commits; durability rises only when this commit completes locally.
         self.with_immediate_tx(|tx| {
             let claim = read_claim(tx, root)?;
-            let settlement = settle_size(
-                root,
-                claim
-                    .as_ref()
-                    .map(|c| (c.size, c.complete, c.durable, &c.held)),
+            let incoming: Vec<_> = groups.ranges.iter().map(|r| (r.start, r.end)).collect();
+            let (recorded, complete, durable, old) =
+                claim.as_ref().map_or((0, false, false, &[][..]), |c| {
+                    (c.size, c.complete, c.durable, c.ranges.as_slice())
+                });
+            // LEAN-MODEL: cas-native-plan-membership (VerifiedCoreProofs.cas_plan_membership)
+            // LEAN-MODEL: cas-native-plan-complete (VerifiedCoreProofs.cas_plan_complete_covers)
+            // Lean owns settlement, bitmap reset/union/clipping and completion.
+            // Rust executes the returned plan within this same SQL transaction.
+            let plan = synch_verified::plan_cas_commit(
+                claim.is_some(),
+                durable,
+                complete,
+                recorded,
                 size,
-            )?;
-            let size = settlement.size;
-            let total = group_count(size);
-            // A settlement that moved the group count invalidates the bitmap:
-            // those bits were verified against a tree of a different shape, and
-            // the size that gave them that shape was only ever a claim. Start
-            // the bitmap again rather than carry bits describing a tree nobody
-            // is writing any more.
-            // LEAN-MODEL: cas-size-reset (Cas.dropped_bit_was_a_claim)
-            // `Cas.dropped_bit_was_a_claim` is why this loses nothing that was
-            // a fact: a bit goes only when the row's size was neither durable
-            // nor attested, and `Cas.Invariant.held_within_size` is what
-            // keeping the bits under an unchanged group count preserves.
-            let held = match (settlement.reset_held, claim) {
-                (false, Some(claim)) => claim.held,
-                _ => ChunkRanges::empty(),
+                old,
+                &incoming,
+            )
+            .ok_or_else(|| StoreError::Verification {
+                root: *root,
+                reason: format!("size mismatch: have {recorded}, offered {size}"),
+            })?;
+            // LEAN-MODEL: cas-native-plan-canonical (VerifiedCoreProofs.cas_plan_separated)
+            // The proved output already satisfies the range container's ordering
+            // and non-overlap contract; do not duplicate normalization in Rust.
+            let verified = ChunkRanges {
+                ranges: plan
+                    .ranges
+                    .into_iter()
+                    .map(|(start, end)| GroupRange { start, end })
+                    .collect(),
             };
-            let verified = held.union(groups).intersect(&ChunkRanges::single(0, total));
-            let complete = verified.count() >= total;
+            let complete = plan.complete;
             let durable = self.complete_is_durable();
             upsert_blob_row(
                 tx,
@@ -990,7 +964,7 @@ impl Store {
     /// The one place a file in the CAS is ever made smaller, and it runs only
     /// after a commit that *completed* the object — at which point the final
     /// group is held and the size is a fact rather than a claim
-    /// ([`size_is_attested`]). What it cleans up is the overstatement
+    /// (the attestation predicate). What it cleans up is the overstatement
     /// case: an entry claimed a few bytes more than the object has, the sparse
     /// payload was grown to fit the claim, and the honest writer that finished
     /// the object replaced it. Best effort — a payload left long costs disk,
@@ -1471,39 +1445,48 @@ impl Store {
     /// under a live entry is exactly the evidence that the release was decided
     /// against a tree that has since changed its mind.
     pub fn pin(&self, root: &Hash, holder: &PinHolder, now: i64) -> Result<bool> {
-        // LEAN-MODEL: cas-pin (Cas.Pin)
-        // `Cas.Pin` includes the held-object check and pin insertion
-        // in this immediate transaction.
-        self.with_immediate_tx(|tx| {
-            // Held *durably*, not merely known or cached: a `blobs` row exists
-            // for a partial fetch too, and on a cloud backend a complete row
-            // is only a scratch copy until the backend has taken it
-            // (`durable=1`). A pin is a promise about the durable tier, so the
-            // predicate is `durable` alone, which is `Cas.Durable`
-            // and the fact the whole GC argument rests on: every path that
-            // drops a staged row without consulting `pins` — cache eviction,
-            // a scratch-generation reset, a backend migration — is safe only
-            // because a non-durable row can never be pinned. On the local
-            // backend a complete row is durable by construction, so nothing
-            // changes there. `take_possession` enforces the same thing on the
-            // other entry point, and a promise about bytes belongs in the
-            // store rather than in the discipline of every caller.
-            let held: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM blobs WHERE root = ?1 AND durable != 0)",
-                params![root.as_bytes().to_vec()],
+        self.acquire_pin(root, holder, now, false)
+    }
+
+    /// Execute the native pin/possession plan against one immediate transaction.
+    /// A pin promises a durable claim, never merely a partial or staged cache
+    /// row. Possession also needs the holder's uncancelled want, so a late fetch
+    /// cannot resurrect an orphan role claim after role removal.
+    /// This durable-only contract is why staged-row eviction need not consult
+    /// pins: scratch copies cannot acquire promises about durable availability.
+    pub(crate) fn acquire_pin(
+        &self,
+        root: &Hash,
+        holder: &PinHolder,
+        now: i64,
+        possession: bool,
+    ) -> Result<bool> {
+        use synch_verified::cas::{AcquisitionSnapshot, LifecycleRequest, Outcome};
+        let outcome = self.execute_cas_lifecycle(root, Some(holder), now, |tx| {
+            // Read facts only. Lean decides which combination authorizes a pin.
+            let durable: Option<i64> = tx
+                .query_row(
+                    "SELECT durable FROM blobs WHERE root = ?1",
+                    params![root.as_bytes().to_vec()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            let wanted: bool = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM content_want WHERE root = ?1 AND holder = ?2)",
+                params![root.as_bytes().to_vec(), holder.render()],
                 |row| row.get(0),
             )?;
-            if !held {
-                return Ok(false);
-            }
-            tx.execute(
-                "INSERT INTO pins (root, holder, created_at, release_after)
-                 VALUES (?1, ?2, ?3, NULL)
-                 ON CONFLICT(root, holder) DO UPDATE SET release_after = NULL",
-                params![root.as_bytes().to_vec(), holder.render(), now],
-            )?;
-            Ok(true)
-        })
+            // LEAN-MODEL: cas-lifecycle-acquisition (CasLifecycleProofs.acquisition_authorized)
+            Ok(LifecycleRequest::Acquire {
+                snapshot: AcquisitionSnapshot {
+                    row: durable.is_some(),
+                    durable: durable.unwrap_or(0) != 0,
+                    wanted,
+                },
+                possession,
+            })
+        })?;
+        Ok(outcome == Outcome::Applied)
     }
 
     /// Drops one holder's claim. Returns whether one was dropped.
@@ -1687,36 +1670,10 @@ impl Store {
         //
         // So the writer's own mark is consulted, under the same guard. A write
         // in flight is not a collectable object, whatever the row says.
-        let mut conn = self.conn();
-        let _ordered_against_writers = self.cas_order();
-        if self.is_being_written(root) {
-            return Ok(false);
-        }
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        // LEAN-MODEL: cas-gc-row-commit (Cas.GcCommit)
-        // `Cas.GcCommit` is this conditional row transition. Its guard is
-        // intentionally re-read here, not inherited from the candidate scan.
-        let rows = tx.execute(
-            "DELETE FROM blobs
-               WHERE root = ?1
-                 AND NOT EXISTS (SELECT 1 FROM pins WHERE pins.root = blobs.root)
-                 AND last_access < ?2
-                 AND NOT EXISTS (
-                   SELECT 1 FROM entries WHERE entries.content = blobs.root
-                 )",
-            params![root.as_bytes().to_vec(), before],
-        )?;
-        tx.commit()?;
-        let deleted = rows > 0;
-        if deleted {
-            // LEAN-MODEL: cas-gc-unlink (Cas.GcUnlink)
-            // `Cas.GcUnlink` is separate from the row commit because the
-            // filesystem cannot join SQLite; `conn` remains held between them.
-            let _ = std::fs::remove_file(self.blob_path(root));
-            let _ = std::fs::remove_file(self.outboard_path(root));
-        }
-        drop(conn);
-        Ok(deleted)
+        Ok(
+            self.execute_blob_deletion(root, Some(before))?
+                == synch_verified::cas::Outcome::Applied,
+        )
     }
 
     /// Deletes an unprotected object's payload, outboard, and index row.
@@ -1726,37 +1683,117 @@ impl Store {
     /// "delete" must not be a back door around a live entry or pin: callers
     /// remove those claims first, then delete the now-unprotected cache object.
     pub fn delete_blob(&self, root: &Hash) -> Result<()> {
+        use synch_verified::cas::Outcome;
+        match self.execute_blob_deletion(root, None)? {
+            Outcome::Writing => Err(StoreError::invalid(format!(
+                "blob {root} is being written and cannot be deleted"
+            ))),
+            Outcome::Protected => Err(StoreError::invalid(format!(
+                "blob {root} is referenced or pinned and cannot be deleted"
+            ))),
+            Outcome::Applied => Ok(()),
+            _ => unreachable!("explicit Lean deletion returned a nonterminal outcome"),
+        }
+    }
+
+    /// Execute Lean's ordered deletion effects while holding both ordering
+    /// guards. The SQL only reads facts or performs unconditional keyed writes;
+    /// policy and the commit-before-unlink protocol live in the native core.
+    fn execute_blob_deletion(
+        &self,
+        root: &Hash,
+        before: Option<i64>,
+    ) -> Result<synch_verified::cas::Outcome> {
+        use synch_verified::cas::{DeletionSnapshot, LifecycleRequest};
+        self.execute_cas_lifecycle(root, None, 0, |tx| {
+            let (pinned, referenced): (bool, bool) = tx.query_row(
+                "SELECT EXISTS(SELECT 1 FROM pins WHERE root = ?1),
+                    EXISTS(SELECT 1 FROM entries WHERE content = ?1)",
+                params![root.as_bytes().to_vec()],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )?;
+            let accessed: Option<i64> = tx
+                .query_row(
+                    "SELECT last_access FROM blobs WHERE root = ?1",
+                    params![root.as_bytes().to_vec()],
+                    |row| row.get(0),
+                )
+                .optional()?;
+            // LEAN-MODEL: cas-lifecycle-deletion (CasLifecycleProofs.deletion_authorized)
+            Ok(LifecycleRequest::Delete {
+                snapshot: DeletionSnapshot {
+                    row: accessed.is_some(),
+                    writing: self.is_being_written(root),
+                    pinned,
+                    referenced,
+                    last_access: accessed.unwrap_or(0),
+                },
+                before,
+            })
+        })
+    }
+
+    /// One CAS-domain executor: snapshot under locks, atomic mutation batch,
+    /// successful commit, then cleanup. No internal Lean phases cross the ABI.
+    fn execute_cas_lifecycle(
+        &self,
+        root: &Hash,
+        holder: Option<&PinHolder>,
+        now: i64,
+        snapshot: impl FnOnce(
+            &rusqlite::Transaction<'_>,
+        ) -> Result<synch_verified::cas::LifecycleRequest>,
+    ) -> Result<synch_verified::cas::Outcome> {
+        use synch_verified::cas::{plan_lifecycle, Cleanup, Mutation};
         let mut conn = self.conn();
         let _ordered_against_writers = self.cas_order();
-        if self.is_being_written(root) {
-            return Err(StoreError::invalid(format!(
-                "blob {root} is being written and cannot be deleted"
-            )));
-        }
         let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        // LEAN-MODEL: cas-protected-delete (Cas.ProtectedDelete)
-        // `Cas.ProtectedDelete` is this no-entry/no-pin/no-writer
-        // transition. The checks and row deletion are one write transaction.
-        let protected: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM pins WHERE root = ?1)
-                 OR EXISTS(SELECT 1 FROM entries WHERE content = ?1)",
-            params![root.as_bytes().to_vec()],
-            |row| row.get(0),
-        )?;
-        if protected {
-            return Err(StoreError::invalid(format!(
-                "blob {root} is referenced or pinned and cannot be deleted"
-            )));
+        // LEAN-MODEL: cas-lifecycle-refusal (CasLifecycleProofs.refusal_effect_free)
+        let plan = plan_lifecycle(snapshot(&tx)?);
+        for mutation in plan.transaction() {
+            match mutation {
+                Mutation::DeleteRow => {
+                    tx.execute(
+                        "DELETE FROM blobs WHERE root = ?1",
+                        params![root.as_bytes().to_vec()],
+                    )?;
+                }
+                Mutation::DeleteWant => {
+                    tx.execute(
+                        "DELETE FROM content_want WHERE root = ?1 AND holder = ?2",
+                        params![
+                            root.as_bytes().to_vec(),
+                            holder.expect("acquisition holder").render()
+                        ],
+                    )?;
+                }
+                Mutation::UpsertPin => {
+                    tx.execute(
+                        "INSERT INTO pins (root, holder, created_at, release_after)
+                        VALUES (?1, ?2, ?3, NULL)
+                        ON CONFLICT(root, holder) DO UPDATE SET release_after = NULL",
+                        params![
+                            root.as_bytes().to_vec(),
+                            holder.expect("acquisition holder").render(),
+                            now
+                        ],
+                    )?;
+                }
+            }
         }
-        tx.execute(
-            "DELETE FROM blobs WHERE root = ?1",
-            params![root.as_bytes().to_vec()],
-        )?;
+        // LEAN-MODEL: cas-lifecycle-cleanup (CasLifecycleProofs.cleanup_requires_row_deletion)
         tx.commit()?;
-        let _ = std::fs::remove_file(self.blob_path(root));
-        let _ = std::fs::remove_file(self.outboard_path(root));
-        drop(conn);
-        Ok(())
+        for cleanup in plan.after_commit() {
+            match cleanup {
+                Cleanup::Payload => {
+                    let _ = std::fs::remove_file(self.blob_path(root));
+                }
+                Cleanup::Outboard => {
+                    let _ = std::fs::remove_file(self.outboard_path(root));
+                }
+            }
+        }
+        Ok(plan.outcome())
     }
 
     /// Simulates storage loss for recovery and race tests.
@@ -2120,6 +2157,7 @@ impl Store {
             reason: e.to_string(),
         })?;
 
+        // LEAN-MODEL: cas-verified-groups-flush (Ingestion.Flush)
         // Persist the verified groups (payload and outboard) before the bitmap
         // in the index advances to cover them — otherwise a crash could leave
         // the index claiming groups the disk never received.
@@ -2682,6 +2720,54 @@ mod tests {
             store.read_all(&root),
             Err(StoreError::MissingBlob(_))
         ));
+    }
+
+    #[test]
+    fn deletion_sql_failures_never_advance_to_unlink() {
+        for fail_at_commit in [false, true] {
+            for collect in [false, true] {
+                let (_dir, store) = store();
+                let bytes = data(100_000);
+                let root = store.ingest_bytes(&bytes, 0).unwrap();
+                if fail_at_commit {
+                    // The DELETE succeeds, but its deferred constraint fails
+                    // COMMIT. No filesystem effect may have been requested yet.
+                    store
+                        .conn()
+                        .execute_batch(
+                            "CREATE TABLE deletion_parent (id INTEGER PRIMARY KEY);
+                         CREATE TABLE deletion_child (parent INTEGER REFERENCES deletion_parent(id)
+                           DEFERRABLE INITIALLY DEFERRED);
+                         CREATE TRIGGER fail_deletion_commit AFTER DELETE ON blobs
+                           BEGIN INSERT INTO deletion_child VALUES (1); END;",
+                        )
+                        .unwrap();
+                } else {
+                    store
+                        .conn()
+                        .execute_batch(
+                            "CREATE TRIGGER fail_deletion_row BEFORE DELETE ON blobs
+                           BEGIN SELECT RAISE(ABORT, 'injected deletion failure'); END;",
+                        )
+                        .unwrap();
+                }
+                let result = if collect {
+                    store
+                        .delete_blob_if_collectable(&root, i64::MAX)
+                        .map(|_| ())
+                } else {
+                    store.delete_blob(&root)
+                };
+                assert!(result.is_err());
+                assert!(
+                    store.blob(&root).unwrap().is_some(),
+                    "row deletion must roll back"
+                );
+                assert!(store.blob_path(&root).exists());
+                assert!(store.outboard_path(&root).exists());
+                assert_eq!(store.read_all(&root).unwrap(), bytes);
+            }
+        }
     }
 
     /// Two writers filling one object keep both halves of what they wrote: a

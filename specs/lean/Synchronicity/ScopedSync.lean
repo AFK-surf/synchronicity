@@ -36,7 +36,7 @@ The model is positional, and so is Rust: `note_redacted` remembers a refusal
 by hash *and position*, `next_batch` treats a refused position as a boundary
 only when the node is absent — a held node, whatever a peer refused at some
 position, is expanded wherever the walk meets it (`Boundary`) — and
-`MissingWalk::seen` deduplicates expansions by hash inside the grant, where
+The executable Lean walk deduplicates expansions by hash and depth inside the grant, where
 `children_inside_grant_admitted` makes expansion position-independent, and by
 hash and position above it.
 -/
@@ -227,6 +227,17 @@ def AdmitsNode (s : Scope) (path : Path) : Node → Prop
   | .ext pre _ => s.AdmitsPath (path ++ pre)
   | .leaf keyRest _ => s.AdmitsKey (path ++ keyRest)
 
+/-- Payload permission is about the value's key, not the containing spine node. -/
+def AdmitsValue (s : Scope) (path : Path) : Node → Prop
+  | .branch _ _ => s.AdmitsKey path
+  | .leaf keyRest _ => s.AdmitsKey (path ++ keyRest)
+  | .ext _ _ => False
+
+/-- Every key whose payload is admitted is a granted key, including branch values. -/
+theorem admitted_value_key (h : AdmitsValue s path n) (hk : SpellsKey path n key) :
+    s.AdmitsKey key := by
+  cases hk <;> exact h
+
 theorem admitsNode_of_full (h : s.IsFull) (path : Path) (n : Node) : AdmitsNode s path n := by
   cases n with
   | leaf rest value => exact Scope.admitsKey_of_containsSubtree (Scope.containsSubtree_of_full h _)
@@ -295,7 +306,6 @@ skip on a failed load.  An absent hash refused at this position is satisfied
 rather than missing, but only above the grant.  A held node is never a
 boundary: a node refused at one position may be held from another it shares
 by structure, and holding it is what the walk is establishing. -/
-@[rust_impl "mpt-walk-boundary"]
 def Boundary (s : Scope) (st : Store) (path : Path) (x : Hash) : Prop :=
   x ∉ st.held ∧ ¬ s.ContainsSubtree path ∧ (path, x) ∈ st.redacted
 
@@ -306,7 +316,6 @@ theorem held_not_boundary (h : x ∈ st.held) : ¬ Boundary s st path x :=
 is admitted, so expanding a node there does not depend on which of its
 positions the walk met it at; one expansion per hash is one per subtree.
 Above the grant the key carries the position. -/
-@[rust_justifies "mpt-walk-seen"]
 theorem children_inside_grant_admitted (h : s.ContainsSubtree path) (stp : Path) :
     s.AdmitsPath (path ++ stp) :=
   Scope.admitsPath_of_containsSubtree (Scope.containsSubtree_append h stp)
@@ -385,11 +394,12 @@ theorem Reach.full (h : Reach c st s r path x) : Reach c st Scope.full r path x 
   Walk.mono_scope (fun p _ => Scope.admitsPath_of_full Scope.full_isFull p) h
 
 /-- A walk finishing with nothing missing: every position it reaches is held or
-a boundary, and every node it expands has its out-of-line value. -/
+a boundary, and every expanded node's key-authorized out-of-line value is held. -/
 def Drained (c : Content) (st : Store) (s : Scope) (W : Path → Hash → Prop) : Prop :=
   ∀ path x, W path x →
     (x ∈ st.held ∨ Boundary s st path x) ∧
-    (¬ Boundary s st path x → ∀ n v, c x = some n → n.valueHash = some v → v ∈ st.heldValue)
+    (¬ Boundary s st path x → ∀ n v, c x = some n → n.valueHash = some v →
+      AdmitsValue s path n → v ∈ st.heldValue)
 
 /-- `trie.rs::Trie::is_complete_scoped`.  The unguarded walk drains with
 nothing missing — the fact the memo records. -/
@@ -400,7 +410,6 @@ def CompleteWithin (c : Content) (st : Store) (s : Scope) (root : Hash) : Prop :
 /-- `trie.rs::MissingWalk::next_batch`, `reference == Some(hash)`.  The walk
 with a reference: a position whose wanted hash the reference pairing also
 names is skipped, and nothing below it is visited. -/
-@[rust_impl "mpt-walk-prune-reference"]
 abbrev ReachRef (c : Content) (st : Store) (s : Scope) (prune : Path → Hash → Prop) (root : Hash) :
     Path → Hash → Prop :=
   Walk c st s (fun p x => ¬ prune p x) root
@@ -460,7 +469,6 @@ prefix); a shape mismatch or an absent node ends the pairing.  That is
 exactly the reference root's own scoped walk, so `Paired` *is* `Reach` — and a
 held node is never a boundary, which is why the code's boundary check on the
 reference side is not a separate premise. -/
-@[rust_impl "mpt-walk-paired-children"]
 abbrev Paired (c : Content) (st : Store) (s : Scope) (R : Hash) : Path → Hash → Prop :=
   Reach c st s R
 
@@ -567,7 +575,7 @@ carries it, resolved at the claimed position and judged by what it reveals. -/
 def ServeValue (c : Content) (s : Scope) (heads : Hash → Prop) (w : Want) (v : Hash) : Prop :=
   v = w.claimed ∧
     (¬ s.IsFull → ∃ x n, Admit c s heads w x ∧ c x = some n ∧ n.valueHash = some v ∧
-      AdmitsNode s w.path n)
+      AdmitsValue s w.path n)
 
 theorem Redacts.not_full (h : Redacts c s heads w x) : ¬ s.IsFull :=
   fun full => let ⟨_, n, _, refused⟩ := h; refused (admitsNode_of_full full _ n)
@@ -705,11 +713,19 @@ served, at an admitted position. -/
 theorem held_value_within_scope (hs : ¬ s.IsFull) (h : Reachable c s heads st) {v : Hash}
     (hheld : v ∈ st.heldValue) :
     ∃ root path x n, heads root ∧ s.AdmitsPath path ∧ At c root path x ∧ c x = some n ∧
-      n.valueHash = some v ∧ AdmitsNode s path n := by
+      n.valueHash = some v ∧ AdmitsValue s path n := by
   obtain ⟨w, served⟩ := (reachable_confined h).values v hheld
   obtain ⟨x, n, hadmit, hc, hv, hnode⟩ := served.2 hs
   obtain ⟨hadm, hat⟩ := admit_resolves hs hadmit
   exact ⟨w.root, w.path, x, n, admit_requires_head hs hadmit, hadm, hat, hc, hv, hnode⟩
+
+/-- A held payload is authorized at its actual key, not merely on the spine. -/
+theorem held_payload_key_granted (hs : ¬ s.IsFull) (h : Reachable c s heads st)
+    (hheld : v ∈ st.heldValue) :
+    ∃ root path x n, heads root ∧ At c root path x ∧ c x = some n ∧
+      n.valueHash = some v ∧ ∀ key, SpellsKey path n key → s.AdmitsKey key := by
+  obtain ⟨root, path, x, n, hh, _, hat, hn, hv, ha⟩ := held_value_within_scope hs h hheld
+  exact ⟨root, path, x, n, hh, hat, hn, hv, fun _ hk => admitted_value_key ha hk⟩
 
 /-- Every redaction a delegate remembers was a refusal at an above-grant
 position, which is the only place the walk consults it. -/

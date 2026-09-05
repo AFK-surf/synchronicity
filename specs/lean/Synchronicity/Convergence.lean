@@ -25,9 +25,10 @@ and the theorem that puts them back together (`converge`).
    `Trie::get`; `view_deterministic` says a key has one value under a root, and
    `ScopedView` — what `materialize_diff` derives under a read scope — is
    therefore the same on every node that promoted the same head under the same
-   scope.  `admitted_key_readable` says a node whose trie is complete within
-   its scope can read every admitted key (`Readable`): it holds the node
-   carrying it, or the key lies under a boundary the walk stopped at.
+   scope. `ReadableOrRefused` distinguishes a held carrier from a refused
+   boundary; it is not actual readability. `complete_reads_unobstructed`
+   establishes `Readable`, including payload availability, when no refusal
+   blocks the key. `Materialization` separately proves actual row equality.
 
 3. **The fetch terminates, and a fetch that can take no step is complete.**
    `FetchStep` is one learned item — a node, a refusal, or a value — for a
@@ -38,14 +39,12 @@ and the theorem that puts them back together (`converge`).
    premise `try_promote` flips on (`stuck_fetch_promotes`).
 
 What is assumed, and stated as hypotheses rather than proved: that a peer
-holding the root's head stays reachable and answers (a `FetchStep` exists
-whenever the responder would serve); that the origin's trie is whole
-(`Whole`) and finite (`Bounded`); and, for out-of-line values, `Productive`:
-that a held node is admitted where the walk meets it.  A node held from a
-position where it revealed less may sit at one where it reveals more, and the
-responder will not serve its value there; Rust abandons that head after
-`MAX_UNPRODUCTIVE_ROUNDS` and retries, and this model has no step for the
-abandonment.
+holding the root's head stays reachable and answers; that the origin's trie
+is whole (`Whole`) and finite (`Bounded`). `fetch_reaches_complete` proves a
+finite successful trace exists. It does not prove delivery or fairness of the
+network scheduler. Payload requests are key-authorized, so no separate
+`Productive` admission assumption is needed. Rust's bounded retry/abandonment
+policy remains outside this progress relation.
 -/
 
 namespace Synchronicity.Convergence
@@ -280,18 +279,17 @@ theorem scoped_view_deterministic {v₁ v₂ : ValueRef} (canon : Canonical c)
     (h₁ : ScopedView c s r key v₁) (h₂ : ScopedView c s r key v₂) : v₁ = v₂ :=
   view_deterministic canon h₁.2 h₂.2
 
-/-- A node can read the value of `key` under the root: it holds the node
-carrying it, or the key lies under a boundary the walk stopped at, a position
-the serving peer refused. -/
-def Readable (c : Content) (st : Store) (s : Scope) (root : Hash) (key : Path) (v : ValueRef) :
+/-- The structural outcome for a key: its carrier is held, or a peer refused
+a boundary above it. This does not assert that its payload is readable. -/
+def ReadableOrRefused (c : Content) (st : Store) (s : Scope) (root : Hash) (key : Path) (v : ValueRef) :
     Prop :=
   (∃ p x, At c root p x ∧ CarriesKey c x p key v ∧ x ∈ st.held) ∨
     ∃ p' x', p' <+: key ∧ Reach c st s root p' x' ∧ Boundary s st p' x'
 
-/-- **A complete scoped node can read its view.**  Under a root complete within
-the scope, every admitted key with a value is `Readable`. -/
-theorem admitted_key_readable {v : ValueRef} (hc : CompleteWithin c st s r)
-    (hkey : s.AdmitsKey key) (hv : HasValue c r key v) : Readable c st s r key v := by
+/-- Under a complete scoped root, each admitted value has a held carrier or
+a refused boundary. Actual readability is proved separately below. -/
+theorem admitted_key_readable_or_refused {v : ValueRef} (hc : CompleteWithin c st s r)
+    (hkey : s.AdmitsKey key) (hv : HasValue c r key v) : ReadableOrRefused c st s r key v := by
   obtain ⟨p, x, hat, hk⟩ := hv
   have hp : p <+: key := carries_prefix hk
   have hadm : s.AdmitsPath p :=
@@ -403,16 +401,10 @@ theorem fetch_terminates (b : Bounded c r) :
 /-- The origin's trie is whole: every position under the root names a node. -/
 def Whole (c : Content) (root : Hash) : Prop := ∀ p x, At c root p x → ∃ n, c x = some n
 
-/-- Every held node is admitted where the walk meets it — the value-side
-assumption of the module comment, the one Rust's unproductive-round
-abandonment stands in for. -/
-def Productive (c : Content) (st : Store) (s : Scope) (root : Hash) : Prop :=
-  ∀ p x n, Reach c st s root p x → x ∈ st.held → c x = some n → AdmitsNode s p n
-
 /-- **A stuck fetch is complete.**  When a peer holding the root's head would
 serve anything the walk still asks for, a store with no fetch step left is
 complete within the scope. -/
-theorem stuck_complete (hhead : heads r) (hwhole : Whole c r) (hprod : Productive c st s r)
+theorem stuck_complete (hhead : heads r) (hwhole : Whole c r)
     (hstuck : ∀ st', ¬ FetchStep c s heads r st st') : CompleteWithin c st s r := by
   intro p x hr
   have settle : x ∉ st.held → Boundary s st p x := by
@@ -425,7 +417,7 @@ theorem stuck_complete (hhead : heads r) (hwhole : Whole c r) (hprod : Productiv
       · exact absurd
           (FetchStep.redact hr hheld hred ⟨honest_want_admitted hhead hr, n, hcn, hn⟩)
           (hstuck _)
-  refine ⟨?_, fun hnb n v hcn hv => ?_⟩
+  refine ⟨?_, fun hnb n v hcn hv ha => ?_⟩
   · by_cases hheld : x ∈ st.held
     · exact Or.inl hheld
     · exact Or.inr (settle hheld)
@@ -437,43 +429,89 @@ theorem stuck_complete (hhead : heads r) (hwhole : Whole c r) (hprod : Productiv
     · exact hval
     exfalso
     refine hstuck _ (FetchStep.value hr hheld hcn hv hval ⟨rfl, fun hs => ?_⟩)
-    exact ⟨x, n, honest_value_want_admitted hs hhead hr v, hcn, hv, hprod _ _ _ hr hheld hcn⟩
+    exact ⟨x, n, honest_value_want_admitted hs hhead hr v, hcn, hv, ha⟩
 
 /-- The promotion `try_promote` performs once the fetch has nothing left: with
 the root's `complete` bit read as `CompleteWithin` — the memo the drained walk
 writes — a stuck fetch enables `MptGc.Promote`, whose other premises are the
 slot state `offer_head` wrote. -/
 theorem stuck_fetch_promotes (m : MptGc.State) (hp : m.pending) (hret : m.retained)
-    (hhead : heads r) (hwhole : Whole c r) (hprod : Productive c st s r)
+    (hhead : heads r) (hwhole : Whole c r)
     (hstuck : ∀ st', ¬ FetchStep c s heads r st st') :
     MptGc.Promote.rel { m with complete := CompleteWithin c st s r }
       (MptGc.Promote.post { m with complete := CompleteWithin c st s r }) :=
-  ⟨⟨hp, hret, stuck_complete hhead hwhole hprod hstuck⟩, rfl⟩
+  ⟨⟨hp, hret, stuck_complete hhead hwhole hstuck⟩, rfl⟩
 
 /-! ## The three pieces together -/
 
 /-- **Convergence.**  Two nodes that have heard the same heads select the same
 head; if each has fetched that head's root under the same scope, from peers
 that heard the same heads, until no step is left, each holds a trie complete
-within the scope, every admitted key has the same value on both, and each can
-read it.  The hypotheses are the assumptions listed in the module comment,
-and nothing else. -/
+within the scope, and the abstract view is deterministic. Each value's carrier
+is held or a boundary was refused; this last disjunction is not a successful
+read. Actual readability additionally needs `Unobstructed` below. -/
 theorem converge {l₁ l₂ : List Head} {h : Head} {st₁ st₂ : Store}
     (canon : Canonical c)
     (heard : ∀ x, x ∈ l₁ ↔ x ∈ l₂) (hsel : select l₁ = some h) (hwhole : Whole c h.root)
-    (hprod₁ : Productive c st₁ s h.root) (hprod₂ : Productive c st₂ s h.root)
     (hstuck₁ : ∀ st', ¬ FetchStep c s (HeardRoots l₁) h.root st₁ st')
     (hstuck₂ : ∀ st', ¬ FetchStep c s (HeardRoots l₂) h.root st₂ st') :
     select l₂ = some h ∧
     CompleteWithin c st₁ s h.root ∧ CompleteWithin c st₂ s h.root ∧
     (∀ key v₁ v₂, ScopedView c s h.root key v₁ → ScopedView c s h.root key v₂ → v₁ = v₂) ∧
     (∀ key v, ScopedView c s h.root key v →
-      Readable c st₁ s h.root key v ∧ Readable c st₂ s h.root key v) :=
+      ReadableOrRefused c st₁ s h.root key v ∧ ReadableOrRefused c st₂ s h.root key v) :=
   have hsel₂ : select l₂ = some h := (select_eq_of_mem_iff heard).symm.trans hsel
-  have hc₁ := stuck_complete (heardRoots_of_select hsel) hwhole hprod₁ hstuck₁
-  have hc₂ := stuck_complete (heardRoots_of_select hsel₂) hwhole hprod₂ hstuck₂
+  have hc₁ := stuck_complete (heardRoots_of_select hsel) hwhole hstuck₁
+  have hc₂ := stuck_complete (heardRoots_of_select hsel₂) hwhole hstuck₂
   ⟨hsel₂, hc₁, hc₂, fun _ _ _ h₁ h₂ => scoped_view_deterministic canon h₁ h₂,
-    fun _ _ hv => ⟨admitted_key_readable hc₁ hv.1 hv.2, admitted_key_readable hc₂ hv.1 hv.2⟩⟩
+    fun _ _ hv => ⟨admitted_key_readable_or_refused hc₁ hv.1 hv.2, admitted_key_readable_or_refused hc₂ hv.1 hv.2⟩⟩
+
+/-- A finite fetch has a reachable terminal state, not just no infinite trace.
+Network scheduling must eventually execute enabled steps for this existential
+progress result to imply wall-clock convergence. -/
+theorem fetch_reaches_complete (b : Bounded c r) (hhead : heads r) (whole : Whole c r)
+    (start : Store) : ∃ finish, Relation.ReflTransGen (FetchStep c s heads r) start finish ∧
+      CompleteWithin c finish s r := by
+  classical
+  induction start using (fetchStep_wf (s := s) (heads := heads) b).induction with
+  | h st ih =>
+    by_cases stuck : ∀ st', ¬ FetchStep c s heads r st st'
+    · exact ⟨st, .refl, stuck_complete hhead whole stuck⟩
+    · push Not at stuck
+      obtain ⟨next, step⟩ := stuck
+      obtain ⟨finish, trace, complete⟩ := ih next step
+      exact ⟨finish, (Relation.ReflTransGen.single step).trans trace, complete⟩
+
+/-- Actual readability includes the out-of-line bytes; a refusal is not a read. -/
+def Readable (c : Content) (st : Store) (s : Scope) (root : Hash) (key : Path)
+    (v : ValueRef) : Prop :=
+  s.AdmitsKey key ∧ ∃ p x, At c root p x ∧ CarriesKey c x p key v ∧ x ∈ st.held ∧
+    ∀ h, v = .outOfLine h → h ∈ st.heldValue
+
+/-- No refused spine position blocks this key. This is an explicit availability
+condition, not a consequence of permission to read the key. -/
+def Unobstructed (c : Content) (st : Store) (s : Scope) (root : Hash) (key : Path) : Prop :=
+  ∀ p x, p <+: key → Reach c st s root p x → ¬ Boundary s st p x
+
+/-- Completeness gives a real read for an admitted key with no refused spine. -/
+theorem complete_reads_unobstructed {v : ValueRef} (hc : CompleteWithin c st s r)
+    (hkey : s.AdmitsKey key) (hv : HasValue c r key v)
+    (clear : Unobstructed c st s r key) : Readable c st s r key v := by
+  obtain ⟨p, x, hat, hk⟩ := hv
+  have hp := carries_prefix hk
+  have hadm := Scope.admitsPath_of_prefix (Scope.admitsPath_of_admitsKey hkey) hp
+  have hr₀ : Reach c st s r [] r := .root (Scope.admitsPath_of_prefix hadm List.nil_prefix)
+  rcases reach_or_boundary hc hat [] hr₀ (by simpa using hadm) with hr | ⟨q, y, hq, hreach, hb⟩
+  · simp only [List.nil_append] at hr
+    have nb := clear p x hp hr
+    have held := (hc p x hr).1.resolve_right nb
+    refine ⟨hkey, p, x, hat, hk, held, ?_⟩
+    intro h eq
+    subst v
+    rcases hk with ⟨rest, hn, rfl⟩ | ⟨children, hn, rfl⟩
+    · exact (hc _ x hr).2 nb _ h hn rfl hkey
+    · exact (hc _ x hr).2 nb _ h hn rfl hkey
+  · exact False.elim (clear q y (by simpa using hq.trans hp) hreach hb)
 
 end Synchronicity.Convergence
 

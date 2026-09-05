@@ -132,46 +132,7 @@ impl Store {
     /// records that this node means to keep the object, and a GC pass in that
     /// window is entitled to take it.
     pub fn take_possession(&self, root: &Hash, holder: &PinHolder, now: i64) -> Result<bool> {
-        // LEAN-MODEL: cas-take-possession (Cas.TakePossession)
-        // `Cas.TakePossession` is this immediate want-to-pin transaction;
-        // its availability check is part of the transition, not a caller fact.
-        self.with_immediate_tx(|tx| {
-            // Held durably, not merely known or cached. A `blobs` row exists
-            // for a partial fetch too, so a row alone would let a claim stand
-            // over a 0%-complete object — exactly what this function's own doc
-            // says cannot happen — and on a cloud backend a complete row is a
-            // scratch copy the backend may drop until `durable=1`. The
-            // predicate is `Store::pin`'s, for the reason given there, and it
-            // belongs in the store rather than in the discipline of every
-            // caller: `hold_object` finalizes before calling this, and this is
-            // what makes that ordering a fact rather than a convention.
-            let held: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM blobs WHERE root = ?1 AND durable != 0)",
-                params![root.as_bytes().to_vec()],
-                |row| row.get(0),
-            )?;
-            if !held {
-                return Ok(false);
-            }
-            let wanted = tx.execute(
-                "DELETE FROM content_want WHERE root = ?1 AND holder = ?2",
-                params![root.as_bytes().to_vec(), holder.render()],
-            )?;
-            // Role removal deletes its wants before releasing its pins.  The
-            // delete and this check share the write transaction, so a fetch
-            // which finishes after that point cannot resurrect an orphaned
-            // source/replica claim.
-            if wanted == 0 {
-                return Ok(false);
-            }
-            tx.execute(
-                "INSERT INTO pins (root, holder, created_at, release_after)
-                 VALUES (?1, ?2, ?3, NULL)
-                 ON CONFLICT(root, holder) DO UPDATE SET release_after = NULL",
-                params![root.as_bytes().to_vec(), holder.render(), now],
-            )?;
-            Ok(true)
-        })
+        self.acquire_pin(root, holder, now, true)
     }
 
     /// Records that a fetch failed, for the backoff and for the alarm.
@@ -797,6 +758,49 @@ mod tests {
 
         assert!(!store.take_possession(&root, &media(), 2).unwrap());
         assert!(store.pins_for(&root).unwrap().is_empty());
+    }
+
+    #[test]
+    fn possession_failure_restores_the_want_without_a_pin() {
+        for fail_at_commit in [false, true] {
+            let (_dir, store) = store();
+            let root = store.ingest_bytes(b"payload", 0).unwrap();
+            assert!(store.stage_want(&root, &media(), 7, None, 1).unwrap());
+            if fail_at_commit {
+                store.conn().execute_batch(
+                    "CREATE TABLE acquisition_parent (id INTEGER PRIMARY KEY);
+                     CREATE TABLE acquisition_child (parent INTEGER REFERENCES acquisition_parent(id)
+                       DEFERRABLE INITIALLY DEFERRED);
+                     CREATE TRIGGER fail_acquisition_commit AFTER INSERT ON pins
+                       BEGIN INSERT INTO acquisition_child VALUES (1); END;"
+                ).unwrap();
+            } else {
+                store
+                    .conn()
+                    .execute_batch(
+                        "CREATE TRIGGER fail_acquisition_pin BEFORE INSERT ON pins
+                       BEGIN SELECT RAISE(ABORT, 'injected pin failure'); END;",
+                    )
+                    .unwrap();
+            }
+            assert!(store.take_possession(&root, &media(), 2).is_err());
+            assert_eq!(store.wants_of(&media()).unwrap().len(), 1);
+            assert!(store.pins_for(&root).unwrap().is_empty());
+            assert_eq!(store.read_all(&root).unwrap(), b"payload");
+        }
+    }
+
+    #[test]
+    fn direct_pin_preserves_want_but_possession_consumes_it() {
+        let (_dir, store) = store();
+        let root = store.ingest_bytes(b"payload", 0).unwrap();
+        store.stage_want(&root, &media(), 7, None, 1).unwrap();
+        assert!(store.pin(&root, &media(), 2).unwrap());
+        assert_eq!(store.wants_of(&media()).unwrap().len(), 1);
+        store.schedule_release(&root, &media(), 3).unwrap();
+        assert!(store.take_possession(&root, &media(), 4).unwrap());
+        assert!(store.wants_of(&media()).unwrap().is_empty());
+        assert_eq!(store.pins_for(&root).unwrap()[0].release_after, None);
     }
 
     #[test]

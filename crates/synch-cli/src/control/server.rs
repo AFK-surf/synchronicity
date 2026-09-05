@@ -2999,8 +2999,8 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
             out.line(format!("activated {space}/{path}")).await?;
             if !synch_sock::SUPPORTED {
                 out.line(
-                    "note: this build serves no sockets — async-ebpf supports Linux, macOS, \
-                     and OpenBSD on x86-64 and arm64. The entry will publish and replicate; \
+                    "note: this build serves no sockets — this build supports Linux and macOS \
+                     on x86-64 and arm64. The entry will publish and replicate; \
                      a peer connecting to it is refused."
                         .to_string(),
                 )

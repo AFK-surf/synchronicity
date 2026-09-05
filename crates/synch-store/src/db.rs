@@ -205,16 +205,6 @@ pub struct Store {
     /// Whether complete out-of-line bytes are only cache until explicitly
     /// finalized into a remote backend.
     remote_cas: std::sync::atomic::AtomicBool,
-    /// Roots a full walk has established this store holds entirely.
-    ///
-    /// "Do I hold this whole trie?" is asked on every `Hello` (§5.1) and
-    /// answered by walking everything reachable — so without this a converged
-    /// cluster pays for the size of its metadata on every anti-entropy round,
-    /// on both sides, forever. A content-addressed root that was complete
-    /// stays complete, so the walk is owed once per root and not once per
-    /// exchange. Process-local and rebuilt on demand: losing it costs one
-    /// walk, never correctness.
-    complete_roots: Mutex<std::collections::HashSet<Hash>>,
     /// Objects a CAS write is currently between its first byte and its commit.
     ///
     /// The collector and the writers agree about *rows* through SQLite and did
@@ -246,15 +236,52 @@ pub struct Store {
     write_window: Mutex<Option<std::sync::Arc<WriteWindow>>>,
 }
 
-/// Process-wide CAS ordering shared by every `Store` opened on one datadir.
+/// Process-wide CAS ordering and trie certificates shared by every `Store`
+/// opened on one datadir.
 ///
 /// The lifecycle lock excludes other processes. This registry closes the
 /// smaller same-process hole: two independently opened Store values must still
-/// agree about writers and serialize lease registration against unlink.
+/// agree about writers and serialize lease registration against unlink, and
+/// invalidate each other's completeness certificates when boundaries dissolve.
 #[derive(Debug, Default)]
 struct CasCoord {
     order: Mutex<()>,
     writing: Mutex<HashMap<Hash, usize>>,
+    completeness: Mutex<Completeness>,
+}
+
+/// Completeness answers avoid a full trie walk on every Hello. They remain
+/// valid only until a non-monotone mutation, including adding a formerly
+/// refused node to a provenance view. Lost certificates cost a fresh walk.
+#[derive(Debug)]
+struct Completeness {
+    state: synch_verified::CertificateCache,
+}
+
+impl Default for Completeness {
+    fn default() -> Self {
+        Self {
+            state: synch_verified::CertificateCache::new(COMPLETE_ROOTS_MAX as u64),
+        }
+    }
+}
+
+/// Keeps certification disabled until the invalidating transaction has either
+/// committed or rolled back. Both edges advance the generation: a reader that
+/// starts during a transaction must not certify its pre-commit snapshot later.
+#[derive(Debug)]
+struct MemoMutation(Arc<CasCoord>);
+
+impl Drop for MemoMutation {
+    fn drop(&mut self) {
+        // LEAN-MODEL: verified-memo-finish (VerifiedCoreProofs.cache_finish)
+        let mut memo = self
+            .0
+            .completeness
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        memo.state.finish();
+    }
 }
 
 fn cas_coord_for(data_dir: &Path) -> Arc<CasCoord> {
@@ -411,7 +438,6 @@ impl Store {
             conn: Mutex::new(conn),
             data_dir,
             remote_cas: std::sync::atomic::AtomicBool::new(false),
-            complete_roots: Mutex::new(std::collections::HashSet::new()),
             cas_coord,
             #[cfg(test)]
             write_window: Mutex::new(None),
@@ -572,6 +598,9 @@ impl Store {
     {
         let mut conn = self.conn();
         let _scope = reentry::Scope::enter();
+        // Declared before `tx`, so rollback precedes releasing the guard even
+        // on an error or panic.
+        let invalidation = std::cell::RefCell::new(None);
         let tx = conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(StoreError::from)?;
@@ -580,6 +609,7 @@ impl Store {
         let out = f(&Txn {
             tx: &tx,
             store: self,
+            invalidation: &invalidation,
         })?;
         tx.commit().map_err(StoreError::from)?;
         Ok(out)
@@ -796,9 +826,30 @@ impl Store {
 pub struct Txn<'a> {
     tx: &'a rusqlite::Transaction<'a>,
     store: &'a Store,
+    invalidation: &'a std::cell::RefCell<Option<MemoMutation>>,
 }
 
 impl Txn<'_> {
+    /// Invalidates walks before a non-monotone trie mutation becomes visible.
+    pub(crate) fn invalidate_completeness(&self) {
+        self.invalidate_completeness_preserving(&std::collections::HashSet::new());
+    }
+
+    /// GC may retain certificates whose roots its snapshot marks in full.
+    pub(crate) fn invalidate_completeness_preserving(
+        &self,
+        keep: &std::collections::HashSet<Hash>,
+    ) {
+        // LEAN-MODEL: verified-memo-begin (VerifiedCoreProofs.cache_begin_retains)
+        let mut guard = self.invalidation.borrow_mut();
+        if guard.is_none() {
+            let mut memo = self.store.completeness();
+            let keep: Vec<&[u8]> = keep.iter().map(|root| root.as_bytes().as_slice()).collect();
+            memo.state.begin(&keep);
+            *guard = Some(MemoMutation(self.store.cas_coord.clone()));
+        }
+    }
+
     /// The underlying connection, for the store's own statement helpers.
     pub(crate) fn conn(&self) -> &Connection {
         self.tx
@@ -982,12 +1033,24 @@ impl NodeStore for Txn<'_> {
         Ok(())
     }
 
+    fn completeness_generation(&self) -> Result<u64> {
+        self.store.completeness_generation()
+    }
+
+    fn note_complete_at(&self, _root: &Hash, generation: u64) -> Result<bool> {
+        // A transaction may verify its own writes, but never memoizes them.
+        Ok(generation == self.completeness_generation()?)
+    }
+
     fn get_node(&self, hash: &Hash) -> Result<Option<Vec<u8>>> {
         get_node_in(self.conn(), hash)
     }
 
     fn put_node(&self, hash: &Hash, data: &[u8]) -> Result<()> {
-        put_node_forgetting_memos(self.store, self.conn(), hash, data)
+        if !has_node_in(self.conn(), hash)? && is_redacted_in(self.conn(), hash, None)? {
+            self.invalidate_completeness();
+        }
+        put_node_in(self.conn(), hash, data).map(|_| ())
     }
 
     fn get_value(&self, hash: &Hash) -> Result<Option<Vec<u8>>> {
@@ -1019,6 +1082,9 @@ impl NodeStore for Txn<'_> {
     }
 
     fn note_owned(&self, origin: &OriginId, hash: &Hash) -> Result<()> {
+        if !owns_node_in(self.conn(), origin, hash)? && is_redacted_in(self.conn(), hash, None)? {
+            self.invalidate_completeness();
+        }
         note_owned_in(self.conn(), origin, hash)
     }
 }
@@ -1117,7 +1183,7 @@ impl NodeStore for Store {
     }
 
     fn put_node(&self, hash: &Hash, data: &[u8]) -> Result<()> {
-        put_node_forgetting_memos(self, &self.conn(), hash, data)
+        self.transaction(|txn| txn.put_node(hash, data))
     }
 
     fn get_value(&self, hash: &Hash) -> Result<Option<Vec<u8>>> {
@@ -1137,16 +1203,24 @@ impl NodeStore for Store {
     }
 
     fn is_known_complete(&self, root: &Hash) -> Result<bool> {
-        Ok(self.complete_roots().contains(root))
+        // LEAN-MODEL: verified-memo-known (VerifiedCoreProofs.cache_known)
+        let memo = self.completeness();
+        Ok(memo.state.contains(root.as_bytes()))
     }
 
     fn note_complete(&self, root: &Hash) -> Result<()> {
-        let mut roots = self.complete_roots();
-        if roots.len() >= COMPLETE_ROOTS_MAX {
-            roots.clear();
-        }
-        roots.insert(*root);
+        self.note_complete_at(root, self.completeness_generation()?)?;
         Ok(())
+    }
+
+    fn completeness_generation(&self) -> Result<u64> {
+        Ok(self.completeness().state.epoch())
+    }
+
+    fn note_complete_at(&self, root: &Hash, generation: u64) -> Result<bool> {
+        // LEAN-MODEL: verified-memo-certify (VerifiedCoreProofs.cache_certify_sound)
+        let mut memo = self.completeness();
+        Ok(memo.state.certify(generation, root.as_bytes()))
     }
 
     /// Redaction is durable, unlike the completeness memo above.
@@ -1171,13 +1245,14 @@ impl NodeStore for Store {
     }
 
     fn note_owned(&self, origin: &OriginId, hash: &Hash) -> Result<()> {
-        note_owned_in(&self.conn(), origin, hash)
+        self.transaction(|txn| txn.note_owned(origin, hash))
     }
 }
 
 impl Store {
-    fn complete_roots(&self) -> MutexGuard<'_, std::collections::HashSet<Hash>> {
-        self.complete_roots
+    fn completeness(&self) -> MutexGuard<'_, Completeness> {
+        self.cas_coord
+            .completeness
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
     }
@@ -1258,20 +1333,6 @@ impl Store {
 
     #[cfg(not(test))]
     pub(crate) fn pause_in_write_window(&self) {}
-
-    /// Keeps only the memo entries for roots still in the retained set.
-    ///
-    /// A sweep takes the nodes of every root it did not mark from, so a memo
-    /// entry for one of those becomes a standing lie: `Hello` would go on
-    /// advertising a trie this node can no longer serve. Dropping the whole
-    /// memo is the safe version of that — but the memo is exactly the answer
-    /// §5.1 exists to avoid recomputing on every exchange, and GC runs every
-    /// five minutes against a thirty-second anti-entropy interval, so clearing
-    /// it wholesale gives the cost back on roughly one round in ten, forever.
-    /// Retaining the marked roots keeps the optimization and the honesty.
-    pub(crate) fn retain_complete_roots(&self, keep: &std::collections::HashSet<Hash>) {
-        self.complete_roots().retain(|root| keep.contains(root));
-    }
 }
 
 // The trie node store, expressed against a connection so that both the store
@@ -1294,33 +1355,6 @@ fn put_node_in(conn: &Connection, hash: &Hash, data: &[u8]) -> Result<bool> {
         params![hash.as_bytes().to_vec(), data],
     )?;
     Ok(inserted > 0)
-}
-
-/// Stores a node and, if a peer ever refused that hash at some position,
-/// forgets every completeness memo.
-///
-/// A refused position is a boundary only while the node is absent
-/// (`MissingWalk::next_batch` expands a held node wherever it meets it, so a
-/// hash refused at one position and later served at another — the same
-/// subtree standing outside a grant in one trie and inside it in another —
-/// dissolves the boundary). A root memoized complete over that boundary may
-/// then reach positions below it that were never fetched, so the memo is no
-/// longer the walk's answer. The window is short (the second fetch drains the
-/// subtree) and the memo is process-local, but a stale answer picks a reference
-/// root that `prune_sound` does not cover, so it is dropped here rather than
-/// trusted. The Lean model has no step for this `put_node`
-/// (`TrieGraph.LearnNode` takes only a hash no position refused); dropping the
-/// memo is what keeps `MptGc.State.complete` the walk's answer either way.
-fn put_node_forgetting_memos(
-    store: &Store,
-    conn: &Connection,
-    hash: &Hash,
-    data: &[u8],
-) -> Result<()> {
-    if put_node_in(conn, hash, data)? && is_redacted_in(conn, hash, None)? {
-        store.complete_roots().clear();
-    }
-    Ok(())
 }
 
 fn get_value_in(conn: &Connection, hash: &Hash) -> Result<Option<Vec<u8>>> {

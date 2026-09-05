@@ -13,12 +13,10 @@ the `complete` bit has one meaning throughout.
 
 `GcSweep` is `gc_trie`'s whole immediate transaction: the mark set is every
 node the unscoped walk reaches from any retained root, the marked values are
-theirs, and everything else goes.  The learning steps are a delegate's
-`ScopedSync.Learn` seen at the store, with one guard: `LearnNode` takes a node
-no position ever refused.  A node refused at one position and later held from
-another is the one Rust `put_node` this model has no step for; it is exactly
-the case in which the completeness memo Rust keeps can go stale, and the
-trust-boundary note in the README says so.
+theirs, and everything else goes. `LearnNode` includes formerly refused nodes:
+learning can dissolve a boundary and make a root incomplete. `Recheck` models
+that transition without changing its active slot. `Completeness` separately
+models the generation-checked certificates used to advertise and prune roots.
 
 The theorems: a sweep keeps a retained root complete, and keeps it incomplete
 (`gcSweep_complete_iff`); every step, read at any root, is an `MptGc`
@@ -60,10 +58,10 @@ def Complete (c : Content) (s : Scope) (st : State) (root : Hash) : Prop :=
 
 /-! ## The transitions -/
 
-/-- A node lands in the store (`put_node`), at a hash no position refused. -/
+/-- A node lands in the store, including a hash previously refused. -/
 @[transition]
 def LearnNode (x : Hash) : Transition State where
-  guard st := ∀ p, (p, x) ∉ st.store.redacted
+  guard _ := True
   post st := { st with store := { st.store with held := insert x st.store.held } }
 
 /-- A value lands in the store (`put_value`). -/
@@ -179,10 +177,10 @@ theorem complete_of_le {st st' : ScopedSync.Store}
   intro p x hr'
   have hr := hreach p x hr'
   obtain ⟨hpos, hvals⟩ := hc p x hr
-  refine ⟨?_, fun hnb n v hcn hv => ?_⟩
+  refine ⟨?_, fun hnb n v hcn hv ha => ?_⟩
   · exact hpos.elim (fun h => Or.inl (hheld p x hr h)) (fun h => Or.inr (hb p x hr h))
   · rcases hpos with held | bnd
-    · exact hval p x n v hr held hcn hv (hvals (held_not_boundary held) n v hcn hv)
+    · exact hval p x n v hr held hcn hv (hvals (held_not_boundary held) n v hcn hv ha)
     · exact absurd (hb p x hr bnd) hnb
 
 /-- A node no position refused, absent from a complete store, is reached
@@ -305,7 +303,9 @@ theorem step_projects (r : Hash) (h : Step c s st st') :
   obtain ⟨k, hg, rfl⟩ := h
   cases k with
   | learnNode x =>
-    exact learnBatch_of_complete_imp (learnNode_complete hg) Iff.rfl Iff.rfl Iff.rfl Iff.rfl
+    by_cases hc : Complete c s ((Trans c s (.learnNode x)).post st) r
+    · exact ⟨.recheck true, trivial, proj_eq Iff.rfl Iff.rfl (by simp [hc]) Iff.rfl Iff.rfl⟩
+    · exact ⟨.recheck false, trivial, proj_eq Iff.rfl Iff.rfl (by simp [hc]) Iff.rfl Iff.rfl⟩
   | learnValue v =>
     exact learnBatch_of_complete_imp learnValue_complete Iff.rfl Iff.rfl Iff.rfl Iff.rfl
   | refuse p x => exact learnBatch_of_complete_imp refuse_complete Iff.rfl Iff.rfl Iff.rfl Iff.rfl

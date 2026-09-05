@@ -190,7 +190,7 @@ fn init_is_the_only_command_that_runs_without_a_daemon() {
 /// stateless description of the object — no daemon, no database, no
 /// publication. The description names the same root the tree would.
 #[cfg(all(
-    any(target_os = "linux", target_os = "macos", target_os = "openbsd"),
+    any(target_os = "linux", target_os = "macos"),
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 #[test]

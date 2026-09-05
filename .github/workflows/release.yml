@@ -24,23 +24,17 @@ jobs:
       fail-fast: false
       matrix:
         include:
-          # Fully static Linux builds via cargo-zigbuild, which cross-compiles
-          # to musl without a per-target C toolchain.
-          - target: x86_64-unknown-linux-musl
-            os: ubuntu-latest
-            zigbuild: true
-          - target: aarch64-unknown-linux-musl
-            os: ubuntu-latest
-            zigbuild: true
+          # Each runner supplies the architecture-matched Lean runtime.
+          - target: x86_64-unknown-linux-gnu
+            os: ubuntu-22.04
+          - target: aarch64-unknown-linux-gnu
+            os: ubuntu-24.04-arm
           - target: aarch64-apple-darwin
             os: macos-latest
-            zigbuild: false
           - target: x86_64-apple-darwin
-            os: macos-latest
-            zigbuild: false
-          - target: x86_64-pc-windows-msvc
+            os: macos-15-intel
+          - target: x86_64-pc-windows-gnullvm
             os: windows-latest
-            zigbuild: false
     steps:
       - uses: actions/checkout@v4
 
@@ -48,26 +42,15 @@ jobs:
         with:
           targets: ${{ matrix.target }}
 
+      - uses: ./.github/actions/setup-lean-core
+
       - uses: Swatinem/rust-cache@v2
         with:
           key: ${{ matrix.target }}
 
-      - name: Install zig and cargo-zigbuild
-        if: matrix.zigbuild
-        run: |
-          pip install ziglang
-          cargo install cargo-zigbuild --locked
-
       - name: Build
         shell: bash
-        run: |
-          if [ "${{ matrix.zigbuild }}" = "true" ]; then
-            cargo zigbuild --release --target ${{ matrix.target }} \
-              --bin synch --bin synch-s3 --bin synch-monitor
-          else
-            cargo build --release --target ${{ matrix.target }} \
-              --bin synch --bin synch-s3 --bin synch-monitor
-          fi
+        run: cargo build --release --locked --target ${{ matrix.target }} --bin synch --bin synch-s3 --bin synch-monitor
 
       - name: Package
         shell: bash

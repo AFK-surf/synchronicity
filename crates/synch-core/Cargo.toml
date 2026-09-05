@@ -17,6 +17,7 @@ iroh-base.workspace = true
 postcard.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+synch-verified.workspace = true
 thiserror.workspace = true
 unicode-normalization.workspace = true
 

@@ -80,7 +80,7 @@ mod tests {
     /// side of each name lives.
     #[test]
     #[cfg(all(
-        any(target_os = "linux", target_os = "macos", target_os = "openbsd"),
+        any(target_os = "linux", target_os = "macos"),
         any(target_arch = "x86_64", target_arch = "aarch64")
     ))]
     fn the_ssh_abi_is_named_not_numbered() {
@@ -175,7 +175,7 @@ mod tests {
     /// connection, which is a long way from where the typo is.
     #[test]
     #[cfg(all(
-        any(target_os = "linux", target_os = "macos", target_os = "openbsd"),
+        any(target_os = "linux", target_os = "macos"),
         any(target_arch = "x86_64", target_arch = "aarch64")
     ))]
     fn the_header_declares_exactly_the_helpers_the_runtime_registers() {

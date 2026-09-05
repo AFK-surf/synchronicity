@@ -9,6 +9,14 @@ membership, per-node published versions, and SQLite-backed local metadata.
 
 ## Build
 
+Install Rust and the pinned Lean 4.30.0 toolchain through elan. Scope
+authorization and CAS size decisions are implemented only in Lean and
+statically linked into every build; no feature flag or Rust fallback exists.
+Supported platforms are Linux GNU and macOS (x86-64/arm64), and Windows
+x86-64 using the GNU/LLVM toolchain. OpenBSD and Linux musl are unsupported.
+See [Lean core build instructions](crates/synch-verified/README.md) for Windows
+setup and the remaining verification boundaries.
+
 ```sh
 cargo build --release          # both binaries
 cargo test --workspace         # the full suite; binds loopback only, no network
@@ -18,7 +26,8 @@ cargo fmt --all --check
 
 The binaries are `target/release/synch` (CLI and daemon) and
 `target/release/synch-s3` (S3 gateway). SQLite is compiled in and TLS is rustls,
-so neither needs a system library.
+so neither needs a system SQLite or TLS library. Lean's runtime is statically
+linked; platform system libraries (including libc) are still required.
 
 ## Container image
 
@@ -81,7 +90,7 @@ docker exec -d synch-node synch-s3 serve --listen 0.0.0.0:9000
   *is* — the membership domain, the CAS backend and its credentials, the data
   plane's control URL and token — stays unset and required, so a misconfigured
   container fails at startup rather than running as something nobody asked for.
-- **glibc, not the static musl of the release tarballs.** These are
+- **glibc, including Linux release tarballs.** These are
   long-running servers; the image is built against the runtime's own glibc
   2.36, which is the configuration the test suite runs on.
 
@@ -582,7 +591,7 @@ declared as data in the object itself — a JSON manifest in a non-executable
 ELF section — so `synch socket inspect` answers "what would this deployment
 do?" without running anything, and every write to an activated path is an
 intentional deployment that serves immediately under its own manifest.
-Serving needs Linux, macOS or OpenBSD on x86-64 or arm64, which is where
+Serving needs Linux or macOS on x86-64 or arm64, which is where
 async-ebpf runs. See [docs/SOCKETS.md](docs/SOCKETS.md).
 
 ## Layout

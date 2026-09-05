@@ -819,7 +819,7 @@ impl Node {
         // (`config::NodeConfig`).
         let socket_workers = config.socket_workers;
         #[cfg(all(
-            any(target_os = "linux", target_os = "macos", target_os = "openbsd"),
+            any(target_os = "linux", target_os = "macos"),
             any(target_arch = "x86_64", target_arch = "aarch64")
         ))]
         let socket_pool = if socket_workers == 0 {
@@ -853,7 +853,7 @@ impl Node {
             )
         };
         #[cfg(not(all(
-            any(target_os = "linux", target_os = "macos", target_os = "openbsd"),
+            any(target_os = "linux", target_os = "macos"),
             any(target_arch = "x86_64", target_arch = "aarch64")
         )))]
         let socket_pool = if socket_workers == 0 {
@@ -1589,6 +1589,7 @@ impl Node {
         let origin = self.origin().clone();
         let now = now_ns();
         let remote_upload_parts = self.cas_backend().remote_upload_parts();
+        let generation = synch_mpt::NodeStore::completeness_generation(self.store().as_ref())?;
 
         let head = self
             .store()
@@ -1708,7 +1709,7 @@ impl Node {
             // it whole by construction. Recording that here is what keeps the
             // first `Hello` after every publish from proving it again by
             // walking the entire trie (§5.1).
-            synch_mpt::NodeStore::note_complete(self.store().as_ref(), &head.root)?;
+            synch_mpt::NodeStore::note_complete_at(self.store().as_ref(), &head.root, generation)?;
             tracing::info!(
                 seq = head.seq,
                 changes = staged.len(),
@@ -2703,7 +2704,7 @@ mod tests {
 
     /// And the default still serves them, so the switch is the host's alone.
     #[cfg(all(
-        any(target_os = "linux", target_os = "macos", target_os = "openbsd"),
+        any(target_os = "linux", target_os = "macos"),
         any(target_arch = "x86_64", target_arch = "aarch64")
     ))]
     #[tokio::test]

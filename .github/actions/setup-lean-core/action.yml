@@ -1,0 +1,40 @@
+name: Set up mandatory Lean core
+description: Install the pinned Lean runtime and the matching Windows C ABI toolchain
+runs:
+  using: composite
+  steps:
+    - uses: leanprover/lean-action@v1
+      with:
+        lake-package-directory: crates/synch-verified/lean
+        build: true
+        build-args: --wfail
+        test: false
+    - if: runner.os == 'Windows'
+      shell: bash
+      run: |
+        # lean-action registers a Git Bash path; native Windows subprocesses
+        # need the drive-qualified spelling to find elan's executable shims.
+        cygpath -w "$HOME/.elan/bin" >> "$GITHUB_PATH"
+    - if: runner.os == 'Windows'
+      id: msys2
+      uses: msys2/setup-msys2@v2
+      with:
+        msystem: CLANG64
+        install: mingw-w64-clang-x86_64-toolchain
+    - if: runner.os == 'Windows'
+      shell: pwsh
+      env:
+        MSYS_ROOT: ${{ steps.msys2.outputs.msys2-location }}
+      run: |
+        rustup target add x86_64-pc-windows-gnullvm
+        if ($LASTEXITCODE -ne 0) { throw 'Rust target installation failed' }
+        $bin = (Join-Path $env:MSYS_ROOT 'clang64/bin').Replace('\', '/')
+        if (!(Test-Path "$bin/clang.exe")) { throw "Missing CLANG64 compiler at $bin" }
+        "CARGO_BUILD_TARGET=x86_64-pc-windows-gnullvm" >> $env:GITHUB_ENV
+        "CARGO_TARGET_X86_64_PC_WINDOWS_GNULLVM_LINKER=$bin/clang.exe" >> $env:GITHUB_ENV
+        "CC_x86_64_pc_windows_gnullvm=$bin/clang.exe" >> $env:GITHUB_ENV
+        "AR_x86_64_pc_windows_gnullvm=$bin/llvm-ar.exe" >> $env:GITHUB_ENV
+        "$bin" >> $env:GITHUB_PATH
+    - if: runner.os == 'Windows'
+      shell: pwsh
+      run: cargo test -p synch-verified --lib --tests

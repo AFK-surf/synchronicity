@@ -130,11 +130,7 @@ pub fn groups_for_byte_range(start: u64, end: u64) -> GroupRange {
 
 /// The number of chunk groups an object of `size` bytes occupies.
 pub fn group_count(size: u64) -> u64 {
-    if size == 0 {
-        1
-    } else {
-        size.div_ceil(CHUNK_GROUP_SIZE)
-    }
+    synch_verified::group_count(size)
 }
 
 #[cfg(test)]
