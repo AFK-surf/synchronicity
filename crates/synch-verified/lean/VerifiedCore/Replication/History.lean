@@ -1,4 +1,5 @@
 import VerifiedCore.Host
+import VerifiedCore.Origin
 import Std.Data.TreeMap.Basic
 import Std.Data.TreeSet.Basic
 
@@ -19,9 +20,10 @@ point the shared storage interpreter/algebra must preserve these contracts:
   retention comparisons deliberately reinterpret the stored bits as UInt64.
   The program now supplies this ordering explicitly.
 * Joined slot reads preserve orphan-pointer absence and check column/byte
-  shapes with typed contextual errors in projection order. They do not yet
-  validate origin syntax or cryptographic public keys. Native terminal error
-  encoding, origin/key validation and scan-failure ordering remain required
+  shapes with typed contextual errors in projection order. Named-origin syntax
+  is checked directly by the shared Lean Origin module, after signature width.
+  Key-origin decoding and cryptographic public keys are not yet validated.
+  Native terminal error encoding, key validation and scan-failure ordering remain required
   before cutover; full diagnostic compatibility is not claimed here.
 
 The generic predicate/order facilities are in Host, not a history-specific
@@ -54,6 +56,7 @@ inductive Error where
   | columnType (index : Nat) (column : String) (actual : CellType)
   | invalidText (bytes : List UInt8)
   | column (column : String) (reason : String)
+  | origin (error : Origin.Error)
   deriving BEq, DecidableEq
 
 abbrev Result (A : Type) := Except Error A
@@ -115,7 +118,8 @@ structure JoinedHead where
   publicKey : ByteArray
 
 /-- Column conversion is sequenced explicitly, followed by record checks.
-Origin parsing and cryptographic public-key validity remain cutover gates. -/
+Named-origin parsing is included; key-origin parsing and cryptographic
+public-key validity remain cutover gates. -/
 def decodeJoinedHead : Row → Result JoinedHead
   | [origin, seq, root, created, key, sig, received, verified] => do
     let origin ← textField 0 "origin_id" origin
@@ -127,6 +131,7 @@ def decodeJoinedHead : Row → Result JoinedHead
     let _ ← integerField 6 "received_at" received
     let _ ← integerField 7 "verified_at" verified
     if sig.size != 64 then throw (.column "heads.sig" "not 64 bytes")
+    let _ ← (Origin.checkNamedText origin).mapError Error.origin
     let root ← hashField "heads.root" root
     if key.size != 32 then throw (.column "heads.signed_by" "not 32 bytes")
     return ⟨origin, ⟨seq.toUInt64, root⟩, key⟩

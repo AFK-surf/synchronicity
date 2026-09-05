@@ -366,16 +366,29 @@ theorem absent_joined_slot (tx : Transaction) (origin slot : String) :
       resume (.ok []) = .pure (.ok []) := by
   exact ⟨_, rfl, rfl⟩
 
-/-- Joined shape decoding admits all typed rows of the established widths.
-Origin syntax and cryptographic key validation are separate, unfinished gates. -/
+/-- Joined decoding admits typed rows of the established widths whose named
+origin is valid. Key-origin and cryptographic validation remain unfinished. -/
 theorem joined_shape_admitted (origin : String) (seq created received verified : Int64)
     (hash key sig : ByteArray) (hashSize : hash.size = 32) (keySize : key.size = 32)
-    (sigSize : sig.size = 64) :
+    (sigSize : sig.size = 64) (originValid : VerifiedCore.Origin.checkNamedText origin = .ok ()) :
     decodeJoinedHead [.text origin, .integer seq, .blob hash, .integer created,
       .blob key, .blob sig, .integer received, .integer verified] =
       .ok ⟨origin, ⟨seq.toUInt64, hash⟩, key⟩ := by
   simp [decodeJoinedHead, textField, integerField, blobField, hashField,
-    bind, Except.bind, pure, Except.pure, hashSize, keySize, sigSize]
+    bind, Except.bind, pure, Except.pure, hashSize, keySize, sigSize,
+    originValid, Except.mapError]
+
+/-- Named-origin rejection precedes root/key width checks, but follows all
+projected typed conversions and the signature-width check. -/
+theorem joined_origin_before_hash (origin : String) (seq created received verified : Int64)
+    (hash key sig : ByteArray) (failure : VerifiedCore.Origin.Error)
+    (sigSize : sig.size = 64)
+    (invalid : VerifiedCore.Origin.checkNamedText origin = .error failure) :
+    decodeJoinedHead [.text origin, .integer seq, .blob hash, .integer created,
+      .blob key, .blob sig, .integer received, .integer verified] =
+        .error (.origin failure) := by
+  simp [decodeJoinedHead, textField, integerField, blobField, bind,
+    Except.bind, pure, Except.pure, sigSize, invalid, Except.mapError]
 
 /-- A malformed signature width is rejected by Lean before retention. -/
 theorem joined_signature_width_required (origin : String) (seq created received verified : Int64)

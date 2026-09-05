@@ -22,3 +22,4 @@ import Synchronicity.CasProgramProofs
 import Synchronicity.TrieProgramProofs
 import Synchronicity.TrieProgramTests
 import Synchronicity.HistoryProgramProofs
+import Synchronicity.OriginProgramProofs

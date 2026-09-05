@@ -249,7 +249,12 @@ Integration review has identified specific gates, not waived limitations:
   regressions cover ordering, binding and trigger-created protection between
   deletes; Lean's request proof and scripted fixtures include the exclusion.
   Joined slot reads and column/byte-shape validation are now implemented in the
-  staged Lean program. Remaining gates are origin syntax, cryptographic key
+  staged Lean program. Named-origin validation now runs directly in Lean,
+  using a reusable Origin domain module with ASCII normalization, first-`@`
+  separation, literal `key:` precedence and contextual label/domain failures.
+  It follows signature-width validation and precedes root-width validation.
+  Key and bare forms are explicitly unchecked by this named-only gate.
+  Remaining gates are key-origin decoding, cryptographic key
   validation, and malformed-storage error behavior. The Rust retention algorithm
   remains until those semantics and the complete native entry point are implemented.
   Specifically, read complete before pending; an orphan pointer without its
@@ -260,7 +265,7 @@ Integration review has identified specific gates, not waived limitations:
   Lean must consume raw storage records and invoke only genuine primitives.
   Raw cells now preserve REAL bits and invalid UTF-8 TEXT instead of rejecting
   them eagerly. Lean's staged history decoder selects contextual field/type
-  errors in projection order. Native terminal encoding and origin/key validation
+  errors in projection order. Native terminal encoding and key-origin/key validation
   remain unfinished. Eager materialization of all rows still requires review:
   a later SQLite scan failure must not preempt an earlier record-validation
   error when the existing reader would stop at that record.
