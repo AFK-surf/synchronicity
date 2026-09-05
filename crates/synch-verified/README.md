@@ -106,6 +106,11 @@ Unsolicited or duplicate observations fail closed. The Rust API exposes only
 poll, observations, resume and batch reset, not independent frontier/seen-set
 or obligation mutations. Native and Rust-adapter fault-injection tests exercise
 this protocol; the complete graph-coverage invariant is still pending.
+An execution relation over these exact Lean exports proves that every pending
+read has an identified position throughout arbitrary finite operation sequences.
+Repeated polling preserves that position, and expansion preserves all work
+already on the frontier. These are intermediate invariants, not yet a proof
+that exhaustion implies complete graph coverage.
 
 `Store` and `MemStore` use Lean's cache state and epoch guard. Rust owns the
 mutex and supplies byte keys, retained-root inputs, and storage effects; it

@@ -556,6 +556,87 @@ theorem unsolicited_observation_rejected (s next : VerifiedCore.MissingWalk)
     (VerifiedCore.finishObservation s next).frontier = s.frontier := by
   simp [VerifiedCore.finishObservation, VerifiedCore.failWalk, healthy, idle]
 
+/-- Scheduling a child cannot discard any already pending position. -/
+theorem enqueue_retains_frontier (s : VerifiedCore.MissingWalk)
+    (r : Option (List Nat)) (hash step : List Nat) (p : VerifiedCore.WalkPosition)
+    (pending : p ∈ s.frontier) : p ∈ (VerifiedCore.enqueueWalk s r hash step).frontier := by
+  unfold VerifiedCore.enqueueWalk
+  split
+  · exact pending
+  · dsimp only
+    split
+    · exact List.mem_cons_of_mem _ pending
+    · exact pending
+
+/-- No suffix of child expansion can discard work scheduled by an earlier child. -/
+theorem enqueue_fold_retains (edges : List (Option (List Nat) × List Nat × List Nat))
+    (s : VerifiedCore.MissingWalk) (p : VerifiedCore.WalkPosition) (pending : p ∈ s.frontier) :
+    p ∈ (edges.foldl (fun s (r, hash, step) => VerifiedCore.enqueueWalk s r hash step) s).frontier := by
+  induction edges generalizing s with
+  | nil => exact pending
+  | cons edge rest ih =>
+    exact ih _ (enqueue_retains_frontier s edge.1 edge.2.1 edge.2.2 p pending)
+
+/-- The actual exported expansion preserves every previously pending position. -/
+theorem expansion_retains_frontier (s : VerifiedCore.MissingWalk)
+    (reference node : VerifiedCore.WalkNode) (p : VerifiedCore.WalkPosition)
+    (pending : p ∈ s.frontier) : p ∈ (VerifiedCore.walkExpand s reference node).frontier :=
+  enqueue_fold_retains _ s p pending
+
+/-- A protocol state cannot claim a pending read without identifying its position. -/
+def ReadIdentified (s : VerifiedCore.MissingWalk) : Prop :=
+  s.awaiting = true → s.current.isSome = true
+
+/-- The acknowledgement gate preserves read identification regardless of the
+observation's result: it either retains the old state or clears the pending bit. -/
+theorem acknowledge_read_identified (s next : VerifiedCore.MissingWalk)
+    (identified : ReadIdentified s) : ReadIdentified (VerifiedCore.finishObservation s next) := by
+  unfold VerifiedCore.finishObservation
+  split
+  · exact identified
+  · split
+    · simp [ReadIdentified]
+    · simpa [ReadIdentified, VerifiedCore.failWalk] using identified
+
+/-- Finite executions of the actual native exports, not a separately implemented
+state machine. Storage facts remain explicit inputs, including arbitrary errors
+that leave the selected read pending by making no observation. -/
+inductive WalkExecution : VerifiedCore.MissingWalk → Prop where
+  | initial (scope : VerifiedCore.Scope) (reference root : ByteArray) (limit : UInt64) :
+      WalkExecution (VerifiedCore.walkNew scope reference root limit)
+  | poll {s} : WalkExecution s → WalkExecution (VerifiedCore.walkPoll s)
+  | resume {s} : WalkExecution s → WalkExecution (VerifiedCore.walkResume s)
+  | batch {s} : WalkExecution s → WalkExecution (VerifiedCore.walkBatch s)
+  | absent {s} (redacted : Bool) : WalkExecution s → WalkExecution (VerifiedCore.walkAbsent s redacted)
+  | present {s} (reference node : VerifiedCore.WalkNode) (childShape : UInt8)
+      (payload : ByteArray) (held : Bool) : WalkExecution s →
+      WalkExecution (VerifiedCore.walkPresent s reference node childShape payload held)
+
+/-- Across every finite exported-operation sequence, a pending read always has
+a concrete position. No assumption about truthful storage facts is needed. -/
+theorem execution_read_identified {s : VerifiedCore.MissingWalk} (run : WalkExecution s) :
+    ReadIdentified s := by
+  induction run with
+  | initial => simp [ReadIdentified, VerifiedCore.walkNew]
+  | poll prior ih =>
+    unfold VerifiedCore.walkPoll VerifiedCore.pollWalk
+    split
+    · exact ih
+    · exact fun h => h
+  | resume prior ih => simpa [ReadIdentified, VerifiedCore.walkResume, VerifiedCore.resumeWalk] using ih
+  | batch prior ih => simpa [ReadIdentified, VerifiedCore.walkBatch] using ih
+  | absent redacted prior ih => exact acknowledge_read_identified _ _ ih
+  | present reference node childShape payload held prior ih => exact acknowledge_read_identified _ _ ih
+
+/-- An unacknowledged read stays the same concrete read after any number of
+polls, not merely after a single retry. -/
+theorem repeated_pending_poll (s : VerifiedCore.MissingWalk) (pending : s.awaiting = true)
+    (count : Nat) : (VerifiedCore.walkPoll^[count]) s = s := by
+  induction count with
+  | zero => rfl
+  | succ count ih =>
+    rw [Function.iterate_succ_apply', ih, pending_poll_unchanged s pending]
+
 end Synchronicity.VerifiedCoreProofs
 
 #lint
