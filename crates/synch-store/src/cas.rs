@@ -926,6 +926,9 @@ impl Store {
                 root: *root,
                 reason: format!("size mismatch: have {recorded}, offered {size}"),
             })?;
+            // LEAN-MODEL: cas-native-plan-canonical (VerifiedCoreProofs.cas_plan_separated)
+            // The proved output already satisfies the range container's ordering
+            // and non-overlap contract; do not duplicate normalization in Rust.
             let verified = ChunkRanges {
                 ranges: plan
                     .ranges

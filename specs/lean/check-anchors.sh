@@ -14,7 +14,7 @@ lean_anchors=$(mktemp)
 trap 'rm -f "$rust_anchors" "$lean_anchors"' EXIT HUP INT TERM
 
 rust_src="$root/crates/synch-store/src $root/crates/synch-engine/src \
-  $root/crates/synch-mpt/src $root/crates/synch-net/src"
+  $root/crates/synch-mpt/src $root/crates/synch-net/src $root/crates/synch-verified/src"
 
 # A Rust anchor that names no declaration is a stale spelling.
 # shellcheck disable=SC2086

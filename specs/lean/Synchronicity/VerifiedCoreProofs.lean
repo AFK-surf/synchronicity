@@ -977,6 +977,253 @@ theorem cas_plan_complete_covers (row durable complete : Bool) (recorded claimed
     apply List.any_eq_true.mpr
     exact ⟨r, member, by simp [endpoints.1, endpoints.2, inside]⟩
 
+/-- Coalescing nonempty bounded intervals preserves both endpoint bounds. -/
+theorem merge_spans_bounds (total : Nat) (head : VerifiedCore.GroupSpan)
+    (rest : List VerifiedCore.GroupSpan) (valid : head.start < head.stop ∧ head.stop ≤ total)
+    (validRest : ∀ r ∈ rest, r.start < r.stop ∧ r.stop ≤ total) :
+    ∀ r ∈ VerifiedCore.mergeSpans head rest, r.start < r.stop ∧ r.stop ≤ total := by
+  induction rest generalizing head with
+  | nil => simpa [VerifiedCore.mergeSpans] using valid
+  | cons next rest ih =>
+    have hn := validRest next (by simp)
+    have ht : ∀ r ∈ rest, r.start < r.stop ∧ r.stop ≤ total :=
+      fun r hr => validRest r (by simp [hr])
+    simp only [VerifiedCore.mergeSpans]
+    split
+    · apply ih _ _ ht
+      simp only
+      constructor <;> omega
+    · intro r hr
+      simp only [List.mem_cons] at hr
+      rcases hr with rfl | hr
+      · exact valid
+      · exact ih next hn ht r hr
+
+/-- Every normalized interval is nonempty and fits within the requested bound. -/
+theorem normalize_spans_bounds (total : Nat) (spans : List VerifiedCore.GroupSpan) :
+    ∀ r ∈ VerifiedCore.normalizeSpans total spans, r.start < r.stop ∧ r.stop ≤ total := by
+  let clipped := spans.filterMap fun r =>
+    if r.start < min r.stop total then some (⟨r.start, min r.stop total⟩ : VerifiedCore.GroupSpan) else none
+  have hc : ∀ r ∈ clipped, r.start < r.stop ∧ r.stop ≤ total := by
+    intro r hr
+    obtain ⟨original, _, eq⟩ := List.mem_filterMap.mp hr
+    split at eq
+    · cases Option.some.inj eq
+      simp only
+      constructor <;> omega
+    · contradiction
+  have hs : ∀ r ∈ clipped.mergeSort (fun a b => a.start ≤ b.start),
+      r.start < r.stop ∧ r.stop ≤ total := by
+    simpa only [List.mem_mergeSort] using hc
+  unfold VerifiedCore.normalizeSpans
+  change ∀ r ∈ (match clipped.mergeSort (fun a b => a.start ≤ b.start) with
+    | [] => [] | h :: t => VerifiedCore.mergeSpans h t), _
+  cases he : clipped.mergeSort (fun a b => a.start ≤ b.start) with
+  | nil => simp
+  | cons head rest =>
+    rw [he] at hs
+    exact merge_spans_bounds total head rest (hs head (by simp))
+      (fun r hr => hs r (by simp [hr]))
+
+/-- All planner endpoints fit into the claimed object's group bound, even
+when the caller supplies malformed or out-of-bound incoming intervals. -/
+theorem cas_plan_bounds (row durable complete : Bool) (recorded claimed : UInt64)
+    (old incoming : List VerifiedCore.GroupSpan) :
+    ∀ r ∈ (VerifiedCore.planCasCommit row durable complete recorded claimed old incoming).spans,
+      r.start < r.stop ∧ r.stop ≤ (VerifiedCore.groupCount claimed).toNat := by
+  unfold VerifiedCore.planCasCommit
+  generalize (if row then
+    if complete then [(⟨0, (VerifiedCore.groupCount recorded).toNat⟩ : VerifiedCore.GroupSpan)] else old
+    else []) = prior
+  dsimp only
+  split
+  · simp
+  · exact normalize_spans_bounds _ _
+
+/-- Coalescing cannot move an interval start below any common lower bound. -/
+theorem merge_spans_lower_bound (lower : Nat) (head : VerifiedCore.GroupSpan)
+    (rest : List VerifiedCore.GroupSpan) (hh : lower ≤ head.start)
+    (ht : ∀ r ∈ rest, lower ≤ r.start) :
+    ∀ r ∈ VerifiedCore.mergeSpans head rest, lower ≤ r.start := by
+  induction rest generalizing head with
+  | nil => simpa [VerifiedCore.mergeSpans] using hh
+  | cons next rest ih =>
+    have hn := ht next (by simp)
+    have tail : ∀ r ∈ rest, lower ≤ r.start := fun r hr => ht r (by simp [hr])
+    simp only [VerifiedCore.mergeSpans]
+    split
+    · exact ih _ (by simp only; omega) tail
+    · intro r hr
+      rcases List.mem_cons.mp hr with rfl | hr
+      · exact hh
+      · exact ih next hn tail r hr
+
+/-- Sorted, nonempty inputs coalesce into strictly separated intervals. -/
+theorem merge_spans_separated (head : VerifiedCore.GroupSpan) (rest : List VerifiedCore.GroupSpan)
+    (valid : ∀ r ∈ head :: rest, r.start < r.stop)
+    (sorted : (head :: rest).Pairwise (fun a b => a.start ≤ b.start)) :
+    (VerifiedCore.mergeSpans head rest).Pairwise (fun a b => a.stop < b.start) := by
+  induction rest generalizing head with
+  | nil => simp [VerifiedCore.mergeSpans]
+  | cons next rest ih =>
+    obtain ⟨headLE, tailSorted⟩ := List.pairwise_cons.mp sorted
+    obtain ⟨nextLE, restSorted⟩ := List.pairwise_cons.mp tailSorted
+    have hh := valid head (by simp)
+    have hn := valid next (by simp)
+    have order := headLE next (by simp)
+    simp only [VerifiedCore.mergeSpans]
+    split
+    · apply ih
+      · intro r hr
+        rcases List.mem_cons.mp hr with rfl | hr
+        · simp only; omega
+        · exact valid r (by simp [hr])
+      · apply List.pairwise_cons.mpr
+        refine ⟨?_, restSorted⟩
+        intro r hr
+        have h := headLE r (by simp [hr])
+        simp only
+        omega
+    · rename_i separated
+      simp only [Bool.and_eq_true, decide_eq_true_eq] at separated
+      have gap : head.stop < next.start := by omega
+      apply List.pairwise_cons.mpr
+      constructor
+      · intro r hr
+        have bound := merge_spans_lower_bound next.start next rest (by omega) nextLE r hr
+        omega
+      · exact ih next (fun r hr => valid r (by simp [hr])) tailSorted
+
+/-- Normalization's output is sorted and has neither overlap nor adjacent runs. -/
+theorem normalize_spans_separated (total : Nat) (spans : List VerifiedCore.GroupSpan) :
+    (VerifiedCore.normalizeSpans total spans).Pairwise (fun a b => a.stop < b.start) := by
+  let clipped := spans.filterMap fun r =>
+    if r.start < min r.stop total then some (⟨r.start, min r.stop total⟩ : VerifiedCore.GroupSpan) else none
+  have hc : ∀ r ∈ clipped, r.start < r.stop := by
+    intro r hr
+    obtain ⟨original, _, eq⟩ := List.mem_filterMap.mp hr
+    split at eq
+    · cases Option.some.inj eq
+      assumption
+    · contradiction
+  have hs : (clipped.mergeSort (fun a b => a.start ≤ b.start)).Pairwise
+      (fun a b => a.start ≤ b.start) := by
+    have sorted := List.pairwise_mergeSort (le := fun (a b : VerifiedCore.GroupSpan) => a.start ≤ b.start)
+      (by intros; simp_all; omega) (by intros; simp; omega) clipped
+    simpa using sorted
+  unfold VerifiedCore.normalizeSpans
+  change (match clipped.mergeSort (fun a b => a.start ≤ b.start) with
+    | [] => [] | h :: t => VerifiedCore.mergeSpans h t).Pairwise _
+  cases he : clipped.mergeSort (fun a b => a.start ≤ b.start) with
+  | nil => simp
+  | cons head rest =>
+    rw [he] at hs
+    apply merge_spans_separated head rest _ hs
+    intro r hr
+    apply hc r
+    have member : r ∈ clipped.mergeSort (fun a b => a.start ≤ b.start) := by simpa [he] using hr
+    simpa only [List.mem_mergeSort] using member
+
+/-- Every accepted or refused production plan has canonical separated ranges. -/
+@[rust_justifies "cas-native-plan-canonical"]
+theorem cas_plan_separated (row durable complete : Bool) (recorded claimed : UInt64)
+    (old incoming : List VerifiedCore.GroupSpan) :
+    (VerifiedCore.planCasCommit row durable complete recorded claimed old incoming).spans.Pairwise
+      (fun a b => a.stop < b.start) := by
+  unfold VerifiedCore.planCasCommit
+  generalize (if row then
+    if complete then [(⟨0, (VerifiedCore.groupCount recorded).toNat⟩ : VerifiedCore.GroupSpan)] else old
+    else []) = prior
+  dsimp only
+  split
+  · simp
+  · exact normalize_spans_separated _ _
+
+/-- For canonical bounded ranges, full pointwise coverage contains a single
+full-span witness; fragmented ranges cannot hide a missing boundary group. -/
+theorem separated_full_coverage (total : Nat) (positive : 0 < total)
+    (spans : List VerifiedCore.GroupSpan)
+    (bounded : ∀ r ∈ spans, r.stop ≤ total)
+    (separated : spans.Pairwise (fun a b => a.stop < b.start))
+    (covered : ∀ g < total, VerifiedCore.spansContain spans g = true) :
+    spans.any (fun r => r.start == 0 && r.stop == total) = true := by
+  cases spans with
+  | nil => simpa [VerifiedCore.spansContain] using covered 0 positive
+  | cons head rest =>
+    have after := (List.pairwise_cons.mp separated).1
+    have atZero := covered 0 positive
+    obtain ⟨r, member, contains⟩ := List.any_eq_true.mp atZero
+    simp only [Bool.and_eq_true, decide_eq_true_eq] at contains
+    have start : head.start = 0 := by
+      rcases List.mem_cons.mp member with rfl | member
+      · omega
+      · have gap := after r member; omega
+    have stop : head.stop = total := by
+      have bound := bounded head (by simp)
+      by_contra different
+      have inside : head.stop < total := by omega
+      obtain ⟨r, member, contains⟩ := List.any_eq_true.mp (covered head.stop inside)
+      simp only [Bool.and_eq_true, decide_eq_true_eq] at contains
+      rcases List.mem_cons.mp member with rfl | member
+      · omega
+      · have gap := after r member; omega
+    simp [start, stop]
+
+/-- Completion of an accepted production plan is exact, not only sound:
+every covered object is recognized as complete. -/
+theorem cas_plan_coverage_completes (row durable complete : Bool) (recorded claimed : UInt64)
+    (old incoming : List VerifiedCore.GroupSpan)
+    (covered : ∀ g < (VerifiedCore.groupCount claimed).toNat,
+      VerifiedCore.spansContain
+        (VerifiedCore.planCasCommit row durable complete recorded claimed old incoming).spans g = true) :
+    (VerifiedCore.planCasCommit row durable complete recorded claimed old incoming).complete = true := by
+  have positive : 0 < (VerifiedCore.groupCount claimed).toNat := by
+    rw [groupCount_correct]
+    unfold Cas.groupCount Cas.groupBytes
+    split <;> omega
+  have full := separated_full_coverage (VerifiedCore.groupCount claimed).toNat positive _
+    (fun r hr => (cas_plan_bounds row durable complete recorded claimed old incoming r hr).2)
+    (cas_plan_separated row durable complete recorded claimed old incoming) covered
+  have zero := covered 0 positive
+  unfold VerifiedCore.planCasCommit at full zero ⊢
+  generalize (if row then
+    if complete then [(⟨0, (VerifiedCore.groupCount recorded).toNat⟩ : VerifiedCore.GroupSpan)] else old
+    else []) = prior at full zero ⊢
+  dsimp only at full zero ⊢
+  split at full
+  · simp at full
+  · rename_i accepted
+    rw [if_neg accepted] at zero ⊢
+    dsimp only at zero full ⊢
+    simp only [zero, full, Bool.and_self]
+
+/-- Paired endpoint encoding round-trips for every representable interval list. -/
+theorem spans_encoding_roundtrip (spans : List VerifiedCore.GroupSpan)
+    (bounded : ∀ r ∈ spans, r.start < UInt64.size ∧ r.stop < UInt64.size) :
+    VerifiedCore.spansOf (spans.flatMap fun r => [UInt64.ofNat r.start, UInt64.ofNat r.stop]) = spans := by
+  induction spans with
+  | nil => rfl
+  | cons r rest ih =>
+    have hr := bounded r (by simp)
+    have ht := ih (fun r hr => bounded r (by simp [hr]))
+    simp only [List.flatMap_cons, List.cons_append, List.nil_append, VerifiedCore.spansOf, ht]
+    rw [UInt64.toNat_ofNat_of_lt' hr.1, UInt64.toNat_ofNat_of_lt' hr.2]
+
+/-- The production native endpoint export is lossless: decoding its UInt64
+pairs recovers exactly the planner's intervals, with no modular truncation. -/
+@[rust_justifies "cas-native-plan-encoding"]
+theorem cas_plan_encoding_roundtrip (row durable complete : Bool) (recorded claimed : UInt64)
+    (old incoming : List VerifiedCore.GroupSpan) :
+    let plan := VerifiedCore.planCasCommit row durable complete recorded claimed old incoming
+    VerifiedCore.spansOf (VerifiedCore.casPlanSpans plan).toList = plan.spans := by
+  dsimp only [VerifiedCore.casPlanSpans]
+  apply spans_encoding_roundtrip
+  intro r member
+  have hr := cas_plan_bounds row durable complete recorded claimed old incoming r member
+  have bound := (VerifiedCore.groupCount claimed).toNat_lt
+  simp only [UInt64.size]
+  constructor <;> omega
+
 end Synchronicity.VerifiedCoreProofs
 
 #lint

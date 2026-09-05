@@ -72,8 +72,10 @@ Apple's system libc++. OS libraries remain dynamic dependencies.
   required, and implements `Cas.Settles` given the row's representation facts.
 - CAS bitmap normalization preserves exactly the in-bound input groups; the
   production commit planner represents exactly retained plus incoming groups,
-  rejects conflicting durable/complete sizes, and reports complete only when
-  every group is covered. Sorting and merging operate on runs, not blob bytes.
+  rejects conflicting durable/complete sizes, and reports complete exactly when
+  every group is covered. Output intervals are proved nonempty, bounded, sorted
+  and strictly separated; exporting their UInt64 endpoints round-trips without
+  truncation. Sorting and merging operate on runs, not blob bytes.
 - the executable certificate cache rejects stale/terminal tickets, hides
   retained roots during mutations, retains only permitted roots at begin,
   advances nonterminal epochs, restores nesting depth at finish, and preserves
@@ -188,8 +190,8 @@ The following are still required:
   scheduling, child pairing, walk canonicality and payload/boundary decisions
   are now Lean; the cache still trusts a completed walk's validity. Other trie
   operations and ingestion-time canonical encoding checks also remain Rust.
-- CAS bitmap settlement now runs in Lean. Prove canonical output ordering and
-  endpoint serialization, then move accounting, GC and promotion decisions.
+- CAS bitmap settlement now runs in Lean, with canonical output and lossless
+  endpoint serialization proved. Move accounting, GC and promotion decisions.
 - Move ingestion and materialization sequencing into Lean-generated effect
   plans; discharge the flush-before-advertise and publication invariants over
   those executed plans, not over independent abstract Rust descriptions.

@@ -624,6 +624,8 @@ pub fn plan_cas_commit(
             2 => true,
             _ => panic!("invalid Lean CAS plan status"),
         };
+        // LEAN-MODEL: cas-native-plan-encoding (VerifiedCoreProofs.cas_plan_encoding_roundtrip)
+        // The exported UInt64 pairs decode to the exact planned intervals.
         let spans = Handle(
             NonNull::new(synch_adapter_cas_plan_spans(plan.0.as_ptr()))
                 .expect("Lean CAS spans allocation failed"),
