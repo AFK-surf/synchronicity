@@ -349,11 +349,12 @@ theorem remove_next (tx : Transaction) (origin : String) (total : Nat)
 /-- Retention obtains raw pointers itself, within the caller's transaction. -/
 theorem prune_reads_pointers (tx : Transaction) (origin : String) (before : Int64) :
     ∃ resume, (pruneIn tx origin before).run = .request
-      (.left (.readRows tx "heads" headColumns
+      (.left (.scanRows tx "heads" headColumns
         [("origin_id", .text origin), ("slot", .text "complete")] [] headJoin)) resume := by
   exact ⟨_, rfl⟩
 
 /-- The public operation itself requests its snapshot lock, before any read. -/
+@[rust_impl "verified-history-prune"]
 theorem prune_begins_transaction (origin : String) (before : Int64) :
     ∃ resume, (prune origin before).run = .request (.left .begin) resume := by
   exact ⟨_, rfl⟩
@@ -361,9 +362,9 @@ theorem prune_begins_transaction (origin : String) (before : Int64) :
 /-- An absent raw join is an absent slot, with no decoding or additional reads. -/
 theorem absent_joined_slot (tx : Transaction) (origin slot : String) :
     ∃ resume, (readSlot tx origin slot).run = .request
-      (.left (.readRows tx "heads" headColumns
+      (.left (.scanRows tx "heads" headColumns
         [("origin_id", .text origin), ("slot", .text slot)] [] headJoin)) resume ∧
-      resume (.ok []) = .pure (.ok []) := by
+      resume (.ok ⟨[], none⟩) = .pure (.ok []) := by
   exact ⟨_, rfl, rfl⟩
 
 /-- Field conversion and signature width precede origin and key validation. -/
@@ -424,6 +425,7 @@ private structure Script where
   receipts : List Row := []
   failAt : Option Nat := none
   invalidKey : Bool := false
+  scanFailure : Option Failure := none
 
 private def failure : Failure := ⟨1, 99⟩
 
@@ -444,15 +446,16 @@ private def runScript (script : Script) : Nat → Nat →
       | .begin => step "begin" (resume (scriptReply script index 7))
       | .commit _ => step "commit" (resume (scriptReply script index ()))
       | .rollback _ => step "rollback" (resume (scriptReply script index ()))
-      | .readRows _ relation columns equals order joined => step relation (resume
+      | .scanRows _ relation columns equals order joined => step relation (resume
         (if relation == "heads" && columns == headColumns && joined == headJoin && order.isEmpty then
-           scriptReply script index (if equals.contains ("slot", .text "complete") then script.pointers else [])
+           scriptReply script index ⟨(if equals.contains ("slot", .text "complete") then script.pointers else []), none⟩
          else if relation == "head_history" && order == [⟨"seq", true⟩, ⟨"root", true⟩] then
-           scriptReply script index script.receipts
+           scriptReply script index ⟨script.receipts, script.scanFailure⟩
          else .error failure))
       | .deleteRows _ relation equals blockers => step "delete" (resume
         (if relation == "head_history" && blockers == [⟨"heads", equals⟩] then
           scriptReply script index 1 else .error failure))
+      | .readRows .. => step "unexpected eager read" (resume (.error failure))
       | .upsert _ _ _ _ _ => step "unexpected upsert" (resume (.error failure))
       | .readBytes _ _ => step "unexpected byte read" (resume (.error failure))
       | .readInput .. => step "unexpected input read" (resume (.error failure))
@@ -462,6 +465,17 @@ private def runScript (script : Script) : Nat → Nat →
 
 private def forkScript : Script :=
   { receipts := [receiptRow 1 1 10, receiptRow 1 2 10, receiptRow 2 3 10] }
+
+/-- Earlier domain validation wins over a later scan failure. -/
+example : runScript { receipts := [[.integer 1, .blob ByteArray.empty, .integer 0]], scanFailure := some failure }
+    12 0 (prune "origin" 20).run =
+    some (.error (.column "head_history.root" "0 bytes, not 32"),
+      ["begin", "heads", "heads", "head_history", "rollback"]) := by decide
+
+/-- A valid prefix does not hide the trailing failure or permit mutation. -/
+example : runScript { forkScript with scanFailure := some failure }
+    12 0 (prune "origin" 20).run =
+    some (.error (.host failure), ["begin", "heads", "heads", "head_history", "rollback"]) := by decide
 
 /-- Both expired fork roots are deleted, the ceiling survives, and success is
 returned only after the commit acknowledgement. -/

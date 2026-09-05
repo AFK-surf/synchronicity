@@ -95,7 +95,7 @@ def TrieGc (complete : Bool) : Transition State where
 
 /-- `heads.rs::Store::prune_history_before`: a root neither slot points at
 leaves retention once it ages out of the `root_retention` window. -/
-@[transition, rust_impl "mpt-prune-history"]
+@[transition]
 def Prune : Transition State where
   guard s := ¬s.pending ∧ ¬s.active
   post s := { s with retained := False }

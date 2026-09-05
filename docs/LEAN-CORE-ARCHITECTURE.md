@@ -228,7 +228,8 @@ unlink failures are returned to Lean, which attempts both files and ignores
 those failures only after committing the row deletion. Trie lookup also runs the complete Lean
 operation in production: Rust supplies only raw node/value reads and maps the
 completed result. Its former Rust decoding/traversal loop is deleted. Other
-trie operations and history cutover remain unfinished. The
+trie operations remain unfinished. History retention now runs in Lean in production,
+with its Rust retention loop and receipt/fork helpers deleted. The
 integration sequence for each operation is:
 
 1. Implement the common native continuation transport with typed reply
@@ -256,7 +257,7 @@ Integration review has identified specific gates, not waived limitations:
   regressions cover ordering, binding and trigger-created protection between
   deletes; Lean's request proof and scripted fixtures include the exclusion.
   Joined slot reads and column/byte-shape validation are now implemented in the
-  staged Lean program. Named-origin validation now runs directly in Lean,
+  production Lean program. Named-origin validation now runs directly in Lean,
   using a reusable Origin domain module with ASCII normalization, first-`@`
   separation, literal `key:` precedence and contextual label/domain failures.
   It follows signature-width validation and precedes root-width validation.
@@ -269,10 +270,10 @@ Integration review has identified specific gates, not waived limitations:
   operation and request rollback, retaining distinct diagnostics. These are
   conditional execution proofs. The native runner now interprets the separate
   crypto capability, and `history::prune` returns Lean-selected contextual
-  terminal errors. Native tests use scripted raw storage and crypto replies;
-  the Store's concrete crypto adapter and exact malformed-storage error mapping
-  remain integration gates. The Rust retention algorithm
-  remains until those semantics and the complete native entry point are implemented.
+  terminal errors. Store now supplies the concrete Ed25519 primitive and maps
+  final diagnostics to its existing error types. Real SQLite and cryptographic
+  regressions exercise the production entry point, including corrupt fields.
+  The old Rust retention algorithm and its receipt/fork readers are deleted.
   Specifically, read complete before pending; an orphan pointer without its
   signed-history row is absent under the existing inner join, not a malformed
   joined head. Preserve projected column errors and the validation order
@@ -280,12 +281,20 @@ Integration review has identified specific gates, not waived limitations:
   requested order. Do not replace these with a Rust `validatedHeads` service;
   Lean must consume raw storage records and invoke only genuine primitives.
   Raw cells now preserve REAL bits and invalid UTF-8 TEXT instead of rejecting
-  them eagerly. Lean's staged history decoder selects contextual field/type
-  errors in projection order. Native terminal encoding and capability transport
-  are implemented; production Store error mapping remains unfinished.
-  Eager materialization of all rows still requires review:
-  a later SQLite scan failure must not preempt an earlier record-validation
-  error when the existing reader would stop at that record.
+  them eagerly. Raw `scanRows` returns the observed prefix plus an optional
+  trailing host failure. Lean validates the prefix before selecting that failure;
+  no deletion begins if the scan failed. This preserves an earlier record error
+  over a later SQLite stepping error without a Rust domain-decoding callback.
+  The legacy all-or-error `readRows` uses the same raw SQLite scan internally.
+  Large-history transfer/allocation benchmarks and broader platform gates remain
+  required; the scan is batched, not a newly claimed streaming implementation.
+  Retention uses local `recorded_at`, never signer-controlled `created_at`.
+  The highest retained sequence must survive even after a pending slot expires:
+  lowering that ceiling could make `next_own_seq` reuse an already published
+  sequence. A fork is retired all-or-nothing only after older retained evidence
+  shows a later sequence; the lowest such witness stays while its fork remains
+  exempt. These policies now live in the Lean retention program, not SQL facts
+  precomputed by Rust.
 - Trie lookup now has soundness/completeness proofs against a stable raw graph
   interpreted by the actual decoder. Codec roundtripping/canonicality and
   mutable-host refinement remain separate obligations. Native commands must

@@ -2,8 +2,8 @@ import Std
 
 /-! Origin syntax and base32 decoding are Lean domain logic. `parse` composes
 them with a primitive Ed25519 point-validation action; it never asks the host
-to parse or normalize an origin. Production wiring of that primitive remains
-a migration gate. `parseSyntax` alone does not establish key validity. -/
+to parse or normalize an origin. History supplies the separate crypto capability
+in production. `parseSyntax` alone does not establish key validity. -/
 namespace VerifiedCore.Origin
 
 inductive Error where

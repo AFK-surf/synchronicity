@@ -564,6 +564,14 @@ impl Store {
         Ok(out)
     }
 
+    /// Keep a synchronous host interpreter's connection and reentry guard on
+    /// this stack. The interpreter's Lean program owns transaction commands.
+    pub(crate) fn with_connection_scope<T>(&self, f: impl FnOnce(&rusqlite::Connection) -> T) -> T {
+        let conn = self.conn();
+        let _scope = reentry::Scope::enter();
+        f(&conn)
+    }
+
     /// Runs `f` inside a single SQLite transaction, committing on `Ok` and
     /// rolling the whole thing back on `Err`.
     ///

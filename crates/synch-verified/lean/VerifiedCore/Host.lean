@@ -53,6 +53,12 @@ inductive Cell where
 abbrev Row := List Cell
 abbrev Fields := List (String × Cell)
 
+/-- Raw rows observed before a scan failed. Domains validate the prefix before
+observing the trailing failure, preserving sequential-reader error ordering. -/
+structure Scan where
+  rows : List Row
+  failure : Option Failure := none
+
 /-- Literal storage ordering, using the host column's stored type. -/
 structure Order where
   column : String
@@ -82,6 +88,9 @@ inductive Storage : Type → Type where
   | readRows (tx : Transaction) (relation : String)
       (columns : List String) (equals : Fields) (order : List Order := [])
       (joins : List Join := []) : Storage (Reply (List Row))
+  | scanRows (tx : Transaction) (relation : String)
+      (columns : List String) (equals : Fields) (order : List Order := [])
+      (joins : List Join := []) : Storage (Reply Scan)
   | upsert (tx : Transaction) (relation : String) (values : Fields)
       (conflictColumns updateColumns : List String) : Storage (Reply Unit)
   | deleteRows (tx : Transaction) (relation : String)

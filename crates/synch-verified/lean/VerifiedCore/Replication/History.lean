@@ -7,11 +7,10 @@ import Std.Data.TreeSet.Basic
 /-!
 History retention over raw storage, independent of CAS and trie internals.
 
-Staged program, NOT yet a production cutover. Before replacing the Rust entry
-point the shared storage interpreter/algebra must preserve these contracts:
+Production retention command. The raw host interpreter preserves these contracts:
 
 * Every deletion must add the generic relational predicate `NOT EXISTS heads`
-  with literal equality fields `origin_id`, `seq`, and `root`. The current Rust
+  with literal equality fields `origin_id`, `seq`, and `root`. The raw host
   SQL protects a slot pointer again at deletion time, including against SQL
   triggers that change pointers within an immediate transaction. Snapshot-only
   selection below does not replace that second defense. The program now
@@ -25,12 +24,14 @@ point the shared storage interpreter/algebra must preserve these contracts:
   and strict key-origin syntax are checked directly by the shared Lean Origin
   module, after signature width. The program requests primitive point validation
   for key origins and signing keys. Native transport and terminal error encoding
-  are implemented. Concrete Store crypto/error integration and scan-failure ordering remain required
-  before cutover; full diagnostic compatibility is not claimed here.
+  are implemented with Store's concrete primitive and contextual error adapter.
+* Scans return observed rows before a trailing failure. Lean validates each
+  receipt first, then observes the trailing failure before any mutation. A later
+  SQLite error cannot replace an earlier malformed-row error.
 
 The generic predicate/order facilities are in Host, not a history-specific
-callback. Current scripted fixtures establish the normal storage protocol and
-failure branches, not production compatibility under triggers/corruption.
+callback. Execution proofs assume their explicit raw-host contracts; native
+SQLite/crypto regressions test interpretation, not the physical storage system.
 -/
 namespace VerifiedCore.Replication.History
 open Host
@@ -162,10 +163,12 @@ def headJoin : List Join :=
 /-- The raw inner join precedes all decoding. Orphan pointers are absent, just
 as in the existing storage reader. Slots are fetched in caller-selected order. -/
 def readSlot (tx : Transaction) (origin slot : String) : Action (List JoinedHead) := do
-  let raw ← request (.readRows tx "heads" headColumns
+  let raw ← request (.scanRows tx "heads" headColumns
     [("origin_id", .text origin), ("slot", .text slot)] [] headJoin)
-  match raw with
-  | [] => return []
+  match raw.rows with
+  | [] => match raw.failure with
+    | none => return []
+    | some failure => throw (.host failure)
   | row :: _ =>
     let head ← decodeJoinedHead row
     return [head]
@@ -260,9 +263,10 @@ def pruneIn (tx : Transaction) (origin : String) (before : Int64) : Action Nat :
   let complete ← readSlot tx origin "complete"
   let pending ← readSlot tx origin "pending"
   let pointers := (complete ++ pending).map (·.pointer)
-  let rawReceipts ← request (.readRows tx "head_history" ["seq", "root", "recorded_at"]
+  let rawReceipts ← request (.scanRows tx "head_history" ["seq", "root", "recorded_at"]
     [("origin_id", .text origin)] [⟨"seq", true⟩, ⟨"root", true⟩])
-  let receipts ← ExceptT.mk (pure (rawReceipts.mapM decodeReceipt))
+  let receipts ← ExceptT.mk (pure (rawReceipts.rows.mapM decodeReceipt))
+  if let some failure := rawReceipts.failure then throw (.host failure)
   remove tx origin (selected pointers before receipts)
 
 /-- Public domain command: origin and retention horizon, returning committed deletions. -/

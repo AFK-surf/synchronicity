@@ -25,7 +25,10 @@ The old acquisition snapshot/planner API and Rust orchestration are deleted.
 CAS deletion also owns raw protection reads, transaction completion and file
 cleanup; its snapshot/planner ABI and Rust phase executor are removed.
 Trie lookup also runs as a complete native Lean operation over raw byte reads;
-the former Rust lookup traversal is removed. History retention remains staged.
+the former Rust lookup traversal is removed. History retention now runs as a
+complete Lean operation over raw scans and a separate Ed25519 primitive; the
+Rust retention loop and receipt/fork helpers are removed. Raw scans retain
+rows before a trailing host failure so Lean owns first-error selection.
 No selectable backend is added.
 
 The acquisition cutover is checked against real SQLite, including abandoned

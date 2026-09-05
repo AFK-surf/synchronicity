@@ -71,6 +71,19 @@ pub trait Storage {
     /// Original host error, retained without converting it into a policy result.
     type Error;
 
+    /// Scan literal raw projections, retaining rows before the first stepping
+    /// failure. Preparation/binding failures use the outer error. No domain
+    /// conversion may run here or replace an earlier row's validation error.
+    fn scan_rows(
+        &mut self,
+        tx: u64,
+        relation: &str,
+        columns: &[String],
+        equals: &Fields,
+        order: &[Order],
+        joins: &[Join],
+    ) -> Result<Scan<Self::Error>, Self::Error>;
+
     /// Begin an immediate transaction before the operation's relevant reads.
     fn begin(&mut self) -> Result<u64, Self::Error>;
     /// Commit the identified transaction.
@@ -115,6 +128,13 @@ pub trait Storage {
     ) -> Result<u64, Self::Error>;
     /// Read opaque bytes by namespace and key, preserving absence versus empty.
     fn read_bytes(&mut self, space: &str, key: &[u8]) -> Result<Option<Vec<u8>>, Self::Error>;
+}
+
+/// Raw prefix and optional trailing scan failure; no domain interpretation.
+#[derive(Debug)]
+pub struct Scan<E> {
+    pub rows: Vec<Row>,
+    pub failure: Option<E>,
 }
 
 /// Primitive cryptography, separate from storage and domain validation.

@@ -1,5 +1,5 @@
-//! Complete Lean retention command. Store cutover remains pending scan/error
-//! compatibility; this facade only constructs commands and decodes final results.
+//! Complete Lean retention command used by Store. This facade only constructs
+//! commands and decodes final results; it contains no retention algorithm.
 use crate::{
     host::{Crypto, Storage},
     operation::{OperationError, Reader, Slice},
@@ -123,6 +123,8 @@ mod tests {
         trace: Trace,
         head: Row,
         rollback_error: bool,
+        receipts: Vec<Row>,
+        scan_failure: Option<&'static str>,
     }
     struct Primitive {
         trace: Trace,
@@ -138,6 +140,26 @@ mod tests {
         }
     }
     impl Storage for Rows {
+        fn scan_rows(
+            &mut self,
+            tx: u64,
+            relation: &str,
+            columns: &[String],
+            equals: &crate::host::Fields,
+            order: &[crate::host::Order],
+            joins: &[crate::host::Join],
+        ) -> Result<crate::host::Scan<Self::Error>, Self::Error> {
+            self.read_rows(tx, relation, columns, equals, order, joins)
+                .map(|rows| crate::host::Scan {
+                    rows,
+                    failure: if relation == "head_history" {
+                        self.scan_failure
+                    } else {
+                        None
+                    },
+                })
+        }
+
         type Error = &'static str;
         fn begin(&mut self) -> Result<u64, Self::Error> {
             self.trace.borrow_mut().push("begin");
@@ -180,7 +202,7 @@ mod tests {
                 }
                 "head_history" => {
                     self.trace.borrow_mut().push("receipts");
-                    Ok(vec![])
+                    Ok(self.receipts.clone())
                 }
                 _ => panic!("unexpected relation"),
             }
@@ -228,6 +250,8 @@ mod tests {
                 trace: trace.clone(),
                 head,
                 rollback_error: false,
+                receipts: vec![],
+                scan_failure: None,
             },
             Primitive {
                 trace: trace.clone(),
@@ -294,6 +318,32 @@ mod tests {
     fn terminal_decoder_rejects_unknown_tags_and_trailing_data() {
         for bytes in [&[9][..], &[2, 0][..], &[5, 9][..], &[1, 0][..]] {
             assert!(decode(bytes).is_err());
+        }
+    }
+
+    #[test]
+    fn earlier_row_error_wins_over_trailing_scan_failure() {
+        for width in [0, 32] {
+            let (mut rows, mut crypto, trace) = setup("node@example", Ok(true));
+            rows.receipts = vec![vec![
+                Cell::Integer(1),
+                Cell::Blob(vec![0; width]),
+                Cell::Integer(0),
+            ]];
+            rows.scan_failure = Some("scan failed");
+            let result = prune(&mut rows, &mut crypto, "node@example", 10).unwrap_err();
+            match (width, result) {
+                (0, Error::Domain(DomainError::Column { column, reason })) => {
+                    assert_eq!(column, "head_history.root");
+                    assert_eq!(reason, "0 bytes, not 32");
+                }
+                (32, Error::Operation(OperationError::Host("scan failed"))) => (),
+                other => panic!("wrong error order: {other:?}"),
+            }
+            assert_eq!(
+                *trace.borrow(),
+                ["begin", "heads", "crypto", "heads", "receipts", "rollback"]
+            );
         }
     }
 }

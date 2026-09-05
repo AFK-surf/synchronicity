@@ -19,6 +19,22 @@ fn pin_acquisition_requires_durability_and_orders_possession_effects() {
     }
 
     impl Storage for Script {
+        fn scan_rows(
+            &mut self,
+            tx: u64,
+            relation: &str,
+            columns: &[String],
+            equals: &synch_verified::host::Fields,
+            order: &[synch_verified::host::Order],
+            joins: &[synch_verified::host::Join],
+        ) -> Result<synch_verified::host::Scan<Self::Error>, Self::Error> {
+            self.read_rows(tx, relation, columns, equals, order, joins)
+                .map(|rows| synch_verified::host::Scan {
+                    rows,
+                    failure: None,
+                })
+        }
+
         type Error = &'static str;
         fn exists_rows(&mut self, _: u64, _: &str, _: &Fields) -> Result<bool, Self::Error> {
             panic!("unexpected existence query")
@@ -179,6 +195,22 @@ fn deletion_protocol_checks_every_protection_and_orders_effects() {
         writing: bool,
     }
     impl Storage for Sql {
+        fn scan_rows(
+            &mut self,
+            tx: u64,
+            relation: &str,
+            columns: &[String],
+            equals: &synch_verified::host::Fields,
+            order: &[synch_verified::host::Order],
+            joins: &[synch_verified::host::Join],
+        ) -> Result<synch_verified::host::Scan<Self::Error>, Self::Error> {
+            self.read_rows(tx, relation, columns, equals, order, joins)
+                .map(|rows| synch_verified::host::Scan {
+                    rows,
+                    failure: None,
+                })
+        }
+
         type Error = &'static str;
         fn begin(&mut self) -> Result<u64, Self::Error> {
             step(&self.trace, self.fail_at, "begin")?;

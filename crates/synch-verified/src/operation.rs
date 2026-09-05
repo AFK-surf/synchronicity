@@ -201,6 +201,7 @@ enum Frame {
     RemoveFile(String, Vec<u8>),
     ExistsRows(u64, String, Fields),
     ValidateEd25519(Vec<u8>),
+    ScanRows(u64, String, Vec<String>, Fields, Vec<Order>, Vec<Join>),
 }
 
 fn decode(packet: &[u8]) -> Result<Frame, ()> {
@@ -214,27 +215,35 @@ fn decode(packet: &[u8]) -> Result<Frame, ()> {
         16 => Frame::Begin,
         17 => Frame::Commit(r.word()?),
         18 => Frame::Rollback(r.word()?),
-        19 => Frame::ReadRows(
-            r.word()?,
-            r.string()?,
-            r.list(Reader::string)?,
-            r.fields()?,
-            r.list(|r| {
-                let column = r.string()?;
-                let descending = match r.byte()? {
-                    0 => false,
-                    1 => true,
-                    _ => return Err(()),
-                };
-                Ok(Order { column, descending })
-            })?,
-            r.list(|r| {
-                Ok(Join {
-                    relation: r.string()?,
-                    keys: r.list(|r| Ok((r.string()?, r.string()?)))?,
-                })
-            })?,
-        ),
+        kind @ (19 | 28) => {
+            let frame = Frame::ReadRows(
+                r.word()?,
+                r.string()?,
+                r.list(Reader::string)?,
+                r.fields()?,
+                r.list(|r| {
+                    let column = r.string()?;
+                    let descending = match r.byte()? {
+                        0 => false,
+                        1 => true,
+                        _ => return Err(()),
+                    };
+                    Ok(Order { column, descending })
+                })?,
+                r.list(|r| {
+                    Ok(Join {
+                        relation: r.string()?,
+                        keys: r.list(|r| Ok((r.string()?, r.string()?)))?,
+                    })
+                })?,
+            );
+            match frame {
+                Frame::ReadRows(tx, table, columns, equals, order, joins) if kind == 28 => {
+                    Frame::ScanRows(tx, table, columns, equals, order, joins)
+                }
+                frame => frame,
+            }
+        }
         20 => Frame::Upsert(
             r.word()?,
             r.string()?,
@@ -298,6 +307,24 @@ fn execute<S: Storage>(
     loop {
         let frame = decode(&state.packet()).map_err(|()| OperationError::Protocol)?;
         let response = match frame {
+            Frame::ScanRows(tx, table, columns, equals, order, joins) => {
+                match storage.scan_rows(tx, &table, &columns, &equals, &order, &joins) {
+                    Err(error) => reply(28, Err::<(), _>(error), &mut errors, |_, ()| {}),
+                    Ok(scan) => {
+                        let mut out = vec![1, 28];
+                        rows(&mut out, scan.rows);
+                        if let Some(error) = scan.failure {
+                            errors.push(Some(error));
+                            out.push(1);
+                            word(&mut out, 1);
+                            word(&mut out, errors.len() as u64);
+                        } else {
+                            out.push(0);
+                        }
+                        out
+                    }
+                }
+            }
             Frame::ValidateEd25519(bytes) => match crypto.as_deref_mut() {
                 Some(crypto) => reply(
                     27,
@@ -443,6 +470,22 @@ pub(crate) unsafe fn run_with_crypto<S: Storage>(
 
 struct ReadOnly<'a, S>(&'a mut S);
 impl<S: ByteStorage> Storage for ReadOnly<'_, S> {
+    fn scan_rows(
+        &mut self,
+        tx: u64,
+        relation: &str,
+        columns: &[String],
+        equals: &crate::host::Fields,
+        order: &[crate::host::Order],
+        joins: &[crate::host::Join],
+    ) -> Result<crate::host::Scan<Self::Error>, Self::Error> {
+        self.read_rows(tx, relation, columns, equals, order, joins)
+            .map(|rows| crate::host::Scan {
+                rows,
+                failure: None,
+            })
+    }
+
     type Error = OperationError<S::Error>;
     fn exists_rows(&mut self, _: u64, _: &str, _: &Fields) -> Result<bool, Self::Error> {
         Err(OperationError::Protocol)
@@ -627,6 +670,22 @@ mod tests {
         }
     }
     impl Storage for Script {
+        fn scan_rows(
+            &mut self,
+            tx: u64,
+            relation: &str,
+            columns: &[String],
+            equals: &crate::host::Fields,
+            order: &[crate::host::Order],
+            joins: &[crate::host::Join],
+        ) -> Result<crate::host::Scan<Self::Error>, Self::Error> {
+            self.read_rows(tx, relation, columns, equals, order, joins)
+                .map(|rows| crate::host::Scan {
+                    rows,
+                    failure: None,
+                })
+        }
+
         type Error = &'static str;
         fn exists_rows(&mut self, _: u64, _: &str, _: &Fields) -> Result<bool, Self::Error> {
             panic!("unexpected existence query")

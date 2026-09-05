@@ -13,6 +13,8 @@ inductive Event where
   | rollback (tx : Transaction)
   | readRows (tx : Transaction) (relation : String) (columns : List String) (equals : Fields)
       (order : List Order := []) (joins : List Join := [])
+  | scanRows (tx : Transaction) (relation : String) (columns : List String) (equals : Fields)
+      (order : List Order := []) (joins : List Join := [])
   | upsert (tx : Transaction) (relation : String) (values : Fields)
       (conflictColumns updateColumns : List String)
   | deleteRows (tx : Transaction) (relation : String) (equals : Fields) (blockers : List Exclusion := [])
@@ -29,6 +31,7 @@ def event : Storage A → Event
   | .commit tx => .commit tx
   | .rollback tx => .rollback tx
   | .readRows tx relation columns equals order joined => .readRows tx relation columns equals order joined
+  | .scanRows tx relation columns equals order joined => .scanRows tx relation columns equals order joined
   | .upsert tx relation values conflicts updates => .upsert tx relation values conflicts updates
   | .deleteRows tx relation equals blockers => .deleteRows tx relation equals blockers
   | .readBytes space key => .readBytes space key
@@ -66,6 +69,7 @@ structure Script where
 
 /-- Return raw scripted observations without implementing CAS policy. -/
 def answer (script : Script) : Storage A → A
+  | .scanRows .. => .error malformedMetadata
   | .begin => script.begin
   | .commit _ => script.commit
   | .rollback _ => script.rollback

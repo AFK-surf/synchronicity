@@ -51,12 +51,15 @@ def tag : Storage A → UInt8
   | .readCounter .. => 24
   | .removeFile .. => 25
   | .existsRows .. => 26
+  | .scanRows .. => 28
 
 def request (effect : Storage A) : ByteArray := octet 1 ++ octet (tag effect) ++
   match effect with
   | .begin => .empty
   | .commit tx | .rollback tx => word tx
   | .readRows tx table columns equals order joined =>
+    word tx ++ string table ++ sequence string columns ++ fields equals ++ ordering order ++ joins joined
+  | .scanRows tx table columns equals order joined =>
     word tx ++ string table ++ sequence string columns ++ fields equals ++ ordering order ++ joins joined
   | .upsert tx table values conflict updates =>
     word tx ++ string table ++ fields values ++ sequence string conflict ++ sequence string updates
@@ -155,6 +158,13 @@ def reply (effect : Storage A) (input : ByteArray) : A :=
   | .commit _ => decodeReply 17 (pure ()) input
   | .rollback _ => decodeReply 18 (pure ()) input
   | .readRows .. => decodeReply 19 (readList (readList readCell)) input
+  | .scanRows .. => decodeReply 28 (do
+      let rows ← readList (readList readCell)
+      let failed ← readByte
+      match failed with
+      | 0 => return ⟨rows, none⟩
+      | 1 => return ⟨rows, some (← readFailure)⟩
+      | _ => throw ()) input
   | .upsert .. => decodeReply 20 (pure ()) input
   | .deleteRows .. => decodeReply 21 (do return (← readWord).toNat) input
   | .readBytes .. => decodeReply 22 (do

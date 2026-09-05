@@ -236,6 +236,22 @@ impl Storage for SqliteStorage<'_> {
         order: &[synch_verified::host::Order],
         joins: &[synch_verified::host::Join],
     ) -> Result<Vec<Row>> {
+        let scan = self.scan_rows(tx, relation, columns, equals, order, joins)?;
+        match scan.failure {
+            Some(error) => Err(error),
+            None => Ok(scan.rows),
+        }
+    }
+
+    fn scan_rows(
+        &mut self,
+        tx: u64,
+        relation: &str,
+        columns: &[String],
+        equals: &Fields,
+        order: &[synch_verified::host::Order],
+        joins: &[synch_verified::host::Join],
+    ) -> Result<synch_verified::host::Scan<StoreError>> {
         self.require_live_transaction(tx)?;
         columns_for(relation)?;
         if columns.is_empty() {
@@ -315,8 +331,20 @@ impl Storage for SqliteStorage<'_> {
                 })
                 .collect::<rusqlite::Result<Row>>()
         })?;
-        rows.collect::<rusqlite::Result<Vec<_>>>()
-            .map_err(Into::into)
+        let mut scan = synch_verified::host::Scan {
+            rows: Vec::new(),
+            failure: None,
+        };
+        for row in rows {
+            match row {
+                Ok(row) => scan.rows.push(row),
+                Err(error) => {
+                    scan.failure = Some(error.into());
+                    break;
+                }
+            }
+        }
+        Ok(scan)
     }
 
     fn upsert(
@@ -415,6 +443,27 @@ impl Storage for SqliteStorage<'_> {
 mod tests {
     use super::*;
     use synch_verified::host::{Exclusion, Join, Order};
+
+    #[test]
+    fn raw_scan_retains_prefix_before_sqlite_step_failure() {
+        let conn = connection();
+        conn.execute_batch(
+            "CREATE TEMP TABLE scan_source (id INTEGER PRIMARY KEY);
+            INSERT INTO scan_source VALUES (1), (2);
+            CREATE TEMP VIEW blobs AS SELECT id AS root,
+              CASE WHEN id = 2 THEN abs(-9223372036854775808) ELSE 1 END AS durable
+              FROM scan_source;",
+        )
+        .unwrap();
+        let mut storage = SqliteStorage::new(&conn);
+        let tx = storage.begin().unwrap();
+        let scan = storage
+            .scan_rows(tx, "blobs", &names(&["root", "durable"]), &vec![], &[], &[])
+            .unwrap();
+        assert_eq!(scan.rows, [vec![Cell::Integer(1), Cell::Integer(1)]]);
+        assert!(matches!(scan.failure, Some(StoreError::Sqlite(_))));
+        storage.rollback(tx).unwrap();
+    }
 
     #[test]
     fn raw_text_and_real_values_keep_their_storage_classes() {
