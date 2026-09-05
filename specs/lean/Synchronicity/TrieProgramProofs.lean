@@ -118,9 +118,9 @@ def executeReads (store : RawSnapshot) : Nat → Program Storage A → Option A
   | _ + 1, .request .begin _ => none
   | _ + 1, .request (.commit _) _ => none
   | _ + 1, .request (.rollback _) _ => none
-  | _ + 1, .request (.readRows _ _ _ _) _ => none
+  | _ + 1, .request (.readRows _ _ _ _ _) _ => none
   | _ + 1, .request (.upsert _ _ _ _ _) _ => none
-  | _ + 1, .request (.deleteRows _ _ _) _ => none
+  | _ + 1, .request (.deleteRows _ _ _ _) _ => none
   | _ + 1, .request (.readInput _ _ _) _ => none
   | _ + 1, .request (.readCounter _ _) _ => none
   | _ + 1, .request (.removeFile _ _) _ => none

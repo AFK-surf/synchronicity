@@ -18,6 +18,20 @@ pub type Row = Vec<Cell>;
 /// Named raw cells used as equality predicates or explicit write values.
 pub type Fields = Vec<(String, Cell)>;
 
+/// Ordering by the column's stored type, not a domain reinterpretation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Order {
+    pub column: String,
+    pub descending: bool,
+}
+
+/// A raw NOT EXISTS query that must be checked in the mutation statement.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Exclusion {
+    pub relation: String,
+    pub equals: Fields,
+}
+
 /// Read-only byte storage capability, without relational or transaction policy.
 pub trait ByteStorage {
     /// Original backing-store failure.
@@ -59,6 +73,7 @@ pub trait Storage {
         relation: &str,
         columns: &[String],
         equals: &Fields,
+        order: &[Order],
     ) -> Result<Vec<Row>, Self::Error>;
     /// Existence query without materializing all matching rows.
     fn exists_rows(
@@ -77,9 +92,15 @@ pub trait Storage {
         conflict_columns: &[String],
         update_columns: &[String],
     ) -> Result<(), Self::Error>;
-    /// Delete rows matching all named equality predicates; return affected rows.
-    fn delete_rows(&mut self, tx: u64, relation: &str, equals: &Fields)
-        -> Result<u64, Self::Error>;
+    /// Delete matching rows only if every exclusion is absent in the same
+    /// statement, not by a preceding read. Return the affected row count.
+    fn delete_rows(
+        &mut self,
+        tx: u64,
+        relation: &str,
+        equals: &Fields,
+        unless: &[Exclusion],
+    ) -> Result<u64, Self::Error>;
     /// Read opaque bytes by namespace and key, preserving absence versus empty.
     fn read_bytes(&mut self, space: &str, key: &[u8]) -> Result<Option<Vec<u8>>, Self::Error>;
 }

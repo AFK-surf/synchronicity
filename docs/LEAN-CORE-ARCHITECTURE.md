@@ -237,12 +237,19 @@ domain implementations throughout migration.
 
 Integration review has identified specific gates, not waived limitations:
 
-- History deletion must retain the existing mutation-time `NOT EXISTS heads`
-  defense, including trigger-induced changes, and its receipt deletion order.
-  Add a generic raw relational predicate/ordered-read capability selected by
-  Lean, not a host `deleteUnreferencedHistory` operation. The staged equality-only
-  deletion is insufficient for cutover. Preserve or explicitly resolve existing
-  malformed signed-head/pointer decoding and error behavior as well.
+- History now requests signed `seq DESC, root DESC` ordering and a mutation-time
+  `NOT EXISTS heads` exclusion through generic storage parameters. SQLite
+  regressions cover ordering, binding and trigger-created protection between
+  deletes; Lean's request proof and scripted fixtures include the exclusion.
+  The remaining cutover gate is joined signed-head/pointer validation and its
+  malformed-storage error behavior. The Rust retention algorithm remains until
+  those semantics and the complete native entry point are implemented.
+  Specifically, read complete before pending; an orphan pointer without its
+  signed-history row is absent under the existing inner join, not a malformed
+  joined head. Preserve projected column errors and the validation order
+  (signature width, origin, root width, public key), then receipt decoding in
+  requested order. Do not replace these with a Rust `validatedHeads` service;
+  Lean must consume raw storage records and invoke only genuine primitives.
 - Trie lookup now has soundness/completeness proofs against a stable raw graph
   interpreted by the actual decoder. Codec roundtripping/canonicality and
   mutable-host refinement remain separate obligations. Native commands must
@@ -291,6 +298,16 @@ and cross-Store ordering guards until the complete Lean call returns. Rust
 copies the active-writer registry count; Lean interprets it. Resource namespaces
 are whitelisted host mappings, not policies such as “collectable object” or
 “best-effort cleanup.” There is no snapshot or mutation-plan ABI for deletion.
+
+Relational reads carry an optional list of column/direction order terms.
+Deletes carry optional raw exclusion queries, each consisting of a whitelisted
+relation and literal equality fields. The interpreter executes all exclusions
+as `NOT EXISTS` subqueries in the DELETE itself, never as preceding checks.
+Thus changes caused by an earlier deletion's trigger are visible to the next
+deletion. Empty parameters retain the original primitive behavior. These extend
+existing read/delete effects; no history-specific service or second query
+language is exposed. The private packets are internal to the same statically
+linked runtime and are neither persisted nor a public compatibility protocol.
 
 Only a host failure's opaque token crosses into Lean; Rust retains the original
 error object until Lean completes. Thus a later rollback failure cannot overwrite

@@ -37,6 +37,18 @@ inductive Cell where
 abbrev Row := List Cell
 abbrev Fields := List (String × Cell)
 
+/-- Literal storage ordering, using the host column's stored type. -/
+structure Order where
+  column : String
+  descending : Bool
+  deriving BEq
+
+/-- A raw relational exclusion evaluated by the same mutation statement. -/
+structure Exclusion where
+  relation : String
+  equals : Fields
+  deriving BEq
+
 /-- Identifiers are host-whitelisted storage names, never executable SQL.
 Read projections preserve absent rows, NULL, types and order of columns.
 An empty equality filter scans the relation; it does not infer domain policy. -/
@@ -45,11 +57,11 @@ inductive Storage : Type → Type where
   | commit (tx : Transaction) : Storage (Reply Unit)
   | rollback (tx : Transaction) : Storage (Reply Unit)
   | readRows (tx : Transaction) (relation : String)
-      (columns : List String) (equals : Fields) : Storage (Reply (List Row))
+      (columns : List String) (equals : Fields) (order : List Order := []) : Storage (Reply (List Row))
   | upsert (tx : Transaction) (relation : String) (values : Fields)
       (conflictColumns updateColumns : List String) : Storage (Reply Unit)
   | deleteRows (tx : Transaction) (relation : String)
-      (equals : Fields) : Storage (Reply Nat)
+      (equals : Fields) (blockers : List Exclusion := []) : Storage (Reply Nat)
   | readBytes (space : String) (key : ByteArray) : Storage (Reply (Option ByteArray))
   /-- Bounded access to an immutable command input, borrowed for this run. -/
   | readInput (handle offset count : UInt64) : Storage (Reply ByteArray)

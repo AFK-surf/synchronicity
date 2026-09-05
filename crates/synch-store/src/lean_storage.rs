@@ -214,17 +214,30 @@ impl Storage for SqliteStorage<'_> {
         relation: &str,
         columns: &[String],
         equals: &Fields,
+        order: &[synch_verified::host::Order],
     ) -> Result<Vec<Row>> {
         self.require_live_transaction(tx)?;
         columns_for(relation)?;
         if columns.is_empty() {
             return Err(StoreError::invalid("empty storage projection"));
         }
-        let sql = format!(
+        let mut sql = format!(
             "SELECT {} FROM \"{relation}\"{}",
             projection(relation, columns)?,
             predicate(relation, equals)?
         );
+        if !order.is_empty() {
+            let terms = order
+                .iter()
+                .map(|term| {
+                    column(relation, &term.column).map(|column| {
+                        format!("{column} {}", if term.descending { "DESC" } else { "ASC" })
+                    })
+                })
+                .collect::<Result<Vec<_>>>()?;
+            sql.push_str(" ORDER BY ");
+            sql.push_str(&terms.join(", "));
+        }
         let mut statement = self.conn.prepare(&sql)?;
         let rows = statement.query_map(params_from_iter(values(equals)), |row| {
             columns
@@ -302,11 +315,32 @@ impl Storage for SqliteStorage<'_> {
         Ok(())
     }
 
-    fn delete_rows(&mut self, tx: u64, relation: &str, equals: &Fields) -> Result<u64> {
+    fn delete_rows(
+        &mut self,
+        tx: u64,
+        relation: &str,
+        equals: &Fields,
+        unless: &[synch_verified::host::Exclusion],
+    ) -> Result<u64> {
         self.require_live_transaction(tx)?;
         columns_for(relation)?;
-        let sql = format!("DELETE FROM \"{relation}\"{}", predicate(relation, equals)?);
-        Ok(self.conn.execute(&sql, params_from_iter(values(equals)))? as u64)
+        let mut sql = format!("DELETE FROM \"{relation}\"{}", predicate(relation, equals)?);
+        let mut bindings = values(equals);
+        for (index, exclusion) in unless.iter().enumerate() {
+            columns_for(&exclusion.relation)?;
+            sql.push_str(if equals.is_empty() && index == 0 {
+                " WHERE "
+            } else {
+                " AND "
+            });
+            sql.push_str(&format!(
+                "NOT EXISTS (SELECT 1 FROM \"{}\"{})",
+                exclusion.relation,
+                predicate(&exclusion.relation, &exclusion.equals)?
+            ));
+            bindings.extend(values(&exclusion.equals));
+        }
+        Ok(self.conn.execute(&sql, params_from_iter(bindings))? as u64)
     }
 
     fn read_bytes(&mut self, space: &str, key: &[u8]) -> Result<Option<Vec<u8>>> {
@@ -325,6 +359,139 @@ impl Storage for SqliteStorage<'_> {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use synch_verified::host::{Exclusion, Order};
+
+    #[test]
+    fn ordered_reads_use_signed_storage_values_and_explicit_tiebreakers() {
+        let conn = connection();
+        for (root, size) in [(1u8, i64::MIN), (2, -1), (3, 0), (4, i64::MAX), (5, 0)] {
+            conn.execute(
+                "INSERT INTO blobs (root, size) VALUES (?1, ?2)",
+                rusqlite::params![vec![root], size],
+            )
+            .unwrap();
+        }
+        let mut storage = SqliteStorage::new(&conn);
+        let tx = storage.begin().unwrap();
+        let order = [
+            Order {
+                column: "size".into(),
+                descending: true,
+            },
+            Order {
+                column: "root".into(),
+                descending: true,
+            },
+        ];
+        assert_eq!(
+            storage
+                .read_rows(tx, "blobs", &names(&["root"]), &vec![], &order)
+                .unwrap(),
+            [4, 5, 3, 2, 1].map(|n| vec![Cell::Blob(vec![n])]).to_vec()
+        );
+        assert!(storage
+            .read_rows(
+                tx,
+                "blobs",
+                &names(&["root"]),
+                &vec![],
+                &[Order {
+                    column: "size; DROP TABLE blobs".into(),
+                    descending: false
+                }]
+            )
+            .is_err());
+        storage.rollback(tx).unwrap();
+    }
+
+    #[test]
+    fn exclusions_recheck_trigger_changed_rows_at_each_mutation() {
+        let conn = connection();
+        conn.execute_batch(
+            "INSERT INTO blobs (root) VALUES (X'01'), (X'02');
+            CREATE TRIGGER protect_next AFTER DELETE ON blobs WHEN OLD.root = X'02'
+            BEGIN INSERT INTO pins (root, holder) VALUES (X'01', 'trigger'); END;",
+        )
+        .unwrap();
+        let mut storage = SqliteStorage::new(&conn);
+        let tx = storage.begin().unwrap();
+        // Both rows are candidates at selection time.
+        assert!(!storage.exists_rows(tx, "pins", &vec![]).unwrap());
+        for (root, expected) in [(2, 1), (1, 0)] {
+            let equals = vec![("root".into(), Cell::Blob(vec![root]))];
+            let guards = [Exclusion {
+                relation: "pins".into(),
+                equals: equals.clone(),
+            }];
+            assert_eq!(
+                storage.delete_rows(tx, "blobs", &equals, &guards).unwrap(),
+                expected
+            );
+        }
+        storage.commit(tx).unwrap();
+        assert_eq!(
+            conn.query_row("SELECT root FROM blobs", [], |row| row.get::<_, Vec<u8>>(0))
+                .unwrap(),
+            vec![1]
+        );
+    }
+
+    #[test]
+    fn exclusions_bind_each_predicate_and_reject_unknown_identifiers() {
+        let conn = connection();
+        conn.execute_batch(
+            "INSERT INTO blobs (root) VALUES (X'01');
+            INSERT INTO pins (root, holder) VALUES (X'02', 'pin');",
+        )
+        .unwrap();
+        let mut storage = SqliteStorage::new(&conn);
+        let tx = storage.begin().unwrap();
+        let guards = [
+            Exclusion {
+                relation: "content_want".into(),
+                equals: vec![],
+            },
+            Exclusion {
+                relation: "pins".into(),
+                equals: vec![("root".into(), Cell::Blob(vec![2]))],
+            },
+        ];
+        assert_eq!(
+            storage.delete_rows(tx, "blobs", &vec![], &guards).unwrap(),
+            0
+        );
+        assert!(storage
+            .delete_rows(
+                tx,
+                "blobs",
+                &vec![],
+                &[Exclusion {
+                    relation: "pins; --".into(),
+                    equals: vec![]
+                }]
+            )
+            .is_err());
+        assert!(storage
+            .delete_rows(
+                tx,
+                "blobs",
+                &vec![],
+                &[Exclusion {
+                    relation: "pins".into(),
+                    equals: vec![("unknown".into(), Cell::Null)]
+                }]
+            )
+            .is_err());
+        let absent = [Exclusion {
+            relation: "pins".into(),
+            equals: vec![("root".into(), Cell::Blob(vec![3]))],
+        }];
+        assert_eq!(
+            storage.delete_rows(tx, "blobs", &vec![], &absent).unwrap(),
+            1
+        );
+        storage.rollback(tx).unwrap();
+    }
 
     fn connection() -> Connection {
         let conn = Connection::open_in_memory().unwrap();
@@ -383,7 +550,8 @@ mod tests {
                     tx,
                     "blobs",
                     &names(&["inline", "bitmap", "size", "durable"]),
-                    &vec![]
+                    &vec![],
+                    &[]
                 )
                 .unwrap(),
             vec![vec![
@@ -399,7 +567,8 @@ mod tests {
                     tx,
                     "blobs",
                     &names(&["root"]),
-                    &vec![("bitmap".into(), Cell::Null)]
+                    &vec![("bitmap".into(), Cell::Null)],
+                    &[]
                 )
                 .unwrap(),
             vec![vec![Cell::Blob(vec![1])]]
@@ -409,7 +578,8 @@ mod tests {
                 tx,
                 "blobs",
                 &names(&["root"]),
-                &vec![("root".into(), Cell::Blob(vec![2]))]
+                &vec![("root".into(), Cell::Blob(vec![2]))],
+                &[]
             )
             .unwrap()
             .is_empty());
@@ -437,7 +607,8 @@ mod tests {
                     tx,
                     "pins",
                     &names(&["created_at", "release_after"]),
-                    &vec![]
+                    &vec![],
+                    &[]
                 )
                 .unwrap(),
             vec![vec![Cell::Integer(3), Cell::Null]]
@@ -479,7 +650,9 @@ mod tests {
         let first = storage.begin().unwrap();
         assert!(storage.begin().is_err());
         assert!(storage.commit(first + 1).is_err());
-        assert!(storage.delete_rows(first + 1, "pins", &vec![]).is_err());
+        assert!(storage
+            .delete_rows(first + 1, "pins", &vec![], &[])
+            .is_err());
         storage.rollback(first).unwrap();
         let next = storage.begin().unwrap();
         assert_ne!(next, first);
@@ -511,7 +684,12 @@ mod tests {
             }
             let mut storage = SqliteStorage::new(&conn);
             let tx = storage.begin().unwrap();
-            assert_eq!(storage.delete_rows(tx, "content_want", &vec![]).unwrap(), 1);
+            assert_eq!(
+                storage
+                    .delete_rows(tx, "content_want", &vec![], &[])
+                    .unwrap(),
+                1
+            );
             if at_commit {
                 insert_pin(&mut storage, tx).unwrap();
                 assert!(storage.commit(tx).is_err());
@@ -541,15 +719,21 @@ mod tests {
         let mut storage = SqliteStorage::new(&conn);
         let tx = storage.begin().unwrap();
         assert!(storage
-            .read_rows(tx, "blobs; DROP TABLE pins", &names(&["root"]), &vec![])
+            .read_rows(
+                tx,
+                "blobs; DROP TABLE pins",
+                &names(&["root"]),
+                &vec![],
+                &[]
+            )
             .is_err());
         assert!(storage
-            .read_rows(tx, "blobs", &names(&["root FROM blobs; --"]), &vec![])
+            .read_rows(tx, "blobs", &names(&["root FROM blobs; --"]), &vec![], &[])
             .is_err());
         assert!(storage
-            .read_rows(tx, "blobs", &names(&["durable"]), &vec![])
+            .read_rows(tx, "blobs", &names(&["durable"]), &vec![], &[])
             .is_err());
-        assert!(storage.read_rows(tx, "blobs", &[], &vec![]).is_err());
+        assert!(storage.read_rows(tx, "blobs", &[], &vec![], &[]).is_err());
         storage.rollback(tx).unwrap();
         assert!(storage.read_bytes("trie_nodes; --", &[1]).is_err());
     }
@@ -569,9 +753,9 @@ mod tests {
         conn.execute_batch("DROP TRIGGER abort_transaction")
             .unwrap();
         assert!(insert_pin(&mut storage, tx).is_err());
-        assert!(storage.delete_rows(tx, "pins", &vec![]).is_err());
+        assert!(storage.delete_rows(tx, "pins", &vec![], &[]).is_err());
         assert!(storage
-            .read_rows(tx, "pins", &names(&["root"]), &vec![])
+            .read_rows(tx, "pins", &names(&["root"]), &vec![], &[])
             .is_err());
         assert!(storage.commit(tx).is_err());
         storage.rollback(tx).unwrap();

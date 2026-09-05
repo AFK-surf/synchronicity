@@ -326,14 +326,14 @@ theorem eligible_sides_agree (policy : Retention) (pointers : List Pointer)
 theorem remove_empty (tx : Transaction) (origin : String) :
     (remove tx origin []).run = .pure (.ok 0) := rfl
 
-/-- Deletion effects contain the exact retained-record key. A failed delete
-has no continuation that can attempt another deletion or return success. -/
+/-- Deletion effects contain the exact retained-record key and a mutation-time
+exclusion for matching head pointers. A failed delete has no continuation that
+can attempt another deletion or return success. -/
 theorem remove_next (tx : Transaction) (origin : String) (total : Nat)
     (receipt : Receipt) (rest : List Receipt) :
     (removeLoop tx origin total (receipt :: rest)).run =
       .request (.deleteRows tx "head_history"
-        [("origin_id", .text origin), ("seq", .integer receipt.pointer.seq.toInt64),
-         ("root", .blob receipt.pointer.root)])
+        (receiptKey origin receipt) [⟨"heads", receiptKey origin receipt⟩])
         (fun reply => match reply with
           | .error failure => .pure (.error failure)
           | .ok count => (removeLoop tx origin (total + count) rest).run) := by
@@ -381,9 +381,14 @@ private def runScript (script : Script) : Nat → Nat →
     | .begin => step "begin" (resume (scriptReply script index 7))
     | .commit _ => step "commit" (resume (scriptReply script index ()))
     | .rollback _ => step "rollback" (resume (scriptReply script index ()))
-    | .readRows _ relation _ _ => step relation (resume
-      (scriptReply script index (if relation == "heads" then script.pointers else script.receipts)))
-    | .deleteRows _ _ _ => step "delete" (resume (scriptReply script index 1))
+    | .readRows _ relation _ _ order => step relation (resume
+      (if relation == "heads" && order.isEmpty then scriptReply script index script.pointers
+       else if relation == "head_history" && order == [⟨"seq", true⟩, ⟨"root", true⟩] then
+         scriptReply script index script.receipts
+       else .error failure))
+    | .deleteRows _ relation equals blockers => step "delete" (resume
+      (if relation == "head_history" && blockers == [⟨"heads", equals⟩] then
+        scriptReply script index 1 else .error failure))
     | .upsert _ _ _ _ _ => step "unexpected upsert" (resume (.error failure))
     | .readBytes _ _ => step "unexpected byte read" (resume (.error failure))
     | .readInput .. => step "unexpected input read" (resume (.error failure))

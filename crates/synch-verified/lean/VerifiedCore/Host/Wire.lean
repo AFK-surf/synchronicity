@@ -24,6 +24,12 @@ def cell : Cell → ByteArray
 def fields (values : Fields) : ByteArray :=
   sequence (fun (name, value) => string name ++ cell value) values
 
+def ordering (orders : List Order) : ByteArray :=
+  sequence (fun order => string order.column ++ octet (if order.descending then 1 else 0)) orders
+
+def exclusions (guards : List Exclusion) : ByteArray :=
+  sequence (fun guard => string guard.relation ++ fields guard.equals) guards
+
 def failure (f : Failure) : ByteArray := word f.code.toUInt64 ++ word f.token
 
 def tag : Storage A → UInt8
@@ -43,11 +49,11 @@ def request (effect : Storage A) : ByteArray := octet 1 ++ octet (tag effect) ++
   match effect with
   | .begin => .empty
   | .commit tx | .rollback tx => word tx
-  | .readRows tx table columns equals =>
-    word tx ++ string table ++ sequence string columns ++ fields equals
+  | .readRows tx table columns equals order =>
+    word tx ++ string table ++ sequence string columns ++ fields equals ++ ordering order
   | .upsert tx table values conflict updates =>
     word tx ++ string table ++ fields values ++ sequence string conflict ++ sequence string updates
-  | .deleteRows tx table equals => word tx ++ string table ++ fields equals
+  | .deleteRows tx table equals blockers => word tx ++ string table ++ fields equals ++ exclusions blockers
   | .readBytes space key => string space ++ bytes key
   | .readInput handle offset count => word handle ++ word offset ++ word count
   | .readCounter space key | .removeFile space key => string space ++ bytes key

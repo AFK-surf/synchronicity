@@ -6,23 +6,25 @@ import Std.Data.TreeSet.Basic
 History retention over raw storage, independent of CAS and trie internals.
 
 Staged program, NOT yet a production cutover. Before replacing the Rust entry
-point the shared storage interpreter/algebra must preserve three contracts:
+point the shared storage interpreter/algebra must preserve these contracts:
 
 * Every deletion must add the generic relational predicate `NOT EXISTS heads`
   with literal equality fields `origin_id`, `seq`, and `root`. The current Rust
   SQL protects a slot pointer again at deletion time, including against SQL
   triggers that change pointers within an immediate transaction. Snapshot-only
-  selection below does not replace that second defense.
+  selection below does not replace that second defense. The program now
+  requests that exclusion in each delete statement.
 * Receipt reads must request SQL ordering `seq DESC, root DESC`, preserving the
   current mutation/trigger/failure order. SQL ordering is signed Int64; Lean's
   retention comparisons deliberately reinterpret the stored bits as UInt64.
+  The program now supplies this ordering explicitly.
 * Raw pointer reads protect orphan pointers, but no longer validate the joined
   signed-head origin/key/signature as `head_in` does. Malformed cells currently
   return code 2/token 0 rather than the existing contextual Rust column/decode
   errors. Those error and corrupt-storage semantics need explicit resolution
   and regression tests before cutover; they are not claimed equivalent here.
 
-The generic predicate/order facilities belong in Host, not a history-specific
+The generic predicate/order facilities are in Host, not a history-specific
 callback. Current scripted fixtures establish the normal storage protocol and
 failure branches, not production compatibility under triggers/corruption.
 -/
@@ -122,12 +124,15 @@ def deletable (policy : Retention) (pointers : List Pointer) (before : Int64)
 def selected (pointers : List Pointer) (before : Int64) (receipts : List Receipt) : List Receipt :=
   receipts.filter (deletable (retention pointers before receipts) pointers before)
 
+def receiptKey (origin : String) (receipt : Receipt) : Fields :=
+  [("origin_id", .text origin), ("seq", .integer receipt.pointer.seq.toInt64),
+   ("root", .blob receipt.pointer.root)]
+
 def removeLoop (tx : Transaction) (origin : String) : Nat → List Receipt → Operation Nat
   | total, [] => pure total
   | total, receipt :: rest => do
     let count ← perform (.deleteRows tx "head_history"
-      [("origin_id", .text origin), ("seq", .integer receipt.pointer.seq.toInt64),
-       ("root", .blob receipt.pointer.root)])
+      (receiptKey origin receipt) [⟨"heads", receiptKey origin receipt⟩])
     removeLoop tx origin (total + count) rest
 
 def remove (tx : Transaction) (origin : String) (receipts : List Receipt) : Operation Nat :=
@@ -139,7 +144,7 @@ def pruneIn (tx : Transaction) (origin : String) (before : Int64) : Operation Na
   let rawPointers ← perform (.readRows tx "heads" ["seq", "root"] [("origin_id", .text origin)])
   let pointers ← ExceptT.mk (pure (rawPointers.mapM decodePointer))
   let rawReceipts ← perform (.readRows tx "head_history" ["seq", "root", "recorded_at"]
-    [("origin_id", .text origin)])
+    [("origin_id", .text origin)] [⟨"seq", true⟩, ⟨"root", true⟩])
   let receipts ← ExceptT.mk (pure (rawReceipts.mapM decodeReceipt))
   remove tx origin (selected pointers before receipts)
 

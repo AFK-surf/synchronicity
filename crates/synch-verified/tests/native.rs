@@ -42,6 +42,7 @@ fn pin_acquisition_requires_durability_and_orders_possession_effects() {
             relation: &str,
             columns: &[String],
             equals: &Fields,
+            _order: &[synch_verified::host::Order],
         ) -> Result<Vec<Row>, Self::Error> {
             assert_eq!(tx, 7);
             match relation {
@@ -94,6 +95,7 @@ fn pin_acquisition_requires_durability_and_orders_possession_effects() {
             tx: u64,
             relation: &str,
             equals: &Fields,
+            _unless: &[synch_verified::host::Exclusion],
         ) -> Result<u64, Self::Error> {
             assert_eq!(tx, 7);
             assert_eq!(relation, "content_want");
@@ -217,6 +219,7 @@ fn deletion_protocol_checks_every_protection_and_orders_effects() {
             table: &str,
             columns: &[String],
             equals: &Fields,
+            _order: &[synch_verified::host::Order],
         ) -> Result<Vec<Row>, Self::Error> {
             assert_eq!(tx, 7);
             assert_eq!(table, "blobs");
@@ -243,6 +246,7 @@ fn deletion_protocol_checks_every_protection_and_orders_effects() {
             tx: u64,
             table: &str,
             equals: &Fields,
+            _unless: &[synch_verified::host::Exclusion],
         ) -> Result<u64, Self::Error> {
             assert_eq!(tx, 7);
             assert_eq!(table, "blobs");

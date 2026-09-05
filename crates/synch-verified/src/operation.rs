@@ -1,5 +1,5 @@
 //! Private synchronous transport. Only raw storage effects are interpreted here.
-use crate::host::{ByteStorage, Cell, Fields, Resources, Row, Storage};
+use crate::host::{ByteStorage, Cell, Exclusion, Fields, Order, Resources, Row, Storage};
 use std::{ffi::c_void, marker::PhantomData, ptr::NonNull, rc::Rc};
 
 #[derive(Debug)]
@@ -182,9 +182,9 @@ enum Frame {
     Begin,
     Commit(u64),
     Rollback(u64),
-    ReadRows(u64, String, Vec<String>, Fields),
+    ReadRows(u64, String, Vec<String>, Fields, Vec<Order>),
     Upsert(u64, String, Fields, Vec<String>, Vec<String>),
-    DeleteRows(u64, String, Fields),
+    DeleteRows(u64, String, Fields, Vec<Exclusion>),
     ReadBytes(String, Vec<u8>),
     ReadInput(u64, u64, u64),
     ReadCounter(String, Vec<u8>),
@@ -203,7 +203,21 @@ fn decode(packet: &[u8]) -> Result<Frame, ()> {
         16 => Frame::Begin,
         17 => Frame::Commit(r.word()?),
         18 => Frame::Rollback(r.word()?),
-        19 => Frame::ReadRows(r.word()?, r.string()?, r.list(Reader::string)?, r.fields()?),
+        19 => Frame::ReadRows(
+            r.word()?,
+            r.string()?,
+            r.list(Reader::string)?,
+            r.fields()?,
+            r.list(|r| {
+                let column = r.string()?;
+                let descending = match r.byte()? {
+                    0 => false,
+                    1 => true,
+                    _ => return Err(()),
+                };
+                Ok(Order { column, descending })
+            })?,
+        ),
         20 => Frame::Upsert(
             r.word()?,
             r.string()?,
@@ -211,7 +225,17 @@ fn decode(packet: &[u8]) -> Result<Frame, ()> {
             r.list(Reader::string)?,
             r.list(Reader::string)?,
         ),
-        21 => Frame::DeleteRows(r.word()?, r.string()?, r.fields()?),
+        21 => Frame::DeleteRows(
+            r.word()?,
+            r.string()?,
+            r.fields()?,
+            r.list(|r| {
+                Ok(Exclusion {
+                    relation: r.string()?,
+                    equals: r.fields()?,
+                })
+            })?,
+        ),
         22 => Frame::ReadBytes(r.string()?, r.bytes()?),
         23 => Frame::ReadInput(r.word()?, r.word()?, r.word()?),
         24 => Frame::ReadCounter(r.string()?, r.bytes()?),
@@ -314,9 +338,9 @@ fn execute<S: Storage>(
             Frame::Begin => reply(16, storage.begin(), &mut errors, word),
             Frame::Commit(tx) => reply(17, storage.commit(tx), &mut errors, |_, ()| {}),
             Frame::Rollback(tx) => reply(18, storage.rollback(tx), &mut errors, |_, ()| {}),
-            Frame::ReadRows(tx, table, columns, equals) => reply(
+            Frame::ReadRows(tx, table, columns, equals, order) => reply(
                 19,
-                storage.read_rows(tx, &table, &columns, &equals),
+                storage.read_rows(tx, &table, &columns, &equals, &order),
                 &mut errors,
                 rows,
             ),
@@ -326,9 +350,9 @@ fn execute<S: Storage>(
                 &mut errors,
                 |_, ()| {},
             ),
-            Frame::DeleteRows(tx, table, equals) => reply(
+            Frame::DeleteRows(tx, table, equals, unless) => reply(
                 21,
-                storage.delete_rows(tx, &table, &equals),
+                storage.delete_rows(tx, &table, &equals, &unless),
                 &mut errors,
                 word,
             ),
@@ -397,6 +421,7 @@ impl<S: ByteStorage> Storage for ReadOnly<'_, S> {
         _: &str,
         _: &[String],
         _: &Fields,
+        _order: &[crate::host::Order],
     ) -> Result<Vec<Row>, Self::Error> {
         Err(OperationError::Protocol)
     }
@@ -410,7 +435,13 @@ impl<S: ByteStorage> Storage for ReadOnly<'_, S> {
     ) -> Result<(), Self::Error> {
         Err(OperationError::Protocol)
     }
-    fn delete_rows(&mut self, _: u64, _: &str, _: &Fields) -> Result<u64, Self::Error> {
+    fn delete_rows(
+        &mut self,
+        _: u64,
+        _: &str,
+        _: &Fields,
+        _unless: &[crate::host::Exclusion],
+    ) -> Result<u64, Self::Error> {
         Err(OperationError::Protocol)
     }
     fn read_bytes(&mut self, space: &str, key: &[u8]) -> Result<Option<Vec<u8>>, Self::Error> {
@@ -436,6 +467,60 @@ pub(crate) unsafe fn run_readonly<S: ByteStorage>(
 mod tests {
     use super::*;
     use crate::cas::acquire;
+
+    #[test]
+    fn ordered_and_guarded_packets_are_exact_and_fail_closed() {
+        let mut read = vec![1, 19];
+        word(&mut read, 7);
+        bytes(&mut read, b"head_history");
+        word(&mut read, 1);
+        bytes(&mut read, b"seq");
+        word(&mut read, 0); // equality fields
+        word(&mut read, 1); // order terms
+        bytes(&mut read, b"seq");
+        read.push(1);
+        match decode(&read).unwrap() {
+            Frame::ReadRows(7, relation, columns, equals, order) => {
+                assert_eq!(relation, "head_history");
+                assert_eq!(columns, ["seq"]);
+                assert!(equals.is_empty());
+                assert_eq!(
+                    order,
+                    [Order {
+                        column: "seq".into(),
+                        descending: true
+                    }]
+                );
+            }
+            _ => panic!("wrong request kind"),
+        }
+        *read.last_mut().unwrap() = 2;
+        assert!(decode(&read).is_err());
+        let mut delete = vec![1, 21];
+        word(&mut delete, 7);
+        bytes(&mut delete, b"head_history");
+        word(&mut delete, 0);
+        word(&mut delete, 1);
+        bytes(&mut delete, b"heads");
+        word(&mut delete, 1);
+        bytes(&mut delete, b"seq");
+        cell(&mut delete, &Cell::Integer(-1));
+        match decode(&delete).unwrap() {
+            Frame::DeleteRows(7, _, _, blockers) => assert_eq!(
+                blockers,
+                [Exclusion {
+                    relation: "heads".into(),
+                    equals: vec![("seq".into(), Cell::Integer(-1))],
+                }]
+            ),
+            _ => panic!("wrong request kind"),
+        }
+        for length in 0..delete.len() {
+            assert!(decode(&delete[..length]).is_err());
+        }
+        delete.push(0);
+        assert!(decode(&delete).is_err());
+    }
     unsafe extern "C" {
         fn synch_adapter_operation_acquire(
             root: Slice,
@@ -490,6 +575,7 @@ mod tests {
             relation: &str,
             columns: &[String],
             equals: &Fields,
+            _order: &[crate::host::Order],
         ) -> Result<Vec<Row>, Self::Error> {
             assert_eq!(tx, 42);
             assert_eq!(equals[0], ("root".into(), Cell::Blob(vec![9; 32])));
@@ -528,6 +614,7 @@ mod tests {
             tx: u64,
             relation: &str,
             equals: &Fields,
+            _unless: &[crate::host::Exclusion],
         ) -> Result<u64, Self::Error> {
             assert_eq!(tx, 42);
             assert_eq!(relation, "content_want");

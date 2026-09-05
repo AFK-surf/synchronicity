@@ -12,9 +12,10 @@ inductive Event where
   | commit (tx : Transaction)
   | rollback (tx : Transaction)
   | readRows (tx : Transaction) (relation : String) (columns : List String) (equals : Fields)
+      (order : List Order := [])
   | upsert (tx : Transaction) (relation : String) (values : Fields)
       (conflictColumns updateColumns : List String)
-  | deleteRows (tx : Transaction) (relation : String) (equals : Fields)
+  | deleteRows (tx : Transaction) (relation : String) (equals : Fields) (blockers : List Exclusion := [])
   | readBytes (space : String) (key : ByteArray)
   | readInput (handle offset count : UInt64)
   | readCounter (space : String) (key : ByteArray)
@@ -27,9 +28,9 @@ def event : Storage A → Event
   | .begin => .begin
   | .commit tx => .commit tx
   | .rollback tx => .rollback tx
-  | .readRows tx relation columns equals => .readRows tx relation columns equals
+  | .readRows tx relation columns equals order => .readRows tx relation columns equals order
   | .upsert tx relation values conflicts updates => .upsert tx relation values conflicts updates
-  | .deleteRows tx relation equals => .deleteRows tx relation equals
+  | .deleteRows tx relation equals blockers => .deleteRows tx relation equals blockers
   | .readBytes space key => .readBytes space key
   | .readInput handle offset count => .readInput handle offset count
   | .readCounter space key => .readCounter space key
@@ -68,13 +69,13 @@ def answer (script : Script) : Storage A → A
   | .begin => script.begin
   | .commit _ => script.commit
   | .rollback _ => script.rollback
-  | .readRows _ relation columns _ =>
+  | .readRows _ relation columns _ _ =>
     if relation == "blobs" then
       if columns == ["last_access"] then script.access else script.durable
     else if relation == "content_want" then script.wanted
     else .error malformedMetadata
   | .upsert _ _ _ _ _ => script.upsert
-  | .deleteRows _ _ _ => script.delete
+  | .deleteRows _ _ _ _ => script.delete
   | .readBytes _ _ => .error malformedMetadata
   | .readInput .. => .error malformedMetadata
   | .readCounter .. => script.writers
