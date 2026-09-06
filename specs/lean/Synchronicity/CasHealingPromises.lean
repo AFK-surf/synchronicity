@@ -1,172 +1,173 @@
+import Synchronicity.SimulatedHost
 import VerifiedCore.Cas.Read
 
-/-! Healing preserves obligations. The state interpreter checks the actual raw
-requests and interprets copy-on-conflict and deletion over arbitrary keyed rows.
-The SQL LIKE matcher is an explicit parameter, shared by copy and delete. -/
+/-! Repair laws over the shared database. Key predicates are proof vocabulary;
+the host itself operates only on raw fields and SQL selections. -/
 namespace Synchronicity.CasHealingPromises
-open VerifiedCore.Host VerifiedCore.Cas.Read
-noncomputable section
-local instance (p : Prop) : Decidable p := Classical.propDecidable p
+open VerifiedCore.Host VerifiedCore.Cas.Read SimulatedHost
 
 abbrev Key := ByteArray × String
 
-structure State where
-  /-- Raw fields of the target blob; unassigned columns survive UPDATE. -/
-  blob : String → Cell
-  pins : Key → Bool
-  wants : Key → Option Fields
+def keyOf (row : Fields) : Option Key :=
+  match cell row "root", cell row "holder" with
+  | .blob root, .text holder => some (root, holder)
+  | _, _ => none
 
-structure Host where
-  root : ByteArray
-  size : Int64
-  now : Int64
-  /-- The backend's LIKE result for the literal repair selection. No typed
-  holder interpretation or case-folding assumption is made. -/
-  likeMatch : String → Bool
+def WellKeyed (table : List Fields) : Prop := ∀ row ∈ table, (keyOf row).isSome = true
 
-def selected (host : Host) (key : Key) : Prop :=
-  key.1 = host.root ∧ host.likeMatch key.2 = true
+def hasKey (table : List Fields) (key : Key) : Prop := ∃ row ∈ table, keyOf row = some key
 
-/-- Raw source-column projection for the pin row being copied. -/
-def sourceCell (key : Key) : String → Cell
-  | "root" => .blob key.1
-  | "holder" => .text key.2
-  | _ => .null
+def obligation (db : Database) (key : Key) : Prop :=
+  hasKey (rows db "pins") key ∨ hasKey (rows db "content_want") key
 
-def project (fields : List (String × SourceValue)) (key : Key) : Fields :=
-  fields.map fun (column, value) => (column, match value with
-    | .column name => sourceCell key name
-    | .literal cell => cell)
+private theorem conflict_key (incoming current : Fields)
+    (validIncoming : (keyOf incoming).isSome = true) (validCurrent : (keyOf current).isSome = true) :
+    conflict ["root", "holder"] incoming current = true ↔ keyOf incoming = keyOf current := by
+  unfold keyOf at validIncoming validCurrent ⊢
+  cases a : cell incoming "root" <;> cases b : cell incoming "holder" <;>
+    cases c : cell current "root" <;> cases d : cell current "holder" <;>
+    simp_all [conflict, equalCell, BEq.beq, instBEqCell.beq]
+  all_goals
+    rename_i ar ah br bh
+    intro _
+    exact (beq_iff_eq (a := ar) (b := br))
 
-/-- Raw INSERT SELECT ON CONFLICT DO NOTHING semantics. -/
-def copy (host : Host) (state : State) (fields : List (String × SourceValue)) : State :=
-  { state with wants := fun key =>
-      if selected host key ∧ state.pins key = true then
-        (state.wants key).orElse (fun _ => some (project fields key))
-      else state.wants key }
+private theorem upsert_hasKey (table : List Fields) (incoming : Fields) (key : Key)
+    (valid : WellKeyed table) (incomingValid : (keyOf incoming).isSome = true) :
+    hasKey (upsertRows table incoming ["root", "holder"] []) key ↔
+      hasKey table key ∨ keyOf incoming = some key := by
+  rw [upsertRows_doNothing]
+  split
+  · rename_i hit
+    obtain ⟨current, member, same⟩ := List.any_eq_true.mp hit
+    have keys := (conflict_key incoming current incomingValid (valid current member)).mp same
+    constructor
+    · exact Or.inl
+    · rintro (held | added)
+      · exact held
+      · exact ⟨current, member, keys ▸ added⟩
+  · simp [hasKey]
 
-/-- Raw DELETE semantics for the same selection. -/
-def deletePins (host : Host) (state : State) : State :=
-  { state with pins := fun key => if selected host key then false else state.pins key }
+private theorem upsert_valid (table : List Fields) (incoming : Fields)
+    (valid : WellKeyed table) (incomingValid : (keyOf incoming).isSome = true) :
+    WellKeyed (upsertRows table incoming ["root", "holder"] []) := by
+  rw [upsertRows_doNothing]
+  split
+  · exact valid
+  · intro row member
+    simp only [List.mem_append, List.mem_singleton] at member
+    rcases member with member | same
+    · exact valid row member
+    · subst row; exact incomingValid
 
-def update (state : State) (fields : Fields) : State :=
-  { state with blob := fun column =>
-      ((fields.find? fun field => field.1 == column).map Prod.snd).getD (state.blob column) }
+private def merge (table incoming : List Fields) :=
+  incoming.foldl (fun table row => upsertRows table row ["root", "holder"] []) table
 
-/-- Only the expected raw transaction capabilities are provided. Guards check
-keys, projections, relations, and conflicts, rather than guessing the policy. -/
-def step (host : Host) : {A : Type} → Effects A → State → Option (A × State)
-  | _, .left .begin, state => some (.ok 7, state)
-  | _, .left (.commit tx), state => if tx = 7 then some (.ok (), state) else none
-  | _, .left (.readRows tx relation columns equals order joins), state =>
-      if tx = 7 ∧ relation = "blobs" ∧ columns = ["size"] ∧
-          equals = [("root", .blob host.root)] ∧ order = [] ∧ joins = [] then
-        some (.ok [[.integer host.size]], state) else none
-  | _, .right (.left (.update tx selection fields)), state =>
-      if tx = 7 ∧ selection = ⟨"blobs", [("root", .blob host.root)], []⟩ then
-        some (.ok 1, update state fields) else none
-  | _, .right (.right (.right (.left .nowNs))), state => some (.ok host.now, state)
-  | _, .right (.left (.copyRows tx target source fields conflicts)), state =>
-      if tx = 7 ∧ target = "content_want" ∧ source = repairPins host.root ∧
-          conflicts = ["root", "holder"] then
-        some (.ok 1, copy host state fields) else none
-  | _, .right (.left (.delete tx selection)), state =>
-      if tx = 7 ∧ selection = repairPins host.root then
-        some (.ok 1, deletePins host state) else none
-  | _, _, _ => none
+private theorem merge_hasKey (table incoming : List Fields) (key : Key)
+    (valid : WellKeyed table) (incomingValid : WellKeyed incoming) :
+    hasKey (merge table incoming) key ↔ hasKey table key ∨ hasKey incoming key := by
+  induction incoming generalizing table with
+  | nil => simp [merge, hasKey]
+  | cons head tail ih =>
+    have headValid := incomingValid head (by simp)
+    have tailValid : WellKeyed tail := fun row member => incomingValid row (by simp [member])
+    change hasKey (merge (upsertRows table head ["root", "holder"] []) tail) key ↔ _
+    rw [ih _ (upsert_valid table head valid headValid) tailValid, upsert_hasKey table head key valid headValid]
+    simp [hasKey, or_assoc]
 
-def execute (host : Host) : Program Effects A → State → Option (A × State)
-  | .pure value, state => some (value, state)
-  | .request effect resume, state => do
-      let (reply, state) ← step host effect state
-      execute host (resume reply) state
-
-/-- The exact new request fields come from the executable program. -/
-def repairFields (host : Host) : List (String × SourceValue) :=
+def repairFields (size now : Int64) : List (String × SourceValue) :=
   [("root", .column "root"), ("holder", .column "holder"),
-   ("size", .literal (.integer host.size)), ("prev", .literal .null),
-   ("first_wanted", .literal (.integer host.now))]
+   ("size", .literal (.integer size)), ("prev", .literal .null), ("first_wanted", .literal (.integer now))]
 
 def invalidation : Fields :=
   [("complete", .integer 0), ("durable", .integer 0), ("bitmap", .null), ("inline", .null)]
 
-/-- Bridge from the actual whole operation to persistent state, for every
-initial pin/want map, root, size, timestamp and SQL matching predicate. -/
-theorem healing_state (host : Host) (state : State) :
-    execute host (heal host.root).run state =
-      some (.ok (), deletePins host (copy host (update state invalidation) (repairFields host))) := by
-  simp [heal, healIn, transactionOver, requestStorage, requestAccess, requestClock,
-    raise, performOver, Inject.inject, execute, step, decodeSize, integerField,
-    VerifiedCore.Cas.Codec.integerField, repairFields, invalidation, Except.mapError,
-    Except.map, bind, pure, Program.bind, ExceptT.bind, ExceptT.bindCont, ExceptT.pure,
-    ExceptT.run, ExceptT.mk]
+@[simp] theorem repair_preserves_key (size now : Int64) (row : Fields) :
+    keyOf (sourceFields (repairFields size now) row) = keyOf row := by
+  simp [keyOf, sourceFields, repairFields, cell]
 
-/-- Responsibility may be represented by possession or by a repair request. -/
-def obligation (state : State) (key : Key) : Prop :=
-  state.pins key = true ∨ (state.wants key).isSome = true
+/-- Persistent state obtained by interpreting UPDATE, COPY and DELETE. This
+expression is derived from the actual operation by healing_state below. -/
+def healedDatabase (db : Database) (root : ByteArray) (size now : Int64) : Database :=
+  let invalidated := setRows db "blobs" ((rows db "blobs").map fun row =>
+    if selects ⟨"blobs", [("root", .blob root)], []⟩ row then assign row invalidation else row)
+  let copied := copyRows invalidated "content_want" (repairPins root) (repairFields size now) ["root", "holder"]
+  setRows copied "pins" ((rows copied "pins").filter fun row => !selects (repairPins root) row)
+
+/-- The whole program operates on the common transaction state. -/
+theorem healing_state (state : State) (root : ByteArray) (size : Int64)
+    (quiet : state.faults = []) (idle : state.pending = none)
+    (observed : query state.db "blobs" ["size"] [("root", .blob root)] [] [] = [[.integer size]]) :
+    let result := SimulatedHost.run (heal root) state
+    result.1 = .ok () ∧ result.2.db = healedDatabase state.db root size state.now := by
+  simp [SimulatedHost.run, heal, healIn, transactionOver, requestStorage, requestAccess, requestClock,
+    raise, performOver, Inject.inject, execute, Interpreter.handle, storage, access, clock,
+    reply, fault, record, SimulatedHost.transaction, quiet, idle, observed,
+    decodeSize, integerField, VerifiedCore.Cas.Codec.integerField, repairFields, invalidation,
+    healedDatabase, repairPins, Except.mapError, Except.map, bind, pure, Program.bind,
+    ExceptT.bind, ExceptT.bindCont, ExceptT.pure, ExceptT.run, ExceptT.mk]
+
+/-- Copy/delete conserves all responsibilities, including unrelated roots. -/
+theorem healed_obligations (db : Database) (root : ByteArray) (size now : Int64)
+    (pinsValid : WellKeyed (rows db "pins")) (wantsValid : WellKeyed (rows db "content_want"))
+    (key : Key) : obligation (healedDatabase db root size now) key ↔ obligation db key := by
+  have copiedValid : WellKeyed (((rows db "pins").filter (selects (repairPins root))).map
+      (sourceFields (repairFields size now))) := by
+    intro row member
+    obtain ⟨pin, pinMember, rfl⟩ := List.mem_map.mp member
+    simpa using pinsValid pin (List.mem_filter.mp pinMember).1
+  simp only [obligation, healedDatabase, copyRows, repairPins, rows_setRows, rows_setRows_other,
+    ne_eq, String.reduceEq, not_false_eq_true]
+  have merged := merge_hasKey (rows db "content_want")
+    (((rows db "pins").filter (selects (repairPins root))).map (sourceFields (repairFields size now)))
+    key wantsValid copiedValid
+  simp only [merge, List.foldl_map, repairPins] at merged
+  rw [merged]
+  simp only [hasKey, List.mem_filter, List.mem_map]
+  constructor
+  · rintro (⟨row, ⟨member, _⟩, same⟩ | (held | ⟨row, ⟨pin, ⟨member, _⟩, rfl⟩, same⟩))
+    · exact Or.inl ⟨row, member, same⟩
+    · exact Or.inr held
+    · exact Or.inl ⟨pin, member, by simpa using same⟩
+  · rintro (⟨pin, member, same⟩ | held)
+    · cases selected : selects (repairPins root) pin with
+      | false => exact Or.inl ⟨pin, ⟨member, by change (!selects (repairPins root) pin) = true; simp [selected]⟩, same⟩
+      | true => exact Or.inr (Or.inr ⟨_, ⟨pin, ⟨member, selected⟩, rfl⟩, by simpa using same⟩)
+    · exact Or.inr (Or.inl held)
 
 /-- Losing a copy does not erase the responsibility to keep it. -/
-theorem losing_a_copy_preserves_responsibility (host : Host) (before after : State)
-    (healed : execute host (heal host.root).run before = some (.ok (), after)) :
-    ∀ key, obligation after key ↔ obligation before key := by
-  rw [healing_state] at healed
-  cases healed
+theorem losing_a_copy_preserves_responsibility (state : State) (root : ByteArray) (size : Int64)
+    (quiet : state.faults = []) (idle : state.pending = none)
+    (observed : query state.db "blobs" ["size"] [("root", .blob root)] [] [] = [[.integer size]])
+    (pinsValid : WellKeyed (rows state.db "pins")) (wantsValid : WellKeyed (rows state.db "content_want")) :
+    ∀ key, obligation (SimulatedHost.run (heal root) state).2.db key ↔ obligation state.db key := by
   intro key
-  unfold obligation deletePins copy update
-  by_cases likeMatch : selected host key <;> cases pin : before.pins key <;>
-    cases want : before.wants key <;> simp [likeMatch, pin, want]
+  rw [(healing_state state root size quiet idle observed).2]
+  exact healed_obligations _ _ _ _ pinsValid wantsValid key
 
-/-- Existing repair requests retain every field, including time and predecessor. -/
-theorem existing_requests_survive_unchanged (host : Host) (before after : State)
-    (healed : execute host (heal host.root).run before = some (.ok (), after))
-    (key : Key) (fields : Fields) (present : before.wants key = some fields) :
-    after.wants key = some fields := by
-  rw [healing_state] at healed
-  cases healed
-  simp [deletePins, copy, update, present]
 
-/-- Healing cannot touch another object's pins or requests. -/
-theorem other_objects_keep_their_claims (host : Host) (before after : State)
-    (healed : execute host (heal host.root).run before = some (.ok (), after))
-    (key : Key) (other : key.1 ≠ host.root) :
-    after.pins key = before.pins key ∧ after.wants key = before.wants key := by
-  rw [healing_state] at healed
-  cases healed
-  simp [deletePins, copy, update, selected, other]
 
-/-- Healing retracts every local availability claim. -/
-theorem losing_a_copy_retracts_availability (host : Host) (before after : State)
-    (healed : execute host (heal host.root).run before = some (.ok (), after)) :
-    after.blob "complete" = .integer 0 ∧ after.blob "durable" = .integer 0 ∧
-    after.blob "bitmap" = .null ∧ after.blob "inline" = .null := by
-  rw [healing_state] at healed
-  cases healed
-  simp [deletePins, copy, update, invalidation]
+/-- Existing repair records keep all fields, without a key-validity premise. -/
+theorem existing_requests_survive_unchanged (state : State) (root : ByteArray) (size : Int64)
+    (quiet : state.faults = []) (idle : state.pending = none)
+    (observed : query state.db "blobs" ["size"] [("root", .blob root)] [] [] = [[.integer size]])
+    (row : Fields) (present : row ∈ rows state.db "content_want") :
+    row ∈ rows (SimulatedHost.run (heal root) state).2.db "content_want" := by
+  rw [(healing_state state root size quiet idle observed).2]
+  unfold healedDatabase
+  rw [rows_setRows_other _ "pins" "content_want" _ (by decide)]
+  apply copyRows_preserves_existing
+  simpa using present
 
-private theorem state_ext (left right : State) (blob : left.blob = right.blob)
-    (pins : left.pins = right.pins) (wants : left.wants = right.wants) : left = right := by
-  cases left
-  cases right
-  simp_all
+/-- Every pin outside the actual SQL selection is preserved verbatim. -/
+theorem unselected_pins_survive_unchanged (state : State) (root : ByteArray) (size : Int64)
+    (quiet : state.faults = []) (idle : state.pending = none)
+    (observed : query state.db "blobs" ["size"] [("root", .blob root)] [] [] = [[.integer size]])
+    (row : Fields) (present : row ∈ rows state.db "pins")
+    (unselected : selects (repairPins root) row = false) :
+    row ∈ rows (SimulatedHost.run (heal root) state).2.db "pins" := by
+  rw [(healing_state state root size quiet idle observed).2]
+  simp [healedDatabase, copyRows, repairPins] at unselected ⊢
+  exact ⟨present, by simpa using unselected⟩
 
-/-- A second repair has nothing left to transfer. Even a new clock value
-cannot replace the repair requests created by the first repair. -/
-theorem repeated_healing_changes_nothing (host : Host) (state : State) (later : Int64) :
-    let once := deletePins host (copy host (update state invalidation) (repairFields host))
-    execute { host with now := later } (heal host.root).run once = some (.ok (), once) := by
-  dsimp only
-  rw [healing_state]
-  apply congrArg (fun state => some (Except.ok (), state))
-  apply state_ext
-  · funext column
-    simp only [deletePins, copy, update]
-    cases invalidation.find? (fun field => field.1 == column) <;> simp
-  · funext key
-    by_cases chosen : selected host key <;> simp [deletePins, copy, update, selected] at chosen ⊢ <;>
-      simp_all
-  · funext key
-    by_cases chosen : selected host key <;>
-      simp [deletePins, copy, update, selected] at chosen ⊢ <;> simp_all
-
-end
 end Synchronicity.CasHealingPromises

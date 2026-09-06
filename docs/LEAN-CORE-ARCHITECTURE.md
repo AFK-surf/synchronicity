@@ -180,7 +180,9 @@ Rust facade files separate; the shared runtime must not import their policies.
 
 The [CAS promises](CAS-PROMISES.md) state the user-facing laws, map them to
 checked theorems, and distinguish proof-host guarantees from native-host
-obligations.
+obligations. CAS and history executions now use one
+[shared simulated host](LEAN-SIMULATED-HOST.md), including state-preserving
+composition across commands.
 
 Prove executions of the actual programs under the explicit host contract, not
 only pure decisions or an independently authored state machine. Required

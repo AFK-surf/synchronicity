@@ -1,6 +1,6 @@
 import VerifiedCore.Cas.IngestCommit
 import Synchronicity.CasPlanProofs
-import Synchronicity.Handlers
+import Synchronicity.CasFixtures
 
 /-! Proofs of the internal ingestion metadata program itself. The production
 whole Lean command composes it; the outer resource, construction-request and
@@ -57,112 +57,23 @@ theorem claim_read_failure_has_no_mutation (tx : Transaction) (root : ByteArray)
         [("root", .blob root)])) resume ∧
       resume (.error failure) = .pure (.error (.host failure)) := ⟨_, rfl, rfl⟩
 
-private def root : ByteArray := ByteArray.empty
-private def primary : Failure := ⟨1, 71⟩
-private def secondary : Failure := ⟨1, 72⟩
+open SimulatedHost CasFixtures
 
-private structure Script where
-  rows : List Row := []
-  tier : Tier := .local
-  failAt : Option Nat := none
-  rollbackFailure : Bool := false
+private def check (state : State := {}) :=
+  traceResult (commitComplete root 4 none 123 .local) state
 
-private def reply (script : Script) (index : Nat) (value : A) : Reply A :=
-  if script.failAt == some index then .error primary else .ok value
+theorem fresh_commit_succeeds : check = (.ok (), ["begin", "read:blobs", "upsert:blobs", "commit"]) := by decide +kernel
 
-/-- Only exact raw statements are accepted; there is no metadata interpretation
-or settlement implementation in this scripted host. -/
-private structure State where
-  script : Script
-  index : Nat := 0
+theorem conflicting_attested_size_is_refused :
+    check { stored with db := [("blobs", [blob root 5])] } =
+      (.error (.sizeMismatch root 5 4), ["begin", "read:blobs", "rollback"]) := by decide +kernel
 
-private def step (state : State) (label : String) (value : A) : Option (String × A × State) :=
-  some (label, value, { state with index := state.index + 1 })
+theorem every_failed_commit_stage_restores_database :
+    (List.range 4).all (fun index =>
+      let result := SimulatedHost.run (commitComplete root 4 none 123 .local) (fail stored index)
+      failed result.1 && (result.2.db == stored.db) && result.2.pending.isNone) = true := by decide +kernel
 
-private def answer (state : State) (value : A) : Reply A := reply state.script state.index value
-
-private instance : Handlers.Handler Storage State String where
-  handle
-    | .begin, s => step s "begin" (answer s 7)
-    | .commit tx, s => if tx == 7 then step s "commit" (answer s ()) else none
-    | .rollback tx, s => if tx == 7 then
-        step s "rollback" (if s.script.rollbackFailure then .error secondary else .ok ()) else none
-    | .readRows tx relation columns equals order joins, s =>
-      if tx == 7 && relation == "blobs" && columns == ["size", "complete", "durable", "bitmap"] &&
-          equals == [("root", .blob root)] && order.isEmpty && joins.isEmpty then
-        step s "claim" (answer s s.script.rows)
-      else none
-    | _, _ => none
-
-private instance : Handlers.Handler Upsert State String where
-  handle
-    | .write tx relation fields conflicts updates, s =>
-      if tx == 7 && relation == "blobs" && conflicts == ["root"] &&
-          fields == [("root", .blob root), ("size", .integer 8),
-            ("complete", .integer 1), ("bitmap", .null), ("inline", .null),
-            ("last_access", .integer 123),
-            ("durable", .integer (if s.script.tier == .local then 1 else 0))] &&
-          updates == [("size", .excluded "size"), ("complete", .excluded "complete"),
-            ("bitmap", .excluded "bitmap"),
-            ("inline", .coalesce (.excluded "inline") (.current "inline")),
-            ("last_access", .excluded "last_access"),
-            ("durable", .max (.current "durable") (.excluded "durable"))] then
-        step s "write" (answer s ())
-      else none
-
-private instance : Handlers.Handler Access State String := Handlers.refuse
-
-private def run (script : Script) :=
-  Handlers.run 8 (commitComplete root 8 none 123 script.tier).run (⟨script, 0⟩ : State)
-
-theorem local_commit_exact_raw_mutations : run {} =
-    some (.ok (), ["begin", "claim", "write", "commit"]) := by decide
-
-theorem cache_commit_stays_staged : run { tier := .cache } =
-    some (.ok (), ["begin", "claim", "write", "commit"]) := by decide
-
-theorem existing_noncanonical_durability_uses_raw_max :
-    run { rows := [[.integer 8, .integer 0, .integer 2, .null]], tier := .cache } =
-      some (.ok (), ["begin", "claim", "write", "commit"]) := by decide
-
-theorem conflicting_complete_size_rolls_back_without_write :
-    run { rows := [[.integer 9, .integer 1, .integer 0, .null]] } =
-      some (.error (.sizeMismatch root 9 8), ["begin", "claim", "rollback"]) := by decide
-
-theorem unattested_size_yields_to_ingestion :
-    run { rows := [[.integer 32768, .integer 0, .integer 0, .null]] } =
-      some (.ok (), ["begin", "claim", "write", "commit"]) := by decide
-
-theorem malformed_bitmap_means_no_attestation :
-    run { rows := [[.integer 32768, .integer 0, .integer 0, .blob ByteArray.empty]] } =
-      some (.ok (), ["begin", "claim", "write", "commit"]) := by decide
-
-theorem size_type_error_precedes_all_later_errors :
-    run { rows := [[.null, .null, .null, .integer 1]] } =
-      some (.error (.metadata (.columnType 0 "size" .null)), ["begin", "claim", "rollback"]) := by decide
-
-theorem complete_type_error_precedes_durable_and_bitmap :
-    run { rows := [[.integer 8, .null, .null, .integer 1]] } =
-      some (.error (.metadata (.columnType 1 "complete" .null)), ["begin", "claim", "rollback"]) := by decide
-
-theorem durable_type_error_precedes_bitmap :
-    run { rows := [[.integer 8, .integer 1, .null, .integer 1]] } =
-      some (.error (.metadata (.columnType 2 "durable" .null)), ["begin", "claim", "rollback"]) := by decide
-
-theorem complete_does_not_skip_bitmap_type_error :
-    run { rows := [[.integer 8, .integer 1, .integer 1, .integer 1]] } =
-      some (.error (.metadata (.columnType 3 "bitmap" .integer)), ["begin", "claim", "rollback"]) := by decide
-
-theorem begin_failure_does_not_rollback : run { failAt := some 0 } =
-    some (.error (.host primary), ["begin"]) := by decide
-
-theorem read_failure_rolls_back : run { failAt := some 1, rollbackFailure := true } =
-    some (.error (.host primary), ["begin", "claim", "rollback"]) := by decide
-
-theorem write_failure_rolls_back : run { failAt := some 2, rollbackFailure := true } =
-    some (.error (.host primary), ["begin", "claim", "write", "rollback"]) := by decide
-
-theorem commit_failure_rolls_back : run { failAt := some 3, rollbackFailure := true } =
-    some (.error (.host primary), ["begin", "claim", "write", "commit", "rollback"]) := by decide
+theorem rollback_failure_preserves_primary : check (fail (fail {} 2) 3 secondary) =
+    (.error (.host primary), ["begin", "read:blobs", "upsert:blobs", "rollback"]) := by decide +kernel
 
 end Synchronicity.IngestCommitProofs

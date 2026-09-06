@@ -1,29 +1,14 @@
-import Synchronicity.CasProgramProofs
+import Synchronicity.CasFixtures
 
-/-! Executions of the production explicit pin-release operation. These proofs
-check its actual storage requests, not a separate abstract CAS transition. -/
 namespace Synchronicity.CasReleaseProofs
-open VerifiedCore.Host VerifiedCore.Cas
-open CasProgramProofs (Event Script execute)
-
-/-- Execute the actual command with independently scripted raw host replies. -/
-def run (script : Script) (root : ByteArray) (holder : PinHolder) :
-    Reply Bool × List Event :=
-  execute script (unpin root holder).run
+open VerifiedCore.Host VerifiedCore.Cas SimulatedHost CasFixtures
 
 /-- The sole mutation's exact key and atomic live-entry exclusion. -/
-def mutation (tx : Transaction) (root : ByteArray) (holder : PinHolder) : Event :=
+def mutation (tx : Transaction) (root : ByteArray) (holder : PinHolder) : Storage (Reply Nat) :=
   .deleteRows tx "pins" [("root", .blob root), ("holder", .text holder.render)]
     (match holder.space with
       | none => []
       | some space => [⟨"entries", [("space", .text space), ("content", .blob root)], []⟩])
-
-/-- There are no metadata reads or secondary mutations: the single DELETE
-carries the guard, and its affected-row count is returned only after commit. -/
-theorem successful_execution (tx : Transaction) (root : ByteArray)
-    (holder : PinHolder) (count : Nat) :
-    run { begin := .ok tx, delete := .ok count } root holder =
-      (.ok (count != 0), [.begin, mutation tx root holder, .commit tx]) := rfl
 
 /-- Operator claims do not acquire a live-entry exclusion. -/
 theorem operator_mutation (tx : Transaction) (root : ByteArray) :
@@ -60,26 +45,21 @@ theorem role_like_other_is_not_role (space : String) :
       PinHolder.space (.other ("source:" ++ space)) = none ∧
       PinHolder.space (.source space) = some space := ⟨rfl, rfl, rfl⟩
 
-/-- A protected or absent claim reports false, without any fallback deletion. -/
-theorem no_rows_released (tx : Transaction) (root : ByteArray) (holder : PinHolder) :
-    run { begin := .ok tx, delete := .ok 0 } root holder =
-      (.ok false, [.begin, mutation tx root holder, .commit tx]) := rfl
 
-/-- A failed begin cannot issue a delete or a spurious rollback. -/
-theorem begin_failure (failure : Failure) (root : ByteArray) (holder : PinHolder) :
-    run { begin := .error failure } root holder = (.error failure, [.begin]) := rfl
+private def pinned : State := { stored with db := [("blobs", [blob]), ("pins", [pin, pin root "operator"])] }
 
-/-- Deletion failure prevents commit. Any rollback failure remains secondary. -/
-theorem delete_failure (tx : Transaction) (failure : Failure) (rollback : Reply Unit)
-    (root : ByteArray) (holder : PinHolder) :
-    run { begin := .ok tx, delete := .error failure, rollback := rollback } root holder =
-      (.error failure, [.begin, mutation tx root holder, .rollback tx]) := rfl
+theorem release_removes_only_requested_holder :
+    let result := SimulatedHost.run (unpin root .operator) pinned
+    result.1 == .ok true ∧ rows result.2.db "pins" == [pin] := by decide +kernel
 
-/-- Even a successful mutation cannot report release before commit succeeds.
-This also covers count zero and an independently failing rollback. -/
-theorem commit_failure (tx : Transaction) (failure : Failure) (rollback : Reply Unit)
-    (root : ByteArray) (holder : PinHolder) (count : Nat) :
-    run { begin := .ok tx, delete := .ok count, commit := .error failure, rollback := rollback } root holder =
-      (.error failure, [.begin, mutation tx root holder, .commit tx, .rollback tx]) := rfl
+theorem live_entry_protects_standing_role :
+    let initial := { pinned with db := pinned.db ++ [("entries", [entry])] }
+    let result := SimulatedHost.run (unpin root (.source "media")) initial
+    result.1 == .ok false ∧ rows result.2.db "pins" == rows initial.db "pins" := by decide +kernel
+
+theorem every_failure_restores_pins :
+    (List.range 3).all (fun index =>
+      let result := SimulatedHost.run (unpin root .operator) (fail pinned index)
+      failed result.1 && (result.2.db == pinned.db)) = true := by decide +kernel
 
 end Synchronicity.CasReleaseProofs

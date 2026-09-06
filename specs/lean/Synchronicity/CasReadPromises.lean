@@ -1,242 +1,180 @@
-import VerifiedCore.Cas.Read
+import Synchronicity.SimulatedHost
 import Synchronicity.CasPlanProofs
+import VerifiedCore.Cas.Read
 
-/-! Extensional read guarantees under exact raw file/output effects. -/
+/-! Read laws over the common simulated host's raw database and file store. -/
 namespace Synchronicity.CasReadPromises
-open VerifiedCore VerifiedCore.Host VerifiedCore.Cas.Read
-noncomputable section
-local instance (p : Prop) : Decidable p := Classical.propDecidable p
+open VerifiedCore VerifiedCore.Host VerifiedCore.Cas.Read SimulatedHost
 
-/-- One stable object's raw observation and physical bytes. Decoding and range
-selection are performed by the production program, never by this host. -/
-structure Host where
-  row : Row
-  payload : ByteArray
+/-- Raw rows selected by the read operation's actual snapshot statement. -/
+def observation (state : State) (root : ByteArray) : List Row :=
+  ((rows state.db "blobs").filter (selects ⟨"blobs", [("root", .blob root)], []⟩)).map
+    (project ["root", "size", "complete", "bitmap", "inline", "last_access", "durable"])
 
-private def unavailable : Failure := ⟨3, 0⟩
+/-- The database decodes to this metadata and the selected backing storage
+contains the represented bytes. No separate read-host state is constructed. -/
+def Represents (state : State) (root : ByteArray) (row : Metadata) (bytes : ByteArray) : Prop :=
+  (∃ raw rest, observation state root = raw :: rest ∧ decodeRow raw = .ok row) ∧
+  row.size.toNat = bytes.size ∧
+  (match row.inline with
+    | some inline => inline = bytes
+    | none => lookupFile state.files ("cas_payload", root) = some bytes)
 
-def answer (host : Host) (root : ByteArray) : {A : Type} → Effects A → A
-  | _, .left .begin => .error unavailable
-  | _, .left (.commit _) => .error unavailable
-  | _, .left (.rollback _) => .error unavailable
-  | _, .left (.readRows ..) => .error unavailable
-  | _, .left (.scanRows ..) => .error unavailable
-  | _, .left (.upsert ..) => .error unavailable
-  | _, .left (.deleteRows ..) => .error unavailable
-  | _, .left (.readBytes ..) => .error unavailable
-  | _, .left (.readInput ..) => .error unavailable
-  | _, .left (.readCounter ..) => .error unavailable
-  | _, .left (.removeFile ..) => .error unavailable
-  | _, .left (.existsRows ..) => .error unavailable
-  | _, .right (.left (.snapshot selection columns)) =>
-      if selection.relation = "blobs" ∧ selection.equals = [("root", .blob root)] ∧
-          selection.likeAny = [] ∧
-          columns = ["root", "size", "complete", "bitmap", "inline", "last_access", "durable"] then
-        .ok ⟨[host.row], none⟩ else .error unavailable
-  | _, .right (.left (.update ..)) => .error unavailable
-  | _, .right (.left (.copyRows ..)) => .error unavailable
-  | _, .right (.left (.delete ..)) => .error unavailable
-  | _, .right (.right (.left (.open space key))) =>
-      if space = "cas_payload" ∧ key = root then .ok 0 else .error ⟨unavailable, .other⟩
-  | _, .right (.right (.left (.readAt _ offset count))) =>
-      .ok (host.payload.extract offset.toNat (offset.toNat + count.toNat))
-  | _, .right (.right (.left (.transfer ..))) => .ok ()
-  | _, .right (.right (.left (.close _))) => .ok ()
-  | _, .right (.right (.right (.left .nowNs))) => .error unavailable
-  | _, .right (.right (.right (.right (.append _)))) => .ok ()
+def readResult (state : State) (root : ByteArray) (request : Request) : Except Error (List UInt8) :=
+  let result := SimulatedHost.run (read root request) state
+  publish Error.protocol result.1 result.2
 
-/-- Output is tracked independently of the terminal count. The file host
-copies the physical slice requested by the program, not a predicted result. -/
-def emitted (host : Host) : {A : Type} → Effects A → List UInt8
-  | _, .right (.right (.left (.transfer _ offset count))) =>
-      (host.payload.extract offset.toNat (offset.toNat + count.toNat)).data.toList
-  | _, .right (.right (.right (.right (.append bytes)))) => bytes.data.toList
-  | _, _ => []
+/-- Publication uses the shared host's private buffer, for any failure/prefix. -/
+theorem failed_read_never_returns_partial_success (error : Error) (state : State) :
+    publish Error.protocol (.error error) state = .error error := rfl
 
-def execute (host : Host) (root : ByteArray) : Program Effects A → A × List UInt8
-  | .pure value => (value, [])
-  | .request effect resume =>
-      let (result, tail) := execute host root (resume (answer host root effect))
-      (result, emitted host effect ++ tail)
-
-/-- Only successful completion with the exact count publishes a buffer. This
-is the explicit native-output contract, not a claim about the Rust allocator. -/
-def publish : Except Error UInt64 × List UInt8 → Except Error (List UInt8)
-  | (.error error, _) => .error error
-  | (.ok count, bytes) =>
-      if count.toNat = bytes.length then .ok bytes else .error .protocol
-
-def run (host : Host) (root : ByteArray) (request : Request) :=
-  publish (execute host root (read root request).run)
-
-/-- A failed read never returns a partial answer as success, for any prefix. -/
-theorem failed_read_never_returns_partial_success (error : Error) (partialBytes : List UInt8) :
-    publish (.error error, partialBytes) = .error error := rfl
-
-/-- Successful command publication is the whole buffer with the stated count. -/
-theorem published_result_is_whole (result : Except Error UInt64) (buffer bytes : List UInt8)
-    (success : publish (result, buffer) = .ok bytes) :
-    buffer = bytes ∧ ∃ count, result = .ok count ∧ count.toNat = bytes.length := by
+theorem published_result_is_whole (result : Except Error UInt64) (state : State) (bytes : List UInt8)
+    (success : publish Error.protocol result state = .ok bytes) :
+    state.output = bytes ∧ ∃ count, result = .ok count ∧ count.toNat = bytes.length := by
   cases result with
   | error e => simp [publish] at success
   | ok count =>
     simp only [publish] at success
     split at success
-    · cases success
-      exact ⟨rfl, count, rfl, by assumption⟩
+    · cases success; exact ⟨rfl, count, rfl, by assumption⟩
     · contradiction
 
-/-- Execute any nonempty covered inline range, with no fixture bytes or size. -/
-theorem inline_range_execution (host : Host) (root : ByteArray) (row : Metadata)
-    (offset length : UInt64) (bytes : ByteArray)
-    (decoded : decodeRow host.row = .ok row)
-    (inline : row.inline = some bytes)
-    (valid : offset.toNat ≤ row.size.toNat)
-    (nonempty : offset.toNat ≠ min (offset.toNat + length.toNat) row.size.toNat)
-    (available : covered row offset (min (offset.toNat + length.toNat) row.size.toNat).toUInt64 = true)
-    (intact : min (offset.toNat + length.toNat) row.size.toNat ≤ bytes.size) :
-    execute host root (read root (.range offset length)).run =
-      (.ok (min (offset.toNat + length.toNat) row.size.toNat - offset.toNat).toUInt64,
-       (bytes.extract offset.toNat (min (offset.toNat + length.toNat) row.size.toNat)).data.toList) := by
-  simp [Cas.Read.read, metadata, requestAccess, requestOutput, raise, performOver, Inject.inject,
-    execute, answer, emitted, decoded, inline, Nat.not_lt.mpr valid, nonempty, available, Nat.not_lt.mpr intact,
+/-- Empty requests are answered using metadata alone. -/
+theorem empty_range_execution (state : State) (root : ByteArray) (row : Metadata)
+    (raw : Row) (rest : List Row) (offset length : UInt64)
+    (quiet : state.faults = []) (observed : observation state root = raw :: rest)
+    (decoded : decodeRow raw = .ok row) (valid : offset.toNat ≤ row.size.toNat)
+    (empty : offset.toNat = min (offset.toNat + length.toNat) row.size.toNat) :
+    let result := execute (read root (.range offset length)).run state
+    (result.1, result.2.output) = (.ok 0, state.output) := by
+  unfold observation at observed
+  simp only [Cas.Read.read, metadata, requestAccess, raise, performOver, Inject.inject,
+    execute, Interpreter.handle, access, reply, fault, record, quiet, List.find?_nil,
+    Option.map_none, observed, decoded, Nat.not_lt.mpr valid,
     bind, pure, Program.bind, ExceptT.bind, ExceptT.bindCont, ExceptT.pure,
-    ExceptT.run, ExceptT.mk, Except.mapError]
+    ExceptT.run, ExceptT.mk, Except.mapError, UInt64.ofNat_toNat,
+    beq_iff_eq, if_false, if_pos empty]
 
-/-- The file transfer path returns the physical range selected by Lean. -/
-theorem file_range_execution (host : Host) (root : ByteArray) (row : Metadata)
-    (offset length : UInt64)
-    (decoded : decodeRow host.row = .ok row)
-    (inline : row.inline = none)
+/-- A nonempty available range appends exactly the selected stored bytes. -/
+theorem range_execution (state : State) (root : ByteArray) (row : Metadata)
+    (bytes : ByteArray) (offset length : UInt64)
+    (quiet : state.faults = []) (represents : Represents state root row bytes)
     (valid : offset.toNat ≤ row.size.toNat)
     (nonempty : offset.toNat ≠ min (offset.toNat + length.toNat) row.size.toNat)
     (available : covered row offset (min (offset.toNat + length.toNat) row.size.toNat).toUInt64 = true) :
-    execute host root (read root (.range offset length)).run =
+    let result := execute (read root (.range offset length)).run state
+    (result.1, result.2.output) =
       (.ok (min (offset.toNat + length.toNat) row.size.toNat - offset.toNat).toUInt64,
-       (host.payload.extract offset.toNat (min (offset.toNat + length.toNat) row.size.toNat)).data.toList) := by
+       state.output ++ (bytes.extract offset.toNat (min (offset.toNat + length.toNat) row.size.toNat)).data.toList) := by
+  obtain ⟨⟨raw, rest, observed, decoded⟩, size, representation⟩ := represents
+  unfold observation at observed
+  have intact : min (offset.toNat + length.toNat) row.size.toNat ≤ bytes.size := by omega
   have bound : min (offset.toNat + length.toNat) row.size.toNat - offset.toNat < UInt64.size :=
     Nat.lt_of_le_of_lt (Nat.le_trans (Nat.sub_le ..) (Nat.min_le_right ..)) row.size.toNat_lt
   have stop : offset.toNat + (min (offset.toNat + length.toNat) row.size.toNat - offset.toNat) =
       min (offset.toNat + length.toNat) row.size.toNat := by omega
-  simp [Cas.Read.read, metadata, requestAccess, readPayload, requestFile, observe,
-    raise, performOver, Inject.inject, execute, answer, emitted, decoded, inline,
-    Nat.not_lt.mpr valid, nonempty, available, bind, pure, Program.bind,
-    ExceptT.bind, ExceptT.bindCont, ExceptT.pure, ExceptT.run, ExceptT.mk, Except.mapError,
-    UInt64.toNat_ofNat_of_lt' bound, stop]
+  cases inline : row.inline with
+  | some value =>
+    simp only [inline] at representation
+    subst value
+    simp [Cas.Read.read, metadata, requestAccess, requestOutput, raise, performOver, Inject.inject,
+      execute, Interpreter.handle, access, SimulatedHost.output, reply, fault, record, quiet,
+      observed, decoded, inline, Nat.not_lt.mpr valid, nonempty, available, Nat.not_lt.mpr intact,
+      bind, pure, Program.bind, ExceptT.bind, ExceptT.bindCont, ExceptT.pure,
+      ExceptT.run, ExceptT.mk, Except.mapError]
+  | none =>
+    simp only [inline] at representation
+    simp [Cas.Read.read, metadata, requestAccess, readPayload, requestFile, observe, raise,
+      performOver, Inject.inject, execute, Interpreter.handle, access, file, fileReply, opened,
+      reply, fault, record, quiet, observed, decoded, inline, representation,
+      Nat.not_lt.mpr valid, nonempty, available, UInt64.toNat_ofNat_of_lt' bound, stop, intact,
+      bind, pure, Program.bind, ExceptT.bind, ExceptT.bindCont, ExceptT.pure,
+      ExceptT.run, ExceptT.mk, Except.mapError]
 
-/-- Empty valid ranges succeed without requiring local availability. -/
-theorem empty_range_execution (host : Host) (root : ByteArray) (row : Metadata)
-    (offset length : UInt64) (decoded : decodeRow host.row = .ok row)
-    (valid : offset.toNat ≤ row.size.toNat)
-    (empty : offset.toNat = min (offset.toNat + length.toNat) row.size.toNat) :
-    execute host root (read root (.range offset length)).run = (.ok 0, []) := by
-  simp only [Cas.Read.read, metadata, requestAccess, raise, performOver, Inject.inject,
-    execute, answer, emitted, decoded, Nat.not_lt.mpr valid,
-    bind, pure, Program.bind, ExceptT.bind, ExceptT.bindCont, ExceptT.pure,
-    ExceptT.run, ExceptT.mk, Except.mapError, UInt64.ofNat_toNat,
-    beq_iff_eq, and_self, if_true, if_false, if_pos empty, List.nil_append]
-
-/-- One representation of intact content; no root/hash correctness is inferred
-from metadata alone. Physical storage and inline storage denote the same bytes. -/
-def Represents (host : Host) (row : Metadata) (bytes : ByteArray) : Prop :=
-  decodeRow host.row = .ok row ∧ row.size.toNat = bytes.size ∧
-    (match row.inline with | some inline => inline = bytes | none => host.payload = bytes)
-
-/-- Reading a part returns exactly that part of the represented content. This
-includes empty requests, EOF clamping, inline storage and physical transfers. -/
-theorem reading_a_part_returns_that_part (host : Host) (root : ByteArray)
+/-- Reading a part returns exactly that part, with no host/state conversion. -/
+theorem reading_a_part_returns_that_part (state : State) (root : ByteArray)
     (row : Metadata) (bytes : ByteArray) (offset length : UInt64)
-    (represents : Represents host row bytes)
+    (quiet : state.faults = []) (represents : Represents state root row bytes)
     (valid : offset.toNat ≤ row.size.toNat)
     (available : covered row offset (min (offset.toNat + length.toNat) row.size.toNat).toUInt64 = true) :
-    run host root (.range offset length) = .ok
+    readResult state root (.range offset length) = .ok
       (bytes.extract offset.toNat (min (offset.toNat + length.toNat) bytes.size)).data.toList := by
-  obtain ⟨decoded, size, representation⟩ := represents
+  have rep : Represents { state with output := [] } root row bytes := represents
+  have size := represents.2.1
   have bound : min (offset.toNat + length.toNat) row.size.toNat - offset.toNat < UInt64.size :=
     Nat.lt_of_le_of_lt (Nat.le_trans (Nat.sub_le ..) (Nat.min_le_right ..)) row.size.toNat_lt
   by_cases empty : offset.toNat = min (offset.toNat + length.toNat) row.size.toNat
-  · unfold run
-    rw [empty_range_execution host root row offset length decoded valid empty]
-    simp [publish, ← size, ← empty]
-  · have executed : execute host root (read root (.range offset length)).run =
-        (.ok (min (offset.toNat + length.toNat) row.size.toNat - offset.toNat).toUInt64,
-         (bytes.extract offset.toNat (min (offset.toNat + length.toNat) row.size.toNat)).data.toList) := by
-      cases inline : row.inline with
-      | none =>
-        simp only [inline] at representation
-        simpa [representation] using
-          file_range_execution host root row offset length decoded inline valid empty available
-      | some value =>
-        simp only [inline] at representation
-        subst value
-        exact inline_range_execution host root row offset length bytes decoded inline valid empty available
-          (by omega)
-    unfold run
-    rw [executed]
+  · obtain ⟨raw, rest, observed, decoded⟩ := represents.1
+    have result := empty_range_execution { state with output := [] } root row raw rest offset length
+      quiet observed decoded valid empty
+    have value := congrArg Prod.fst result
+    have output := congrArg Prod.snd result
+    simp only [readResult, SimulatedHost.run] at value output ⊢
+    rw [value]
+    simp [publish, output, ← size, ← empty]
+  · have result := range_execution { state with output := [] } root row bytes offset length
+      quiet rep valid empty available
+    have value := congrArg Prod.fst result
+    have output := congrArg Prod.snd result
+    simp only [List.nil_append] at value output
+    simp only [readResult, SimulatedHost.run, value, publish, output]
     have count : (min (offset.toNat + length.toNat) row.size.toNat - offset.toNat).toUInt64.toNat =
         (bytes.extract offset.toNat (min (offset.toNat + length.toNat) row.size.toNat)).data.toList.length := by
       change (min (offset.toNat + length.toNat) row.size.toNat - offset.toNat).toUInt64.toNat =
         (bytes.extract offset.toNat (min (offset.toNat + length.toNat) row.size.toNat)).size
       rw [UInt64.toNat_ofNat_of_lt' bound, ByteArray.size_extract]
       omega
-    simp only [publish]
     rw [if_pos count, size]
 
-/-- A complete local claim covers every byte range inside the recorded size. -/
+/-- A complete local claim covers all ranges inside the object. -/
 theorem complete_covers (row : Metadata) (start stop : UInt64)
     (complete : row.complete = true) (inside : stop.toNat ≤ row.size.toNat) :
     covered row start stop = true := by
   unfold covered
   split
   · rfl
-  · simp only [List.any_cons, List.any_nil, Bool.or_false,
-      Bool.and_eq_true, decide_eq_true_eq]
+  · simp only [List.any_cons, List.any_nil, Bool.or_false, Bool.and_eq_true, decide_eq_true_eq]
     constructor
     · omega
     · rw [CasPlanProofs.groupCount_spec]
       split
-      · rename_i zero
-        simp [zero] at inside
-        omega
+      · rename_i zero; simp [zero] at inside; omega
       · omega
 
-/-- Full and ranged reads share the same executable operation after observation. -/
-theorem full_read_is_range (host : Host) (root : ByteArray) (row : Metadata)
-    (decoded : decodeRow host.row = .ok row) :
-    execute host root (read root .all).run = execute host root (read root (.range 0 row.size)).run := by
+theorem full_read_is_range (state : State) (root : ByteArray) (row : Metadata)
+    (raw : Row) (rest : List Row) (quiet : state.faults = [])
+    (observed : observation state root = raw :: rest) (decoded : decodeRow raw = .ok row) :
+    execute (read root .all).run state = execute (read root (.range 0 row.size)).run state := by
+  unfold observation at observed
   simp [Cas.Read.read, metadata, requestAccess, raise, performOver, Inject.inject,
-    execute, answer, emitted, decoded, bind, pure, Program.bind, ExceptT.bind,
-    ExceptT.bindCont, ExceptT.pure, ExceptT.run, ExceptT.mk, Except.mapError]
+    execute, Interpreter.handle, access, reply, fault, record, quiet, observed, decoded,
+    bind, pure, Program.bind, ExceptT.bind, ExceptT.bindCont, ExceptT.pure, ExceptT.run, ExceptT.mk, Except.mapError]
 
-/-- A full read of intact complete content returns that content. -/
-theorem full_read_returns_content (host : Host) (root : ByteArray)
-    (row : Metadata) (bytes : ByteArray) (represents : Represents host row bytes)
+theorem full_read_returns_content (state : State) (root : ByteArray) (row : Metadata)
+    (bytes : ByteArray) (quiet : state.faults = []) (represents : Represents state root row bytes)
     (complete : row.complete = true) :
-    run host root .all = .ok bytes.data.toList := by
-  unfold run
-  rw [full_read_is_range host root row represents.1]
-  change run host root (.range 0 row.size) = _
+    readResult state root .all = .ok bytes.data.toList := by
+  obtain ⟨raw, rest, observed, decoded⟩ := represents.1
+  unfold readResult SimulatedHost.run
+  rw [full_read_is_range { state with output := [] } root row raw rest quiet observed decoded]
+  change readResult state root (.range 0 row.size) = _
   have available : covered row 0 (min ((0 : UInt64).toNat + row.size.toNat) row.size.toNat).toUInt64 = true := by
     simpa using complete_covers row 0 row.size complete (Nat.le_refl _)
-  have result := reading_a_part_returns_that_part host root row bytes 0 row.size represents
-    (by simp) available
+  have result := reading_a_part_returns_that_part state root row bytes 0 row.size quiet represents (by simp) available
   simpa [represents.2.1] using result
 
-/-- Reading a part agrees with reading the whole, in either representation. -/
-theorem reading_a_part_agrees_with_reading_the_whole (host : Host) (root : ByteArray)
+theorem reading_a_part_agrees_with_reading_the_whole (state : State) (root : ByteArray)
     (row : Metadata) (bytes : ByteArray) (offset length : UInt64)
-    (represents : Represents host row bytes) (complete : row.complete = true)
-    (valid : offset.toNat ≤ row.size.toNat) :
-    run host root (.range offset length) =
-      (run host root .all).map (fun whole =>
-        (whole.drop offset.toNat).take (min (offset.toNat + length.toNat) whole.length - offset.toNat)) := by
-  rw [full_read_returns_content host root row bytes represents complete,
-    reading_a_part_returns_that_part host root row bytes offset length represents valid]
-  · simp only [Except.map, ByteArray.data_extract, Array.toList_extract]
-    rfl
+    (quiet : state.faults = []) (represents : Represents state root row bytes)
+    (complete : row.complete = true) (valid : offset.toNat ≤ row.size.toNat) :
+    readResult state root (.range offset length) = (readResult state root .all).map
+      (fun whole => (whole.drop offset.toNat).take
+        (min (offset.toNat + length.toNat) whole.length - offset.toNat)) := by
+  rw [full_read_returns_content state root row bytes quiet represents complete,
+    reading_a_part_returns_that_part state root row bytes offset length quiet represents valid]
+  · simp only [Except.map, ByteArray.data_extract, Array.toList_extract]; rfl
   · apply complete_covers row _ _ complete
     rw [UInt64.toNat_ofNat_of_lt' (Nat.lt_of_le_of_lt (Nat.min_le_right ..) row.size.toNat_lt)]
     exact Nat.min_le_right ..
 
-end
 end Synchronicity.CasReadPromises

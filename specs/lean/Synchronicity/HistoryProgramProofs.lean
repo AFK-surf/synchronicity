@@ -1,14 +1,15 @@
 import VerifiedCore.Replication.History
 import Std.Data.TreeMap.Lemmas
 import Std.Data.TreeSet.Lemmas
-import Synchronicity.Handlers
+import Synchronicity.CasFixtures
 
 /-! These properties concern the executable retention program, not a parallel model. -/
 namespace Synchronicity.HistoryProgramProofs
 -- The pinned compiler's asynchronous elaborator emits internal Option.get!
--- diagnostics for these expanded scripted traces. Keep elaboration serial;
+-- diagnostics for these expanded execution traces. Keep elaboration serial;
 -- kernel checks and warnings-as-errors are unchanged.
 set_option Elab.async false
+set_option maxRecDepth 8192
 open VerifiedCore.Host VerifiedCore.Replication.History
 
 theorem summary_count_fold (pointers : List Pointer) (before : Int64)
@@ -410,151 +411,119 @@ theorem receipt_type_before_width (seq : Int64) (root : ByteArray) :
       .error (.columnType 2 "recorded_at" .real) := by
   rfl
 
-/-! Scripted host fixtures run the actual free-monadic program. They deliberately
-return raw cells; no fork, age, current or ceiling decisions enter from the host. -/
+set_option maxHeartbeats 2000000
+
+/-! Raw history fixtures execute on the same host used by CAS commands. -/
+open SimulatedHost
+
 private def root (byte : UInt8) : ByteArray := ⟨Array.replicate 32 byte⟩
-private def pointerRow (seq : Int64) (byte : UInt8) : Row := [.integer seq, .blob (root byte)]
-private def receiptRow (seq : Int64) (byte : UInt8) (received : Int64) : Row :=
-  pointerRow seq byte ++ [.integer received]
-
-private def headRow (seq : Int64) (byte : UInt8) : Row :=
-  [.text "node@example", .integer seq, .blob (root byte), .integer 0, .blob (root 0),
-   .blob ⟨Array.replicate 64 0⟩, .integer 0, .integer 0]
-
-private structure Script where
-  pointers : List Row := []
-  receipts : List Row := []
-  failAt : Option Nat := none
-  invalidKey : Bool := false
-  scanFailure : Option Failure := none
-
+private def history (seq : Int64) (byte : UInt8) (received : Int64) : Fields :=
+  [("origin_id", .text "node@example"), ("seq", .integer seq), ("root", .blob (root byte)),
+   ("recorded_at", .integer received), ("created_at", .integer 0), ("signed_by", .blob (root 0)),
+   ("sig", .blob ⟨Array.replicate 64 0⟩)]
+private def head (seq : Int64) (byte : UInt8) : Fields :=
+  [("origin_id", .text "node@example"), ("seq", .integer seq), ("root", .blob (root byte)),
+   ("slot", .text "complete"), ("received_at", .integer 0), ("verified_at", .integer 0)]
+private def fork : State :=
+  { db := [("head_history", [history 1 1 10, history 1 2 10, history 2 3 10])] }
+private def pointed : State := { fork with db := ("heads", [head 1 1]) :: fork.db }
 private def failure : Failure := ⟨1, 99⟩
+private def check (state : State := fork) := CasFixtures.traceResult (prune "node@example" 20) state
+private def scans := ["begin", "scan:heads", "scan:heads", "scan:head_history"]
 
-private def scriptReply (script : Script) (index : Nat) (value : A) : Reply A :=
-  if script.failAt == some index then .error failure else .ok value
+private theorem head_projection :
+    query pointed.db "heads" headColumns [("origin_id", .text "node@example"), ("slot", .text "complete")] [] headJoin =
+      [[.text "node@example", .integer 1, .blob (root 1), .integer 0, .blob (root 0),
+        .blob ⟨Array.replicate 64 0⟩, .integer 0, .integer 0]] := by
+  apply eq_of_beq
+  decide +kernel
 
-private structure State where
-  script : Script
-  index : Nat
 
-private def step (state : State) (label : String) (value : A) : Option (String × Reply A × State) :=
-  some (label, scriptReply state.script state.index value, { state with index := state.index + 1 })
+private theorem joined_head_step :
+    (decodeJoinedHead [.text "node@example", .integer 1, .blob (root 1), .integer 0, .blob (root 0),
+      .blob ⟨Array.replicate 64 0⟩, .integer 0, .integer 0]).run =
+      Program.request (.right (.validateEd25519 (root 0).data.toList)) (fun result =>
+        Program.pure (match result with
+          | .error error => .error (.host error)
+          | .ok false => .error (.column "heads.signed_by" "data is not a valid public key")
+          | .ok true => .ok ⟨"node@example", ⟨1, root 1⟩, root 0⟩)) := by
+  change Program.request _ _ = Program.request _ _
+  congr 1
+  funext result
+  cases result with
+  | error error => rfl
+  | ok valid => cases valid <;> rfl
 
-private def refused (state : State) (label : String) : Option (String × Reply A × State) :=
-  some (label, .error failure, { state with index := state.index + 1 })
+example : check { fork with scanFault := some (3, failure) } =
+    (.error (.host failure), scans ++ ["rollback"]) := by cbv
 
-private instance : Handlers.Handler Crypto State String where
-  handle
-    | .validateEd25519 _, s => step s "crypto" (!s.script.invalidKey)
+example : check = (.ok 2, scans ++ ["delete:head_history", "delete:head_history", "commit"]) := by cbv
 
-private instance : Handlers.Handler Storage State String where
-  handle
-    | .begin, s => step s "begin" 7
-    | .commit _, s => step s "commit" ()
-    | .rollback _, s => step s "rollback" ()
-    | .scanRows _ relation columns equals order joined, s =>
-      if relation == "heads" && columns == headColumns && joined == headJoin && order.isEmpty then
-        step s relation ⟨(if equals.contains ("slot", .text "complete") then s.script.pointers else []), none⟩
-      else if relation == "head_history" && order == [⟨"seq", true⟩, ⟨"root", true⟩] then
-        step s relation ⟨s.script.receipts, s.script.scanFailure⟩
-      else refused s relation
-    | .deleteRows _ relation equals blockers atMost, s =>
-      if relation == "head_history" && blockers == [⟨"heads", equals, []⟩] && atMost.isEmpty then
-        step s "delete" 1 else refused s "delete"
-    | .readRows .., s => refused s "unexpected eager read"
-    | .upsert _ _ _ _ _, s => refused s "unexpected upsert"
-    | .readBytes _ _, s => refused s "unexpected byte read"
-    | .readInput .., s => refused s "unexpected input read"
-    | .readCounter .., s => refused s "unexpected counter read"
-    | .removeFile .., s => refused s "unexpected file removal"
-    | .existsRows .., s => refused s "unexpected existence query"
+example : check pointed = (.ok 0,
+    ["begin", "scan:heads", "crypto", "scan:heads", "scan:head_history", "commit"]) := by
+  have idle : pointed.pending = none := rfl
+  have initialFaults : pointed.faults = [] := rfl
+  have initialTrace : pointed.trace = [] := rfl
+  simp [check, CasFixtures.traceResult, SimulatedHost.run, prune, pruneIn, readSlot,
+    request, transactionOver, raise, performOver, Inject.inject, execute, Interpreter.handle,
+    storage, reply, fault, record, SimulatedHost.transaction, initialFaults, initialTrace, idle, head_projection,
+    bind, pure, Program.bind, ExceptT.bind, ExceptT.bindCont, ExceptT.pure, ExceptT.run, ExceptT.mk,
+    Except.mapError]
+  have headStep := joined_head_step
+  dsimp only [ExceptT.run] at headStep
+  rw [headStep]
+  cbv
 
-/-- Scripted execution of the actual free-monadic program from a given effect
-index, so every failure position of the successful trace can be scripted. -/
-private def runScript (script : Script) (fuel index : Nat) (program : Program Effects (Result Nat)) :
-    Option (Result Nat × List String) :=
-  Handlers.run fuel program (⟨script, index⟩ : State)
+example : check { pointed with validateKey := fun _ => false } =
+    (.error (.column "heads.signed_by" "data is not a valid public key"),
+      ["begin", "scan:heads", "crypto", "rollback"]) := by
+  have idle : pointed.pending = none := rfl
+  have initialFaults : pointed.faults = [] := rfl
+  have initialTrace : pointed.trace = [] := rfl
+  simp [check, CasFixtures.traceResult, SimulatedHost.run, prune, pruneIn, readSlot,
+    request, transactionOver, raise, performOver, Inject.inject, execute, Interpreter.handle,
+    storage, reply, fault, record, SimulatedHost.transaction, initialFaults, initialTrace, idle, head_projection,
+    bind, pure, Program.bind, ExceptT.bind, ExceptT.bindCont, ExceptT.pure, ExceptT.run, ExceptT.mk,
+    Except.mapError]
+  have headStep := joined_head_step
+  dsimp only [ExceptT.run] at headStep
+  rw [headStep]
+  cbv
 
-private def forkScript : Script :=
-  { receipts := [receiptRow 1 1 10, receiptRow 1 2 10, receiptRow 2 3 10] }
+example : check (CasFixtures.fail pointed 2 failure) =
+    (.error (.host failure), ["begin", "scan:heads", "crypto", "rollback"]) := by
+  have idle : pointed.pending = none := rfl
+  have initialFaults : pointed.faults = [] := rfl
+  have initialTrace : pointed.trace = [] := rfl
+  simp [CasFixtures.fail, check, CasFixtures.traceResult, SimulatedHost.run, prune, pruneIn, readSlot,
+    request, transactionOver, raise, performOver, Inject.inject, execute, Interpreter.handle,
+    storage, reply, fault, record, SimulatedHost.transaction, initialFaults, initialTrace, idle, head_projection,
+    bind, pure, Program.bind, ExceptT.bind, ExceptT.bindCont, ExceptT.pure, ExceptT.run, ExceptT.mk,
+    Except.mapError]
+  have headStep := joined_head_step
+  dsimp only [ExceptT.run] at headStep
+  rw [headStep]
+  cbv
 
-/-- Earlier domain validation wins over a later scan failure. -/
-example : runScript { receipts := [[.integer 1, .blob ByteArray.empty, .integer 0]], scanFailure := some failure }
-    12 0 (prune "origin" 20).run =
-    some (.error (.column "head_history.root" "0 bytes, not 32"),
-      ["begin", "heads", "heads", "head_history", "rollback"]) := by decide
+example : check { fork with db := [("head_history", [history 1 1 10, history 1 2 30, history 2 3 10])] } =
+    (.ok 0, scans ++ ["commit"]) := by cbv
 
-/-- A valid prefix does not hide the trailing failure or permit mutation. -/
-example : runScript { forkScript with scanFailure := some failure }
-    12 0 (prune "origin" 20).run =
-    some (.error (.host failure), ["begin", "heads", "heads", "head_history", "rollback"]) := by decide
+example : check (CasFixtures.fail fork 6 failure) =
+    (.error (.host failure), scans ++ ["delete:head_history", "delete:head_history", "commit", "rollback"]) := by cbv
 
-/-- Both expired fork roots are deleted, the ceiling survives, and success is
-returned only after the commit acknowledgement. -/
-example : runScript forkScript 12 0 (prune "origin" 20).run =
-    some (.ok 2, ["begin", "heads", "heads", "head_history", "delete", "delete", "commit"]) := by
-  decide
+example : check (CasFixtures.fail fork 5 failure) =
+    (.error (.host failure), scans ++ ["delete:head_history", "delete:head_history", "rollback"]) := by cbv
 
-/-- The current pointer preserves its whole fork and the next old witness. -/
-example : runScript { forkScript with pointers := [headRow 1 1] }
-    12 0 (prune "origin" 20).run =
-    some (.ok 0, ["begin", "heads", "crypto", "heads", "head_history", "commit"]) := by
-  decide
-
-/-- Invalid signing-key bytes stop the operation and roll back its transaction. -/
-example : runScript { forkScript with pointers := [headRow 1 1], invalidKey := true }
-    12 0 (prune "origin" 20).run =
-    some (.error (.column "heads.signed_by" "data is not a valid public key"),
-      ["begin", "heads", "crypto", "rollback"]) := by decide
-
-/-- A primitive host failure retains its token and prevents any further reads. -/
-example : runScript { forkScript with pointers := [headRow 1 1], failAt := some 2 }
-    12 0 (prune "origin" 20).run =
-    some (.error (.host failure), ["begin", "heads", "crypto", "rollback"]) := by decide
-
-/-- A young side preserves the complete fork, never just one proof. -/
-example : runScript { forkScript with
-      receipts := [receiptRow 1 1 10, receiptRow 1 2 30, receiptRow 2 3 10] }
-    12 0 (prune "origin" 20).run =
-    some (.ok 0, ["begin", "heads", "heads", "head_history", "commit"]) := by
-  decide
-
-/-- Commit failure is not success, even after both delete acknowledgements. -/
-example : runScript { forkScript with failAt := some 6 } 12 0 (prune "origin" 20).run =
-    some (.error (.host failure), ["begin", "heads", "heads", "head_history", "delete", "delete", "commit", "rollback"]) := by
-  decide
-
-/-- A partial deletion failure stops immediately and rolls back the prefix. -/
-example : runScript { forkScript with failAt := some 5 } 12 0 (prune "origin" 20).run =
-    some (.error (.host failure), ["begin", "heads", "heads", "head_history", "delete", "delete", "rollback"]) := by
-  decide
-
-/-- Raw malformed pointers cause rollback before history reads or deletions. -/
-example : runScript { forkScript with pointers := [[.integer 1, .blob ByteArray.empty]] }
-    12 0 (prune "origin" 20).run =
-    some (.error malformed, ["begin", "heads", "rollback"]) := by
-  decide
-
-/-- Every fallible position of the successful trace reports the original
-failure, including begin, all three reads, both deletes, and commit. -/
+/-- Every failing effect restores the committed history, including failures
+following an earlier deletion. This checks real rollback, not its request. -/
 example : (List.range 7).all (fun index =>
-    ((runScript { forkScript with failAt := some index } 12 0 (prune "origin" 20).run).map
-      (fun result => result.1)) == some (.error (.host failure))) = true := by
-  decide
+    let result := SimulatedHost.run (prune "node@example" 20) (CasFixtures.fail fork index failure)
+    (result.1 == .error (.host failure)) && (result.2.db == fork.db)) = true := by cbv
 
-/-- An exempt fork retains its least higher old witness even when that witness
-is not itself the sequence ceiling. -/
-example : runScript { forkScript with receipts :=
-      [receiptRow 1 1 10, receiptRow 1 2 30, receiptRow 2 3 10, receiptRow 3 4 10] }
-    12 0 (prune "origin" 20).run =
-    some (.ok 0, ["begin", "heads", "heads", "head_history", "commit"]) := by
-  decide
+example : check { fork with db := [("head_history", [history 1 1 10, history 1 2 30, history 2 3 10, history 3 4 10])] } =
+    (.ok 0, scans ++ ["commit"]) := by cbv
 
-/-- Negative SQL sequence cells are unsigned high sequences, not zero. The
-maximum bit-pattern remains the ceiling, protecting recovery monotonicity. -/
-example : runScript { forkScript with receipts := [receiptRow 2 1 10, receiptRow (-1) 2 10] }
-    12 0 (prune "origin" 20).run =
-    some (.ok 1, ["begin", "heads", "heads", "head_history", "delete", "commit"]) := by
-  decide
+example : check { fork with db := [("head_history", [history 2 1 10, history (-1) 2 10])] } =
+    (.ok 1, scans ++ ["delete:head_history", "commit"]) := by cbv
 
 end Synchronicity.HistoryProgramProofs

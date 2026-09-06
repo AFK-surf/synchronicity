@@ -63,44 +63,45 @@ theorem download_order_does_not_matter (size : UInt64)
     · exact ⟨Or.inr h, inside⟩
     · exact ⟨Or.inl ⟨Or.inr h, inside⟩, inside⟩
 
-open VerifiedCore.Host VerifiedCore.Cas CasProgramProofs
+open VerifiedCore.Host VerifiedCore.Cas SimulatedHost
 
-/-- Deleting metadata or attempting to remove a physical file is destructive. -/
-def destructive : Event → Bool
-  | .deleteRows .. | .removeFile .. => true
-  | _ => false
+/-- A cancelled request stays cancelled in the shared database. The raw
+observation is decoded by the production operation inside its transaction. -/
+theorem a_cancelled_request_stays_cancelled (root : ByteArray) (holder : String)
+    (now : Int64) (state : State) (durable : Bool)
+    (quiet : state.faults = []) (idle : state.pending = none)
+    (decoded : decodeDurability (query state.db "blobs" ["durable"] [("root", .blob root)] [] []) = .ok durable)
+    (cancelled : query state.db "content_want" ["root"] [("root", .blob root), ("holder", .text holder)] [] [] = []) :
+    let result := SimulatedHost.run (acquire root holder now true) state
+    result.1 = .ok false ∧ result.2.db = state.db := by
+  cases durable <;>
+    simp [SimulatedHost.run, acquire, acquireIn, transactionWith, transactionOver,
+      request, performWith, execute, Interpreter.handle, storage, reply, fault, record,
+      SimulatedHost.transaction, quiet, idle, decoded, cancelled, Except.mapError,
+      bind, pure, Program.bind, ExceptT.bind, ExceptT.bindCont, ExceptT.pure, ExceptT.run, ExceptT.mk]
 
 set_option maxHeartbeats 2000000 in
-/-- Kept content is protected from collection: the actual operation neither
-accepts deletion nor requests metadata deletion or physical cleanup. Raw
-observations must come from the protected transaction/ordering session. -/
-theorem kept_content_is_protected_from_collection (root : ByteArray)
-    (accessed : Option Int64) (pinned referenced : Bool) (writers : UInt64)
-    (before : Option Int64)
-    (kept : pinned = true ∨ referenced = true ∨ writers ≠ 0) :
-    let result := execute
-      { access := .ok (accessed.toList.map fun n => [.integer n])
-        pinned := .ok pinned, referenced := .ok referenced, writers := .ok writers }
-      (delete root before).run
-    result.1 ≠ .ok .applied ∧ result.2.all (fun event => !destructive event) = true := by
-  cases accessed <;> cases pinned <;> cases referenced <;>
-    by_cases writing : writers = 0 <;> simp_all [delete, deleteIn, transactionWith,
-      transactionOver, request, performWith, execute, answer, event, decodeAccess,
-      Codec.integerField, planLifecycle, destructive, Except.mapError, Except.map,
-      bind, pure, Program.bind, ExceptT.bind, ExceptT.bindCont, ExceptT.pure,
-      ExceptT.run, ExceptT.mk]
-
-/-- A cancelled request stays cancelled: for any decoded durability state,
-a late possession attempt observes no want, returns false, and requests no
-pin UPSERT. The absence premise is at the transaction's observation point. -/
-theorem a_cancelled_request_stays_cancelled (tx : Transaction) (root : ByteArray)
-    (holder : String) (now : Int64) (rows : List Row) (durable : Bool)
-    (decoded : decodeDurability rows = .ok durable) :
-    let result := CasProgramProofs.run
-      { begin := .ok tx, durable := .ok rows, wanted := .ok [] } root holder now true
-    result.1 = .ok false ∧
-      result.2.all (fun event => match event with | .upsert .. => false | _ => true) = true := by
-  rw [decoded_execution tx root holder now true durable rows [] decoded]
-  cases durable <;> exact ⟨rfl, rfl⟩
+/-- Kept content is protected from collection: neither the database nor files
+change. The host computes protection from actual rows and writer counters. -/
+theorem kept_content_is_protected_from_collection (root : ByteArray) (before : Option Int64)
+    (state : State) (accessed : Option Int64)
+    (quiet : state.faults = []) (idle : state.pending = none)
+    (decoded : decodeAccess (query state.db "blobs" ["last_access"] [("root", .blob root)] [] []) = .ok accessed)
+    (kept : (rows state.db "pins").any (fun row => equals row [("root", .blob root)]) = true ∨
+      (rows state.db "entries").any (fun row => equals row [("content", .blob root)]) = true ∨
+      counter state ("cas_writers", root) ≠ 0) :
+    let result := SimulatedHost.run (delete root before) state
+    result.1 ≠ .ok .applied ∧ result.2.db = state.db ∧ result.2.files = state.files := by
+  generalize hp : (rows state.db "pins").any (fun row => equals row [("root", .blob root)]) = pinned at kept
+  generalize hr : (rows state.db "entries").any (fun row => equals row [("content", .blob root)]) = referenced at kept
+  cases pinned <;> cases referenced <;>
+    by_cases writing : counter state ("cas_writers", root) = 0 <;>
+    simp only [Bool.false_eq_true, false_or] at kept <;> (try contradiction)
+  all_goals unfold counter at writing
+  all_goals simp (config := { maxSteps := 100000 }) [SimulatedHost.run, delete, deleteIn, transactionWith, transactionOver,
+      request, performWith, execute, Interpreter.handle, storage, reply, fault, record,
+      SimulatedHost.transaction, counter, planLifecycle, Except.mapError,
+      quiet, idle, decoded, hp, hr, writing,
+      bind, pure, Program.bind, ExceptT.bind, ExceptT.bindCont, ExceptT.pure, ExceptT.run, ExceptT.mk]
 
 end Synchronicity.CasPromises

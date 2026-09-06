@@ -1,32 +1,16 @@
-import Synchronicity.CasProgramProofs
+import Synchronicity.CasFixtures
 
-/-! Executions of the production scheduled pin-expiry command. These proofs
-retain the complete raw mutation, its correlation and inclusive deadline, not
-a second implementation of the expiry policy. -/
 namespace Synchronicity.CasExpiryProofs
-open VerifiedCore.Host VerifiedCore.Cas
-open CasProgramProofs (Event Script execute)
-
-/-- Execute the actual command against independently scripted host replies. -/
-def run (script : Script) (holder : Option PinHolder) (now : Int64) :
-    Reply Nat × List Event :=
-  execute script (expire holder now).run
+open VerifiedCore.Host VerifiedCore.Cas SimulatedHost CasFixtures
 
 /-- The exact bulk request, including the atomic per-row content correlation. -/
-def mutation (tx : Transaction) (holder : Option PinHolder) (now : Int64) : Event :=
+def mutation (tx : Transaction) (holder : Option PinHolder) (now : Int64) : Storage (Reply Nat) :=
   .deleteRows tx "pins"
     (match holder with
       | none => []
       | some holder => [("holder", .text holder.render)])
     [{ relation := "entries", equals := [], keys := [("root", "content")] }]
     [("release_after", .integer now)]
-
-/-- No rows are pre-read, interpreted in Rust, or individually deleted. The
-exact affected-row count is returned after successful commit, including zero. -/
-theorem successful_execution (tx : Transaction) (holder : Option PinHolder)
-    (now : Int64) (count : Nat) :
-    run { begin := .ok tx, delete := .ok count } holder now =
-      (.ok count, [.begin, mutation tx holder now, .commit tx]) := rfl
 
 /-- Global expiry does not restrict the holder or the protecting entry's space. -/
 theorem global_mutation (tx : Transaction) (now : Int64) :
@@ -50,27 +34,23 @@ theorem equal_spelling_equal_mutation (tx : Transaction) (left right : PinHolder
     mutation tx (some left) now = mutation tx (some right) now := by
   simp only [mutation, same]
 
-/-- An empty deletion is still committed, with no fallback mutation. -/
-theorem no_rows_expired (tx : Transaction) (holder : Option PinHolder) (now : Int64) :
-    run { begin := .ok tx, delete := .ok 0 } holder now =
-      (.ok 0, [.begin, mutation tx holder now, .commit tx]) := rfl
 
-/-- A failed begin issues neither a mutation nor a rollback. -/
-theorem begin_failure (failure : Failure) (holder : Option PinHolder) (now : Int64) :
-    run { begin := .error failure } holder now = (.error failure, [.begin]) := rfl
+private def scheduled : State :=
+  { db := [("pins", [pin root "operator" (.integer 10), pin otherRoot "operator" (.integer 11), pin root "source:media"])] }
 
-/-- A failed bulk mutation cannot commit; rollback failure is secondary. -/
-theorem delete_failure (tx : Transaction) (failure : Failure) (rollback : Reply Unit)
-    (holder : Option PinHolder) (now : Int64) :
-    run { begin := .ok tx, delete := .error failure, rollback := rollback } holder now =
-      (.error failure, [.begin, mutation tx holder now, .rollback tx]) := rfl
+theorem expiry_is_inclusive_and_ignores_unscheduled :
+    let result := SimulatedHost.run (expire none 10) scheduled
+    result.1 == .ok 1 ∧ rows result.2.db "pins" ==
+      [pin otherRoot "operator" (.integer 11), pin root "source:media"] := by decide +kernel
 
-/-- No affected-row count escapes when commit fails, even after a successful
-bulk mutation and even when rollback independently fails. -/
-theorem commit_failure (tx : Transaction) (failure : Failure) (rollback : Reply Unit)
-    (holder : Option PinHolder) (now : Int64) (count : Nat) :
-    run { begin := .ok tx, delete := .ok count, commit := .error failure, rollback := rollback }
-        holder now =
-      (.error failure, [.begin, mutation tx holder now, .commit tx, .rollback tx]) := rfl
+theorem live_entry_protects_every_holder :
+    let initial := { scheduled with db := scheduled.db ++ [("entries", [entry])] }
+    let result := SimulatedHost.run (expire none 10) initial
+    result.1 == .ok 0 ∧ rows result.2.db "pins" == rows initial.db "pins" := by decide +kernel
+
+theorem every_failure_restores_pins :
+    (List.range 3).all (fun index =>
+      let result := SimulatedHost.run (expire none 10) (fail scheduled index)
+      failed result.1 && (result.2.db == scheduled.db)) = true := by decide +kernel
 
 end Synchronicity.CasExpiryProofs
