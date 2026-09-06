@@ -10,8 +10,9 @@ import gleam/http/response.{type Response}
 import gleam/string
 import mist
 
+/// The wire a GET brought back, and whether the server closed behind it.
 @external(erlang, "test_ffi", "http_get")
-fn http_get(port: Int, path: String) -> BitArray
+fn http_get(port: Int, path: String) -> #(BitArray, Bool)
 
 // -- the head ----------------------------------------------------------------
 
@@ -33,7 +34,7 @@ pub fn the_head_carries_the_length_and_no_transfer_coding_test() {
   assert string.contains(head, "\r\nconnection: close\r\n")
   assert string.contains(head, "\r\nx-synch-root: abc\r\n")
   assert !string.contains(string.lowercase(head), "transfer-encoding")
-  assert !string.contains(head, "99")
+  assert !string.contains(head, "content-length: 99")
   assert !string.contains(head, "keep-alive")
   assert string.ends_with(head, "\r\n\r\n")
 }
@@ -68,12 +69,13 @@ pub fn a_download_carries_its_content_length_test() {
         },
       )
     })
-  let #(head, body) = split(http_get(port, "/file"))
+  let #(head, body, closed) = fetch(port)
   assert string.starts_with(head, "HTTP/1.1 200 OK\r\n")
   assert string.contains(head, "\r\ncontent-length: 11\r\n")
   assert string.contains(head, "\r\ncontent-type: application/octet-stream\r\n")
   assert !string.contains(string.lowercase(head), "transfer-encoding")
   assert body == "hello world"
+  assert closed
 }
 
 /// A body given up on is cut short of the length its head promised — the one
@@ -93,9 +95,11 @@ pub fn an_aborted_download_falls_short_of_its_length_test() {
         },
       )
     })
-  let #(head, body) = split(http_get(port, "/file"))
+  let #(head, body, closed) = fetch(port)
   assert string.contains(head, "\r\ncontent-length: 11\r\n")
   assert body == "hello "
+  // Closed, not left open: the client learns at once, not at its own timeout.
+  assert closed
 }
 
 /// A body that crashes mid-stream is cut the same way, and nothing else — no
@@ -115,9 +119,10 @@ pub fn a_crashed_download_falls_short_of_its_length_test() {
         },
       )
     })
-  let #(head, body) = split(http_get(port, "/file"))
+  let #(head, body, closed) = fetch(port)
   assert string.contains(head, "\r\ncontent-length: 11\r\n")
   assert body == "hello "
+  assert closed
 }
 
 // -- plumbing ----------------------------------------------------------------
@@ -142,10 +147,11 @@ fn text_of(bytes: bytes_tree.BytesTree) -> String {
   text
 }
 
-/// The wire, cut at the blank line: the head with its terminator, then the
-/// body as text.
-fn split(wire: BitArray) -> #(String, String) {
+/// One GET of `/file`, cut at the blank line: the head with its terminator,
+/// the body as text, and whether the server closed the connection.
+fn fetch(port: Int) -> #(String, String, Bool) {
+  let #(wire, closed) = http_get(port, "/file")
   let assert Ok(text) = bit_array.to_string(wire)
   let assert Ok(#(head, body)) = string.split_once(text, "\r\n\r\n")
-  #(head <> "\r\n\r\n", body)
+  #(head <> "\r\n\r\n", body, closed)
 }

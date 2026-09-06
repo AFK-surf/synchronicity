@@ -70,14 +70,16 @@ pub fn respond(
   let sink = fn(data: BitArray) { send(bytes_tree.from_bit_array(data)) }
   case exception.rescue(fn() { body(sink) }) {
     Ok(Complete) -> Nil
+    // Closed before anything else on both paths, the logging included: were a
+    // step after the close to raise, mist's own rescue would put a 500 on
+    // this socket — bytes a client counting to `length` would take for the
+    // tail of the file. Closed first, that 500 has nowhere to go.
     Ok(Aborted(reason)) -> {
-      wisp.log_warning("download aborted: " <> reason)
       let _ = transport.close(conn.transport, conn.socket)
+      wisp.log_warning("download aborted: " <> reason)
       Nil
     }
     Error(crash) -> {
-      // Closed before mist's own rescue can put a 500 on this socket — bytes a
-      // client counting to `length` would take for the tail of the file.
       let _ = transport.close(conn.transport, conn.socket)
       wisp.log_error("download crashed: " <> string.inspect(crash))
       Nil

@@ -26,6 +26,7 @@ import auth/api_key
 import auth/principal.{type Principal, Cookie, Principal}
 import auth/session
 import envoy
+import exception
 import gleam/bit_array
 import gleam/bytes_tree
 import gleam/crypto
@@ -594,28 +595,37 @@ fn stream(
       False -> []
     }
   ]
-  sized_body.respond(
-    request: req,
-    status: status,
-    headers: headers,
-    length: length,
-    body: fn(sink) {
-      let inbox = process.new_subject()
-      process.send(session.inbox, agent.Fetch(root, size, start, length, inbox))
-      let outcome = relay(agent.relay(session), inbox, sink, length)
-      record(download)
-      outcome
-    },
-  )
+  let response =
+    sized_body.respond(
+      request: req,
+      status: status,
+      headers: headers,
+      length: length,
+      body: fn(sink) {
+        let inbox = process.new_subject()
+        process.send(
+          session.inbox,
+          agent.Fetch(root, size, start, length, inbox),
+        )
+        relay(agent.relay(session), inbox, sink, length)
+      },
+    )
+  // Outside the body, which `respond` runs under a rescue: the slot goes back
+  // however the relay ended, a crash included. Left inside, a crash would hold
+  // it until the lease reclaims it an hour on.
+  record(download)
+  response
 }
 
 /// Feeds the session's events to the relay until the stream ends, one way or
 /// the other.
 ///
-/// The wait for each event is the watchdog. A tunnel silent for a whole wait
-/// is asked about with an `Idle`, and one silent for the next wait too is a
-/// dead tunnel dressed as a slow one — the relay ends it rather than let a
-/// download hang forever.
+/// The wait for each event is the watchdog. `Idle` stands in for the event a
+/// silent wait did not bring; the relay tolerates one such wait after the
+/// tunnel last moved and ends the stream on the next, since a tunnel silent
+/// that long is a dead one dressed as slow, and a download that hangs forever
+/// is worse for whoever is waiting than one that fails. A tunnel that never
+/// spoke at all is ended on the first.
 fn relay(
   state: agent.Relay,
   inbox: Subject(agent.Event),
@@ -645,9 +655,17 @@ fn relay(
       )
     }
     False ->
-      case agent.relay_step(state, event, sink) {
-        agent.Relaying(next) -> relay(next, inbox, sink, length)
-        agent.Finished(next) ->
+      // Rescued here, where the stream's id is known: a relay that falls over
+      // cancels its stream at the daemon, which would otherwise hold the read
+      // open until the credit window drained and keep the entry for the life
+      // of the tunnel. `respond` then closes the socket on the abort.
+      case exception.rescue(fn() { agent.relay_step(state, event, sink) }) {
+        Error(crash) -> {
+          agent.relay_cancel(state)
+          sized_body.Aborted("the relay crashed: " <> string.inspect(crash))
+        }
+        Ok(agent.Relaying(next)) -> relay(next, inbox, sink, length)
+        Ok(agent.Finished(next)) ->
           case agent.relay_sent(next) == length {
             True -> sized_body.Complete
             // Ended cleanly at the daemon, but short of what it resolved: an
@@ -662,7 +680,7 @@ fn relay(
                 <> " bytes it resolved",
               )
           }
-        agent.Failed(_next, why) -> sized_body.Aborted(why)
+        Ok(agent.Failed(_next, why)) -> sized_body.Aborted(why)
       }
   }
 }

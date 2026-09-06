@@ -86,22 +86,24 @@ smtp_dialogue(Socket, Said, command) ->
 smtp_reply(Socket, Text) ->
     ok = gen_tcp:send(Socket, [Text, "\r\n"]).
 
-%% One HTTP/1.1 GET over raw TCP, read until the server closes: the wire
-%% itself, head and body, as a client would see it — for asserting what a
-%% streamed response really carries rather than what a client library
-%% made of it.
+%% One HTTP/1.1 GET over raw TCP, read until the server closes or five
+%% seconds pass in silence: the wire itself, head and body, as a client
+%% would see it — for asserting what a streamed response really carries
+%% rather than what a client library made of it — and whether the server
+%% closed, told apart from a server that merely went quiet.
 http_get(Port, Path) ->
     {ok, S} = gen_tcp:connect({127, 0, 0, 1}, Port,
                               [binary, {active, false}, {packet, raw}], 5000),
     ok = gen_tcp:send(S, ["GET ", Path, " HTTP/1.1\r\nHost: localhost\r\n\r\n"]),
-    Wire = http_drain(S, []),
+    {Wire, Closed} = http_drain(S, []),
     gen_tcp:close(S),
-    Wire.
+    {Wire, Closed}.
 
 http_drain(S, Acc) ->
     case gen_tcp:recv(S, 0, 5000) of
         {ok, Data} -> http_drain(S, [Data | Acc]);
-        {error, _} -> iolist_to_binary(lists:reverse(Acc))
+        {error, closed} -> {iolist_to_binary(lists:reverse(Acc)), true};
+        {error, _} -> {iolist_to_binary(lists:reverse(Acc)), false}
     end.
 
 udp_roundtrip(Port, Packet) ->
