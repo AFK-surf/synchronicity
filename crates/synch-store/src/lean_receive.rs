@@ -259,6 +259,10 @@ mod tests {
             self.trace.borrow_mut().push("acquire".into());
             self.inner.acquire(space, key)
         }
+        fn order(&mut self, space: &str) -> Result<u64> {
+            self.trace.borrow_mut().push("order".into());
+            self.inner.order(space)
+        }
         fn release(&mut self, token: u64) -> Result<()> {
             self.trace.borrow_mut().push("release".into());
             self.inner.release(token)

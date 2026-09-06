@@ -501,21 +501,6 @@ pub(crate) fn to_bao_ranges(ranges: &ChunkRanges) -> bao_tree::ChunkRanges {
     out
 }
 
-fn cache_file_bytes(path: &std::path::Path) -> u64 {
-    let Ok(metadata) = std::fs::metadata(path) else {
-        return 0;
-    };
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        metadata.blocks().saturating_mul(512)
-    }
-    #[cfg(not(unix))]
-    {
-        metadata.len()
-    }
-}
-
 impl Store {
     /// The filesystem path of a blob payload: `store/<hex[0..2]>/<hex>` (§6.2).
     pub(crate) fn blob_path(&self, root: &Hash) -> PathBuf {
@@ -856,69 +841,25 @@ impl Store {
         Ok(discarded.len())
     }
 
-    /// Current out-of-line bytes occupied by reconstructible durable cache
-    /// entries (payload plus outboard).
-    pub(crate) fn durable_cache_bytes(&self) -> Result<u64> {
-        Ok(self
-            .durable_cache_entries()?
-            .into_iter()
-            .map(|(_, _, bytes)| bytes)
-            .sum())
+    /// Evicts least-recently-used durable cache entries until the cache is
+    /// within `limit` bytes and `shortfall` bytes more are free. Pinned rows
+    /// are eligible because their promise lives remotely; staged-only rows
+    /// are never eligible because scratch is their only copy. Which rows, in
+    /// what order, the measure of each and the refusal of one a writer holds
+    /// are the Lean program's; returns the entries evicted and the bytes freed.
+    pub(crate) fn evict_durable_cache(
+        &self,
+        limit: Option<u64>,
+        shortfall: u64,
+    ) -> Result<(usize, u64)> {
+        crate::lean_collect::evict(self, limit, shortfall)
     }
 
-    /// Evicts least-recently-used durable cache entries until `target_bytes`
-    /// is met. Pinned rows are eligible because their promise lives remotely;
-    /// staged-only rows are never eligible because scratch is their only copy.
-    pub(crate) fn evict_durable_cache_to(&self, target_bytes: u64) -> Result<(usize, u64)> {
-        let mut entries = self.durable_cache_entries()?;
-        entries.sort_unstable_by_key(|(_, last_access, _)| *last_access);
-        let mut usage: u64 = entries.iter().map(|(_, _, bytes)| *bytes).sum();
-        let mut evicted = 0usize;
-        let mut freed = 0u64;
-        for (root, _, bytes) in entries {
-            if usage <= target_bytes {
-                break;
-            }
-            if !self.clear_blob_cache(&root)? {
-                continue;
-            }
-            usage = usage.saturating_sub(bytes);
-            freed = freed.saturating_add(bytes);
-            evicted += 1;
-        }
-        Ok((evicted, freed))
-    }
-
-    /// Advances a cache entry's LRU clock after a backend-served read.
-    pub(crate) fn touch_blob(&self, root: &Hash, now: i64) -> Result<()> {
-        self.conn().execute(
-            "UPDATE blobs SET last_access = max(last_access, ?2) WHERE root = ?1",
-            params![root.as_bytes().to_vec(), now],
-        )?;
-        Ok(())
-    }
-
-    fn durable_cache_entries(&self) -> Result<Vec<(Hash, i64, u64)>> {
-        let conn = self.conn();
-        let mut stmt = conn.prepare(
-            "SELECT root, last_access FROM blobs
-              WHERE durable != 0 AND inline IS NULL",
-        )?;
-        let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?))
-        })?;
-        let mut out = Vec::new();
-        for row in rows {
-            let (encoded, last_access) = row?;
-            let root = hash_column(encoded, "blobs.root")?;
-            let payload = cache_file_bytes(&self.blob_path(&root));
-            let outboard = cache_file_bytes(&self.outboard_path(&root));
-            let bytes = payload.saturating_add(outboard);
-            if bytes > 0 {
-                out.push((root, last_access, bytes));
-            }
-        }
-        Ok(out)
+    /// Advances a cache entry's LRU clock after a backend-served read. The
+    /// Lean program coalesces touches to once a minute against the row's own
+    /// stamp and never moves it backwards; answers whether it moved.
+    pub(crate) fn touch_blob(&self, root: &Hash) -> Result<bool> {
+        crate::lean_collect::touch(self, root)
     }
 
     /// Records one holder's claim on an object against GC (§9.2,
@@ -1129,6 +1070,7 @@ impl Store {
     /// [`Store::delete_blob`] explains.
     ///
     /// Returns whether the object was deleted.
+    #[cfg(test)]
     pub(crate) fn delete_blob_if_collectable(&self, root: &Hash, before: i64) -> Result<bool> {
         // The connection and shared CAS order guards are held across the
         // unlinks, not just across the transaction, so no row writer or writer

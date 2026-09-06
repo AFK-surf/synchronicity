@@ -27,6 +27,11 @@ mutations use the token established by Storage.begin. Bulk transfer and delete
 are each one statement, not a host scan followed by per-row callbacks. -/
 inductive Access : Type → Type where
   | snapshot (selection : Selection) (columns : List String) : Access (Reply Scan)
+  /-- A snapshot of the rows the selection admits and no exclusion matches:
+  each exclusion is the same correlated `NOT EXISTS` a delete's blockers
+  evaluate, in the same statement as the selection. -/
+  | snapshotExcluding (selection : Selection) (columns : List String)
+      (excluding : List Exclusion) : Access (Reply Scan)
   | update (tx : Transaction) (selection : Selection) (values : Fields) : Access (Reply Nat)
   /-- Atomic INSERT SELECT with ON CONFLICT on these columns DO NOTHING.
   Existing rows retain every field; no replacement/update is permitted. -/

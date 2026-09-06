@@ -5,14 +5,14 @@
 //! starts it, and hands its terminal back as a typed result.
 
 pub use crate::generated::{
-    CellType, Committed, DurableDomainError, IngestDomainError, IngestInput, Ingested,
-    LifecycleDomainError, Outcome, PinHolder, ProvenSubtree, ReadDomainError, ReceiveDomainError,
-    ServeDomainError, Served,
+    CellType, CollectDomainError, Committed, DurableDomainError, Evicted, IngestDomainError,
+    IngestInput, Ingested, LifecycleDomainError, Outcome, PinHolder, ProvenSubtree,
+    ReadDomainError, ReceiveDomainError, ServeDomainError, Served,
 };
 pub use crate::host::IngestResources;
 pub use crate::operation::OperationError;
 use crate::{
-    host::{Bao, Clock, FileIO, Lease, Resources, Storage},
+    host::{Bao, Clock, FileIO, Lease, Resources, Storage, Sweep},
     operation::{run, terminal, Capabilities, Command, Decode},
 };
 
@@ -60,6 +60,88 @@ pub enum DurableError<E> {
 pub enum ServeError<E> {
     Operation(OperationError<E>),
     Domain(ServeDomainError),
+}
+
+/// Completed sweep failure, preserving original host errors.
+#[derive(Debug)]
+pub enum CollectError<E> {
+    Operation(OperationError<E>),
+    Domain(CollectDomainError),
+}
+
+/// The services a sweep directs besides its relational storage: the writer
+/// counters and unlinks, the clock, the remover's critical section, and the
+/// object store as a directory.
+pub struct CollectResources<'a, E> {
+    pub resources: &'a mut dyn Resources<Error = E>,
+    pub clock: &'a mut dyn Clock<Error = E>,
+    pub leases: &'a mut dyn Lease<Error = E>,
+    pub sweep: &'a mut dyn Sweep<Error = E>,
+}
+impl<E> std::fmt::Debug for CollectResources<'_, E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CollectResources").finish_non_exhaustive()
+    }
+}
+
+fn collect<T: Decode, S: Storage>(
+    storage: &mut S,
+    resources: CollectResources<'_, S::Error>,
+    command: &Command,
+) -> Result<T, CollectError<S::Error>> {
+    let capabilities = Capabilities {
+        resources: Some(resources.resources),
+        clock: Some(resources.clock),
+        leases: Some(resources.leases),
+        sweep: Some(resources.sweep),
+        ..Capabilities::default()
+    };
+    let outcome: Result<T, CollectDomainError> =
+        finish(run(storage, capabilities, &[], command)).map_err(CollectError::Operation)?;
+    outcome.map_err(CollectError::Domain)
+}
+
+/// Advance an object's access clock to now, coalesced to once a minute;
+/// answers whether it moved.
+pub fn touch<S: Storage>(
+    storage: &mut S,
+    resources: CollectResources<'_, S::Error>,
+    root: &[u8; 32],
+) -> Result<bool, CollectError<S::Error>> {
+    collect(storage, resources, &Command::CasTouch(root.to_vec()))
+}
+
+/// Evict cached durable objects by least recent use until the cache is
+/// within `limit` bytes and `shortfall` bytes more are free. Lean reads the
+/// rows, measures their files, orders them and clears each inside the
+/// remover's section; answers what went.
+pub fn evict<S: Storage>(
+    storage: &mut S,
+    resources: CollectResources<'_, S::Error>,
+    limit: Option<u64>,
+    shortfall: u64,
+) -> Result<Evicted, CollectError<S::Error>> {
+    collect(storage, resources, &Command::CasEvict { limit, shortfall })
+}
+
+/// Collect every unreferenced, unpinned object untouched since `before`,
+/// each decided again in its own transaction; answers how many went.
+pub fn gc_content<S: Storage>(
+    storage: &mut S,
+    resources: CollectResources<'_, S::Error>,
+    before: i64,
+) -> Result<u64, CollectError<S::Error>> {
+    collect(storage, resources, &Command::CasGcContent(before))
+}
+
+/// Remove every object file no row accounts for, once older than `before`
+/// and held by no writer; answers how many went.
+pub fn gc_orphans<S: Storage>(
+    storage: &mut S,
+    resources: CollectResources<'_, S::Error>,
+    before: i64,
+) -> Result<u64, CollectError<S::Error>> {
+    collect(storage, resources, &Command::CasGcOrphans(before))
 }
 
 /// What one exchange served: the encoded bytes and the group spans they cover.

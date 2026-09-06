@@ -102,7 +102,8 @@ impl Storage for Script {
         update,
         copy_rows,
         delete,
-        write
+        write,
+        snapshot_excluding
     );
 }
 

@@ -74,6 +74,13 @@ program value. On the receiving side `State.decodeInline`,
 `State.decodeSlice`, `State.proven` and `State.agrees` say what a received
 encoding decodes to, whether it verifies, what a proof establishes and
 whether a donor's tree agrees with a run; flushes are recorded in `synced`.
+The sweeps read the store as files: a file costs its length, its time is
+what `State.modified` records for it, and the object roots are the keys of
+the payload and outboard files on one page. The remover's critical section
+(`Lease.order`) is a counted token like a lease, keyed by its space alone,
+so "inside the section" is the counter of `("cas", empty)` reading one;
+its exclusion against writers is a host obligation the model states, not
+one it simulates.
 Literal predicates (`equals`, `notEquals`, delete bounds) have SQL `IS`
 semantics, as the store adapter renders them: NULL selects NULL and `IS NOT`
 NULL excludes it. Conflict detection and join correlation keep SQL `=`, where

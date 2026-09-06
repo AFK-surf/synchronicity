@@ -277,6 +277,20 @@ instance : Decode Commands.ReceiveDomainError where
     | 3 => return .sizeMismatch (← Decode.decode) (← Decode.decode) (← Decode.decode)
     | _ => throw ()
 
+instance : Encode Commands.CollectDomainError where
+  encode out value := match value with
+    | .malformed => out.push 0
+    | .columnType a0 a1 a2 => out.push 1 |>.put a0 |>.put a1 |>.put a2
+    | .sizeMismatch a0 a1 a2 => out.push 2 |>.put a0 |>.put a1 |>.put a2
+
+instance : Decode Commands.CollectDomainError where
+  decode := do
+    match ← readByte with
+    | 0 => return .malformed
+    | 1 => return .columnType (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 2 => return .sizeMismatch (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | _ => throw ()
+
 instance : Encode Commands.Ingested where
   encode out value := match value with
     | .mk a0 a1 => out |>.put a0 |>.put a1
@@ -302,6 +316,16 @@ instance : Encode Commands.Served where
     | .mk a0 a1 => out |>.put a0 |>.put a1
 
 instance : Decode Commands.Served where
+  decode := do
+    let a0 ← Decode.decode
+    let a1 ← Decode.decode
+    return .mk a0 a1
+
+instance : Encode Commands.Evicted where
+  encode out value := match value with
+    | .mk a0 a1 => out |>.put a0 |>.put a1
+
+instance : Decode Commands.Evicted where
   decode := do
     let a0 ← Decode.decode
     let a1 ← Decode.decode
@@ -333,6 +357,10 @@ instance : Encode Commands.Command where
     | .casWriteSlice a0 a1 a2 a3 a4 => out.push 21 |>.put a0 |>.put a1 |>.put a2 |>.put a3 |>.put a4
     | .casWriteProof a0 a1 a2 a3 a4 a5 => out.push 22 |>.put a0 |>.put a1 |>.put a2 |>.put a3 |>.put a4 |>.put a5
     | .casPromote a0 a1 a2 a3 a4 a5 => out.push 23 |>.put a0 |>.put a1 |>.put a2 |>.put a3 |>.put a4 |>.put a5
+    | .casTouch a0 => out.push 24 |>.put a0
+    | .casEvict a0 a1 => out.push 25 |>.put a0 |>.put a1
+    | .casGcContent a0 => out.push 26 |>.put a0
+    | .casGcOrphans a0 => out.push 27 |>.put a0
 
 instance : Decode Commands.Command where
   decode := do
@@ -361,6 +389,10 @@ instance : Decode Commands.Command where
     | 21 => return .casWriteSlice (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode)
     | 22 => return .casWriteProof (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode)
     | 23 => return .casPromote (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 24 => return .casTouch (← Decode.decode)
+    | 25 => return .casEvict (← Decode.decode) (← Decode.decode)
+    | 26 => return .casGcContent (← Decode.decode)
+    | 27 => return .casGcOrphans (← Decode.decode)
     | _ => throw ()
 
 end VerifiedCore

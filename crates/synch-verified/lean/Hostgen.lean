@@ -8,6 +8,7 @@ import VerifiedCore.Host.Resources
 import VerifiedCore.Host.Source
 import VerifiedCore.Host.Digest
 import VerifiedCore.Host.Bao
+import VerifiedCore.Host.Sweep
 import VerifiedCore.Host.Writes
 import VerifiedCore.Commands
 
@@ -68,7 +69,7 @@ def algebras : List Name := [
   ``VerifiedCore.Host.FileIO, ``VerifiedCore.Host.Clock, ``VerifiedCore.Host.Output,
   ``VerifiedCore.Host.Construct, ``VerifiedCore.Host.Upsert, ``VerifiedCore.Host.Resources,
   ``VerifiedCore.Host.Lease, ``VerifiedCore.Host.SourceIO, ``VerifiedCore.Host.Digest,
-  ``VerifiedCore.Host.ByteWrites, ``VerifiedCore.Host.Bao]
+  ``VerifiedCore.Host.ByteWrites, ``VerifiedCore.Host.Bao, ``VerifiedCore.Host.Sweep]
 
 /-- The types that cross the command boundary: what a caller asks for and
 what a finished command reports. Each gets Lean `Encode`/`Decode` instances
@@ -81,9 +82,9 @@ def messages : List Name := [
   ``VerifiedCore.Commands.LifecycleDomainError, ``VerifiedCore.Commands.IngestDomainError,
   ``VerifiedCore.Commands.ReadDomainError, ``VerifiedCore.Commands.HistoryDomainError,
   ``VerifiedCore.Commands.DurableDomainError, ``VerifiedCore.Commands.ServeDomainError,
-  ``VerifiedCore.Commands.ReceiveDomainError,
+  ``VerifiedCore.Commands.ReceiveDomainError, ``VerifiedCore.Commands.CollectDomainError,
   ``VerifiedCore.Commands.Ingested, ``VerifiedCore.Commands.Committed, ``VerifiedCore.Commands.Served,
-  ``VerifiedCore.Commands.Command]
+  ``VerifiedCore.Commands.Evicted, ``VerifiedCore.Commands.Command]
 
 /-- Rust spellings that differ from the Lean short name. -/
 def rustName (name : Name) : String :=
@@ -117,7 +118,9 @@ def tags : List (String × Nat) := [
   ("Digest.blake3", 53), ("ByteWrites.putBytes", 54),
   ("Bao.encodeSlice", 55), ("Bao.encodeProof", 56), ("Bao.decodeInline", 57),
   ("Bao.decodeSlice", 58), ("Bao.flushObject", 59), ("Bao.trimObject", 60),
-  ("Bao.writeProof", 61), ("Bao.promoteRun", 62)]
+  ("Bao.writeProof", 61), ("Bao.promoteRun", 62),
+  ("Lease.order", 63), ("Access.snapshotExcluding", 64),
+  ("Sweep.fileBytes", 65), ("Sweep.fileModified", 66), ("Sweep.listObjects", 67)]
 
 /-- Which Rust service answers an algebra by default. -/
 def defaultRoute : String → Route
@@ -133,6 +136,7 @@ def defaultRoute : String → Route
   | "Digest" => .capability "digest" "Digest"
   | "ByteWrites" => .capability "writes" "ByteWrites"
   | "Bao" => .capability "bao" "Bao"
+  | "Sweep" => .capability "sweep" "Sweep"
   | _ => .special
 
 /-- Which Rust service each effect belongs to. The command inputs, the
@@ -158,7 +162,8 @@ def traitDoc : String → String
   | "FileIO" => "/// Session-local raw file handles. Dropping the host releases outstanding handles."
   | "Output" => "/// Operation-local byte sink. Appended bytes are provisional until the whole\n/// operation succeeds; the caller discards the sink on failure."
   | "TemporaryFiles" => "/// Invocation-owned staging resources. Abandonment releases handles and\n/// removes unpublished temporary names; replacement consumes temporary ownership."
-  | "Lease" => "/// Opaque counted resource leases ordered against competing deletion. Host\n/// abandonment releases outstanding tokens; policy chooses their lifetime."
+  | "Lease" => "/// Opaque counted resource leases ordered against competing deletion, and\n/// the remover's critical section they are ordered against. Host abandonment\n/// releases outstanding tokens; policy chooses their lifetime."
+  | "Sweep" => "/// The object store as a directory: what each object's files cost on disk,\n/// when they were written, and which objects have files at all. The layout is\n/// this host's; what is evicted, collected or unlinked is the operation's."
   | "SourceIO" => "/// Raw input observations. Successful bounded reads may be short at EOF;\n/// freeze retains an immutable copy under an invocation-owned input handle."
   | "Construct" => "/// Bulk object construction over resources the requesting operation owns.\n///\n/// The operation decides what is built, from which opened source and into\n/// which owned temporaries; the host streams the bytes, hashes them into the\n/// BLAKE3 tree and lays out the Bao outboard. Neither call publishes, flushes\n/// or records anything."
   | "Clock" => "/// Wall-clock input; the operation chooses when to observe it."
@@ -177,7 +182,7 @@ def traitExtras : String → String
 
 def traitOrder : List String :=
   ["Storage", "Resources", "Crypto", "FileIO", "Clock", "Output", "Construct", "TemporaryFiles",
-    "Lease", "SourceIO", "Digest", "ByteWrites", "Bao"]
+    "Lease", "SourceIO", "Digest", "ByteWrites", "Bao", "Sweep"]
 
 def baseTy : Name → Option Ty
   | ``UInt64 | ``VerifiedCore.Host.Transaction => some .u64
@@ -304,7 +309,7 @@ def leanAlgebra (algebra : Algebra) : String := Id.run do
   return out
 
 def leanFile (all : Array Algebra) : String := Id.run do
-  let mut out := "import VerifiedCore.Host.Codec\nimport VerifiedCore.Crypto\nimport VerifiedCore.Host.Construct\nimport VerifiedCore.Host.Source\nimport VerifiedCore.Host.Digest\nimport VerifiedCore.Host.Writes\nimport VerifiedCore.Host.Bao\n\n"
+  let mut out := "import VerifiedCore.Host.Codec\nimport VerifiedCore.Crypto\nimport VerifiedCore.Host.Construct\nimport VerifiedCore.Host.Source\nimport VerifiedCore.Host.Digest\nimport VerifiedCore.Host.Writes\nimport VerifiedCore.Host.Bao\nimport VerifiedCore.Host.Sweep\n\n"
   out := out ++ "/-! GENERATED by `hostgen` from the effect algebras; do not edit. Each\nalgebra's tags, names, request encoder, reply decoder and `WireEffect`\ninstance follow from its constructors and the tag table. -/\nnamespace VerifiedCore.Host\nopen Wire\n"
   for algebra in all do
     out := out ++ "\n" ++ leanAlgebra algebra
@@ -668,7 +673,7 @@ def main (args : List String) : IO UInt32 := do
   let modules : Array Name := #[`VerifiedCore.Host, `VerifiedCore.Crypto, `VerifiedCore.Host.Access,
     `VerifiedCore.Host.Construct, `VerifiedCore.Host.Upsert, `VerifiedCore.Host.Resources,
     `VerifiedCore.Host.Source, `VerifiedCore.Host.Digest, `VerifiedCore.Host.Writes,
-    `VerifiedCore.Host.Bao, `VerifiedCore.Commands]
+    `VerifiedCore.Host.Bao, `VerifiedCore.Host.Sweep, `VerifiedCore.Commands]
   let env ← importModules (modules.map fun module => ({ module } : Import)) {} 0
   let (lean, commands, rust) ← Prod.fst <$> (Meta.MetaM.toIO (do
       let all ← algebras.toArray.mapM readAlgebra

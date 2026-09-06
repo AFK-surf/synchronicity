@@ -9,6 +9,7 @@ import VerifiedCore.Trie.Mutate
 import VerifiedCore.Cas.Durable
 import VerifiedCore.Cas.Serve
 import VerifiedCore.Cas.Receive
+import VerifiedCore.Cas.Collect
 
 /-! The shapes that cross the command boundary: what a caller asks for and
 what a finished command reports. `hostgen` derives the codecs of every type
@@ -85,6 +86,17 @@ inductive Command where
   /-- Promote the donor's bytes for every proven subtree its tree agrees with. -/
   | casPromote (donor root : ByteArray) (size : UInt64) (proven : List Cas.Receive.ProvenSubtree)
       (now : Int64) (cache : Bool)
+  /-- Advance an object's access clock, coalesced to once a minute; answers
+  whether it moved. -/
+  | casTouch (root : ByteArray)
+  /-- Evict cached durable objects by least recent use until the cache is
+  within `limit` bytes and `shortfall` bytes more are free. -/
+  | casEvict (limit : Option UInt64) (shortfall : UInt64)
+  /-- Collect every unreferenced, unpinned object untouched since `before`. -/
+  | casGcContent (before : Int64)
+  /-- Remove object files no row accounts for, once older than `before` and
+  held by no writer. -/
+  | casGcOrphans (before : Int64)
 
 /-- Malformed metadata or a column of the wrong storage class, as pin
 acquisition and deletion report it. -/
@@ -138,6 +150,13 @@ inductive ReceiveDomainError where
   | sizeMismatch (root : ByteArray) (recorded offered : UInt64)
   deriving BEq, DecidableEq
 
+/-- How a sweep refuses: a malformed row, or a claim a row cannot yield to. -/
+inductive CollectDomainError where
+  | malformed
+  | columnType (index : Nat) (column : String) (actual : Cas.Codec.CellType)
+  | sizeMismatch (root : ByteArray) (recorded offered : UInt64)
+  deriving BEq, DecidableEq
+
 inductive HistoryDomainError where
   | malformed
   | columnType (index : Nat) (column : String) (actual : Cas.Codec.CellType)
@@ -164,6 +183,12 @@ group spans they cover. -/
 structure Served where
   count : UInt64
   spans : List (UInt64 × UInt64)
+  deriving BEq, DecidableEq
+
+/-- What an eviction pass took: the entries cleared and the bytes they freed. -/
+structure Evicted where
+  entries : UInt64
+  freed : UInt64
   deriving BEq, DecidableEq
 
 end VerifiedCore.Commands

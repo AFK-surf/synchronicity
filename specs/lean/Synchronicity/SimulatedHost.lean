@@ -4,6 +4,7 @@ import VerifiedCore.Host.Construct
 import VerifiedCore.Host.Source
 import VerifiedCore.Crypto
 import VerifiedCore.Host.Bao
+import VerifiedCore.Host.Sweep
 import Synchronicity.Decidable
 
 /-! One stateful host for composed CAS proofs. Successful replies are computed
@@ -32,6 +33,9 @@ structure State where
   pending : Option (Transaction × Database) := none
   nextTx : UInt64 := 1
   files : FileStore := []
+  /-- When each file was last written, for the sweeps; a file without a
+  time is one whose time cannot be read. -/
+  modified : List (ObjectKey × Int64) := []
   handles : List (UInt64 × ByteArray) := []
   temporaries : List (UInt64 × Temporary) := []
   leases : List (UInt64 × ObjectKey) := []
@@ -161,6 +165,11 @@ def access : Access A → State → Result A
   | .snapshot selection columns, state => reply state ("snapshot:" ++ selection.relation) fun state =>
       (.ok ⟨((rows state.db selection.relation).filter (selects selection)).map (project columns),
         scanFailure state⟩, state)
+  | .snapshotExcluding selection columns excluding, state =>
+      reply state ("exclude:" ++ selection.relation) fun state =>
+      (.ok ⟨((rows state.db selection.relation).filter fun row =>
+          selects selection row && !excluded state.db row excluding).map (project columns),
+        scanFailure state⟩, state)
   | .update tx selection values, state => reply state ("update:" ++ selection.relation) fun state =>
       transaction state tx fun db =>
         let table := rows db selection.relation
@@ -280,6 +289,14 @@ def lease : Lease A → State → Result A
       (.ok state.nextHandle, { next with
         leases := (state.nextHandle, (space, key)) :: state.leases
         nextHandle := state.nextHandle + 1 })
+  -- The section is a counted token like a lease, keyed by the space alone,
+  -- so "inside the section" is the counter of `(space, empty)` being one.
+  | .order space, state => reply state ("order:" ++ space) fun state =>
+      let key := (space, ByteArray.empty)
+      let next := setCounter state key (counter state key + 1)
+      (.ok state.nextHandle, { next with
+        leases := (state.nextHandle, key) :: state.leases
+        nextHandle := state.nextHandle + 1 })
   | .release token, state => reply state "release" (fun state =>
       match (state.leases.find? fun entry => entry.1 == token).map Prod.snd with
       | none => (.error invalid, state)
@@ -319,6 +336,26 @@ def bao : Bao A → State → Result A
   | .promoteRun donor root size start groups cv, state => reply state "bao:promoteRun" fun state =>
       (.ok (state.agrees donor root size start groups cv), state)
 
+/-- The object files of the store, as the host would list them: every root
+some payload or outboard is named for, once. -/
+def objectRoots (state : State) : List ByteArray :=
+  (state.files.filterMap fun ((space, key), _) =>
+    if space == "cas_payload" || space == "cas_outboard" then some key else none).eraseDups
+
+/-- A file costs its length; its time is what was recorded for it; the store
+is one page. -/
+def sweep : Sweep A → State → Result A
+  | .fileBytes space key, state => reply state ("bytes:" ++ space) fun state =>
+      (.ok ((lookupFile state.files (space, key)).map (·.size.toUInt64) |>.getD 0), state)
+  | .fileModified space key, state => reply state ("modified:" ++ space) fun state =>
+      (.ok (match lookupFile state.files (space, key) with
+        | none => none
+        | some _ => (state.modified.find? fun entry => entry.1 == (space, key)).map Prod.snd), state)
+  | .listObjects page, state => reply state "list" fun state =>
+      (.ok (if page == 0 then
+        some ((objectRoots state).foldl (fun listed root => listed ++ root) ByteArray.empty)
+      else none), state)
+
 /-- Capability composition is shared by every proof and every operation. -/
 class Interpreter (E : Type → Type) where
   handle : E A → State → Result A
@@ -335,6 +372,7 @@ instance : Interpreter Resources := ⟨resources⟩
 instance : Interpreter Lease := ⟨lease⟩
 instance : Interpreter Crypto := ⟨crypto⟩
 instance : Interpreter Bao := ⟨bao⟩
+instance : Interpreter Sweep := ⟨sweep⟩
 instance [Interpreter L] [Interpreter R] : Interpreter (EffectSum L R) where
   handle
     | .left effect, state => Interpreter.handle effect state

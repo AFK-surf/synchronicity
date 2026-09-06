@@ -244,6 +244,10 @@ mod tests {
             self.step("acquire")?;
             self.inner.acquire(space, key)
         }
+        fn order(&mut self, space: &str) -> Result<u64> {
+            self.step("order")?;
+            self.inner.order(space)
+        }
         fn release(&mut self, token: u64) -> Result<()> {
             self.inner.release(token)?;
             self.step("release")

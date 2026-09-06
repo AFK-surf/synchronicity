@@ -7,7 +7,7 @@ use synch_verified::{cas, host};
 
 use crate::{lean_diagnostics, Result, Store, StoreError};
 
-struct Clock;
+pub(crate) struct Clock;
 impl host::Clock for Clock {
     type Error = StoreError;
     fn now_ns(&mut self) -> Result<i64> {

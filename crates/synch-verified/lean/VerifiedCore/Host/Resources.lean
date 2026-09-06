@@ -59,6 +59,12 @@ inductive Lease : Type → Type where
   section. Multiple concurrent tokens are allowed; this is not an exclusive
   writer lock. It must not be acquired inside a database transaction. -/
   | acquire (space : String) (key : ByteArray) : Lease (Reply UInt64)
+  /-- Enter the remover's critical section of the space: the exclusive
+  section every `acquire` of the space is ordered against, so a decision
+  taken inside it about who holds an object stays true until `release`.
+  Taken before any transaction it brackets, never inside one, and never
+  while a token of the same space is held. -/
+  | order (space : String) : Lease (Reply UInt64)
   /-- Consume the token, including on reported failure. Abandonment releases
   outstanding tokens; a caller must never retry release after an error. -/
   | release (token : UInt64) : Lease (Reply Unit)

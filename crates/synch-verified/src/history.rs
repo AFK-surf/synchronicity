@@ -149,7 +149,8 @@ mod tests {
             update,
             copy_rows,
             delete,
-            write
+            write,
+            snapshot_excluding
         );
     }
     fn setup(origin: &str, result: Result<bool, &'static str>) -> (Rows, Primitive, Trace) {

@@ -415,6 +415,26 @@ Integration review has identified specific gates, not waived limitations:
   everything, no row and no lease after any failure before the commit) and
   proves a promotion never asks about a held group. The Rust orchestration
   of `write_slice`, `write_proof` and `promote` is deleted.
+- Keeping the store within bounds is now the whole commands `casTouch`,
+  `casEvict`, `casGcContent` and `casGcOrphans` (`Cas/Collect.lean`) over
+  storage, access, the clock, the lease algebra and a `Sweep` algebra that
+  reports what an object's files cost, when they were written and which
+  objects have files, one host page at a time. `Lease.order` is the
+  remover's critical section, ordered against every writer's lease, and the
+  Rust service shares the connection it holds with the storage session;
+  `Access.snapshotExcluding` is a snapshot with a delete's correlated
+  exclusions. Lean owns the access clock's coalescing, the evictable
+  selection and its least-recently-used order, the target from the limit
+  and the filesystem shortfall, the collection pre-filter and the deletion
+  of each candidate through the existing `Cas.delete`, and the per-file
+  orphan decision (age, row, writer, unlink) inside the section.
+  `CasCollectProofs` proves the pre-filter drops only rows the deletion
+  refuses on the same database, derives the clock, the held refusal and
+  the sweep of one file with its section order on the simulated host, and
+  runs the passes on fixtures with a failure injected at every effect. The
+  Rust eviction loop, cache measurement, in-memory touch coalescing,
+  candidate pre-filter and per-file orphan loop are deleted; the
+  staging-directory sweep stays a Rust layout sweep.
 - Native tests now cover acquisition transport, every effect-failure position,
   repeated polling, malformed replies and terminal resume. Generic SQLite tests
   cover UPSERT identity/time preservation, raw cells, failed commit, abandoned

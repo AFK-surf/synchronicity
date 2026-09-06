@@ -42,7 +42,13 @@ land in the private output sink; the Bao tree stays a Rust service.
 Receiving (`Cas/Receive.lean`: a verified slice, a tree proof, a donor
 promotion) is three whole commands over the same commit, the write lease
 and further `Bao` effects that decode, verify, copy, flush and trim exactly
-what the program names; `synch-store`'s orchestration is deleted. History retention now runs as a
+what the program names; `synch-store`'s orchestration is deleted. Keeping
+the store within bounds (`Cas/Collect.lean`: the access clock, eviction by
+least recent use, content collection through the existing deletion, the
+orphan-file sweep) is four whole commands over a `Sweep` algebra that
+reports file cost, age and the store's object roots, and `Lease.order`,
+the remover's critical section every writer's lease is ordered against;
+the Rust eviction, pre-filter and per-file sweep loops are deleted. History retention now runs as a
 complete Lean operation over raw scans and a separate Ed25519 primitive; the
 Rust retention loop and receipt/fork helpers are removed. Raw scans retain
 rows before a trailing host failure so Lean owns first-error selection.

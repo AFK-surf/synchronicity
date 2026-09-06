@@ -332,6 +332,17 @@ impl EncodeReply for Option<u64> {
         }
     }
 }
+impl EncodeReply for Option<i64> {
+    fn encode(out: &mut Vec<u8>, value: Self) {
+        match value {
+            None => out.push(0),
+            Some(value) => {
+                out.push(1);
+                word(out, value as u64);
+            }
+        }
+    }
+}
 impl EncodeReply for Option<Vec<u8>> {
     fn encode(out: &mut Vec<u8>, value: Self) {
         match value {
@@ -560,6 +571,7 @@ pub(crate) struct Capabilities<'a, E> {
     pub(crate) digest: Option<&'a mut dyn crate::host::Digest<Error = E>>,
     pub(crate) writes: Option<&'a mut dyn crate::host::ByteWrites<Error = E>>,
     pub(crate) bao: Option<&'a mut dyn crate::host::Bao<Error = E>>,
+    pub(crate) sweep: Option<&'a mut dyn crate::host::Sweep<Error = E>>,
 }
 
 impl<E> Default for Capabilities<'_, E> {
@@ -577,6 +589,7 @@ impl<E> Default for Capabilities<'_, E> {
             digest: None,
             writes: None,
             bao: None,
+            sweep: None,
         }
     }
 }
@@ -1828,7 +1841,15 @@ mod tests {
             })
         }
 
-        host_unexpected!(exists_rows, read_bytes, update, copy_rows, delete, write);
+        host_unexpected!(
+            exists_rows,
+            read_bytes,
+            update,
+            copy_rows,
+            delete,
+            write,
+            snapshot_excluding
+        );
     }
 
     #[test]

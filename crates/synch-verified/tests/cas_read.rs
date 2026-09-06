@@ -188,7 +188,8 @@ impl Storage for Database {
         upsert,
         delete_rows,
         read_bytes,
-        write
+        write,
+        snapshot_excluding
     );
 }
 struct Files {

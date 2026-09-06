@@ -6,6 +6,7 @@ import VerifiedCore.Cas.Input
 import VerifiedCore.Cas.Durable
 import VerifiedCore.Cas.Serve
 import VerifiedCore.Cas.Receive
+import VerifiedCore.Cas.Collect
 import VerifiedCore.Entry
 import VerifiedCore.Trie.Program
 import VerifiedCore.Trie.Verify

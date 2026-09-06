@@ -128,31 +128,20 @@ impl Store {
     /// invert the retention semantics — with it a hot object is never
     /// collected, without it it is. Every write path stamps the column, which
     /// is all this needs.
+    ///
+    /// The pass is the Lean program `Cas.Collect.gcContent`: one snapshot of
+    /// the rows no pin and no entry protects, filtered by the horizon, is the
+    /// pre-filter that keeps the pass from opening a transaction per row; the
+    /// deletion of each candidate re-reads every fact inside its own
+    /// transaction, under the CAS ordering section, and that is what decides
+    /// (`specs/lean/Synchronicity/CasCollectProofs.lean`).
     pub fn gc_content(&self, before: i64) -> Result<GcStats> {
         // `Cas.Age` abstracts crossing this `before` horizon; it grants no
         // permission by itself, only removes the freshness guard.
-        let referenced = self.referenced_content()?;
-        let pinned: HashSet<Hash> = self.pinned_blobs()?.into_iter().collect();
-        let mut stats = GcStats::default();
-        // The three reads above are a snapshot and the delete is a fourth
-        // statement, so a pin or a resumed fetch landing in between would
-        // otherwise be decided against by a snapshot older than it is. They
-        // stay as a cheap pre-filter — they keep the pass from opening a
-        // transaction per row — and `delete_blob_if_collectable` re-reads the
-        // predicate inside the transaction that does the delete, which is what
-        // actually decides.
-        for candidate in self.blob_candidates()? {
-            if referenced.contains(&candidate.root) || pinned.contains(&candidate.root) {
-                continue;
-            }
-            if candidate.last_access >= before {
-                continue;
-            }
-            if self.delete_blob_if_collectable(&candidate.root, before)? {
-                stats.blobs += 1;
-            }
-        }
-        Ok(stats)
+        Ok(GcStats {
+            blobs: crate::lean_collect::gc_content(self, before)?,
+            ..GcStats::default()
+        })
     }
 
     /// Removes CAS files that no `blobs` row accounts for.
@@ -179,63 +168,18 @@ impl Store {
     /// unlink — a row claiming verified groups whose bytes are gone.
     ///
     /// So the decision and the unlink are one step under one guard, and the
-    /// writer's own mark is part of the decision (`Store::lease_write`).
-    /// Anything in a shard directory that is not named for an object is left
-    /// alone.
+    /// writer's own mark is part of the decision (`Store::lease_write`). The
+    /// Lean program `Cas.Collect.gcOrphans` takes that section around each
+    /// file's reading, decision and unlink; the listing of the store, one
+    /// shard at a time, and the file names are this side's layout. Anything in
+    /// a shard directory that is not named for an object is never listed.
     ///
     /// Half-written ingests go with them, by way of `Store::gc_staging`.
     ///
-    /// Nothing in the CAS root but a directory is descended into. That is not
-    /// defensiveness: `read_dir` on a regular file fails with `NotADirectory`,
-    /// not `NotFound`, so a single stray file in the root — a leaked staging
-    /// file, say — would make this return an error on every pass from then on.
-    /// `maintenance_pass` would report failure forever and no orphan would be
-    /// swept again, including the file causing it.
-    ///
     /// Returns how many files went.
     pub fn gc_orphans(&self, before: i64) -> Result<usize> {
-        let mut swept = self.gc_staging(before)?;
-        let shards = match std::fs::read_dir(self.cas_dir()) {
-            Ok(shards) => shards,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(swept),
-            Err(e) => return Err(e.into()),
-        };
-        for shard in shards {
-            let shard = shard?.path();
-            if !shard.is_dir() || shard == self.staging_dir() {
-                continue;
-            }
-            let files = match std::fs::read_dir(&shard) {
-                Ok(files) => files,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(e) => return Err(e.into()),
-            };
-            for file in files {
-                let path = file?.path();
-                let Some(root) = cas_root_of(&path) else {
-                    continue;
-                };
-                // One guard across the whole decision and the unlink, so
-                // nothing can make the file live in between. The `stat` is
-                // inside it too: it is the reading the verdict rests on.
-                let conn = self.conn();
-                let _ordered_against_writers = self.cas_order();
-                let Ok(meta) = std::fs::metadata(&path) else {
-                    continue;
-                };
-                if !meta.is_file() || mtime_nanos(&meta).is_none_or(|at| at >= before) {
-                    continue;
-                }
-                if blob_row_exists(&conn, &root)? || self.is_being_written(&root) {
-                    continue;
-                }
-                if std::fs::remove_file(&path).is_ok() {
-                    swept += 1;
-                }
-                drop(conn);
-            }
-        }
-        Ok(swept)
+        let swept = self.gc_staging(before)?;
+        Ok(swept + crate::lean_collect::gc_orphans(self, before)?)
     }
 
     /// Removes staging files no ingest is still writing.
@@ -383,7 +327,7 @@ impl Store {
 /// an outboard.
 ///
 /// `None` for anything else in the directory, which is then left alone.
-fn cas_root_of(path: &std::path::Path) -> Option<Hash> {
+pub(crate) fn cas_root_of(path: &std::path::Path) -> Option<Hash> {
     let name = path.file_name()?.to_str()?;
     let stem = name.strip_suffix(".obao").unwrap_or(name);
     let bytes = hex::decode(stem).ok()?;
@@ -432,7 +376,7 @@ fn sweep_stale_files(
 
 /// A file's modification time in unix nanoseconds, if it has one this side of
 /// the epoch.
-fn mtime_nanos(meta: &std::fs::Metadata) -> Option<i64> {
+pub(crate) fn mtime_nanos(meta: &std::fs::Metadata) -> Option<i64> {
     meta.modified()
         .ok()?
         .duration_since(std::time::UNIX_EPOCH)
@@ -457,15 +401,6 @@ pub(crate) fn retained_roots_in(conn: &rusqlite::Connection) -> Result<Vec<Hash>
         out.push(hash_column(row?, "heads.root")?);
     }
     Ok(out)
-}
-
-/// Whether a `blobs` row accounts for an object, on a connection already held.
-fn blob_row_exists(conn: &rusqlite::Connection, root: &Hash) -> Result<bool> {
-    Ok(conn.query_row(
-        "SELECT EXISTS (SELECT 1 FROM blobs WHERE root = ?1)",
-        params![root.as_bytes().to_vec()],
-        |row| row.get::<_, i64>(0),
-    )? != 0)
 }
 
 /// Deletes every row of `table` whose hash is not in `marked`, in one

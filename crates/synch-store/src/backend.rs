@@ -176,7 +176,6 @@ pub struct Cloud {
     objects: CloudStore,
     upload_policy: CloudUploadPolicy,
     cache_bytes: Option<u64>,
-    accessed: Arc<std::sync::Mutex<std::collections::HashMap<Hash, i64>>>,
 }
 
 impl Cloud {
@@ -214,7 +213,6 @@ impl Cloud {
             objects,
             upload_policy,
             cache_bytes,
-            accessed: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         }
     }
 
@@ -338,28 +336,8 @@ impl Cloud {
     }
 
     async fn touch(&self, root: Hash) -> Result<()> {
-        const TOUCH_INTERVAL_NS: i64 = 60 * 1_000_000_000;
-        let now = synch_core::now_ns();
-        let due = {
-            let mut accessed = self
-                .accessed
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if accessed
-                .get(&root)
-                .is_some_and(|last| now.saturating_sub(*last) < TOUCH_INTERVAL_NS)
-            {
-                false
-            } else {
-                accessed.insert(root, now);
-                true
-            }
-        };
-        if due {
-            let store = self.store.clone();
-            blocking(move || store.touch_blob(&root, now)).await?;
-        }
-        Ok(())
+        let store = self.store.clone();
+        blocking(move || store.touch_blob(&root).map(|_| ())).await
     }
 
     async fn hydrate_ranges(&self, root: Hash, size: u64, ranges: ChunkRanges) -> Result<()> {
@@ -944,24 +922,25 @@ impl CasBackend for Cloud {
     }
 }
 
+/// The filesystem's shortfall of its free floor is this side's reading; how
+/// much the cache holds, which entries go and in what order is Lean's.
 fn enforce_cache_limit(store: &Store, configured: Option<u64>) -> Result<(usize, u64)> {
-    let usage = store.durable_cache_bytes()?;
-    let mut target = configured.unwrap_or(u64::MAX);
     #[cfg(unix)]
-    {
+    let shortfall = {
         let filesystem = rustix::fs::statvfs(store.cas_dir())
             .map_err(|error| std::io::Error::from_raw_os_error(error.raw_os_error()))?;
         let fragment = filesystem.f_frsize.max(filesystem.f_bsize);
         let total = filesystem.f_blocks.saturating_mul(fragment);
         let available = filesystem.f_bavail.saturating_mul(fragment);
         let free_floor = total / 5;
-        let shortfall = free_floor.saturating_sub(available);
-        target = target.min(usage.saturating_sub(shortfall));
-    }
-    if target == u64::MAX || usage <= target {
+        free_floor.saturating_sub(available)
+    };
+    #[cfg(not(unix))]
+    let shortfall = 0u64;
+    if configured.is_none() && shortfall == 0 {
         return Ok((0, 0));
     }
-    store.evict_durable_cache_to(target)
+    store.evict_durable_cache(configured, shortfall)
 }
 
 fn materialize_cached(

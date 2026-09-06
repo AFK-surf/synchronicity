@@ -615,11 +615,28 @@ impl SourceIO for Files<'_> {
     }
 }
 
+/// One held token: a writer's mark, or the remover's critical section. The
+/// section's guards drop in the order they are declared: the CAS ordering
+/// guard first, then the connection it was taken after.
+#[derive(Debug)]
+enum Token<'a> {
+    Write {
+        _mark: WriteLease<'a>,
+    },
+    Order {
+        _order: std::sync::MutexGuard<'a, ()>,
+        _conn: std::rc::Rc<crate::db::ConnectionLease<'a>>,
+    },
+}
+
 #[derive(Debug)]
 pub(crate) struct Leases<'a> {
     store: &'a Store,
     next: u64,
-    active: BTreeMap<u64, WriteLease<'a>>,
+    active: BTreeMap<u64, Token<'a>>,
+    /// The connection state shared with the invocation's storage session,
+    /// when the operation may open the remover's critical section.
+    section: Option<crate::lean_storage::Section<'a>>,
 }
 
 impl<'a> Leases<'a> {
@@ -628,7 +645,37 @@ impl<'a> Leases<'a> {
             store,
             next: 1,
             active: BTreeMap::new(),
+            section: None,
         }
+    }
+
+    /// A lease service that can also open the remover's critical section,
+    /// sharing the connection it holds with the storage session `section`
+    /// came from.
+    pub(crate) fn ordered(store: &'a Store, section: crate::lean_storage::Section<'a>) -> Self {
+        Self {
+            store,
+            next: 1,
+            active: BTreeMap::new(),
+            section: Some(section),
+        }
+    }
+
+    fn in_section(&self) -> bool {
+        self.section
+            .as_ref()
+            .is_some_and(|section| section.borrow().held.is_some())
+    }
+
+    fn insert(&mut self, token: Token<'a>) -> Result<u64> {
+        let next = self
+            .next
+            .checked_add(1)
+            .ok_or_else(|| StoreError::invalid("lease identifiers exhausted"))?;
+        let handle = self.next;
+        self.next = next;
+        self.active.insert(handle, token);
+        Ok(handle)
     }
 }
 
@@ -638,22 +685,77 @@ impl Lease for Leases<'_> {
         if space != "cas_writers" {
             return Err(StoreError::invalid("unsupported lease namespace"));
         }
+        // A writer's mark is taken through the guards the section holds;
+        // taking it inside the section would wait on the invocation itself.
+        if self.in_section() {
+            return Err(StoreError::invalid(
+                "a write lease cannot be taken inside the removal section",
+            ));
+        }
         let root = Hash::from_slice(key).map_err(|error| StoreError::invalid(error.to_string()))?;
-        let next = self
-            .next
+        self.next
             .checked_add(1)
             .ok_or_else(|| StoreError::invalid("lease identifiers exhausted"))?;
-        let token = self.next;
         let lease = self.store.lease_write(&root);
-        self.next = next;
-        self.active.insert(token, lease);
-        Ok(token)
+        self.insert(Token::Write { _mark: lease })
+    }
+    fn order(&mut self, space: &str) -> Result<u64> {
+        if space != "cas" {
+            return Err(StoreError::invalid("unsupported ordering namespace"));
+        }
+        let Some(section) = self.section.clone() else {
+            return Err(StoreError::invalid(
+                "this operation has no removal section to enter",
+            ));
+        };
+        {
+            let shared = section.borrow();
+            if shared.held.is_some() {
+                return Err(StoreError::invalid("the removal section is already held"));
+            }
+            if shared.transaction {
+                return Err(StoreError::invalid(
+                    "the removal section cannot begin inside a transaction",
+                ));
+            }
+        }
+        self.next
+            .checked_add(1)
+            .ok_or_else(|| StoreError::invalid("lease identifiers exhausted"))?;
+        // The same order every writer's lease takes: the connection, then the
+        // CAS ordering guard shared by every Store on this data directory.
+        let conn = std::rc::Rc::new(self.store.connection_lease());
+        let order = self.store.cas_order();
+        section.borrow_mut().held = Some(conn.clone());
+        self.insert(Token::Order {
+            _order: order,
+            _conn: conn,
+        })
     }
     fn release(&mut self, token: u64) -> Result<()> {
-        self.active
+        let held = self
+            .active
             .remove(&token)
             .ok_or_else(|| StoreError::invalid("unknown lease token"))?;
+        if let Token::Order { .. } = &held {
+            if let Some(section) = &self.section {
+                section.borrow_mut().held = None;
+            }
+        }
+        // The session's own reference to the connection is gone with the
+        // section; dropping the token releases both guards.
+        drop(held);
         Ok(())
+    }
+}
+
+impl Drop for Leases<'_> {
+    fn drop(&mut self) {
+        // Abandonment: the section's connection must not outlive the token
+        // that holds the ordering guard, so the shared reference goes first.
+        if let Some(section) = &self.section {
+            section.borrow_mut().held = None;
+        }
     }
 }
 

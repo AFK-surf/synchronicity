@@ -1308,10 +1308,10 @@ impl Store {
         }
     }
 
-    /// True if a CAS write is in flight for `root`.
-    ///
-    /// Read by both sweeps while they hold the shared CAS order guard, so the
-    /// answer cannot go stale between the decision and the unlink.
+    /// True if a CAS write is in flight for `root`. The sweeps read the count
+    /// through `Storage.readCounter` inside the ordering section; this is
+    /// the tests' view of the same registry.
+    #[cfg(test)]
     pub(crate) fn is_being_written(&self, root: &Hash) -> bool {
         self.writing().contains_key(root)
     }

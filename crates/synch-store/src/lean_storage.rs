@@ -50,6 +50,9 @@ pub(crate) struct SqliteStorage<'a> {
 enum ConnectionSource<'a> {
     Borrowed(&'a Connection),
     Owned(crate::db::ConnectionLease<'a>),
+    /// The connection the remover's critical section holds, shared with the
+    /// section's token for as long as either lives.
+    Shared(std::rc::Rc<crate::db::ConnectionLease<'a>>),
 }
 
 impl std::ops::Deref for ConnectionSource<'_> {
@@ -58,9 +61,22 @@ impl std::ops::Deref for ConnectionSource<'_> {
         match self {
             Self::Borrowed(conn) => conn,
             Self::Owned(conn) => conn,
+            Self::Shared(conn) => conn,
         }
     }
 }
+
+/// The connection state one invocation's storage session and its lease
+/// service share: the connection a critical section (`Lease::order`) holds,
+/// which every statement inside the section then runs on, and whether a
+/// transaction is open, which is when a section may not begin.
+#[derive(Debug, Default)]
+pub(crate) struct Shared<'a> {
+    pub(crate) held: Option<std::rc::Rc<crate::db::ConnectionLease<'a>>>,
+    pub(crate) transaction: bool,
+}
+
+pub(crate) type Section<'a> = std::rc::Rc<std::cell::RefCell<Shared<'a>>>;
 
 impl<'a> SqliteStorage<'a> {
     pub(crate) fn new(conn: &'a Connection) -> Self {
@@ -94,6 +110,7 @@ pub(crate) struct Session<'a> {
     store: &'a crate::Store,
     active: Option<SqliteStorage<'a>>,
     next: u64,
+    section: Section<'a>,
 }
 
 impl<'a> Session<'a> {
@@ -102,7 +119,14 @@ impl<'a> Session<'a> {
             store,
             active: None,
             next: 1,
+            section: Section::default(),
         }
+    }
+
+    /// The connection state a lease service of the same invocation shares,
+    /// so a critical section it opens carries this session's statements.
+    pub(crate) fn section(&self) -> Section<'a> {
+        self.section.clone()
     }
 
     fn transaction(&mut self) -> Result<&mut SqliteStorage<'a>> {
@@ -115,11 +139,22 @@ impl<'a> Session<'a> {
         if self.active.is_some() {
             return Err(StoreError::invalid("snapshot during storage transaction"));
         }
+        // Inside a critical section the connection is already held; taking
+        // it again would wait on the invocation's own guard forever.
+        let conn = match self.section.borrow().held.as_ref() {
+            Some(held) => ConnectionSource::Shared(held.clone()),
+            None => ConnectionSource::Owned(self.store.connection_lease()),
+        };
         Ok(SqliteStorage {
-            conn: ConnectionSource::Owned(self.store.connection_lease()),
+            conn,
             active: None,
             next: self.next,
         })
+    }
+
+    fn finish(&mut self) {
+        self.active = None;
+        self.section.borrow_mut().transaction = false;
     }
 }
 
@@ -131,19 +166,30 @@ impl Storage for Session<'_> {
         let tx = storage.begin()?;
         self.next = storage.next;
         self.active = Some(storage);
+        self.section.borrow_mut().transaction = true;
         Ok(tx)
     }
 
     fn commit(&mut self, tx: u64) -> Result<()> {
         self.transaction()?.commit(tx)?;
-        self.active = None;
+        self.finish();
         Ok(())
     }
 
     fn rollback(&mut self, tx: u64) -> Result<()> {
         self.transaction()?.rollback(tx)?;
-        self.active = None;
+        self.finish();
         Ok(())
+    }
+
+    fn snapshot_excluding(
+        &mut self,
+        selection: &Selection,
+        columns: &[String],
+        excluding: &[synch_verified::host::Exclusion],
+    ) -> Result<Scan<StoreError>> {
+        self.snapshot_storage()?
+            .snapshot_excluding(selection, columns, excluding)
     }
 
     fn exists_rows(&mut self, tx: u64, relation: &str, equals: &Fields) -> Result<bool> {
@@ -390,6 +436,44 @@ fn predicate(relation: &str, equals: &Fields) -> Result<String> {
     } else {
         format!(" WHERE {}", terms.join(" AND "))
     })
+}
+
+/// The correlated `NOT EXISTS` terms of raw exclusions against the base
+/// relation aliased `"target"`, with the literals they bind, in order.
+fn exclusion_terms(
+    relation: &str,
+    exclusions: &[synch_verified::host::Exclusion],
+) -> Result<(Vec<String>, Vec<Cell>)> {
+    let mut terms = Vec::new();
+    let mut bindings = Vec::new();
+    for exclusion in exclusions {
+        columns_for(&exclusion.relation)?;
+        let mut guards = exclusion
+            .equals
+            .iter()
+            .map(|(name, _)| {
+                column(&exclusion.relation, name).map(|name| format!("\"guard\".{name} IS ?"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        for (base, excluded) in &exclusion.keys {
+            guards.push(format!(
+                "\"target\".{} = \"guard\".{}",
+                column(relation, base)?,
+                column(&exclusion.relation, excluded)?
+            ));
+        }
+        let predicate = if guards.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", guards.join(" AND "))
+        };
+        terms.push(format!(
+            "NOT EXISTS (SELECT 1 FROM \"{}\" AS \"guard\"{predicate})",
+            exclusion.relation
+        ));
+        bindings.extend(exclusion.equals.iter().map(|(_, cell)| cell.clone()));
+    }
+    Ok((terms, bindings))
 }
 
 /// Build only whitelisted identifiers; every literal remains a bound cell.
@@ -712,33 +796,9 @@ impl Storage for SqliteStorage<'_> {
         );
         let mut bindings = values(equals);
         bindings.extend(values(at_most));
-        for exclusion in unless {
-            columns_for(&exclusion.relation)?;
-            let mut guards = exclusion
-                .equals
-                .iter()
-                .map(|(name, _)| {
-                    column(&exclusion.relation, name).map(|name| format!("\"guard\".{name} IS ?"))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            for (base, excluded) in &exclusion.keys {
-                guards.push(format!(
-                    "\"target\".{} = \"guard\".{}",
-                    column(relation, base)?,
-                    column(&exclusion.relation, excluded)?
-                ));
-            }
-            let predicate = if guards.is_empty() {
-                String::new()
-            } else {
-                format!(" WHERE {}", guards.join(" AND "))
-            };
-            terms.push(format!(
-                "NOT EXISTS (SELECT 1 FROM \"{}\" AS \"guard\"{predicate})",
-                exclusion.relation
-            ));
-            bindings.extend(values(&exclusion.equals));
-        }
+        let (excluded, guards) = exclusion_terms(relation, unless)?;
+        terms.extend(excluded);
+        bindings.extend(guards.iter().map(BoundCell));
         let predicate = if terms.is_empty() {
             String::new()
         } else {
@@ -761,15 +821,32 @@ impl Storage for SqliteStorage<'_> {
     }
 
     fn snapshot(&mut self, selection: &Selection, columns: &[String]) -> Result<Scan<StoreError>> {
+        self.snapshot_excluding(selection, columns, &[])
+    }
+
+    fn snapshot_excluding(
+        &mut self,
+        selection: &Selection,
+        columns: &[String],
+        excluding: &[synch_verified::host::Exclusion],
+    ) -> Result<Scan<StoreError>> {
         if self.active.is_some() || !self.conn.is_autocommit() {
             return Err(StoreError::invalid("snapshot during storage transaction"));
         }
         if columns.is_empty() {
             return Err(StoreError::invalid("empty storage projection"));
         }
-        let (predicate, bindings) = selection_sql(selection)?;
+        // The same alias a delete's blockers correlate against, so the
+        // exclusion rendering is shared with `delete_rows`.
+        let (mut predicate, mut bindings) = selection_sql(selection)?;
+        let (excluded, guards) = exclusion_terms(&selection.relation, excluding)?;
+        for term in excluded {
+            predicate.push_str(" AND ");
+            predicate.push_str(&term);
+        }
+        bindings.extend(guards);
         let sql = format!(
-            "SELECT {} FROM \"{}\"{predicate}",
+            "SELECT {} FROM \"{}\" AS \"target\"{predicate}",
             projection(&selection.relation, columns)?,
             selection.relation
         );

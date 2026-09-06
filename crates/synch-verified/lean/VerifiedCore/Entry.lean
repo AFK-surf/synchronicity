@@ -10,6 +10,7 @@ import VerifiedCore.Trie.Mutate
 import VerifiedCore.Cas.Durable
 import VerifiedCore.Cas.Serve
 import VerifiedCore.Cas.Receive
+import VerifiedCore.Cas.Collect
 import VerifiedCore.Replication.History
 
 /-! The one native entry point. A command arrives as a packet, decoded with
@@ -127,6 +128,15 @@ def receiving [Encode A] : Except Cas.Receive.Error A → Host.Reply ByteArray
       | .sizeMismatch root recorded offered => .sizeMismatch root recorded offered
       | .host _ | .protocol => .malformed) : Except _ A)
 
+def collecting [Encode A] : Except Cas.Collect.Error A → Host.Reply ByteArray
+  | .ok value => terminalOf (Except.ok value : Except CollectDomainError A)
+  | .error (.host hostFailure) => .error hostFailure
+  | .error .malformed => terminalOf (Except.error CollectDomainError.malformed : Except _ A)
+  | .error (.columnType index column actual) =>
+    terminalOf (Except.error (CollectDomainError.columnType index column actual) : Except _ A)
+  | .error (.sizeMismatch root recorded offered) =>
+    terminalOf (Except.error (CollectDomainError.sizeMismatch root recorded offered) : Except _ A)
+
 def malformedRoot : Native := .pure (.error ⟨2, 0⟩)
 def protocol : Native := .pure (.error protocolFailure)
 
@@ -189,6 +199,13 @@ def dispatch : Command → Native
   | .casPromote donor root size proven now cache =>
     if root.size != 32 || donor.size != 32 then protocol
     else command (Cas.Receive.promote donor root size proven now (if cache then .cache else .local)) receiving
+  | .casTouch root =>
+    if root.size != 32 then protocol else command (Cas.Collect.touch root) collecting
+  | .casEvict limit shortfall =>
+    command (Cas.Collect.evict limit shortfall)
+      (collecting ∘ Except.map fun (entries, freed) => Evicted.mk entries freed)
+  | .casGcContent before => command (Cas.Collect.gcContent before) collecting
+  | .casGcOrphans before => command (Cas.Collect.gcOrphans before) collecting
 
 /-- Every command starts here: an undecodable packet is a protocol failure
 before any effect is requested. -/

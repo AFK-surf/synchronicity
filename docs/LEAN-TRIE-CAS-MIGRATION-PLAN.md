@@ -69,8 +69,8 @@ a raw store for tests.
 | `cache_trusted_range` (cloud hydration write) | `backend.rs:365-410` | `Cas/Hydrate.lean` |
 | `adopt_durable_blob`, `mark_blob_durable`, `heal_missing_durable_blob`, `reconcile_scratch_generation`, `clear_blob_cache` | `backend.rs` | `Cas/Durable.lean` |
 | `Cloud::{row_or_adopt, hydrate_ranges, finalize, read paths, touch}` (`backend.rs:174-945`) | `CasBackend` trait | `Cas/Cloud.lean` composing the above |
-| `touch_blob`, `durable_cache_entries`, `evict_durable_cache_to`, `enforce_cache_limit` | `backend.rs:340-363,947` | `Cas/Evict.lean` |
-| `gc_content`, `gc_orphans`, `gc_staging`, `blob_candidates` pre-filter | `gc.rs:131-285` | `Cas/Collect.lean` |
+| `touch_blob`, `durable_cache_entries`, `evict_durable_cache_to`, `enforce_cache_limit` | `backend.rs:340-363,947` | `Cas/Collect.lean` (done) |
+| `gc_content`, `gc_orphans`, `gc_staging`, `blob_candidates` pre-filter | `gc.rs:131-285` | `Cas/Collect.lean` (done; `gc_staging` stays a Rust layout sweep) |
 | `hold_source_blob`, `reconcile_source_holds`, `live_source_blob_size` (`Txn`) | `synch-engine/src/node.rs:1633-1668`, inside the publish transaction | `Cas/Holds.lean`, gated on Publication (§6) |
 | `local_ad`, `blob_candidates`, `blobs`, `pins*` projections | engine, CLI | `Cas/Project.lean` |
 | `commit_cas_migration` | CLI one-shot | stays Rust (operator migration tool), documented as such |
@@ -344,16 +344,51 @@ failure kind does; no transaction is open across a provider effect (F2
 theorem). Cutover: `Cloud` in `backend.rs`; `cloud.rs` remains as the
 provider service.
 
-**C5. Eviction and collection** (`Cas/Evict.lean`, `Cas/Collect.lean`).
-`touch` with its 60 s coalescing through `Clock`; LRU eviction over
-`durable` rows using `FileIO.blocks`; `gcContent` as one program that reads
-the candidate projection and runs the existing Lean `delete` decision per
-object inside its own transaction; `gcOrphans` over `FileIO.list`/`mtime`
-and `Lease`. Proofs: eviction never touches a non-durable row or a row with a
-live lease; the candidate pre-filter is sound (every collected object would
-also be collected without the pre-filter); an orphan is removed only when
-older than the window and unleased. Cutover: `gc.rs:131-285`,
-`backend.rs:922-947`.
+**C5. Eviction and collection** (`Cas/Collect.lean`). Done. `touch`,
+`evict`, `gcContent` and `gcOrphans` run as the whole commands `casTouch`,
+`casEvict`, `casGcContent` and `casGcOrphans` over `Storage`, `Access`,
+`Clock`, `Lease` and a new `Sweep` algebra (`Host/Sweep.lean`: the bytes a
+keyed file occupies, when it was written, and the store's object roots one
+host-chosen page at a time). Two effects were added to existing algebras:
+`Access.snapshotExcluding` (a snapshot with the same correlated `NOT
+EXISTS` exclusions a delete's blockers evaluate) and `Lease.order`, the
+remover's critical section, which the Rust service implements as the
+connection followed by the CAS ordering guard (the order every writer's
+lease takes) and shares with the storage session, so every statement inside
+the section runs on the connection it holds. Lean owns the 60 s coalescing
+against the row's own stamp and the rule that the clock never moves
+backwards; the selection of evictable rows (`durable`, no inline bytes: a
+pinned row is eligible, a staged-only row never), their measure, their
+order by least recent use (a structural insertion sort, so the proofs can
+evaluate it), the target from the configured limit and the filesystem
+shortfall the host reports, and the clear of each entry inside the section
+through `Durable.clearCache`, which refuses an object a writer holds; the
+collection pre-filter as one excluding snapshot filtered by the horizon,
+and the deletion of each candidate inside the section through the existing
+`Cas.delete`, which re-reads every fact in its own transaction; and the
+orphan sweep, per file, inside the section: the file's age, then whether a
+row accounts for the object, then the writer count, then the unlink. The
+staging-directory sweep (`gc_staging`) stays Rust: it removes unregistered
+temporaries by age and consults no row. Proved (`CasCollectProofs`): the
+clock moves only past the interval and only forwards; eviction considers
+only cached durable rows, stops once within the target, and a clear of a
+held object is refused before any transaction; the pre-filter's exclusions
+are exactly the pin and entry facts the deletion re-reads
+(`excluded_iff_protected`), so a row it drops for protection or freshness
+is one `delete` refuses on the same database (`dropped_protected_is_kept`,
+`dropped_fresh_is_kept`, the first by the read path's existing promise); a
+fresh file is left alone with only the section and one reading; a stale
+file of an unaccounted, unheld object goes, with the reading, the row
+check, the writer check and the unlink inside the one section in that
+order; fixtures run eviction in LRU order with a pinned row eligible and a
+staged row not, skip a held object, collect exactly the cold unprotected
+object with the section around the whole deletion, sweep only the stale
+unaccounted unheld files, and release the section at every injected
+failure. Cutover: `Store::touch_blob`, `evict_durable_cache`, `gc_content`
+and the object-file half of `gc_orphans` delegate (`lean_collect.rs`,
+`lean_sweep.rs`); the Rust LRU loop, cache measurement, in-memory touch
+coalescing, candidate pre-filter and per-file orphan decision are deleted,
+and `enforce_cache_limit` keeps only the `statvfs` reading.
 
 **C6. Source holds** (`Cas/Holds.lean`). `holdSourceBlob`,
 `reconcileSourceHolds`, `liveSourceBlobSize` run inside the engine's publish
