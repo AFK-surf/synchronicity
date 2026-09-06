@@ -1,5 +1,5 @@
 import Synchronicity.Decidable
-import Synchronicity.Handlers
+import Synchronicity.SimulatedHost
 import Synchronicity.HostProgramProofs
 import Synchronicity.HostWireProofs
 import Synchronicity.WireBufferProofs
@@ -20,3 +20,9 @@ import Synchronicity.TrieProgramProofs
 import Synchronicity.TrieProgramTests
 import Synchronicity.HistoryProgramProofs
 import Synchronicity.OriginProgramProofs
+import Synchronicity.CasPromises
+import Synchronicity.CasReadPromises
+import Synchronicity.CasHealingPromises
+import Synchronicity.CasStorePromises
+import Synchronicity.SimulatedHostProofs
+import Synchronicity.CasCompositionProofs

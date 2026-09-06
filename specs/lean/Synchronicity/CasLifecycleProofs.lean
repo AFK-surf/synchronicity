@@ -1,6 +1,6 @@
 import VerifiedCore.Cas
 import VerifiedCore.Cas.Program
-import Synchronicity.CasProgramProofs
+import Synchronicity.CasFixtures
 
 /-! Proofs of complete CAS lifecycle plans. No trie or sync model imports. -/
 namespace Synchronicity.CasLifecycleProofs
@@ -93,65 +93,40 @@ theorem committed_deletion_runs_cleanup (root : ByteArray) (before : Option Int6
   rw [cleanup_attempts_both_files]
   rfl
 
-open CasProgramProofs in
-/-- The actual production program performs every observation before mutation,
-then commit, then both unlinks. This includes explicit deletion of a missing
-row, which still cleans orphan files. No Rust phase executor is assumed. -/
-theorem explicit_deletion_trace (root : ByteArray) (accessed : Option Int64) :
-    execute { access := .ok (accessed.toList.map fun n => [.integer n]) }
-      (delete root none).run =
-    (.ok .applied,
-      [.begin,
-       .existsRows 7 "pins" [("root", .blob root)],
-       .existsRows 7 "entries" [("content", .blob root)],
-       .readRows 7 "blobs" ["last_access"] [("root", .blob root)],
-       .readCounter "cas_writers" root,
-       .deleteRows 7 "blobs" [("root", .blob root)],
-       .commit 7,
-       .removeFile "cas_payload" root,
-       .removeFile "cas_outboard" root]) := by
-  cases accessed <;> rfl
+open SimulatedHost CasFixtures
 
--- Keep this case-heavy proof serial: asynchronous elaboration in the pinned
--- compiler emits an internal Option.get! diagnostic despite accepting it.
--- This changes scheduling only; all kernel and lint checks remain enabled.
-set_option Elab.async false in
-open CasProgramProofs in
-/-- The completed operation's outcome is the internal proved decision for
-every well-typed access row, not merely for the successful fixture above. -/
-theorem deletion_execution_outcome (root : ByteArray) (accessed : Option Int64)
-    (pinned referenced : Bool) (writers : UInt64) (before : Option Int64) :
-    (execute
-      { access := .ok (accessed.toList.map fun n => [.integer n])
-        pinned := .ok pinned
-        referenced := .ok referenced
-        writers := .ok writers }
-      (delete root before).run).1 =
-    .ok (planLifecycle (.delete
-      ⟨accessed.isSome, writers != 0, pinned, referenced, accessed.getD 0⟩ before)).outcome := by
-  cases accessed <;> cases before <;> cases pinned <;> cases referenced <;>
-    by_cases writing : writers = 0 <;>
-    simp [delete, deleteIn, cleanup, transactionWith, transactionOver, request, performWith,
-      execute, answer, event, Except.mapError, Except.map,
-      bind, pure, Program.bind, ExceptT.bind, ExceptT.bindCont, ExceptT.pure,
-      ExceptT.run, ExceptT.mk, decodeAccess, Codec.integerField, planLifecycle, writing]
-  all_goals (try split) <;> rfl
+private def check (state : State := stored) (before : Option Int64 := none) :=
+  traceResult (delete root before) state
 
-open CasProgramProofs in
-/-- Authorization of the executed operation follows from the internal decision
-theorem through the checked execution equality, with no Rust model premise. -/
-theorem executed_deletion_authorized (root : ByteArray) (accessed : Option Int64)
-    (pinned referenced : Bool) (writers : UInt64) (before : Option Int64) :
-    (execute
-      { access := .ok (accessed.toList.map fun n => [.integer n])
-        pinned := .ok pinned
-        referenced := .ok referenced
-        writers := .ok writers }
-      (delete root before).run).1 = .ok .applied ↔
-    (writers != 0) = false ∧ pinned = false ∧ referenced = false ∧
-      (∀ cutoff ∈ before, accessed.isSome = true ∧ accessed.getD 0 < cutoff) := by
-  rw [deletion_execution_outcome]
-  simpa using deletion_authorized
-    ⟨accessed.isSome, writers != 0, pinned, referenced, accessed.getD 0⟩ before
+theorem explicit_deletion_trace : check = (.ok .applied,
+    ["begin", "exists:pins", "exists:entries", "read:blobs", "counter:cas_writers", "delete:blobs", "commit", "remove:cas_payload", "remove:cas_outboard"]) := by decide +kernel
+
+theorem committed_deletion_removes_actual_rows_and_files :
+    let result := SimulatedHost.run (delete root none) stored
+    rows result.2.db "blobs" == [] ∧ (lookupFile result.2.files ("cas_payload", root)).isNone := by decide +kernel
+
+theorem pinned_content_has_no_cleanup :
+    check { stored with db := [("blobs", [blob]), ("pins", [pin])] } =
+      (.ok .protectedClaim, ["begin", "exists:pins", "exists:entries", "read:blobs", "counter:cas_writers", "commit"]) := by decide +kernel
+
+theorem referenced_content_has_no_cleanup :
+    check { stored with db := [("blobs", [blob]), ("entries", [entry])] } =
+      (.ok .protectedClaim, ["begin", "exists:pins", "exists:entries", "read:blobs", "counter:cas_writers", "commit"]) := by decide +kernel
+
+theorem active_writer_has_no_cleanup :
+    check { stored with counters := [(("cas_writers", root), 1)] } =
+      (.ok .writing, ["begin", "exists:pins", "exists:entries", "read:blobs", "counter:cas_writers", "commit"]) := by decide +kernel
+
+theorem collection_respects_strict_access_horizon : check stored (some 0) =
+    (.ok .skipped, ["begin", "exists:pins", "exists:entries", "read:blobs", "counter:cas_writers", "commit"]) := by decide +kernel
+
+theorem every_failed_transaction_stage_preserves_files :
+    (List.range 7).all (fun index =>
+      let result := SimulatedHost.run (delete root none) (fail stored index)
+      failed result.1 && (result.2.db == stored.db) && (result.2.files == stored.files)) = true := by decide +kernel
+
+theorem cleanup_failure_does_not_skip_second_file :
+    check (fail stored 7) = (.ok .applied,
+      ["begin", "exists:pins", "exists:entries", "read:blobs", "counter:cas_writers", "delete:blobs", "commit", "remove:cas_payload", "remove:cas_outboard"]) := by decide +kernel
 
 end Synchronicity.CasLifecycleProofs
