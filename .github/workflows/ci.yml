@@ -153,10 +153,21 @@ jobs:
           $binary = "target/$env:CARGO_BUILD_TARGET/release/examples/decisions.exe"
           $headers = & llvm-objdump --private-headers $binary
           if ($LASTEXITCODE -ne 0) { throw 'Unable to inspect executable imports' }
-          $imports = $headers | Select-String 'DLL Name:'
+          # Match complete DLL basenames, not substrings such as "std" in
+          # api-ms-win-crt-stdio-l1-1-0.dll (a supported Windows CRT import).
+          $forbiddenDll = '(?i)^(lib)?(lean|leanrt|Init|Std|gmp|uv|c\+\+|c\+\+abi|unwind|winpthread)[^\\/]*\.dll$'
+          # Lightweight regression checks exercise the exact production pattern.
+          foreach ($allowed in @('api-ms-win-crt-stdio-l1-1-0.dll', 'api-ms-win-crt-runtime-l1-1-0.dll', 'KERNEL32.dll', 'icu.dll', 'bcrypt.dll')) {
+            if ($allowed -match $forbiddenDll) { throw "False positive static-runtime check: $allowed" }
+          }
+          foreach ($blocked in @('lean.dll', 'libleanshared.dll', 'leanrt.dll', 'libLeanRT.dll', 'Init.dll', 'libInit_shared.dll', 'Std.dll', 'libStd.dll', 'libgmp-10.dll', 'libuv-1.dll', 'libc++.dll', 'libc++abi.dll', 'libunwind.dll', 'libwinpthread-1.dll', 'libstdc++-6.dll')) {
+            if ($blocked -notmatch $forbiddenDll) { throw "Missed dynamic-runtime import: $blocked" }
+          }
+          $imports = $headers | Select-String '^\s*DLL Name:\s*(.+\.dll)\s*$'
           if (!$imports) { throw 'No executable import table found' }
           $imports | ForEach-Object { Write-Output $_ }
-          if ($imports -match '(?i)(lib)?(lean|leanrt|Init|Std|gmp|uv|c\+\+|c\+\+abi|unwind|winpthread)[^\\/]*\.dll') {
+          $dllNames = $imports | ForEach-Object { ($_.Matches[0].Groups[1].Value -split '[\\/]')[-1] }
+          if ($dllNames -match $forbiddenDll) {
             throw 'Lean runtime dependency was not statically linked'
           }
 
