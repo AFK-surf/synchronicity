@@ -50,6 +50,7 @@ fn main() {
     }
     println!("cargo:rerun-if-changed=lean/Hostgen.lean");
     println!("cargo:rerun-if-changed=lean/lean-toolchain");
+    println!("cargo:rerun-if-changed=src/layout.c");
     let target = env::var("TARGET").unwrap();
     let linux = target.ends_with("-linux-gnu");
     let macos = target.ends_with("-apple-darwin");
@@ -139,6 +140,8 @@ fn main() {
         .include(sysroot.join("include"))
         .file(&generated)
         .files(&compiled_modules)
+        // Compile-time checks of the object layout native.rs copies from lean.h.
+        .file(root.join("src/layout.c"))
         .flag_if_supported("-Wno-unused-parameter")
         .compile("synch_verified_core");
     println!(

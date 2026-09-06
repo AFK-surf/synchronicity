@@ -5,9 +5,10 @@
 //! a Lean export; nothing here interprets a continuation.
 //!
 //! The object layout is copied from the pinned toolchain's `lean.h`, whose
-//! helpers are `static inline` and cannot be linked. `build.rs` refuses any
-//! other Lean version; when the pin moves, recheck each item against the
-//! `lean.h` definition its comment names.
+//! helpers are `static inline` and cannot be linked. `layout.c` checks the
+//! sizes, offsets and bitfield packing against the real header at compile
+//! time, and `build.rs` refuses any other Lean version; when the pin moves,
+//! recheck each item against the `lean.h` definition its comment names.
 use std::{
     marker::PhantomData,
     ptr::NonNull,
@@ -261,6 +262,23 @@ pub(crate) fn start(command: &[u8]) -> Handle {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    unsafe extern "C" {
+        /// A `lean_object` that `layout.c` initializes field by field with the
+        /// pinned header, so its bytes show how the C compiler packs the
+        /// bitfields.
+        static synch_layout_probe: [u8; size_of::<Object>()];
+    }
+
+    #[test]
+    fn header_fields_sit_where_the_c_compiler_packs_them() {
+        // SAFETY: a constant of the asserted size, read through the layout under test.
+        let probe = unsafe { std::ptr::read(synch_layout_probe.as_ptr().cast::<Object>()) };
+        assert_eq!(
+            (probe.rc, probe.cs_sz, probe.other, probe.tag),
+            (1, 0x1234, 0x56, 0x78)
+        );
+    }
 
     #[test]
     fn byte_arrays_round_trip_through_the_lean_layout() {

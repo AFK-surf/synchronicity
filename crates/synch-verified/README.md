@@ -199,7 +199,8 @@ Only one command constructor (`synch_lean_start`, taking an encoded
 called directly from Rust; there is no C shim. `src/native.rs` holds the
 runtime and object lifetime calls and the Lean object layout it needs to
 build byte arrays and hold references, copied from the pinned toolchain's
-`lean.h` (`build.rs` refuses any other Lean version). Rust executes raw
+`lean.h`; `src/layout.c` asserts that layout against the real header at
+compile time, and `build.rs` refuses any other Lean version. Rust executes raw
 effects synchronously and returns their results to Lean. Handles and packets
 are invocation-owned and thread-confined; no shared scope/walk/cache object
 graphs cross foreign threads. The runtime initializes once per process and
