@@ -6,6 +6,7 @@ import VerifiedCore.Cas.Read
 import VerifiedCore.Cas.Input
 import VerifiedCore.Trie.Program
 import VerifiedCore.Trie.Verify
+import VerifiedCore.Trie.Mutate
 import VerifiedCore.Replication.History
 
 /-! The one native entry point. A command arrives as a packet, decoded with
@@ -85,6 +86,11 @@ def retention : Replication.History.Result Nat → Host.Reply ByteArray
       | .origin error => .origin error
       | .host _ => .malformed) : Except _ Nat)
 
+def mutation : Except Trie.Error ByteArray → Host.Reply ByteArray
+  | .ok root => terminalOf (Except.ok root : Except Trie.MutationError ByteArray)
+  | .error (.host hostFailure) => .error hostFailure
+  | .error (.domain error) => terminalOf (Except.error error : Except _ ByteArray)
+
 def malformedRoot : Native := .pure (.error ⟨2, 0⟩)
 def protocol : Native := .pure (.error protocolFailure)
 
@@ -118,6 +124,11 @@ def dispatch : Command → Native
   | .trieAdmit size => command (Trie.admitInput 0 size) hostOnly
   | .trieVerify expected size =>
     if expected.size != 32 then protocol else command (Trie.verifyInput expected 0 size) hostOnly
+  | .trieInsert root keySize valueSize =>
+    if root.size != 32 then malformedRoot
+    else command (Trie.insertInput root keySize valueSize) mutation
+  | .trieRemove root keySize =>
+    if root.size != 32 then malformedRoot else command (Trie.removeInput root keySize) mutation
   | .pruneHistory origin before => command (Replication.History.prune origin before) retention
 
 /-- Every command starts here: an undecodable packet is a protocol failure

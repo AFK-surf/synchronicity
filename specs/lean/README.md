@@ -40,6 +40,7 @@ statements to their checked theorems and explicit host assumptions.
 | `TrieProgramProofs`, `TrieProgramTests` | Trie lookup soundness and completeness against a raw node graph read through the actual codec, plus decoder fixtures |
 | `TrieCodecProofs` | The node encoder and decoder roundtrip for every well-formed node, by induction over the executable parsers |
 | `TrieVerifyProofs` | The ingress boundary: only an encoder image is admitted, within the shared key bound and the structural invariants; acceptance and origin/peer fault follow from the host's digests alone; the served bytes are read whole before anything is decided |
+| `TrieMutateProofs` | The write path over a content-addressed store: every node it stores is the canonical image its address covers, so a store whose nodes the boundary admits stays that way through every insert and remove; bounds are refused before any effect; a remove's merges push down at most one key's worth of nibbles |
 | `HistoryProgramProofs` | Head-history retention: fork, ceiling and witness protection derived from actual receipts, and shared-host executions with injected failures |
 | `OriginProgramProofs` | Origin syntax and key decoding |
 | `Decidable` | Decidable equality of `Except`, which core Lean lacks and the trace proofs decide with |

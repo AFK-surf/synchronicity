@@ -488,6 +488,18 @@ fn dispatch_readonly<S: ByteStorage>(
                 .ok_or(OperationError::Protocol)?;
             Ok(reply(53, digest.blake3(bytes), errors, EncodeReply::encode))
         }
+        Frame::PutBytes(space, key, bytes) => {
+            let writes = capabilities
+                .writes
+                .as_deref_mut()
+                .ok_or(OperationError::Protocol)?;
+            Ok(reply(
+                54,
+                writes.put_bytes(&space, key, bytes),
+                errors,
+                EncodeReply::encode,
+            ))
+        }
         _ => Err(OperationError::Protocol),
     }
 }
@@ -524,6 +536,7 @@ pub(crate) struct Capabilities<'a, E> {
     pub(crate) leases: Option<&'a mut dyn crate::host::Lease<Error = E>>,
     pub(crate) source: Option<&'a mut dyn crate::host::SourceIO<Error = E>>,
     pub(crate) digest: Option<&'a mut dyn crate::host::Digest<Error = E>>,
+    pub(crate) writes: Option<&'a mut dyn crate::host::ByteWrites<Error = E>>,
 }
 
 impl<E> Default for Capabilities<'_, E> {
@@ -539,6 +552,7 @@ impl<E> Default for Capabilities<'_, E> {
             leases: None,
             source: None,
             digest: None,
+            writes: None,
         }
     }
 }
@@ -699,6 +713,32 @@ pub(crate) fn run_readonly<S: ByteStorage>(
         },
         inputs,
         Capabilities::default(),
+    )
+}
+
+/// Same ownership contract as `run`, narrowed to byte reads, content-addressed
+/// byte writes and the digest primitive: what a trie write needs and nothing
+/// relational.
+pub(crate) fn run_bytes<S: ByteStorage>(
+    storage: &mut S,
+    writes: &mut dyn crate::host::ByteWrites<Error = S::Error>,
+    digest: &mut dyn crate::host::Digest<Error = S::Error>,
+    inputs: &[&[u8]],
+    command: &Command,
+) -> Result<Vec<u8>, OperationError<S::Error>> {
+    let state = start(command);
+    let capabilities = Capabilities {
+        digest: Some(digest),
+        writes: Some(writes),
+        ..Capabilities::default()
+    };
+    execute(
+        state,
+        |frame, capabilities, errors| {
+            dispatch_readonly(Some(&mut *storage), capabilities, frame, errors)
+        },
+        inputs,
+        capabilities,
     )
 }
 

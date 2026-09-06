@@ -68,3 +68,36 @@ pub(crate) fn refusal_error(refusal: synch_verified::trie::NodeRefusal) -> MptEr
         }
     }
 }
+
+impl<S: NodeStore + ?Sized> synch_verified::host::ByteWrites for Bytes<'_, S> {
+    type Error = MptError;
+    fn put_bytes(&mut self, space: &str, key: &[u8], bytes: &[u8]) -> Result<(), MptError> {
+        let hash = Hash::from_slice(key).map_err(MptError::store)?;
+        match space {
+            "trie_nodes" => self.0.put_node(&hash, bytes).map_err(MptError::store),
+            "trie_values" => self.0.put_value(&hash, bytes).map_err(MptError::store),
+            _ => Err(protocol_error()),
+        }
+    }
+}
+
+/// A refused or failed write is one of the store's existing diagnostics.
+pub(crate) fn mutation_error(error: synch_verified::trie::MutationDomainError) -> MptError {
+    use synch_verified::trie::MutationDomainError;
+    match error {
+        MutationDomainError::KeyTooLong(bytes) => {
+            MptError::KeyTooLong(usize::try_from(bytes).unwrap_or(usize::MAX))
+        }
+        MutationDomainError::ValueTooLong(bytes) => {
+            MptError::ValueTooLong(usize::try_from(bytes).unwrap_or(usize::MAX))
+        }
+        MutationDomainError::MissingNode(hash) => match Hash::from_slice(&hash) {
+            Ok(hash) => MptError::MissingNode(hash),
+            Err(_) => protocol_error(),
+        },
+        MutationDomainError::Decode(message) => MptError::Decode(message),
+        MutationDomainError::DepthExceeded => {
+            MptError::NonCanonical("a write descended further than any valid key is long".into())
+        }
+    }
+}

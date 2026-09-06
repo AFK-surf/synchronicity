@@ -6103,6 +6103,7 @@ dependencies = [
 name = "synch-verified"
 version = "0.1.8"
 dependencies = [
+ "blake3",
  "cc",
  "proptest",
 ]

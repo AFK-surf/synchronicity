@@ -26,6 +26,7 @@ fn main() {
         "Host/Resources",
         "Host/Source",
         "Host/Digest",
+        "Host/Writes",
         "Crypto",
         "Host/Codec",
         "Host/Generated",
@@ -42,6 +43,7 @@ fn main() {
         "Trie/Codec",
         "Trie/Program",
         "Trie/Verify",
+        "Trie/Mutate",
         "Replication/History",
         "Commands",
         "Commands/Generated",
@@ -145,6 +147,11 @@ fn main() {
         // Compile-time checks of the object layout native.rs copies from lean.h.
         .file(root.join("src/layout.c"))
         .flag_if_supported("-Wno-unused-parameter")
+        // The generated C is the compiled core, not code anyone steps through
+        // in a debugger: build it optimized in every profile, as the Lean
+        // toolchain's own libraries are, so a debug test run pays for the
+        // Rust it is debugging and not for an unoptimized proof-carrying core.
+        .opt_level(2)
         .compile("synch_verified_core");
     println!(
         "cargo:rustc-link-search=native={}",

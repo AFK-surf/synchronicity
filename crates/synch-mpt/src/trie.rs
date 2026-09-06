@@ -6,8 +6,8 @@ use synch_core::{Hash, OriginId, MAX_KEY_LEN};
 
 use crate::{
     error::MptError,
-    nibbles::{common_prefix_len, Nibbles},
-    node::{TrieNode, ValueRef, NO_CHILDREN},
+    nibbles::Nibbles,
+    node::{TrieNode, ValueRef},
     scope::Scope,
     store::NodeStore,
 };
@@ -123,41 +123,6 @@ impl FanoutGuard {
         }
         Ok(())
     }
-}
-
-/// One level of an insert's descent: how the level above was entered, so the
-/// path can be rebuilt once the changed subtree below it is known.
-#[allow(clippy::large_enum_variant)]
-#[derive(Debug)]
-enum InsertFrame {
-    /// An extension whose prefix the key matched whole.
-    Ext { prefix: Nibbles },
-    /// A branch entered through `idx`.
-    Branch {
-        children: [Option<Hash>; 16],
-        value: Option<ValueRef>,
-        idx: usize,
-    },
-}
-
-/// One level of a removal's descent. Carries the level's own hash as well, so
-/// an unchanged child can be answered with the node that is already stored
-/// rather than an identical rebuild.
-#[allow(clippy::large_enum_variant)]
-#[derive(Debug)]
-enum RemoveFrame {
-    Ext {
-        hash: Hash,
-        prefix: Nibbles,
-        child: Hash,
-    },
-    Branch {
-        hash: Hash,
-        children: [Option<Hash>; 16],
-        value: Option<ValueRef>,
-        idx: usize,
-        child: Hash,
-    },
 }
 
 /// One step of a [`Trie::descend`] walk: the parent's state, the child
@@ -673,13 +638,6 @@ impl<'a, S: NodeStore + ?Sized> Trie<'a, S> {
         Self::wrap(self.store.has_value(hash))
     }
 
-    fn put(&self, node: &TrieNode) -> Result<Hash, MptError> {
-        let encoded = node.encode();
-        let hash = crate::node::hash_encoded(node.tag(), &encoded);
-        Self::wrap(self.store.put_node(&hash, &encoded))?;
-        Ok(hash)
-    }
-
     /// Resolves a value reference into bytes, fetching out-of-line payloads.
     pub fn resolve(&self, value: &ValueRef) -> Result<Vec<u8>, MptError> {
         match value {
@@ -721,23 +679,28 @@ impl<'a, S: NodeStore + ?Sized> Trie<'a, S> {
     // ---- writes -----------------------------------------------------------
 
     /// Inserts or replaces a key, returning the new root.
+    ///
+    /// The whole write is the Lean operation `Trie.insert`: the §12 key and
+    /// value bounds, the inline-or-out-of-line choice, the descent to the one
+    /// position that changes, the rebuild of the path above it in canonical
+    /// form, and the order of writes (a value before the node that names it).
+    /// Rust supplies raw node reads, content-addressed writes and BLAKE3.
     pub fn insert(&self, root: Hash, key: &[u8], value: &[u8]) -> Result<Hash, MptError> {
-        if key.len() > MAX_KEY_LEN {
-            return Err(MptError::KeyTooLong(key.len()));
+        let mut bytes = crate::lean_storage::Bytes(self.store);
+        let mut writes = crate::lean_storage::Bytes(self.store);
+        match synch_verified::trie::insert(
+            &mut bytes,
+            &mut writes,
+            &mut crate::lean_storage::Blake3,
+            root.as_bytes(),
+            key,
+            value,
+        )
+        .map_err(crate::lean_storage::operation_error)?
+        {
+            Ok(root) => Ok(Hash(root)),
+            Err(error) => Err(crate::lean_storage::mutation_error(error)),
         }
-        // The value side is bounded here for the same reason the key side is,
-        // and it was not: this node must not publish a record every peer's
-        // `GetValues` answer and promotion diff will then have to carry
-        // ([`MAX_TRIE_VALUE_LEN`]).
-        if value.len() > synch_core::MAX_TRIE_VALUE_LEN {
-            return Err(MptError::ValueTooLong(value.len()));
-        }
-        let (vref, out_of_line) = ValueRef::for_value(value);
-        if let Some((hash, payload)) = out_of_line {
-            Self::wrap(self.store.put_value(&hash, &payload))?;
-        }
-        let nibbles = Nibbles::from_bytes(key);
-        self.insert_at(root_opt(root), nibbles.as_slice(), &vref)
     }
 
     /// Applies a batch of insertions and removals in one pass, returning the
@@ -759,312 +722,28 @@ impl<'a, S: NodeStore + ?Sized> Trie<'a, S> {
         Ok(root)
     }
 
-    /// Descends to the one position an insert changes, then rebuilds the path
-    /// above it — with the path on the heap.
-    fn insert_at(
-        &self,
-        node: Option<Hash>,
-        key: &[u8],
-        value: &ValueRef,
-    ) -> Result<Hash, MptError> {
-        let mut stack: Vec<InsertFrame> = Vec::new();
-        let mut cursor = node;
-        let mut rest = key;
-
-        // Descend to the position that actually changes, remembering how each
-        // level was entered so it can be rebuilt on the way back up.
-        let mut built = loop {
-            let Some(hash) = cursor else {
-                break self.put(&TrieNode::leaf(Nibbles::from_nibbles(rest), value.clone()))?;
-            };
-            match self.load(&hash)? {
-                TrieNode::Ext { prefix, child } => {
-                    let p = prefix.as_slice();
-                    let cp = common_prefix_len(p, rest);
-                    if cp == p.len() {
-                        stack.push(InsertFrame::Ext {
-                            prefix: prefix.clone(),
-                        });
-                        cursor = Some(child);
-                        rest = &rest[cp..];
-                        continue;
-                    }
-                    break self.split_ext(&prefix, child, rest, value)?;
-                }
-                TrieNode::Branch {
-                    children,
-                    value: branch_value,
-                } => {
-                    if rest.is_empty() {
-                        break self.put(&TrieNode::Branch {
-                            children,
-                            value: Some(value.clone()),
-                        })?;
-                    }
-                    let idx = rest[0] as usize;
-                    let next = children[idx];
-                    stack.push(InsertFrame::Branch {
-                        children,
-                        value: branch_value,
-                        idx,
-                    });
-                    cursor = next;
-                    rest = &rest[1..];
-                }
-                node @ TrieNode::Leaf { .. } => break self.split_leaf(node, rest, value)?,
-            }
-        };
-
-        while let Some(frame) = stack.pop() {
-            built = match frame {
-                InsertFrame::Ext { prefix } => self.put(&TrieNode::ext(prefix, built))?,
-                InsertFrame::Branch {
-                    mut children,
-                    value,
-                    idx,
-                } => {
-                    children[idx] = Some(built);
-                    self.put(&TrieNode::Branch { children, value })?
-                }
-            };
-        }
-        Ok(built)
-    }
-
-    /// Splits a leaf that shares only part of its key with the one being
-    /// inserted, returning the hash of the replacement subtree.
-    fn split_leaf(&self, leaf: TrieNode, key: &[u8], value: &ValueRef) -> Result<Hash, MptError> {
-        let TrieNode::Leaf {
-            key_rest,
-            value: old,
-        } = leaf
-        else {
-            unreachable!("split_leaf is only called with a leaf")
-        };
-        let k = key_rest.as_slice();
-        if k == key {
-            return self.put(&TrieNode::leaf(key_rest.clone(), value.clone()));
-        }
-        let cp = common_prefix_len(k, key);
-        let mut children = NO_CHILDREN;
-        let mut branch_value = None;
-
-        let existing = &k[cp..];
-        if existing.is_empty() {
-            branch_value = Some(old);
-        } else {
-            let child = self.put(&TrieNode::leaf(Nibbles::from_nibbles(&existing[1..]), old))?;
-            children[existing[0] as usize] = Some(child);
-        }
-
-        let inserted = &key[cp..];
-        if inserted.is_empty() {
-            branch_value = Some(value.clone());
-        } else {
-            let child = self.put(&TrieNode::leaf(
-                Nibbles::from_nibbles(&inserted[1..]),
-                value.clone(),
-            ))?;
-            children[inserted[0] as usize] = Some(child);
-        }
-
-        let branch = self.put(&TrieNode::Branch {
-            children,
-            value: branch_value,
-        })?;
-        self.wrap_in_ext(&key[..cp], branch)
-    }
-
-    /// Splits an extension whose prefix diverges from the key being inserted,
-    /// returning the hash of the replacement subtree.
-    fn split_ext(
-        &self,
-        prefix: &Nibbles,
-        child: Hash,
-        key: &[u8],
-        value: &ValueRef,
-    ) -> Result<Hash, MptError> {
-        let p = prefix.as_slice();
-        let cp = common_prefix_len(p, key);
-        let mut children = NO_CHILDREN;
-        let mut branch_value = None;
-
-        let existing = &p[cp..];
-        let down = if existing.len() > 1 {
-            self.put(&TrieNode::ext(Nibbles::from_nibbles(&existing[1..]), child))?
-        } else {
-            child
-        };
-        children[existing[0] as usize] = Some(down);
-
-        let inserted = &key[cp..];
-        if inserted.is_empty() {
-            branch_value = Some(value.clone());
-        } else {
-            let leaf = self.put(&TrieNode::leaf(
-                Nibbles::from_nibbles(&inserted[1..]),
-                value.clone(),
-            ))?;
-            children[inserted[0] as usize] = Some(leaf);
-        }
-
-        let branch = self.put(&TrieNode::Branch {
-            children,
-            value: branch_value,
-        })?;
-        self.wrap_in_ext(&key[..cp], branch)
-    }
-
-    fn wrap_in_ext(&self, prefix: &[u8], child: Hash) -> Result<Hash, MptError> {
-        if prefix.is_empty() {
-            Ok(child)
-        } else {
-            self.put(&TrieNode::ext(Nibbles::from_nibbles(prefix), child))
-        }
-    }
-
     /// Removes a key, returning the new root.
     ///
     /// Removing an absent key returns the root unchanged, so the trie stays in
     /// canonical form: any two tries holding the same key/value map have the
-    /// same root regardless of the operation history that produced them.
+    /// same root regardless of the operation history that produced them. The
+    /// whole removal is the Lean operation `Trie.remove`, including the §12
+    /// key bound `insert` applies and the collapse and merge rules that keep
+    /// an extension above a branch only.
     pub fn remove(&self, root: Hash, key: &[u8]) -> Result<Hash, MptError> {
-        // The same §12 bound `insert` applies. A key this long cannot be
-        // present, so the walk is merely wasted — but the asymmetry is the kind
-        // that stops being harmless the moment `remove_at` grows an allocation
-        // keyed on the input.
-        if key.len() > MAX_KEY_LEN {
-            return Err(MptError::KeyTooLong(key.len()));
-        }
-        let nibbles = Nibbles::from_bytes(key);
-        match root_opt(root) {
-            None => Ok(Hash::EMPTY),
-            Some(hash) => Ok(self
-                .remove_at(hash, nibbles.as_slice())?
-                .unwrap_or(Hash::EMPTY)),
-        }
-    }
-
-    /// The removal counterpart of [`Trie::insert_at`], on the same heap stack
-    /// and for the same reason: one recursion frame per trie level aborted the
-    /// process on a deep tree rather than returning an error.
-    fn remove_at(&self, hash: Hash, key: &[u8]) -> Result<Option<Hash>, MptError> {
-        let mut stack: Vec<RemoveFrame> = Vec::new();
-        let mut cursor = hash;
-        let mut rest = key;
-
-        let mut result: Option<Hash> = loop {
-            match self.load(&cursor)? {
-                TrieNode::Leaf { ref key_rest, .. } => {
-                    break if key_rest.as_slice() == rest {
-                        None
-                    } else {
-                        Some(cursor)
-                    };
-                }
-                TrieNode::Ext { prefix, child } => {
-                    let p = prefix.as_slice();
-                    if !rest.starts_with(p) {
-                        break Some(cursor);
-                    }
-                    rest = &rest[p.len()..];
-                    stack.push(RemoveFrame::Ext {
-                        hash: cursor,
-                        prefix: prefix.clone(),
-                        child,
-                    });
-                    cursor = child;
-                }
-                TrieNode::Branch { children, value } => {
-                    if rest.is_empty() {
-                        if value.is_none() {
-                            break Some(cursor);
-                        }
-                        break self.collapse(children, None)?;
-                    }
-                    let idx = rest[0] as usize;
-                    let Some(child) = children[idx] else {
-                        break Some(cursor);
-                    };
-                    rest = &rest[1..];
-                    stack.push(RemoveFrame::Branch {
-                        hash: cursor,
-                        children,
-                        value,
-                        idx,
-                        child,
-                    });
-                    cursor = child;
-                }
-            }
-        };
-
-        // Unwind. A level whose child came back unchanged is itself unchanged,
-        // which is what keeps removing an absent key from rewriting the path
-        // and so from producing a second root for one key/value map.
-        while let Some(frame) = stack.pop() {
-            result = match frame {
-                RemoveFrame::Ext {
-                    hash,
-                    prefix,
-                    child,
-                } => match result {
-                    None => None,
-                    Some(new_child) if new_child == child => Some(hash),
-                    Some(new_child) => Some(self.merge_down(prefix.as_slice(), new_child)?),
-                },
-                RemoveFrame::Branch {
-                    hash,
-                    mut children,
-                    value,
-                    idx,
-                    child,
-                } => {
-                    if result == Some(child) {
-                        Some(hash)
-                    } else {
-                        children[idx] = result;
-                        self.collapse(children, value)?
-                    }
-                }
-            };
-        }
-        Ok(result)
-    }
-
-    /// Pushes `prefix` down into `child`, preserving canonical form: an
-    /// extension node always sits above a branch, never above a leaf or another
-    /// extension.
-    fn merge_down(&self, prefix: &[u8], child: Hash) -> Result<Hash, MptError> {
-        match self.load(&child)? {
-            TrieNode::Leaf { key_rest, value } => {
-                self.put(&TrieNode::leaf(key_rest.prepend_all(prefix), value))
-            }
-            TrieNode::Ext {
-                prefix: below,
-                child: grandchild,
-            } => self.put(&TrieNode::ext(below.prepend_all(prefix), grandchild)),
-            TrieNode::Branch { .. } => {
-                self.put(&TrieNode::ext(Nibbles::from_nibbles(prefix), child))
-            }
-        }
-    }
-
-    fn collapse(
-        &self,
-        children: [Option<Hash>; 16],
-        value: Option<ValueRef>,
-    ) -> Result<Option<Hash>, MptError> {
-        let occupied: Vec<usize> = (0..16).filter(|&i| children[i].is_some()).collect();
-        match (occupied.len(), value) {
-            (0, None) => Ok(None),
-            (0, Some(v)) => Ok(Some(self.put(&TrieNode::leaf(Nibbles::new(), v))?)),
-            (1, None) => {
-                let idx = occupied[0];
-                let child = children[idx].expect("occupied slot");
-                Ok(Some(self.merge_down(&[idx as u8], child)?))
-            }
-            (_, value) => Ok(Some(self.put(&TrieNode::Branch { children, value })?)),
+        let mut bytes = crate::lean_storage::Bytes(self.store);
+        let mut writes = crate::lean_storage::Bytes(self.store);
+        match synch_verified::trie::remove(
+            &mut bytes,
+            &mut writes,
+            &mut crate::lean_storage::Blake3,
+            root.as_bytes(),
+            key,
+        )
+        .map_err(crate::lean_storage::operation_error)?
+        {
+            Ok(root) => Ok(Hash(root)),
+            Err(error) => Err(crate::lean_storage::mutation_error(error)),
         }
     }
 
@@ -1550,7 +1229,7 @@ fn subtree_is_below(path: &[u8], after: &[u8]) -> bool {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::MemStore;
+    use crate::{node::NO_CHILDREN, store::MemStore};
 
     #[test]
     fn walk_depth_fault_precedes_reference_pruning_and_survives_resume() {

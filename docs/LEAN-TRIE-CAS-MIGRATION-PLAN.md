@@ -27,9 +27,11 @@ terminals. "Complete proof" means, for every migrated operation:
    [CAS-PROMISES.md](CAS-PROMISES.md) or its Trie counterpart.
 
 What stays trusted, permanently: SQLite, the filesystem, the object provider,
-the BLAKE3 compression function, Ed25519, the native runner and transport, the
-Lean compiler and runtime. Nothing in this plan disguises one of those as a
-metadata invariant.
+BLAKE3 and the whole Bao tree (construction, slice encode and decode, proofs
+and chaining-value comparison, implemented in Rust on `bao-tree` and never
+reimplemented or verified in Lean), Ed25519, the native runner and
+transport, the Lean compiler and runtime. Nothing in this plan disguises one
+of those as a metadata invariant.
 
 ## 2. Inventory of what moves
 
@@ -86,11 +88,12 @@ carries policy; each is a primitive the current Rust code already performs.
 
 | Algebra | Effects | Serves |
 |---|---|---|
-| `ByteStorage` (extend) | `writeBytes space key bytes`, `existsBytes space key` | node/value writes, `has_value` |
+| `ByteStorage` (extend) | `existsBytes space key` | `has_value` without materializing the payload |
 | `Storage` (extend) | `deleteExcept tx relation keyColumn keys` (one statement over a host temp table) | set-wise GC sweep, never per-row callbacks |
-| `Hash` (new; `Crypto` stays signature-only) | `blake3 bytes`, `chunkGroup handle offset len isRoot` (chaining value of one 16 KiB group read from a file or stream), `parent left right isRoot` | node hashing, Bao tree math |
-| `FileIO` (extend) | `writeAt handle offset bytes` (64-byte outboard nodes only), `copyRange src dst offset len` (reflink or positional), `setLen handle len`, `blocks space key`, `list space`, `mtime space key` | receive, promote, trim, eviction accounting, orphan sweep |
-| `Stream` (new) | `openSlice`, `readNode handle` (64 bytes), `groupToFile handle payload offset len` (copies one group from the wire into the payload and answers its chaining value), `close` | verified slice receive without a payload byte ever being a Lean value |
+| `Digest` (new; `Crypto` stays signature-only) | `blake3 bytes` | node hashing (done, T1) |
+| `ByteWrites` (new) | `putBytes space key bytes` | content-addressed node and value writes (T2) |
+| `FileIO` (extend) | `copyRange src dst offset len` (reflink or positional), `setLen handle len`, `blocks space key`, `list space`, `mtime space key` | promote, trim, eviction accounting, orphan sweep |
+| `Bao` (new, a whole host service like `Construct`) | `decodeSlice stream payload outboard size ranges` (verifies a slice stream against the root, writes only verified groups and their outboard nodes, answers the verified spans), `encodeSlice payload outboard size ranges → output`, `encodeProof`, `verifyProof`, `promoteRun` (compare-then-copy of one donor run) | every Bao computation: slice receive and serve, delta-sync proofs and promotion. Implemented in Rust on `bao-tree`/`blake3`, tested against standard vectors, and a stated trust assumption; Lean directs which ranges are asked for and what a reply means, never the tree |
 | `Provider` (new) | `head root`, `readRange root offset len into handle`, `readOutboard root into handle`, `putPair payload outboard`, `putPairBytes`, `scratchSweep`, with a raw failure kind `notFound | other` | cloud adoption, hydration, finalize; Lean applies the §6.4 rule, the host only classifies |
 | `Memo` (new) | `isKnown key`, `generation`, `certify key generation` | the completeness cache; invalidation on mutation edges is a host resource guarantee like `Lease` |
 | `Peer` (new) | `fetchNodes wants : Reply (List (path × hash × bytes))`, `fetchValues` | the reconcile fetch loop (§4, T3) |
@@ -154,16 +157,29 @@ are deleted. `TrieNode::encode` stays until T2 removes the Rust write path.
 `Digest` is the first F1 algebra; the byte-only runner gained a digest-only
 entry (`run_digest`) with no storage reachable.
 
-**T2. Mutation** (`Trie/Mutate.lean`). `insert`, `remove`, `apply` over
-`ByteStorage` reads/writes and `Hash.blake3`, with the inline/out-of-line
-split at 128 bytes and the 32 KiB value bound. Proof: a denotation
-`⟦root⟧ : key ⇀ bytes` read through the actual decoder;
-`⟦insert root k v⟧ = ⟦root⟧[k ↦ v]`, `⟦remove root k⟧ = ⟦root⟧ \ k`; every
-written node satisfies the canonical invariants; two operations that yield
-the same denotation yield the same root under F3 (the `root_is_order_independent`
-and `canonical_after_delete` proptests become theorems). Effect trace: values
-are written before the nodes that reference them; a failed write leaves the
-old root readable. Cutover: `node.rs` publish path.
+**T2. Mutation** (`Trie/Mutate.lean`). Done, with the denotational half
+still open. `insert` and `remove` run as the whole commands `trieInsert` and
+`trieRemove` over raw node reads, `ByteWrites.putBytes` and `Digest.blake3`,
+with the inline/out-of-line split at 128 bytes and the 32 KiB value bound;
+`apply` is the caller's sequence of those commands. The descent keeps its
+path as data and rebuilds from an explicit stack, as the Rust did, so a
+host round trip is a constant-depth step (the nested-continuation first
+draft was quadratic in depth). Proved (`TrieMutateProofs`): every node the
+path stores is the canonical image its address covers, so a store whose
+nodes the ingress boundary admits stays so through every insert and remove
+(`insert_preserves`, `remove_preserves`); values are written before the
+nodes that name them; bounds are refused before any input is borrowed; a
+remove's merges push down at most one key of nibbles. Still open: the
+denotation `⟦root⟧ : key ⇀ bytes` with `⟦insert root k v⟧ = ⟦root⟧[k ↦ v]`
+and `⟦remove root k⟧ = ⟦root⟧ \ k`, root uniqueness under F3, and the
+key-depth invariant of whole paths (which is why the run bound is a
+hypothesis rather than a theorem). The `properties.rs` proptests remain
+the evidence for those. Cutover: `node.rs` publish path; the Rust
+`insert_at`, `split_leaf`, `split_ext`, `wrap_in_ext`, `remove_at`,
+`merge_down`, `collapse` and the frame types are deleted. Measured:
+`deep_write_path` (about a thousand keys branching at every fourth byte
+of a 4 KiB key) 8.9 s in the Rust write path, 17.5 s through the Lean
+commands in a debug test run with the core's C compiled at `-O2`.
 
 **T3. Walk and fetch** (`Trie/Walk.lean`, requires F2). The reconcile fetch
 loop becomes one suspended program: walk a batch (reads inside a transaction
@@ -222,41 +238,38 @@ them.
 ## 5. CAS slices, in order
 
 **C1. Serving** (`Cas/Serve.lean`). `encodeSlice root ranges` computes
-`requested ∩ verified ∩ [0, groups)` clamped to `MAX_SLICE_GROUPS`, then
-directs the host: positional `FileIO.transfer`s of outboard nodes and payload
-groups into the output sink, in Bao pre-order, with no hashing on the serve
-path.
-`encodeProof` moves the `Subtree` tree math (`locate`, `is_whole`,
-`byte_range`, the level cut, the `MAX_PROOF_NODES` refusal) into Lean.
-Proofs: every served group is in the row's coverage; an over-budget proof is
-refused, not truncated; the served byte count equals the window arithmetic.
-Cutover: `backend.rs:494,654,740`, `blob.rs:325`, CLI.
+`requested ∩ verified ∩ [0, groups)` clamped to `MAX_SLICE_GROUPS`, reads
+the row, and asks the `Bao` service for exactly that window of the payload
+and outboard into the output sink; `encodeProof` computes the same window
+and the `MAX_PROOF_NODES` refusal and asks the service for the proof. The
+Bao encoding itself stays in Rust. Proofs: every group Lean asks the host
+to serve is in the row's coverage; an over-budget proof is refused, not
+truncated; nothing is served for a row without the groups. Cutover:
+`backend.rs:494,654,740`, `blob.rs:325`, CLI.
 
 **C2. Verified receive** (`Cas/Receive.lean`, `Cas/Delta.lean`). `writeSlice`
 owns the lease, `admit`, the row read, the complete short-circuit, the inline
-buffer versus never-pre-grown-never-shrunk file policy, and the Bao tree:
-Lean reads each 64-byte parent with `Stream.readNode`, has the host copy
-each group into the payload with `Stream.groupToFile`, compares chaining
-values up to the requested root, writes accepted outboard nodes with
-`FileIO.writeAt`, flushes payload then outboard then parents, and only then
-runs `IngestCommit.commitGroups` with the verified spans and `trim`.
-`writeProof` and `promote` are the same tree math over `Hash.parent`,
-`FileIO.copyRange` and the outboard reach rule. Proofs: a group is written to
-the payload only after its chaining value chained to the requested root
-(compare strictly before writing, the delta-sync invariant); the committed
-spans are exactly the verified groups; the outboard is never written beyond
-`reach`; promotion copies a run only when the extent the chaining value
-attests equals the extent copied; every effect failure leaves the row and the
-files as they were, with the lease released. This slice also closes the
-existing gap: `commitGroups` with arbitrary spans and `admit` get execution
-theorems on the simulated host, composed with `CasReadPromises` so that
-"downloading more preserves what you have" becomes a statement about the
+buffer versus never-pre-grown-never-shrunk file policy, the order of flushes
+(payload, then outboard, then parents) and the metadata commit: it asks the
+`Bao` service for one `decodeSlice` of the stream into the opened payload and
+outboard, takes the verified spans the service answers, and only then runs
+`IngestCommit.commitGroups` with them and `trim`. `writeProof` and `promote`
+likewise ask the service to verify a proof or to compare-then-copy a donor
+run, and own the outboard reach rule, the extent-equality check and the
+commit. The Bao tree, chaining values and slice formats stay in Rust: they
+are a trust assumption on `bao-tree`/`blake3`, tested against standard
+vectors and the same encoder the serve path reads, exactly as construction
+already is for ingestion. Proofs: the committed spans are exactly the spans
+the service reported verified, never a superset; flushes precede the commit;
+the outboard is never asked to be written beyond `reach`; promotion commits a
+run only when the service reported the extents equal; every effect failure
+leaves the row as it was, with the lease released. This slice also closes
+the existing gap: `commitGroups` with arbitrary spans and `admit` get
+execution theorems on the simulated host, composed with `CasReadPromises` so
+that "downloading more preserves what you have" becomes a statement about the
 executed receive, not only the planner. Cutover: `write_slice`, `write_proof`,
-`promote`, `trim_to_size`. Throughput gate: the CI slice benchmark must stay
-within 10 % of the Rust decoder for 16 MiB slices; if two round trips per
-group exceed that, the fallback is one `Stream.decodeSlice` host service
-with the tree comparison stated as a trust assumption, chosen by measurement
-and recorded, not assumed in advance.
+`promote`, `trim_to_size`. No per-group round trips: the throughput of the
+Rust decoder is kept by construction.
 
 **C3. Durability transitions** (`Cas/Durable.lean`). `adopt`, `markDurable`,
 `healMissing`, `reconcileScratchGeneration`, `clearCache` are relational
@@ -343,8 +356,9 @@ F2 ──┴── T3 ── T4
 Publication migration ── C6
 ```
 
-F1 and C1/T1 can start together. T3 and C4 wait for F2. Relative size: F2,
-T3 and C2 are the large items; T1, C3 and C7 are small; the rest are medium.
+F1 and C1/T1 can start together. T3 and C4 wait for F2. Relative size: F2
+and T3 are the large items; T1, C3 and C7 are small; the rest are medium.
+C2 shrank when the Bao tree was fixed on the Rust side.
 
 ## 9. What the end state claims, and what it does not
 

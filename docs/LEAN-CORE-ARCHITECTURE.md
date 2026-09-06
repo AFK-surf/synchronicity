@@ -351,8 +351,22 @@ Integration review has identified specific gates, not waived limitations:
   before anything is decided. `synch-mpt`'s `hash_of_encoded`, `hashes_to`
   and `check_invariants` algorithms are deleted; the crate supplies the
   BLAKE3 primitive and names the refusal, and `reconcile.rs` maps the verdict.
-  Mutation, walking, completeness and the rest of the trie remain Rust, per
-  the migration plan's later slices.
+  Walking, completeness and the rest of the trie remain Rust, per the
+  migration plan's later slices.
+- The trie write path is now the whole commands `trieInsert` and `trieRemove`
+  (`Trie/Mutate.lean`) over raw node reads, content-addressed writes
+  (`ByteWrites.putBytes`) and the digest primitive. The descent keeps its path
+  as an explicit frame stack and rebuilds from it, so each host round trip is
+  a constant-depth step. `TrieMutateProofs` proves that a store whose nodes
+  the ingress boundary admits stays that way through every insert and remove
+  (`insert_preserves`, `remove_preserves`), that values are written before
+  the nodes naming them, and that bounds are refused before any input is
+  borrowed; the denotational theorems and the key-depth invariant of whole
+  paths remain open, and `properties.rs` stays their evidence. The Rust
+  write helpers are deleted. The generated core C is now compiled at `-O2` in
+  every profile: `deep_write_path` measures 8.9 s (Rust) against 17.5 s
+  (Lean commands) in a debug test run, and 505 s before the explicit stack
+  and the optimized C.
 - Native tests now cover acquisition transport, every effect-failure position,
   repeated polling, malformed replies and terminal resume. Generic SQLite tests
   cover UPSERT identity/time preservation, raw cells, failed commit, abandoned

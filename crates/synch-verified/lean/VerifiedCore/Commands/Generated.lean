@@ -131,6 +131,24 @@ instance : Decode Trie.Verdict where
     | 2 => return .peerFault
     | _ => throw ()
 
+instance : Encode Trie.MutationError where
+  encode out value := match value with
+    | .keyTooLong a0 => out.push 0 |>.put a0
+    | .valueTooLong a0 => out.push 1 |>.put a0
+    | .missingNode a0 => out.push 2 |>.put a0
+    | .decode a0 => out.push 3 |>.put a0
+    | .depthExceeded => out.push 4
+
+instance : Decode Trie.MutationError where
+  decode := do
+    match ← readByte with
+    | 0 => return .keyTooLong (← Decode.decode)
+    | 1 => return .valueTooLong (← Decode.decode)
+    | 2 => return .missingNode (← Decode.decode)
+    | 3 => return .decode (← Decode.decode)
+    | 4 => return .depthExceeded
+    | _ => throw ()
+
 instance : Encode Commands.LifecycleDomainError where
   encode out value := match value with
     | .malformed => out.push 0
@@ -232,7 +250,9 @@ instance : Encode Commands.Command where
     | .trieGet a0 a1 => out.push 8 |>.put a0 |>.put a1
     | .trieAdmit a0 => out.push 9 |>.put a0
     | .trieVerify a0 a1 => out.push 10 |>.put a0 |>.put a1
-    | .pruneHistory a0 a1 => out.push 11 |>.put a0 |>.put a1
+    | .trieInsert a0 a1 a2 => out.push 11 |>.put a0 |>.put a1 |>.put a2
+    | .trieRemove a0 a1 => out.push 12 |>.put a0 |>.put a1
+    | .pruneHistory a0 a1 => out.push 13 |>.put a0 |>.put a1
 
 instance : Decode Commands.Command where
   decode := do
@@ -248,7 +268,9 @@ instance : Decode Commands.Command where
     | 8 => return .trieGet (← Decode.decode) (← Decode.decode)
     | 9 => return .trieAdmit (← Decode.decode)
     | 10 => return .trieVerify (← Decode.decode) (← Decode.decode)
-    | 11 => return .pruneHistory (← Decode.decode) (← Decode.decode)
+    | 11 => return .trieInsert (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 12 => return .trieRemove (← Decode.decode) (← Decode.decode)
+    | 13 => return .pruneHistory (← Decode.decode) (← Decode.decode)
     | _ => throw ()
 
 end VerifiedCore

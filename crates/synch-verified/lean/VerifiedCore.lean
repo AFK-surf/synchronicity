@@ -6,6 +6,7 @@ import VerifiedCore.Cas.Input
 import VerifiedCore.Entry
 import VerifiedCore.Trie.Program
 import VerifiedCore.Trie.Verify
+import VerifiedCore.Trie.Mutate
 import VerifiedCore.Replication.History
 
 /-!

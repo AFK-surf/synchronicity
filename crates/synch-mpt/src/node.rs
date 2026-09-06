@@ -207,7 +207,9 @@ pub fn hash_encoded(tag: &[u8], encoded: &[u8]) -> Hash {
     Hash(*hasher.finalize().as_bytes())
 }
 
-/// An empty child array, for building branches.
+/// An empty child array, for building branches by hand in tests; the write
+/// path builds its branches in Lean.
+#[cfg(test)]
 pub(crate) const NO_CHILDREN: [Option<Hash>; 16] = [None; 16];
 
 #[cfg(test)]

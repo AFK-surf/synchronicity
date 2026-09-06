@@ -20,6 +20,7 @@ import Synchronicity.TrieProgramProofs
 import Synchronicity.TrieProgramTests
 import Synchronicity.TrieCodecProofs
 import Synchronicity.TrieVerifyProofs
+import Synchronicity.TrieMutateProofs
 import Synchronicity.HistoryProgramProofs
 import Synchronicity.OriginProgramProofs
 import Synchronicity.CasPromises

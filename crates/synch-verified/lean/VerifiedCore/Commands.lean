@@ -5,6 +5,7 @@ import VerifiedCore.Cas.Input
 import VerifiedCore.Origin
 import VerifiedCore.Trie.Program
 import VerifiedCore.Trie.Verify
+import VerifiedCore.Trie.Mutate
 
 /-! The shapes that cross the command boundary: what a caller asks for and
 what a finished command reports. `hostgen` derives the codecs of every type
@@ -45,6 +46,11 @@ inductive Command where
   /-- Decide whether served node bytes (the run's first byte input) are the
   node `expected` names and, when they are not, whose fault that is. -/
   | trieVerify (expected : ByteArray) (size : UInt64)
+  /-- Insert or replace a key (the run's first byte input) with a value (the
+  second), answering the new root. -/
+  | trieInsert (root : ByteArray) (keySize valueSize : UInt64)
+  /-- Remove a key (the run's first byte input), answering the new root. -/
+  | trieRemove (root : ByteArray) (keySize : UInt64)
   /-- Retire head history of an origin recorded before `before`. -/
   | pruneHistory (origin : String) (before : Int64)
 

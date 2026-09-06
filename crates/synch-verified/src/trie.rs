@@ -1,10 +1,10 @@
 //! Complete trie operations. No decoded node shapes cross this interface.
 use crate::{
-    host::{ByteStorage, Digest},
+    host::{ByteStorage, ByteWrites, Digest},
     operation::{self, terminal, Command},
 };
 
-pub use crate::generated::{LookupDomainError, NodeRefusal, NodeVerdict};
+pub use crate::generated::{LookupDomainError, MutationDomainError, NodeRefusal, NodeVerdict};
 pub use crate::operation::OperationError;
 
 /// Admit node bytes at the canonical ingress boundary: decoded, re-encoded
@@ -39,6 +39,65 @@ pub fn verify<D: Digest>(
     };
     let result = operation::run_digest(digest, &[bytes], &command)?;
     terminal(&result).map_err(|()| OperationError::Protocol)
+}
+
+/// A completed write, or the domain reason it did not happen; the outer error
+/// is the host's or the transport's.
+pub type Mutation<E> = Result<Result<[u8; 32], MutationDomainError>, OperationError<E>>;
+
+fn mutated<E>(result: Result<Vec<u8>, OperationError<E>>) -> Mutation<E> {
+    let outcome: Result<Vec<u8>, MutationDomainError> =
+        terminal(&result?).map_err(|()| OperationError::Protocol)?;
+    match outcome {
+        Ok(root) => Ok(Ok(root.try_into().map_err(|_| OperationError::Protocol)?)),
+        Err(error) => Ok(Err(error)),
+    }
+}
+
+/// Insert or replace a key, answering the new root. Lean owns the bounds,
+/// the descent, canonical form and the order of writes; the host supplies
+/// raw node reads, content-addressed writes and BLAKE3.
+pub fn insert<S: ByteStorage>(
+    storage: &mut S,
+    writes: &mut dyn ByteWrites<Error = S::Error>,
+    digest: &mut dyn Digest<Error = S::Error>,
+    root: &[u8; 32],
+    key: &[u8],
+    value: &[u8],
+) -> Mutation<S::Error> {
+    let command = Command::TrieInsert {
+        root: root.to_vec(),
+        key_size: key.len() as u64,
+        value_size: value.len() as u64,
+    };
+    mutated(operation::run_bytes(
+        storage,
+        writes,
+        digest,
+        &[key, value],
+        &command,
+    ))
+}
+
+/// Remove a key, answering the new root; an absent key leaves it unchanged.
+pub fn remove<S: ByteStorage>(
+    storage: &mut S,
+    writes: &mut dyn ByteWrites<Error = S::Error>,
+    digest: &mut dyn Digest<Error = S::Error>,
+    root: &[u8; 32],
+    key: &[u8],
+) -> Mutation<S::Error> {
+    let command = Command::TrieRemove {
+        root: root.to_vec(),
+        key_size: key.len() as u64,
+    };
+    mutated(operation::run_bytes(
+        storage,
+        writes,
+        digest,
+        &[key],
+        &command,
+    ))
 }
 
 /// A completed lookup failure, not an intermediate host observation.
@@ -331,6 +390,161 @@ mod boundary_tests {
         assert!(matches!(
             verify(&mut hasher, &[0; 32], &LEAF),
             Err(OperationError::Host("original digest failure"))
+        ));
+    }
+}
+
+#[cfg(test)]
+mod write_tests {
+    use super::*;
+    use std::collections::BTreeMap;
+
+    /// A content-addressed byte store, in memory, with the digest primitive.
+    #[derive(Default)]
+    struct Nodes {
+        nodes: BTreeMap<Vec<u8>, Vec<u8>>,
+        values: BTreeMap<Vec<u8>, Vec<u8>>,
+        writes: Vec<(String, Vec<u8>)>,
+        fail_writes: bool,
+    }
+
+    impl ByteStorage for Nodes {
+        type Error = &'static str;
+        fn read_bytes(&mut self, space: &str, key: &[u8]) -> Result<Option<Vec<u8>>, Self::Error> {
+            Ok(match space {
+                "trie_nodes" => self.nodes.get(key).cloned(),
+                "trie_values" => self.values.get(key).cloned(),
+                _ => panic!("unexpected namespace"),
+            })
+        }
+    }
+
+    impl ByteWrites for Nodes {
+        type Error = &'static str;
+        fn put_bytes(&mut self, space: &str, key: &[u8], bytes: &[u8]) -> Result<(), Self::Error> {
+            if self.fail_writes {
+                return Err("original write failure");
+            }
+            self.writes.push((space.into(), key.to_vec()));
+            match space {
+                "trie_nodes" => self.nodes.insert(key.to_vec(), bytes.to_vec()),
+                "trie_values" => self.values.insert(key.to_vec(), bytes.to_vec()),
+                _ => panic!("unexpected namespace"),
+            };
+            Ok(())
+        }
+    }
+
+    struct Hasher;
+    impl Digest for Hasher {
+        type Error = &'static str;
+        fn blake3(&mut self, bytes: &[u8]) -> Result<Vec<u8>, Self::Error> {
+            Ok(blake3::hash(bytes).as_bytes().to_vec())
+        }
+    }
+
+    fn tagged(tag: &str, bytes: &[u8]) -> [u8; 32] {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(tag.as_bytes());
+        hasher.update(bytes);
+        *hasher.finalize().as_bytes()
+    }
+
+    #[test]
+    fn a_first_insert_stores_one_canonical_leaf_under_its_tagged_digest() {
+        let mut store = Nodes::default();
+        let mut writes = Nodes::default();
+        let root = insert(
+            &mut store,
+            &mut writes,
+            &mut Hasher,
+            &[0; 32],
+            &[0xab],
+            b"xy",
+        )
+        .unwrap()
+        .unwrap();
+        // Leaf with nibbles [10, 11] and the inline value: the same canonical
+        // image the ingress boundary admits, hashed under the leaf tag.
+        let leaf = [0u8, 2, 10, 11, 0, 2, 120, 121];
+        assert_eq!(root, tagged("synch-mpt/1/leaf", &leaf));
+        assert_eq!(
+            writes.writes,
+            vec![("trie_nodes".to_string(), root.to_vec())]
+        );
+        assert_eq!(writes.nodes[&root.to_vec()], leaf);
+        assert_eq!(admit(&mut Hasher, &leaf).unwrap().unwrap(), root);
+        // Reading back through the lookup command sees the value.
+        assert_eq!(
+            get(&mut writes, &root, &[0xab]).unwrap(),
+            Some(b"xy".to_vec())
+        );
+    }
+
+    #[test]
+    fn large_values_are_stored_out_of_line_before_the_node_that_names_them() {
+        let big = vec![7u8; 129];
+        let mut reads = Nodes::default();
+        let mut sink = Nodes::default();
+        let root = insert(&mut reads, &mut sink, &mut Hasher, &[0; 32], b"k", &big)
+            .unwrap()
+            .unwrap();
+        assert_eq!(sink.writes[0].0, "trie_values");
+        assert_eq!(sink.writes[0].1, blake3::hash(&big).as_bytes().to_vec());
+        assert_eq!(sink.writes[1], ("trie_nodes".to_string(), root.to_vec()));
+    }
+
+    #[test]
+    fn bounds_are_refused_before_any_effect() {
+        let mut store = Nodes::default();
+        let mut writes = Nodes::default();
+        assert!(matches!(
+            insert(
+                &mut store,
+                &mut writes,
+                &mut Hasher,
+                &[0; 32],
+                &[0; 4097],
+                b"v"
+            ),
+            Ok(Err(MutationDomainError::KeyTooLong(4097)))
+        ));
+        assert!(matches!(
+            insert(
+                &mut store,
+                &mut writes,
+                &mut Hasher,
+                &[0; 32],
+                b"k",
+                &vec![0; 32769]
+            ),
+            Ok(Err(MutationDomainError::ValueTooLong(32769)))
+        ));
+        assert!(matches!(
+            remove(&mut store, &mut writes, &mut Hasher, &[0; 32], &[0; 4097]),
+            Ok(Err(MutationDomainError::KeyTooLong(4097)))
+        ));
+        assert!(writes.writes.is_empty());
+        // Removing from the empty trie answers the empty root without effects.
+        assert_eq!(
+            remove(&mut store, &mut writes, &mut Hasher, &[0; 32], b"k").unwrap(),
+            Ok([0; 32])
+        );
+        assert!(writes.writes.is_empty());
+    }
+
+    #[test]
+    fn a_missing_node_and_a_failed_write_are_reported_as_such() {
+        let mut store = Nodes::default();
+        let mut writes = Nodes::default();
+        assert!(matches!(
+            insert(&mut store, &mut writes, &mut Hasher, &[9; 32], b"k", b"v"),
+            Ok(Err(MutationDomainError::MissingNode(hash))) if hash == vec![9; 32]
+        ));
+        writes.fail_writes = true;
+        assert!(matches!(
+            insert(&mut store, &mut writes, &mut Hasher, &[0; 32], b"k", b"v"),
+            Err(OperationError::Host("original write failure"))
         ));
     }
 }

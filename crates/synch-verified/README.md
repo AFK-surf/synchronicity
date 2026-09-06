@@ -26,7 +26,10 @@ for peer-served nodes (`Trie/Verify.lean`: decode, re-encode identically,
 the shared key bound, the structural invariants, and the origin-versus-peer
 fault decision) is a Lean command over one `Digest.blake3` primitive; the
 Rust `hash_of_encoded`, `hashes_to` and `check_invariants` algorithms are
-deleted and `synch-mpt` only names the refusal. History retention now runs as a
+deleted and `synch-mpt` only names the refusal. The trie write path
+(`Trie/Mutate.lean`: insert and remove, canonical form, the order of writes)
+is likewise a pair of whole commands over raw reads, `ByteWrites.putBytes`
+and the digest; `synch-mpt`'s write helpers are deleted. History retention now runs as a
 complete Lean operation over raw scans and a separate Ed25519 primitive; the
 Rust retention loop and receipt/fork helpers are removed. Raw scans retain
 rows before a trailing host failure so Lean owns first-error selection.
