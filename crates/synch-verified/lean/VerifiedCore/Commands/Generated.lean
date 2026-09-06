@@ -231,6 +231,24 @@ instance : Decode Commands.DurableDomainError where
     | 2 => return .sizeMismatch (← Decode.decode) (← Decode.decode) (← Decode.decode)
     | _ => throw ()
 
+instance : Encode Commands.ServeDomainError where
+  encode out value := match value with
+    | .missingBlob => out.push 0
+    | .malformed => out.push 1
+    | .columnType a0 a1 a2 => out.push 2 |>.put a0 |>.put a1 |>.put a2
+    | .column a0 a1 => out.push 3 |>.put a0 |>.put a1
+    | .overBudget a0 a1 => out.push 4 |>.put a0 |>.put a1
+
+instance : Decode Commands.ServeDomainError where
+  decode := do
+    match ← readByte with
+    | 0 => return .missingBlob
+    | 1 => return .malformed
+    | 2 => return .columnType (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 3 => return .column (← Decode.decode) (← Decode.decode)
+    | 4 => return .overBudget (← Decode.decode) (← Decode.decode)
+    | _ => throw ()
+
 instance : Encode Commands.Ingested where
   encode out value := match value with
     | .mk a0 a1 => out |>.put a0 |>.put a1
@@ -246,6 +264,16 @@ instance : Encode Commands.Committed where
     | .mk a0 a1 => out |>.put a0 |>.put a1
 
 instance : Decode Commands.Committed where
+  decode := do
+    let a0 ← Decode.decode
+    let a1 ← Decode.decode
+    return .mk a0 a1
+
+instance : Encode Commands.Served where
+  encode out value := match value with
+    | .mk a0 a1 => out |>.put a0 |>.put a1
+
+instance : Decode Commands.Served where
   decode := do
     let a0 ← Decode.decode
     let a1 ← Decode.decode
@@ -272,6 +300,8 @@ instance : Encode Commands.Command where
     | .casHealMissing a0 => out.push 16 |>.put a0
     | .casReconcileScratch a0 => out.push 17 |>.put a0
     | .casClearCache a0 => out.push 18 |>.put a0
+    | .casEncodeSlice a0 a1 => out.push 19 |>.put a0 |>.put a1
+    | .casEncodeProof a0 a1 a2 a3 => out.push 20 |>.put a0 |>.put a1 |>.put a2 |>.put a3
 
 instance : Decode Commands.Command where
   decode := do
@@ -295,6 +325,8 @@ instance : Decode Commands.Command where
     | 16 => return .casHealMissing (← Decode.decode)
     | 17 => return .casReconcileScratch (← Decode.decode)
     | 18 => return .casClearCache (← Decode.decode)
+    | 19 => return .casEncodeSlice (← Decode.decode) (← Decode.decode)
+    | 20 => return .casEncodeProof (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode)
     | _ => throw ()
 
 end VerifiedCore

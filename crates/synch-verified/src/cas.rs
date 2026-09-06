@@ -6,12 +6,12 @@
 
 pub use crate::generated::{
     CellType, Committed, DurableDomainError, IngestDomainError, IngestInput, Ingested,
-    LifecycleDomainError, Outcome, PinHolder, ReadDomainError,
+    LifecycleDomainError, Outcome, PinHolder, ReadDomainError, ServeDomainError, Served,
 };
 pub use crate::host::IngestResources;
 pub use crate::operation::OperationError;
 use crate::{
-    host::{Clock, FileIO, Resources, Storage},
+    host::{Bao, Clock, FileIO, Resources, Storage},
     operation::{run, terminal, Capabilities, Command, Decode},
 };
 
@@ -53,6 +53,16 @@ pub enum DurableError<E> {
     Operation(OperationError<E>),
     Domain(DurableDomainError),
 }
+
+/// Completed serving failure, preserving original host errors.
+#[derive(Debug)]
+pub enum ServeError<E> {
+    Operation(OperationError<E>),
+    Domain(ServeDomainError),
+}
+
+/// What one exchange served: the encoded bytes and the group spans they cover.
+pub type ServedBytes = (Vec<u8>, Vec<(u64, u64)>);
 
 /// Decode a run's terminal, or carry its host or protocol failure through.
 fn finish<T: Decode, E>(
@@ -214,6 +224,74 @@ pub fn read<S: Storage>(
     };
     let result = run(storage, capabilities, &[], &command);
     finish_read(result, output)
+}
+
+/// The served bytes are released only on a successful terminal whose count is
+/// exactly what the sink holds, with the group spans they cover.
+fn finish_served<E>(
+    result: Result<Vec<u8>, OperationError<E>>,
+    output: ReadOutput<E>,
+) -> Result<ServedBytes, ServeError<E>> {
+    let outcome: Result<Served, ServeDomainError> =
+        finish(result).map_err(ServeError::Operation)?;
+    let served = outcome.map_err(ServeError::Domain)?;
+    if usize::try_from(served.count).ok() != Some(output.bytes.len()) {
+        return Err(ServeError::Operation(OperationError::Protocol));
+    }
+    Ok((output.bytes, served.spans))
+}
+
+fn serve<S: Storage>(
+    storage: &mut S,
+    bao: &mut dyn Bao<Error = S::Error>,
+    command: &Command,
+) -> Result<ServedBytes, ServeError<S::Error>> {
+    let mut output = ReadOutput {
+        bytes: Vec::new(),
+        error: std::marker::PhantomData,
+    };
+    let capabilities = Capabilities {
+        bao: Some(bao),
+        output: Some(&mut output),
+        ..Capabilities::default()
+    };
+    let result = run(storage, capabilities, &[], command);
+    finish_served(result, output)
+}
+
+/// Serve a Bao slice: the requested group spans the row holds, within the
+/// object, clamped to one exchange's window. Lean names the groups; the Bao
+/// service encodes exactly those into the private sink.
+pub fn encode_slice<S: Storage>(
+    storage: &mut S,
+    bao: &mut dyn Bao<Error = S::Error>,
+    root: &[u8; 32],
+    requested: &[(u64, u64)],
+) -> Result<ServedBytes, ServeError<S::Error>> {
+    let command = Command::CasEncodeSlice {
+        root: root.to_vec(),
+        requested: requested.to_vec(),
+    };
+    serve(storage, bao, &command)
+}
+
+/// Serve the interior tree over the requested group spans the row holds, no
+/// deeper than `level`; a proof past `budget` nodes is refused whole.
+pub fn encode_proof<S: Storage>(
+    storage: &mut S,
+    bao: &mut dyn Bao<Error = S::Error>,
+    root: &[u8; 32],
+    requested: &[(u64, u64)],
+    level: u8,
+    budget: u64,
+) -> Result<ServedBytes, ServeError<S::Error>> {
+    let command = Command::CasEncodeProof {
+        root: root.to_vec(),
+        requested: requested.to_vec(),
+        level: u64::from(level),
+        budget,
+    };
+    serve(storage, bao, &command)
 }
 
 /// Expire due claims, optionally for one holder, through Lean's complete

@@ -237,15 +237,31 @@ them.
 
 ## 5. CAS slices, in order
 
-**C1. Serving** (`Cas/Serve.lean`). `encodeSlice root ranges` computes
-`requested ∩ verified ∩ [0, groups)` clamped to `MAX_SLICE_GROUPS`, reads
-the row, and asks the `Bao` service for exactly that window of the payload
-and outboard into the output sink; `encodeProof` computes the same window
-and the `MAX_PROOF_NODES` refusal and asks the service for the proof. The
-Bao encoding itself stays in Rust. Proofs: every group Lean asks the host
-to serve is in the row's coverage; an over-budget proof is refused, not
-truncated; nothing is served for a row without the groups. Cutover:
-`backend.rs:494,654,740`, `blob.rs:325`, CLI.
+**C1. Serving** (`Cas/Serve.lean`). Done. `encodeSlice root ranges` reads
+the row through the read path's statement and decoder, computes
+`requested ∩ held ∩ [0, groups)` clamped to `maxSliceGroups`, and asks the
+new `Bao` host algebra (`Host/Bao.lean`: `encodeSlice`, `encodeProof`) for
+exactly that window; `encodeProof` computes the same window, answers a
+single-group object without asking, and turns the service's over-budget
+answer into a refusal of the whole request. The service appends its
+encoding to the run's private output sink, as a file transfer does, so a
+served window is never a Lean value; the interpreter loop serves the two
+effects by hand for that reason, and the trait's methods are written in the
+generator. The Bao tree, both formats and the walk stay in Rust as the
+service (`lean_serve.rs`), a stated trust assumption. Proved
+(`CasServeProofs`): every group the program asks the service for was
+requested, is held by the row's own record and lies within the object
+(`window_sound`, `wanted_sound`); a slice window covers at most
+`maxSliceGroups` groups; a missing row and an empty window are answered
+before the service is asked anything; a proof past the budget is an error
+with nothing published; on the simulated host the published bytes are
+exactly the service's encoding of the window the answer names, and every
+failed effect publishes nothing. Cutover: `Store::encode_slice` and
+`Store::encode_proof` delegate; the Rust window computation and
+`encode_slice_inner` are deleted. `encode_complete_proof` (the cloud path's
+in-memory outboard) stays Rust until C4. The requester-facing terminal
+carries the byte count and the served spans, so `SliceEnd`/`ProofEnd` are
+unchanged.
 
 **C2. Verified receive** (`Cas/Receive.lean`, `Cas/Delta.lean`). `writeSlice`
 owns the lease, `admit`, the row read, the complete short-circuit, the inline

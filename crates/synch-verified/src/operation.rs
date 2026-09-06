@@ -119,6 +119,16 @@ impl<'a> Reader<'a> {
         }
         (0..count).map(|_| read(self)).collect()
     }
+    pub(crate) fn option<T>(
+        &mut self,
+        read: impl FnOnce(&mut Self) -> Result<T, ()>,
+    ) -> Result<Option<T>, ()> {
+        match self.byte()? {
+            0 => Ok(None),
+            1 => read(self).map(Some),
+            _ => Err(()),
+        }
+    }
     pub(crate) fn cell(&mut self) -> Result<Cell, ()> {
         Ok(match self.byte()? {
             0 => Cell::Null,
@@ -309,6 +319,17 @@ impl EncodeReply for bool {
 impl EncodeReply for Vec<u8> {
     fn encode(out: &mut Vec<u8>, value: Self) {
         bytes(out, &value);
+    }
+}
+impl EncodeReply for Option<u64> {
+    fn encode(out: &mut Vec<u8>, value: Self) {
+        match value {
+            None => out.push(0),
+            Some(value) => {
+                out.push(1);
+                word(out, value);
+            }
+        }
     }
 }
 impl EncodeReply for Option<Vec<u8>> {
@@ -538,6 +559,7 @@ pub(crate) struct Capabilities<'a, E> {
     pub(crate) source: Option<&'a mut dyn crate::host::SourceIO<Error = E>>,
     pub(crate) digest: Option<&'a mut dyn crate::host::Digest<Error = E>>,
     pub(crate) writes: Option<&'a mut dyn crate::host::ByteWrites<Error = E>>,
+    pub(crate) bao: Option<&'a mut dyn crate::host::Bao<Error = E>>,
 }
 
 impl<E> Default for Capabilities<'_, E> {
@@ -554,6 +576,40 @@ impl<E> Default for Capabilities<'_, E> {
             source: None,
             digest: None,
             writes: None,
+            bao: None,
+        }
+    }
+}
+
+/// Append a host encoding to the output sink and reply with the count it
+/// added, shaped by `wrap`. A sink that cannot grow is a protocol failure
+/// delivered into the program, so its own cleanup still runs.
+fn sink_reply<E, A: EncodeReply>(
+    tag: u8,
+    encoded: Vec<u8>,
+    output: &mut dyn crate::host::Output<Error = OperationError<E>>,
+    errors: &mut Vec<Option<E>>,
+    wrap: impl FnOnce(u64) -> Option<A>,
+) -> Vec<u8> {
+    let count = encoded.len() as u64;
+    match output.append(&encoded) {
+        Ok(()) => match wrap(count) {
+            Some(value) => reply(tag, Ok::<A, E>(value), errors, EncodeReply::encode),
+            None => {
+                let mut out = vec![1, 0];
+                word(&mut out, 3);
+                word(&mut out, 0);
+                out
+            }
+        },
+        Err(OperationError::Host(error)) => {
+            reply(tag, Err::<A, _>(error), errors, EncodeReply::encode)
+        }
+        Err(_) => {
+            let mut out = vec![1, 0];
+            word(&mut out, 3);
+            word(&mut out, 0);
+            out
         }
     }
 }
@@ -610,6 +666,50 @@ fn execute<E>(
                         out.push(2);
                         out
                     }
+                }
+            }
+            // A Bao encoding lands in the output sink the way a transfer does:
+            // the host encodes exactly the groups the program named, and the
+            // program learns only the byte count it appended.
+            Frame::EncodeSlice(root, size, inline, spans) => {
+                let bao = capabilities
+                    .bao
+                    .as_deref_mut()
+                    .ok_or(OperationError::Protocol)?;
+                let output = capabilities
+                    .output
+                    .as_deref_mut()
+                    .ok_or(OperationError::Protocol)?;
+                match bao.encode_slice(root, size, inline, &spans) {
+                    Ok(encoded) => sink_reply(55, encoded, output, &mut errors, Some),
+                    Err(error) => reply(55, Err::<u64, _>(error), &mut errors, EncodeReply::encode),
+                }
+            }
+            Frame::EncodeProof(root, size, spans, level, budget) => {
+                let bao = capabilities
+                    .bao
+                    .as_deref_mut()
+                    .ok_or(OperationError::Protocol)?;
+                let output = capabilities
+                    .output
+                    .as_deref_mut()
+                    .ok_or(OperationError::Protocol)?;
+                match bao.encode_proof(root, size, &spans, level, budget) {
+                    Ok(Some(encoded)) => {
+                        sink_reply(56, encoded, output, &mut errors, |count| Some(Some(count)))
+                    }
+                    Ok(None) => reply(
+                        56,
+                        Ok::<Option<u64>, _>(None),
+                        &mut errors,
+                        EncodeReply::encode,
+                    ),
+                    Err(error) => reply(
+                        56,
+                        Err::<Option<u64>, _>(error),
+                        &mut errors,
+                        EncodeReply::encode,
+                    ),
                 }
             }
             Frame::Append(bytes) => match capabilities.output.as_deref_mut() {

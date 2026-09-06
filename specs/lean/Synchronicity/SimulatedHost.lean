@@ -3,6 +3,7 @@ import VerifiedCore.Host.Resources
 import VerifiedCore.Host.Construct
 import VerifiedCore.Host.Source
 import VerifiedCore.Crypto
+import VerifiedCore.Host.Bao
 import Synchronicity.Decidable
 
 /-! One stateful host for composed CAS proofs. Successful replies are computed
@@ -49,6 +50,12 @@ structure State where
   hash : ByteArray → ByteArray := fun _ => ⟨Array.replicate 32 0⟩
   outboard : ByteArray → ByteArray := fun _ => ByteArray.empty
   validateKey : List UInt8 → Bool := fun _ => true
+  /-- The Bao encodings are a trust parameter too: what the host would encode
+  for exactly the groups it is asked for, and whether a proof walk fits. -/
+  slice : ByteArray → UInt64 → Option ByteArray → List (UInt64 × UInt64) → ByteArray :=
+    fun _ _ _ _ => ByteArray.empty
+  proof : ByteArray → UInt64 → List (UInt64 × UInt64) → UInt64 → UInt64 → Option ByteArray :=
+    fun _ _ _ _ _ => some ByteArray.empty
 
 abbrev Result (A : Type) := A × State
 
@@ -272,6 +279,18 @@ def lease : Lease A → State → Result A
 def crypto : Crypto A → State → Result A
   | .validateEd25519 bytes, state => reply state "crypto" fun state => (.ok (state.validateKey bytes), state)
 
+/-- Encodings land in the private output, as a transfer does; the program
+sees only the count. A refused proof appends nothing. -/
+def bao : Bao A → State → Result A
+  | .encodeSlice root size inline spans, state => reply state "bao:slice" fun state =>
+      let encoded := state.slice root size inline spans
+      (.ok encoded.size.toUInt64, { state with output := state.output ++ encoded.data.toList })
+  | .encodeProof root size spans level budget, state => reply state "bao:proof" fun state =>
+      match state.proof root size spans level budget with
+      | none => (.ok none, state)
+      | some encoded =>
+        (.ok (some encoded.size.toUInt64), { state with output := state.output ++ encoded.data.toList })
+
 /-- Capability composition is shared by every proof and every operation. -/
 class Interpreter (E : Type → Type) where
   handle : E A → State → Result A
@@ -287,6 +306,7 @@ instance : Interpreter Construct := ⟨construct⟩
 instance : Interpreter Resources := ⟨resources⟩
 instance : Interpreter Lease := ⟨lease⟩
 instance : Interpreter Crypto := ⟨crypto⟩
+instance : Interpreter Bao := ⟨bao⟩
 instance [Interpreter L] [Interpreter R] : Interpreter (EffectSum L R) where
   handle
     | .left effect, state => Interpreter.handle effect state

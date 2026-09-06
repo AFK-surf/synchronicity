@@ -8,6 +8,7 @@ import VerifiedCore.Trie.Program
 import VerifiedCore.Trie.Verify
 import VerifiedCore.Trie.Mutate
 import VerifiedCore.Cas.Durable
+import VerifiedCore.Cas.Serve
 import VerifiedCore.Replication.History
 
 /-! The one native entry point. A command arrives as a packet, decoded with
@@ -101,6 +102,19 @@ def durable [Encode A] : Except Cas.Durable.Error A → Host.Reply ByteArray
   | .error (.sizeMismatch root recorded offered) =>
     terminalOf (Except.error (DurableDomainError.sizeMismatch root recorded offered) : Except _ A)
 
+def serving : Except Cas.Serve.Error Cas.Serve.Served → Host.Reply ByteArray
+  | .ok served =>
+    terminalOf (Except.ok (Served.mk served.count served.spans) : Except ServeDomainError Served)
+  | .error (.host hostFailure) => .error hostFailure
+  | .error .protocol => .error protocolFailure
+  | .error error => terminalOf (Except.error (match error with
+      | .missingBlob => ServeDomainError.missingBlob
+      | .malformed => .malformed
+      | .columnType index column actual => .columnType index column actual
+      | .column column reason => .column column reason
+      | .overBudget level budget => .overBudget level budget
+      | .host _ | .protocol => .malformed) : Except _ Served)
+
 def malformedRoot : Native := .pure (.error ⟨2, 0⟩)
 def protocol : Native := .pure (.error protocolFailure)
 
@@ -149,6 +163,11 @@ def dispatch : Command → Native
   | .casReconcileScratch marker => command (Cas.Durable.reconcileScratch marker) durable
   | .casClearCache root =>
     if root.size != 32 then protocol else command (Cas.Durable.clearCache root) durable
+  | .casEncodeSlice root requested =>
+    if root.size != 32 then protocol else command (Cas.Serve.encodeSlice root requested) serving
+  | .casEncodeProof root requested level budget =>
+    if root.size != 32 then protocol
+    else command (Cas.Serve.encodeProof root requested level budget) serving
 
 /-- Every command starts here: an undecodable packet is a protocol failure
 before any effect is requested. -/

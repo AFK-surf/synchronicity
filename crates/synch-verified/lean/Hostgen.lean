@@ -7,6 +7,7 @@ import VerifiedCore.Host.Upsert
 import VerifiedCore.Host.Resources
 import VerifiedCore.Host.Source
 import VerifiedCore.Host.Digest
+import VerifiedCore.Host.Bao
 import VerifiedCore.Host.Writes
 import VerifiedCore.Commands
 
@@ -67,7 +68,7 @@ def algebras : List Name := [
   ``VerifiedCore.Host.FileIO, ``VerifiedCore.Host.Clock, ``VerifiedCore.Host.Output,
   ``VerifiedCore.Host.Construct, ``VerifiedCore.Host.Upsert, ``VerifiedCore.Host.Resources,
   ``VerifiedCore.Host.Lease, ``VerifiedCore.Host.SourceIO, ``VerifiedCore.Host.Digest,
-  ``VerifiedCore.Host.ByteWrites]
+  ``VerifiedCore.Host.ByteWrites, ``VerifiedCore.Host.Bao]
 
 /-- The types that cross the command boundary: what a caller asks for and
 what a finished command reports. Each gets Lean `Encode`/`Decode` instances
@@ -78,8 +79,8 @@ def messages : List Name := [
   ``VerifiedCore.Trie.Refusal, ``VerifiedCore.Trie.Verdict, ``VerifiedCore.Trie.MutationError,
   ``VerifiedCore.Commands.LifecycleDomainError, ``VerifiedCore.Commands.IngestDomainError,
   ``VerifiedCore.Commands.ReadDomainError, ``VerifiedCore.Commands.HistoryDomainError,
-  ``VerifiedCore.Commands.DurableDomainError,
-  ``VerifiedCore.Commands.Ingested, ``VerifiedCore.Commands.Committed,
+  ``VerifiedCore.Commands.DurableDomainError, ``VerifiedCore.Commands.ServeDomainError,
+  ``VerifiedCore.Commands.Ingested, ``VerifiedCore.Commands.Committed, ``VerifiedCore.Commands.Served,
   ``VerifiedCore.Commands.Command]
 
 /-- Rust spellings that differ from the Lean short name. -/
@@ -111,7 +112,8 @@ def tags : List (String × Nat) := [
   ("Resources.discard", 45), ("Resources.syncParent", 46),
   ("Lease.acquire", 47), ("Lease.release", 48),
   ("SourceIO.stat", 49), ("SourceIO.readSome", 50), ("SourceIO.freeze", 51),
-  ("Digest.blake3", 53), ("ByteWrites.putBytes", 54)]
+  ("Digest.blake3", 53), ("ByteWrites.putBytes", 54),
+  ("Bao.encodeSlice", 55), ("Bao.encodeProof", 56)]
 
 /-- Which Rust service answers an algebra by default. -/
 def defaultRoute : String → Route
@@ -126,15 +128,18 @@ def defaultRoute : String → Route
   | "SourceIO" => .capability "source" "SourceIO"
   | "Digest" => .capability "digest" "Digest"
   | "ByteWrites" => .capability "writes" "ByteWrites"
+  | "Bao" => .capability "bao" "Bao"
   | _ => .special
 
-/-- Which Rust service each effect belongs to. The command inputs and the
-transfer into the output sink are not trait methods at all: the interpreter
-loop serves them from the run's own resources. -/
+/-- Which Rust service each effect belongs to. The command inputs, the
+transfer into the output sink and the Bao encodings that land in it are not
+trait methods derived from the algebra: the interpreter loop serves them from
+the run's own resources (the Bao trait's methods are written by hand below,
+because they hand their bytes to the sink). -/
 def route (algebra ctor : String) : Route :=
   match algebra ++ "." ++ ctor with
   | "Storage.readCounter" | "Storage.removeFile" => .capability "resources" "Resources"
-  | "Storage.readInput" | "FileIO.transfer" => .special
+  | "Storage.readInput" | "FileIO.transfer" | "Bao.encodeSlice" | "Bao.encodeProof" => .special
   | _ => defaultRoute algebra
 
 /-- Effects the interpreter loop dispatches by hand even though their service
@@ -155,17 +160,19 @@ def traitDoc : String → String
   | "Crypto" => "/// Primitive cryptography, separate from storage and domain validation."
   | "Digest" => "/// Primitive hashing of exactly the bytes the operation supplies, domain tag\n/// included. What is hashed and what a digest's equality means are the\n/// operation's decisions."
   | "ByteWrites" => "/// Raw content-addressed writes: the operation names the namespace, the\n/// address and the bytes, and has proved the address covers them."
+  | "Bao" => "/// The Bao tree as a service: slice and proof encodings of exactly the group\n/// spans the operation names, which it has read from the row's own record.\n/// The tree, its chaining values and both formats are a trust assumption on\n/// `bao-tree`/`blake3`; the interpreter appends what is encoded to the\n/// operation's output sink, so a served window is never a Lean value."
   | _ => ""
 
 /-- Trait methods the interpreter needs beyond the algebra's effects. -/
 def traitExtras : String → String
   | "FileIO" => "    /// Fill `buffer` from `offset`, returning `ShortRead` at EOF. The\n    /// interpreter hands over the tail of the operation's output sink, so a\n    /// transfer costs one read into the bytes the caller receives.\n    fn read_into(\n        &mut self,\n        handle: u64,\n        offset: u64,\n        buffer: &mut [u8],\n    ) -> Result<(), FileFailure<Self::Error>>;\n"
+  | "Bao" => "    /// Encode the Bao slice of exactly these half-open group spans of the\n    /// object, from its inline bytes or its payload and outboard files,\n    /// validating the local copy against the root.\n    fn encode_slice(\n        &mut self,\n        root: &[u8],\n        size: u64,\n        inline: Option<&[u8]>,\n        spans: &[(u64, u64)],\n    ) -> Result<Vec<u8>, Self::Error>;\n    /// Encode the interior tree nodes over these group spans, no deeper than\n    /// `level`, or answer `None` when the walk would exceed `budget` nodes.\n    fn encode_proof(\n        &mut self,\n        root: &[u8],\n        size: u64,\n        spans: &[(u64, u64)],\n        level: u64,\n        budget: u64,\n    ) -> Result<Option<Vec<u8>>, Self::Error>;\n"
   | "Output" => "    /// Extend the sink by `count` bytes and hand them back for an in-place\n    /// fill, so a file transfer lands directly in the result.\n    fn grow(&mut self, count: u64) -> Result<&mut [u8], Self::Error>;\n    /// Take back the last `count` bytes after a fill failed.\n    fn shrink(&mut self, count: u64);\n"
   | _ => ""
 
 def traitOrder : List String :=
   ["Storage", "Resources", "Crypto", "FileIO", "Clock", "Output", "Construct", "TemporaryFiles",
-    "Lease", "SourceIO", "Digest", "ByteWrites"]
+    "Lease", "SourceIO", "Digest", "ByteWrites", "Bao"]
 
 def baseTy : Name → Option Ty
   | ``UInt64 | ``VerifiedCore.Host.Transaction => some .u64
@@ -292,7 +299,7 @@ def leanAlgebra (algebra : Algebra) : String := Id.run do
   return out
 
 def leanFile (all : Array Algebra) : String := Id.run do
-  let mut out := "import VerifiedCore.Host.Codec\nimport VerifiedCore.Crypto\nimport VerifiedCore.Host.Construct\nimport VerifiedCore.Host.Source\nimport VerifiedCore.Host.Digest\nimport VerifiedCore.Host.Writes\n\n"
+  let mut out := "import VerifiedCore.Host.Codec\nimport VerifiedCore.Crypto\nimport VerifiedCore.Host.Construct\nimport VerifiedCore.Host.Source\nimport VerifiedCore.Host.Digest\nimport VerifiedCore.Host.Writes\nimport VerifiedCore.Host.Bao\n\n"
   out := out ++ "/-! GENERATED by `hostgen` from the effect algebras; do not edit. Each\nalgebra's tags, names, request encoder, reply decoder and `WireEffect`\ninstance follow from its constructors and the tag table. -/\nnamespace VerifiedCore.Host\nopen Wire\n"
   for algebra in all do
     out := out ++ "\n" ++ leanAlgebra algebra
@@ -377,6 +384,11 @@ partial def rustDecoder : Ty → String
       s!"r.list(Reader::{((inner.drop 2).dropEnd 3).toString})?"
     else s!"r.list(|r| Ok({inner}))?"
   | .prod a b => s!"({rustDecoder a}, {rustDecoder b})"
+  | .option t =>
+    let inner := rustDecoder t
+    if inner.startsWith "r." && inner.endsWith "()?" then
+      s!"r.option(Reader::{((inner.drop 2).dropEnd 3).toString})?"
+    else s!"r.option(|r| Ok({inner}))?"
   | t => panic! s!"hostgen: no request decoder for {repr t}"
 
 def rustTypeAll (all : Array Algebra) (route : Algebra → Ctor → Route) : List (String × Array (Algebra × Ctor)) := Id.run do
@@ -650,7 +662,7 @@ def main (args : List String) : IO UInt32 := do
   let modules : Array Name := #[`VerifiedCore.Host, `VerifiedCore.Crypto, `VerifiedCore.Host.Access,
     `VerifiedCore.Host.Construct, `VerifiedCore.Host.Upsert, `VerifiedCore.Host.Resources,
     `VerifiedCore.Host.Source, `VerifiedCore.Host.Digest, `VerifiedCore.Host.Writes,
-    `VerifiedCore.Commands]
+    `VerifiedCore.Host.Bao, `VerifiedCore.Commands]
   let env ← importModules (modules.map fun module => ({ module } : Import)) {} 0
   let (lean, commands, rust) ← Prod.fst <$> (Meta.MetaM.toIO (do
       let all ← algebras.toArray.mapM readAlgebra

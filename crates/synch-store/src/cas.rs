@@ -16,7 +16,7 @@ use std::{
 use bao_tree::{
     io::{
         outboard::PreOrderOutboard,
-        sync::{decode_ranges, encode_ranges, WriteAt},
+        sync::{decode_ranges, WriteAt},
     },
     BaoTree, BlockSize, ChunkNum,
 };
@@ -491,7 +491,7 @@ pub(crate) fn bitmap_to_ranges(bits: &[u8], groups: u64) -> ChunkRanges {
 }
 
 /// Converts our group ranges into bao chunk ranges.
-fn to_bao_ranges(ranges: &ChunkRanges) -> bao_tree::ChunkRanges {
+pub(crate) fn to_bao_ranges(ranges: &ChunkRanges) -> bao_tree::ChunkRanges {
     let per_group = 1u64 << CHUNK_GROUP_LOG2;
     let mut out = bao_tree::ChunkRanges::empty();
     for r in &ranges.ranges {
@@ -1268,57 +1268,16 @@ impl Store {
     /// an unclamped request would let a peer name an object-sized allocation —
     /// and no honest requester needs one, because `SliceEnd` tells it exactly
     /// how far it got and its next window starts there (§6.4, §12).
+    ///
+    /// The window (what was asked for, that the row holds, within the object,
+    /// clamped) is the Lean command `Cas.Serve.encodeSlice`; this store is
+    /// the Bao service that encodes exactly the groups it names.
     pub fn encode_slice(
         &self,
         root: &Hash,
         requested: &ChunkRanges,
     ) -> Result<(Vec<u8>, ChunkRanges)> {
-        let blob = self.blob(root)?.ok_or(StoreError::MissingBlob(*root))?;
-        let served = requested
-            .intersect(&blob.verified_groups())
-            .intersect(&ChunkRanges::single(0, group_count(blob.size)))
-            .take(synch_core::MAX_SLICE_GROUPS);
-        if served.is_empty() {
-            return Ok((Vec::new(), served));
-        }
-        let encoded = self.encode_slice_inner(&blob, &served)?;
-        Ok((encoded, served))
-    }
-
-    fn encode_slice_inner(&self, blob: &BlobRow, ranges: &ChunkRanges) -> Result<Vec<u8>> {
-        let tree = Self::tree(blob.size);
-        let bao_ranges = to_bao_ranges(ranges);
-        let mut encoded = Vec::new();
-        let root_hash = blake3::Hash::from_bytes(blob.root.0);
-
-        match &blob.inline {
-            Some(data) => {
-                let outboard = PreOrderOutboard {
-                    root: root_hash,
-                    tree,
-                    data: Vec::<u8>::new(),
-                };
-                encode_ranges(data.as_slice(), outboard, &bao_ranges, &mut encoded)
-            }
-            None => {
-                // Both files are read positionally, never slurped. An outboard
-                // is 1/256 of its object, so reading it whole costs 40 MB on a
-                // 10 GB object — and this runs once per served window (§6.4)
-                // and once per chunk of a streaming read, which turns a large
-                // object's transfer into a repeated scan of its own hash tree.
-                // What each call actually touches is the sibling hashes on the
-                // path to the requested groups.
-                let data = File::open(self.blob_path(&blob.root))?;
-                let outboard = PreOrderOutboard {
-                    root: root_hash,
-                    tree,
-                    data: DataFile(File::open(self.outboard_path(&blob.root))?),
-                };
-                encode_ranges(DataFile(data), outboard, &bao_ranges, &mut encoded)
-            }
-        }
-        .map_err(|error| StoreError::invalid(format!("encode slice: {error}")))?;
-        Ok(encoded)
+        crate::lean_serve::encode_slice(self, root, requested)
     }
 
     /// Caches one group-aligned range returned by the trusted remote backend.

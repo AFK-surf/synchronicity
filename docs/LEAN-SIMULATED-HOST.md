@@ -66,6 +66,11 @@ Relational comparisons cover the typed CAS/history schemas. The model does not
 implement SQLite affinity, arbitrary collations, numeric mixed-type ordering, or
 its full malformed-text behavior. General repair key theorems require canonical
 blob roots and text holders. LIKE supports ASCII case folding, `%`, and `_`.
+The Bao service is a trust parameter like the hash: `State.slice` and
+`State.proof` say what the host would encode for exactly the groups it is
+asked for (and whether a proof walk fits the budget); the encoding is
+appended to the private output, as a file transfer is, and never becomes a
+program value.
 Literal predicates (`equals`, `notEquals`, delete bounds) have SQL `IS`
 semantics, as the store adapter renders them: NULL selects NULL and `IS NOT`
 NULL excludes it. Conflict detection and join correlation keep SQL `=`, where

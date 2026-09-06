@@ -385,6 +385,21 @@ Integration review has identified specific gates, not waived limitations:
   durable out-of-line rows' cached groups. The simulated host's literal
   predicates now have SQL `IS` semantics (NULL selects NULL), matching the
   adapter. The five Rust SQL bodies in `cas.rs` are deleted.
+- Serving is now the whole commands `casEncodeSlice` and `casEncodeProof`
+  (`Cas/Serve.lean`) over the read path's row statement and a new `Bao`
+  host algebra (`Host/Bao.lean`). Lean decides the window: what was asked
+  for, that the row's own record holds, within the object, clamped to one
+  exchange for a slice; the Bao service encodes exactly those groups
+  straight into the run's private output sink, as a file transfer does, and
+  the program learns only the byte count. The two effects are served by the
+  interpreter loop by hand for that reason. A single-group object is
+  answered without the service; a proof the walk cannot fit in the node
+  budget is refused whole with nothing published. `CasServeProofs` proves
+  the window sound and bounded and derives each execution on the simulated
+  host, including that every failed effect publishes nothing. The Bao tree,
+  the slice and proof formats and the walk remain Rust (`lean_serve.rs`) as
+  a trust assumption; the Rust window computation is deleted, and the
+  cloud path's in-memory `encode_complete_proof` stays until C4.
 - Native tests now cover acquisition transport, every effect-failure position,
   repeated polling, malformed replies and terminal resume. Generic SQLite tests
   cover UPSERT identity/time preservation, raw cells, failed commit, abandoned

@@ -24,6 +24,7 @@ mod lean_ingest_metadata;
 mod lean_ingest_streams;
 mod lean_read;
 mod lean_resources;
+mod lean_serve;
 mod lean_storage;
 pub mod proof;
 pub mod recovery;

@@ -333,9 +333,9 @@ impl Subtree {
 
 /// What one walk of an object's tree established.
 #[derive(Debug, Default)]
-struct Proof {
+pub(crate) struct Proof {
     /// The interior nodes the walk visited, in pre-order.
-    nodes: Vec<(TreeNode, [u8; PROOF_NODE_LEN])>,
+    pub(crate) nodes: Vec<(TreeNode, [u8; PROOF_NODE_LEN])>,
     /// The subtrees whose chaining values the walk established.
     proven: Vec<ProvenSubtree>,
 }
@@ -446,7 +446,7 @@ where
 ///
 /// Returns what the walk established and, when the node budget ran out, the
 /// first group it could not cover.
-fn walk_proof<L>(
+pub(crate) fn walk_proof<L>(
     root: &Hash,
     size: u64,
     ranges: &ChunkRanges,
@@ -478,7 +478,7 @@ where
 }
 
 /// Reads a node's pair out of a pre-order outboard.
-fn load_from_outboard<R: ReadAt>(
+pub(crate) fn load_from_outboard<R: ReadAt>(
     outboard: &PreOrderOutboard<R>,
     root: &Hash,
     node: &TreeNode,
@@ -596,6 +596,19 @@ impl Store {
     ///
     /// An over-budget request is refused rather than truncated; see the walk
     /// below for why that is safe once the requester sizes its own windows.
+    ///
+    /// The window (what was asked for, that the row holds, within the
+    /// object), the single-group short-circuit and the refusal of a walk that
+    /// overran the budget are the Lean command `Cas.Serve.encodeProof`; this
+    /// store is the Bao service that walks the tree over the groups it names.
+    /// Refusing *after* walking is not the amplification it reads as: the
+    /// budget is checked before each node is loaded, so an over-budget request
+    /// costs at most `budget` loads, strictly less than a conforming maximal
+    /// request, which does the same loads and then serialises and sends the
+    /// result. Refusing is also what keeps this to a single walk: serving a
+    /// truncated answer would mean making the two sides agree about where it
+    /// stopped, at up to `MAX_PROOF_NODES` random 64-byte outboard reads for
+    /// a ~50-byte request.
     pub fn encode_proof(
         &self,
         root: &Hash,
@@ -603,66 +616,7 @@ impl Store {
         level: u8,
         budget: u64,
     ) -> Result<(Vec<u8>, ChunkRanges)> {
-        let blob = self.blob(root)?.ok_or(StoreError::MissingBlob(*root))?;
-        let groups = group_count(blob.size);
-        let wanted = requested
-            .intersect(&blob.verified_groups())
-            .intersect(&ChunkRanges::single(0, groups));
-        if wanted.is_empty() || groups <= 1 {
-            // A single-group object has no interior nodes at all: its root is
-            // the group, and there is nothing to prove about it that the root
-            // does not already say.
-            return Ok((Vec::new(), wanted));
-        }
-
-        let tree = Self::tree(blob.size);
-        let outboard = PreOrderOutboard {
-            root: blake3::Hash::from_bytes(root.0),
-            tree,
-            data: DataFile(File::open(self.outboard_path(root))?),
-        };
-        let (proof, truncated) =
-            walk_proof(root, blob.size, &wanted, level, budget, false, |node| {
-                load_from_outboard(&outboard, root, node)
-            })?;
-        // A truncated walk is a refused request, not a partial answer.
-        //
-        // The requester sizes its window from `proof_nodes_upper_bound` so that
-        // a provider holding *everything* it asked for still fits the budget,
-        // and this walk covers `requested ∩ what we hold`, which is a subset of
-        // that and so cannot cost more. Overrunning therefore means the request
-        // was not sized by a conforming requester, and the answer is to say so
-        // rather than to serve a prefix.
-        //
-        // Refusing *after* walking is not the amplification it reads as: the
-        // budget is checked before each node is loaded, so an over-budget
-        // request costs at most `budget` loads — strictly less than a
-        // conforming maximal request, which does the same loads and then
-        // serialises and sends the result. The §12 sanity bound on this message
-        // is enforced, and it is enforced by `budget`, not by this check.
-        //
-        // Refusing is also what keeps this to a single walk. Serving a
-        // truncated answer would mean making the two sides agree about where it
-        // stopped — done by discarding the work and walking the whole thing
-        // again over the ranges that fit, at up to `MAX_PROOF_NODES` random
-        // 64-byte outboard reads for a ~50-byte request.
-        if let Some(at) = truncated {
-            return Err(StoreError::Verification {
-                root: *root,
-                reason: format!(
-                    "a proof over these ranges at level {level} exceeds the \
-                     {budget}-node budget (stopped at group {at}); the requester \
-                     must split the request"
-                ),
-            });
-        }
-        let served = wanted;
-
-        let mut encoded = Vec::with_capacity(proof.nodes.len() * PROOF_NODE_LEN);
-        for (_, pair) in &proof.nodes {
-            encoded.extend_from_slice(pair);
-        }
-        Ok((encoded, served))
+        crate::lean_serve::encode_proof(self, root, requested, level, budget)
     }
 
     /// Encodes a proof for a remotely durable complete object from its whole

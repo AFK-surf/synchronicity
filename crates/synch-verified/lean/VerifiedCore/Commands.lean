@@ -7,6 +7,7 @@ import VerifiedCore.Trie.Program
 import VerifiedCore.Trie.Verify
 import VerifiedCore.Trie.Mutate
 import VerifiedCore.Cas.Durable
+import VerifiedCore.Cas.Serve
 
 /-! The shapes that cross the command boundary: what a caller asks for and
 what a finished command reports. `hostgen` derives the codecs of every type
@@ -66,6 +67,12 @@ inductive Command where
   | casReconcileScratch (marker : String)
   /-- Drop reconstructible local bytes while keeping a remote durable claim. -/
   | casClearCache (root : ByteArray)
+  /-- Serve a Bao slice of the requested group spans into the run's output
+  sink: what the row holds, clamped to one exchange's window. -/
+  | casEncodeSlice (root : ByteArray) (requested : List (UInt64 × UInt64))
+  /-- Serve the interior tree over the requested group spans, no deeper than
+  `level`, refused whole beyond `budget` nodes. -/
+  | casEncodeProof (root : ByteArray) (requested : List (UInt64 × UInt64)) (level budget : UInt64)
 
 /-- Malformed metadata or a column of the wrong storage class, as pin
 acquisition and deletion report it. -/
@@ -101,6 +108,16 @@ inductive DurableDomainError where
   | sizeMismatch (root : ByteArray) (recorded offered : UInt64)
   deriving BEq, DecidableEq
 
+/-- How serving refuses: no row, a malformed row, or a proof that does not
+fit the node budget. -/
+inductive ServeDomainError where
+  | missingBlob
+  | malformed
+  | columnType (index : Nat) (column : String) (actual : Cas.Codec.CellType)
+  | column (column : String) (reason : String)
+  | overBudget (level budget : UInt64)
+  deriving BEq, DecidableEq
+
 inductive HistoryDomainError where
   | malformed
   | columnType (index : Nat) (column : String) (actual : Cas.Codec.CellType)
@@ -120,6 +137,13 @@ group of the object is present. -/
 structure Committed where
   size : UInt64
   complete : Bool
+  deriving BEq, DecidableEq
+
+/-- What one exchange served: the bytes appended to the output sink and the
+group spans they cover. -/
+structure Served where
+  count : UInt64
+  spans : List (UInt64 × UInt64)
   deriving BEq, DecidableEq
 
 end VerifiedCore.Commands

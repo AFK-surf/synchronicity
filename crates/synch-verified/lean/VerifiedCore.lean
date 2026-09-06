@@ -4,6 +4,7 @@ import VerifiedCore.Cas.IngestCommit
 import VerifiedCore.Cas.Ingest
 import VerifiedCore.Cas.Input
 import VerifiedCore.Cas.Durable
+import VerifiedCore.Cas.Serve
 import VerifiedCore.Entry
 import VerifiedCore.Trie.Program
 import VerifiedCore.Trie.Verify

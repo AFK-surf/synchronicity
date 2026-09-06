@@ -30,3 +30,4 @@ import Synchronicity.CasStorePromises
 import Synchronicity.SimulatedHostProofs
 import Synchronicity.CasCompositionProofs
 import Synchronicity.CasDurableProofs
+import Synchronicity.CasServeProofs
