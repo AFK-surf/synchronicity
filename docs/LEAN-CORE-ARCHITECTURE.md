@@ -886,6 +886,19 @@ versus empty byte values. The post-refactor store/verified suite passed (335
 tests, five ignored), as did all-target Clippy with warnings denied and formatting.
 These local checks do not substitute for subsequent platform checks.
 
+The second step shares only mechanical store-side diagnostics: CAS column-type
+conversion and classification of filesystem failures as missing, short-read or
+other. Keep operation-specific messages and domain-error mapping at each caller.
+Preserve the original `StoreError` rather than reconstructing it from text or
+classifying non-I/O errors as filesystem failures. No new public error type or
+host capability is required. History's separately typed diagnostics, SQL query
+validation, namespace rules and connection/resource guards remain unchanged.
+The shared helpers have four regressions covering all five SQLite storage
+classes, native index bounds, I/O classification, raw OS codes and original error
+allocation identity. The combined store/verified suite and all-target Clippy
+passed again after this step. Neither refactor changes Lean sources or the ABI;
+cross-platform CI is still required on the final refactor commit.
+
 ### Bounded development validation
 
 Native compilation and the repository's Lean packages limit each Lean compiler

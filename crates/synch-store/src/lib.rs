@@ -10,6 +10,7 @@ pub mod db;
 pub mod error;
 pub mod gc;
 pub mod heads;
+mod lean_diagnostics;
 mod lean_hash;
 mod lean_history;
 mod lean_ingest;

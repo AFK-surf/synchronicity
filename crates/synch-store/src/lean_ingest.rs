@@ -5,6 +5,7 @@ use synch_core::Hash;
 use synch_verified::{cas, host};
 
 use crate::{
+    lean_diagnostics,
     lean_resources::{Files, Input, Leases},
     Result, Store, StoreError,
 };
@@ -30,19 +31,7 @@ fn error(error: cas::IngestError<StoreError>) -> StoreError {
             index,
             column,
             actual,
-        }) => {
-            let kind = match actual {
-                cas::CellType::Null => rusqlite::types::Type::Null,
-                cas::CellType::Integer => rusqlite::types::Type::Integer,
-                cas::CellType::Real => rusqlite::types::Type::Real,
-                cas::CellType::Text => rusqlite::types::Type::Text,
-                cas::CellType::Blob => rusqlite::types::Type::Blob,
-            };
-            match usize::try_from(index) {
-                Ok(index) => rusqlite::Error::InvalidColumnType(index, column, kind).into(),
-                Err(_) => StoreError::invalid("native column index exceeds address space"),
-            }
-        }
+        }) => lean_diagnostics::column_type(index, column, actual),
         IngestError::Domain(Domain::SizeMismatch {
             root,
             recorded,

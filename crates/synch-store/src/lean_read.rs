@@ -7,7 +7,7 @@ use bao_tree::io::sync::ReadAt;
 use synch_core::Hash;
 use synch_verified::{cas, host};
 
-use crate::{Result, Store, StoreError};
+use crate::{lean_diagnostics, Result, Store, StoreError};
 
 struct Files<'a> {
     store: &'a Store,
@@ -22,18 +22,6 @@ impl<'a> Files<'a> {
             opened: BTreeMap::new(),
             next: 1,
         }
-    }
-}
-
-fn io_failure(error: std::io::Error) -> host::FileFailure<StoreError> {
-    let kind = match error.kind() {
-        std::io::ErrorKind::NotFound => host::FileFailureKind::Missing,
-        std::io::ErrorKind::UnexpectedEof => host::FileFailureKind::ShortRead,
-        _ => host::FileFailureKind::Other,
-    };
-    host::FileFailure {
-        error: error.into(),
-        kind,
     }
 }
 
@@ -60,7 +48,8 @@ impl host::FileIO for Files<'_> {
             .next
             .checked_add(1)
             .ok_or_else(|| file_protocol("file handle exhaustion"))?;
-        let file = File::open(self.store.blob_path(&root)).map_err(io_failure)?;
+        let file = File::open(self.store.blob_path(&root))
+            .map_err(|error| lean_diagnostics::io_failure(error.into()))?;
         let handle = self.next;
         self.next = next;
         self.opened.insert(handle, file);
@@ -84,7 +73,8 @@ impl host::FileIO for Files<'_> {
             .try_reserve_exact(count)
             .map_err(|_| file_protocol("file read allocation failed"))?;
         bytes.resize(count, 0);
-        file.read_exact_at(offset, &mut bytes).map_err(io_failure)?;
+        file.read_exact_at(offset, &mut bytes)
+            .map_err(|error| lean_diagnostics::io_failure(error.into()))?;
         Ok(bytes)
     }
 
@@ -131,19 +121,7 @@ fn error(root: &Hash, error: cas::ReadError<StoreError>) -> StoreError {
             index,
             column,
             actual,
-        }) => {
-            let kind = match actual {
-                cas::CellType::Null => rusqlite::types::Type::Null,
-                cas::CellType::Integer => rusqlite::types::Type::Integer,
-                cas::CellType::Real => rusqlite::types::Type::Real,
-                cas::CellType::Text => rusqlite::types::Type::Text,
-                cas::CellType::Blob => rusqlite::types::Type::Blob,
-            };
-            match usize::try_from(index) {
-                Ok(index) => rusqlite::Error::InvalidColumnType(index, column, kind).into(),
-                Err(_) => StoreError::invalid("native column index exceeds address space"),
-            }
-        }
+        }) => lean_diagnostics::column_type(index, column, actual),
         ReadError::Domain(Domain::Column { column, reason }) => match column.as_str() {
             "blobs.root" => StoreError::column("blobs.root", reason),
             _ => StoreError::invalid("unknown native read error column"),

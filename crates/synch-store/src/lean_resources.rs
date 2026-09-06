@@ -14,7 +14,7 @@ use bao_tree::io::sync::{ReadAt, WriteAt};
 use synch_core::Hash;
 use synch_verified::host::{self, ByteWriter, FileIO, Lease, SourceIO, TemporaryFiles};
 
-use crate::{db::WriteLease, Result, Store, StoreError};
+use crate::{db::WriteLease, lean_diagnostics::io_failure, Result, Store, StoreError};
 
 #[derive(Debug, Clone, Copy)]
 pub(crate) enum Input<'a> {
@@ -343,19 +343,6 @@ fn input_key(space: &str, key: &[u8]) -> Result<()> {
     } else {
         Err(StoreError::invalid("unsupported invocation input"))
     }
-}
-
-fn io_failure(error: StoreError) -> host::FileFailure<StoreError> {
-    let kind = match &error {
-        StoreError::Io(error) if error.kind() == io::ErrorKind::NotFound => {
-            host::FileFailureKind::Missing
-        }
-        StoreError::Io(error) if error.kind() == io::ErrorKind::UnexpectedEof => {
-            host::FileFailureKind::ShortRead
-        }
-        _ => host::FileFailureKind::Other,
-    };
-    host::FileFailure { error, kind }
 }
 
 impl FileIO for Files<'_> {
