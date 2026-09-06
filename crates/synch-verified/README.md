@@ -184,7 +184,8 @@ Apple's system libc++. OS libraries remain dynamic dependencies.
 The whole-operation proof modules in `specs/lean` import the exact production
 Lean sources. Their individual theorem scopes and host assumptions remain
 explicit; they do not prove arbitrary filesystem/database behavior, native
-cryptographic primitives, the Rust interpreters, the C adapter or the compiler.
+cryptographic primitives, the Rust interpreters, the runtime bindings or the
+compiler.
 
 Nothing in `specs/lean` models Rust. Scoped walks, completeness certificates,
 cloud and network ingestion and every other Rust path are covered by
@@ -193,15 +194,20 @@ with a Rust site.
 
 ## ABI and ownership
 
-Only one command constructor (`synch_adapter_start`, taking an encoded
-`Command`), the packet/resume transport and runtime/object lifetime functions
-cross the ABI. Rust executes raw effects synchronously and
-returns their results to Lean. Handles and packets are invocation-owned and
-thread-confined; no shared scope/walk/cache object graphs cross foreign threads.
-The runtime initializes once per process and initializes/finalizes calling
-threads through TLS. Resume transfers the owned continuation; packets retain
-independent byte-array ownership. Strict framing and original host errors are
-preserved, and read output stays private until a successful terminal result.
+Only one command constructor (`synch_lean_start`, taking an encoded
+`Command`) and the packet/resume transport cross the ABI, as Lean exports
+called directly from Rust; there is no C shim. `src/native.rs` holds the
+runtime and object lifetime calls and the Lean object layout it needs to
+build byte arrays and hold references, copied from the pinned toolchain's
+`lean.h`; `src/layout.c` asserts that layout against the real header at
+compile time, and `build.rs` refuses any other Lean version. Rust executes raw
+effects synchronously and returns their results to Lean. Handles and packets
+are invocation-owned and thread-confined; no shared scope/walk/cache object
+graphs cross foreign threads. The runtime initializes once per process and
+initializes/finalizes calling threads through TLS. Resume transfers the owned
+continuation; packets retain independent byte-array ownership. Strict framing
+and original host errors are preserved, and read output stays private until a
+successful terminal result.
 
 The `decisions` example is now a static-link smoke check of a complete lookup,
 not a scalar predicate benchmark. The architecture document retains historical

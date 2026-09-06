@@ -50,7 +50,7 @@ fn main() {
     }
     println!("cargo:rerun-if-changed=lean/Hostgen.lean");
     println!("cargo:rerun-if-changed=lean/lean-toolchain");
-    println!("cargo:rerun-if-changed=src/adapter.c");
+    println!("cargo:rerun-if-changed=src/layout.c");
     let target = env::var("TARGET").unwrap();
     let linux = target.ends_with("-linux-gnu");
     let macos = target.ends_with("-apple-darwin");
@@ -107,7 +107,7 @@ fn main() {
         "Lean runtime {triple} is incompatible with Cargo target {target}"
     );
     // Dependency order above is shared by the native compiler and proof imports.
-    // Domain modules remain separate; the ABI adapter does not implement policy.
+    // Domain modules remain separate; the runtime layer in native.rs does not implement policy.
     let mut compiled_modules = Vec::new();
     for module in modules {
         let object = out.join(format!("VerifiedCore/{module}.olean"));
@@ -140,7 +140,8 @@ fn main() {
         .include(sysroot.join("include"))
         .file(&generated)
         .files(&compiled_modules)
-        .file(root.join("src/adapter.c"))
+        // Compile-time checks of the object layout native.rs copies from lean.h.
+        .file(root.join("src/layout.c"))
         .flag_if_supported("-Wno-unused-parameter")
         .compile("synch_verified_core");
     println!(
