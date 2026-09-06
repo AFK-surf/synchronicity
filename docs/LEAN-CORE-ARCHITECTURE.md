@@ -505,20 +505,21 @@ a replacement build while its original process is still alive.
 
 ### Complete ingestion: construction and publication boundary
 
-The next production replacement is the **whole** `ingest_bytes`/`ingest_file`
-operation. Moving `commit_groups` behind another row planner, or asking Rust for
-an outboard, verified spans or an attested size, would retain the wrong core.
-The internal construction algorithm lives in `Cas/Bao.lean`; until the complete
-command and native host are wired, it is staged shared executable source, not
-a production cutover. No new standalone Bao/planner Rust facade is introduced.
+Production local `ingest_bytes`/`ingest_file` now execute as **whole Lean
+operations**. Their Rust orchestration, `write_payload`, `commit_complete` and
+old ingestion-only pause hooks have been deleted. The internal construction
+algorithm lives in `Cas/Bao.lean`; Rust provides raw storage and cryptographic
+primitives, never an outboard, verified spans or an attested-size snapshot.
+No standalone Bao/planner facade or alternative Rust local ingestion exists.
 
-The staged native integration now invokes the **whole** `Cas/Input.run` byte
+The mandatory native integration invokes the **whole** `Cas/Input.run` byte
 or file command. Its Rust wrapper binds raw services and translates terminal
 diagnostics only. Lean observes file metadata, chooses exact-length versus
 EOF reads, selects inline storage, and composes `Cas/Ingest.run` for out-of-line
-publication. The production `Store::ingest_bytes` and `Store::ingest_file`
-entrypoints have not switched yet; their Rust implementations are to be deleted
-at the cutover, not retained behind an implementation option.
+publication. `Store::ingest_bytes` and `Store::ingest_file` only supply a raw
+input capability and translate the completed result. The obsolete
+`cas-write-complete-commit` Rust/abstract-model pairing anchor is removed;
+same-source program proofs cover the executed local ingestion path.
 
 An initially small file still captures to EOF, even if it grows beyond 16 KiB.
 That exceptional branch retains its captured bytes, as the previous whole-file
@@ -652,7 +653,8 @@ evaluation was replaced by compositional equations after hitting evaluator
 limits; no unchecked evaluator or enlarged recursion limit is required.
 The additional root, slot-enumeration and trace results below strengthen these
 checks. Their raw-host assumptions remain explicit; native primitive/layout
-tests and platform/performance gates still precede production cutover. Invocation-owned source, payload and outboard
+tests check the native boundary, with the measured throughput gap remaining
+explicit performance work. Invocation-owned source, payload and outboard
 resources must be distinct; fresh temporary creation establishes this host
 resource contract before the internal constructor is called.
 
@@ -787,18 +789,26 @@ Directory synchronization uses an explicit backend policy: require successful
 sync, or accept a reported unsupported operation on a configured platform.
 Actual I/O failure is never accepted. The latter policy does not prove
 directory persistence and cannot be described as such; Windows replacement
-must still retain the existing write-through/retry semantics. The staged
-captured-source command is composed by the staged whole `Cas/Input.run`
+must still retain the existing write-through/retry semantics. The internal
+captured-source command is composed by the whole `Cas/Input.run`
 command described above; it is not separately exported as a Rust planner.
-The production `ingest_bytes`/`ingest_file` cutover still awaits its gates.
+The production local entrypoints use that command unconditionally.
 
-Cutover gates are executable construction/layout proofs, actual primitive and
+Local cutover validation includes executable construction/layout proofs, actual primitive and
 outboard fixtures, single-pass changing-file tests, native transfer/allocation
 checks, failure injection across every file/lease/SQL effect, and deterministic
-GC-versus-publication tests. Then remove Rust ingestion orchestration and its
-obsolete abstract pairing anchors. Cloud adoption/finalization and Bao
-serving/import must compose this internal Lean construction/codec machinery;
-they must not call back into Rust domain operations.
+GC-versus-publication tests. Performance parity is not claimed: the measured
+gap remains to be reduced without restoring Rust domain logic. Cloud
+adoption/finalization and Bao serving/import remain unfinished migrations;
+`compute_outboard` and `TeeReader` still have production cloud callers, so they
+cannot yet be removed globally. Those operations must compose the internal
+Lean construction/codec machinery, not call back into Rust domain operations.
+The memory probe now exercises only the mandatory public entrypoints;
+historical Rust measurements are documentation, not a retained fallback.
+Post-cutover isolated debug checks measured 2152/2280 KiB additional peak RSS
+for 4/64 MiB + 3 byte file inputs, and 2344/2216 KiB for byte inputs. All root
+and cleanup checks passed. These are process-level observations, not universal
+allocation bounds or release-throughput measurements.
 
 ### Bounded development validation
 
@@ -809,6 +819,10 @@ sequentially (`CARGO_BUILD_JOBS=1`, test threads 1), and check individual change
 proof targets before the aggregate build. An OS process-group memory limit adds
 protection for the whole build; a virtual-address limit is not an equivalent
 measure for memory-mapped proof artifacts.
+Use one active build/test scope with `MemoryMax=4G` and `MemorySwapMax=0`;
+subagents must not start competing builds. After an interrupted session, inspect
+surviving processes/scopes before launching another job. If the cap is reached,
+inspect its memory events and narrow the work instead of raising the limit.
 
 The transport proofs import only their executable runtime modules, not the
 abstract model prelude. Fixed-width integer reads use one bounds check/state

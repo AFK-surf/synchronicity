@@ -16,6 +16,14 @@ entire Rust engine or its FFI/storage effects. The native package imports no
 Mathlib. Builds require the pinned Lean toolchain on Linux GNU, macOS, or
 Windows GNU/LLVM; there is no alternative Rust implementation.
 
+Local `Store::ingest_bytes`/`ingest_file` now execute the whole `Cas/Input` and
+`Cas/Ingest` Lean programs. Input, cleanup, metadata, chunk-tree and outboard
+trace proofs import their actual executable source; the deleted Rust complete
+ingestion implementation no longer has a manual pairing anchor. Cloud and
+partial/network ingestion remain separate unfinished migrations, and native
+cryptography, filesystem behavior and FFI ownership remain explicit trust
+boundaries.
+
 The [operation architecture](../../docs/LEAN-CORE-ARCHITECTURE.md) requires
 proofs over complete executable Lean programs, not host-prepared snapshots.
 `HostProgramProofs` proves composition and transaction failure traces of the

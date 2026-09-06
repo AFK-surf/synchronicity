@@ -1,7 +1,7 @@
 import VerifiedCore.Cas.Codec
 import VerifiedCore.Host.Upsert
 
-/-! Internal metadata stage for future whole ingestion. No native constructor
+/-! Internal metadata stage of whole ingestion. No native constructor
 or Rust planner interface exposes this stage. Payload hashing, writing and
 syncing must precede it under the whole operation's write lease. -/
 namespace VerifiedCore.Cas.IngestCommit

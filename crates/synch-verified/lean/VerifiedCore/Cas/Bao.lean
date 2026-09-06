@@ -83,7 +83,7 @@ def buildAux : Nat → UInt64 → UInt64 → UInt64 → Nat → Nat → Nat → 
         hash (.parent isRoot left right)
 
 /-- Complete bounded-memory construction for a known UInt64 input length.
-The public ingestion operation will supply invocation-owned staging handles;
+The whole ingestion operation supplies invocation-owned staging handles;
 this program never publishes files or metadata itself. Sixty-four levels
 cover every possible UInt64-sized object, including the empty object. -/
 def build (source payload outboard size : UInt64) : Action ByteArray :=

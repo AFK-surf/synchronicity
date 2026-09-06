@@ -1,6 +1,5 @@
-//! Whole native Lean ingestion integration, staged until production cutover
-//! gates finish. Rust binds raw services and maps terminal diagnostics only.
-#![cfg_attr(not(test), allow(dead_code))]
+//! Mandatory whole native Lean ingestion integration. Rust binds raw services
+//! and maps terminal diagnostics only; no alternative ingestion algorithm lives here.
 
 use synch_core::Hash;
 use synch_verified::{cas, host};

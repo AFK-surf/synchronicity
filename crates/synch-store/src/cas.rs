@@ -703,142 +703,20 @@ impl Store {
     // ---- ingest -----------------------------------------------------------
 
     /// Ingests an in-memory object, returning its root.
-    pub fn ingest_bytes(&self, data: &[u8], now: i64) -> Result<Hash> {
-        let size = data.len() as u64;
-        let tree = Self::tree(size);
-        let mut outboard = vec![0u8; tree.outboard_size() as usize];
-        let root = compute_outboard(data, tree, &mut outboard)?;
-
-        if size <= INLINE_BLOB_MAX {
-            self.commit_complete(&root, size, Some(data.to_vec()), now)?;
-        } else {
-            // Held from the first byte on disk through the row that describes
-            // it, exactly as `write_slice` does. An ingest re-creating content
-            // whose *old* row is a collection candidate is the one writer that
-            // races `gc_content` rather than `gc_orphans`, so the mtime window
-            // does not cover it ([`Store::lease_write`]).
-            let _lease = self.lease_write(&root);
-            self.write_payload(&root, data, &outboard)?;
-            self.commit_complete(&root, size, None, now)?;
-        }
-        Ok(root)
-    }
-
-    /// Ingests a file from the local filesystem in a single streaming pass,
-    /// emitting the outboard as a by-product (§7.1).
-    pub fn ingest_file(&self, path: &std::path::Path, now: i64) -> Result<(Hash, u64)> {
-        let metadata = std::fs::metadata(path)?;
-        let size = metadata.len();
-        if size <= INLINE_BLOB_MAX {
-            let data = std::fs::read(path)?;
-            // The length of what was read, not what the stat said. A file
-            // appended to between the two is ordinary — a log, a download in
-            // progress — and returning the stale length publishes an entry
-            // whose size does not describe its own root: no peer can fetch
-            // that version, because their tree is built over the wrong length.
-            let size = data.len() as u64;
-            let root = self.ingest_bytes(&data, now)?;
-            return Ok((root, size));
-        }
-
-        let tree = Self::tree(size);
-        let mut outboard = vec![0u8; tree.outboard_size() as usize];
-        // Stream the file once, teeing into a staging file in the CAS so the
-        // payload lands without a second read.
-        //
-        // Into the staging directory, never the CAS root: the root holds shard
-        // directories, and a regular file among them stopped
-        // [`Store::gc_orphans`] dead — `read_dir` on a file is `NotADirectory`,
-        // which the sweep took as a hard error, so one leaked staging file
-        // disabled orphan collection on that node forever. The sweep is also
-        // what reclaims these, which is why they have a place of their own.
-        std::fs::create_dir_all(self.staging_dir())?;
-        // Unique per ingest, not just per process: two concurrent ingests
-        // (a scan and a control-socket `put`, or parallel space scans) must not
-        // share one staging file, or each would truncate the other's stream and
-        // rename a corrupt payload into place under a correct-looking root.
-        let staging = self
-            .staging_dir()
-            .join(format!("{}.tmp", synch_core::fs::unique_suffix()));
-        let root = {
-            let source = File::open(path)?;
-            let sink = File::create(&staging)?;
-            let tee = TeeReader {
-                inner: source,
-                sink,
-            };
-            match compute_outboard(tee, tree, &mut outboard) {
-                Ok(root) => root,
-                Err(e) => {
-                    let _ = std::fs::remove_file(&staging);
-                    return Err(e);
-                }
-            }
-        };
-
-        // Taken as soon as the root is known — which is the first moment it
-        // *can* be — and held past the row. Everything from here to
-        // `write_blob_row` is file IO with no lock held, and for a large object
-        // that is a full payload fsync plus an outboard write: seconds, during
-        // which `gc_content` acting on this root's older row would delete that
-        // row and unlink the bytes this is about to claim are complete
-        // ([`Store::lease_write`]).
-        let _lease = self.lease_write(&root);
-        let target = self.blob_path(&root);
-        if let Some(parent) = target.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        replace_file(&staging, &target)?;
-        // The instant the lease is for: the payload is in place under its
-        // final name and the only row naming this root is the *old* one, which
-        // a `gc_content` pass may hold to be collectable. A no-op outside this
-        // crate's tests, which stop the write here to watch a sweep refuse it.
-        self.pause_in_write_window();
-        // Flush the payload contents, the outboard, and the directory entries
-        // before the index row claims this blob is complete. Checked, like the
-        // flushes below it: a swallowed ENOSPC or EIO here is a row claiming
-        // bytes the disk never took. Opened for *writing* to flush it, because
-        // Windows refuses `FlushFileBuffers` on a read-only handle.
-        fsync_file(&OpenOptions::new().write(true).open(&target)?)?;
-        fsync_parent(&target);
-        write_and_sync(&self.staging_dir(), &self.outboard_path(&root), &outboard)?;
-        self.commit_complete(&root, size, None, now)?;
-        Ok((root, size))
-    }
-
-    fn write_payload(&self, root: &Hash, data: &[u8], outboard: &[u8]) -> Result<()> {
-        let staging = self.staging_dir();
-        write_and_sync(&staging, &self.blob_path(root), data)?;
-        write_and_sync(&staging, &self.outboard_path(root), outboard)?;
-        Ok(())
-    }
-
-    /// Records an ingested object: every group of it, verified at once.
     ///
-    /// The same row write as [`Store::commit_groups`], claiming the whole
-    /// object, so an ingest meets [`settle_size`] like every other writer of
-    /// the root. An ingest's size is the truth about its bytes, and so is a
-    /// size the disk attests to, so the two can only disagree on a root two
-    /// objects share — which verification rules out — and a row's settled
-    /// size is never rewritten by anyone, not even the writer that hashed the
-    /// bytes. A claim off an entry that a partial fetch left behind yields to
-    /// the ingest as it would to any writer, bitmap and all.
-    pub(crate) fn commit_complete(
-        &self,
-        root: &Hash,
-        size: u64,
-        inline: Option<Vec<u8>>,
-        now: i64,
-    ) -> Result<()> {
-        // LEAN-MODEL: cas-write-complete-commit (Cas.CommitComplete)
-        // `Cas.CommitComplete` is `Cas.CommitGroups` over every group, exactly
-        // as this is `commit_groups` over the full range. Its staged branch is
-        // the `durable = 0` row a cloud backend leaves until `finalize`. File
-        // callers hold the write lease; inline callers have no unlink window.
-        let all = ChunkRanges::single(0, group_count(size));
-        let commit = self.commit_groups(root, size, &all, inline, now)?;
-        debug_assert!(commit.complete, "a commit of every group is complete");
-        Ok(())
+    /// The mandatory Lean operation owns hashing, inline selection, file
+    /// publication, write-lease lifetime and the atomic metadata commit.
+    pub fn ingest_bytes(&self, data: &[u8], now: i64) -> Result<Hash> {
+        crate::lean_ingest::ingest(self, crate::lean_resources::Input::Bytes(data), now)
+            .map(|(root, _)| root)
+    }
+
+    /// Ingests a local file and returns its root and captured byte count.
+    ///
+    /// Lean observes the source and owns read-to-EOF versus bounded capture;
+    /// Rust supplies the path capability without preparing an ingestion plan.
+    pub fn ingest_file(&self, path: &std::path::Path, now: i64) -> Result<(Hash, u64)> {
+        crate::lean_ingest::ingest(self, crate::lean_resources::Input::File(path), now)
     }
 
     /// Records a complete object whose bytes were durably committed by a
@@ -2130,6 +2008,8 @@ impl bao_tree::io::sync::OutboardMut for MemOutboard {
 
 /// A reader that copies everything it yields into a sink, so hashing a file and
 /// writing it into the CAS take one pass over the bytes.
+/// Retained for cloud ingestion, whose separate outer operation still awaits
+/// migration. Mandatory local ingestion does not use this Rust orchestration.
 pub(crate) struct TeeReader {
     pub(crate) inner: std::fs::File,
     pub(crate) sink: std::fs::File,
@@ -2143,6 +2023,8 @@ impl Read for TeeReader {
     }
 }
 
+/// Legacy cloud-ingestion builder and independent test oracle. Local
+/// ingestion constructs its hash tree and outboard entirely in Lean.
 pub(crate) fn compute_outboard(
     data: impl Read,
     tree: BaoTree,
@@ -3185,66 +3067,6 @@ mod tests {
         );
         drop(held);
         assert!(leasing.join().unwrap());
-    }
-
-    /// An ingest re-creating content whose old row is collectable keeps its
-    /// bytes: between the rename and the row write there is a window a
-    /// `gc_content` pass could unlink the payload in. The ingest is stopped
-    /// inside that window by a [`WriteWindow`] rather than raced for — a
-    /// rename, an fsync and a row is about a millisecond where `fsync` returns
-    /// before the disk does, and a collector thread spinning to catch it caught
-    /// it everywhere but on a loaded macOS runner.
-    #[test]
-    fn an_ingest_that_recreates_a_collectable_object_keeps_its_bytes() {
-        let (dir, store) = store();
-        let store = std::sync::Arc::new(store);
-        // Past `INLINE_BLOB_MAX`, so the payload is a file rather than a column
-        // and the rename → fsync → outboard → row window is a real one.
-        let payload = data(1024 * 1024);
-        let source = dir.path().join("restored.bin");
-        std::fs::write(&source, &payload).unwrap();
-
-        // The state that makes this reachable: a row for this exact content
-        // that is cold, unreferenced and unpinned — an ordinary `gc_content`
-        // candidate — while the same content is ingested again.
-        let root = store.ingest_bytes(&payload, 0).unwrap();
-
-        let window = std::sync::Arc::new(crate::db::WriteWindow::default());
-        store.set_write_window(window.clone());
-        let collector = {
-            let store = store.clone();
-            let window = window.clone();
-            std::thread::spawn(move || {
-                window.wait_entered();
-                let leased = store.is_being_written(&root);
-                // Refused — or this returns true and unlinks the bytes the
-                // ingest is midway through writing, leaving the row it is about
-                // to commit describing nothing.
-                let collected = store.delete_blob_if_collectable(&root, i64::MAX);
-                // Before the assertions: a panic here with the ingest still
-                // parked in its window would hang the test rather than fail it.
-                window.release();
-                assert!(
-                    leased,
-                    "the ingest held no write lease, so a sweep in its window \
-                     would have unlinked the bytes of the row it then committed"
-                );
-                assert!(
-                    !collected.unwrap(),
-                    "an ingest in flight is not a collectable object"
-                );
-            })
-        };
-
-        let (ingested, size) = store.ingest_file(&source, 1).unwrap();
-        collector.join().unwrap();
-
-        assert_eq!(ingested, root);
-        assert_eq!(size, payload.len() as u64);
-        // The invariant: a row calling the object complete, and the bytes it
-        // describes.
-        assert!(store.blob(&root).unwrap().unwrap().complete);
-        assert_eq!(store.read_all(&root).unwrap(), payload);
     }
 
     /// A write that resumes into a stale payload keeps it: `write_slice` opens

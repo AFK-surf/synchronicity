@@ -2,9 +2,9 @@ import VerifiedCore.Cas.Bao
 import VerifiedCore.Cas.IngestCommit
 import VerifiedCore.Host.Resources
 
-/-! Staged captured-source ingestion, not a production or public entry point.
-The source is already opened and its length captured. Inline selection, input
-acquisition and native resource interpretation remain future integration work.
+/-! Internal captured-source ingestion, composed by the production Input command.
+The source is already opened and its length captured. Input owns inline selection
+and input acquisition; Rust interprets only the raw resource effects.
 This program owns the source immediately on entry, builds out-of-line data,
 publishes the two files and commits metadata under one root-keyed lease. -/
 namespace VerifiedCore.Cas.Ingest

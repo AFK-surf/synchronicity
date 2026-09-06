@@ -2,8 +2,9 @@ import VerifiedCore.Cas.IngestCommit
 import Synchronicity.VerifiedCoreProofs
 import Synchronicity.Prelude
 
-/-! Proofs of the staged ingestion metadata program itself. This does not claim
-a production cutover or verify the still-Rust outer ingestion operation. -/
+/-! Proofs of the internal ingestion metadata program itself. The production
+whole Lean command composes it; outer resource and construction obligations
+are covered separately by the corresponding ingestion and Bao proof modules. -/
 namespace Synchronicity.IngestCommitProofs
 open VerifiedCore VerifiedCore.Host VerifiedCore.Cas.IngestCommit
 set_option Elab.async false

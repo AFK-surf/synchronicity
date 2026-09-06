@@ -43,22 +43,21 @@ proofs and native/SQLite fault tests cover this boundary; cloud hydration and
 Bao serving/import remain separate unfinished operations. See the architecture
 document for isolated allocation measurements and remaining performance gates.
 
-The next ingestion stage is `Cas/Bao.lean`: a bounded-buffer constructor owns
+Production local ingestion uses `Cas/Bao.lean`: a bounded-buffer constructor owns
 the BLAKE3 tree, chunk counters/ROOT flags and preorder outboard placement in
 Lean. Its raw capabilities are exact reads, positioned writes and chunk/parent
 cryptographic primitives. It is compiled from the same source as its geometry
-and effect proofs, but is **not yet called by production ingestion**. No new
-Rust subtree/planner facade is added. Whole-command staging/lease/publication
-orchestration and primitive integration are implemented below; the remaining
-native platform/performance gates are required before deleting
-Rust ingestion. The architecture document
+and effect proofs. `Store::ingest_bytes` and `Store::ingest_file` now call the
+whole Lean command unconditionally; the old Rust orchestration, complete-row
+wrapper and ingestion-only test hooks are deleted. No Rust subtree/planner
+facade or implementation option remains for local ingestion. The architecture document
 records changing-file behavior, temporary-file/GC hazards and durability gates.
 
-The staged `Cas/IngestCommit.lean` owns claim decoding, settlement and atomic
+`Cas/IngestCommit.lean` owns claim decoding, settlement and atomic
 metadata mutation over raw storage effects, without exposing a Rust planner
 facade. Its transaction/error proofs and the inner hash tree's conditional
-Lean recurrence proof strengthen this stage; neither constitutes a whole
-ingestion cutover or a proof of native cryptographic correctness.
+Lean recurrence proof cover the executed code, not a manually paired Rust
+model. Native cryptographic correctness remains a trust assumption.
 
 `Cas/Ingest.lean` now composes construction and metadata commit with raw
 temporary-file and keyed-lease effects for an already captured, out-of-line
@@ -79,8 +78,8 @@ raw replies. The growing-small-file collector retains chunks and flattens
 once, with universal Lean order/length proofs, avoiding suspended prefix
 copies. Isolated Linux probes show bounded ordinary-large-input retention but
 a significant release-throughput gap; see the architecture document for
-measurements. Performance work and platform validation still precede
-production cutover and deletion of Rust ingestion. The focused CI/static-link
+measurements. The throughput gap remains performance work after the mandatory
+local cutover; no benchmark-only Rust fallback is retained. The focused CI/static-link
 gate now covers Linux, macOS and Windows; configuration is not execution
 evidence, and the growing-small-file path still retains whole captured input.
 Raw source reads now also preserve non-seekable Unix FIFO inputs, with
@@ -90,7 +89,7 @@ cells. Transport-only optimizations consume old continuation ownership and
 avoid intermediate packet copies; Lean proofs preserve the exact byte ABI,
 including the unrolled fixed-width encoder. Interleaved release measurements
 show a modest gain, not throughput parity.
-The raw chunk/parent cryptography adapter is staged privately in the store
+The raw chunk/parent cryptography adapter is private to the store
 crate; it contains no tree traversal or CAS decisions.
 
 The acquisition cutover is checked against real SQLite, including abandoned
@@ -317,9 +316,10 @@ The following are still required:
   scheduled expiry, and local reads/repair. Move remaining accounting,
   GC candidate selection, trie GC, remote cache eviction/healing, Bao
   serving/import, and publication/promotion decisions.
-- Move ingestion and materialization sequencing into Lean-generated effect
-  plans; discharge the flush-before-advertise and publication invariants over
-  those executed plans, not over independent abstract Rust descriptions.
+- Complete local ingestion now executes a whole Lean command over raw host
+  effects, with no Rust orchestration fallback. Move remaining cloud and partial
+  ingestion and materialization sequencing into whole Lean commands; prove
+  flush-before-advertise and publication invariants over those implementations.
 - Move head adoption, fetch progress/retry and provenance decision logic into
   Lean, connecting the executable transitions to system safety/liveness proofs.
 - Replace remaining manually paired `LEAN-MODEL`/`rust_impl` sites as their

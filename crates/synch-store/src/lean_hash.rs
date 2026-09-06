@@ -1,8 +1,6 @@
-//! Raw BLAKE3 primitives for the staged Lean ingestion interpreter.
+//! Raw BLAKE3 primitives for the mandatory Lean ingestion interpreter.
 //! No subtree traversal, Bao layout, I/O or CAS policy is implemented here.
-//! Remove the staging-only dead-code allowance when the complete command uses
-//! these services; this module is intentionally not a public Rust hash facade.
-#![cfg_attr(not(test), allow(dead_code))]
+//! This module is intentionally not a public Rust hash facade.
 
 use crate::{Result, StoreError};
 

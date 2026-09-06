@@ -28,11 +28,11 @@ fn sequential_source_reads_preserve_offsets_without_moving_positioned_reads() {
 }
 
 #[test]
-fn native_and_production_ingest_nonseekable_streams_to_actual_eof() {
+fn public_and_internal_ingest_nonseekable_streams_to_actual_eof() {
     for size in [3_usize, 131075] {
         let expected: Vec<u8> = (0..size).map(|index| (index % 251) as u8).collect();
         let mut results = Vec::new();
-        for native in [false, true] {
+        for internal in [false, true] {
             let directory = tempfile::tempdir().unwrap();
             let path = directory.path().join("input.fifo");
             rustix::fs::mkfifoat(
@@ -60,7 +60,7 @@ fn native_and_production_ingest_nonseekable_streams_to_actual_eof() {
                     // Invocation-owned Rc resources are constructed here,
                     // never sent between threads.
                     let store = Store::open(&store_path)?;
-                    let (root, captured) = if native {
+                    let (root, captured) = if internal {
                         crate::lean_ingest::ingest(&store, Input::File(&path), 17)?
                     } else {
                         store.ingest_file(&path, 17)?
@@ -81,10 +81,11 @@ fn native_and_production_ingest_nonseekable_streams_to_actual_eof() {
             let observed = completed_rx
                 .recv_timeout(Duration::from_secs(30))
                 .expect("FIFO ingestion did not complete within the bounded wait")
-                .unwrap_or_else(|error| panic!("native={native}, size={size}: {error}"));
+                .unwrap_or_else(|error| panic!("internal={internal}, size={size}: {error}"));
             reader.join().unwrap();
             writer.join().unwrap().unwrap();
             assert_eq!(observed.1, size as u64);
+            assert_eq!(observed.0.as_bytes(), blake3::hash(&expected).as_bytes());
             assert_eq!(observed.2, expected);
             assert_eq!(observed.3, size <= synch_core::INLINE_BLOB_MAX as usize);
             results.push(observed);

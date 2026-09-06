@@ -249,11 +249,6 @@ pub struct Store {
     /// datadir, so independently opened Store values see the same fact; the
     /// lifecycle lock excludes a second process.
     cas_coord: Arc<CasCoord>,
-    /// A latch this crate's own tests use to stop a CAS write between its
-    /// bytes and its row — the window `writing` exists for. Absent from every
-    /// other build.
-    #[cfg(test)]
-    write_window: Mutex<Option<std::sync::Arc<WriteWindow>>>,
 }
 
 /// Process-wide CAS ordering and trie certificates shared by every `Store`
@@ -320,59 +315,6 @@ fn cas_coord_for(data_dir: &Path) -> Arc<CasCoord> {
     let coord = Arc::new(CasCoord::default());
     coords.insert(key, Arc::downgrade(&coord));
     coord
-}
-
-/// A pause a test can install inside a CAS write, at the instant the payload is
-/// on disk and no row yet claims it.
-///
-/// The window `writing` exists to protect is real but short — a rename, an
-/// fsync and a row — and on a platform whose `fsync` returns before the disk
-/// does it is about a millisecond. A collector thread spinning to catch it
-/// therefore catches it on most machines and not on a loaded one, which is how
-/// `an_ingest_that_recreates_a_collectable_object_keeps_its_bytes` came to fail
-/// on a macOS runner while passing everywhere else. Holding the window open
-/// from inside the writer makes the collector's observation a fact rather than
-/// a race, and leaves the property under test unchanged.
-#[cfg(test)]
-#[derive(Debug, Default)]
-pub(crate) struct WriteWindow {
-    /// `(the writer is inside the window, the observer is done with it)`.
-    state: Mutex<(bool, bool)>,
-    changed: std::sync::Condvar,
-}
-
-#[cfg(test)]
-impl WriteWindow {
-    /// Called by the writer: announces the window and blocks until released.
-    fn hold(&self) {
-        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        state.0 = true;
-        self.changed.notify_all();
-        while !state.1 {
-            state = self
-                .changed
-                .wait(state)
-                .unwrap_or_else(PoisonError::into_inner);
-        }
-    }
-
-    /// Called by the observer: blocks until a writer is inside the window.
-    pub(crate) fn wait_entered(&self) {
-        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        while !state.0 {
-            state = self
-                .changed
-                .wait(state)
-                .unwrap_or_else(PoisonError::into_inner);
-        }
-    }
-
-    /// Called by the observer: lets the writer out of the window.
-    pub(crate) fn release(&self) {
-        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        state.1 = true;
-        self.changed.notify_all();
-    }
 }
 
 /// Marks an object as being written, until dropped.
@@ -462,8 +404,6 @@ impl Store {
             data_dir,
             remote_cas: std::sync::atomic::AtomicBool::new(false),
             cas_coord,
-            #[cfg(test)]
-            write_window: Mutex::new(None),
         };
         store.init(options)?;
         // WAL/SHM sidecars are created by `init` (WAL mode); tighten them too.
@@ -1358,34 +1298,6 @@ impl Store {
     pub(crate) fn writer_count(&self, root: &Hash) -> usize {
         self.writing().get(root).copied().unwrap_or(0)
     }
-
-    /// Installs the pause described by [`WriteWindow`].
-    #[cfg(test)]
-    pub(crate) fn set_write_window(&self, window: std::sync::Arc<WriteWindow>) {
-        *self
-            .write_window
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Some(window);
-    }
-
-    /// Stops a CAS writer inside its window, if a test asked for it. Compiled
-    /// away — and never called — outside this crate's own tests.
-    #[cfg(test)]
-    pub(crate) fn pause_in_write_window(&self) {
-        // Cloned out from under the lock: the pause blocks until an observer
-        // releases it, and that observer needs the store.
-        let window = self
-            .write_window
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone();
-        if let Some(window) = window {
-            window.hold();
-        }
-    }
-
-    #[cfg(not(test))]
-    pub(crate) fn pause_in_write_window(&self) {}
 }
 
 // The trie node store, expressed against a connection so that both the store

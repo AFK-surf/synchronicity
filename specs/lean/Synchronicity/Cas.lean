@@ -6,9 +6,10 @@ The CAS transition system, stated once.
 `Cell H` is one content root as the store sees it: its row — the size it
 records and the groups it claims verified — its bytes and durable claim, the
 entry that names it, and the pins, wants and live leaves indexed by holder
-`H`.  Every transition is a `Transition`, a guard and a successor, and a named
-Rust linearization point carried by the `rust_impl` attribute on its
-definition.  Where the code has two outcomes — a complete commit that is or is
+`H`. Every transition is a `Transition`, a guard and a successor. Remaining
+handwritten operations have named Rust linearization points carried by
+`rust_impl`; migrated operations are proved over their executable Lean source
+in separate program proof modules. Where the code has two outcomes — a complete commit that is or is
 not durable, a promotion that pins or wants — the outcome is a parameter of
 the transition, so that each is still one guarded deterministic step.  `Kind`
 names the transitions with their parameters, `Trans` gives each its
@@ -21,7 +22,8 @@ differ only in `H` and in which steps they close over:
 
 A row need not be complete.  A peer slice, a delta proof or a cloud cache
 refill commits the groups it verified into the row's bitmap (`CommitGroups`),
-and an ingest is the same commit of every group at once (`CommitComplete`).
+and complete ingestion is represented abstractly as every group at once
+(`CommitComplete`), not as a call to Rust's partial-write implementation.
 Until the final group is held the size the row records is a claim off an
 entry rather than a fact (`Attested`), and `Settles` is the rule every commit's
 size claim meets: a durable or attested size stands and a claim yields, taking
@@ -210,9 +212,10 @@ def WriteAbort : Transition (Cell H) where
   guard c := 0 < c.writing
   post c := { c with writing := c.writing - 1 }
 
-/-- `cas.rs::commit_groups`: the one row write every writer of verified
-groups makes — a peer slice, a delta proof, a promotion, a cloud cache refill
-and, through `CommitComplete`, an ingest.  The size claim meets `Settles`
+/-- `cas.rs::commit_groups`: the remaining partial/network verified-group row
+write — a peer slice, a delta proof, a promotion or a cloud cache refill.
+Complete local ingestion instead executes Lean's `Cas/IngestCommit`.
+The size claim meets `Settles`
 inside the transaction; the row then records the claim and what is held under
 it, is complete when every group of that size is, and rises to durable only on
 a complete commit a local backend acknowledges (`durable`, from
@@ -233,10 +236,10 @@ def CommitGroups (durable : Bool) (size : Nat) (groups : Set Nat) : Transition (
       durable := (durable ∧ complete) ∨ c.durable
       fresh := True }
 
-/-- `cas.rs::Store::commit_complete`, the ingest's row: `CommitGroups` with
-every group of the object at once.  File callers hold the write lease; inline
-callers have no unlink window. -/
-@[transition, rust_impl "cas-write-complete-commit"]
+/-- Abstract complete-row accounting: `CommitGroups` with every group of the
+object at once. Production local ingestion executes `Cas/IngestCommit.lean`;
+its same-source proofs, not a Rust anchor, cover the concrete operation. -/
+@[transition]
 def CommitComplete (durable : Bool) (size : Nat) : Transition (Cell H) :=
   CommitGroups durable size Set.univ
 

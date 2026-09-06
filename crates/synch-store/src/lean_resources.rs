@@ -1,6 +1,5 @@
-//! Raw invocation-owned ingestion resources. Staged until the full Lean
-//! ingestion command is wired; no hash-tree, commit or publication policy lives here.
-#![cfg_attr(not(test), allow(dead_code))]
+//! Raw invocation-owned resources for mandatory Lean ingestion. No hash-tree,
+//! commit or publication policy lives here.
 
 use std::{
     cell::RefCell,

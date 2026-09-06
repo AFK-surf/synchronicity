@@ -3,7 +3,8 @@ import VerifiedCore.Host.Source
 
 /-! Whole byte/file ingestion input policy. The host supplies an immutable
 byte input or a path capability, never a preselected inline/captured plan.
-Native integration is staged; no Rust planner facade exposes these internals. -/
+Production local ingestion invokes this command; no Rust planner facade exposes
+these internals. -/
 namespace VerifiedCore.Cas.Input
 open VerifiedCore.Host
 

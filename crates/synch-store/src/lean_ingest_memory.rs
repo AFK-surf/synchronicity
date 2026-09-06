@@ -1,10 +1,10 @@
 //! Linux-only, isolated whole-process memory measurements, including Lean's
 //! allocator. Kept ignored because RSS and timing are environment-sensitive.
-//! Remove the Rust-baseline modes when Store entrypoints switch to Lean;
-//! never retain a production fallback just to preserve this comparison.
+//! Exercises the mandatory public Store entrypoints. Historical Rust baselines
+//! are recorded in the architecture document, not retained as a fallback.
 use std::{io::Write, process::Command, time::Instant};
 
-use crate::{lean_resources::Input, Store};
+use crate::Store;
 
 fn status_kib(field: &str) -> u64 {
     std::fs::read_to_string("/proc/self/status")
@@ -31,11 +31,7 @@ fn isolated_ingestion_memory_worker() {
     let store = Store::open(directory.path()).unwrap();
     let path = directory.path().join("source");
     let from_file = mode.ends_with("file");
-    let native = mode.starts_with("lean-");
-    assert!(matches!(
-        mode.as_str(),
-        "lean-file" | "lean-bytes" | "rust-file" | "rust-bytes"
-    ));
+    assert!(matches!(mode.as_str(), "lean-file" | "lean-bytes"));
     let mut expected = blake3::Hasher::new();
     // File fixtures are produced in bounded chunks; byte fixtures are fully
     // touched before the baseline, so caller-owned input is not miscounted as
@@ -58,14 +54,13 @@ fn isolated_ingestion_memory_worker() {
         bytes
     };
     // Warm runtime initialization independently of the measured input.
-    super::lean_ingest::ingest(&store, Input::Bytes(b"warm"), 0).unwrap();
+    store.ingest_bytes(b"warm", 0).unwrap();
     let before = status_kib("VmHWM:");
     let started = Instant::now();
-    let (root, length) = match (native, from_file) {
-        (true, true) => super::lean_ingest::ingest(&store, Input::File(&path), 1).unwrap(),
-        (true, false) => super::lean_ingest::ingest(&store, Input::Bytes(&bytes), 1).unwrap(),
-        (false, true) => store.ingest_file(&path, 1).unwrap(),
-        (false, false) => (store.ingest_bytes(&bytes, 1).unwrap(), size as u64),
+    let (root, length) = if from_file {
+        store.ingest_file(&path, 1).unwrap()
+    } else {
+        (store.ingest_bytes(&bytes, 1).unwrap(), size as u64)
     };
     let elapsed = started.elapsed().as_millis();
     let after = status_kib("VmHWM:");
@@ -84,7 +79,7 @@ fn isolated_ingestion_memory_worker() {
 #[ignore = "isolated Linux RSS/throughput probe; run under a memory-capped scope"]
 fn isolated_ingestion_memory() {
     let executable = std::env::current_exe().unwrap();
-    for mode in ["lean-file", "lean-bytes", "rust-file", "rust-bytes"] {
+    for mode in ["lean-file", "lean-bytes"] {
         let mut deltas = Vec::new();
         for size in [4 * 1024 * 1024 + 3, 64 * 1024 * 1024 + 3] {
             let output = Command::new(&executable)
@@ -118,15 +113,13 @@ fn isolated_ingestion_memory() {
                 .unwrap();
             deltas.push(delta);
         }
-        if mode.starts_with("lean-") {
-            // Deliberately loose process-level gates, not allocator-level or
-            // universal asymptotic proofs. Catch retained payload/outboard
-            // regressions without asserting noisy sub-MiB allocator details.
-            assert!(deltas[1] < 16 * 1024, "{mode}: {deltas:?}");
-            assert!(
-                deltas[1] <= deltas[0] + 8 * 1024,
-                "{mode}: ingestion memory grew with input: {deltas:?}"
-            );
-        }
+        // Deliberately loose process-level gates, not allocator-level or
+        // universal asymptotic proofs. Catch retained payload/outboard
+        // regressions without asserting noisy sub-MiB allocator details.
+        assert!(deltas[1] < 16 * 1024, "{mode}: {deltas:?}");
+        assert!(
+            deltas[1] <= deltas[0] + 8 * 1024,
+            "{mode}: ingestion memory grew with input: {deltas:?}"
+        );
     }
 }
