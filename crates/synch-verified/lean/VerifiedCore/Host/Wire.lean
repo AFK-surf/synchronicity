@@ -1,6 +1,11 @@
 import VerifiedCore.Host
 import VerifiedCore.Crypto
 import VerifiedCore.Host.Access
+import VerifiedCore.Host.Write
+import VerifiedCore.Host.Hash
+import VerifiedCore.Host.Upsert
+import VerifiedCore.Host.Resources
+import VerifiedCore.Host.Source
 
 /-! Private versioned transport for raw host effects, not domain snapshots.
 All lengths and integers are little-endian u64; replies must match the pending
@@ -200,8 +205,10 @@ def resume (state : State) (input : ByteArray) : State :=
 
 /-- One native continuation transport, with storage and crypto kept as distinct
 typed capabilities. Existing storage packets retain their exact representation. -/
+abbrev WriteEffects := EffectSum ByteWriter (EffectSum Blake3
+  (EffectSum Upsert (EffectSum Resources (EffectSum Lease SourceIO))))
 abbrev NativeEffects := EffectSum Storage (EffectSum Crypto
-  (EffectSum Access (EffectSum FileIO (EffectSum Clock Output))))
+  (EffectSum Access (EffectSum FileIO (EffectSum Clock (EffectSum Output WriteEffects)))))
 abbrev NativeState := Program NativeEffects (Reply ByteArray)
 
 def cryptoRequest : Crypto A → ByteArray
@@ -289,6 +296,105 @@ def outputReply (effect : Output A) (input : ByteArray) : A :=
   match effect with
   | .append _ => decodeReply 37 (pure ()) input
 
+def writerRequest : ByteWriter A → ByteArray
+  | .writeAt handle offset chunk => octet 1 ++ octet 38 ++ word handle ++ word offset ++ bytes chunk
+
+def writerReply (effect : ByteWriter A) (input : ByteArray) : A :=
+  match effect with
+  | .writeAt .. => decodeReply 38 (pure ()) input
+
+def blake3Request : Blake3 A → ByteArray
+  | .chunk counter root chunk => octet 1 ++ octet 39 ++ word counter ++
+      octet (if root then 1 else 0) ++ bytes chunk
+  | .parent root left right => octet 1 ++ octet 40 ++ octet (if root then 1 else 0) ++
+      bytes left ++ bytes right
+
+def blake3Reply (effect : Blake3 A) (input : ByteArray) : A :=
+  match effect with
+  | .chunk .. => decodeReply 39 readBytes input
+  | .parent .. => decodeReply 40 readBytes input
+
+def conflictValue : ConflictValue → ByteArray
+  | .current column => octet 0 ++ string column
+  | .excluded column => octet 1 ++ string column
+  | .coalesce left right => octet 2 ++ conflictValue left ++ conflictValue right
+  | .max left right => octet 3 ++ conflictValue left ++ conflictValue right
+
+def upsertRequest : Upsert A → ByteArray
+  | .write tx relation values conflicts assignments =>
+    octet 1 ++ octet 41 ++ word tx ++ string relation ++ fields values ++
+      sequence string conflicts ++ sequence (fun (column, value) =>
+        string column ++ conflictValue value) assignments
+
+def upsertReply (effect : Upsert A) (input : ByteArray) : A :=
+  match effect with
+  | .write .. => decodeReply 41 (pure ()) input
+
+def resourcesRequest : Resources A → ByteArray
+  | .createTemporary space => octet 1 ++ octet 42 ++ string space
+  | .flush handle => octet 1 ++ octet 43 ++ word handle
+  | .replace handle space key => octet 1 ++ octet 44 ++ word handle ++ string space ++ bytes key
+  | .discard handle => octet 1 ++ octet 45 ++ word handle
+  | .syncParent space key => octet 1 ++ octet 46 ++ string space ++ bytes key
+
+def resourcesReply (effect : Resources A) (input : ByteArray) : A :=
+  match effect with
+  | .createTemporary .. => decodeReply 42 readWord input
+  | .flush .. => decodeReply 43 (pure ()) input
+  | .replace .. => decodeReply 44 (pure ()) input
+  | .discard .. => decodeReply 45 (pure ()) input
+  | .syncParent .. => decodeReply 46 (do
+      match ← readByte with
+      | 0 => return SyncStatus.synced
+      | 1 => return SyncStatus.unsupported
+      | _ => throw ()) input
+
+def leaseRequest : Lease A → ByteArray
+  | .acquire space key => octet 1 ++ octet 47 ++ string space ++ bytes key
+  | .release token => octet 1 ++ octet 48 ++ word token
+
+def leaseReply (effect : Lease A) (input : ByteArray) : A :=
+  match effect with
+  | .acquire .. => decodeReply 47 readWord input
+  | .release .. => decodeReply 48 (pure ()) input
+
+def sourceRequest : SourceIO A → ByteArray
+  | .stat space key => octet 1 ++ octet 49 ++ string space ++ bytes key
+  | .readSome handle offset count => octet 1 ++ octet 50 ++ word handle ++ word offset ++ word count
+  | .freeze chunk => octet 1 ++ octet 51 ++ bytes chunk
+
+def sourceReply (effect : SourceIO A) (input : ByteArray) : A :=
+  match effect with
+  | .stat .. => decodeReply 49 readWord input
+  | .readSome .. => decodeReply 50 readBytes input
+  | .freeze .. => decodeReply 51 readWord input
+
+def writeRequest (effect : WriteEffects A) : ByteArray :=
+  match effect with
+  | .left writer => writerRequest writer
+  | .right effect => match effect with
+    | .left blake3 => blake3Request blake3
+    | .right effect => match effect with
+      | .left upsert => upsertRequest upsert
+      | .right effect => match effect with
+        | .left resources => resourcesRequest resources
+        | .right effect => match effect with
+          | .left lease => leaseRequest lease
+          | .right source => sourceRequest source
+
+def writeReply (effect : WriteEffects A) (input : ByteArray) : A :=
+  match effect with
+  | .left writer => writerReply writer input
+  | .right effect => match effect with
+    | .left blake3 => blake3Reply blake3 input
+    | .right effect => match effect with
+      | .left upsert => upsertReply upsert input
+      | .right effect => match effect with
+        | .left resources => resourcesReply resources input
+        | .right effect => match effect with
+          | .left lease => leaseReply lease input
+          | .right source => sourceReply source input
+
 def nativeRequest (effect : NativeEffects A) : ByteArray :=
   match effect with
   | .left storage => request storage
@@ -300,7 +406,9 @@ def nativeRequest (effect : NativeEffects A) : ByteArray :=
         | .left file => fileRequest file
         | .right effect => match effect with
           | .left clock => clockRequest clock
-          | .right output => outputRequest output
+          | .right effect => match effect with
+            | .left output => outputRequest output
+            | .right writer => writeRequest writer
 
 def nativeReply (effect : NativeEffects A) (input : ByteArray) : A :=
   match effect with
@@ -313,7 +421,9 @@ def nativeReply (effect : NativeEffects A) (input : ByteArray) : A :=
         | .left file => fileReply file input
         | .right effect => match effect with
           | .left clock => clockReply clock input
-          | .right output => outputReply output input
+          | .right effect => match effect with
+            | .left output => outputReply output input
+            | .right writer => writeReply writer input
 
 @[export synch_lean_operation_packet]
 def nativePacket : NativeState → ByteArray

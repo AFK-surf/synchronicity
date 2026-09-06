@@ -1,5 +1,21 @@
 //! Domain-neutral services requested by executable Lean operations.
 
+/// Separate raw capabilities supplied together to a write operation. The
+/// shared transport depends only on these service types, never domain commands.
+pub struct WriteServices<'a, E> {
+    pub files: &'a mut dyn FileIO<Error = E>,
+    pub writer: &'a mut dyn ByteWriter<Error = E>,
+    pub hash: &'a mut dyn Blake3<Error = E>,
+    pub temporary: &'a mut dyn TemporaryFiles<Error = E>,
+    pub leases: &'a mut dyn Lease<Error = E>,
+    pub source: &'a mut dyn SourceIO<Error = E>,
+}
+impl<E> std::fmt::Debug for WriteServices<'_, E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WriteServices").finish_non_exhaustive()
+    }
+}
+
 /// Raw storage cell. Interpretation belongs to the requesting Lean domain.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Cell {
@@ -59,6 +75,53 @@ pub trait Upsert: Storage {
         conflicts: &[String],
         assignments: &[(String, ConflictValue)],
     ) -> Result<(), Self::Error>;
+}
+
+/// Exact positioned writes; success does not imply flush or publication.
+pub trait ByteWriter {
+    type Error;
+    fn write_at(&mut self, handle: u64, offset: u64, bytes: &[u8]) -> Result<(), Self::Error>;
+}
+
+/// Raw input observations. Successful bounded reads may be short at EOF;
+/// freeze retains an immutable copy under an invocation-owned input handle.
+pub trait SourceIO {
+    type Error;
+    fn stat(&mut self, space: &str, key: &[u8]) -> Result<u64, Self::Error>;
+    fn read_some(&mut self, handle: u64, offset: u64, count: u64) -> Result<Vec<u8>, Self::Error>;
+    fn freeze(&mut self, bytes: &[u8]) -> Result<u64, Self::Error>;
+}
+
+/// Fixed unkeyed cryptographic primitives, never subtree traversal.
+pub trait Blake3 {
+    type Error;
+    fn chunk(&mut self, counter: u64, root: bool, bytes: &[u8]) -> Result<Vec<u8>, Self::Error>;
+    fn parent(&mut self, root: bool, left: &[u8], right: &[u8]) -> Result<Vec<u8>, Self::Error>;
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectorySync {
+    Synced,
+    Unsupported,
+}
+
+/// Invocation-owned staging resources. Abandonment releases handles and
+/// removes unpublished temporary names; replacement consumes temporary ownership.
+pub trait TemporaryFiles {
+    type Error;
+    fn create_temporary(&mut self, space: &str) -> Result<u64, Self::Error>;
+    fn flush(&mut self, handle: u64) -> Result<(), Self::Error>;
+    fn replace(&mut self, handle: u64, space: &str, key: &[u8]) -> Result<(), Self::Error>;
+    fn discard(&mut self, handle: u64) -> Result<(), Self::Error>;
+    fn sync_parent(&mut self, space: &str, key: &[u8]) -> Result<DirectorySync, Self::Error>;
+}
+
+/// Opaque counted resource leases ordered against competing deletion. Host
+/// abandonment releases outstanding tokens; policy chooses their lifetime.
+pub trait Lease {
+    type Error;
+    fn acquire(&mut self, space: &str, key: &[u8]) -> Result<u64, Self::Error>;
+    fn release(&mut self, token: u64) -> Result<(), Self::Error>;
 }
 
 /// Raw relational access, without metadata interpretation or healing policy.

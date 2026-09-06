@@ -1,0 +1,98 @@
+import VerifiedCore.Cas.Ingest
+import VerifiedCore.Host.Source
+
+/-! Whole byte/file ingestion input policy. The host supplies an immutable
+byte input or a path capability, never a preselected inline/captured plan.
+Native integration is staged; no Rust planner facade exposes these internals. -/
+namespace VerifiedCore.Cas.Input
+open VerifiedCore.Host
+
+abbrev Effects := EffectSum Ingest.Effects SourceIO
+
+inductive Kind where
+  | bytes (size : UInt64)
+  | file
+  deriving BEq, DecidableEq
+
+inductive Error where
+  | host (failure : Failure)
+  | ingestion (error : Ingest.Error)
+  | construction (error : Bao.Error)
+  | metadata (error : IngestCommit.Error)
+  | protocol
+  deriving BEq, DecidableEq
+
+structure Result where
+  root : ByteArray
+  size : UInt64
+  deriving BEq
+
+abbrev Action (A : Type) := OperationOver Effects Error A
+
+def source (effect : SourceIO (Reply A)) : Action A :=
+  performOver Error.host (.right effect)
+
+def openSource : Action UInt64 := ExceptT.mk do
+  let reply ← Program.request (.left (.left (.left (.open "input" ByteArray.empty)))) Program.pure
+  return reply.mapError (fun error => Error.host error.failure)
+
+def closeSource (handle : UInt64) : Action Unit :=
+  performOver Error.host (.left (.left (.left (.close handle))))
+
+def captured (handle size : UInt64) (now : Int64) (tier : IngestCommit.Tier)
+    (policy : Ingest.DirectoryPolicy) : Action Result := ExceptT.mk do
+  let reply ← (Ingest.run handle size now tier policy).run.mapEffects EffectSum.left
+  return (reply.mapError Error.ingestion).map (fun root => ⟨root, size⟩)
+
+def inlineBytes (bytes : ByteArray) (now : Int64) (tier : IngestCommit.Tier) : Action Result := do
+  let root ← ExceptT.mk do
+    let reply ← (Bao.hashAux 4 0 true bytes).run.mapEffects (fun effect => .left (.left effect))
+    return reply.mapError Error.construction
+  let size := bytes.size.toUInt64
+  let _ ← ExceptT.mk do
+    let reply ← (IngestCommit.commitComplete root size (some bytes) now tier).run.mapEffects
+      (fun effect => .left (.right (.left effect)))
+    return reply.mapError Error.metadata
+  return ⟨root, size⟩
+
+/-- Preserve read-to-EOF for an initially small file, including growth across
+the inline threshold. Like the previous read-to-end path, this may retain the
+entire captured stream. Large initial inputs use bounded streaming instead.
+Fuel permits one request per byte plus the final EOF observation. -/
+def collectAux : Nat → UInt64 → ByteArray → Action ByteArray
+  | 0, _, _ => throw .protocol
+  | fuel + 1, handle, acc => do
+    let bytes ← source (.readSome handle acc.size.toUInt64 65536)
+    if bytes.size > 65536 || acc.size + bytes.size > 18446744073709551615 then throw .protocol
+    if bytes.isEmpty then return acc
+    collectAux fuel handle (acc ++ bytes)
+
+def collect (handle : UInt64) : Action ByteArray :=
+  collectAux 18446744073709551616 handle ByteArray.empty
+
+/-- A growing small file is frozen from exactly the bytes already captured;
+never reopen the mutable path to construct a root for a different stream. -/
+def capturedBytes (bytes : ByteArray) (now : Int64) (tier : IngestCommit.Tier)
+    (policy : Ingest.DirectoryPolicy) : Action Result := do
+  if bytes.size ≤ 16384 then inlineBytes bytes now tier
+  else
+    let handle ← source (.freeze bytes)
+    captured handle bytes.size.toUInt64 now tier policy
+
+def run (kind : Kind) (now : Int64) (tier : IngestCommit.Tier)
+    (policy : Ingest.DirectoryPolicy := .requireSync) : Action Result := do
+  let size ← match kind with
+    | .bytes size => pure size
+    | .file => source (.stat "input" ByteArray.empty)
+  let handle ← openSource
+  if size ≤ 16384 then
+    let bytes ← ensure (match kind with
+      | .file => collect handle
+      | .bytes _ => ExceptT.mk do
+        let reply ← (Bao.readAt handle 0 size.toNat).run.mapEffects (fun effect => .left (.left effect))
+        return reply.mapError Error.construction) (closeSource handle)
+    capturedBytes bytes now tier policy
+  else
+    captured handle size now tier policy
+
+end VerifiedCore.Cas.Input

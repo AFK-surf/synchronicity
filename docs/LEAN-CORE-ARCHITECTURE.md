@@ -512,6 +512,40 @@ The internal construction algorithm lives in `Cas/Bao.lean`; until the complete
 command and native host are wired, it is staged shared executable source, not
 a production cutover. No new standalone Bao/planner Rust facade is introduced.
 
+The staged native integration now invokes the **whole** `Cas/Input.run` byte
+or file command. Its Rust wrapper binds raw services and translates terminal
+diagnostics only. Lean observes file metadata, chooses exact-length versus
+EOF reads, selects inline storage, and composes `Cas/Ingest.run` for out-of-line
+publication. The production `Store::ingest_bytes` and `Store::ingest_file`
+entrypoints have not switched yet; their Rust implementations are to be deleted
+at the cutover, not retained behind an implementation option.
+
+An initially small file still captures to EOF, even if it grows beyond 16 KiB.
+That exceptional branch retains its captured bytes, as the previous whole-file
+read did; it freezes those bytes under an immutable raw handle before invoking
+streaming construction. It never reopens the mutable path. Ordinary initially
+large files and large immutable byte inputs use bounded reads and do not build
+a whole outboard buffer. The small-file-growth path is not claimed to have
+bounded whole-object memory or transfer-copy parity.
+
+The native raw resource pool shares one invocation-local handle allocator
+across source, frozen and temporary handles. Temporary creation uses
+`create_new`; a process-wide, canonical-datadir registry protects live names
+against staging GC across independently opened Store values. GC holds its
+registry lock through exclusion and unlink. Raw keyed leases reuse the existing
+connection/CAS ordering and counted writer protection. Unix directory-sync
+failures propagate, including flushes of the new shard's namespace ancestors
+down to the configured store directory; Windows reports unsupported under explicit platform policy
+and retains the existing write-through replacement helper.
+
+Native fixtures check standard roots, payloads and Bao outboard bytes across
+chunk/group boundaries using real SQLite and files, plus metadata failure
+cleanup. These are integration checks, not a substitute for the remaining
+standard-root and complete-layout Lean proofs. Raw capability framing tests
+reject truncated/trailing packets, invalid booleans and excessive conflict
+expression depth/node counts. Source capture/inline decisions remain absent
+from the Rust interpreter.
+
 Lean owns the binary BLAKE3 tree, group boundaries, preorder outboard placement,
 input length policy, tee ordering, inline choice, temporary resource lifecycle,
 writer-lease lifetime, durability ordering and transactional row settlement.
@@ -652,9 +686,9 @@ sync, or accept a reported unsupported operation on a configured platform.
 Actual I/O failure is never accepted. The latter policy does not prove
 directory persistence and cannot be described as such; Windows replacement
 must still retain the existing write-through/retry semantics. The staged
-captured-source command does not yet replace initial stat/read-to-EOF policy,
-inline selection or native invocation setup, so it is not the production
-`ingest_bytes`/`ingest_file` cutover.
+captured-source command is composed by the staged whole `Cas/Input.run`
+command described above; it is not separately exported as a Rust planner.
+The production `ingest_bytes`/`ingest_file` cutover still awaits its gates.
 
 Cutover gates are executable construction/layout proofs, actual primitive and
 outboard fixtures, single-pass changing-file tests, native transfer/allocation

@@ -102,6 +102,39 @@ impl Drop for Handle {
 
 pub(crate) struct Reader<'a>(pub(crate) &'a [u8]);
 impl<'a> Reader<'a> {
+    fn boolean(&mut self) -> Result<bool, ()> {
+        match self.byte()? {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(()),
+        }
+    }
+    fn conflict_value(
+        &mut self,
+        depth: usize,
+        budget: &mut usize,
+    ) -> Result<crate::host::ConflictValue, ()> {
+        use crate::host::ConflictValue;
+        if depth > 32 || *budget == 0 {
+            return Err(());
+        }
+        *budget -= 1;
+        Ok(match self.byte()? {
+            0 => ConflictValue::Current(self.string()?),
+            1 => ConflictValue::Excluded(self.string()?),
+            tag @ (2 | 3) => {
+                let left = self.conflict_value(depth + 1, budget)?;
+                let right = self.conflict_value(depth + 1, budget)?;
+                let pair = Box::new((left, right));
+                if tag == 2 {
+                    ConflictValue::Coalesce(pair)
+                } else {
+                    ConflictValue::Maximum(pair)
+                }
+            }
+            _ => return Err(()),
+        })
+    }
     fn take(&mut self, count: usize) -> Result<&'a [u8], ()> {
         if count > self.0.len() {
             return Err(());
@@ -232,6 +265,26 @@ enum Frame<'a> {
     Close(u64),
     Now,
     Append(&'a [u8]),
+    WriteAt(u64, u64, &'a [u8]),
+    HashChunk(u64, bool, &'a [u8]),
+    HashParent(bool, &'a [u8], &'a [u8]),
+    ExpressionUpsert(
+        u64,
+        String,
+        Fields,
+        Vec<String>,
+        Vec<(String, crate::host::ConflictValue)>,
+    ),
+    CreateTemporary(String),
+    Flush(u64),
+    Replace(u64, String, &'a [u8]),
+    Discard(u64),
+    SyncParent(String, &'a [u8]),
+    LeaseAcquire(String, &'a [u8]),
+    LeaseRelease(u64),
+    SourceStat(String, &'a [u8]),
+    ReadSome(u64, u64, u64),
+    Freeze(&'a [u8]),
 }
 
 enum AccessFrame {
@@ -339,6 +392,35 @@ fn decode(packet: &[u8]) -> Result<Frame<'_>, ()> {
         35 => Frame::Close(r.word()?),
         36 => Frame::Now,
         37 => Frame::Append(r.byte_slice()?),
+        38 => Frame::WriteAt(r.word()?, r.word()?, r.byte_slice()?),
+        39 => Frame::HashChunk(r.word()?, r.boolean()?, r.byte_slice()?),
+        40 => Frame::HashParent(r.boolean()?, r.byte_slice()?, r.byte_slice()?),
+        41 => {
+            let tx = r.word()?;
+            let relation = r.string()?;
+            let fields = r.fields()?;
+            let conflicts = r.list(Reader::string)?;
+            let count = r.count()?;
+            let mut budget = 4096;
+            if count > budget || count > r.0.len() {
+                return Err(());
+            }
+            let mut assignments = Vec::new();
+            for _ in 0..count {
+                assignments.push((r.string()?, r.conflict_value(0, &mut budget)?));
+            }
+            Frame::ExpressionUpsert(tx, relation, fields, conflicts, assignments)
+        }
+        42 => Frame::CreateTemporary(r.string()?),
+        43 => Frame::Flush(r.word()?),
+        44 => Frame::Replace(r.word()?, r.string()?, r.byte_slice()?),
+        45 => Frame::Discard(r.word()?),
+        46 => Frame::SyncParent(r.string()?, r.byte_slice()?),
+        47 => Frame::LeaseAcquire(r.string()?, r.byte_slice()?),
+        48 => Frame::LeaseRelease(r.word()?),
+        49 => Frame::SourceStat(r.string()?, r.byte_slice()?),
+        50 => Frame::ReadSome(r.word()?, r.word()?, r.word()?),
+        51 => Frame::Freeze(r.byte_slice()?),
         _ => return Err(()),
     };
     r.end()?;
@@ -433,6 +515,15 @@ fn dispatch_access<S: Access>(
 type AccessDispatch<S> =
     fn(&mut S, AccessFrame, &mut Vec<Option<<S as Storage>::Error>>) -> Vec<u8>;
 
+type UpsertDispatch<S> = fn(
+    &mut S,
+    u64,
+    &str,
+    &Fields,
+    &[String],
+    &[(String, crate::host::ConflictValue)],
+) -> Result<(), <S as Storage>::Error>;
+
 struct Capabilities<'a, S: Storage> {
     resources: Option<&'a mut dyn Resources<Error = S::Error>>,
     crypto: Option<&'a mut dyn crate::host::Crypto<Error = S::Error>>,
@@ -440,6 +531,12 @@ struct Capabilities<'a, S: Storage> {
     files: Option<&'a mut dyn FileIO<Error = S::Error>>,
     clock: Option<&'a mut dyn Clock<Error = S::Error>>,
     output: Option<&'a mut dyn crate::host::Output<Error = OperationError<S::Error>>>,
+    writer: Option<&'a mut dyn crate::host::ByteWriter<Error = S::Error>>,
+    blake3: Option<&'a mut dyn crate::host::Blake3<Error = S::Error>>,
+    upsert: Option<UpsertDispatch<S>>,
+    temporary: Option<&'a mut dyn crate::host::TemporaryFiles<Error = S::Error>>,
+    leases: Option<&'a mut dyn crate::host::Lease<Error = S::Error>>,
+    source: Option<&'a mut dyn crate::host::SourceIO<Error = S::Error>>,
 }
 
 impl<S: Storage> Default for Capabilities<'_, S> {
@@ -451,6 +548,12 @@ impl<S: Storage> Default for Capabilities<'_, S> {
             files: None,
             clock: None,
             output: None,
+            writer: None,
+            blake3: None,
+            upsert: None,
+            temporary: None,
+            leases: None,
+            source: None,
         }
     }
 }
@@ -466,6 +569,141 @@ fn execute<S: Storage>(
         let packet = state.packet();
         let frame = decode(packet.as_bytes()).map_err(|()| OperationError::Protocol)?;
         let response = match frame {
+            Frame::SourceStat(space, key) => {
+                let source = capabilities
+                    .source
+                    .as_deref_mut()
+                    .ok_or(OperationError::Protocol)?;
+                reply(49, source.stat(&space, key), &mut errors, word)
+            }
+            Frame::ReadSome(handle, offset, count) => {
+                let source = capabilities
+                    .source
+                    .as_deref_mut()
+                    .ok_or(OperationError::Protocol)?;
+                reply(
+                    50,
+                    source.read_some(handle, offset, count),
+                    &mut errors,
+                    |out, value| bytes(out, &value),
+                )
+            }
+            Frame::Freeze(input) => {
+                let source = capabilities
+                    .source
+                    .as_deref_mut()
+                    .ok_or(OperationError::Protocol)?;
+                reply(51, source.freeze(input), &mut errors, word)
+            }
+            Frame::WriteAt(handle, offset, bytes) => {
+                let writer = capabilities
+                    .writer
+                    .as_deref_mut()
+                    .ok_or(OperationError::Protocol)?;
+                reply(
+                    38,
+                    writer.write_at(handle, offset, bytes),
+                    &mut errors,
+                    |_, ()| {},
+                )
+            }
+            Frame::HashChunk(counter, root, input) => {
+                let hash = capabilities
+                    .blake3
+                    .as_deref_mut()
+                    .ok_or(OperationError::Protocol)?;
+                reply(
+                    39,
+                    hash.chunk(counter, root, input),
+                    &mut errors,
+                    |out, value| bytes(out, &value),
+                )
+            }
+            Frame::HashParent(root, left, right) => {
+                let hash = capabilities
+                    .blake3
+                    .as_deref_mut()
+                    .ok_or(OperationError::Protocol)?;
+                reply(
+                    40,
+                    hash.parent(root, left, right),
+                    &mut errors,
+                    |out, value| bytes(out, &value),
+                )
+            }
+            Frame::ExpressionUpsert(tx, relation, fields, conflicts, assignments) => {
+                let write = capabilities.upsert.ok_or(OperationError::Protocol)?;
+                reply(
+                    41,
+                    write(storage, tx, &relation, &fields, &conflicts, &assignments),
+                    &mut errors,
+                    |_, ()| {},
+                )
+            }
+            Frame::CreateTemporary(space) => {
+                let temporary = capabilities
+                    .temporary
+                    .as_deref_mut()
+                    .ok_or(OperationError::Protocol)?;
+                reply(42, temporary.create_temporary(&space), &mut errors, word)
+            }
+            Frame::Flush(handle) => {
+                let temporary = capabilities
+                    .temporary
+                    .as_deref_mut()
+                    .ok_or(OperationError::Protocol)?;
+                reply(43, temporary.flush(handle), &mut errors, |_, ()| {})
+            }
+            Frame::Replace(handle, space, key) => {
+                let temporary = capabilities
+                    .temporary
+                    .as_deref_mut()
+                    .ok_or(OperationError::Protocol)?;
+                reply(
+                    44,
+                    temporary.replace(handle, &space, key),
+                    &mut errors,
+                    |_, ()| {},
+                )
+            }
+            Frame::Discard(handle) => {
+                let temporary = capabilities
+                    .temporary
+                    .as_deref_mut()
+                    .ok_or(OperationError::Protocol)?;
+                reply(45, temporary.discard(handle), &mut errors, |_, ()| {})
+            }
+            Frame::SyncParent(space, key) => {
+                let temporary = capabilities
+                    .temporary
+                    .as_deref_mut()
+                    .ok_or(OperationError::Protocol)?;
+                reply(
+                    46,
+                    temporary.sync_parent(&space, key),
+                    &mut errors,
+                    |out, value| {
+                        out.push(match value {
+                            crate::host::DirectorySync::Synced => 0,
+                            crate::host::DirectorySync::Unsupported => 1,
+                        })
+                    },
+                )
+            }
+            Frame::LeaseAcquire(space, key) => {
+                let leases = capabilities
+                    .leases
+                    .as_deref_mut()
+                    .ok_or(OperationError::Protocol)?;
+                reply(47, leases.acquire(&space, key), &mut errors, word)
+            }
+            Frame::LeaseRelease(token) => {
+                let leases = capabilities
+                    .leases
+                    .as_deref_mut()
+                    .ok_or(OperationError::Protocol)?;
+                reply(48, leases.release(token), &mut errors, |_, ()| {})
+            }
             Frame::Append(bytes) => match capabilities.output.as_deref_mut() {
                 Some(output) => match output.append(bytes) {
                     Ok(()) => vec![1, 37],
@@ -641,6 +879,33 @@ pub(crate) unsafe fn run<S: Storage>(
     )
 }
 
+/// Run a whole ingestion with independent raw capabilities.
+///
+/// # Safety
+/// `start` returns a fresh owned native program after runtime initialization.
+pub(crate) unsafe fn run_ingest<S: crate::host::Upsert>(
+    storage: &mut S,
+    resources: crate::host::WriteServices<'_, S::Error>,
+    start: impl FnOnce() -> *mut c_void,
+) -> Result<Vec<u8>, OperationError<S::Error>> {
+    crate::native::enter();
+    execute(
+        Handle::new(start()),
+        storage,
+        &[],
+        Capabilities {
+            files: Some(resources.files),
+            writer: Some(resources.writer),
+            blake3: Some(resources.hash),
+            temporary: Some(resources.temporary),
+            leases: Some(resources.leases),
+            source: Some(resources.source),
+            upsert: Some(S::write),
+            ..Capabilities::default()
+        },
+    )
+}
+
 /// Run with separate raw resource capabilities.
 ///
 /// # Safety
@@ -793,6 +1058,161 @@ pub(crate) unsafe fn run_readonly<S: ByteStorage>(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn native_ingestion_constructor_owns_input_admission_and_failure_continuation() {
+        unsafe extern "C" {
+            fn synch_adapter_operation_ingest(
+                kind: u8,
+                size: u64,
+                now: i64,
+                cache: u8,
+                allow_unsupported: u8,
+            ) -> *mut c_void;
+        }
+        crate::native::enter();
+        for kind in [0, 1, 255] {
+            // SAFETY: runtime initialized; constructor returns one fresh owned
+            // native continuation and receives only scalar arguments.
+            let mut state =
+                Handle::new(unsafe { synch_adapter_operation_ingest(kind, 0, i64::MIN, 0, 0) });
+            match (kind, decode(state.packet().as_bytes()).unwrap()) {
+                (0, Frame::Open(space, key)) => {
+                    assert_eq!(space, "input");
+                    assert!(key.is_empty());
+                }
+                (1, Frame::SourceStat(space, key)) => {
+                    assert_eq!(space, "input");
+                    assert!(key.is_empty());
+                }
+                (255, Frame::Failure(3, 0)) => continue,
+                _ => panic!("unexpected ingestion start"),
+            }
+            let mut failed = vec![1, 0];
+            word(&mut failed, 1);
+            word(&mut failed, 77);
+            if kind == 0 {
+                failed.push(2);
+            } // Generic FileIO error classification.
+            state.resume(&failed);
+            assert!(matches!(
+                decode(state.packet().as_bytes()),
+                Ok(Frame::Failure(1, 77))
+            ));
+        }
+    }
+
+    #[test]
+    fn ingestion_frames_are_exact_and_borrow_payloads() {
+        let mut packet = vec![1, 38];
+        word(&mut packet, 7);
+        word(&mut packet, u64::MAX);
+        bytes(&mut packet, &[41, 42]);
+        match decode(&packet).unwrap() {
+            Frame::WriteAt(7, u64::MAX, payload) => {
+                assert_eq!(payload, [41, 42]);
+                assert_eq!(payload.as_ptr(), packet[26..].as_ptr());
+            }
+            _ => panic!("unexpected frame"),
+        }
+        for end in 0..packet.len() {
+            assert!(decode(&packet[..end]).is_err());
+        }
+        packet.push(0);
+        assert!(decode(&packet).is_err());
+        for tag in [43, 45, 48] {
+            let mut packet = vec![1, tag];
+            word(&mut packet, 7);
+            assert!(decode(&packet).is_ok());
+            packet.push(0);
+            assert!(decode(&packet).is_err());
+        }
+    }
+
+    #[test]
+    fn hash_frames_reject_non_boolean_flags_and_hostile_lengths() {
+        for flag in [2, 255] {
+            let mut chunk = vec![1, 39];
+            word(&mut chunk, 0);
+            chunk.push(flag);
+            bytes(&mut chunk, &[]);
+            assert!(decode(&chunk).is_err());
+            let mut parent = vec![1, 40, flag];
+            bytes(&mut parent, &[0; 32]);
+            bytes(&mut parent, &[0; 32]);
+            assert!(decode(&parent).is_err());
+        }
+        let mut packet = vec![1, 39];
+        word(&mut packet, u64::MAX);
+        packet.push(0);
+        word(&mut packet, u64::MAX);
+        assert!(decode(&packet).is_err());
+    }
+
+    #[test]
+    fn expression_decoder_bounds_recursion_and_total_nodes() {
+        let mut deep = vec![2; 34];
+        deep.push(0);
+        bytes(&mut deep, b"size");
+        assert!(Reader(&deep).conflict_value(0, &mut 4096).is_err());
+        let leaf = [0, 0, 0, 0, 0, 0, 0, 0, 0];
+        assert!(Reader(&leaf).conflict_value(0, &mut 0).is_err());
+        assert!(Reader(&[4]).conflict_value(0, &mut 4096).is_err());
+        let mut pair = vec![3];
+        pair.extend_from_slice(&leaf);
+        pair.extend_from_slice(&leaf);
+        assert!(Reader(&pair).conflict_value(0, &mut 2).is_err());
+        assert!(matches!(
+            Reader(&pair).conflict_value(0, &mut 3),
+            Ok(crate::host::ConflictValue::Maximum(_))
+        ));
+        let mut packet = vec![1, 41];
+        word(&mut packet, 1);
+        bytes(&mut packet, b"blobs");
+        word(&mut packet, 0);
+        word(&mut packet, 0);
+        word(&mut packet, u64::MAX);
+        assert!(decode(&packet).is_err());
+    }
+
+    #[test]
+    fn ingestion_failures_preserve_opaque_errors_in_generic_replies() {
+        for tag in 38..=51 {
+            let mut errors = Vec::new();
+            let response = reply(tag, Err::<(), _>("original"), &mut errors, |_, ()| {});
+            assert_eq!(errors, vec![Some("original")]);
+            let mut expected = vec![1, 0];
+            word(&mut expected, 1);
+            word(&mut expected, 1);
+            assert_eq!(response, expected);
+        }
+    }
+
+    #[test]
+    fn source_frames_preserve_unsigned_coordinates_and_borrow_frozen_bytes() {
+        let mut read = vec![1, 50];
+        for value in [7, u64::MAX, 65536] {
+            word(&mut read, value);
+        }
+        assert!(matches!(
+            decode(&read),
+            Ok(Frame::ReadSome(7, u64::MAX, 65536))
+        ));
+        let mut frozen = vec![1, 51];
+        bytes(&mut frozen, &[41, 42]);
+        match decode(&frozen).unwrap() {
+            Frame::Freeze(bytes) => assert_eq!(bytes.as_ptr(), frozen[10..].as_ptr()),
+            _ => panic!("unexpected frame"),
+        }
+        for packet in [&read, &frozen] {
+            for end in 0..packet.len() {
+                assert!(decode(&packet[..end]).is_err());
+            }
+            let mut trailing = packet.clone();
+            trailing.push(0);
+            assert!(decode(&trailing).is_err());
+        }
+    }
     use crate::cas::acquire;
 
     #[test]

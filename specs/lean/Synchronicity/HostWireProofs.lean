@@ -257,4 +257,129 @@ theorem output_append_packet_carries_only_raw_bytes :
     outputRequest (.append (b [41, 42])) =
       b [1, 37, 2, 0, 0, 0, 0, 0, 0, 0, 41, 42] := by rfl
 
+theorem native_output_injection_preserves_packet (effect : Output A) :
+    nativeRequest (.right (.right (.right (.right (.right (.left effect)))))) =
+      outputRequest effect := rfl
+
+theorem native_output_injection_preserves_reply (effect : Output A) (input : ByteArray) :
+    nativeReply (.right (.right (.right (.right (.right (.left effect)))))) input =
+      outputReply effect input := rfl
+
+theorem native_write_injection_preserves_packet (effect : WriteEffects A) :
+    nativeRequest (.right (.right (.right (.right (.right (.right effect)))))) =
+      writeRequest effect := rfl
+
+theorem native_write_injection_preserves_reply (effect : WriteEffects A) (input : ByteArray) :
+    nativeReply (.right (.right (.right (.right (.right (.right effect)))))) input =
+      writeReply effect input := rfl
+
+theorem writer_request_has_only_handle_offset_and_bytes (handle offset : UInt64) (chunk : ByteArray) :
+    writerRequest (.writeAt handle offset chunk) =
+      octet 1 ++ octet 38 ++ word handle ++ word offset ++ bytes chunk := rfl
+
+theorem writer_requires_exact_unit_reply :
+    writerReply (.writeAt 9 8 .empty) (b [1, 38, 0]) = .error protocolFailure := by decide
+
+theorem writer_accepts_acknowledgement :
+    writerReply (.writeAt 9 8 .empty) (b [1, 38]) = .ok () := by decide
+
+theorem chunk_request_preserves_counter_root_and_bytes (counter : UInt64) (root : Bool)
+    (chunk : ByteArray) : blake3Request (.chunk counter root chunk) =
+      octet 1 ++ octet 39 ++ word counter ++ octet (if root then 1 else 0) ++ bytes chunk := rfl
+
+theorem parent_request_preserves_root_and_children (root : Bool) (left right : ByteArray) :
+    blake3Request (.parent root left right) = octet 1 ++ octet 40 ++
+      octet (if root then 1 else 0) ++ bytes left ++ bytes right := rfl
+
+theorem hash_wrong_variant_rejected :
+    blake3Reply (.chunk 0 true .empty) (b [1, 40, 0, 0, 0, 0, 0, 0, 0, 0]) =
+      .error protocolFailure := by decide
+
+theorem hash_truncated_payload_rejected :
+    blake3Reply (.parent false .empty .empty) (b [1, 40, 1, 0, 0, 0, 0, 0, 0, 0]) =
+      .error protocolFailure := by decide
+
+theorem conflict_expression_tree_tags (column : String) :
+    conflictValue (.coalesce (.excluded column) (.max (.current column) (.excluded column))) =
+      octet 2 ++ (octet 1 ++ string column) ++
+        (octet 3 ++ (octet 0 ++ string column) ++ (octet 1 ++ string column)) := rfl
+
+theorem upsert_requires_exact_unit_reply :
+    upsertReply (.write 7 "blobs" [] ["root"] []) (b [1, 41, 0]) =
+      .error protocolFailure := by decide
+
+theorem upsert_accepts_acknowledgement :
+    upsertReply (.write 7 "blobs" [] ["root"] []) (b [1, 41]) = .ok () := by decide
+
+theorem temporary_handle_preserves_all_bits :
+    resourcesReply (.createTemporary "cas_payload")
+      (b [1, 42, 255, 255, 255, 255, 255, 255, 255, 255]) =
+      .ok 18446744073709551615 := by decide
+
+theorem temporary_truncated_handle_rejected :
+    resourcesReply (.createTemporary "cas_payload") (b [1, 42, 0]) =
+      .error protocolFailure := by decide
+
+theorem flush_accepts_acknowledgement :
+    resourcesReply (.flush 7) (b [1, 43]) = .ok () := by decide
+
+theorem replace_accepts_acknowledgement :
+    resourcesReply (.replace 7 "cas_payload" .empty) (b [1, 44]) = .ok () := by decide
+
+theorem discard_accepts_acknowledgement :
+    resourcesReply (.discard 7) (b [1, 45]) = .ok () := by decide
+
+theorem directory_sync_synced_is_distinct_from_unsupported :
+    resourcesReply (.syncParent "cas_payload" .empty) (b [1, 46, 0]) = .ok .synced ∧
+    resourcesReply (.syncParent "cas_payload" .empty) (b [1, 46, 1]) = .ok .unsupported := by decide
+
+theorem directory_sync_invalid_enum_rejected :
+    resourcesReply (.syncParent "cas_payload" .empty) (b [1, 46, 2]) =
+      .error protocolFailure := by decide
+
+theorem directory_sync_truncated_enum_rejected :
+    resourcesReply (.syncParent "cas_payload" .empty) (b [1, 46]) =
+      .error protocolFailure := by decide
+
+theorem directory_sync_trailing_bytes_rejected :
+    resourcesReply (.syncParent "cas_payload" .empty) (b [1, 46, 0, 0]) =
+      .error protocolFailure := by decide
+
+theorem directory_sync_original_failure_not_unsupported :
+    resourcesReply (.syncParent "cas_payload" .empty)
+      (b [1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0]) =
+      .error ⟨1, 9⟩ := by rfl
+
+theorem lease_handle_preserved :
+    leaseReply (.acquire "cas_writers" .empty) (b [1, 47, 9, 0, 0, 0, 0, 0, 0, 0]) =
+      .ok 9 := by decide
+
+theorem lease_release_requires_exact_acknowledgement :
+    leaseReply (.release 9) (b [1, 48, 0]) = .error protocolFailure := by decide
+
+theorem lease_release_accepts_acknowledgement :
+    leaseReply (.release 9) (b [1, 48]) = .ok () := by decide
+
+theorem stat_reply_preserves_unsigned_size :
+    sourceReply (.stat "source" .empty) (b [1, 49, 255, 255, 255, 255, 255, 255, 255, 255]) =
+      .ok 18446744073709551615 := by decide
+
+theorem stat_reply_rejects_truncated_size :
+    sourceReply (.stat "source" .empty) (b [1, 49, 0]) = .error protocolFailure := by decide
+
+theorem read_some_reply_allows_eof :
+    sourceReply (.readSome 7 0 8) (b [1, 50, 0, 0, 0, 0, 0, 0, 0, 0]) =
+      .ok ByteArray.empty := by rfl
+
+theorem read_some_reply_rejects_truncated_payload :
+    sourceReply (.readSome 7 0 8) (b [1, 50, 2, 0, 0, 0, 0, 0, 0, 0, 42]) =
+      .error protocolFailure := by decide
+
+theorem freeze_reply_preserves_handle :
+    sourceReply (.freeze .empty) (b [1, 51, 7, 0, 0, 0, 0, 0, 0, 0]) = .ok 7 := by decide
+
+theorem freeze_reply_rejects_trailing_bytes :
+    sourceReply (.freeze .empty) (b [1, 51, 7, 0, 0, 0, 0, 0, 0, 0, 0]) =
+      .error protocolFailure := by decide
+
 end Synchronicity.HostWireProofs

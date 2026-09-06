@@ -63,9 +63,12 @@ ingestion cutover or a proof of native cryptographic correctness.
 temporary-file and keyed-lease effects for an already captured, out-of-line
 source. Lean owns cleanup, both flushes before publication, directory-sync
 policy, and lease release after the transaction. Fault traces cover every
-effect on the empty-source execution path. This remains internal staged code:
-input acquisition, inline/EOF policy and the native resource interpreter must
-be integrated before deleting the production Rust ingestion implementation.
+effect on the empty-source execution path. `Cas/Input.run` now adds byte/file
+input acquisition and inline/EOF policy, with a whole-command native facade
+and a raw filesystem/lease interpreter. Real SQLite/file tests check roots,
+payloads, Bao layout and failure cleanup. Production Rust ingestion still
+awaits deletion at cutover; full layout/root proofs and the remaining fault,
+concurrency and platform gates must finish first.
 The raw chunk/parent cryptography adapter is staged privately in the store
 crate; it contains no tree traversal or CAS decisions.
 

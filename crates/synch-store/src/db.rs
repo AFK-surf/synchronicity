@@ -267,6 +267,9 @@ pub struct Store {
 struct CasCoord {
     order: Mutex<()>,
     writing: Mutex<HashMap<Hash, usize>>,
+    /// Canonical temporary paths protected from staging GC while an invocation
+    /// owns them. Creation/registration and collector check/unlink share this lock.
+    temporaries: Mutex<std::collections::HashSet<PathBuf>>,
     completeness: Mutex<Completeness>,
 }
 
@@ -1288,6 +1291,13 @@ impl NodeStore for Store {
 }
 
 impl Store {
+    pub(crate) fn active_temporaries(&self) -> MutexGuard<'_, std::collections::HashSet<PathBuf>> {
+        self.cas_coord
+            .temporaries
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
     fn completeness(&self) -> MutexGuard<'_, Completeness> {
         self.cas_coord
             .completeness

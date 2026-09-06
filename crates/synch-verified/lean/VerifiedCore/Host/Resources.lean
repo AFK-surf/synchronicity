@@ -48,7 +48,9 @@ inductive Resources : Type → Type where
   consumes the token too; host abandonment cleanup retains any needed fallback. -/
   | discard (handle : UInt64) : Resources (Reply Unit)
   /-- Distinguish a platform's lack of directory synchronization support from
-  an actual failed synchronization. Policy for unsupported lives in Lean. -/
+  an actual failed synchronization. Include newly created namespace ancestor
+  entries down to the configured durable storage root, not just the target's
+  immediate directory. Policy for unsupported lives in Lean. -/
   | syncParent (space : String) (key : ByteArray) : Resources (Reply SyncStatus)
 
 inductive Lease : Type → Type where

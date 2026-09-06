@@ -11,6 +11,130 @@ pub enum Outcome {
 
 pub use crate::operation::OperationError;
 
+/// Input resource bound to the invocation's `input` namespace. Lean observes
+/// file length itself; immutable byte inputs carry their actual byte count.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IngestInput {
+    Bytes { size: u64 },
+    File,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum IngestTier {
+    Local,
+    Cache,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum DirectoryPolicy {
+    RequireSync,
+    AllowUnsupported,
+}
+
+pub use crate::host::WriteServices as IngestResources;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Ingested {
+    pub root: [u8; 32],
+    pub size: u64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum IngestDomainError {
+    Malformed,
+    ColumnType {
+        index: u64,
+        column: String,
+        actual: CellType,
+    },
+    SizeMismatch {
+        root: [u8; 32],
+        recorded: u64,
+        offered: u64,
+    },
+    DirectorySyncUnsupported,
+}
+
+#[derive(Debug)]
+pub enum IngestError<E> {
+    Operation(OperationError<E>),
+    Domain(IngestDomainError),
+}
+
+fn decode_ingest(bytes: &[u8]) -> Result<Result<Ingested, IngestDomainError>, ()> {
+    let mut reader = crate::operation::Reader(bytes);
+    let result = match reader.byte()? {
+        0 => Ok(Ingested {
+            root: reader.byte_slice()?.try_into().map_err(|_| ())?,
+            size: reader.word()?,
+        }),
+        1 => Err(IngestDomainError::Malformed),
+        2 => Err(IngestDomainError::ColumnType {
+            index: reader.word()?,
+            column: reader.string()?,
+            actual: match reader.byte()? {
+                0 => CellType::Null,
+                1 => CellType::Integer,
+                2 => CellType::Real,
+                3 => CellType::Text,
+                4 => CellType::Blob,
+                _ => return Err(()),
+            },
+        }),
+        3 => Err(IngestDomainError::SizeMismatch {
+            root: reader.byte_slice()?.try_into().map_err(|_| ())?,
+            recorded: reader.word()?,
+            offered: reader.word()?,
+        }),
+        4 => Err(IngestDomainError::DirectorySyncUnsupported),
+        _ => return Err(()),
+    };
+    reader.end()?;
+    Ok(result)
+}
+
+/// Ingest one invocation-bound input through Lean's complete command, including
+/// capture, hashing, staging, leases, durability and atomic metadata publication.
+pub fn ingest<S: crate::host::Upsert>(
+    storage: &mut S,
+    resources: IngestResources<'_, S::Error>,
+    input: IngestInput,
+    now: i64,
+    tier: IngestTier,
+    directory: DirectoryPolicy,
+) -> Result<Ingested, IngestError<S::Error>> {
+    unsafe extern "C" {
+        fn synch_adapter_operation_ingest(
+            kind: u8,
+            size: u64,
+            now: i64,
+            cache: u8,
+            allow_unsupported: u8,
+        ) -> *mut std::ffi::c_void;
+    }
+    let (kind, size) = match input {
+        IngestInput::Bytes { size } => (0, size),
+        IngestInput::File => (1, 0),
+    };
+    // SAFETY: the runner initializes Lean and owns the fresh thread-confined
+    // continuation; the constructor receives only copied scalar command values.
+    let result = unsafe {
+        crate::operation::run_ingest(storage, resources, || {
+            synch_adapter_operation_ingest(
+                kind,
+                size,
+                now,
+                u8::from(tier == IngestTier::Cache),
+                u8::from(directory == DirectoryPolicy::AllowUnsupported),
+            )
+        })
+    }
+    .map_err(IngestError::Operation)?;
+    decode_ingest(&result)
+        .map_err(|()| IngestError::Operation(OperationError::Protocol))?
+        .map_err(IngestError::Domain)
+}
+
 /// Whole-object or bounded local read. Lean owns admission and repair.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ReadRequest {
@@ -305,6 +429,63 @@ pub fn acquire<S: crate::host::Storage>(
         [0] => Ok(false),
         [1] => Ok(true),
         _ => Err(OperationError::Protocol),
+    }
+}
+
+#[cfg(test)]
+mod ingest_terminal_tests {
+    use super::*;
+
+    fn root_packet(tag: u8, root: &[u8]) -> Vec<u8> {
+        let mut packet = vec![tag];
+        packet.extend_from_slice(&(root.len() as u64).to_le_bytes());
+        packet.extend_from_slice(root);
+        packet
+    }
+
+    #[test]
+    fn ingestion_success_requires_exact_root_and_unsigned_size() {
+        let mut packet = root_packet(0, &[7; 32]);
+        packet.extend_from_slice(&u64::MAX.to_le_bytes());
+        assert_eq!(
+            decode_ingest(&packet),
+            Ok(Ok(Ingested {
+                root: [7; 32],
+                size: u64::MAX
+            }))
+        );
+        for end in 0..packet.len() {
+            assert!(decode_ingest(&packet[..end]).is_err());
+        }
+        packet.push(0);
+        assert!(decode_ingest(&packet).is_err());
+        for width in [0, 31, 33] {
+            let mut packet = root_packet(0, &vec![0; width]);
+            packet.extend_from_slice(&1_u64.to_le_bytes());
+            assert!(decode_ingest(&packet).is_err());
+        }
+    }
+
+    #[test]
+    fn ingestion_size_mismatch_and_directory_failure_are_domain_results() {
+        let mut packet = root_packet(3, &[9; 32]);
+        packet.extend_from_slice(&u64::MAX.to_le_bytes());
+        packet.extend_from_slice(&0_u64.to_le_bytes());
+        assert_eq!(
+            decode_ingest(&packet),
+            Ok(Err(IngestDomainError::SizeMismatch {
+                root: [9; 32],
+                recorded: u64::MAX,
+                offered: 0,
+            }))
+        );
+        assert_eq!(
+            decode_ingest(&[4]),
+            Ok(Err(IngestDomainError::DirectorySyncUnsupported))
+        );
+        for malformed in [&[4, 0][..], &[5], &[2], &[1, 0]] {
+            assert!(decode_ingest(malformed).is_err());
+        }
     }
 }
 

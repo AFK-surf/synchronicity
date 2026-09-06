@@ -1,11 +1,74 @@
 import VerifiedCore.Host.Wire
 import VerifiedCore.Cas.Program
 import VerifiedCore.Cas.Read
+import VerifiedCore.Cas.Input
 import VerifiedCore.Trie.Program
 import VerifiedCore.Replication.History
 
 /-! Domain command constructors. The transport itself imports no domain policy. -/
 namespace VerifiedCore.Entry
+
+private def ingestWriteEffect (effect : Host.Wire.WriteEffects A) : Host.Wire.NativeEffects A :=
+  .right (.right (.right (.right (.right (.right effect)))))
+
+private def ingestEffect (effect : Cas.Input.Effects A) : Host.Wire.NativeEffects A :=
+  match effect with
+  | .right source => ingestWriteEffect (.right (.right (.right (.right (.right source)))))
+  | .left effect => match effect with
+    | .left effect => match effect with
+      | .left file => .right (.right (.right (.left file)))
+      | .right effect => match effect with
+        | .left writer => ingestWriteEffect (.left writer)
+        | .right hash => ingestWriteEffect (.right (.left hash))
+    | .right effect => match effect with
+      | .left effect => match effect with
+        | .left storage => .left storage
+        | .right upsert => ingestWriteEffect (.right (.right (.left upsert)))
+      | .right effect => match effect with
+        | .left files => ingestWriteEffect (.right (.right (.right (.left files))))
+        | .right lease => ingestWriteEffect (.right (.right (.right (.right (.left lease)))))
+
+private def ingestMetadataError : Cas.IngestCommit.Error → Host.Reply ByteArray
+  | .host failure => .error failure
+  | .metadata .malformed => .ok (Host.Wire.octet 1)
+  | .metadata (.columnType index column actual) => .ok (Host.Wire.octet 2 ++
+      Host.Wire.word index.toUInt64 ++ Host.Wire.string column ++ Host.Wire.octet (match actual with
+        | .null => 0 | .integer => 1 | .real => 2 | .text => 3 | .blob => 4))
+  | .sizeMismatch root recorded offered => .ok (Host.Wire.octet 3 ++ Host.Wire.bytes root ++
+      Host.Wire.word recorded ++ Host.Wire.word offered)
+
+private def ingestConstructionError : Cas.Bao.Error → Host.Reply ByteArray
+  | .host failure => .error failure
+  | .protocol => .error Host.Wire.protocolFailure
+
+private def ingestResourceError : Cas.Ingest.Error → Host.Reply ByteArray
+  | .host failure => .error failure
+  | .construction error => ingestConstructionError error
+  | .metadata error => ingestMetadataError error
+  | .protocol => .error Host.Wire.protocolFailure
+  | .directorySyncUnsupported => .ok (Host.Wire.octet 4)
+
+private def ingestResult : Except Cas.Input.Error Cas.Input.Result → Host.Reply ByteArray
+  | .ok result => .ok (Host.Wire.octet 0 ++ Host.Wire.bytes result.root ++ Host.Wire.word result.size)
+  | .error (.host failure) => .error failure
+  | .error (.ingestion error) => ingestResourceError error
+  | .error (.construction error) => ingestConstructionError error
+  | .error (.metadata error) => ingestMetadataError error
+  | .error .protocol => .error Host.Wire.protocolFailure
+
+/-- One whole byte/file command. No captured-source, hash-tree or metadata
+planner is exported. The input path/buffer is an invocation-owned capability. -/
+@[export synch_lean_cas_ingest]
+def ingest (kind : UInt8) (size : UInt64) (now : Int64) (cache allowUnsupported : Bool) :
+    Host.Wire.NativeState :=
+  let input := if kind == 0 then some (Cas.Input.Kind.bytes size)
+    else if kind == 1 && size == 0 then some Cas.Input.Kind.file else none
+  match input with
+  | none => .pure (.error Host.Wire.protocolFailure)
+  | some input => do
+    let result ← (Cas.Input.run input now (if cache then .cache else .local)
+      (if allowUnsupported then .allowUnsupported else .requireSync)).run.mapEffects ingestEffect
+    return ingestResult result
 
 /-- Decode the holder constructor, not its rendered storage spelling. In
 particular an opaque future holder can resemble a known role's spelling. -/
@@ -127,7 +190,13 @@ def readRoot (root : ByteArray) (all : Bool) (offset length : UInt64) : Host.Wir
     let result ← (Cas.Read.read root (if all then .all else .range offset length)).run.mapEffects
       (fun effect => match effect with
         | .left storage => .left storage
-        | .right other => .right (.right other))
+        | .right other => .right (.right (match other with
+          | .left access => .left access
+          | .right other => .right (match other with
+            | .left file => .left file
+            | .right other => .right (match other with
+              | .left clock => .left clock
+              | .right output => .right (.left output))))))
     return encodeRead result
 
 end VerifiedCore.Entry

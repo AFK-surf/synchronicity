@@ -254,9 +254,10 @@ impl Store {
     /// than [`INLINE_BLOB_MAX`](synch_core::INLINE_BLOB_MAX) by construction,
     /// since smaller files never take this path.
     ///
-    /// Age is the same horizon the rest of GC uses, read off the file's own
-    /// mtime: an ingest in progress is writing to it, so it is younger than the
-    /// window and stays. Files written by an older build, which staged into the
+    /// Invocation-owned temporaries are excluded by the shared live registry,
+    /// even if an in-progress operation has been idle past the age horizon.
+    /// Unregistered files use the same mtime horizon as the rest of GC. Files
+    /// written by an older build, which staged into the
     /// CAS root under an `incoming-` name, are taken from there as well —
     /// nothing else would.
     ///
@@ -265,7 +266,14 @@ impl Store {
         // The staging directory holds staging files and nothing else, so every
         // stale file in it goes; the CAS root holds shard directories, so only
         // the names an older build staged there do.
-        let mut swept = sweep_stale_files(&self.staging_dir(), before, &|_| true)?;
+        // Keep the lock through unlink, not merely the exclusion check: an
+        // invocation creates and registers its temporary under this same lock.
+        // Canonical keys also cover independently opened Store path aliases.
+        let active = self.active_temporaries();
+        let mut swept = sweep_stale_files(&self.staging_dir(), before, &|path| {
+            path.canonicalize()
+                .map_or(true, |key| !active.contains(&key))
+        })?;
         swept += sweep_stale_files(&self.cas_dir(), before, &is_legacy_staging)?;
         Ok(swept)
     }
