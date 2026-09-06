@@ -852,6 +852,40 @@ resource lifetimes and cleanup. Start that refactor only after known correctness
 defects are resolved and the relevant local/proof/platform checks pass; take
 small independently verified steps instead of replacing the entire FFI at once.
 
+#### Stabilization baseline and first refactor
+
+The executable baseline is `e6707dc`, CI run `34006870082`. Linux, macOS
+and Windows native-link and engine checks passed, as did the existing Lean
+proof check. All workspace test steps passed on all three platforms, including
+the Windows default-feature and ignored fanout stress tests. These are test
+results, not additional formal guarantees; the accepted limitations above remain.
+
+The first refactor removes the private read-only `Storage` substitute. The
+transport loop should depend on the host error type and an explicit request
+dispatcher, not require every operation to implement relational storage.
+Byte-only commands receive only byte-reading dispatch; relational commands
+retain their existing capabilities. Unsupported requests remain protocol errors.
+This also allows relational access/upsert routing to stay beside the storage
+borrow instead of encoding it as optional function pointers in the transport.
+
+Do not change the exported Rust APIs, Lean constructors, wire tags or schemas,
+continuation/packet ownership, original error registry, or output publication
+rules in this step. Validate byte-only missing-key and original-error behavior,
+capability rejection, and the existing operation/store regression suites before
+proceeding to shared diagnostic conversion helpers. No new host framework or
+domain migration is needed for either step.
+
+The first implementation removes the fake store, its nested error wrapper, and
+the access/upsert function-pointer slots. The synchronous dispatcher retains the
+backend borrow on the caller's stack; no callback crosses the native ABI. A
+byte-only runner rejects relational requests immediately without a host call,
+rather than returning a synthetic host error to Lean. Valid trie commands do not
+request relational effects. Four regressions cover this rejection (both direct
+dispatch and a native program), original error allocation identity, and absent
+versus empty byte values. The post-refactor store/verified suite passed (335
+tests, five ignored), as did all-target Clippy with warnings denied and formatting.
+These local checks do not substitute for subsequent platform checks.
+
 ### Bounded development validation
 
 Native compilation and the repository's Lean packages limit each Lean compiler
