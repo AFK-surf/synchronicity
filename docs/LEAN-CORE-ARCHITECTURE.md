@@ -1,6 +1,6 @@
 # Lean-owned domain operations and host effects
 
-Status: implementation architecture, 2026-09-05. This supersedes the incremental
+Status: implementation architecture, 2026-09-06. This supersedes the incremental
 predicate/snapshot-planner approach in PR #127. It is a target and migration
 contract, not a claim that the repository already implements it everywhere.
 
@@ -502,6 +502,97 @@ those remain explicit trusted host services tested independently.
 Subagents may edit disjoint domain/proof/test files, but only the primary runs
 heavy validation. Inspect surviving processes after interruption; never launch
 a replacement build while its original process is still alive.
+
+### Complete ingestion: construction and publication boundary
+
+The next production replacement is the **whole** `ingest_bytes`/`ingest_file`
+operation. Moving `commit_groups` behind another row planner, or asking Rust for
+an outboard, verified spans or an attested size, would retain the wrong core.
+The internal construction algorithm lives in `Cas/Bao.lean`; until the complete
+command and native host are wired, it is staged shared executable source, not
+a production cutover. No new standalone Bao/planner Rust facade is introduced.
+
+Lean owns the binary BLAKE3 tree, group boundaries, preorder outboard placement,
+input length policy, tee ordering, inline choice, temporary resource lifecycle,
+writer-lease lifetime, durability ordering and transactional row settlement.
+Primitive cryptography supplies only unkeyed BLAKE3 chunk compression (at most
+1024 bytes, explicit chunk counter/root flag) and parent compression of two
+32-byte chaining values. There is no host hash-subtree or Bao constructor.
+Successful primitive replies are width-checked before use. Cryptographic
+correctness of the primitive remains a stated trust assumption.
+
+Construction reads at most 16 KiB through one retained source handle, writes
+the captured bytes to an unpublished payload resource, and computes all chunk
+and parent combinations in Lean. Above the group layer, a subtree containing
+more than one group splits at the largest power-of-two group boundary strictly
+before its end. For a pair at byte offset `base` with `leftGroups` groups, its
+children's pair regions begin at `base + 64` and `base + 64 * leftGroups`.
+Children are computed before their parent pair is written at its preorder
+offset. This needs bounded working buffers and a logarithmic traversal stack,
+not a payload-sized or outboard-sized Lean accumulator. Raw positioned writes
+do not imply flush, publication or a CAS state transition.
+
+The construction proof module checks the executable splitter's positivity,
+alignment, strict shrinking and power-of-two fuel budgets (including every
+UInt64 input), bounded I/O/hash requests, small/error executions and recursive
+program equations with concrete two-/three-group layouts. Large-buffer kernel
+evaluation was replaced by compositional equations after hitting evaluator
+limits; no unchecked evaluator or enlarged recursion limit is required.
+These checks do not yet prove full conditional root correctness, enumeration
+of every outboard pair, or preservation of every offset bound through the
+whole execution. Those are required before production cutover, alongside
+native primitive/layout tests. Invocation-owned source, payload and outboard
+resources must be distinct; fresh temporary creation establishes this host
+resource contract before the internal constructor is called.
+
+The whole ingestion command must preserve these observed input semantics:
+
+- A small initial file stat selects read-to-EOF; the captured bytes' actual
+  length determines the result, even if growth crosses the inline threshold.
+- A large initial stat selects exactly that many bytes. Appended suffixes are
+  ignored; truncation fails. The root describes the captured stream, not a
+  claimed atomic filesystem snapshot.
+- A root lease starts as soon as the hash is known and before final-path
+  publication, survives metadata commit, and is never acquired inside an
+  active SQL session. Acquisition must preserve existing connection/CAS-order
+  lock ordering, not be implemented as an unsynchronized counter increment.
+- Metadata settlement remains one transaction and preserves existing inline
+  bytes through COALESCE and durable values through the existing SQL maximum
+  semantics. It must decode raw rows inside Lean rather than receive spans.
+  Its claim projection is exactly `[size, complete, durable, bitmap]`, with
+  integer diagnostics at indices 0/1/2 preceding the optional-blob diagnostic
+  at index 3. Reusing the local-read row decoder would introduce unrelated
+  field validation and change error ordering. Reuse scalar/bitmap codecs but
+  keep operation-specific row schemas explicit. The raw UPSERT interpreter
+  needs narrowly typed current/excluded value, coalesce and maximum expressions;
+  a host `commitComplete` callback or a precomputed durable boolean is not an
+  acceptable substitute for these storage semantics.
+
+Required raw host resources and compatibility improvements:
+
+- Atomically create an exclusive temporary resource and retain cleanup
+  ownership until replacement/removal. Current PID/counter names combined
+  with `File::create` can collide after process-ID reuse; `create_new` is
+  required. Protect live temporary resources from age-only staging GC.
+- Exact/EOF reads, positioned writes, checked file flush, close, atomic
+  replacement and explicit removal are independent effects. Lean requests
+  cleanup and selects primary failures; RAII covers abandonment.
+- Unify payload publication behind flush-before-replace. The old large-file
+  branch replaces before reopening and flushing, unlike byte ingestion.
+  Windows requires a writable flush handle and replacement semantics equivalent
+  to the existing write-through/retry helper; Linux/macOS use atomic rename.
+- Directory synchronization must report success, unsupported operation or
+  failure. Existing `fsync_parent` swallows errors, so the current host cannot
+  justify a theorem claiming checked directory durability. Specify the
+  supported-platform contract before wiring a stronger publication guarantee.
+
+Cutover gates are executable construction/layout proofs, actual primitive and
+outboard fixtures, single-pass changing-file tests, native transfer/allocation
+checks, failure injection across every file/lease/SQL effect, and deterministic
+GC-versus-publication tests. Then remove Rust ingestion orchestration and its
+obsolete abstract pairing anchors. Cloud adoption/finalization and Bao
+serving/import must compose this internal Lean construction/codec machinery;
+they must not call back into Rust domain operations.
 
 ### Bounded development validation
 

@@ -43,6 +43,16 @@ proofs and native/SQLite fault tests cover this boundary; cloud hydration and
 Bao serving/import remain separate unfinished operations. See the architecture
 document for isolated allocation measurements and remaining performance gates.
 
+The next ingestion stage is `Cas/Bao.lean`: a bounded-buffer constructor owns
+the BLAKE3 tree, chunk counters/ROOT flags and preorder outboard placement in
+Lean. Its raw capabilities are exact reads, positioned writes and chunk/parent
+cryptographic primitives. It is compiled from the same source as its geometry
+and effect proofs, but is **not yet called by production ingestion**. No new
+Rust subtree/planner facade is added. Whole-command staging/lease/publication
+orchestration, primitive integration and conditional root/layout correctness
+remain required before deleting Rust ingestion. The architecture document
+records changing-file behavior, temporary-file/GC hazards and durability gates.
+
 The acquisition cutover is checked against real SQLite, including abandoned
 transactions, automatic rollback, deferred commit failure, UPSERT timestamp
 preservation and the existing typed errors for corrupt durability cells.
