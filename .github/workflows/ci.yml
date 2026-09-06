@@ -57,7 +57,10 @@ jobs:
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    # Windows' serial native/toolchain builds and three feature configurations
+    # exhausted 30 minutes just as the expensive fanout tests began. Preserve
+    # every gate and allow the cold-cache Windows job time to finish them.
+    timeout-minutes: ${{ matrix.os == 'windows-latest' && 45 || 30 }}
     strategy:
       fail-fast: false
       matrix:
