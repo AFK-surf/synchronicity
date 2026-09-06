@@ -10,6 +10,7 @@ import VerifiedCore.Cas.Durable
 import VerifiedCore.Cas.Serve
 import VerifiedCore.Cas.Receive
 import VerifiedCore.Cas.Collect
+import VerifiedCore.Cas.Project
 
 /-! The shapes that cross the command boundary: what a caller asks for and
 what a finished command reports. `hostgen` derives the codecs of every type
@@ -97,6 +98,16 @@ inductive Command where
   /-- Remove object files no row accounts for, once older than `before` and
   held by no writer. -/
   | casGcOrphans (before : Int64)
+  /-- One object's index row, with whether any claim stands on it. -/
+  | casBlob (root : ByteArray)
+  /-- Every index row, most recently accessed first. -/
+  | casBlobs
+  /-- Every row's summary without its payload, most recently accessed first. -/
+  | casBlobCandidates
+  /-- Every claim on one object, or on all, by object and then by holder. -/
+  | casPins (root : Option ByteArray)
+  /-- Every pinned object, in root order. -/
+  | casPinnedBlobs
 
 /-- Malformed metadata or a column of the wrong storage class, as pin
 acquisition and deletion report it. -/
@@ -148,6 +159,14 @@ inductive ReceiveDomainError where
   | columnType (index : Nat) (column : String) (actual : Cas.Codec.CellType)
   | column (column : String) (reason : String)
   | sizeMismatch (root : ByteArray) (recorded offered : UInt64)
+  deriving BEq, DecidableEq
+
+/-- How a projection refuses: a malformed row, a column of the wrong class,
+or a column whose value is not a root or a holder. -/
+inductive ProjectDomainError where
+  | malformed
+  | columnType (index : Nat) (column : String) (actual : Cas.Codec.CellType)
+  | column (column : String) (reason : String)
   deriving BEq, DecidableEq
 
 /-- How a sweep refuses: a malformed row, or a claim a row cannot yield to. -/

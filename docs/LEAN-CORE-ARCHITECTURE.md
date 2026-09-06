@@ -435,6 +435,17 @@ Integration review has identified specific gates, not waived limitations:
   Rust eviction loop, cache measurement, in-memory touch coalescing,
   candidate pre-filter and per-file orphan loop are deleted; the
   staging-directory sweep stays a Rust layout sweep.
+- The store's projections are now the whole commands `casBlob`, `casBlobs`,
+  `casBlobCandidates`, `casPins` and `casPinnedBlobs` (`Cas/Project.lean`),
+  one read transaction each over raw reads. Lean owns the statements and
+  their order, the row validation the read path applies, the holder
+  spelling, and the pin state: read as one join of the same relation in the
+  same order and merged in one pass. `CasProjectProofs` proves the merge
+  marks exactly the rows the join listed, the decoder's refusals name their
+  column, and derives one object's read on the simulated host; fixtures run
+  the ordered listings with a failure injected at every effect. The Rust
+  SQL projections and the pins reader are deleted; the in-transaction row
+  read and advertisement rule of the publish path stay with Publication.
 - Native tests now cover acquisition transport, every effect-failure position,
   repeated polling, malformed replies and terminal resume. Generic SQLite tests
   cover UPSERT identity/time preservation, raw cells, failed commit, abandoned

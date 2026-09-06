@@ -48,7 +48,11 @@ least recent use, content collection through the existing deletion, the
 orphan-file sweep) is four whole commands over a `Sweep` algebra that
 reports file cost, age and the store's object roots, and `Lease.order`,
 the remover's critical section every writer's lease is ordered against;
-the Rust eviction, pre-filter and per-file sweep loops are deleted. History retention now runs as a
+the Rust eviction, pre-filter and per-file sweep loops are deleted. The
+projections (`Cas/Project.lean`: one row, every row, the summary, the
+claims, the pinned roots) are five whole read transactions that validate
+rows as the read path does and merge a joined pin state in one pass; the
+Rust SQL projections are deleted. History retention now runs as a
 complete Lean operation over raw scans and a separate Ed25519 primitive; the
 Rust retention loop and receipt/fork helpers are removed. Raw scans retain
 rows before a trailing host failure so Lean owns first-error selection.

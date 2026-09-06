@@ -45,6 +45,7 @@ fn main() {
         "Cas/Serve",
         "Cas/Receive",
         "Cas/Collect",
+        "Cas/Project",
         "Host/Wire",
         "Trie/Codec",
         "Trie/Program",

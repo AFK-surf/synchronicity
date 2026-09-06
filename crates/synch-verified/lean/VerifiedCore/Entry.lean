@@ -11,6 +11,7 @@ import VerifiedCore.Cas.Durable
 import VerifiedCore.Cas.Serve
 import VerifiedCore.Cas.Receive
 import VerifiedCore.Cas.Collect
+import VerifiedCore.Cas.Project
 import VerifiedCore.Replication.History
 
 /-! The one native entry point. A command arrives as a packet, decoded with
@@ -128,6 +129,15 @@ def receiving [Encode A] : Except Cas.Receive.Error A → Host.Reply ByteArray
       | .sizeMismatch root recorded offered => .sizeMismatch root recorded offered
       | .host _ | .protocol => .malformed) : Except _ A)
 
+def projecting [Encode A] : Except Cas.Project.Error A → Host.Reply ByteArray
+  | .ok value => terminalOf (Except.ok value : Except ProjectDomainError A)
+  | .error (.host hostFailure) => .error hostFailure
+  | .error .malformed => terminalOf (Except.error ProjectDomainError.malformed : Except _ A)
+  | .error (.columnType index column actual) =>
+    terminalOf (Except.error (ProjectDomainError.columnType index column actual) : Except _ A)
+  | .error (.column column reason) =>
+    terminalOf (Except.error (ProjectDomainError.column column reason) : Except _ A)
+
 def collecting [Encode A] : Except Cas.Collect.Error A → Host.Reply ByteArray
   | .ok value => terminalOf (Except.ok value : Except CollectDomainError A)
   | .error (.host hostFailure) => .error hostFailure
@@ -206,6 +216,12 @@ def dispatch : Command → Native
       (collecting ∘ Except.map fun (entries, freed) => Evicted.mk entries freed)
   | .casGcContent before => command (Cas.Collect.gcContent before) collecting
   | .casGcOrphans before => command (Cas.Collect.gcOrphans before) collecting
+  | .casBlob root => if root.size != 32 then protocol else command (Cas.Project.blob root) projecting
+  | .casBlobs => command Cas.Project.blobs projecting
+  | .casBlobCandidates => command Cas.Project.candidates projecting
+  | .casPins root =>
+    if root.any (·.size != 32) then protocol else command (Cas.Project.pins root) projecting
+  | .casPinnedBlobs => command Cas.Project.pinnedBlobs projecting
 
 /-- Every command starts here: an undecodable packet is a protocol failure
 before any effect is requested. -/

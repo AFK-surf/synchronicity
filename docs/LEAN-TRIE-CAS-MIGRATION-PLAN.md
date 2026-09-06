@@ -72,7 +72,7 @@ a raw store for tests.
 | `touch_blob`, `durable_cache_entries`, `evict_durable_cache_to`, `enforce_cache_limit` | `backend.rs:340-363,947` | `Cas/Collect.lean` (done) |
 | `gc_content`, `gc_orphans`, `gc_staging`, `blob_candidates` pre-filter | `gc.rs:131-285` | `Cas/Collect.lean` (done; `gc_staging` stays a Rust layout sweep) |
 | `hold_source_blob`, `reconcile_source_holds`, `live_source_blob_size` (`Txn`) | `synch-engine/src/node.rs:1633-1668`, inside the publish transaction | `Cas/Holds.lean`, gated on Publication (§6) |
-| `local_ad`, `blob_candidates`, `blobs`, `pins*` projections | engine, CLI | `Cas/Project.lean` |
+| `local_ad`, `blob_candidates`, `blobs`, `pins*` projections | engine, CLI | `Cas/Project.lean` (done; the advertisement rule stays with C6) |
 | `commit_cas_migration` | CLI one-shot | stays Rust (operator migration tool), documented as such |
 
 Not CAS, not in this plan: `uploads.rs` (staged S3 uploads; touches the CAS
@@ -397,9 +397,32 @@ atomicity with the `entries` write. They migrate when Publication does, as
 sub-operations composed under the same transaction token. Until then they
 stay Rust and are listed as the one CAS remainder.
 
-**C7. Projections** (`Cas/Project.lean`). `local_ad`, `blob_candidates`,
-`blobs`, `pins`: row decoding through the existing `ReadCodec`, so a
-malformed row is reported the same way everywhere. Small, last.
+**C7. Projections** (`Cas/Project.lean`). Done. `blob`, `blobs`,
+`blob_candidates`, `pins`, `pins_for` and `pinned_blobs` run as the whole
+commands `casBlob`, `casBlobs`, `casBlobCandidates`, `casPins` and
+`casPinnedBlobs`, each one read transaction over raw `readRows` and
+`existsRows`. Lean owns the statements and their order (most recently
+accessed first, ties by root; claims by object then holder; pinned roots by
+root), the row validation the read path applies (column class by position
+and name, then the root's width, a row of the wrong shape malformed), the
+holder spelling (`PinHolder.parse`, structural over the characters, with an
+unknown spelling kept as a holder rather than dropped), and the pin state:
+one object's from `existsRows` in the same transaction, a listing's from one
+inner join of the same relation in the same order, merged in one pass
+(`markPinned`) rather than asked row by row. Proved (`CasProjectProofs`): a
+well-typed row decodes to its cells and each refusal names its column; the
+merge marks exactly the rows the join listed a root for
+(`markPinned_marks_exactly`, under a primary key's distinct roots); dropping
+adjacent duplicates keeps exactly the roots there were; the holder parser on
+the spellings that matter; one object's row on the simulated host, absent or
+present with its pin state; and the ordered listings on fixtures with a
+failure injected at every effect. The simulated host's ordered `query` now
+sorts with a structural insertion sort so such fixtures can be decided.
+Cutover: the six `Store` methods delegate (`lean_project.rs`); their SQL,
+the pin subquery and the pins reader are deleted. `Txn::blob` and
+`BlobRow::to_ad`, the row read and the advertisement rule inside the publish
+transaction, stay Rust with C6: they are composed under the `entries` write
+and move with Publication. `local_ad` is that rule over the Lean row read.
 
 ## 6. Cross-domain seams
 

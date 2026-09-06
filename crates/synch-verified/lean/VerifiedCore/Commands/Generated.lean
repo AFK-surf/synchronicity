@@ -161,6 +161,48 @@ instance : Decode Cas.Receive.ProvenSubtree where
     let a3 ← Decode.decode
     return .mk a0 a1 a2 a3
 
+instance : Encode Cas.Project.Blob where
+  encode out value := match value with
+    | .mk a0 a1 a2 a3 a4 a5 a6 a7 => out |>.put a0 |>.put a1 |>.put a2 |>.put a3 |>.put a4 |>.put a5 |>.put a6 |>.put a7
+
+instance : Decode Cas.Project.Blob where
+  decode := do
+    let a0 ← Decode.decode
+    let a1 ← Decode.decode
+    let a2 ← Decode.decode
+    let a3 ← Decode.decode
+    let a4 ← Decode.decode
+    let a5 ← Decode.decode
+    let a6 ← Decode.decode
+    let a7 ← Decode.decode
+    return .mk a0 a1 a2 a3 a4 a5 a6 a7
+
+instance : Encode Cas.Project.Summary where
+  encode out value := match value with
+    | .mk a0 a1 a2 a3 a4 a5 => out |>.put a0 |>.put a1 |>.put a2 |>.put a3 |>.put a4 |>.put a5
+
+instance : Decode Cas.Project.Summary where
+  decode := do
+    let a0 ← Decode.decode
+    let a1 ← Decode.decode
+    let a2 ← Decode.decode
+    let a3 ← Decode.decode
+    let a4 ← Decode.decode
+    let a5 ← Decode.decode
+    return .mk a0 a1 a2 a3 a4 a5
+
+instance : Encode Cas.Project.Pin where
+  encode out value := match value with
+    | .mk a0 a1 a2 a3 => out |>.put a0 |>.put a1 |>.put a2 |>.put a3
+
+instance : Decode Cas.Project.Pin where
+  decode := do
+    let a0 ← Decode.decode
+    let a1 ← Decode.decode
+    let a2 ← Decode.decode
+    let a3 ← Decode.decode
+    return .mk a0 a1 a2 a3
+
 instance : Encode Commands.LifecycleDomainError where
   encode out value := match value with
     | .malformed => out.push 0
@@ -291,6 +333,20 @@ instance : Decode Commands.CollectDomainError where
     | 2 => return .sizeMismatch (← Decode.decode) (← Decode.decode) (← Decode.decode)
     | _ => throw ()
 
+instance : Encode Commands.ProjectDomainError where
+  encode out value := match value with
+    | .malformed => out.push 0
+    | .columnType a0 a1 a2 => out.push 1 |>.put a0 |>.put a1 |>.put a2
+    | .column a0 a1 => out.push 2 |>.put a0 |>.put a1
+
+instance : Decode Commands.ProjectDomainError where
+  decode := do
+    match ← readByte with
+    | 0 => return .malformed
+    | 1 => return .columnType (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 2 => return .column (← Decode.decode) (← Decode.decode)
+    | _ => throw ()
+
 instance : Encode Commands.Ingested where
   encode out value := match value with
     | .mk a0 a1 => out |>.put a0 |>.put a1
@@ -361,6 +417,11 @@ instance : Encode Commands.Command where
     | .casEvict a0 a1 => out.push 25 |>.put a0 |>.put a1
     | .casGcContent a0 => out.push 26 |>.put a0
     | .casGcOrphans a0 => out.push 27 |>.put a0
+    | .casBlob a0 => out.push 28 |>.put a0
+    | .casBlobs => out.push 29
+    | .casBlobCandidates => out.push 30
+    | .casPins a0 => out.push 31 |>.put a0
+    | .casPinnedBlobs => out.push 32
 
 instance : Decode Commands.Command where
   decode := do
@@ -393,6 +454,11 @@ instance : Decode Commands.Command where
     | 25 => return .casEvict (← Decode.decode) (← Decode.decode)
     | 26 => return .casGcContent (← Decode.decode)
     | 27 => return .casGcOrphans (← Decode.decode)
+    | 28 => return .casBlob (← Decode.decode)
+    | 29 => return .casBlobs
+    | 30 => return .casBlobCandidates
+    | 31 => return .casPins (← Decode.decode)
+    | 32 => return .casPinnedBlobs
     | _ => throw ()
 
 end VerifiedCore

@@ -6,8 +6,9 @@
 
 pub use crate::generated::{
     CellType, CollectDomainError, Committed, DurableDomainError, Evicted, IngestDomainError,
-    IngestInput, Ingested, LifecycleDomainError, Outcome, PinHolder, ProvenSubtree,
-    ReadDomainError, ReceiveDomainError, ServeDomainError, Served,
+    IngestInput, Ingested, LifecycleDomainError, Outcome, PinHolder, ProjectDomainError,
+    ProjectedBlob, ProjectedPin, ProjectedSummary, ProvenSubtree, ReadDomainError,
+    ReceiveDomainError, ServeDomainError, Served,
 };
 pub use crate::host::IngestResources;
 pub use crate::operation::OperationError;
@@ -60,6 +61,70 @@ pub enum DurableError<E> {
 pub enum ServeError<E> {
     Operation(OperationError<E>),
     Domain(ServeDomainError),
+}
+
+/// Completed projection failure, preserving original host errors.
+#[derive(Debug)]
+pub enum ProjectError<E> {
+    Operation(OperationError<E>),
+    Domain(ProjectDomainError),
+}
+
+macro_rules! decode_list {
+    ($($item:ty),+ $(,)?) => {
+        $(impl Decode for Vec<$item> {
+            fn decode(r: &mut crate::operation::Reader<'_>) -> Result<Self, ()> {
+                r.list(Decode::decode)
+            }
+        })+
+    };
+}
+decode_list!(ProjectedBlob, ProjectedSummary, ProjectedPin, Vec<u8>);
+
+fn project<T: Decode, S: Storage>(
+    storage: &mut S,
+    command: &Command,
+) -> Result<T, ProjectError<S::Error>> {
+    let outcome: Result<T, ProjectDomainError> =
+        finish(run(storage, Capabilities::default(), &[], command))
+            .map_err(ProjectError::Operation)?;
+    outcome.map_err(ProjectError::Domain)
+}
+
+/// One object's index row, with whether any claim stands on it; the row is
+/// validated as the read path validates it.
+pub fn blob<S: Storage>(
+    storage: &mut S,
+    root: &[u8; 32],
+) -> Result<Option<ProjectedBlob>, ProjectError<S::Error>> {
+    project(storage, &Command::CasBlob(root.to_vec()))
+}
+
+/// Every index row, most recently accessed first, each with its pin state
+/// read as one join and merged in one pass.
+pub fn blobs<S: Storage>(storage: &mut S) -> Result<Vec<ProjectedBlob>, ProjectError<S::Error>> {
+    project(storage, &Command::CasBlobs)
+}
+
+/// Every row's summary without its payload, most recently accessed first.
+pub fn blob_candidates<S: Storage>(
+    storage: &mut S,
+) -> Result<Vec<ProjectedSummary>, ProjectError<S::Error>> {
+    project(storage, &Command::CasBlobCandidates)
+}
+
+/// Every claim on one object, or on all, by object and then by holder; a
+/// spelling this build does not know is kept as a holder.
+pub fn pins<S: Storage>(
+    storage: &mut S,
+    root: Option<&[u8; 32]>,
+) -> Result<Vec<ProjectedPin>, ProjectError<S::Error>> {
+    project(storage, &Command::CasPins(root.map(|root| root.to_vec())))
+}
+
+/// Every pinned object, in root order.
+pub fn pinned_blobs<S: Storage>(storage: &mut S) -> Result<Vec<Vec<u8>>, ProjectError<S::Error>> {
+    project(storage, &Command::CasPinnedBlobs)
 }
 
 /// Completed sweep failure, preserving original host errors.

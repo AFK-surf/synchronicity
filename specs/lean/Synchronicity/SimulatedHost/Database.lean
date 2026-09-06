@@ -227,9 +227,24 @@ def ordered (order : List Order) (left right : Fields) : Bool :=
       | .lt => !next.descending
       | .gt => next.descending
 
+/-- A stable sort by `le`, structurally recursive so a fixture can decide
+an ordered query: an earlier row stays before a later one it ties with. -/
+def insertOrdered (le : Fields → Fields → Bool) (row : Fields) : List Fields → List Fields
+  | [] => [row]
+  | head :: rest => if le row head then row :: head :: rest else head :: insertOrdered le row rest
+
+def sortRows (le : Fields → Fields → Bool) : List Fields → List Fields
+  | [] => []
+  | row :: rest => insertOrdered le row (sortRows le rest)
+
+@[simp] theorem sortRows_nil (le : Fields → Fields → Bool) : sortRows le [] = [] := rfl
+
+@[simp] theorem sortRows_singleton (le : Fields → Fields → Bool) (row : Fields) :
+    sortRows le [row] = [row] := rfl
+
 def query (db : Database) (relation : String) (columns : List String) (fields : Fields)
     (order : List Order) (joins : List Join) : List Row :=
   let candidates := if joins.isEmpty then rows db relation else joinedRows db relation joins
-  ((candidates.filter (fun row => equals row fields)).mergeSort (ordered order)).map (project columns)
+  (sortRows (ordered order) (candidates.filter (fun row => equals row fields))).map (project columns)
 
 end Synchronicity.SimulatedHost

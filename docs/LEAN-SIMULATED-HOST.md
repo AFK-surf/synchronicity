@@ -80,7 +80,9 @@ the payload and outboard files on one page. The remover's critical section
 (`Lease.order`) is a counted token like a lease, keyed by its space alone,
 so "inside the section" is the counter of `("cas", empty)` reading one;
 its exclusion against writers is a host obligation the model states, not
-one it simulates.
+one it simulates. An ordered query sorts with a structural, stable
+insertion sort, so a fixture over several rows can be decided by the
+kernel; the order it produces is the one `ordered` states.
 Literal predicates (`equals`, `notEquals`, delete bounds) have SQL `IS`
 semantics, as the store adapter renders them: NULL selects NULL and `IS NOT`
 NULL excludes it. Conflict detection and join correlation keep SQL `=`, where

@@ -33,3 +33,4 @@ import Synchronicity.CasDurableProofs
 import Synchronicity.CasServeProofs
 import Synchronicity.CasReceiveProofs
 import Synchronicity.CasCollectProofs
+import Synchronicity.CasProjectProofs

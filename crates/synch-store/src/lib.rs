@@ -24,6 +24,7 @@ mod lean_ingest_memory;
 mod lean_ingest_metadata;
 #[cfg(all(test, unix))]
 mod lean_ingest_streams;
+mod lean_project;
 mod lean_read;
 mod lean_receive;
 mod lean_resources;

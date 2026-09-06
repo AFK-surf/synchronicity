@@ -78,11 +78,13 @@ def messages : List Name := [
   ``VerifiedCore.Cas.Codec.CellType, ``VerifiedCore.Cas.PinHolder, ``VerifiedCore.Cas.Input.Kind,
   ``VerifiedCore.Cas.Outcome, ``VerifiedCore.Origin.Error, ``VerifiedCore.Trie.LookupError,
   ``VerifiedCore.Trie.Refusal, ``VerifiedCore.Trie.Verdict, ``VerifiedCore.Trie.MutationError,
-  ``VerifiedCore.Cas.Receive.ProvenSubtree,
+  ``VerifiedCore.Cas.Receive.ProvenSubtree, ``VerifiedCore.Cas.Project.Blob,
+  ``VerifiedCore.Cas.Project.Summary, ``VerifiedCore.Cas.Project.Pin,
   ``VerifiedCore.Commands.LifecycleDomainError, ``VerifiedCore.Commands.IngestDomainError,
   ``VerifiedCore.Commands.ReadDomainError, ``VerifiedCore.Commands.HistoryDomainError,
   ``VerifiedCore.Commands.DurableDomainError, ``VerifiedCore.Commands.ServeDomainError,
   ``VerifiedCore.Commands.ReceiveDomainError, ``VerifiedCore.Commands.CollectDomainError,
+  ``VerifiedCore.Commands.ProjectDomainError,
   ``VerifiedCore.Commands.Ingested, ``VerifiedCore.Commands.Committed, ``VerifiedCore.Commands.Served,
   ``VerifiedCore.Commands.Evicted, ``VerifiedCore.Commands.Command]
 
@@ -95,6 +97,9 @@ def rustName (name : Name) : String :=
   | ``VerifiedCore.Trie.Refusal => "NodeRefusal"
   | ``VerifiedCore.Trie.Verdict => "NodeVerdict"
   | ``VerifiedCore.Trie.MutationError => "MutationDomainError"
+  | ``VerifiedCore.Cas.Project.Blob => "ProjectedBlob"
+  | ``VerifiedCore.Cas.Project.Summary => "ProjectedSummary"
+  | ``VerifiedCore.Cas.Project.Pin => "ProjectedPin"
   | _ => name.getString!
 
 /-- The private transport's tags. Numbering is historical, so it is a table

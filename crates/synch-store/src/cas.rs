@@ -627,17 +627,11 @@ impl Store {
 
     // ---- index reads ------------------------------------------------------
 
-    /// Reads the local index row for an object.
+    /// Reads the local index row for an object, with whether any claim
+    /// stands on it: the Lean projection `Cas.Project.blob`, validated as
+    /// the read path validates a row.
     pub fn blob(&self, root: &Hash) -> Result<Option<BlobRow>> {
-        let conn = self.conn();
-        let row = conn
-            .query_row(
-                &format!("SELECT {BLOB_COLUMNS} FROM blobs WHERE root = ?1"),
-                params![root.as_bytes().to_vec()],
-                raw_blob_row,
-            )
-            .optional()?;
-        row.map(blob_row_from).transpose()
+        crate::lean_project::blob(self, root)
     }
 
     /// Every locally held object, as the columns a sweep or a report reads.
@@ -648,51 +642,16 @@ impl Store {
     /// pin state and `last_access`. Pulling the payloads anyway made a pass
     /// over a store of many small objects allocate the inlined half of the CAS,
     /// every five minutes and again on every doctor run, and drop all of it.
+    /// The pin state is read as one join and merged in one pass by the Lean
+    /// projection `Cas.Project.candidates`.
     pub fn blob_candidates(&self) -> Result<Vec<BlobSummary>> {
-        let conn = self.conn();
-        let mut stmt = conn.prepare(
-            "SELECT root, size, complete, durable,
-                    EXISTS(SELECT 1 FROM pins WHERE pins.root = blobs.root),
-                    last_access
-             FROM blobs ORDER BY last_access DESC",
-        )?;
-        let rows = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, Vec<u8>>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, i64>(3)?,
-                row.get::<_, i64>(4)?,
-                row.get::<_, i64>(5)?,
-            ))
-        })?;
-        let mut out = Vec::new();
-        for row in rows {
-            let (root, size, complete, durable, pinned, last_access) = row?;
-            out.push(BlobSummary {
-                root: hash_column(root, "blobs.root")?,
-                size: size as u64,
-                complete: complete != 0,
-                durable: durable != 0,
-                pinned: pinned != 0,
-                last_access,
-            });
-        }
-        Ok(out)
+        crate::lean_project::blob_candidates(self)
     }
 
-    /// Every locally held object.
+    /// Every locally held object, most recently accessed first: the Lean
+    /// projection `Cas.Project.blobs`.
     pub fn blobs(&self) -> Result<Vec<BlobRow>> {
-        let conn = self.conn();
-        let mut stmt = conn.prepare(&format!(
-            "SELECT {BLOB_COLUMNS} FROM blobs ORDER BY last_access DESC"
-        ))?;
-        let rows = stmt.query_map([], raw_blob_row)?;
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(blob_row_from(row?)?);
-        }
-        Ok(out)
+        crate::lean_project::blobs(self)
     }
 
     /// True if the whole object is present and verified locally.
@@ -996,57 +955,22 @@ impl Store {
         })
     }
 
-    /// Every claim on one object, oldest first.
+    /// Every claim on one object, by holder.
     pub fn pins_for(&self, root: &Hash) -> Result<Vec<PinRow>> {
-        self.query_pins("WHERE root = ?1", params![root.as_bytes().to_vec()])
+        crate::lean_project::pins(self, Some(root))
     }
 
-    /// Every claim this node holds, by object and then by holder.
+    /// Every claim this node holds, by object and then by holder. A holder
+    /// spelling this build does not know is kept as a holder rather than
+    /// dropped: an unreadable claim is still a claim, and forgetting it is
+    /// how bytes go missing after a downgrade (`Cas.Project.PinHolder.parse`).
     pub fn pins(&self) -> Result<Vec<PinRow>> {
-        self.query_pins("", params![])
+        crate::lean_project::pins(self, None)
     }
 
-    fn query_pins(&self, filter: &str, args: &[&dyn rusqlite::ToSql]) -> Result<Vec<PinRow>> {
-        let conn = self.conn();
-        let mut stmt = conn.prepare(&format!(
-            "SELECT root, holder, created_at, release_after FROM pins {filter}
-             ORDER BY root, holder"
-        ))?;
-        let rows = stmt.query_map(args, |row| {
-            Ok((
-                row.get::<_, Vec<u8>>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, Option<i64>>(3)?,
-            ))
-        })?;
-        let mut out = Vec::new();
-        for row in rows {
-            let (root, holder, created_at, release_after) = row?;
-            out.push(PinRow {
-                root: hash_column(root, "pins.root")?,
-                // A holder spelling this build does not know is kept as a
-                // holder rather than dropped: an unreadable claim is still a
-                // claim, and forgetting it is how bytes go missing after a
-                // downgrade.
-                holder: PinHolder::parse(&holder),
-                created_at,
-                release_after,
-            });
-        }
-        Ok(out)
-    }
-
-    /// Every pinned object.
+    /// Every pinned object, in root order.
     pub fn pinned_blobs(&self) -> Result<Vec<Hash>> {
-        let conn = self.conn();
-        let mut stmt = conn.prepare("SELECT DISTINCT root FROM pins ORDER BY root")?;
-        let rows = stmt.query_map([], |r| r.get::<_, Vec<u8>>(0))?;
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(hash_column(row?, "pins.root")?);
-        }
-        Ok(out)
+        crate::lean_project::pinned_blobs(self)
     }
 
     /// Deletes an object, but only if it is still a GC candidate.
