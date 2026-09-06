@@ -225,8 +225,8 @@ impl Storage for Session<'_> {
         self.transaction()?
             .copy_rows(tx, target, source, fields, conflicts)
     }
-    fn delete_selected(&mut self, tx: u64, selection: &Selection) -> Result<u64> {
-        self.transaction()?.delete_selected(tx, selection)
+    fn delete(&mut self, tx: u64, selection: &Selection) -> Result<u64> {
+        self.transaction()?.delete(tx, selection)
     }
 
     fn write(
@@ -843,7 +843,7 @@ impl Storage for SqliteStorage<'_> {
             .execute(&sql, params_from_iter(bindings.iter().map(BoundCell)))? as u64)
     }
 
-    fn delete_selected(&mut self, tx: u64, selection: &Selection) -> Result<u64> {
+    fn delete(&mut self, tx: u64, selection: &Selection) -> Result<u64> {
         self.require_live_transaction(tx)?;
         let (predicate, bindings) = selection_sql(selection)?;
         let sql = format!("DELETE FROM \"{}\"{predicate}", selection.relation);
@@ -956,7 +956,7 @@ mod tests {
                 .unwrap(),
             2
         );
-        assert_eq!(storage.delete_selected(tx, &selection).unwrap(), 2);
+        assert_eq!(storage.delete(tx, &selection).unwrap(), 2);
         storage.commit(tx).unwrap();
         assert_eq!(
             storage
@@ -1097,7 +1097,7 @@ mod tests {
                 &[]
             )
             .is_err());
-        assert!(storage.delete_selected(tx, &invalid).is_err());
+        assert!(storage.delete(tx, &invalid).is_err());
         storage.rollback(tx).unwrap();
     }
 

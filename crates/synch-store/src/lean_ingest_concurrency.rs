@@ -45,7 +45,7 @@ impl TemporaryFiles for PublicationGate<'_> {
     fn discard(&mut self, handle: u64) -> Result<()> {
         self.files.discard(handle)
     }
-    fn sync_parent(&mut self, space: &str, key: &[u8]) -> Result<host::DirectorySync> {
+    fn sync_parent(&mut self, space: &str, key: &[u8]) -> Result<host::SyncStatus> {
         self.files.sync_parent(space, key)
     }
 }
@@ -87,9 +87,7 @@ fn whole_native_ingestion_holds_gc_lease_across_both_file_publications() {
                 leases: &mut leases,
                 source: &mut source,
             },
-            cas::IngestInput::Bytes {
-                size: bytes.len() as u64,
-            },
+            cas::IngestInput::Bytes(bytes.len() as u64),
             123,
             cas::IngestTier::Local,
             if cfg!(windows) {

@@ -91,10 +91,10 @@ pub(crate) fn admit_size(store: &Store, root: &Hash, size: u64) -> Result<()> {
 
 pub(crate) fn ingest(store: &Store, input: Input<'_>, now: i64) -> Result<(Hash, u64)> {
     let kind = match input {
-        Input::Bytes(bytes) => cas::IngestInput::Bytes {
-            size: u64::try_from(bytes.len())
+        Input::Bytes(bytes) => cas::IngestInput::Bytes(
+            u64::try_from(bytes.len())
                 .map_err(|_| StoreError::invalid("input exceeds unsigned size domain"))?,
-        },
+        ),
         Input::File(_) => cas::IngestInput::File,
     };
     let mut storage = crate::lean_storage::Session::new(store);
@@ -233,7 +233,7 @@ mod tests {
             self.inner.discard(handle)?;
             self.step("discard")
         }
-        fn sync_parent(&mut self, space: &str, key: &[u8]) -> Result<host::DirectorySync> {
+        fn sync_parent(&mut self, space: &str, key: &[u8]) -> Result<host::SyncStatus> {
             self.step("sync")?;
             self.inner.sync_parent(space, key)
         }
@@ -457,7 +457,7 @@ mod tests {
 
     fn assert_captured(store: &Store, result: cas::Ingested, expected: &[u8]) {
         assert_eq!(result.size, expected.len() as u64);
-        assert_eq!(&result.root, blake3::hash(expected).as_bytes());
+        assert_eq!(result.root.as_slice(), blake3::hash(expected).as_bytes());
         let root = Hash::from_slice(&result.root).unwrap();
         assert_eq!(store.read_all(&root).unwrap(), expected);
         assert!(store.blob(&root).unwrap().unwrap().complete);

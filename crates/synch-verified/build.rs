@@ -26,6 +26,8 @@ fn main() {
         "Host/Resources",
         "Host/Source",
         "Crypto",
+        "Host/Codec",
+        "Host/Generated",
         "Origin",
         "Cas",
         "Cas/Codec",
@@ -39,6 +41,8 @@ fn main() {
         "Trie/Codec",
         "Trie/Program",
         "Replication/History",
+        "Commands",
+        "Commands/Generated",
         "Entry",
     ];
     for module in modules {

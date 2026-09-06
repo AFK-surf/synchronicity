@@ -1,5 +1,5 @@
 import VerifiedCore.Cas.Read
-import Synchronicity.Decidable
+import Synchronicity.Handlers
 
 /-! Executions of the whole read program. The scripted interpreter
 supplies raw observations only, without availability or recovery decisions. -/
@@ -59,68 +59,70 @@ private inductive Event where
   | append (count : Nat)
   deriving DecidableEq
 
-private def execute (script : Script) : Nat → List UInt8 →
-    Program Effects (Except Error UInt64) →
-      Option (Except Error UInt64 × List UInt8 × List Event)
-  | 0, _, _ => none
-  | _ + 1, output, .pure result => some (result, output, [])
-  | fuel + 1, output, .request effect resume =>
-    let step (event : Event) (next : Program Effects (Except Error UInt64)) :=
-      (execute script fuel output next).map fun (result, bytes, trace) => (result, bytes, event :: trace)
-    match effect with
-    | .left effect => match effect with
-      | .begin => step .begin (resume (match script.beginFailure with
-          | none => .ok 7 | some failure => .error failure))
-      | .commit _ => step .commit (resume (.ok ()))
-      | .rollback _ => step .rollback (resume (.ok ()))
-      | .readRows _ _ _ _ _ _ => step .size (resume (.ok [[.integer 4]]))
-      | _ => none
-    | .right effect => match effect with
-      | .left effect => match effect with
-        | .snapshot selection columns =>
-          if selection == ⟨"blobs", [("root", .blob root)], []⟩ &&
-              columns == ["root", "size", "complete", "bitmap", "inline", "last_access", "durable"] then
-            step .snapshot (resume (match script.snapshotFailure with
-              | none => .ok script.scan | some failure => .error failure))
-          else none
-        | .update .. => step .invalidate (resume (.ok 1))
-        | .copyRows .. => step .copy (resume (.ok 1))
-        | .delete .. => step .delete (resume (.ok 1))
-      | .right effect => match effect with
-        | .left effect => match effect with
-          | .open space key => if space == "cas_payload" && key == root then
-              step .open (resume script.opened) else none
-          | .readAt _ _ _ => none
-          | .transfer handle offset count => match script.transferReply with
-            | .error failure => step (.transfer handle offset count) (resume (.error failure))
-            | .ok () => (execute script fuel
-                (output ++ (script.payload.extract offset.toNat (offset.toNat + count.toNat)).data.toList)
-                (resume (.ok ()))).map
-                  fun (result, output, trace) => (result, output, .transfer handle offset count :: trace)
-          | .close handle => step (.close handle) (resume (.ok ()))
-        | .right effect => match effect with
-          | .left effect => match effect with
-            | .nowNs => step .clock (resume (.ok 123))
-          | .right effect => match effect with
-            | .append bytes => match script.appendFailure with
-              | some failure => step (.append bytes.size) (resume (.error failure))
-              | none => (execute script fuel (output ++ bytes.data.toList) (resume (.ok ()))).map
-                  fun (result, output, trace) => (result, output, .append bytes.size :: trace)
+/-- The script and the bytes the host has moved into the private output. -/
+private structure State where
+  script : Script
+  output : List UInt8 := []
+
+private def step (state : State) (event : Event) (value : A) : Option (Event × A × State) :=
+  some (event, value, state)
+
+private instance : Handlers.Handler Storage State Event where
+  handle
+    | .begin, s => step s .begin (match s.script.beginFailure with
+        | none => .ok 7 | some failure => .error failure)
+    | .commit _, s => step s .commit (.ok ())
+    | .rollback _, s => step s .rollback (.ok ())
+    | .readRows _ _ _ _ _ _, s => step s .size (.ok [[.integer 4]])
+    | _, _ => none
+
+private instance : Handlers.Handler Access State Event where
+  handle
+    | .snapshot selection columns, s =>
+      if selection == ⟨"blobs", [("root", .blob root)], []⟩ &&
+          columns == ["root", "size", "complete", "bitmap", "inline", "last_access", "durable"] then
+        step s .snapshot (match s.script.snapshotFailure with
+          | none => .ok s.script.scan | some failure => .error failure)
+      else none
+    | .update .., s => step s .invalidate (.ok 1)
+    | .copyRows .., s => step s .copy (.ok 1)
+    | .delete .., s => step s .delete (.ok 1)
+
+private instance : Handlers.Handler FileIO State Event where
+  handle
+    | .open space key, s =>
+      if space == "cas_payload" && key == root then step s .open s.script.opened else none
+    | .readAt _ _ _, _ => none
+    | .transfer handle offset count, s => match s.script.transferReply with
+      | .error failure => step s (.transfer handle offset count) (.error failure)
+      | .ok () => some (.transfer handle offset count, .ok (), { s with output := s.output ++
+          (s.script.payload.extract offset.toNat (offset.toNat + count.toNat)).data.toList })
+    | .close handle, s => step s (.close handle) (.ok ())
+
+private instance : Handlers.Handler Clock State Event where
+  handle
+    | .nowNs, s => step s .clock (.ok 123)
+
+private instance : Handlers.Handler Output State Event where
+  handle
+    | .append bytes, s => match s.script.appendFailure with
+      | some failure => step s (.append bytes.size) (.error failure)
+      | none => some (.append bytes.size, .ok (), { s with output := s.output ++ bytes.data.toList })
 
 /-- A raw output buffer is an unobservable prefix until successful termination.
 The completed byte count must agree with the collected append effects. -/
-private def observe : Option (Except Error UInt64 × List UInt8 × List Event) →
+private def observe : Option (Except Error UInt64 × State × List Event) →
     Option (Except Error (List UInt8) × List Event)
   | none => none
   | some (.error error, _, trace) => some (.error error, trace)
-  | some (.ok count, output, trace) =>
-    some ((if count.toNat == output.length then .ok output else .error .protocol), trace)
+  | some (.ok count, state, trace) =>
+    some ((if count.toNat == state.output.length then .ok state.output else .error .protocol), trace)
 
 private def run (script : Script := {}) (request : Request := .all) :=
-  observe (execute script 30 [] (read root request).run)
+  observe (Handlers.execute 30 (read root request).run (⟨script, []⟩ : State))
 
 theorem failed_command_never_publishes_prefix (error : Error) (partialBytes : List UInt8)
-    (trace : List Event) : observe (some (.error error, partialBytes, trace)) =
+    (trace : List Event) : observe (some (.error error, ⟨{}, partialBytes⟩, trace)) =
       some (.error error, trace) := by rfl
 
 theorem empty_precedes_availability_and_file :
@@ -213,8 +215,9 @@ theorem healing_error_overrides_truncated_transfer_after_close :
 /-- A large request is still one transfer; no chunking policy lives in the
 program. The failure fixture avoids materializing a large payload. -/
 theorem large_read_is_one_transfer :
-    observe (execute { transferReply := .error ⟨ioFailure, .other⟩ } 30 []
-      (do readPayload root 17 65537; return 65537 : Action UInt64).run) =
+    observe (Handlers.execute 30
+      (do readPayload root 17 65537; return 65537 : Action UInt64).run
+      (⟨{ transferReply := .error ⟨ioFailure, .other⟩ }, []⟩ : State)) =
       some (.error (.host ioFailure), [.open, .transfer 9 17 65537, .close 9]) := by decide
 
 theorem output_failure_is_not_file_failure (bytes : ByteArray) (failure : Failure) :
@@ -231,15 +234,16 @@ theorem inline_output_failure_has_no_file_or_healing :
 count: a terminal count that disagrees with the collected bytes is a protocol
 failure, never a shorter or longer published result. -/
 theorem terminal_count_must_match_collected_output :
-    execute {} 10 []
+    (Handlers.execute 10
       (do requestOutput ⟨#[10, 20]⟩
           requestOutput ⟨#[30, 40]⟩
-          return 3 : Action UInt64).run =
+          return 3 : Action UInt64).run (⟨{}, []⟩ : State)).map
+        (fun (value, state, trace) => (value, state.output, trace)) =
       some (.ok 3, [10, 20, 30, 40], [.append 2, .append 2]) ∧
-    observe (execute {} 10 []
+    observe (Handlers.execute 10
       (do requestOutput ⟨#[10, 20]⟩
           requestOutput ⟨#[30, 40]⟩
-          return 3 : Action UInt64).run) =
+          return 3 : Action UInt64).run (⟨{}, []⟩ : State)) =
       some (.error .protocol, [.append 2, .append 2]) := by decide
 
 end Synchronicity.CasReadProgramProofs

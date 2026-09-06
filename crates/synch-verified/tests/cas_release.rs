@@ -1,5 +1,5 @@
 use synch_verified::cas::{unpin, OperationError, PinHolder};
-use synch_verified::host::{Cell, Exclusion, Fields, Join, Order, Row, Scan, Storage};
+use synch_verified::host::{Cell, Exclusion, Fields, Storage};
 
 const ROOT: [u8; 32] = [0xa7; 32];
 const TX: u64 = 73;
@@ -93,115 +93,61 @@ impl Storage for Script {
         Ok(self.affected)
     }
 
-    fn scan_rows(
-        &mut self,
-        _: u64,
-        _: &str,
-        _: &[String],
-        _: &Fields,
-        _: &[Order],
-        _: &[Join],
-    ) -> Result<Scan<Self::Error>, Self::Error> {
-        panic!("release must not scan rows")
-    }
-
-    fn read_rows(
-        &mut self,
-        _: u64,
-        _: &str,
-        _: &[String],
-        _: &Fields,
-        _: &[Order],
-        _: &[Join],
-    ) -> Result<Vec<Row>, Self::Error> {
-        panic!("release must not read rows")
-    }
-
-    fn exists_rows(&mut self, _: u64, _: &str, _: &Fields) -> Result<bool, Self::Error> {
-        panic!("release protection must be atomic with deletion")
-    }
-
-    fn upsert(
-        &mut self,
-        _: u64,
-        _: &str,
-        _: &Fields,
-        _: &[String],
-        _: &[String],
-    ) -> Result<(), Self::Error> {
-        panic!("release must not upsert")
-    }
-
-    fn read_bytes(&mut self, _: &str, _: &[u8]) -> Result<Option<Vec<u8>>, Self::Error> {
-        panic!("release must not read bytes")
-    }
-
     // The relational host is one trait; these operations never request the
     // read-repair, copy or expression-upsert statements.
-    fn snapshot(
-        &mut self,
-        _: &synch_verified::host::Selection,
-        _: &[String],
-    ) -> Result<synch_verified::host::Scan<Self::Error>, Self::Error> {
-        panic!("unexpected snapshot")
-    }
-    fn update(
-        &mut self,
-        _: u64,
-        _: &synch_verified::host::Selection,
-        _: &Fields,
-    ) -> Result<u64, Self::Error> {
-        panic!("unexpected update")
-    }
-    fn copy_rows(
-        &mut self,
-        _: u64,
-        _: &str,
-        _: &synch_verified::host::Selection,
-        _: &[(String, synch_verified::host::SourceValue)],
-        _: &[String],
-    ) -> Result<u64, Self::Error> {
-        panic!("unexpected row copy")
-    }
-    fn delete_selected(
-        &mut self,
-        _: u64,
-        _: &synch_verified::host::Selection,
-    ) -> Result<u64, Self::Error> {
-        panic!("unexpected selected delete")
-    }
-    fn write(
-        &mut self,
-        _: u64,
-        _: &str,
-        _: &Fields,
-        _: &[String],
-        _: &[(String, synch_verified::host::ConflictValue)],
-    ) -> Result<(), Self::Error> {
-        panic!("unexpected expression upsert")
-    }
+    synch_verified::host_unexpected!(
+        scan_rows,
+        read_rows,
+        exists_rows,
+        upsert,
+        read_bytes,
+        snapshot,
+        update,
+        copy_rows,
+        delete,
+        write
+    );
 }
 
 #[test]
 fn release_renders_typed_holders_and_uses_atomic_live_reference_guards() {
     let cases = [
         (PinHolder::Operator, "operator", None),
-        (PinHolder::Source("space"), "source:space", Some("space")),
-        (PinHolder::Replica("space"), "replica:space", Some("space")),
-        (PinHolder::Other("custom"), "custom", None),
-        (PinHolder::Other("source:x"), "source:x", None),
-        (PinHolder::Other("replica:x"), "replica:x", None),
-        (PinHolder::Source(""), "source:", Some("")),
-        (PinHolder::Replica(""), "replica:", Some("")),
-        (PinHolder::Source("雪:a"), "source:雪:a", Some("雪:a")),
-        (PinHolder::Replica("雪:a"), "replica:雪:a", Some("雪:a")),
-        (PinHolder::Other("雪:a"), "雪:a", None),
-        (PinHolder::Other(""), "", None),
+        (
+            PinHolder::Source("space".into()),
+            "source:space",
+            Some("space"),
+        ),
+        (
+            PinHolder::Replica("space".into()),
+            "replica:space",
+            Some("space"),
+        ),
+        (PinHolder::Other("custom".into()), "custom", None),
+        (PinHolder::Other("source:x".into()), "source:x", None),
+        (PinHolder::Other("replica:x".into()), "replica:x", None),
+        (PinHolder::Source("".into()), "source:", Some("")),
+        (PinHolder::Replica("".into()), "replica:", Some("")),
+        (
+            PinHolder::Source("雪:a".into()),
+            "source:雪:a",
+            Some("雪:a"),
+        ),
+        (
+            PinHolder::Replica("雪:a".into()),
+            "replica:雪:a",
+            Some("雪:a"),
+        ),
+        (PinHolder::Other("雪:a".into()), "雪:a", None),
+        (PinHolder::Other("".into()), "", None),
     ];
     for (holder, rendered, space) in cases {
         for affected in [0, 1, 2, u64::MAX] {
             let mut script = Script::new(rendered, space, affected);
-            assert_eq!(unpin(&mut script, &ROOT, holder).unwrap(), affected != 0);
+            assert_eq!(
+                unpin(&mut script, &ROOT, holder.clone()).unwrap(),
+                affected != 0
+            );
             assert_eq!(script.trace, ["begin", "delete", "commit"]);
         }
     }
@@ -218,7 +164,7 @@ fn release_failure_preserves_primary_error_and_transaction_trace() {
             let mut script = Script::new("source:space", Some("space"), 1);
             script.failure = Some(failure);
             script.rollback_fails = rollback_fails;
-            match unpin(&mut script, &ROOT, PinHolder::Source("space")) {
+            match unpin(&mut script, &ROOT, PinHolder::Source("space".into())) {
                 Err(OperationError::Host(error)) => assert_eq!(error, failure),
                 result => panic!("expected original host failure, got {result:?}"),
             }

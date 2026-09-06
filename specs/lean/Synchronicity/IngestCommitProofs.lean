@@ -1,6 +1,6 @@
 import VerifiedCore.Cas.IngestCommit
 import Synchronicity.CasPlanProofs
-import Synchronicity.Decidable
+import Synchronicity.Handlers
 
 /-! Proofs of the internal ingestion metadata program itself. The production
 whole Lean command composes it; the outer resource, construction-request and
@@ -71,44 +71,49 @@ private def reply (script : Script) (index : Nat) (value : A) : Reply A :=
   if script.failAt == some index then .error primary else .ok value
 
 /-- Only exact raw statements are accepted; there is no metadata interpretation
-or settlement implementation in this effect interpreter. -/
-private def execute (script : Script) : Nat → Nat →
-    Program Effects (Except Error Unit) → Option (Except Error Unit × List String)
-  | 0, _, _ => none
-  | _ + 1, _, .pure result => some (result, [])
-  | fuel + 1, index, .request effect resume =>
-    let step (label : String) (next : Program Effects (Except Error Unit)) :=
-      (execute script fuel (index + 1) next).map fun (result, trace) => (result, label :: trace)
-    match effect with
-    | .left effect => match effect with
-      | .begin => step "begin" (resume (reply script index 7))
-      | .commit tx => if tx == 7 then step "commit" (resume (reply script index ())) else none
-      | .rollback tx => if tx == 7 then step "rollback"
-          (resume (if script.rollbackFailure then .error secondary else .ok ())) else none
-      | .readRows tx relation columns equals order joins =>
-        if tx == 7 && relation == "blobs" && columns == ["size", "complete", "durable", "bitmap"] &&
-            equals == [("root", .blob root)] && order.isEmpty && joins.isEmpty then
-          step "claim" (resume (reply script index script.rows))
-        else none
-      | _ => none
-    | .right (.right _) => none
-    | .right (.left effect) => match effect with
-      | .write tx relation fields conflicts updates =>
-        if tx == 7 && relation == "blobs" && conflicts == ["root"] &&
-            fields == [("root", .blob root), ("size", .integer 8),
-              ("complete", .integer 1), ("bitmap", .null), ("inline", .null),
-              ("last_access", .integer 123),
-              ("durable", .integer (if script.tier == .local then 1 else 0))] &&
-            updates == [("size", .excluded "size"), ("complete", .excluded "complete"),
-              ("bitmap", .excluded "bitmap"),
-              ("inline", .coalesce (.excluded "inline") (.current "inline")),
-              ("last_access", .excluded "last_access"),
-              ("durable", .max (.current "durable") (.excluded "durable"))] then
-          step "write" (resume (reply script index ()))
-        else none
+or settlement implementation in this scripted host. -/
+private structure State where
+  script : Script
+  index : Nat := 0
+
+private def step (state : State) (label : String) (value : A) : Option (String × A × State) :=
+  some (label, value, { state with index := state.index + 1 })
+
+private def answer (state : State) (value : A) : Reply A := reply state.script state.index value
+
+private instance : Handlers.Handler Storage State String where
+  handle
+    | .begin, s => step s "begin" (answer s 7)
+    | .commit tx, s => if tx == 7 then step s "commit" (answer s ()) else none
+    | .rollback tx, s => if tx == 7 then
+        step s "rollback" (if s.script.rollbackFailure then .error secondary else .ok ()) else none
+    | .readRows tx relation columns equals order joins, s =>
+      if tx == 7 && relation == "blobs" && columns == ["size", "complete", "durable", "bitmap"] &&
+          equals == [("root", .blob root)] && order.isEmpty && joins.isEmpty then
+        step s "claim" (answer s s.script.rows)
+      else none
+    | _, _ => none
+
+private instance : Handlers.Handler Upsert State String where
+  handle
+    | .write tx relation fields conflicts updates, s =>
+      if tx == 7 && relation == "blobs" && conflicts == ["root"] &&
+          fields == [("root", .blob root), ("size", .integer 8),
+            ("complete", .integer 1), ("bitmap", .null), ("inline", .null),
+            ("last_access", .integer 123),
+            ("durable", .integer (if s.script.tier == .local then 1 else 0))] &&
+          updates == [("size", .excluded "size"), ("complete", .excluded "complete"),
+            ("bitmap", .excluded "bitmap"),
+            ("inline", .coalesce (.excluded "inline") (.current "inline")),
+            ("last_access", .excluded "last_access"),
+            ("durable", .max (.current "durable") (.excluded "durable"))] then
+        step s "write" (answer s ())
+      else none
+
+private instance : Handlers.Handler Access State String := Handlers.refuse
 
 private def run (script : Script) :=
-  execute script 8 0 (commitComplete root 8 none 123 script.tier).run
+  Handlers.run 8 (commitComplete root 8 none 123 script.tier).run (⟨script, 0⟩ : State)
 
 theorem local_commit_exact_raw_mutations : run {} =
     some (.ok (), ["begin", "claim", "write", "commit"]) := by decide

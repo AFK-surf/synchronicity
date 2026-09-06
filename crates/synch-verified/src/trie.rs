@@ -1,8 +1,10 @@
 //! Complete trie operations. No decoded node shapes cross this interface.
 use crate::{
     host::ByteStorage,
-    operation::{self, OperationError, Reader, Slice},
+    operation::{self, terminal, Command, OperationError},
 };
+
+pub use crate::generated::LookupDomainError;
 
 /// A completed lookup failure, not an intermediate host observation.
 #[derive(Debug)]
@@ -16,39 +18,29 @@ pub enum LookupError<E> {
     Protocol,
 }
 
-unsafe extern "C" {
-    fn synch_adapter_operation_trie_get(root: Slice, key_size: u64) -> *mut std::ffi::c_void;
+fn domain<E>(error: LookupDomainError) -> LookupError<E> {
+    let address = |address: Vec<u8>| address.try_into().map_err(|_| LookupError::Protocol);
+    match error {
+        LookupDomainError::KeyTooLong(size) => {
+            LookupError::KeyTooLong(usize::try_from(size).unwrap_or(usize::MAX))
+        }
+        LookupDomainError::MissingNode(hash) => match address(hash) {
+            Ok(hash) => LookupError::MissingNode(hash),
+            Err(error) => error,
+        },
+        LookupDomainError::MissingValue(hash) => match address(hash) {
+            Ok(hash) => LookupError::MissingValue(hash),
+            Err(error) => error,
+        },
+        LookupDomainError::Decode(message) => LookupError::Decode(message),
+        LookupDomainError::DepthExceeded => LookupError::DepthExceeded,
+    }
 }
 
-fn decode<E>(result: &[u8]) -> Result<Option<Vec<u8>>, LookupError<E>> {
-    let mut reader = Reader(result);
-    let result = match reader.byte().map_err(|()| LookupError::Protocol)? {
-        0 => Ok(None),
-        1 => Ok(Some(reader.bytes().map_err(|()| LookupError::Protocol)?)),
-        2 => Err(LookupError::KeyTooLong(
-            usize::try_from(reader.word().map_err(|()| LookupError::Protocol)?)
-                .map_err(|_| LookupError::Protocol)?,
-        )),
-        tag @ (3 | 4) => {
-            let address = reader
-                .bytes()
-                .map_err(|()| LookupError::Protocol)?
-                .try_into()
-                .map_err(|_| LookupError::Protocol)?;
-            Err(if tag == 3 {
-                LookupError::MissingNode(address)
-            } else {
-                LookupError::MissingValue(address)
-            })
-        }
-        5 => Err(LookupError::Decode(
-            reader.string().map_err(|()| LookupError::Protocol)?,
-        )),
-        6 => Err(LookupError::DepthExceeded),
-        _ => return Err(LookupError::Protocol),
-    };
-    reader.end().map_err(|()| LookupError::Protocol)?;
-    result
+fn finish<E>(result: Vec<u8>) -> Result<Option<Vec<u8>>, LookupError<E>> {
+    let outcome: Result<Option<Vec<u8>>, LookupDomainError> =
+        terminal(&result).map_err(|()| LookupError::Protocol)?;
+    outcome.map_err(domain)
 }
 
 /// Lookup over raw byte storage. Lean owns key bounds, decoding and traversal.
@@ -58,18 +50,18 @@ pub fn get<S: ByteStorage>(
     root: &[u8; 32],
     key: &[u8],
 ) -> Result<Option<Vec<u8>>, LookupError<S::Error>> {
-    // SAFETY: constructor returns an owned program; runner initializes the
-    // runtime and retains the borrowed key throughout all input effects.
-    let result = unsafe {
-        operation::run_readonly(storage, &[key], || {
-            synch_adapter_operation_trie_get(root.as_slice().into(), key.len() as u64)
-        })
-    }
-    .map_err(|error| match error {
-        OperationError::Host(error) => LookupError::Host(error),
-        OperationError::MalformedMetadata(_) | OperationError::Protocol => LookupError::Protocol,
-    })?;
-    decode(&result)
+    let command = Command::TrieGet {
+        root: root.to_vec(),
+        key_size: key.len() as u64,
+    };
+    let result =
+        operation::run_readonly(storage, &[key], &command).map_err(|error| match error {
+            OperationError::Host(error) => LookupError::Host(error),
+            OperationError::MalformedMetadata(_) | OperationError::Protocol => {
+                LookupError::Protocol
+            }
+        })?;
+    finish(result)
 }
 
 #[cfg(test)]
@@ -104,15 +96,13 @@ mod tests {
     fn oversized_input_is_rejected_without_borrowing_or_reading_storage() {
         let mut store = Store::default();
         // No input capability exists: Lean must reject the size before requesting it.
-        // SAFETY: the constructor returns a fresh owned program to the initialized runner.
-        let result = unsafe {
-            operation::run_readonly(&mut store, &[], || {
-                synch_adapter_operation_trie_get([1; 32].as_slice().into(), u64::MAX)
-            })
-        }
-        .unwrap();
+        let command = Command::TrieGet {
+            root: vec![1; 32],
+            key_size: u64::MAX,
+        };
+        let result = operation::run_readonly(&mut store, &[], &command).unwrap();
         assert!(matches!(
-            decode::<()>(&result),
+            finish::<()>(result),
             Err(LookupError::KeyTooLong(usize::MAX))
         ));
         assert!(matches!(
@@ -125,12 +115,11 @@ mod tests {
     #[test]
     fn missing_input_capability_fails_before_storage() {
         let mut store = Store::default();
-        // SAFETY: same constructor ownership contract as the public entry point.
-        let result = unsafe {
-            operation::run_readonly(&mut store, &[], || {
-                synch_adapter_operation_trie_get([1; 32].as_slice().into(), 1)
-            })
+        let command = Command::TrieGet {
+            root: vec![1; 32],
+            key_size: 1,
         };
+        let result = operation::run_readonly(&mut store, &[], &command);
         assert!(matches!(result, Err(OperationError::Protocol)));
         assert!(store.calls.is_empty());
     }

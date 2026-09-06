@@ -297,6 +297,11 @@ jobs:
           leanchecker: true
           leanchecker-args: Synchronicity
           axiom-audit: true
+      # The host boundary is generated from the Lean effect algebras and
+      # command types; the checked-in Lean codecs and Rust glue must match
+      # what the generator prints for the current source.
+      - name: Check the generated host boundary
+        run: cd crates/synch-verified/hostgen && lake exe hostgen --check
 
   bench:
     name: benchmark (smoke)

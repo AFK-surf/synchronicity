@@ -1,6 +1,7 @@
 import VerifiedCore.Host
 import VerifiedCore.Crypto
 import VerifiedCore.Origin
+import VerifiedCore.Cas.Codec
 import Std.Data.TreeMap.Basic
 import Std.Data.TreeSet.Basic
 
@@ -46,9 +47,7 @@ structure Receipt where
   recordedAt : Int64
 
 /-- SQL storage classes, independent of a domain's expected field type. -/
-inductive CellType where
-  | null | integer | real | text | blob
-  deriving BEq, DecidableEq
+abbrev CellType := Cas.Codec.CellType
 
 /-- Rich validation failures remain in Lean until the operation completes.
 Host tokens are retained unchanged; the native entry will encode domain errors

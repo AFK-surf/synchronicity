@@ -119,6 +119,32 @@ cargo run --release -p synch-verified --example decisions
 cd specs/lean && lake build --wfail
 ```
 
+### The generated boundary
+
+The host boundary is declared once, in Lean, and generated on both sides by
+`hostgen` (`crates/synch-verified/hostgen`, a Lean program that reflects over
+the executable core):
+
+- the effect algebras (`lean/VerifiedCore/Host*.lean`, `Crypto.lean`) yield
+  `lean/VerifiedCore/Host/Generated.lean` (tags, names, request encoders,
+  reply decoders and `WireEffect` instances) and, in `src/generated.rs`, the
+  Rust host traits, the request `Frame` enum with its decoder, the dispatch
+  of each frame to its service and the `host_unexpected!` stubs test doubles
+  fill their `impl` blocks with;
+- the command and outcome types (`lean/VerifiedCore/Commands.lean` and the
+  domain types it names) yield `lean/VerifiedCore/Commands/Generated.lean`
+  (`Encode`/`Decode` instances) and the mirrored Rust enums and structs with
+  their codecs.
+
+Only the tag table and the routing of each algebra to a Rust service are
+written by hand, in the generator. After changing an algebra or a command
+type, run `cd crates/synch-verified/hostgen && lake exe hostgen` and commit
+the output; CI runs `lake exe hostgen --check`. One native entry point,
+`synch_lean_start`, takes an encoded `Command`; `Entry.lean` maps each
+operation's domain result onto its outcome type, and the Rust facades in
+`src/cas.rs`, `src/history.rs` and `src/trie.rs` only bind capabilities and
+decode terminals.
+
 ### Windows
 
 Lean ships an LLVM/MinGW UCRT runtime, not an MSVC C++ runtime. Install the
@@ -163,8 +189,9 @@ with a Rust site.
 
 ## ABI and ownership
 
-Only complete operation constructors, packet/resume transport and runtime/object
-lifetime functions cross the ABI. Rust executes raw effects synchronously and
+Only one command constructor (`synch_adapter_start`, taking an encoded
+`Command`), the packet/resume transport and runtime/object lifetime functions
+cross the ABI. Rust executes raw effects synchronously and
 returns their results to Lean. Handles and packets are invocation-owned and
 thread-confined; no shared scope/walk/cache object graphs cross foreign threads.
 The runtime initializes once per process and initializes/finalizes calling

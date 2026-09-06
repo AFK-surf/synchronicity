@@ -1,0 +1,10 @@
+name = "hostgen"
+defaultTargets = ["hostgen"]
+
+[[require]]
+name = "synch_verified"
+path = "../lean"
+
+[[lean_exe]]
+name = "hostgen"
+root = "Hostgen"

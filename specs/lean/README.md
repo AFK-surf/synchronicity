@@ -36,6 +36,7 @@ standalone kernel checker and fails on `sorryAx` or an unapproved axiom.
 | `HistoryProgramProofs` | Head-history retention: fork, ceiling and witness protection derived from actual receipts, and scripted traces of every failure position |
 | `OriginProgramProofs` | Origin syntax and key decoding |
 | `Decidable` | Decidable equality of `Except`, which core Lean lacks and the trace proofs decide with |
+| `Handlers` | Scripted hosts for whole-program proofs: one `Handler` instance per capability, composed over `EffectSum`, run with fuel to a `(result, trace)` pair |
 
 ## Conventions
 
@@ -47,3 +48,7 @@ standalone kernel checker and fails on `sorryAx` or an unapproved axiom.
 - Keep host assumptions in the theorem statement. A theorem about a
   scripted host says what the program does given those replies, nothing
   about SQLite or the filesystem.
+- Script a host per capability with `Handlers.Handler` instances on the
+  proof's own state type and run the program with `Handlers.run`; the
+  `EffectSum` instance composes them, so a proof never spells the
+  `.left`/`.right` path of an effect.

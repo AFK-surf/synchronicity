@@ -2,7 +2,8 @@ import VerifiedCore.Host.Wire
 import Synchronicity.WireBufferProofs
 import VerifiedCore.Entry
 
-/-! Lean-side native packet transport and actual continuation behavior.
+/-! Lean-side native packet transport and actual continuation behavior, over
+the request encoders and reply decoders generated from the effect algebras.
 These proofs do not establish C ownership, Rust packet decoding, or host I/O.
 -/
 namespace Synchronicity.HostWireProofs
@@ -52,37 +53,38 @@ theorem parser_failure_is_protocol_failure (expected : UInt8) (read : Reader A)
   simp [decodeReply, failed]
 
 theorem terminal_cannot_restart (result : Reply ByteArray) (input : ByteArray) :
-    resume (.pure result) input = .pure (.error protocolFailure) := rfl
+    resume (E := Storage) (.pure result) input = .pure (.error protocolFailure) := rfl
 
 theorem rejected_terminal_stays_terminal (result : Reply ByteArray)
     (first second : ByteArray) :
-    resume (resume (.pure result) first) second = .pure (.error protocolFailure) := rfl
+    resume (E := Storage) (resume (.pure result) first) second =
+      .pure (.error protocolFailure) := rfl
 
 private def b (data : List UInt8) : ByteArray := ⟨data.toArray⟩
 
 -- Version, exact pending kind and full-consumption checks. No reader accepts
 -- the tag of a different successful operation, even if its payload is empty.
 theorem wrong_version_rejected :
-    reply (.commit 7) (b [2, 17]) = .error protocolFailure := by decide
+    Storage.reply (.commit 7) (b [2, 17]) = .error protocolFailure := by decide
 
 theorem wrong_pending_kind_rejected :
-    reply (.commit 7) (b [1, 18]) = .error protocolFailure := by decide
+    Storage.reply (.commit 7) (b [1, 18]) = .error protocolFailure := by decide
 
 theorem trailing_byte_rejected :
-    reply (.commit 7) (b [1, 17, 0]) = .error protocolFailure := by decide
+    Storage.reply (.commit 7) (b [1, 17, 0]) = .error protocolFailure := by decide
 
 theorem exact_unit_reply_accepted :
-    reply (.commit 7) (b [1, 17]) = .ok () := by decide
+    Storage.reply (.commit 7) (b [1, 17]) = .ok () := by decide
 
 -- A generic failure packet is deliberately valid for any pending effect.
 -- Both the full-width token and the complete 32-bit error code survive.
 theorem failure_token_preserved :
-    reply (.begin) (b [1, 0, 255, 255, 255, 255, 0, 0, 0, 0,
+    Storage.reply (.begin) (b [1, 0, 255, 255, 255, 255, 0, 0, 0, 0,
       239, 205, 171, 137, 103, 69, 35, 1]) =
       .error ⟨0xffffffff, 0x0123456789abcdef⟩ := by rfl
 
 theorem oversized_failure_code_rejected :
-    reply (.begin) (b [1, 0, 0, 0, 0, 0, 1, 0, 0, 0,
+    Storage.reply (.begin) (b [1, 0, 0, 0, 0, 0, 1, 0, 0, 0,
       1, 0, 0, 0, 0, 0, 0, 0]) = .error protocolFailure := by rfl
 
 -- Raw bytes retain absent versus present-empty. Fixtures use parser output
@@ -93,10 +95,10 @@ private def byteReplyView : Reply (Option ByteArray) → Option (Option (List UI
   | .ok (some bytes) => some (some bytes.toList)
 
 theorem absent_bytes_preserved :
-    byteReplyView (reply (.readBytes "raw" .empty) (b [1, 22, 0])) = some none := by decide
+    byteReplyView (Storage.reply (.readBytes "raw" .empty) (b [1, 22, 0])) = some none := by decide
 
 theorem empty_bytes_preserved :
-    byteReplyView (reply (.readBytes "raw" .empty)
+    byteReplyView (Storage.reply (.readBytes "raw" .empty)
       (b [1, 22, 1, 0, 0, 0, 0, 0, 0, 0, 0])) = some (some []) := by
   change some (some ByteArray.empty.toList) = some (some [])
   rw [ByteArray.toList_empty]
@@ -114,7 +116,7 @@ private def cellReplyView : Reply (List Row) → Option (List (List (Nat × Int 
   | .ok rows => some (rows.map (List.map cellView))
 
 private def oneCell (encoded : List UInt8) :=
-  cellReplyView (reply (.readRows 7 "raw" [] [])
+  cellReplyView (Storage.reply (.readRows 7 "raw" [] [])
     (b ([1, 19, 1, 0, 0, 0, 0, 0, 0, 0, 1, 0, 0, 0, 0, 0, 0, 0] ++ encoded)))
 
 -- Check each raw-cell representation independently. Combining all the closed
@@ -181,13 +183,13 @@ theorem native_storage_resume (state : State) (input : ByteArray) :
   cases state <;> rfl
 
 theorem invalid_crypto_boolean_rejected :
-    cryptoReply (.validateEd25519 []) (b [1, 27, 2]) = .error protocolFailure := by decide
+    Crypto.reply (.validateEd25519 []) (b [1, 27, 2]) = .error protocolFailure := by decide
 
 theorem crypto_wrong_reply_kind_rejected :
-    cryptoReply (.validateEd25519 []) (b [1, 26, 1]) = .error protocolFailure := by decide
+    Crypto.reply (.validateEd25519 []) (b [1, 26, 1]) = .error protocolFailure := by decide
 
 theorem crypto_false_is_not_host_failure :
-    cryptoReply (.validateEd25519 []) (b [1, 27, 0]) = .ok false := by decide
+    Crypto.reply (.validateEd25519 []) (b [1, 27, 0]) = .ok false := by decide
 
 private def cryptoTransaction : NativeState :=
   (transactionOver EffectSum.left id (fun _ => do
@@ -206,117 +208,117 @@ theorem crypto_rollback_preserves_protocol_error :
       .pure (.error protocolFailure) := by rfl
 
 theorem file_missing_preserves_original_error :
-    fileReply (.open "cas_payload" .empty)
+    FileIO.reply (.open "cas_payload" .empty)
       (b [1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0, 0]) =
       .error ⟨⟨1, 9⟩, .missing⟩ := by rfl
 
 theorem invalid_file_classification_is_protocol_failure :
-    fileReply (.open "cas_payload" .empty)
+    FileIO.reply (.open "cas_payload" .empty)
       (b [1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0, 3]) =
       .error ⟨protocolFailure, .other⟩ := by rfl
 
 theorem file_reply_rejects_storage_failure_without_classification :
-    fileReply (.readAt 7 0 1)
+    FileIO.reply (.readAt 7 0 1)
       (b [1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0]) =
       .error ⟨protocolFailure, .other⟩ := by rfl
 
 theorem file_close_requires_exact_acknowledgement :
-    fileReply (.close 7) (b [1, 35, 0]) = .error protocolFailure := by decide
+    FileIO.reply (.close 7) (b [1, 35, 0]) = .error protocolFailure := by decide
 
 theorem file_close_accepts_acknowledgement :
-    fileReply (.close 7) (b [1, 35]) = .ok () := by decide
+    FileIO.reply (.close 7) (b [1, 35]) = .ok () := by decide
 
 theorem snapshot_rejects_invalid_trailing_failure_flag :
-    accessReply (.snapshot ⟨"blobs", [], []⟩ [])
+    Access.reply (.snapshot ⟨"blobs", [], []⟩ [])
       (b [1, 29, 0, 0, 0, 0, 0, 0, 0, 0, 2]) = .error protocolFailure := by rfl
 
 theorem update_rejects_copy_reply :
-    accessReply (.update 7 ⟨"blobs", [], []⟩ [])
+    Access.reply (.update 7 ⟨"blobs", [], []⟩ [])
       (b [1, 31, 0, 0, 0, 0, 0, 0, 0, 0]) = .error protocolFailure := by decide
 
 theorem clock_rejects_wrong_reply_kind :
-    clockReply .nowNs (b [1, 33, 0, 0, 0, 0, 0, 0, 0, 0]) = .error protocolFailure := by decide
+    Clock.reply .nowNs (b [1, 33, 0, 0, 0, 0, 0, 0, 0, 0]) = .error protocolFailure := by decide
 
 theorem output_append_requires_exact_acknowledgement :
-    outputReply (.append (b [41, 42])) (b [1, 37, 0]) = .error protocolFailure := by decide
+    Output.reply (.append (b [41, 42])) (b [1, 37, 0]) = .error protocolFailure := by decide
 
 theorem output_append_accepts_acknowledgement :
-    outputReply (.append (b [41, 42])) (b [1, 37]) = .ok () := by decide
+    Output.reply (.append (b [41, 42])) (b [1, 37]) = .ok () := by decide
 
 theorem output_append_rejects_wrong_reply_kind :
-    outputReply (.append (b [41, 42])) (b [1, 35]) = .error protocolFailure := by decide
+    Output.reply (.append (b [41, 42])) (b [1, 35]) = .error protocolFailure := by decide
 
 theorem output_append_rejects_truncated_acknowledgement :
-    outputReply (.append (b [41, 42])) (b [1]) = .error protocolFailure := by decide
+    Output.reply (.append (b [41, 42])) (b [1]) = .error protocolFailure := by decide
 
 theorem output_append_preserves_original_failure :
-    outputReply (.append (b [41, 42]))
+    Output.reply (.append (b [41, 42]))
       (b [1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0]) =
       .error ⟨1, 9⟩ := by rfl
 
 theorem output_append_packet_carries_only_raw_bytes :
-    outputRequest (.append (b [41, 42])) =
+    Output.request (.append (b [41, 42])) =
       b [1, 37, 2, 0, 0, 0, 0, 0, 0, 0, 41, 42] := by rfl
 
 theorem native_output_injection_preserves_packet (effect : Output A) :
-    nativeRequest (.right (.right (.right (.right (.right (.left effect)))))) =
-      outputRequest effect := rfl
+    WireEffect.request (E := NativeEffects) (.right (.right (.right (.right (.right (.left effect)))))) =
+      Output.request effect := rfl
 
 theorem native_output_injection_preserves_reply (effect : Output A) (input : ByteArray) :
-    nativeReply (.right (.right (.right (.right (.right (.left effect)))))) input =
-      outputReply effect input := rfl
+    WireEffect.reply (E := NativeEffects) (.right (.right (.right (.right (.right (.left effect)))))) input =
+      Output.reply effect input := rfl
 
 theorem native_write_injection_preserves_packet (effect : WriteEffects A) :
-    nativeRequest (.right (.right (.right (.right (.right (.right effect)))))) =
-      writeRequest effect := rfl
+    WireEffect.request (E := NativeEffects) (.right (.right (.right (.right (.right (.right effect)))))) =
+      WireEffect.request effect := rfl
 
 theorem native_write_injection_preserves_reply (effect : WriteEffects A) (input : ByteArray) :
-    nativeReply (.right (.right (.right (.right (.right (.right effect)))))) input =
-      writeReply effect input := rfl
+    WireEffect.reply (E := NativeEffects) (.right (.right (.right (.right (.right (.right effect)))))) input =
+      WireEffect.reply effect input := rfl
 
 theorem build_request_carries_handles_and_size_only (source payload outboard size : UInt64) :
-    constructRequest (.build source payload outboard size) =
+    Construct.request (.build source payload outboard size) =
       octet 1 ++ octet 38 ++ word source ++ word payload ++ word outboard ++ word size := rfl
 
 theorem build_reply_requires_root_bytes :
-    constructReply (.build 1 2 3 0) (b [1, 38, 0]) = .error protocolFailure := by decide
+    Construct.reply (.build 1 2 3 0) (b [1, 38, 0]) = .error protocolFailure := by decide
 
 theorem build_reply_rejects_hash_variant :
-    constructReply (.build 1 2 3 0) (b [1, 39, 0, 0, 0, 0, 0, 0, 0, 0]) =
+    Construct.reply (.build 1 2 3 0) (b [1, 39, 0, 0, 0, 0, 0, 0, 0, 0]) =
       .error protocolFailure := by decide
 
 theorem build_reply_preserves_original_failure :
-    constructReply (.build 1 2 3 0)
+    Construct.reply (.build 1 2 3 0)
       (b [1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0]) = .error ⟨1, 9⟩ := by rfl
 
 theorem hash_request_preserves_bytes (chunk : ByteArray) :
-    constructRequest (.hash chunk) = octet 1 ++ octet 39 ++ bytes chunk :=
+    Construct.request (.hash chunk) = octet 1 ++ octet 39 ++ bytes chunk :=
   WireBufferProofs.hashRequest_preserves_bytes chunk
 
 theorem hash_reply_rejects_build_variant :
-    constructReply (.hash .empty) (b [1, 38, 0, 0, 0, 0, 0, 0, 0, 0]) =
+    Construct.reply (.hash .empty) (b [1, 38, 0, 0, 0, 0, 0, 0, 0, 0]) =
       .error protocolFailure := by decide
 
 theorem hash_reply_rejects_truncated_payload :
-    constructReply (.hash .empty) (b [1, 39, 1, 0, 0, 0, 0, 0, 0, 0]) =
+    Construct.reply (.hash .empty) (b [1, 39, 1, 0, 0, 0, 0, 0, 0, 0]) =
       .error protocolFailure := by decide
 
 theorem transfer_request_carries_handle_offset_and_count (handle offset count : UInt64) :
-    fileRequest (.transfer handle offset count) =
+    FileIO.request (.transfer handle offset count) =
       octet 1 ++ octet 52 ++ word handle ++ word offset ++ word count := rfl
 
 theorem transfer_requires_exact_acknowledgement :
-    fileReply (.transfer 7 0 1) (b [1, 52, 0]) = .error ⟨protocolFailure, .other⟩ := by rfl
+    FileIO.reply (.transfer 7 0 1) (b [1, 52, 0]) = .error ⟨protocolFailure, .other⟩ := by rfl
 
 theorem transfer_accepts_acknowledgement :
-    fileReply (.transfer 7 0 1) (b [1, 52]) = .ok () := by rfl
+    FileIO.reply (.transfer 7 0 1) (b [1, 52]) = .ok () := by rfl
 
 theorem transfer_rejects_read_reply :
-    fileReply (.transfer 7 0 1) (b [1, 34, 0, 0, 0, 0, 0, 0, 0, 0]) =
+    FileIO.reply (.transfer 7 0 1) (b [1, 34, 0, 0, 0, 0, 0, 0, 0, 0]) =
       .error ⟨protocolFailure, .other⟩ := by rfl
 
 theorem transfer_preserves_short_read_classification :
-    fileReply (.transfer 7 0 1)
+    FileIO.reply (.transfer 7 0 1)
       (b [1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0, 1]) =
       .error ⟨⟨1, 9⟩, .shortRead⟩ := by rfl
 
@@ -326,81 +328,81 @@ theorem conflict_expression_tree_tags (column : String) :
         (octet 3 ++ (octet 0 ++ string column) ++ (octet 1 ++ string column)) := rfl
 
 theorem upsert_requires_exact_unit_reply :
-    upsertReply (.write 7 "blobs" [] ["root"] []) (b [1, 41, 0]) =
+    Upsert.reply (.write 7 "blobs" [] ["root"] []) (b [1, 41, 0]) =
       .error protocolFailure := by decide
 
 theorem upsert_accepts_acknowledgement :
-    upsertReply (.write 7 "blobs" [] ["root"] []) (b [1, 41]) = .ok () := by decide
+    Upsert.reply (.write 7 "blobs" [] ["root"] []) (b [1, 41]) = .ok () := by decide
 
 theorem temporary_handle_preserves_all_bits :
-    resourcesReply (.createTemporary "cas_payload")
+    Resources.reply (.createTemporary "cas_payload")
       (b [1, 42, 255, 255, 255, 255, 255, 255, 255, 255]) =
       .ok 18446744073709551615 := by decide
 
 theorem temporary_truncated_handle_rejected :
-    resourcesReply (.createTemporary "cas_payload") (b [1, 42, 0]) =
+    Resources.reply (.createTemporary "cas_payload") (b [1, 42, 0]) =
       .error protocolFailure := by decide
 
 theorem flush_accepts_acknowledgement :
-    resourcesReply (.flush 7) (b [1, 43]) = .ok () := by decide
+    Resources.reply (.flush 7) (b [1, 43]) = .ok () := by decide
 
 theorem replace_accepts_acknowledgement :
-    resourcesReply (.replace 7 "cas_payload" .empty) (b [1, 44]) = .ok () := by decide
+    Resources.reply (.replace 7 "cas_payload" .empty) (b [1, 44]) = .ok () := by decide
 
 theorem discard_accepts_acknowledgement :
-    resourcesReply (.discard 7) (b [1, 45]) = .ok () := by decide
+    Resources.reply (.discard 7) (b [1, 45]) = .ok () := by decide
 
 theorem directory_sync_synced_is_distinct_from_unsupported :
-    resourcesReply (.syncParent "cas_payload" .empty) (b [1, 46, 0]) = .ok .synced ∧
-    resourcesReply (.syncParent "cas_payload" .empty) (b [1, 46, 1]) = .ok .unsupported := by decide
+    Resources.reply (.syncParent "cas_payload" .empty) (b [1, 46, 0]) = .ok .synced ∧
+    Resources.reply (.syncParent "cas_payload" .empty) (b [1, 46, 1]) = .ok .unsupported := by decide
 
 theorem directory_sync_invalid_enum_rejected :
-    resourcesReply (.syncParent "cas_payload" .empty) (b [1, 46, 2]) =
+    Resources.reply (.syncParent "cas_payload" .empty) (b [1, 46, 2]) =
       .error protocolFailure := by decide
 
 theorem directory_sync_truncated_enum_rejected :
-    resourcesReply (.syncParent "cas_payload" .empty) (b [1, 46]) =
+    Resources.reply (.syncParent "cas_payload" .empty) (b [1, 46]) =
       .error protocolFailure := by decide
 
 theorem directory_sync_trailing_bytes_rejected :
-    resourcesReply (.syncParent "cas_payload" .empty) (b [1, 46, 0, 0]) =
+    Resources.reply (.syncParent "cas_payload" .empty) (b [1, 46, 0, 0]) =
       .error protocolFailure := by decide
 
 theorem directory_sync_original_failure_not_unsupported :
-    resourcesReply (.syncParent "cas_payload" .empty)
+    Resources.reply (.syncParent "cas_payload" .empty)
       (b [1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0]) =
       .error ⟨1, 9⟩ := by rfl
 
 theorem lease_handle_preserved :
-    leaseReply (.acquire "cas_writers" .empty) (b [1, 47, 9, 0, 0, 0, 0, 0, 0, 0]) =
+    Lease.reply (.acquire "cas_writers" .empty) (b [1, 47, 9, 0, 0, 0, 0, 0, 0, 0]) =
       .ok 9 := by decide
 
 theorem lease_release_requires_exact_acknowledgement :
-    leaseReply (.release 9) (b [1, 48, 0]) = .error protocolFailure := by decide
+    Lease.reply (.release 9) (b [1, 48, 0]) = .error protocolFailure := by decide
 
 theorem lease_release_accepts_acknowledgement :
-    leaseReply (.release 9) (b [1, 48]) = .ok () := by decide
+    Lease.reply (.release 9) (b [1, 48]) = .ok () := by decide
 
 theorem stat_reply_preserves_unsigned_size :
-    sourceReply (.stat "source" .empty) (b [1, 49, 255, 255, 255, 255, 255, 255, 255, 255]) =
+    SourceIO.reply (.stat "source" .empty) (b [1, 49, 255, 255, 255, 255, 255, 255, 255, 255]) =
       .ok 18446744073709551615 := by decide
 
 theorem stat_reply_rejects_truncated_size :
-    sourceReply (.stat "source" .empty) (b [1, 49, 0]) = .error protocolFailure := by decide
+    SourceIO.reply (.stat "source" .empty) (b [1, 49, 0]) = .error protocolFailure := by decide
 
 theorem read_some_reply_allows_eof :
-    sourceReply (.readSome 7 0 8) (b [1, 50, 0, 0, 0, 0, 0, 0, 0, 0]) =
+    SourceIO.reply (.readSome 7 0 8) (b [1, 50, 0, 0, 0, 0, 0, 0, 0, 0]) =
       .ok ByteArray.empty := by rfl
 
 theorem read_some_reply_rejects_truncated_payload :
-    sourceReply (.readSome 7 0 8) (b [1, 50, 2, 0, 0, 0, 0, 0, 0, 0, 42]) =
+    SourceIO.reply (.readSome 7 0 8) (b [1, 50, 2, 0, 0, 0, 0, 0, 0, 0, 42]) =
       .error protocolFailure := by decide
 
 theorem freeze_reply_preserves_handle :
-    sourceReply (.freeze .empty) (b [1, 51, 7, 0, 0, 0, 0, 0, 0, 0]) = .ok 7 := by decide
+    SourceIO.reply (.freeze .empty) (b [1, 51, 7, 0, 0, 0, 0, 0, 0, 0]) = .ok 7 := by decide
 
 theorem freeze_reply_rejects_trailing_bytes :
-    sourceReply (.freeze .empty) (b [1, 51, 7, 0, 0, 0, 0, 0, 0, 0, 0]) =
+    SourceIO.reply (.freeze .empty) (b [1, 51, 7, 0, 0, 0, 0, 0, 0, 0, 0]) =
       .error protocolFailure := by decide
 
 end Synchronicity.HostWireProofs

@@ -335,14 +335,39 @@ Integration review has identified specific gates, not waived limitations:
 
 ### Current native transport
 
-`Host/Wire.lean` encodes raw requests and decodes replies. `Entry.lean` alone
-imports domains to construct commands; the shared transport imports no domain
-policy. Packets begin with version 1 and a discriminant, with little-endian u64
-integers/lengths and length-delimited UTF-8/bytes. Requests encode explicit
-relation/projection/equality/upsert values. Replies preserve raw signed cells,
-NULL, empty values, absence and original host failures. Decoders reject unknown
-versions/tags, wrong effect reply types, truncated or trailing data and lengths
-that cannot fit the remaining packet before allocation.
+The boundary is declared once, in Lean, and generated on both sides.
+`Host/Codec.lean` holds the transport primitives: little-endian u64 words,
+length-delimited bytes and strings, the `Encode`/`Decode` classes with an
+instance per raw type, the reply and file-reply decoders, and the
+`WireEffect` class whose `EffectSum` instance puts any composed algebra on the
+wire. `Host/Generated.lean` is printed by `hostgen` from the effect
+inductives: each algebra's tags, names, request encoder, reply decoder and
+`WireEffect` instance. `Host/Wire.lean` only steps a program: `packet`
+renders a terminal or the pending request, `resume` feeds a reply to the
+pending continuation, and the two native exports specialize them to the
+native algebra. Packets begin with version 1 and a discriminant; replies must
+match the pending effect's tag and consume the whole input, and decoders
+reject unknown versions/tags, wrong reply types, truncated or trailing data
+and lengths that cannot fit the remaining packet before allocation.
+
+The same generator prints `src/generated.rs`: the Rust host traits (with the
+Lean docstrings), the `Frame` enum with its decoder, the dispatch of every
+frame to the storage host or the capability that serves it, and the
+`host_unexpected!` macro test doubles use for the methods an operation never
+requests. The interpreter loop in `operation.rs` serves by hand only the
+frames that use the run's own resources: borrowed command inputs, the
+transfer into the output sink and the sink append. The generator's only
+tables are the wire tags and the routing of each algebra to a Rust service;
+CI fails if the checked-in output is stale.
+
+Commands cross the same way. `Commands.lean` declares the `Command`
+inductive and the flat outcome types; `Commands/Generated.lean` and the Rust
+mirrors with their codecs are generated. One export, `synch_lean_start`,
+decodes the packet and dispatches; `Entry.lean` keeps only the mapping from
+each operation's domain errors to its outcome type, host failures and
+protocol failures. The Rust facades bind capabilities, encode the command and
+decode the terminal; no per-command C constructor, extern declaration or
+hand-written terminal codec remains.
 
 The native state now carries the sum of storage and crypto effects. Storage-only
 commands inject their effects into that sum without changing their sequencing;
@@ -369,8 +394,7 @@ the runner checks capability/range validity and copies only that range. In
 particular, lookup rejects oversized keys in Lean before requesting any bytes,
 preserving cheap rejection without duplicating the key-limit policy in Rust.
 Byte-only operations use a narrow `ByteStorage` host interface; they do not
-require SQL or transaction services. Domain command construction and terminal
-result decoding live in the domain facades, not the common continuation runner.
+require SQL or transaction services.
 
 Deletion extends the host algebra with raw relational existence, keyed counter
 reads and keyed file removal. Existence queries avoid materializing every pin

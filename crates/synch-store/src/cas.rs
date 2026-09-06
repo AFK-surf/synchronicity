@@ -1096,9 +1096,9 @@ impl Store {
         use synch_verified::cas::{unpin, OperationError, PinHolder as Holder};
         let holder = match holder {
             PinHolder::Operator => Holder::Operator,
-            PinHolder::Source(space) => Holder::Source(space),
-            PinHolder::Replica(space) => Holder::Replica(space),
-            PinHolder::Other(text) => Holder::Other(text),
+            PinHolder::Source(space) => Holder::Source(space.clone()),
+            PinHolder::Replica(space) => Holder::Replica(space.clone()),
+            PinHolder::Other(text) => Holder::Other(text.clone()),
         };
         self.with_connection_scope(|conn| {
             let mut storage = crate::lean_storage::SqliteStorage::new(conn);
@@ -1153,9 +1153,9 @@ impl Store {
         use synch_verified::cas::{expire, OperationError, PinHolder as Holder};
         let holder = holder.map(|holder| match holder {
             PinHolder::Operator => Holder::Operator,
-            PinHolder::Source(space) => Holder::Source(space),
-            PinHolder::Replica(space) => Holder::Replica(space),
-            PinHolder::Other(text) => Holder::Other(text),
+            PinHolder::Source(space) => Holder::Source(space.clone()),
+            PinHolder::Replica(space) => Holder::Replica(space.clone()),
+            PinHolder::Other(text) => Holder::Other(text.clone()),
         });
         self.with_connection_scope(|conn| {
             let mut storage = crate::lean_storage::SqliteStorage::new(conn);
@@ -1283,7 +1283,7 @@ impl Store {
             Outcome::Writing => Err(StoreError::invalid(format!(
                 "blob {root} is being written and cannot be deleted"
             ))),
-            Outcome::Protected => Err(StoreError::invalid(format!(
+            Outcome::ProtectedClaim => Err(StoreError::invalid(format!(
                 "blob {root} is referenced or pinned and cannot be deleted"
             ))),
             Outcome::Applied => Ok(()),

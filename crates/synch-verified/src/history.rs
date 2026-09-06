@@ -1,88 +1,17 @@
-//! Complete Lean retention command used by Store. This facade only constructs
-//! commands and decodes final results; it contains no retention algorithm.
+//! Complete Lean retention command used by Store. This facade only starts the
+//! command and hands its terminal back; it contains no retention algorithm.
 use crate::{
     host::{Crypto, Storage},
-    operation::{Capabilities, OperationError, Reader, Slice},
+    operation::{run, terminal, Capabilities, Command, OperationError},
 };
 
-/// Storage class observed at a Lean-selected invalid column.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub enum CellType {
-    Null,
-    Integer,
-    Real,
-    Text,
-    Blob,
-}
-
-/// Origin parse failure selected by Lean, with original text for diagnostics.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum OriginError {
-    Label(String),
-    Domain(String),
-    KeyDecode,
-    KeyData,
-    Shape(String),
-}
-
-/// Completed domain validation error, not a host service request.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum DomainError {
-    Malformed,
-    ColumnType {
-        index: u64,
-        column: String,
-        actual: CellType,
-    },
-    InvalidText(Vec<u8>),
-    Column {
-        column: String,
-        reason: String,
-    },
-    Origin(OriginError),
-}
+pub use crate::generated::{CellType, HistoryDomainError as DomainError, OriginError};
 
 /// Retention failure, preserving the original host error when applicable.
 #[derive(Debug)]
 pub enum Error<E> {
     Operation(OperationError<E>),
     Domain(DomainError),
-}
-
-fn decode(bytes: &[u8]) -> Result<Result<u64, DomainError>, ()> {
-    let mut r = Reader(bytes);
-    let result = match r.byte()? {
-        0 => Ok(r.word()?),
-        1 => Err(DomainError::Malformed),
-        2 => Err(DomainError::ColumnType {
-            index: r.word()?,
-            column: r.string()?,
-            actual: match r.byte()? {
-                0 => CellType::Null,
-                1 => CellType::Integer,
-                2 => CellType::Real,
-                3 => CellType::Text,
-                4 => CellType::Blob,
-                _ => return Err(()),
-            },
-        }),
-        3 => Err(DomainError::InvalidText(r.bytes()?)),
-        4 => Err(DomainError::Column {
-            column: r.string()?,
-            reason: r.string()?,
-        }),
-        5 => Err(DomainError::Origin(match r.byte()? {
-            0 => OriginError::Label(r.string()?),
-            1 => OriginError::Domain(r.string()?),
-            2 => OriginError::KeyDecode,
-            3 => OriginError::KeyData,
-            4 => OriginError::Shape(r.string()?),
-            _ => return Err(()),
-        })),
-        _ => return Err(()),
-    };
-    r.end()?;
-    Ok(result)
 }
 
 /// Run retention with raw storage and primitive crypto. Lean owns transactions,
@@ -93,35 +22,24 @@ pub fn prune<S: Storage>(
     origin: &str,
     before: i64,
 ) -> Result<u64, Error<S::Error>> {
-    unsafe extern "C" {
-        fn synch_adapter_operation_history_prune(
-            origin: Slice,
-            before: u64,
-        ) -> *mut std::ffi::c_void;
-    }
-    // SAFETY: the runner initializes Lean; the constructor copies the input and
-    // returns one fresh owned native continuation, confined to this call.
-    let result = unsafe {
-        crate::operation::run(
-            storage,
-            Capabilities {
-                crypto: Some(crypto),
-                ..Capabilities::default()
-            },
-            &[],
-            || synch_adapter_operation_history_prune(origin.as_bytes().into(), before as u64),
-        )
-    }
-    .map_err(Error::Operation)?;
-    decode(&result)
-        .map_err(|()| Error::Operation(OperationError::Protocol))?
-        .map_err(Error::Domain)
+    let command = Command::PruneHistory {
+        origin: origin.to_owned(),
+        before,
+    };
+    let capabilities = Capabilities {
+        crypto: Some(crypto),
+        ..Capabilities::default()
+    };
+    let result = run(storage, capabilities, &[], &command).map_err(Error::Operation)?;
+    let outcome: Result<u64, DomainError> =
+        terminal(&result).map_err(|()| Error::Operation(OperationError::Protocol))?;
+    outcome.map_err(Error::Domain)
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::host::{Cell, Exclusion, Fields, Join, Order, Row};
+    use crate::host::{Cell, Fields, Join, Order, Row};
     use std::{cell::RefCell, rc::Rc};
 
     type Trace = Rc<RefCell<Vec<&'static str>>>;
@@ -213,77 +131,26 @@ mod tests {
                 _ => panic!("unexpected relation"),
             }
         }
-        fn exists_rows(&mut self, _: u64, _: &str, _: &Fields) -> Result<bool, Self::Error> {
-            panic!("unexpected exists")
-        }
-        fn upsert(
-            &mut self,
-            _: u64,
-            _: &str,
-            _: &Fields,
-            _: &[String],
-            _: &[String],
-        ) -> Result<(), Self::Error> {
-            panic!("unexpected upsert")
-        }
         fn delete_rows(
             &mut self,
             _: u64,
             _: &str,
             _: &Fields,
-            _: &[Exclusion],
+            _: &[crate::host::Exclusion],
             _: &Fields,
         ) -> Result<u64, Self::Error> {
             panic!("unexpected delete")
         }
-        fn read_bytes(&mut self, _: &str, _: &[u8]) -> Result<Option<Vec<u8>>, Self::Error> {
-            panic!("unexpected bytes")
-        }
-
-        // The relational host is one trait; these operations never request the
-        // read-repair, copy or expression-upsert statements.
-        fn snapshot(
-            &mut self,
-            _: &crate::host::Selection,
-            _: &[String],
-        ) -> Result<crate::host::Scan<Self::Error>, Self::Error> {
-            panic!("unexpected snapshot")
-        }
-        fn update(
-            &mut self,
-            _: u64,
-            _: &crate::host::Selection,
-            _: &Fields,
-        ) -> Result<u64, Self::Error> {
-            panic!("unexpected update")
-        }
-        fn copy_rows(
-            &mut self,
-            _: u64,
-            _: &str,
-            _: &crate::host::Selection,
-            _: &[(String, crate::host::SourceValue)],
-            _: &[String],
-        ) -> Result<u64, Self::Error> {
-            panic!("unexpected row copy")
-        }
-        fn delete_selected(
-            &mut self,
-            _: u64,
-            _: &crate::host::Selection,
-        ) -> Result<u64, Self::Error> {
-            panic!("unexpected selected delete")
-        }
-        fn write(
-            &mut self,
-            _: u64,
-            _: &str,
-            _: &Fields,
-            _: &[String],
-            _: &[(String, crate::host::ConflictValue)],
-        ) -> Result<(), Self::Error> {
-            panic!("unexpected expression upsert")
-        }
+        crate::host_unexpected!(
+            exists_rows,
+            upsert,
+            read_bytes,
+            snapshot,
+            update,
+            copy_rows,
+            delete,
+            write
+        );
     }
     fn setup(origin: &str, result: Result<bool, &'static str>) -> (Rows, Primitive, Trace) {
         let trace = Trace::default();
@@ -368,9 +235,13 @@ mod tests {
     }
     #[test]
     fn terminal_decoder_rejects_unknown_tags_and_trailing_data() {
-        for bytes in [&[9][..], &[2, 0][..], &[5, 9][..], &[1, 0][..]] {
-            assert!(decode(bytes).is_err());
+        for bytes in [&[9][..], &[1, 0, 0][..], &[1, 4, 9][..], &[0, 0][..]] {
+            assert!(terminal::<Result<u64, DomainError>>(bytes).is_err());
         }
+        assert_eq!(
+            terminal::<Result<u64, DomainError>>(&[1, 4, 2]),
+            Ok(Err(DomainError::Origin(OriginError::KeyDecode)))
+        );
     }
 
     #[test]
