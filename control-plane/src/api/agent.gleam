@@ -1566,7 +1566,7 @@ fn nullable_int() -> Decoder(Int) {
 
 // -- streaming a download ----------------------------------------------------
 
-/// Relays one content stream to a chunked HTTP response.
+/// Relays one content stream into an HTTP response body.
 ///
 /// The relay never holds more than the credit window: one chunk goes to the
 /// socket and one credit goes back, so a slow browser stalls the read at the
@@ -1590,17 +1590,18 @@ pub type Relayed {
   Failed(Relay, String)
 }
 
-/// Acts on one event from the session serving a download.
+/// Acts on one event from the session serving a download. `send` puts bytes
+/// on the wire and fails when the client has stopped reading them.
 pub fn relay_step(
   state: Relay,
   event: Event,
-  conn: mist.Connection,
+  send: fn(BitArray) -> Result(Nil, Nil),
 ) -> Relayed {
   case event {
     Started(id) -> Relaying(Relay(..state, id: id, moved: True))
     Header(_, root) -> Relaying(Relay(..state, root: root, moved: True))
     Body(_, data) ->
-      case mist.send_chunk(conn, data) {
+      case send(data) {
         Ok(_) -> {
           // One chunk out, one credit back: the window is the whole of what
           // this process is allowed to be holding.

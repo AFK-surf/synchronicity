@@ -2,7 +2,7 @@
 %% OS process out from under a connection for the crash-isolation test,
 %% and a one-session SMTP server that hands back what the client said.
 -module(test_ffi).
--export([tmp_db/0, kill9/1, rename/2, udp_roundtrip/2]).
+-export([tmp_db/0, kill9/1, rename/2, udp_roundtrip/2, http_get/2]).
 -export([smtp_listen/0, smtp_transcript/0]).
 
 tmp_db() ->
@@ -85,6 +85,24 @@ smtp_dialogue(Socket, Said, command) ->
 
 smtp_reply(Socket, Text) ->
     ok = gen_tcp:send(Socket, [Text, "\r\n"]).
+
+%% One HTTP/1.1 GET over raw TCP, read until the server closes: the wire
+%% itself, head and body, as a client would see it — for asserting what a
+%% streamed response really carries rather than what a client library
+%% made of it.
+http_get(Port, Path) ->
+    {ok, S} = gen_tcp:connect({127, 0, 0, 1}, Port,
+                              [binary, {active, false}, {packet, raw}], 5000),
+    ok = gen_tcp:send(S, ["GET ", Path, " HTTP/1.1\r\nHost: localhost\r\n\r\n"]),
+    Wire = http_drain(S, []),
+    gen_tcp:close(S),
+    Wire.
+
+http_drain(S, Acc) ->
+    case gen_tcp:recv(S, 0, 5000) of
+        {ok, Data} -> http_drain(S, [Data | Acc]);
+        {error, _} -> iolist_to_binary(lists:reverse(Acc))
+    end.
 
 udp_roundtrip(Port, Packet) ->
     {ok, S} = gen_udp:open(0, [binary, {active, false}]),
