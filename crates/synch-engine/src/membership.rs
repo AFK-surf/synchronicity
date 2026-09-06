@@ -1592,13 +1592,16 @@ mod tests {
                 .await;
         });
 
-        // The first pass is due immediately; give it a generous window.
-        assert!(
-            crate::testkit::eventually(|| resolver.calls() > 0).await,
-            "the loop resolves what is due"
-        );
+        // Resolution starts before its answer is applied on the blocking pool.
+        // Wait for the committed binding, not merely the resolver call counter.
         let origin = OriginId::named("nas", "cluster.example").unwrap();
-        assert!(node.store().is_bound(&origin, &nas, now_ns()).unwrap());
+        assert!(
+            crate::testkit::eventually(
+                || resolver.calls() > 0 && node.store().is_bound(&origin, &nas, now_ns()).unwrap()
+            )
+            .await,
+            "the loop resolves and applies what is due"
+        );
 
         tx.send(()).unwrap();
         tokio::time::timeout(Duration::from_secs(10), handle)

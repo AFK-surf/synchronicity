@@ -46,20 +46,39 @@ pub trait NodeStore {
     /// "Do I hold this whole trie?" has no cheap answer — it is a walk of
     /// everything reachable — and it is asked on every `Hello` (§5.1), which
     /// makes a converged cluster pay for the size of its metadata on every
-    /// anti-entropy round rather than for what changed. A root is immutable
-    /// and content-addressed, so the answer, once *computed*, cannot stop
-    /// being true: nothing rewrites a node under an existing hash, and GC
-    /// marks from every head it could be reached through. A store that can
-    /// remember the answer says so here; the default remembers nothing.
+    /// anti-entropy round rather than for what changed. Although a root is
+    /// immutable, the answer can change after GC or when learning a node
+    /// dissolves a redaction boundary. Implementations that cache answers must
+    /// invalidate them before such mutations; the default remembers nothing.
     fn is_known_complete(&self, _root: &Hash) -> Result<bool, Self::Error> {
         Ok(false)
     }
 
     /// Records that every node and value under `root` was found present.
     ///
-    /// Only ever called after a full walk has established it.
+    /// The caller must hold a stable snapshot through this operation. Resumed
+    /// or concurrent walks must use `note_complete_at` with their starting
+    /// generation instead.
     fn note_complete(&self, _root: &Hash) -> Result<(), Self::Error> {
         Ok(())
+    }
+
+    /// Changes whenever a mutation can invalidate a completed or in-flight
+    /// walk (including GC and newly held redaction boundaries). Implementations
+    /// with concurrent non-monotone mutations must override both generation
+    /// methods and prevent certification during an uncommitted mutation.
+    fn completeness_generation(&self) -> Result<u64, Self::Error> {
+        Ok(0)
+    }
+
+    /// Certifies a walk only if its generation is still current. The default
+    /// is for immutable/monotonically growing stores; it need not cache.
+    fn note_complete_at(&self, root: &Hash, generation: u64) -> Result<bool, Self::Error> {
+        if self.completeness_generation()? != generation {
+            return Ok(false);
+        }
+        self.note_complete(root)?;
+        Ok(true)
     }
 
     /// True if a peer has told this store it may not see the node `hash` at
@@ -102,7 +121,6 @@ pub trait NodeStore {
     /// out in the origin itself — and the origin cannot serve what it never
     /// held. The default owns nothing, which is the conservative answer for a
     /// store that never records provenance.
-    // LEAN-MODEL: mpt-owned-node (Provenance.view_owned)
     // `Provenance.Store.owned`; `Provenance.view` is the presence a walk with
     // an owner reads, and `privacy`/`integrity` are what provenance buys.
     fn owns_node(&self, _origin: &OriginId, _hash: &Hash) -> Result<bool, Self::Error> {
@@ -117,11 +135,25 @@ pub trait NodeStore {
 
 /// An in-memory node store, for tests and for verifying a proof against a
 /// root without touching any durable store.
-#[derive(Debug, Default)]
+#[derive(Debug)]
 pub struct MemStore {
     nodes: Mutex<HashMap<Hash, Vec<u8>>>,
     values: Mutex<HashMap<Hash, Vec<u8>>>,
     owned: Mutex<std::collections::HashSet<(OriginId, Hash)>>,
+    // Held across each destructive mutation; both edges advance the ticket.
+    // Saturation permanently refuses certification instead of reusing tickets.
+    generation: Mutex<u64>,
+}
+
+impl Default for MemStore {
+    fn default() -> Self {
+        Self {
+            nodes: Mutex::default(),
+            values: Mutex::default(),
+            owned: Mutex::default(),
+            generation: Mutex::new(0),
+        }
+    }
 }
 
 impl MemStore {
@@ -141,24 +173,51 @@ impl MemStore {
     /// Forgets one node, for tests that need a held trie to go partial.
     #[cfg(test)]
     pub(crate) fn remove_node(&self, hash: &Hash) {
+        let mut generation = self
+            .generation
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        *generation = generation.saturating_add(1);
         self.nodes
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .remove(hash);
+        *generation = generation.saturating_add(1);
     }
 
     /// Drops every out-of-line value, keeping the nodes: a store that relayed
     /// the structure but GC'd (or never held) the payloads.
     pub fn clear_values(&self) {
+        let mut generation = self
+            .generation
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        *generation = generation.saturating_add(1);
         self.values
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
             .clear();
+        *generation = generation.saturating_add(1);
     }
 }
 
 impl NodeStore for MemStore {
     type Error = Infallible;
+
+    fn completeness_generation(&self) -> Result<u64, Infallible> {
+        Ok(*self
+            .generation
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner))
+    }
+
+    fn note_complete_at(&self, _root: &Hash, generation: u64) -> Result<bool, Infallible> {
+        let current = self
+            .generation
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        Ok(*current == generation && generation != u64::MAX)
+    }
 
     fn get_node(&self, hash: &Hash) -> Result<Option<Vec<u8>>, Infallible> {
         Ok(self
@@ -224,5 +283,29 @@ impl NodeStore for MemStore {
             .unwrap_or_else(PoisonError::into_inner)
             .insert((origin.clone(), *hash));
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod generation_tests {
+    use super::*;
+
+    #[test]
+    fn destructive_mutations_advance_both_edges_and_refuse_terminal_epoch() {
+        let store = MemStore::new();
+        let root = Hash::new(b"root");
+        assert!(store.note_complete_at(&root, 0).unwrap());
+        store.clear_values();
+        assert_eq!(store.completeness_generation().unwrap(), 2);
+        assert!(!store.note_complete_at(&root, 0).unwrap());
+        store.remove_node(&root);
+        assert_eq!(store.completeness_generation().unwrap(), 4);
+        *store.generation.lock().unwrap() = u64::MAX - 1;
+        store.clear_values();
+        assert_eq!(store.completeness_generation().unwrap(), u64::MAX);
+        assert!(!store.note_complete_at(&root, u64::MAX).unwrap());
+        store.remove_node(&root);
+        assert_eq!(store.completeness_generation().unwrap(), u64::MAX);
+        assert!(!store.note_complete_at(&root, u64::MAX).unwrap());
     }
 }

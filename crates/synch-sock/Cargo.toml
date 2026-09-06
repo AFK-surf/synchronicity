@@ -25,7 +25,7 @@ thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 
-# async-ebpf runs on Linux, macOS and OpenBSD, on x86-64 and arm64, and refuses
+# async-ebpf runs on Linux and macOS, on x86-64 and arm64, and refuses
 # to compile anywhere else (its `lib.rs` says so with a `compile_error!`). The
 # dependency is therefore per-target rather than unconditional, so this crate —
 # and `synch-engine`, which is meant to stay embeddable — still builds on
@@ -33,7 +33,7 @@ tracing.workspace = true
 # declare, publish, replicate and materialize socket entries anywhere, and
 # `synch socket connect` works everywhere because the connecting side executes nothing
 # (`docs/SOCKETS.md` §1).
-[target.'cfg(all(any(target_os = "linux", target_os = "macos", target_os = "openbsd"), any(target_arch = "x86_64", target_arch = "aarch64")))'.dependencies]
+[target.'cfg(all(any(target_os = "linux", target_os = "macos"), any(target_arch = "x86_64", target_arch = "aarch64")))'.dependencies]
 async-ebpf = "0.4.0-alpha.14"
 libc = "0.2"
 rand = "0.8"

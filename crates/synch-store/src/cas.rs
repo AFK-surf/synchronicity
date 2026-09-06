@@ -16,7 +16,7 @@ use std::{
 use bao_tree::{
     io::{
         outboard::PreOrderOutboard,
-        sync::{decode_ranges, encode_ranges, ReadAt, WriteAt},
+        sync::{decode_ranges, encode_ranges, WriteAt},
     },
     BaoTree, BlockSize, ChunkNum,
 };
@@ -400,116 +400,6 @@ impl BlobRow {
     }
 }
 
-/// True if the groups on this disk actually attest to a recorded size.
-///
-/// Only the last group can. Every other group's chaining value is the same
-/// whatever the object's total length, so holding the first half of an object
-/// says a great deal about its content and nothing at all about where it ends;
-/// the final group is short by exactly the amount the size determines, and is
-/// the one place a wrong size cannot survive.
-///
-/// This is what keeps a peer from bricking a root. An object's tree has the same
-/// shape for every size inside its last 16 KiB **group** — the group is this
-/// store's leaf, and nothing above it moves while the group count stays put — so
-/// an entry that overstates an honest root by a few bytes yields a proof that
-/// verifies, and the row it creates would then refuse every honest writer of
-/// that root forever with "size mismatch", on every node that ever touched the
-/// poisoned path, with nothing to collect the row because the honest entry still
-/// references it. A size no group attests to is a claim, not a fact, and the
-/// next writer's claim replaces it (§5.1, §6.2).
-///
-/// Taken as three loose values rather than off a [`BlobRow`] so that the commit
-/// path can ask the question of a row it read *inside* its own transaction.
-fn size_is_attested(size: u64, complete: bool, held: &ChunkRanges) -> bool {
-    // LEAN-MODEL: cas-size-attested (Cas.Attested)
-    // `Cas.Attested` is this predicate: complete, or the final group held.
-    complete || held.contains(group_count(size) - 1)
-}
-
-/// What a size claim settled to, and what that costs the bits already held.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Settlement {
-    /// The size the row should record.
-    pub(crate) size: u64,
-    /// True when the recorded size changed the object's *group count*, so the
-    /// verified-group bitmap describes a tree that is no longer the one being
-    /// written and must be started again.
-    pub(crate) reset_held: bool,
-}
-
-/// Decides the size an object's row should record when a writer arrives
-/// claiming `claimed`, or refuses the writer.
-///
-/// Three answers, and the order matters:
-///
-/// 1. A size the disk attests to ([`size_is_attested`]) is a fact, and a writer
-///    offering a different one is offering bytes for some other object: refused.
-/// 2. A size no group attests to is a peer's claim off an entry, and yields to
-///    this writer's — that is what keeps an overstated entry from bricking an
-///    honest root forever (§5.1, §6.2).
-/// 3. It yields *completely*, including the bits already held.
-///
-/// Rule 3 does *not* refuse a claim that changes the object's group count
-/// while a group is held. The tempting reasoning — a changed count changes the
-/// shape of the tree, so no slice for it could have verified — is wrong, and
-/// inverts the rule it would be protecting. bao splits at the largest
-/// power of two below the chunk count, so every size in one bracket shares a
-/// left subtree: 20 groups and 24 groups both split at 16, and a slice covering
-/// groups 0..16 verifies identically under either — the right sibling's
-/// chaining value is opaque bytes from the encoder that join to the same root.
-/// An entry overstating the size within its bracket therefore produced a row
-/// that verified, held real bits, and refused every honest writer of that root
-/// for good: exactly the brick rule 2 exists to prevent, reached through rule 3.
-///
-/// So bits set under a size nothing attests to are themselves only a claim. A
-/// writer offering a different size takes the row, and if the group count moves
-/// the bitmap starts again — a re-fetch, which is cheap next to an object no
-/// one can ever complete. Rule 1 is what stops this churning: the first writer
-/// to hold the final group settles the size permanently, because that is the
-/// one group whose chaining value a wrong size cannot survive.
-///
-/// The decision belongs inside the transaction that writes the row. Read
-/// outside it, rule 1 is a check against a snapshot: an honest writer finishing
-/// an object could see "not attested yet", and a claim of a different size
-/// could land between the look and the commit, leaving the row complete under a
-/// size no byte on the disk supports — attested from then on, unreadable, and
-/// refusing every honest writer for good (`docs/DELTA-SYNC.md` §6).
-pub(crate) fn settle_size(
-    root: &Hash,
-    existing: Option<(u64, bool, bool, &ChunkRanges)>,
-    claimed: u64,
-) -> Result<Settlement> {
-    // LEAN-MODEL: cas-size-settlement (Cas.Settles)
-    // `Cas.Settles` is this decision as the guard on every groups commit: no
-    // row, or the recorded size, or a size neither durable nor attested.
-    let settled = |size| {
-        Ok(Settlement {
-            size,
-            reset_held: false,
-        })
-    };
-    let Some((recorded, complete, durable, held)) = existing else {
-        return settled(claimed);
-    };
-    if recorded == claimed {
-        return settled(recorded);
-    }
-    if durable || size_is_attested(recorded, complete, held) {
-        // LEAN-MODEL: cas-size-refusal (Cas.settled_size_is_stable)
-        // `Cas.settled_size_is_stable` is what this refusal buys: no step of
-        // the model leaves a row standing under a different size once its
-        // size is durable or attested.
-        return Err(StoreError::Verification {
-            root: *root,
-            reason: format!("size mismatch: have {recorded}, offered {claimed}"),
-        });
-    }
-    Ok(Settlement {
-        size: claimed,
-        reset_held: group_count(claimed) != group_count(recorded),
-    })
-}
-
 /// What a bitmap commit settled.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Commit {
@@ -517,14 +407,6 @@ pub(crate) struct Commit {
     pub(crate) size: u64,
     /// True if every group of the object is present.
     pub(crate) complete: bool,
-}
-
-/// What an object's row already claims, as the commit path needs it.
-struct RowClaim {
-    size: u64,
-    complete: bool,
-    durable: bool,
-    held: ChunkRanges,
 }
 
 /// Extends a file to at least `len`, and never shortens it.
@@ -608,85 +490,6 @@ pub(crate) fn bitmap_to_ranges(bits: &[u8], groups: u64) -> ChunkRanges {
     ChunkRanges::from_ranges(ranges)
 }
 
-/// Writes an object's index row, creating it or replacing what it claimed.
-struct BlobRowWrite<'a> {
-    root: &'a Hash,
-    size: u64,
-    complete: bool,
-    bitmap: Option<Vec<u8>>,
-    inline: Option<Vec<u8>>,
-    now: i64,
-    durable: bool,
-}
-
-fn upsert_blob_row(conn: &rusqlite::Connection, row: BlobRowWrite<'_>) -> Result<()> {
-    let BlobRowWrite {
-        root,
-        size,
-        complete,
-        bitmap,
-        inline,
-        now,
-        durable,
-    } = row;
-    conn.execute(
-        "INSERT INTO blobs
-           (root, size, complete, bitmap, inline, last_access, durable)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-         ON CONFLICT(root) DO UPDATE SET
-           size = excluded.size,
-           complete = excluded.complete,
-           bitmap = excluded.bitmap,
-           inline = COALESCE(excluded.inline, blobs.inline),
-           last_access = excluded.last_access,
-           durable = max(blobs.durable, excluded.durable)",
-        params![
-            root.as_bytes().to_vec(),
-            size as i64,
-            complete as i64,
-            bitmap,
-            inline,
-            now,
-            (complete && durable) as i64
-        ],
-    )?;
-    Ok(())
-}
-
-/// What an object's row currently claims, read on a given connection.
-///
-/// The bitmap is read against the row's *own* size, not the caller's: the two
-/// can differ, and that difference is the whole subject of [`settle_size`].
-fn read_claim(conn: &rusqlite::Connection, root: &Hash) -> Result<Option<RowClaim>> {
-    let row: Option<(i64, i64, i64, Option<Vec<u8>>)> = conn
-        .query_row(
-            "SELECT size, complete, durable, bitmap FROM blobs WHERE root = ?1",
-            params![root.as_bytes().to_vec()],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        )
-        .optional()?;
-    Ok(row.map(|(size, complete, durable, bitmap)| {
-        let size = size as u64;
-        let total = group_count(size);
-        let complete = complete != 0;
-        // LEAN-MODEL: cas-row-complete (Cas.Complete)
-        // `Cas.Complete` is what `complete` means when a row is read: every
-        // group of the row's own size is held. A bitmap row holds the groups
-        // it names and nothing more.
-        let held = match (complete, &bitmap) {
-            (true, _) => ChunkRanges::single(0, total),
-            (false, Some(bytes)) => blob_to_ranges(bytes, total),
-            (false, None) => ChunkRanges::empty(),
-        };
-        RowClaim {
-            size,
-            complete,
-            durable: durable != 0,
-            held,
-        }
-    }))
-}
-
 /// Converts our group ranges into bao chunk ranges.
 fn to_bao_ranges(ranges: &ChunkRanges) -> bao_tree::ChunkRanges {
     let per_group = 1u64 << CHUNK_GROUP_LOG2;
@@ -734,142 +537,20 @@ impl Store {
     // ---- ingest -----------------------------------------------------------
 
     /// Ingests an in-memory object, returning its root.
-    pub fn ingest_bytes(&self, data: &[u8], now: i64) -> Result<Hash> {
-        let size = data.len() as u64;
-        let tree = Self::tree(size);
-        let mut outboard = vec![0u8; tree.outboard_size() as usize];
-        let root = compute_outboard(data, tree, &mut outboard)?;
-
-        if size <= INLINE_BLOB_MAX {
-            self.commit_complete(&root, size, Some(data.to_vec()), now)?;
-        } else {
-            // Held from the first byte on disk through the row that describes
-            // it, exactly as `write_slice` does. An ingest re-creating content
-            // whose *old* row is a collection candidate is the one writer that
-            // races `gc_content` rather than `gc_orphans`, so the mtime window
-            // does not cover it ([`Store::lease_write`]).
-            let _lease = self.lease_write(&root);
-            self.write_payload(&root, data, &outboard)?;
-            self.commit_complete(&root, size, None, now)?;
-        }
-        Ok(root)
-    }
-
-    /// Ingests a file from the local filesystem in a single streaming pass,
-    /// emitting the outboard as a by-product (§7.1).
-    pub fn ingest_file(&self, path: &std::path::Path, now: i64) -> Result<(Hash, u64)> {
-        let metadata = std::fs::metadata(path)?;
-        let size = metadata.len();
-        if size <= INLINE_BLOB_MAX {
-            let data = std::fs::read(path)?;
-            // The length of what was read, not what the stat said. A file
-            // appended to between the two is ordinary — a log, a download in
-            // progress — and returning the stale length publishes an entry
-            // whose size does not describe its own root: no peer can fetch
-            // that version, because their tree is built over the wrong length.
-            let size = data.len() as u64;
-            let root = self.ingest_bytes(&data, now)?;
-            return Ok((root, size));
-        }
-
-        let tree = Self::tree(size);
-        let mut outboard = vec![0u8; tree.outboard_size() as usize];
-        // Stream the file once, teeing into a staging file in the CAS so the
-        // payload lands without a second read.
-        //
-        // Into the staging directory, never the CAS root: the root holds shard
-        // directories, and a regular file among them stopped
-        // [`Store::gc_orphans`] dead — `read_dir` on a file is `NotADirectory`,
-        // which the sweep took as a hard error, so one leaked staging file
-        // disabled orphan collection on that node forever. The sweep is also
-        // what reclaims these, which is why they have a place of their own.
-        std::fs::create_dir_all(self.staging_dir())?;
-        // Unique per ingest, not just per process: two concurrent ingests
-        // (a scan and a control-socket `put`, or parallel space scans) must not
-        // share one staging file, or each would truncate the other's stream and
-        // rename a corrupt payload into place under a correct-looking root.
-        let staging = self
-            .staging_dir()
-            .join(format!("{}.tmp", synch_core::fs::unique_suffix()));
-        let root = {
-            let source = File::open(path)?;
-            let sink = File::create(&staging)?;
-            let tee = TeeReader {
-                inner: source,
-                sink,
-            };
-            match compute_outboard(tee, tree, &mut outboard) {
-                Ok(root) => root,
-                Err(e) => {
-                    let _ = std::fs::remove_file(&staging);
-                    return Err(e);
-                }
-            }
-        };
-
-        // Taken as soon as the root is known — which is the first moment it
-        // *can* be — and held past the row. Everything from here to
-        // `write_blob_row` is file IO with no lock held, and for a large object
-        // that is a full payload fsync plus an outboard write: seconds, during
-        // which `gc_content` acting on this root's older row would delete that
-        // row and unlink the bytes this is about to claim are complete
-        // ([`Store::lease_write`]).
-        let _lease = self.lease_write(&root);
-        let target = self.blob_path(&root);
-        if let Some(parent) = target.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        replace_file(&staging, &target)?;
-        // The instant the lease is for: the payload is in place under its
-        // final name and the only row naming this root is the *old* one, which
-        // a `gc_content` pass may hold to be collectable. A no-op outside this
-        // crate's tests, which stop the write here to watch a sweep refuse it.
-        self.pause_in_write_window();
-        // Flush the payload contents, the outboard, and the directory entries
-        // before the index row claims this blob is complete. Checked, like the
-        // flushes below it: a swallowed ENOSPC or EIO here is a row claiming
-        // bytes the disk never took. Opened for *writing* to flush it, because
-        // Windows refuses `FlushFileBuffers` on a read-only handle.
-        fsync_file(&OpenOptions::new().write(true).open(&target)?)?;
-        fsync_parent(&target);
-        write_and_sync(&self.staging_dir(), &self.outboard_path(&root), &outboard)?;
-        self.commit_complete(&root, size, None, now)?;
-        Ok((root, size))
-    }
-
-    fn write_payload(&self, root: &Hash, data: &[u8], outboard: &[u8]) -> Result<()> {
-        let staging = self.staging_dir();
-        write_and_sync(&staging, &self.blob_path(root), data)?;
-        write_and_sync(&staging, &self.outboard_path(root), outboard)?;
-        Ok(())
-    }
-
-    /// Records an ingested object: every group of it, verified at once.
     ///
-    /// The same row write as [`Store::commit_groups`], claiming the whole
-    /// object, so an ingest meets [`settle_size`] like every other writer of
-    /// the root. An ingest's size is the truth about its bytes, and so is a
-    /// size the disk attests to, so the two can only disagree on a root two
-    /// objects share — which verification rules out — and a row's settled
-    /// size is never rewritten by anyone, not even the writer that hashed the
-    /// bytes. A claim off an entry that a partial fetch left behind yields to
-    /// the ingest as it would to any writer, bitmap and all.
-    pub(crate) fn commit_complete(
-        &self,
-        root: &Hash,
-        size: u64,
-        inline: Option<Vec<u8>>,
-        now: i64,
-    ) -> Result<()> {
-        // LEAN-MODEL: cas-write-complete-commit (Cas.CommitComplete)
-        // `Cas.CommitComplete` is `Cas.CommitGroups` over every group, exactly
-        // as this is `commit_groups` over the full range. Its staged branch is
-        // the `durable = 0` row a cloud backend leaves until `finalize`. File
-        // callers hold the write lease; inline callers have no unlink window.
-        let all = ChunkRanges::single(0, group_count(size));
-        let commit = self.commit_groups(root, size, &all, inline, now)?;
-        debug_assert!(commit.complete, "a commit of every group is complete");
-        Ok(())
+    /// The mandatory Lean operation owns hashing, inline selection, file
+    /// publication, write-lease lifetime and the atomic metadata commit.
+    pub fn ingest_bytes(&self, data: &[u8], now: i64) -> Result<Hash> {
+        crate::lean_ingest::ingest(self, crate::lean_resources::Input::Bytes(data), now)
+            .map(|(root, _)| root)
+    }
+
+    /// Ingests a local file and returns its root and captured byte count.
+    ///
+    /// Lean observes the source and owns read-to-EOF versus bounded capture;
+    /// Rust supplies the path capability without preparing an ingestion plan.
+    pub fn ingest_file(&self, path: &std::path::Path, now: i64) -> Result<(Hash, u64)> {
+        crate::lean_ingest::ingest(self, crate::lean_resources::Input::File(path), now)
     }
 
     /// Records a complete object whose bytes were durably committed by a
@@ -904,27 +585,13 @@ impl Store {
     /// Two writers of one root is the ordinary case rather than an exotic one:
     /// checkout reconciliation, a `synch cat` and the gateway's range read all resolve to
     /// the same content, and a promotion commits a whole span in a single step.
-    /// Reading the bitmap, unioning, and writing it back as three separate
-    /// statements loses one of two interleaved writers' progress every time —
-    /// harmlessly, because bits only ever grow and the bytes are already on the
-    /// disk, but the groups it dropped are then fetched all over again, and a
-    /// promotion's share of that loss is a whole span rather than a slice.
-    ///
-    /// So the read, the union and the write happen inside one transaction on
-    /// the store's single connection. The expensive part — decoding, hashing,
-    /// copying, fsyncing — stays outside it, as it must: this is a row update,
-    /// not a lock over the file IO that earned it.
-    ///
-    /// The **size** decision is made in here too, and for the same reason
-    /// ([`settle_size`]). Deciding whether a writer's claimed length may stand
-    /// is a read of the row followed by a write of it, and every committer used
-    /// to make that decision on its own snapshot before doing the work: two
-    /// writers of one root — the honest one finishing the object, the other
-    /// carrying a size a hundred bytes long off a peer's entry — could each see
-    /// an unattested row and each go ahead, and whichever committed second left
-    /// the row complete under a size no byte on the disk supports. Attested from
-    /// then on, unreadable, refusing every honest writer, and pinned against the
-    /// collector by the entry that named it. One decision, one transaction.
+    /// So the read, the settlement, the union and the write happen inside one
+    /// transaction, and the expensive part (decoding, hashing, copying,
+    /// fsyncing) stays outside it. The Lean commit owns that decision: the
+    /// offered size is settled against the row's claim, a claim only a
+    /// complete, durable or final-group-holding row can refuse; a changed
+    /// tree shape resets an unattested bitmap; and the merged groups are
+    /// written as ranges, `NULL` when there are none or all.
     pub(crate) fn commit_groups(
         &self,
         root: &Hash,
@@ -933,56 +600,15 @@ impl Store {
         inline: Option<Vec<u8>>,
         now: i64,
     ) -> Result<Commit> {
-        // LEAN-MODEL: cas-write-groups-commit (Cas.CommitGroups)
-        // `Cas.CommitGroups` abstracts both partial and completing bitmap
-        // commits; durability rises only when this commit completes locally.
-        self.with_immediate_tx(|tx| {
-            let claim = read_claim(tx, root)?;
-            let settlement = settle_size(
-                root,
-                claim
-                    .as_ref()
-                    .map(|c| (c.size, c.complete, c.durable, &c.held)),
-                size,
-            )?;
-            let size = settlement.size;
-            let total = group_count(size);
-            // A settlement that moved the group count invalidates the bitmap:
-            // those bits were verified against a tree of a different shape, and
-            // the size that gave them that shape was only ever a claim. Start
-            // the bitmap again rather than carry bits describing a tree nobody
-            // is writing any more.
-            // LEAN-MODEL: cas-size-reset (Cas.dropped_bit_was_a_claim)
-            // `Cas.dropped_bit_was_a_claim` is why this loses nothing that was
-            // a fact: a bit goes only when the row's size was neither durable
-            // nor attested, and `Cas.Invariant.held_within_size` is what
-            // keeping the bits under an unchanged group count preserves.
-            let held = match (settlement.reset_held, claim) {
-                (false, Some(claim)) => claim.held,
-                _ => ChunkRanges::empty(),
-            };
-            let verified = held.union(groups).intersect(&ChunkRanges::single(0, total));
-            let complete = verified.count() >= total;
-            let durable = self.complete_is_durable();
-            upsert_blob_row(
-                tx,
-                BlobRowWrite {
-                    root,
-                    size,
-                    complete,
-                    // `NULL` is the canonical spelling of "no verified
-                    // groups".  Besides saving an allocation, the missing-
-                    // durable heal uses that spelling to distinguish a cold
-                    // row with no cache payload from a partial cache worth
-                    // retaining.
-                    bitmap: (!complete && !verified.is_empty()).then(|| ranges_to_blob(&verified)),
-                    inline,
-                    now,
-                    durable,
-                },
-            )?;
-            Ok(Commit { size, complete })
-        })
+        crate::lean_ingest::commit_groups(self, root, size, groups, inline, now)
+    }
+
+    /// The cheap refusal of a size the row's claim cannot yield to, decided
+    /// by the same Lean settlement outside a transaction, so a writer never
+    /// decodes bytes (and writes an outboard of the wrong shape) against a
+    /// claim the commit would refuse anyway.
+    pub(crate) fn admit_size(&self, root: &Hash, size: u64) -> Result<()> {
+        crate::lean_ingest::admit_size(self, root, size)
     }
 
     /// Shortens an object's payload and outboard to the size a commit settled.
@@ -990,7 +616,7 @@ impl Store {
     /// The one place a file in the CAS is ever made smaller, and it runs only
     /// after a commit that *completed* the object — at which point the final
     /// group is held and the size is a fact rather than a claim
-    /// ([`size_is_attested`]). What it cleans up is the overstatement
+    /// (the attestation predicate). What it cleans up is the overstatement
     /// case: an entry claimed a few bytes more than the object has, the sparse
     /// payload was grown to fit the claim, and the honest writer that finished
     /// the object replaced it. Best effort — a payload left long costs disk,
@@ -1108,7 +734,6 @@ impl Store {
     /// Reconstructs a cold durable row after metadata restore, once the remote
     /// backend has confirmed that the final payload/outboard pair exists.
     pub(crate) fn adopt_durable_blob(&self, root: &Hash, size: u64, now: i64) -> Result<()> {
-        // LEAN-MODEL: cas-adopt-durable (Cas.AdoptRemote)
         // `Cas.AdoptRemote` is this row creation from a remote pair
         // the backend has just confirmed; it only ever adds availability.
         self.with_immediate_tx(|tx| {
@@ -1146,7 +771,6 @@ impl Store {
     /// The durable claim is withdrawn. A row with no verified cache bytes is
     /// removed altogether; otherwise it remains a partial peer-fetched cache.
     pub(crate) fn heal_missing_durable_blob(&self, root: &Hash) -> Result<bool> {
-        // LEAN-MODEL: cas-heal-missing-durable (FaultTolerant.HealRemote)
         // `FaultTolerant.HealRemote` is this transaction: the durable claim is
         // withdrawn, role pins become wants, the operator's pin is left alone.
         // The backend losing the object is the environment step before it.
@@ -1218,48 +842,6 @@ impl Store {
         })
     }
 
-    /// Invalidates a local complete claim after the payload is missing or
-    /// truncated, preserving every standing role as a repair intent.
-    fn heal_missing_local_blob(&self, root: &Hash) -> Result<()> {
-        // LEAN-MODEL: cas-heal-missing-local (FaultTolerant.HealLocal)
-        // `FaultTolerant.HealLocal` is this transaction, the local-bytes twin
-        // of the one above.
-        self.with_immediate_tx(|tx| {
-            let key = root.as_bytes().to_vec();
-            let size: Option<i64> = tx
-                .query_row(
-                    "SELECT size FROM blobs WHERE root = ?1",
-                    params![key.clone()],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            let Some(size) = size else {
-                return Ok(());
-            };
-            tx.execute(
-                "UPDATE blobs
-                    SET complete = 0, durable = 0, bitmap = NULL, inline = NULL
-                  WHERE root = ?1",
-                params![key.clone()],
-            )?;
-            tx.execute(
-                "INSERT INTO content_want (root, holder, size, prev, first_wanted)
-                 SELECT p.root, p.holder, ?2, NULL, ?3
-                   FROM pins p
-                  WHERE p.root = ?1
-                    AND (p.holder LIKE 'source:%' OR p.holder LIKE 'replica:%')
-                 ON CONFLICT(root, holder) DO NOTHING",
-                params![key.clone(), size, synch_core::now_ns()],
-            )?;
-            tx.execute(
-                "DELETE FROM pins WHERE root = ?1
-                   AND (holder LIKE 'source:%' OR holder LIKE 'replica:%')",
-                params![key],
-            )?;
-            Ok(())
-        })
-    }
-
     /// Reconciles database cache claims with an ephemeral scratch generation.
     ///
     /// A changed marker drops staged-only rows and clears cached groups on
@@ -1313,7 +895,6 @@ impl Store {
     /// claim. The row changes first, so a crash can leave only harmless orphan
     /// files, never a warm-cache claim with missing bytes.
     pub(crate) fn clear_blob_cache(&self, root: &Hash) -> Result<bool> {
-        // LEAN-MODEL: cas-cache-evict (Cas.CacheEvict)
         // `Cas.CacheEvict` retains remote durability when local cache
         // bytes disappear; callers select durable cache rows.
         let conn = self.conn();
@@ -1321,7 +902,6 @@ impl Store {
         if self.is_being_written(root) {
             return Ok(false);
         }
-        // LEAN-MODEL: cas-drop-staged-row (Cas.DropStaged)
         // `Cas.DropStaged` is this row removal of a non-durable cache
         // claim, and the same transition behind `reconcile_scratch_generation`
         // and the `commit_cas_migration` discard. None of the three consults
@@ -1471,38 +1051,37 @@ impl Store {
     /// under a live entry is exactly the evidence that the release was decided
     /// against a tree that has since changed its mind.
     pub fn pin(&self, root: &Hash, holder: &PinHolder, now: i64) -> Result<bool> {
-        // LEAN-MODEL: cas-pin (Cas.Pin)
-        // `Cas.Pin` includes the held-object check and pin insertion
-        // in this immediate transaction.
-        self.with_immediate_tx(|tx| {
-            // Held *durably*, not merely known or cached: a `blobs` row exists
-            // for a partial fetch too, and on a cloud backend a complete row
-            // is only a scratch copy until the backend has taken it
-            // (`durable=1`). A pin is a promise about the durable tier, so the
-            // predicate is `durable` alone, which is `Cas.Durable`
-            // and the fact the whole GC argument rests on: every path that
-            // drops a staged row without consulting `pins` — cache eviction,
-            // a scratch-generation reset, a backend migration — is safe only
-            // because a non-durable row can never be pinned. On the local
-            // backend a complete row is durable by construction, so nothing
-            // changes there. `take_possession` enforces the same thing on the
-            // other entry point, and a promise about bytes belongs in the
-            // store rather than in the discipline of every caller.
-            let held: bool = tx.query_row(
-                "SELECT EXISTS(SELECT 1 FROM blobs WHERE root = ?1 AND durable != 0)",
-                params![root.as_bytes().to_vec()],
-                |row| row.get(0),
-            )?;
-            if !held {
-                return Ok(false);
-            }
-            tx.execute(
-                "INSERT INTO pins (root, holder, created_at, release_after)
-                 VALUES (?1, ?2, ?3, NULL)
-                 ON CONFLICT(root, holder) DO UPDATE SET release_after = NULL",
-                params![root.as_bytes().to_vec(), holder.render(), now],
-            )?;
-            Ok(true)
+        self.acquire_pin(root, holder, now, false)
+    }
+
+    /// Execute the complete Lean pin/possession operation over raw storage.
+    /// A pin promises a durable claim, never merely a partial or staged cache
+    /// row. Possession also needs the holder's uncancelled want, so a late fetch
+    /// cannot resurrect an orphan role claim after role removal.
+    /// This durable-only contract is why staged-row eviction need not consult
+    /// pins: scratch copies cannot acquire promises about durable availability.
+    pub(crate) fn acquire_pin(
+        &self,
+        root: &Hash,
+        holder: &PinHolder,
+        now: i64,
+        possession: bool,
+    ) -> Result<bool> {
+        use synch_verified::cas::acquire;
+        let conn = self.conn();
+        let _ordered_against_writers = self.cas_order();
+        let mut storage = crate::lean_storage::SqliteStorage::new(&conn);
+        // Lean requests begin before reading metadata and owns every normal
+        // completion/failure path. Rust holds host resources, not policy facts.
+        acquire(
+            &mut storage,
+            root.as_bytes(),
+            &holder.render(),
+            now,
+            possession,
+        )
+        .map_err(|error| {
+            crate::lean_diagnostics::lifecycle_error(error, "invalid CAS acquisition metadata")
         })
     }
 
@@ -1514,25 +1093,22 @@ impl Store {
     /// model forbids. The operator's claim has no leaf behind it and goes
     /// unconditionally.
     pub fn unpin(&self, root: &Hash, holder: &PinHolder) -> Result<bool> {
-        // LEAN-MODEL: cas-unpin (Cas.Unpin)
-        // `Cas.Unpin` requires this holder's live role to have ended;
-        // for a role holder that guard is the entry check in this DELETE.
-        let dropped = match holder.space() {
-            None => self.conn().execute(
-                "DELETE FROM pins WHERE root = ?1 AND holder = ?2",
-                params![root.as_bytes().to_vec(), holder.render()],
-            )?,
-            Some(space) => self.conn().execute(
-                "DELETE FROM pins
-                  WHERE root = ?1 AND holder = ?2
-                    AND NOT EXISTS (
-                      SELECT 1 FROM entries
-                       WHERE entries.space = ?3 AND entries.content = pins.root
-                    )",
-                params![root.as_bytes().to_vec(), holder.render(), space],
-            )?,
+        use synch_verified::cas::{unpin, OperationError, PinHolder as Holder};
+        let holder = match holder {
+            PinHolder::Operator => Holder::Operator,
+            PinHolder::Source(space) => Holder::Source(space.clone()),
+            PinHolder::Replica(space) => Holder::Replica(space.clone()),
+            PinHolder::Other(text) => Holder::Other(text.clone()),
         };
-        Ok(dropped > 0)
+        self.with_connection_scope(|conn| {
+            let mut storage = crate::lean_storage::SqliteStorage::new(conn);
+            unpin(&mut storage, root.as_bytes(), holder).map_err(|error| match error {
+                OperationError::Host(error) => error,
+                OperationError::MalformedMetadata(_) | OperationError::Protocol => {
+                    StoreError::invalid("invalid native release-operation protocol")
+                }
+            })
+        })
     }
 
     /// Schedules one holder's claim to end, without ending it yet
@@ -1564,32 +1140,34 @@ impl Store {
     /// sweep visits any more: a space removed with its pins kept still has
     /// claims that were scheduled before it went.
     pub fn expire_pins_of(&self, holder: &PinHolder, now: i64) -> Result<usize> {
-        // LEAN-MODEL: cas-expire-pin (Cas.ExpirePin)
-        // `Cas.ExpirePin` covers this holder-specific path and the
-        // node-wide variant below. Both re-check that no live entry returned.
-        Ok(self.conn().execute(
-            "DELETE FROM pins
-              WHERE holder = ?1 AND release_after IS NOT NULL AND release_after <= ?2
-                AND NOT EXISTS (
-                  SELECT 1 FROM entries WHERE entries.content = pins.root
-                )",
-            params![holder.render(), now],
-        )?)
+        self.expire_claims(Some(holder), now)
     }
 
     /// Drops claims whose scheduled release has arrived, so that every other
     /// predicate over `pins` can stay free of the clock. Returns how many went.
     pub fn expire_pins(&self, now: i64) -> Result<usize> {
-        // As above, the entry predicate is re-checked here so a stale schedule
-        // is harmless.
-        Ok(self.conn().execute(
-            "DELETE FROM pins
-              WHERE release_after IS NOT NULL AND release_after <= ?1
-                AND NOT EXISTS (
-                  SELECT 1 FROM entries WHERE entries.content = pins.root
-                )",
-            params![now],
-        )?)
+        self.expire_claims(None, now)
+    }
+
+    fn expire_claims(&self, holder: Option<&PinHolder>, now: i64) -> Result<usize> {
+        use synch_verified::cas::{expire, OperationError, PinHolder as Holder};
+        let holder = holder.map(|holder| match holder {
+            PinHolder::Operator => Holder::Operator,
+            PinHolder::Source(space) => Holder::Source(space.clone()),
+            PinHolder::Replica(space) => Holder::Replica(space.clone()),
+            PinHolder::Other(text) => Holder::Other(text.clone()),
+        });
+        self.with_connection_scope(|conn| {
+            let mut storage = crate::lean_storage::SqliteStorage::new(conn);
+            let count = expire(&mut storage, holder, now).map_err(|error| match error {
+                OperationError::Host(error) => error,
+                OperationError::MalformedMetadata(_) | OperationError::Protocol => {
+                    StoreError::invalid("invalid native expiry-operation protocol")
+                }
+            })?;
+            usize::try_from(count)
+                .map_err(|_| StoreError::invalid("native expiry count exceeds address space"))
+        })
     }
 
     /// Every claim on one object, oldest first.
@@ -1687,36 +1265,10 @@ impl Store {
         //
         // So the writer's own mark is consulted, under the same guard. A write
         // in flight is not a collectable object, whatever the row says.
-        let mut conn = self.conn();
-        let _ordered_against_writers = self.cas_order();
-        if self.is_being_written(root) {
-            return Ok(false);
-        }
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        // LEAN-MODEL: cas-gc-row-commit (Cas.GcCommit)
-        // `Cas.GcCommit` is this conditional row transition. Its guard is
-        // intentionally re-read here, not inherited from the candidate scan.
-        let rows = tx.execute(
-            "DELETE FROM blobs
-               WHERE root = ?1
-                 AND NOT EXISTS (SELECT 1 FROM pins WHERE pins.root = blobs.root)
-                 AND last_access < ?2
-                 AND NOT EXISTS (
-                   SELECT 1 FROM entries WHERE entries.content = blobs.root
-                 )",
-            params![root.as_bytes().to_vec(), before],
-        )?;
-        tx.commit()?;
-        let deleted = rows > 0;
-        if deleted {
-            // LEAN-MODEL: cas-gc-unlink (Cas.GcUnlink)
-            // `Cas.GcUnlink` is separate from the row commit because the
-            // filesystem cannot join SQLite; `conn` remains held between them.
-            let _ = std::fs::remove_file(self.blob_path(root));
-            let _ = std::fs::remove_file(self.outboard_path(root));
-        }
-        drop(conn);
-        Ok(deleted)
+        Ok(
+            self.execute_blob_deletion(root, Some(before))?
+                == synch_verified::cas::Outcome::Applied,
+        )
     }
 
     /// Deletes an unprotected object's payload, outboard, and index row.
@@ -1726,37 +1278,35 @@ impl Store {
     /// "delete" must not be a back door around a live entry or pin: callers
     /// remove those claims first, then delete the now-unprotected cache object.
     pub fn delete_blob(&self, root: &Hash) -> Result<()> {
-        let mut conn = self.conn();
-        let _ordered_against_writers = self.cas_order();
-        if self.is_being_written(root) {
-            return Err(StoreError::invalid(format!(
+        use synch_verified::cas::Outcome;
+        match self.execute_blob_deletion(root, None)? {
+            Outcome::Writing => Err(StoreError::invalid(format!(
                 "blob {root} is being written and cannot be deleted"
-            )));
-        }
-        let tx = conn.transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)?;
-        // LEAN-MODEL: cas-protected-delete (Cas.ProtectedDelete)
-        // `Cas.ProtectedDelete` is this no-entry/no-pin/no-writer
-        // transition. The checks and row deletion are one write transaction.
-        let protected: bool = tx.query_row(
-            "SELECT EXISTS(SELECT 1 FROM pins WHERE root = ?1)
-                 OR EXISTS(SELECT 1 FROM entries WHERE content = ?1)",
-            params![root.as_bytes().to_vec()],
-            |row| row.get(0),
-        )?;
-        if protected {
-            return Err(StoreError::invalid(format!(
+            ))),
+            Outcome::ProtectedClaim => Err(StoreError::invalid(format!(
                 "blob {root} is referenced or pinned and cannot be deleted"
-            )));
+            ))),
+            Outcome::Applied => Ok(()),
+            _ => unreachable!("explicit Lean deletion returned a nonterminal outcome"),
         }
-        tx.execute(
-            "DELETE FROM blobs WHERE root = ?1",
-            params![root.as_bytes().to_vec()],
-        )?;
-        tx.commit()?;
-        let _ = std::fs::remove_file(self.blob_path(root));
-        let _ = std::fs::remove_file(self.outboard_path(root));
-        drop(conn);
-        Ok(())
+    }
+
+    /// Execute Lean's ordered deletion effects while holding both ordering
+    /// guards. The SQL only reads facts or performs unconditional keyed writes;
+    /// policy and the commit-before-unlink protocol live in the native core.
+    fn execute_blob_deletion(
+        &self,
+        root: &Hash,
+        before: Option<i64>,
+    ) -> Result<synch_verified::cas::Outcome> {
+        use synch_verified::cas::delete;
+        let conn = self.conn();
+        let _ordered_against_writers = self.cas_order();
+        let mut storage = crate::lean_storage::SqliteStorage::new(&conn);
+        let mut resources = crate::lean_storage::Resources(self);
+        delete(&mut storage, &mut resources, root.as_bytes(), before).map_err(|error| {
+            crate::lean_diagnostics::lifecycle_error(error, "invalid CAS deletion metadata")
+        })
     }
 
     /// Simulates storage loss for recovery and race tests.
@@ -1804,51 +1354,19 @@ impl Store {
 
     /// Reads a byte range from the trusted storage backend.
     pub fn read_range(&self, root: &Hash, offset: u64, len: u64) -> Result<Vec<u8>> {
-        let blob = self.blob(root)?.ok_or(StoreError::MissingBlob(*root))?;
-        let end = offset.saturating_add(len).min(blob.size);
-        if offset > blob.size {
-            return Err(StoreError::RangeOutOfBounds {
-                start: offset,
-                end,
-                size: blob.size,
-            });
-        }
-        if offset == end {
-            return Ok(Vec::new());
-        }
-        let wanted = ChunkRanges::from_ranges([groups_for_byte_range(offset, end)]);
-        let available = blob.verified_groups();
-        if !wanted.difference(&available).is_empty() {
-            return Err(StoreError::Verification {
-                root: *root,
-                reason: "requested range is not fully present locally".into(),
-            });
-        }
-
-        let mut out = vec![0u8; (end - offset) as usize];
-        match &blob.inline {
-            Some(data) => out.copy_from_slice(&data[offset as usize..end as usize]),
-            None => {
-                let result = File::open(self.blob_path(root))
-                    .and_then(|file| file.read_exact_at(offset, &mut out));
-                if let Err(error) = result {
-                    if matches!(
-                        error.kind(),
-                        std::io::ErrorKind::NotFound | std::io::ErrorKind::UnexpectedEof
-                    ) {
-                        self.heal_missing_local_blob(root)?;
-                    }
-                    return Err(error.into());
-                }
-            }
-        }
-        Ok(out)
+        crate::lean_read::read(
+            self,
+            root,
+            synch_verified::cas::ReadRequest::Range {
+                offset,
+                length: len,
+            },
+        )
     }
 
     /// Reads a whole object from the trusted storage backend.
     pub fn read_all(&self, root: &Hash) -> Result<Vec<u8>> {
-        let blob = self.blob(root)?.ok_or(StoreError::MissingBlob(*root))?;
-        self.read_range(root, 0, blob.size)
+        crate::lean_read::read(self, root, synch_verified::cas::ReadRequest::All)
     }
 
     // ---- slice serving and receiving --------------------------------------
@@ -1959,16 +1477,9 @@ impl Store {
         }
 
         let _lease = self.lease_write(root);
-        if let Some(row) = self.blob(root)? {
-            let held = row.verified_groups();
-            settle_size(
-                root,
-                Some((row.size, row.complete, row.durable, &held)),
-                size,
-            )?;
-            if row.complete {
-                return Ok(ChunkRanges::empty());
-            }
+        self.admit_size(root, size)?;
+        if self.blob(root)?.is_some_and(|row| row.complete) {
+            return Ok(ChunkRanges::empty());
         }
 
         if size <= INLINE_BLOB_MAX {
@@ -2026,20 +1537,13 @@ impl Store {
         let bao_ranges = to_bao_ranges(&served);
         let root_hash = blake3::Hash::from_bytes(root.0);
 
+        // The cheap refusal; the commit decides again, transactionally. This
+        // one is here so a claim that cannot possibly stand never reaches the
+        // disk at all.
+        self.admit_size(root, size)?;
         let existing = self.blob(root)?;
-        if let Some(row) = &existing {
-            // The cheap refusal. [`settle_size`] decides again, transactionally,
-            // at the commit — this one is here so a claim that cannot possibly
-            // stand never reaches the disk at all.
-            let held = row.verified_groups();
-            settle_size(
-                root,
-                Some((row.size, row.complete, row.durable, &held)),
-                size,
-            )?;
-            if row.complete {
-                return Ok(ChunkRanges::empty());
-            }
+        if existing.as_ref().is_some_and(|row| row.complete) {
+            return Ok(ChunkRanges::empty());
         }
 
         // Small objects are decoded in memory and inlined; larger ones stream
@@ -2223,6 +1727,8 @@ impl bao_tree::io::sync::OutboardMut for MemOutboard {
 
 /// A reader that copies everything it yields into a sink, so hashing a file and
 /// writing it into the CAS take one pass over the bytes.
+/// Retained for cloud ingestion, whose separate outer operation still awaits
+/// migration. Mandatory local ingestion does not use this Rust orchestration.
 pub(crate) struct TeeReader {
     pub(crate) inner: std::fs::File,
     pub(crate) sink: std::fs::File,
@@ -2236,6 +1742,8 @@ impl Read for TeeReader {
     }
 }
 
+/// Legacy cloud-ingestion builder and independent test oracle. Local
+/// ingestion constructs its hash tree and outboard entirely in Lean.
 pub(crate) fn compute_outboard(
     data: impl Read,
     tree: BaoTree,
@@ -2253,6 +1761,96 @@ pub(crate) fn compute_outboard(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn integer_metadata_reports_text_type_before_invalid_utf8() {
+        let (_dir, store) = crate::testutil::store();
+        let root = Hash::new(b"raw text integer metadata");
+        {
+            let conn = store.conn();
+            conn.execute_batch(
+                "CREATE TEMP TABLE blobs (root BLOB PRIMARY KEY, durable, last_access)",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO blobs VALUES (?1, CAST(X'FF' AS TEXT), CAST(X'FE' AS TEXT))",
+                params![root.as_bytes().to_vec()],
+            )
+            .unwrap();
+        }
+        for (column, result) in [
+            (
+                "durable",
+                store
+                    .acquire_pin(&root, &PinHolder::Operator, 1, false)
+                    .map(|_| ()),
+            ),
+            ("last_access", store.delete_blob(&root)),
+        ] {
+            match result.unwrap_err() {
+                StoreError::Sqlite(rusqlite::Error::InvalidColumnType(
+                    0,
+                    name,
+                    rusqlite::types::Type::Text,
+                )) => assert_eq!(name, column),
+                other => panic!("raw text preempted the integer field error: {other:?}"),
+            }
+            assert!(store.conn().is_autocommit());
+        }
+    }
+
+    #[test]
+    fn acquisition_preserves_sqlite_column_errors_for_corrupt_durability() {
+        use rusqlite::types::Value;
+
+        for value in [
+            Value::Null,
+            Value::Text("1".into()),
+            Value::Text("not an integer".into()),
+            Value::Blob(vec![]),
+            Value::Blob(vec![1]),
+            Value::Real(1.5),
+        ] {
+            let (_dir, store) = crate::testutil::store();
+            let root = Hash::new(b"corrupt durability fixture");
+            let expected_type = {
+                let conn = store.conn();
+                // A temporary raw table models damaged column types without
+                // changing the persisted schema or bypassing NOT NULL checks.
+                conn.execute_batch("CREATE TEMP TABLE blobs (root BLOB PRIMARY KEY, durable)")
+                    .unwrap();
+                conn.execute(
+                    "INSERT INTO blobs (root, durable) VALUES (?1, ?2)",
+                    params![root.as_bytes().to_vec(), value],
+                )
+                .unwrap();
+                let old_error = conn
+                    .query_row("SELECT durable FROM blobs", [], |row| row.get::<_, i64>(0))
+                    .unwrap_err();
+                match old_error {
+                    rusqlite::Error::InvalidColumnType(0, column, kind) => {
+                        assert_eq!(column, "durable");
+                        kind
+                    }
+                    other => panic!("unexpected reference decoder error: {other:?}"),
+                }
+            };
+            for possession in [false, true] {
+                let error = store
+                    .acquire_pin(&root, &PinHolder::Operator, 1, possession)
+                    .unwrap_err();
+                match error {
+                    StoreError::Sqlite(rusqlite::Error::InvalidColumnType(0, column, kind)) => {
+                        assert_eq!(column, "durable");
+                        assert_eq!(kind, expected_type);
+                    }
+                    other => panic!("native acquisition changed the error: {other:?}"),
+                }
+                assert!(store.conn().is_autocommit());
+                assert!(store.pins_for(&root).unwrap().is_empty());
+            }
+        }
+    }
 
     #[test]
     fn durable_rows_survive_cold_scratch_and_heal_missing_objects() {
@@ -2410,6 +2008,117 @@ mod tests {
             .unwrap();
         assert!(store.unpin(&root, &replica).unwrap());
         assert!(store.pinned_blobs().unwrap().is_empty());
+    }
+
+    #[test]
+    fn unpin_preserves_typed_holder_identity_and_empty_role_space() {
+        let (_d, store) = store();
+        let root = store.ingest_bytes(&data(100), 0).unwrap();
+        for space in ["media", "", "odd:space'雪"] {
+            let role = PinHolder::Source(space.into());
+            assert!(store.pin(&root, &role, 1).unwrap());
+            store
+                .put_entry(
+                    &crate::testutil::origin(),
+                    space,
+                    "a",
+                    &synch_core::FileEntry::file(100, 0, root, 1),
+                )
+                .unwrap();
+            assert!(!store.unpin(&root, &role).unwrap());
+            // Public Other values intentionally remain opaque: reparsing the
+            // identical stored spelling would invent a role guard.
+            let opaque = PinHolder::Other(role.render());
+            assert!(store.unpin(&root, &opaque).unwrap());
+            assert!(!store.unpin(&root, &opaque).unwrap());
+        }
+    }
+
+    #[test]
+    fn failed_unpin_rolls_back_and_preserves_the_claim() {
+        let (_d, store) = store();
+        let root = store.ingest_bytes(&data(100), 0).unwrap();
+        assert!(store.pin(&root, &PinHolder::Operator, 1).unwrap());
+        store
+            .conn()
+            .execute_batch(
+                "CREATE TEMP TRIGGER reject_pin_release BEFORE DELETE ON pins
+                 BEGIN SELECT RAISE(ABORT, 'release denied'); END;",
+            )
+            .unwrap();
+        let error = store.unpin(&root, &PinHolder::Operator).unwrap_err();
+        assert!(error.to_string().contains("release denied"));
+        assert!(store.conn().is_autocommit());
+        assert_eq!(store.pins_for(&root).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn expiry_preserves_sqlite_time_ordering_and_cross_space_protection() {
+        let (_d, store) = store();
+        let root = store.ingest_bytes(&data(100), 0).unwrap();
+        for (holder, time) in [
+            ("minimum", rusqlite::types::Value::Integer(i64::MIN)),
+            ("due", rusqlite::types::Value::Integer(0)),
+            ("future", rusqlite::types::Value::Integer(i64::MAX)),
+            ("real_due", rusqlite::types::Value::Real(-0.5)),
+            ("real_future", rusqlite::types::Value::Real(0.5)),
+            ("text", rusqlite::types::Value::Text("corrupt".into())),
+            ("blob", rusqlite::types::Value::Blob(vec![0])),
+            ("unscheduled", rusqlite::types::Value::Null),
+        ] {
+            store.conn().execute(
+                "INSERT INTO pins (root, holder, created_at, release_after) VALUES (?1, ?2, 0, ?3)",
+                params![root.as_bytes().as_slice(), holder, time],
+            ).unwrap();
+        }
+        let origin = crate::testutil::origin();
+        store
+            .put_entry(
+                &origin,
+                "other",
+                "live",
+                &synch_core::FileEntry::file(100, 0, root, 1),
+            )
+            .unwrap();
+        assert_eq!(store.expire_pins(0).unwrap(), 0);
+        store.delete_entry(&origin, "other", "live").unwrap();
+        assert_eq!(
+            store
+                .expire_pins_of(&PinHolder::Other("due".into()), 0)
+                .unwrap(),
+            1
+        );
+        assert_eq!(store.expire_pins(0).unwrap(), 2);
+        assert_eq!(store.expire_pins(0).unwrap(), 0);
+        let count: i64 = store
+            .conn()
+            .query_row("SELECT COUNT(*) FROM pins", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(count, 5);
+        assert!(store.conn().is_autocommit());
+    }
+
+    #[test]
+    fn failed_expiry_rolls_back_earlier_deletes_in_the_same_statement() {
+        let (_d, store) = store();
+        let root = store.ingest_bytes(&data(100), 0).unwrap();
+        for name in ["first", "second"] {
+            let holder = PinHolder::Other(name.into());
+            assert!(store.pin(&root, &holder, 0).unwrap());
+            assert!(store.schedule_release(&root, &holder, 1).unwrap());
+        }
+        store
+            .conn()
+            .execute_batch(
+                "CREATE TEMP TRIGGER reject_second_expiry BEFORE DELETE ON pins
+             WHEN (SELECT COUNT(*) FROM pins) = 1
+             BEGIN SELECT RAISE(ABORT, 'expiry denied'); END;",
+            )
+            .unwrap();
+        let error = store.expire_pins(1).unwrap_err();
+        assert!(error.to_string().contains("expiry denied"));
+        assert!(store.conn().is_autocommit());
+        assert_eq!(store.pins_for(&root).unwrap().len(), 2);
     }
 
     use crate::testutil::{data, store};
@@ -2684,6 +2393,107 @@ mod tests {
         ));
     }
 
+    #[test]
+    fn deletion_sql_failures_never_advance_to_unlink() {
+        for fail_at_commit in [false, true] {
+            for collect in [false, true] {
+                let (_dir, store) = store();
+                let bytes = data(100_000);
+                let root = store.ingest_bytes(&bytes, 0).unwrap();
+                if fail_at_commit {
+                    // The DELETE succeeds, but its deferred constraint fails
+                    // COMMIT. No filesystem effect may have been requested yet.
+                    store
+                        .conn()
+                        .execute_batch(
+                            "CREATE TABLE deletion_parent (id INTEGER PRIMARY KEY);
+                         CREATE TABLE deletion_child (parent INTEGER REFERENCES deletion_parent(id)
+                           DEFERRABLE INITIALLY DEFERRED);
+                         CREATE TRIGGER fail_deletion_commit AFTER DELETE ON blobs
+                           BEGIN INSERT INTO deletion_child VALUES (1); END;",
+                        )
+                        .unwrap();
+                } else {
+                    store
+                        .conn()
+                        .execute_batch(
+                            "CREATE TRIGGER fail_deletion_row BEFORE DELETE ON blobs
+                           BEGIN SELECT RAISE(ABORT, 'injected deletion failure'); END;",
+                        )
+                        .unwrap();
+                }
+                let result = if collect {
+                    store
+                        .delete_blob_if_collectable(&root, i64::MAX)
+                        .map(|_| ())
+                } else {
+                    store.delete_blob(&root)
+                };
+                assert!(result.is_err());
+                assert!(
+                    store.blob(&root).unwrap().is_some(),
+                    "row deletion must roll back"
+                );
+                assert!(store.blob_path(&root).exists());
+                assert!(store.outboard_path(&root).exists());
+                assert_eq!(store.read_all(&root).unwrap(), bytes);
+            }
+        }
+    }
+
+    #[test]
+    fn deletion_preserves_corrupt_access_errors_and_never_unlinks() {
+        use rusqlite::types::Value;
+        for value in [
+            Value::Null,
+            Value::Text("not a timestamp".into()),
+            Value::Blob(vec![]),
+            Value::Real(1.5),
+        ] {
+            let (_dir, store) = store();
+            let root = store.ingest_bytes(&data(100_000), 0).unwrap();
+            let expected_type = {
+                let conn = store.conn();
+                conn.execute_batch("CREATE TEMP TABLE blobs (root BLOB PRIMARY KEY, last_access)")
+                    .unwrap();
+                conn.execute(
+                    "INSERT INTO blobs VALUES (?1, ?2)",
+                    params![root.as_bytes().to_vec(), value],
+                )
+                .unwrap();
+                match conn
+                    .query_row("SELECT last_access FROM blobs", [], |row| {
+                        row.get::<_, i64>(0)
+                    })
+                    .unwrap_err()
+                {
+                    rusqlite::Error::InvalidColumnType(0, _, kind) => kind,
+                    other => panic!("unexpected decoder error: {other:?}"),
+                }
+            };
+            for collect in [false, true] {
+                let error = if collect {
+                    store
+                        .delete_blob_if_collectable(&root, i64::MAX)
+                        .map(|_| ())
+                } else {
+                    store.delete_blob(&root)
+                }
+                .unwrap_err();
+                match error {
+                    StoreError::Sqlite(rusqlite::Error::InvalidColumnType(0, column, kind)) => {
+                        assert_eq!(column, "last_access");
+                        assert_eq!(kind, expected_type);
+                    }
+                    other => panic!("deletion changed the original column error: {other:?}"),
+                }
+                assert!(store.conn().is_autocommit());
+                assert!(store.blob_path(&root).exists());
+                assert!(store.outboard_path(&root).exists());
+            }
+        }
+    }
+
     /// Two writers filling one object keep both halves of what they wrote: a
     /// read-union-write of the verified bitmap drops the earlier writer's bits
     /// — harmless bytes-wise, but the dropped groups are fetched all over
@@ -2709,6 +2519,224 @@ mod tests {
                 all,
                 "round {round}: one writer's groups were lost"
             );
+        }
+    }
+
+    #[test]
+    fn partial_commit_normalizes_ranges_at_unsigned_size_boundaries() {
+        let (_d, store) = store();
+        for size in [i64::MAX as u64, 1u64 << 63, u64::MAX] {
+            let root = Hash::new(&size.to_le_bytes());
+            let total = group_count(size);
+            let malformed = ChunkRanges {
+                ranges: vec![
+                    GroupRange::new(total, u64::MAX),
+                    GroupRange::new(2, 4),
+                    GroupRange::new(4, 2),
+                    GroupRange::new(0, 3),
+                ],
+            };
+            let partial = store
+                .commit_groups(&root, size, &malformed, None, 0)
+                .unwrap();
+            assert_eq!(partial.size, size);
+            assert!(!partial.complete);
+            assert_eq!(
+                store.blob(&root).unwrap().unwrap().verified_groups(),
+                ChunkRanges::single(0, 4)
+            );
+            let complete = store
+                .commit_groups(&root, size, &ChunkRanges::single(4, u64::MAX), None, 0)
+                .unwrap();
+            assert!(complete.complete);
+            // A complete row denotes all groups even though its bitmap is NULL.
+            assert!(
+                store
+                    .commit_groups(&root, size, &ChunkRanges::empty(), None, 0)
+                    .unwrap()
+                    .complete
+            );
+            assert!(matches!(
+                store.commit_groups(&root, size - 1, &ChunkRanges::empty(), None, 0),
+                Err(StoreError::Verification { .. })
+            ));
+            assert_eq!(store.blob(&root).unwrap().unwrap().size, size);
+        }
+    }
+
+    /// Seeds a row the way a writer left it, bypassing the commit path.
+    fn seed_claim(
+        store: &Store,
+        root: &Hash,
+        size: u64,
+        complete: bool,
+        durable: bool,
+        held: &[(u64, u64)],
+    ) {
+        store
+            .conn()
+            .execute(
+                "INSERT OR REPLACE INTO blobs (root, size, complete, durable, bitmap, last_access)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 0)",
+                params![
+                    root.as_bytes().to_vec(),
+                    size as i64,
+                    complete,
+                    durable,
+                    postcard::to_stdvec(held).unwrap()
+                ],
+            )
+            .unwrap();
+    }
+
+    #[test]
+    fn partial_size_settlement_only_replaces_unattested_claims() {
+        let (_d, store) = store();
+        let root = Hash::new(b"settlement cases");
+        let recorded = 4 * CHUNK_GROUP_SIZE;
+        let prefix = [(0, 1)];
+        let final_group = [(3, 4)];
+        assert!(
+            store.admit_size(&root, recorded).is_ok(),
+            "no row admits any size"
+        );
+        for (complete, durable, held) in [
+            (true, false, &prefix[..]),
+            (false, true, &prefix[..]),
+            (false, false, &final_group[..]),
+        ] {
+            seed_claim(&store, &root, recorded, complete, durable, held);
+            assert!(store.admit_size(&root, recorded).is_ok());
+            assert!(matches!(
+                store.admit_size(&root, recorded - 1),
+                Err(StoreError::Verification { .. })
+            ));
+        }
+        // An unattested claim yields: the same tree shape keeps its bits and a
+        // changed one starts over.
+        seed_claim(&store, &root, recorded, false, false, &prefix);
+        store.admit_size(&root, recorded - 1).unwrap();
+        let same_shape = store
+            .commit_groups(&root, recorded - 1, &ChunkRanges::empty(), None, 0)
+            .unwrap();
+        assert_eq!(same_shape.size, recorded - 1);
+        assert_eq!(
+            store.blob(&root).unwrap().unwrap().verified_groups(),
+            ChunkRanges::single(0, 1)
+        );
+        store.admit_size(&root, recorded + 1).unwrap();
+        let changed_shape = store
+            .commit_groups(&root, recorded + 1, &ChunkRanges::empty(), None, 0)
+            .unwrap();
+        assert_eq!(changed_shape.size, recorded + 1);
+        assert!(store
+            .blob(&root)
+            .unwrap()
+            .unwrap()
+            .verified_groups()
+            .is_empty());
+    }
+
+    #[test]
+    fn partial_commit_resets_unattested_tree_shape_and_handles_empty_objects() {
+        let (_d, store) = store();
+        let empty = Hash::new(b"empty commit");
+        assert!(
+            store
+                .commit_groups(&empty, 0, &ChunkRanges::single(0, u64::MAX), None, 0)
+                .unwrap()
+                .complete
+        );
+        let root = Hash::new(b"changed shape");
+        store
+            .commit_groups(
+                &root,
+                4 * CHUNK_GROUP_SIZE,
+                &ChunkRanges::single(0, 2),
+                None,
+                0,
+            )
+            .unwrap();
+        let result = store
+            .commit_groups(
+                &root,
+                8 * CHUNK_GROUP_SIZE,
+                &ChunkRanges::single(7, u64::MAX),
+                None,
+                0,
+            )
+            .unwrap();
+        assert!(!result.complete);
+        assert_eq!(
+            store.blob(&root).unwrap().unwrap().verified_groups(),
+            ChunkRanges::single(7, 8)
+        );
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn partial_settlement_matches_the_integer_contract(
+            row in proptest::prelude::any::<bool>(), durable in proptest::prelude::any::<bool>(), complete in proptest::prelude::any::<bool>(),
+            final_held in proptest::prelude::any::<bool>(), recorded in 0u64..(128 * CHUNK_GROUP_SIZE), claimed in 0u64..(128 * CHUNK_GROUP_SIZE),
+        ) {
+            let count = |size: u64| u128::from(size).div_ceil(u128::from(CHUNK_GROUP_SIZE)).max(1) as u64;
+            proptest::prop_assert_eq!(group_count(recorded), count(recorded));
+            let (_d, store) = store();
+            let root = Hash::new(b"property");
+            if row {
+                let held: &[(u64, u64)] = if final_held { &[(count(recorded) - 1, count(recorded))] } else { &[] };
+                seed_claim(&store, &root, recorded, complete, durable, held);
+            }
+            let admitted = store.admit_size(&root, claimed);
+            let actual = store.commit_groups(&root, claimed, &ChunkRanges::empty(), None, 0);
+            if row && recorded != claimed && (durable || complete || final_held) {
+                proptest::prop_assert!(admitted.is_err());
+                proptest::prop_assert!(actual.is_err());
+            } else {
+                proptest::prop_assert!(admitted.is_ok());
+                let actual = actual.unwrap();
+                proptest::prop_assert_eq!(actual.size, claimed);
+                let reset = row && count(recorded) != count(claimed);
+                let kept = store.blob(&root).unwrap().unwrap().verified_groups();
+                proptest::prop_assert_eq!(kept.is_empty(), reset || !(row && (final_held || complete)));
+            }
+        }
+
+        #[test]
+        fn partial_commits_match_pointwise_group_membership(
+            row in proptest::prelude::any::<bool>(), durable in proptest::prelude::any::<bool>(), complete in proptest::prelude::any::<bool>(),
+            recorded in 0u64..(128 * CHUNK_GROUP_SIZE), claimed in 0u64..(128 * CHUNK_GROUP_SIZE),
+            old in proptest::collection::vec((0u64..150, 0u64..150), 0..32),
+            incoming in proptest::collection::vec((0u64..150, 0u64..150), 0..32),
+        ) {
+            let (_d, store) = store();
+            let root = Hash::new(b"bitmap property");
+            if row {
+                store.conn().execute(
+                    "INSERT INTO blobs (root, size, complete, durable, bitmap, last_access) VALUES (?1, ?2, ?3, ?4, ?5, 0)",
+                    params![root.as_bytes().to_vec(), recorded as i64, complete, durable, postcard::to_stdvec(&old).unwrap()],
+                ).unwrap();
+            }
+            let contains = |ranges: &[(u64, u64)], g| ranges.iter().any(|&(a, b)| a <= g && g < b);
+            let prior = |g| row && (if complete { g < group_count(recorded) } else { contains(&old, g) });
+            let refused = row && recorded != claimed && (durable || complete || prior(group_count(recorded) - 1));
+            let incoming_ranges = ChunkRanges { ranges: incoming.iter().map(|&(a, b)| GroupRange::new(a, b)).collect() };
+            let actual = store.commit_groups(&root, claimed, &incoming_ranges, None, 0);
+            if refused {
+                proptest::prop_assert!(actual.is_err());
+            } else {
+                let actual = actual.unwrap();
+                let total = group_count(claimed);
+                let reset = row && group_count(recorded) != total;
+                let expected = |g| g < total && (contains(&incoming, g) || (!reset && prior(g)));
+                let ranges = store.blob(&root).unwrap().unwrap().verified_groups();
+                for g in 0..151 {
+                    proptest::prop_assert_eq!(ranges.contains(g), expected(g));
+                }
+                proptest::prop_assert_eq!(actual.complete, (0..total).all(expected));
+                proptest::prop_assert!(ranges.ranges.iter().all(|r| r.start < r.end && r.end <= total));
+                proptest::prop_assert!(ranges.ranges.windows(2).all(|rs| rs[0].end < rs[1].start));
+            }
         }
     }
 
@@ -2799,12 +2827,12 @@ mod tests {
         }
     }
 
-    /// An ingest is a writer like any other and meets `settle_size`: a claim
+    /// An ingest is a writer like any other and meets the size settlement: a claim
     /// a partial fetch left behind under a size nothing attests to yields to
     /// the ingest, bitmap and all, and the object is complete at the length
     /// its bytes have. A size the disk attests to is never rewritten, not
     /// even by the writer that hashed the bytes — the only way the two can
-    /// disagree is a root two objects share (`Cas.settled_size_is_stable`).
+    /// disagree is a root two objects share (`CasPlanProofs.settlement_accepts_iff`).
     #[test]
     fn an_ingest_settles_size_like_any_other_writer() {
         let (_d1, provider) = store();
@@ -2976,66 +3004,6 @@ mod tests {
         );
         drop(held);
         assert!(leasing.join().unwrap());
-    }
-
-    /// An ingest re-creating content whose old row is collectable keeps its
-    /// bytes: between the rename and the row write there is a window a
-    /// `gc_content` pass could unlink the payload in. The ingest is stopped
-    /// inside that window by a [`WriteWindow`] rather than raced for — a
-    /// rename, an fsync and a row is about a millisecond where `fsync` returns
-    /// before the disk does, and a collector thread spinning to catch it caught
-    /// it everywhere but on a loaded macOS runner.
-    #[test]
-    fn an_ingest_that_recreates_a_collectable_object_keeps_its_bytes() {
-        let (dir, store) = store();
-        let store = std::sync::Arc::new(store);
-        // Past `INLINE_BLOB_MAX`, so the payload is a file rather than a column
-        // and the rename → fsync → outboard → row window is a real one.
-        let payload = data(1024 * 1024);
-        let source = dir.path().join("restored.bin");
-        std::fs::write(&source, &payload).unwrap();
-
-        // The state that makes this reachable: a row for this exact content
-        // that is cold, unreferenced and unpinned — an ordinary `gc_content`
-        // candidate — while the same content is ingested again.
-        let root = store.ingest_bytes(&payload, 0).unwrap();
-
-        let window = std::sync::Arc::new(crate::db::WriteWindow::default());
-        store.set_write_window(window.clone());
-        let collector = {
-            let store = store.clone();
-            let window = window.clone();
-            std::thread::spawn(move || {
-                window.wait_entered();
-                let leased = store.is_being_written(&root);
-                // Refused — or this returns true and unlinks the bytes the
-                // ingest is midway through writing, leaving the row it is about
-                // to commit describing nothing.
-                let collected = store.delete_blob_if_collectable(&root, i64::MAX);
-                // Before the assertions: a panic here with the ingest still
-                // parked in its window would hang the test rather than fail it.
-                window.release();
-                assert!(
-                    leased,
-                    "the ingest held no write lease, so a sweep in its window \
-                     would have unlinked the bytes of the row it then committed"
-                );
-                assert!(
-                    !collected.unwrap(),
-                    "an ingest in flight is not a collectable object"
-                );
-            })
-        };
-
-        let (ingested, size) = store.ingest_file(&source, 1).unwrap();
-        collector.join().unwrap();
-
-        assert_eq!(ingested, root);
-        assert_eq!(size, payload.len() as u64);
-        // The invariant: a row calling the object complete, and the bytes it
-        // describes.
-        assert!(store.blob(&root).unwrap().unwrap().complete);
-        assert_eq!(store.read_all(&root).unwrap(), payload);
     }
 
     /// A write that resumes into a stale payload keeps it: `write_slice` opens

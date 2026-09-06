@@ -37,6 +37,7 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
         with:
           components: clippy
+      - uses: ./.github/actions/setup-lean-core
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy --workspace --all-targets -- -D warnings
       - run: cargo clippy --workspace --all-features --all-targets -- -D warnings
@@ -56,7 +57,10 @@ jobs:
   test:
     name: test (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    # Windows' serial native/toolchain builds and three feature configurations
+    # exhausted 30 minutes just as the expensive fanout tests began. Preserve
+    # every gate and allow the cold-cache Windows job time to finish them.
+    timeout-minutes: ${{ matrix.os == 'windows-latest' && 45 || 30 }}
     strategy:
       fail-fast: false
       matrix:
@@ -64,13 +68,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/setup-lean-core
       - uses: Swatinem/rust-cache@v2
       # No network access needed: loopback only, relays and discovery off.
       # --no-fail-fast reports every platform's failures in one round-trip.
       # synch-engine is split into `test-engine` below: its real-network,
       # real-clock integration tests alone outrun the rest of the workspace.
-      # `--all-features` is a strict superset of a default-features run here —
-      # optional features are all purely additive — so there's no separate one.
       - run: cargo test --workspace --all-features --all-targets --no-fail-fast --exclude synch-engine
       - run: cargo test --workspace --doc --no-fail-fast --exclude synch-engine
       # `--lib --bins` resolves synch-net's `sim` dev-feature off, testing the
@@ -91,6 +94,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/setup-lean-core
       - uses: Swatinem/rust-cache@v2
       # Split from `test`: real network + real clock per test makes this
       # crate alone slower than the rest of the workspace combined.
@@ -98,31 +102,77 @@ jobs:
       - run: cargo test -p synch-engine --doc --no-fail-fast
       - run: cargo test -p synch-engine --lib --bins --no-fail-fast
 
-  musl:
-    name: musl (release binaries)
-    runs-on: ubuntu-latest
+
+  verified-core:
+    name: statically linked Lean core (${{ matrix.os }})
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 30
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    env:
+      CARGO_BUILD_JOBS: "1"
+      RUST_TEST_THREADS: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-        with:
-          targets: x86_64-unknown-linux-musl
+      - uses: ./.github/actions/setup-lean-core
       - uses: Swatinem/rust-cache@v2
         with:
-          key: musl
-      # musl's libc typedefs are not glibc's — `ioctl`'s request argument is
-      # `c_int` there and `c_ulong` here — so code that compiles on every host
-      # in `test` above can still fail to compile for the static Linux binaries
-      # the release workflow ships, and the first sign of it is a broken tag.
-      # Type-check the released binaries against musl here instead, where the
-      # break costs a red pull request. This checks x86_64 only: the aarch64
-      # musl build differs from it in target-specific constants, not in the
-      # libc typedefs that make glibc-only code fail, and cross-compiling C
-      # dependencies for it would need the release workflow's zig toolchain.
-      - run: sudo apt-get update && sudo apt-get install -y musl-tools
-      - run: cargo check --target x86_64-unknown-linux-musl --bin synch --bin synch-s3 --bin synch-monitor
-        env:
-          CC_x86_64_unknown_linux_musl: musl-gcc
+          key: verified-lean
+      - run: cargo test -p synch-verified -p synch-mpt -p synch-store --all-targets
+      - run: cargo test -p synch-engine --test delegation --test convergence --test trust_boundaries --test replication
+      - name: Check isolated native ingestion memory
+        if: runner.os == 'Linux'
+        run: cargo test -p synch-store --lib lean_ingest_memory::isolated_ingestion_memory -- --ignored --exact --nocapture --test-threads=1
+      - run: cargo run --release -p synch-verified --example decisions
+      - name: Verify static Lean runtime (Linux)
+        if: runner.os == 'Linux'
+        shell: bash
+        run: |
+          dependencies=$(ldd target/release/examples/decisions)
+          echo "$dependencies"
+          if echo "$dependencies" | grep -Ei 'liblean|libInit|libStd|libc\+\+|libgmp|libuv'; then
+            echo '::error::Lean runtime dependency was not statically linked'
+            exit 1
+          fi
+      - name: Verify static Lean runtime (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          dependencies=$(otool -L target/release/examples/decisions)
+          echo "$dependencies"
+          # Apple's system libc++ is intentionally dynamically linked; Lean,
+          # Init/Std and the bundled GMP/libuv dependencies must be static.
+          if echo "$dependencies" | grep -Ei 'liblean|libInit|libStd|libgmp|libuv'; then
+            echo '::error::Lean runtime dependency was not statically linked'
+            exit 1
+          fi
+      - name: Verify static Lean runtime (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          $binary = "target/$env:CARGO_BUILD_TARGET/release/examples/decisions.exe"
+          $headers = & llvm-objdump --private-headers $binary
+          if ($LASTEXITCODE -ne 0) { throw 'Unable to inspect executable imports' }
+          # Match complete DLL basenames, not substrings such as "std" in
+          # api-ms-win-crt-stdio-l1-1-0.dll (a supported Windows CRT import).
+          $forbiddenDll = '(?i)^(lib)?(lean|leanrt|Init|Std|gmp|uv|c\+\+|c\+\+abi|unwind|winpthread)[^\\/]*\.dll$'
+          # Lightweight regression checks exercise the exact production pattern.
+          foreach ($allowed in @('api-ms-win-crt-stdio-l1-1-0.dll', 'api-ms-win-crt-runtime-l1-1-0.dll', 'KERNEL32.dll', 'icu.dll', 'bcrypt.dll')) {
+            if ($allowed -match $forbiddenDll) { throw "False positive static-runtime check: $allowed" }
+          }
+          foreach ($blocked in @('lean.dll', 'libleanshared.dll', 'leanrt.dll', 'libLeanRT.dll', 'Init.dll', 'libInit_shared.dll', 'Std.dll', 'libStd.dll', 'libgmp-10.dll', 'libuv-1.dll', 'libc++.dll', 'libc++abi.dll', 'libunwind.dll', 'libwinpthread-1.dll', 'libstdc++-6.dll')) {
+            if ($blocked -notmatch $forbiddenDll) { throw "Missed dynamic-runtime import: $blocked" }
+          }
+          $imports = $headers | Select-String '^\s*DLL Name:\s*(.+\.dll)\s*$'
+          if (!$imports) { throw 'No executable import table found' }
+          $imports | ForEach-Object { Write-Output $_ }
+          $dllNames = $imports | ForEach-Object { ($_.Matches[0].Groups[1].Value -split '[\\/]')[-1] }
+          if ($dllNames -match $forbiddenDll) {
+            throw 'Lean runtime dependency was not statically linked'
+          }
 
   cloud-providers:
     name: cloud CAS providers
@@ -134,6 +184,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/setup-lean-core
       - uses: Swatinem/rust-cache@v2
       - name: Start MinIO, fake-gcs-server, and Azurite
         run: |
@@ -189,6 +240,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/setup-lean-core
       - uses: Swatinem/rust-cache@v2
       - run: cargo doc --workspace --no-deps
         env:
@@ -227,25 +279,30 @@ jobs:
           fi
 
   lean:
-    name: lean (CAS / mptsync / ingest)
+    name: lean (core proofs)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+      # Proofs over the executable core, built from the same source Cargo
+      # compiles. Every declaration is rechecked by the standalone kernel
+      # checker, and sorryAx or an unapproved axiom fails the job.
       - uses: leanprover/lean-action@v1
         with:
           lake-package-directory: specs/lean
           build: true
           build-args: --wfail
           test: false
-          use-mathlib-cache: true
-          # Recheck every compiled declaration with Lean's standalone kernel
-          # checker, then reject sorryAx and any unapproved custom axiom.
+          use-mathlib-cache: false
           leanchecker: true
           leanchecker-args: Synchronicity
           axiom-audit: true
-      - name: Check Rust/Lean implementation anchors
-        run: specs/lean/check-anchors.sh
+      # The host boundary is generated from the Lean effect algebras and
+      # command types. The Lean codecs are kept in the tree and must match
+      # what the generator prints for the current source; the Rust glue is
+      # printed into Cargo's output directory by every build.
+      - name: Check the generated Lean codecs
+        run: cd crates/synch-verified/lean && lake env lean --run Hostgen.lean --check
 
   bench:
     name: benchmark (smoke)
@@ -254,6 +311,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
+      - uses: ./.github/actions/setup-lean-core
       - uses: Swatinem/rust-cache@v2
       # A correctness check on the benchmark, not a performance gate: a shared
       # CI runner's timings are too noisy to threshold, and a benchmark nobody

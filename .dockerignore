@@ -17,4 +17,5 @@
 # Build outputs that would otherwise ride along inside those trees. A host
 # target/ is both enormous and the wrong architecture.
 **/target/
+**/.lake/
 **/*.rs.bk

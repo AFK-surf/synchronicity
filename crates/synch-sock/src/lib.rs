@@ -10,7 +10,7 @@
 //!
 //! # What is here on every platform, and what is not
 //!
-//! async-ebpf runs on Linux, macOS and OpenBSD, on x86-64 and arm64. This crate
+//! async-ebpf runs on Linux and macOS, on x86-64 and arm64. This crate
 //! builds everywhere: the ABI, the limits, the policy and the SDK header are
 //! portable, and [`SUPPORTED`] says whether the runtime behind them exists.
 //! What a node without it loses is *serving*: it can still activate, publish,
@@ -39,13 +39,13 @@ pub mod sdk;
 pub mod stream;
 
 #[cfg(all(
-    any(target_os = "linux", target_os = "macos", target_os = "openbsd"),
+    any(target_os = "linux", target_os = "macos"),
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 mod runtime;
 
 #[cfg(all(
-    any(target_os = "linux", target_os = "macos", target_os = "openbsd"),
+    any(target_os = "linux", target_os = "macos"),
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 pub use runtime::{validate_program, SshHostKey, Worker, WorkerHandle};
@@ -65,11 +65,7 @@ pub use stream::DuplexStream;
 /// [`RefuseCode::Unsupported`](synch_core::RefuseCode::Unsupported), and
 /// `synch socket activate` says so at activation time rather than at 3am.
 pub const SUPPORTED: bool = cfg!(all(
-    any(
-        target_os = "linux",
-        target_os = "macos",
-        target_os = "openbsd"
-    ),
+    any(target_os = "linux", target_os = "macos"),
     any(target_arch = "x86_64", target_arch = "aarch64")
 ));
 
@@ -87,7 +83,7 @@ pub enum SockError {
     Fault(String),
     /// This build has no runtime for this platform.
     #[error(
-        "this build serves no sockets: async-ebpf supports Linux, macOS and OpenBSD on \
+        "this build serves no sockets: async-ebpf supports Linux and macOS on \
          x86-64 and arm64"
     )]
     Unsupported,

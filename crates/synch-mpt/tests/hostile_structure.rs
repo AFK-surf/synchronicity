@@ -5,6 +5,55 @@
 use synch_core::Hash;
 use synch_mpt::{node::hash_encoded, MemStore, Nibbles, NodeStore, Trie, TrieNode, ValueRef};
 
+#[test]
+fn shallow_shared_leaf_cannot_hide_invalid_deeper_reuse() {
+    let store = MemStore::new();
+    let limit = synch_core::MAX_KEY_LEN * 2;
+    let shared = put(
+        &store,
+        &TrieNode::Leaf {
+            key_rest: Nibbles::from_nibbles(&vec![5; limit - 1]),
+            value: ValueRef::Inline(vec![1]),
+        },
+    );
+    let other = put(
+        &store,
+        &TrieNode::Leaf {
+            key_rest: Nibbles::new(),
+            value: ValueRef::Inline(vec![2]),
+        },
+    );
+    let mut children = [None; 16];
+    children[0] = Some(shared);
+    children[1] = Some(other);
+    let nested = put(
+        &store,
+        &TrieNode::Branch {
+            children,
+            value: None,
+        },
+    );
+    let mut children = [None; 16];
+    children[15] = Some(shared); // Visited first, at a legal total key depth.
+    children[0] = Some(nested);
+    let root = put(
+        &store,
+        &TrieNode::Branch {
+            children,
+            value: None,
+        },
+    );
+    let mut walk = synch_mpt::MissingWalk::new(root);
+    let error = walk.next_batch(&Trie::new(&store), usize::MAX).unwrap_err();
+    assert!(
+        error
+            .to_string()
+            .contains(&format!("nibble depth {}", limit + 1)),
+        "{error}"
+    );
+    assert!(!walk.is_exhausted());
+}
+
 /// Stores a node under its own hash, the way a fetch commits a served node.
 fn put(store: &MemStore, node: &TrieNode) -> Hash {
     let encoded = node.encode();

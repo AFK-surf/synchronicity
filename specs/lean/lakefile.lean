@@ -4,16 +4,12 @@ open Lake DSL
 
 package synchronicity_specs where
   version := v!"0.1.0"
+  weakLeanArgs := #["-j1", "-M4096"]
 
-require mathlib from git
-  "https://github.com/leanprover-community/mathlib4" @ "v4.30.0"
+require synch_verified from "../../crates/synch-verified/lean"
 
+/-- Proofs about the executable Lean core: the same source Cargo compiles
+and links, checked here with warnings as errors. -/
 @[default_target]
 lean_lib Synchronicity where
   srcDir := "."
-
-/-- Dumps every `(anchor, declaration)` pair the `rust_impl` attribute
-recorded; `check-anchors.sh` diffs it against the Rust sources. -/
-lean_exe anchors where
-  root := `AnchorsDump
-  supportInterpreter := true

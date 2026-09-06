@@ -192,6 +192,26 @@ fn in_transaction() -> bool {
     reentry::active()
 }
 
+/// A synchronous connection lease, including its reentry guard. Owning the
+/// guard directly avoids self-referential transaction storage or lifetime casts.
+pub(crate) struct ConnectionLease<'a> {
+    conn: MutexGuard<'a, Connection>,
+    _scope: reentry::Scope,
+}
+
+impl std::fmt::Debug for ConnectionLease<'_> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ConnectionLease").finish_non_exhaustive()
+    }
+}
+
+impl std::ops::Deref for ConnectionLease<'_> {
+    type Target = Connection;
+    fn deref(&self) -> &Connection {
+        &self.conn
+    }
+}
+
 /// The node's metadata store.
 ///
 /// All writes funnel through one mutex-guarded connection, which is how the
@@ -205,16 +225,6 @@ pub struct Store {
     /// Whether complete out-of-line bytes are only cache until explicitly
     /// finalized into a remote backend.
     remote_cas: std::sync::atomic::AtomicBool,
-    /// Roots a full walk has established this store holds entirely.
-    ///
-    /// "Do I hold this whole trie?" is asked on every `Hello` (§5.1) and
-    /// answered by walking everything reachable — so without this a converged
-    /// cluster pays for the size of its metadata on every anti-entropy round,
-    /// on both sides, forever. A content-addressed root that was complete
-    /// stays complete, so the walk is owed once per root and not once per
-    /// exchange. Process-local and rebuilt on demand: losing it costs one
-    /// walk, never correctness.
-    complete_roots: Mutex<std::collections::HashSet<Hash>>,
     /// Objects a CAS write is currently between its first byte and its commit.
     ///
     /// The collector and the writers agree about *rows* through SQLite and did
@@ -239,22 +249,85 @@ pub struct Store {
     /// datadir, so independently opened Store values see the same fact; the
     /// lifecycle lock excludes a second process.
     cas_coord: Arc<CasCoord>,
-    /// A latch this crate's own tests use to stop a CAS write between its
-    /// bytes and its row — the window `writing` exists for. Absent from every
-    /// other build.
-    #[cfg(test)]
-    write_window: Mutex<Option<std::sync::Arc<WriteWindow>>>,
 }
 
-/// Process-wide CAS ordering shared by every `Store` opened on one datadir.
+/// Process-wide CAS ordering and trie certificates shared by every `Store`
+/// opened on one datadir.
 ///
 /// The lifecycle lock excludes other processes. This registry closes the
 /// smaller same-process hole: two independently opened Store values must still
-/// agree about writers and serialize lease registration against unlink.
+/// agree about writers and serialize lease registration against unlink, and
+/// invalidate each other's completeness certificates when boundaries dissolve.
 #[derive(Debug, Default)]
 struct CasCoord {
     order: Mutex<()>,
     writing: Mutex<HashMap<Hash, usize>>,
+    /// Canonical temporary paths protected from staging GC while an invocation
+    /// owns them. Creation/registration and collector check/unlink share this lock.
+    temporaries: Mutex<std::collections::HashSet<PathBuf>>,
+    completeness: Mutex<Completeness>,
+}
+
+/// Completeness answers avoid a full trie walk on every Hello. They remain
+/// valid only until a non-monotone mutation, including adding a formerly
+/// refused node to a provenance view. Lost certificates cost a fresh walk.
+#[derive(Debug, Default)]
+struct Completeness {
+    roots: std::collections::HashSet<Hash>,
+    generation: u64,
+    mutating: usize,
+}
+
+impl Completeness {
+    fn begin(&mut self, keep: &std::collections::HashSet<Hash>) {
+        // Never wrap the depth and accidentally enable certification. Each
+        // live mutation owns a guard, so this bound cannot be reached in memory.
+        self.mutating = self
+            .mutating
+            .checked_add(1)
+            .expect("too many memo mutations");
+        self.roots.retain(|root| keep.contains(root));
+        self.generation = self.generation.saturating_add(1);
+    }
+
+    fn finish(&mut self) {
+        if self.mutating != 0 {
+            self.generation = self.generation.saturating_add(1);
+            self.mutating -= 1;
+        }
+    }
+
+    fn contains(&self, root: &Hash) -> bool {
+        self.mutating == 0 && self.roots.contains(root)
+    }
+
+    fn certify(&mut self, root: &Hash, generation: u64) -> bool {
+        if self.mutating != 0 || self.generation != generation || generation == u64::MAX {
+            return false;
+        }
+        if self.roots.len() >= COMPLETE_ROOTS_MAX {
+            self.roots.clear();
+        }
+        self.roots.insert(*root);
+        true
+    }
+}
+
+/// Keeps certification disabled until the invalidating transaction has either
+/// committed or rolled back. Both edges advance the generation: a reader that
+/// starts during a transaction must not certify its pre-commit snapshot later.
+#[derive(Debug)]
+struct MemoMutation(Arc<CasCoord>);
+
+impl Drop for MemoMutation {
+    fn drop(&mut self) {
+        let mut memo = self
+            .0
+            .completeness
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner);
+        memo.finish();
+    }
 }
 
 fn cas_coord_for(data_dir: &Path) -> Arc<CasCoord> {
@@ -272,59 +345,6 @@ fn cas_coord_for(data_dir: &Path) -> Arc<CasCoord> {
     coord
 }
 
-/// A pause a test can install inside a CAS write, at the instant the payload is
-/// on disk and no row yet claims it.
-///
-/// The window `writing` exists to protect is real but short — a rename, an
-/// fsync and a row — and on a platform whose `fsync` returns before the disk
-/// does it is about a millisecond. A collector thread spinning to catch it
-/// therefore catches it on most machines and not on a loaded one, which is how
-/// `an_ingest_that_recreates_a_collectable_object_keeps_its_bytes` came to fail
-/// on a macOS runner while passing everywhere else. Holding the window open
-/// from inside the writer makes the collector's observation a fact rather than
-/// a race, and leaves the property under test unchanged.
-#[cfg(test)]
-#[derive(Debug, Default)]
-pub(crate) struct WriteWindow {
-    /// `(the writer is inside the window, the observer is done with it)`.
-    state: Mutex<(bool, bool)>,
-    changed: std::sync::Condvar,
-}
-
-#[cfg(test)]
-impl WriteWindow {
-    /// Called by the writer: announces the window and blocks until released.
-    fn hold(&self) {
-        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        state.0 = true;
-        self.changed.notify_all();
-        while !state.1 {
-            state = self
-                .changed
-                .wait(state)
-                .unwrap_or_else(PoisonError::into_inner);
-        }
-    }
-
-    /// Called by the observer: blocks until a writer is inside the window.
-    pub(crate) fn wait_entered(&self) {
-        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        while !state.0 {
-            state = self
-                .changed
-                .wait(state)
-                .unwrap_or_else(PoisonError::into_inner);
-        }
-    }
-
-    /// Called by the observer: lets the writer out of the window.
-    pub(crate) fn release(&self) {
-        let mut state = self.state.lock().unwrap_or_else(PoisonError::into_inner);
-        state.1 = true;
-        self.changed.notify_all();
-    }
-}
-
 /// Marks an object as being written, until dropped.
 ///
 /// A count rather than a flag: two fetches of one root — replica acquisition and a
@@ -338,7 +358,6 @@ pub(crate) struct WriteLease<'a> {
 
 impl Drop for WriteLease<'_> {
     fn drop(&mut self) {
-        // LEAN-MODEL: cas-write-lease-end (Cas.WriteAbort)
         // `Cas.WriteAbort` also covers the successful lease end: the
         // protection disappears only after the writer has stopped touching bytes.
         let mut writing = self.store.writing();
@@ -411,10 +430,7 @@ impl Store {
             conn: Mutex::new(conn),
             data_dir,
             remote_cas: std::sync::atomic::AtomicBool::new(false),
-            complete_roots: Mutex::new(std::collections::HashSet::new()),
             cas_coord,
-            #[cfg(test)]
-            write_window: Mutex::new(None),
         };
         store.init(options)?;
         // WAL/SHM sidecars are created by `init` (WAL mode); tighten them too.
@@ -494,6 +510,16 @@ impl Store {
         self.conn.lock().unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// Lease the raw connection for one statement or an explicitly requested
+    /// transaction. Dropping it releases both the mutex and reentry scope.
+    pub(crate) fn connection_lease(&self) -> ConnectionLease<'_> {
+        let conn = self.conn();
+        ConnectionLease {
+            conn,
+            _scope: reentry::Scope::enter(),
+        }
+    }
+
     /// Runs `f` against the raw transaction handle, committing on `Ok`.
     ///
     /// The store's own multi-statement writes use this; callers outside the
@@ -538,6 +564,14 @@ impl Store {
         Ok(out)
     }
 
+    /// Keep a synchronous host interpreter's connection and reentry guard on
+    /// this stack. The interpreter's Lean program owns transaction commands.
+    pub(crate) fn with_connection_scope<T>(&self, f: impl FnOnce(&rusqlite::Connection) -> T) -> T {
+        let conn = self.conn();
+        let _scope = reentry::Scope::enter();
+        f(&conn)
+    }
+
     /// Runs `f` inside a single SQLite transaction, committing on `Ok` and
     /// rolling the whole thing back on `Err`.
     ///
@@ -572,6 +606,9 @@ impl Store {
     {
         let mut conn = self.conn();
         let _scope = reentry::Scope::enter();
+        // Declared before `tx`, so rollback precedes releasing the guard even
+        // on an error or panic.
+        let invalidation = std::cell::RefCell::new(None);
         let tx = conn
             .transaction_with_behavior(rusqlite::TransactionBehavior::Immediate)
             .map_err(StoreError::from)?;
@@ -580,6 +617,7 @@ impl Store {
         let out = f(&Txn {
             tx: &tx,
             store: self,
+            invalidation: &invalidation,
         })?;
         tx.commit().map_err(StoreError::from)?;
         Ok(out)
@@ -796,9 +834,28 @@ impl Store {
 pub struct Txn<'a> {
     tx: &'a rusqlite::Transaction<'a>,
     store: &'a Store,
+    invalidation: &'a std::cell::RefCell<Option<MemoMutation>>,
 }
 
 impl Txn<'_> {
+    /// Invalidates walks before a non-monotone trie mutation becomes visible.
+    pub(crate) fn invalidate_completeness(&self) {
+        self.invalidate_completeness_preserving(&std::collections::HashSet::new());
+    }
+
+    /// GC may retain certificates whose roots its snapshot marks in full.
+    pub(crate) fn invalidate_completeness_preserving(
+        &self,
+        keep: &std::collections::HashSet<Hash>,
+    ) {
+        let mut guard = self.invalidation.borrow_mut();
+        if guard.is_none() {
+            let mut memo = self.store.completeness();
+            memo.begin(keep);
+            *guard = Some(MemoMutation(self.store.cas_coord.clone()));
+        }
+    }
+
     /// The underlying connection, for the store's own statement helpers.
     pub(crate) fn conn(&self) -> &Connection {
         self.tx
@@ -982,12 +1039,24 @@ impl NodeStore for Txn<'_> {
         Ok(())
     }
 
+    fn completeness_generation(&self) -> Result<u64> {
+        self.store.completeness_generation()
+    }
+
+    fn note_complete_at(&self, _root: &Hash, generation: u64) -> Result<bool> {
+        // A transaction may verify its own writes, but never memoizes them.
+        Ok(generation == self.completeness_generation()?)
+    }
+
     fn get_node(&self, hash: &Hash) -> Result<Option<Vec<u8>>> {
         get_node_in(self.conn(), hash)
     }
 
     fn put_node(&self, hash: &Hash, data: &[u8]) -> Result<()> {
-        put_node_forgetting_memos(self.store, self.conn(), hash, data)
+        if !has_node_in(self.conn(), hash)? && is_redacted_in(self.conn(), hash, None)? {
+            self.invalidate_completeness();
+        }
+        put_node_in(self.conn(), hash, data).map(|_| ())
     }
 
     fn get_value(&self, hash: &Hash) -> Result<Option<Vec<u8>>> {
@@ -1019,6 +1088,9 @@ impl NodeStore for Txn<'_> {
     }
 
     fn note_owned(&self, origin: &OriginId, hash: &Hash) -> Result<()> {
+        if !owns_node_in(self.conn(), origin, hash)? && is_redacted_in(self.conn(), hash, None)? {
+            self.invalidate_completeness();
+        }
         note_owned_in(self.conn(), origin, hash)
     }
 }
@@ -1117,7 +1189,7 @@ impl NodeStore for Store {
     }
 
     fn put_node(&self, hash: &Hash, data: &[u8]) -> Result<()> {
-        put_node_forgetting_memos(self, &self.conn(), hash, data)
+        self.transaction(|txn| txn.put_node(hash, data))
     }
 
     fn get_value(&self, hash: &Hash) -> Result<Option<Vec<u8>>> {
@@ -1137,16 +1209,22 @@ impl NodeStore for Store {
     }
 
     fn is_known_complete(&self, root: &Hash) -> Result<bool> {
-        Ok(self.complete_roots().contains(root))
+        let memo = self.completeness();
+        Ok(memo.contains(root))
     }
 
     fn note_complete(&self, root: &Hash) -> Result<()> {
-        let mut roots = self.complete_roots();
-        if roots.len() >= COMPLETE_ROOTS_MAX {
-            roots.clear();
-        }
-        roots.insert(*root);
+        self.note_complete_at(root, self.completeness_generation()?)?;
         Ok(())
+    }
+
+    fn completeness_generation(&self) -> Result<u64> {
+        Ok(self.completeness().generation)
+    }
+
+    fn note_complete_at(&self, root: &Hash, generation: u64) -> Result<bool> {
+        let mut memo = self.completeness();
+        Ok(memo.certify(root, generation))
     }
 
     /// Redaction is durable, unlike the completeness memo above.
@@ -1171,13 +1249,21 @@ impl NodeStore for Store {
     }
 
     fn note_owned(&self, origin: &OriginId, hash: &Hash) -> Result<()> {
-        note_owned_in(&self.conn(), origin, hash)
+        self.transaction(|txn| txn.note_owned(origin, hash))
     }
 }
 
 impl Store {
-    fn complete_roots(&self) -> MutexGuard<'_, std::collections::HashSet<Hash>> {
-        self.complete_roots
+    pub(crate) fn active_temporaries(&self) -> MutexGuard<'_, std::collections::HashSet<PathBuf>> {
+        self.cas_coord
+            .temporaries
+            .lock()
+            .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    fn completeness(&self) -> MutexGuard<'_, Completeness> {
+        self.cas_coord
+            .completeness
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
     }
@@ -1211,7 +1297,6 @@ impl Store {
     /// a payload into place before that unlink, even when writer and sweep use
     /// independently opened Store values.
     pub(crate) fn lease_write(&self, root: &Hash) -> WriteLease<'_> {
-        // LEAN-MODEL: cas-write-lease-begin (Cas.BeginWrite)
         // `Cas.BeginWrite` models this ordered guard acquisition plus the
         // insertion into `writing`; neither half may move past the other.
         let _ordered_against_the_sweeps = self.conn();
@@ -1231,46 +1316,9 @@ impl Store {
         self.writing().contains_key(root)
     }
 
-    /// Installs the pause described by [`WriteWindow`].
-    #[cfg(test)]
-    pub(crate) fn set_write_window(&self, window: std::sync::Arc<WriteWindow>) {
-        *self
-            .write_window
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner) = Some(window);
-    }
-
-    /// Stops a CAS writer inside its window, if a test asked for it. Compiled
-    /// away — and never called — outside this crate's own tests.
-    #[cfg(test)]
-    pub(crate) fn pause_in_write_window(&self) {
-        // Cloned out from under the lock: the pause blocks until an observer
-        // releases it, and that observer needs the store.
-        let window = self
-            .write_window
-            .lock()
-            .unwrap_or_else(PoisonError::into_inner)
-            .clone();
-        if let Some(window) = window {
-            window.hold();
-        }
-    }
-
-    #[cfg(not(test))]
-    pub(crate) fn pause_in_write_window(&self) {}
-
-    /// Keeps only the memo entries for roots still in the retained set.
-    ///
-    /// A sweep takes the nodes of every root it did not mark from, so a memo
-    /// entry for one of those becomes a standing lie: `Hello` would go on
-    /// advertising a trie this node can no longer serve. Dropping the whole
-    /// memo is the safe version of that — but the memo is exactly the answer
-    /// §5.1 exists to avoid recomputing on every exchange, and GC runs every
-    /// five minutes against a thirty-second anti-entropy interval, so clearing
-    /// it wholesale gives the cost back on roughly one round in ten, forever.
-    /// Retaining the marked roots keeps the optimization and the honesty.
-    pub(crate) fn retain_complete_roots(&self, keep: &std::collections::HashSet<Hash>) {
-        self.complete_roots().retain(|root| keep.contains(root));
+    /// Raw registry observation for a caller holding the CAS ordering session.
+    pub(crate) fn writer_count(&self, root: &Hash) -> usize {
+        self.writing().get(root).copied().unwrap_or(0)
     }
 }
 
@@ -1294,33 +1342,6 @@ fn put_node_in(conn: &Connection, hash: &Hash, data: &[u8]) -> Result<bool> {
         params![hash.as_bytes().to_vec(), data],
     )?;
     Ok(inserted > 0)
-}
-
-/// Stores a node and, if a peer ever refused that hash at some position,
-/// forgets every completeness memo.
-///
-/// A refused position is a boundary only while the node is absent
-/// (`MissingWalk::next_batch` expands a held node wherever it meets it, so a
-/// hash refused at one position and later served at another — the same
-/// subtree standing outside a grant in one trie and inside it in another —
-/// dissolves the boundary). A root memoized complete over that boundary may
-/// then reach positions below it that were never fetched, so the memo is no
-/// longer the walk's answer. The window is short (the second fetch drains the
-/// subtree) and the memo is process-local, but a stale answer picks a reference
-/// root that `prune_sound` does not cover, so it is dropped here rather than
-/// trusted. The Lean model has no step for this `put_node`
-/// (`TrieGraph.LearnNode` takes only a hash no position refused); dropping the
-/// memo is what keeps `MptGc.State.complete` the walk's answer either way.
-fn put_node_forgetting_memos(
-    store: &Store,
-    conn: &Connection,
-    hash: &Hash,
-    data: &[u8],
-) -> Result<()> {
-    if put_node_in(conn, hash, data)? && is_redacted_in(conn, hash, None)? {
-        store.complete_roots().clear();
-    }
-    Ok(())
 }
 
 fn get_value_in(conn: &Connection, hash: &Hash) -> Result<Option<Vec<u8>>> {
@@ -1434,6 +1455,66 @@ mod tests {
     use crate::testutil;
     use rusqlite::OptionalExtension;
     use synch_mpt::Trie;
+
+    #[test]
+    fn completeness_nested_mutations_hide_and_intersect_retained_roots() {
+        let a = Hash::new(b"a");
+        let b = Hash::new(b"b");
+        let mut memo = Completeness::default();
+        assert!(memo.certify(&a, 0));
+        assert!(memo.certify(&b, 0));
+        memo.begin(&[a, b].into_iter().collect());
+        assert!(!memo.contains(&a));
+        assert!(!memo.certify(&a, 1));
+        memo.begin(&[a].into_iter().collect());
+        assert_eq!(memo.generation, 2);
+        memo.finish();
+        assert_eq!(memo.generation, 3);
+        assert!(!memo.contains(&a));
+        assert!(!memo.certify(&a, 3));
+        memo.finish();
+        assert_eq!(memo.generation, 4);
+        assert!(memo.contains(&a));
+        assert!(!memo.contains(&b));
+        assert!(!memo.certify(&b, 0));
+        assert!(memo.certify(&b, 4));
+        memo.finish();
+        assert_eq!(memo.generation, 4);
+    }
+
+    #[test]
+    fn completeness_terminal_epoch_never_certifies() {
+        let root = Hash::new(b"retained");
+        let mut memo = Completeness {
+            generation: u64::MAX - 1,
+            ..Completeness::default()
+        };
+        assert!(memo.certify(&root, u64::MAX - 1));
+        memo.begin(&[root].into_iter().collect());
+        memo.finish();
+        assert_eq!(memo.generation, u64::MAX);
+        // Existing retained certificates remain readable; no new walk can
+        // certify against a saturated ticket, even after another mutation.
+        assert!(memo.contains(&root));
+        assert!(!memo.certify(&root, u64::MAX));
+        memo.begin(&Default::default());
+        memo.finish();
+        assert!(!memo.contains(&root));
+        assert!(!memo.certify(&root, u64::MAX));
+    }
+
+    #[test]
+    fn completeness_capacity_clears_before_even_duplicate_certification() {
+        let mut memo = Completeness::default();
+        for index in 0..COMPLETE_ROOTS_MAX {
+            assert!(memo.certify(&Hash::new(&index.to_le_bytes()), 0));
+        }
+        assert_eq!(memo.roots.len(), COMPLETE_ROOTS_MAX);
+        let root = Hash::new(&0usize.to_le_bytes());
+        assert!(memo.certify(&root, 0));
+        assert_eq!(memo.roots.len(), 1);
+        assert!(memo.contains(&root));
+    }
 
     /// The config surface round-trips through a reopen, appends never rewrite
     /// what is already there (§9.4), and the self-origin is one config key

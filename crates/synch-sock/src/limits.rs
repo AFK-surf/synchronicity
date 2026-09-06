@@ -123,7 +123,7 @@ pub(crate) const MAX_LABELS: usize = 8;
 /// the runtime performs. That matters twice: `Duration::as_nanos()` for a
 /// window of `2^58` ms is a multiple of `2^64`, which truncates to zero in
 /// the limiter's `as u64` and would divide by zero; and `Instant + Duration`
-/// overflows on the nanosecond-repr platforms (macOS, OpenBSD) for values
+/// overflows on the nanosecond-repr platforms (macOS) for values
 /// near `u64::MAX` ms. `u32::MAX` ms is ~49.7 days — long enough that the
 /// clamp is indistinguishable from the program's intent.
 pub(crate) const MAX_GUEST_DURATION_MS: u64 = u32::MAX as u64;

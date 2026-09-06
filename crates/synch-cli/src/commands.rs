@@ -367,7 +367,7 @@ fn inspect_socket(file: &Path) -> Result<()> {
 
 /// The load half of inspection, where this build has a runtime.
 #[cfg(all(
-    any(target_os = "linux", target_os = "macos", target_os = "openbsd"),
+    any(target_os = "linux", target_os = "macos"),
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 fn validate_inspected(bytes: &[u8], declared: &synch_core::Declaration) -> Result<()> {
@@ -378,7 +378,7 @@ fn validate_inspected(bytes: &[u8], declared: &synch_core::Declaration) -> Resul
 
 /// The same check where it cannot run: the portable facts still hold.
 #[cfg(not(all(
-    any(target_os = "linux", target_os = "macos", target_os = "openbsd"),
+    any(target_os = "linux", target_os = "macos"),
     any(target_arch = "x86_64", target_arch = "aarch64")
 )))]
 fn validate_inspected(bytes: &[u8], _declared: &synch_core::Declaration) -> Result<()> {

@@ -669,7 +669,6 @@ impl Store {
             txn.conn()
                 .execute("DELETE FROM sources WHERE space = ?1", params![space])?;
             let holder = crate::PinHolder::Source(space.to_string()).render();
-            // LEAN-MODEL: cas-remove-source-role (Cas.RemoveRole)
             // `Cas.RemoveRole` is this pair of deletes under `Unpin`'s and
             // `DropWant`'s own guard: a hold or a repair intent behind an
             // entry the tree still names survives the role. The engine
@@ -775,7 +774,6 @@ impl Store {
                     params![holder.clone(), now],
                 )?;
             }
-            // LEAN-MODEL: cas-remove-replica-role (Cas.RetireRole)
             // `Cas.RetireRole` is this transaction: the holder ceases, so the
             // leaves it stood behind are no longer any role's and its pins
             // and wants go whatever the tree still names. Unlike
@@ -1182,6 +1180,8 @@ impl Txn<'_> {
         // building the whole resolved set first meant holding every changed
         // value in memory at once — inside the transaction the head flip runs
         // in (`Trie::for_each_resolved_change_scoped`).
+        // The functional delta's contract is proved by `applyDiff_exact`;
+        // decoding and this structural walk are the implementation boundary.
         Trie::new(self).for_each_resolved_change_scoped(old_root, new_root, &scope, |change| {
             apply_change(self.conn(), origin, &change, now, release_now, &replicas)
         })
@@ -1493,10 +1493,6 @@ fn apply_change(
         };
         match change.kind {
             ChangeKind::Deleted => {
-                // LEAN-MODEL: mpt-materialize-remove-source (Cas.RemoveSource)
-                // LEAN-MODEL: mpt-materialize-remove-replica (Cas.RemoveReplica)
-                // LEAN-MODEL: mpt-materialize-remove-ordinary (Cas.RemoveOrdinary)
-                // LEAN-MODEL: mpt-materialize-drop-entry (Cas.DropEntry)
                 // A deleted leaf leaves the derived views: the leaf of whatever
                 // kind this origin held, and the entry row once no leaf names
                 // the content.

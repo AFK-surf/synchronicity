@@ -13,6 +13,84 @@ use synch_store::{Slot, StoreError};
 mod common;
 use common::wire::{connect, connect_blob, trust as trust_static, WireNode};
 
+#[tokio::test]
+async fn a_spine_branch_exposes_its_children_but_not_its_own_payload() {
+    use synch_mpt::{Nibbles, NodeStore, TrieNode};
+    let issuer = WireNode::spawn(Some("nas")).await;
+    let delegate = WireNode::spawn(None).await;
+    trust_static(&delegate.store, &issuer.origin, &issuer.key());
+    let private_key = synch_core::space_info_key("photos").unwrap();
+    let public_key = synch_core::space_info_key("photos-raw").unwrap();
+    let private = postcard::to_stdvec(&synch_core::SpaceInfo {
+        v: synch_core::RECORD_VERSION,
+        description: "private".repeat(synch_core::INLINE_VALUE_MAX),
+        entry_count: 9,
+    })
+    .unwrap();
+    let public = postcard::to_stdvec(&synch_core::SpaceInfo {
+        v: synch_core::RECORD_VERSION,
+        description: "public".into(),
+        entry_count: 1,
+    })
+    .unwrap();
+    issuer.publish(
+        1,
+        &[],
+        &[
+            delegation(&delegate.key(), &["photos-raw"]),
+            (private_key.clone(), private.clone()),
+            (public_key.clone(), public.clone()),
+        ],
+    );
+    let root = issuer.root();
+    let path = Nibbles::from_bytes(&private_key).as_slice().to_vec();
+    let carrier = Trie::new(issuer.store.as_ref())
+        .resolve_paths(root, std::slice::from_ref(&path))
+        .unwrap()[0]
+        .unwrap();
+    assert!(matches!(
+        TrieNode::decode(&issuer.store.get_node(&carrier).unwrap().unwrap()).unwrap(),
+        TrieNode::Branch {
+            value: Some(synch_mpt::ValueRef::Hash(_)),
+            ..
+        }
+    ));
+    let hash = Hash::new(&private);
+    let client = connect(&delegate, &issuer).await;
+    let node = client
+        .get_nodes(root, &[(path.clone(), carrier)])
+        .await
+        .unwrap();
+    assert_eq!(node.nodes.len(), 1, "the spine remains traversable");
+    let values = client.get_values(root, &[(path, hash)]).await.unwrap();
+    assert!(
+        values.values.is_empty(),
+        "the branch's own key is outside the grant"
+    );
+    assert_eq!(values.missing, vec![hash]);
+    Syncer::new(delegate.store.clone())
+        .sync_with(&client)
+        .await
+        .unwrap();
+    assert_eq!(
+        delegate
+            .store
+            .complete_head(&issuer.origin)
+            .unwrap()
+            .unwrap()
+            .root,
+        root
+    );
+    assert!(!delegate.store.has_value(&hash).unwrap());
+    assert_eq!(
+        Trie::new(delegate.store.as_ref())
+            .get(root, &public_key)
+            .unwrap(),
+        Some(public)
+    );
+    common::wire::shutdown_all(&[&issuer, &delegate]).await;
+}
+
 /// The `d:` record an issuer publishes to delegate `subject` (§3.5).
 fn delegation(subject: &NodeId, spaces: &[&str]) -> (Vec<u8>, Vec<u8>) {
     let record = Delegation {

@@ -1155,12 +1155,13 @@ origin, and an origin cannot serve what it never held: the grafted head is asked
 for its subtree, told `missing`, and abandoned, on every member. Rooted origins are
 judged by presence alone, as before, and a node's own trie by construction. The
 cost is one row per node per confined origin, and one re-fetch of the nodes a
-confined origin's trie shares with another's. `specs/lean/Synchronicity/Provenance.lean`
-is the model: `Legit` is what "legitimately a reader's" means across every trie a
-node may be read through, and `privacy` and `integrity` are the theorem — a
-confined participant holds only what is legitimately its, and a member vouches
-for a confined origin's head only if every node under it is legitimately that
-origin's; `withheld_root_incomplete` is this graft excluded, for any trie.
+confined origin's trie shares with another's. The invariant this maintains: a
+confined participant holds only what is legitimately its — served under one of
+its origins' roots by a peer that vouches for it, through every trie the node
+may be read through — and a member vouches for a confined origin's head only if
+every node under it is legitimately that origin's, so the graft above is
+excluded for any trie. That invariant is a design statement checked by the
+delegate regression tests, not a Lean theorem.
 
 ## 6. Content storage and transfer
 

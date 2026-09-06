@@ -5983,6 +5983,7 @@ dependencies = [
  "proptest",
  "serde",
  "synch-core",
+ "synch-verified",
  "thiserror 2.0.20",
 ]
 
@@ -6090,11 +6091,20 @@ dependencies = [
  "serde",
  "synch-core",
  "synch-mpt",
+ "synch-verified",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
  "tracing",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "synch-verified"
+version = "0.1.8"
+dependencies = [
+ "cc",
+ "proptest",
 ]
 
 [[package]]

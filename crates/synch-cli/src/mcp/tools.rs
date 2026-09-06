@@ -1686,7 +1686,7 @@ async fn socket_inspect(args: &Value) -> Result<Outcome, ToolError> {
 
 /// The load half of inspection, where this build has a runtime.
 #[cfg(all(
-    any(target_os = "linux", target_os = "macos", target_os = "openbsd"),
+    any(target_os = "linux", target_os = "macos"),
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 fn inspect_loads(bytes: &[u8], declared: &synch_core::Declaration) -> Result<Option<bool>, String> {
@@ -1696,7 +1696,7 @@ fn inspect_loads(bytes: &[u8], declared: &synch_core::Declaration) -> Result<Opt
 
 /// The portable half where it cannot: the stream section is still checkable.
 #[cfg(not(all(
-    any(target_os = "linux", target_os = "macos", target_os = "openbsd"),
+    any(target_os = "linux", target_os = "macos"),
     any(target_arch = "x86_64", target_arch = "aarch64")
 )))]
 fn inspect_loads(

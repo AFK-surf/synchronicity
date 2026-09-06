@@ -51,71 +51,61 @@ impl Store {
     /// `fetch_pending` commits one batch per transaction and `reachable`
     /// silently skips missing children.
     pub(crate) fn gc_trie(&self) -> Result<GcStats> {
-        // LEAN-MODEL: mpt-trie-gc (MptGc.TrieGc)
         // `MptGc.TrieGc` models this whole immediate transaction, not its
         // individual reads and deletes; splitting it invalidates the theorem.
         let mut stats = GcStats::default();
-        let (swept_nodes, swept_values, roots) =
-            self.transaction(|txn| -> Result<(usize, usize, Vec<Hash>)> {
-                let conn = txn.conn();
-                let roots = retained_roots_in(conn)?;
-                stats.roots_marked = roots.len();
-                // One accumulating mark set across every retained root, not one
-                // walk per root. Successive roots of an origin share all but
-                // the path that changed, so walking each into its own set would
-                // cost a store read per node *per root* — and `head_history`
-                // holds a row per publish for `root_retention`, so that
-                // multiplier is in the thousands for a node that publishes
-                // steadily. All of it inside the immediate transaction below,
-                // which holds the one write connection.
-                // LEAN-MODEL: mpt-trie-mark-sweep (TrieGraph.GcSweep)
-                // `TrieGraph.GcSweep` states the graph-level obligation: every
-                // stored node reachable from any retained root is in the mark set.
-                let trie = Trie::new(txn);
-                let mut marked = synch_mpt::Reachable::default();
-                for root in &roots {
-                    trie.reach_into(*root, &mut marked)?;
-                }
-                let (nodes, values) = (marked.nodes, marked.values);
-                // Deleted set-wise rather than row by row: pulling every hash
-                // into a `Vec` and issuing one `DELETE ... WHERE hash = ?` per
-                // unreferenced row is, on a large store, millions of statements
-                // under the write lock.
-                let n = sweep_unmarked(conn, "trie_nodes", &nodes)?;
-                // Provenance rows name nodes; a row for a swept node would
-                // vouch, for the next trie to carry that hash, for a node this
-                // store no longer holds as anyone's.
-                sweep_unmarked(conn, "trie_node_origins", &nodes)?;
-                let v = sweep_unmarked(conn, "trie_values", &values)?;
-                Ok((n, v, roots))
+        let scope = self.local_trie_scope()?;
+        let (swept_nodes, swept_values) = self.transaction(|txn| -> Result<(usize, usize)> {
+            let conn = txn.conn();
+            let roots = retained_roots_in(conn)?;
+            stats.roots_marked = roots.len();
+            // One accumulating mark set across every retained root, not one
+            // walk per root. Successive roots of an origin share all but
+            // the path that changed, so walking each into its own set would
+            // cost a store read per node *per root* — and `head_history`
+            // holds a row per publish for `root_retention`, so that
+            // multiplier is in the thousands for a node that publishes
+            // steadily. All of it inside the immediate transaction below,
+            // which holds the one write connection.
+            // `TrieGraph.GcSweep` states the graph-level obligation: every
+            // stored node reachable from any retained root is in the mark set.
+            let trie = Trie::new(txn);
+            let mut marked = synch_mpt::Reachable::default();
+            for root in &roots {
+                trie.reach_into(*root, &mut marked)?;
+            }
+            let (nodes, values) = (marked.nodes, marked.values);
+            // Keep certificates only for roots marked by this very
+            // snapshot. The generation still advances to reject walks
+            // that started before the sweep, including pruned fetches.
+            let mut keep: HashSet<Hash> = roots.iter().copied().collect();
+            keep.extend(roots.iter().map(|root| scope.memo_key(*root)));
+            let mut stmt = conn.prepare("SELECT DISTINCT origin_id, root FROM head_history")?;
+            let rows = stmt.query_map([], |row| {
+                Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
             })?;
+            for row in rows {
+                let (origin, root) = row?;
+                let origin = crate::db::origin_column(origin, "head_history.origin_id")?;
+                let root = hash_column(root, "head_history.root")?;
+                keep.insert(scope.memo_key_for(Some(&origin), root));
+                keep.insert(Scope::full().memo_key_for(Some(&origin), root));
+            }
+            txn.invalidate_completeness_preserving(&keep);
+            // Deleted set-wise rather than row by row: pulling every hash
+            // into a `Vec` and issuing one `DELETE ... WHERE hash = ?` per
+            // unreferenced row is, on a large store, millions of statements
+            // under the write lock.
+            let n = sweep_unmarked(conn, "trie_nodes", &nodes)?;
+            // Provenance rows name nodes; a row for a swept node would
+            // vouch, for the next trie to carry that hash, for a node this
+            // store no longer holds as anyone's.
+            sweep_unmarked(conn, "trie_node_origins", &nodes)?;
+            let v = sweep_unmarked(conn, "trie_values", &values)?;
+            Ok((n, v))
+        })?;
         stats.nodes = swept_nodes;
         stats.values = swept_values;
-        // The memo may only vouch for roots the sweep just marked from. A root
-        // that fell out of the retained set has had its nodes taken, and a memo
-        // entry for it would be a standing lie about what this node can serve —
-        // but dropping the *whole* memo would throw away the answer §5.1
-        // exists to avoid recomputing on every `Hello`.
-        //
-        // A scoped answer is memoized under `Scope::memo_key`, not under the
-        // bare root, so retaining the roots alone dropped every one of them on
-        // every pass — a delegate re-walked its whole in-scope trie after each
-        // five-minute cycle, which is exactly the cost this retention exists
-        // to avoid. Both spellings of a retained root are kept.
-        //
-        // The third spelling is the provenance one: a confined origin's root
-        // is memoized under `Scope::memo_key_for(Some(origin), root)`, and
-        // that answer is kept with the root too.
-        let scope = self.local_trie_scope()?;
-        let mut keep: std::collections::HashSet<Hash> = roots.iter().copied().collect();
-        if !scope.is_full() {
-            keep.extend(roots.iter().map(|root| scope.memo_key(*root)));
-        }
-        for (origin, root) in self.retained_roots_with_origins()? {
-            keep.insert(scope.memo_key_for(Some(&origin), root));
-            keep.insert(Scope::full().memo_key_for(Some(&origin), root));
-        }
-        self.retain_complete_roots(&keep);
         Ok(stats)
     }
 
@@ -139,7 +129,6 @@ impl Store {
     /// collected, without it it is. Every write path stamps the column, which
     /// is all this needs.
     pub fn gc_content(&self, before: i64) -> Result<GcStats> {
-        // LEAN-MODEL: cas-retention-elapses (Cas.Age)
         // `Cas.Age` abstracts crossing this `before` horizon; it grants no
         // permission by itself, only removes the freshness guard.
         let referenced = self.referenced_content()?;
@@ -262,9 +251,10 @@ impl Store {
     /// than [`INLINE_BLOB_MAX`](synch_core::INLINE_BLOB_MAX) by construction,
     /// since smaller files never take this path.
     ///
-    /// Age is the same horizon the rest of GC uses, read off the file's own
-    /// mtime: an ingest in progress is writing to it, so it is younger than the
-    /// window and stays. Files written by an older build, which staged into the
+    /// Invocation-owned temporaries are excluded by the shared live registry,
+    /// even if an in-progress operation has been idle past the age horizon.
+    /// Unregistered files use the same mtime horizon as the rest of GC. Files
+    /// written by an older build, which staged into the
     /// CAS root under an `incoming-` name, are taken from there as well —
     /// nothing else would.
     ///
@@ -273,7 +263,20 @@ impl Store {
         // The staging directory holds staging files and nothing else, so every
         // stale file in it goes; the CAS root holds shard directories, so only
         // the names an older build staged there do.
-        let mut swept = sweep_stale_files(&self.staging_dir(), before, &|_| true)?;
+        // Keep the lock through unlink, not merely the exclusion check: an
+        // invocation creates and registers its temporary under this same lock.
+        // Canonical keys also cover independently opened Store path aliases.
+        // The lock covers only the staging sweep: the legacy CAS-root sweep
+        // never consults the registry, and holding the process-wide lock
+        // across its listing would stall every concurrent ingest's
+        // temporary creation for the length of a shard scan.
+        let mut swept = {
+            let active = self.active_temporaries();
+            sweep_stale_files(&self.staging_dir(), before, &|path| {
+                path.canonicalize()
+                    .map_or(true, |key| !active.contains(&key))
+            })?
+        };
         swept += sweep_stale_files(&self.cas_dir(), before, &is_legacy_staging)?;
         Ok(swept)
     }
@@ -446,27 +449,6 @@ fn mtime_nanos(meta: &std::fs::Metadata) -> Option<i64> {
 /// remove a row a slot still names, so every current head's root is here by
 /// construction. The union returned the same set — but stating the mark set
 /// twice, in two places, is how the two come to disagree.
-impl Store {
-    /// Every `(origin, root)` pair in the retained history: the roots GC marks
-    /// from, with whose tries they are.
-    fn retained_roots_with_origins(&self) -> Result<Vec<(synch_core::OriginId, Hash)>> {
-        let conn = self.conn();
-        let mut stmt = conn.prepare("SELECT DISTINCT origin_id, root FROM head_history")?;
-        let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
-        })?;
-        let mut out = Vec::new();
-        for row in rows {
-            let (origin, root) = row?;
-            out.push((
-                crate::db::origin_column(origin, "head_history.origin_id")?,
-                hash_column(root, "head_history.root")?,
-            ));
-        }
-        Ok(out)
-    }
-}
-
 pub(crate) fn retained_roots_in(conn: &rusqlite::Connection) -> Result<Vec<Hash>> {
     let mut stmt = conn.prepare("SELECT DISTINCT root FROM head_history")?;
     let rows = stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))?;

@@ -10,6 +10,20 @@ pub mod db;
 pub mod error;
 pub mod gc;
 pub mod heads;
+mod lean_diagnostics;
+mod lean_history;
+mod lean_ingest;
+#[cfg(test)]
+mod lean_ingest_concurrency;
+#[cfg(all(test, target_os = "linux"))]
+mod lean_ingest_memory;
+#[cfg(test)]
+mod lean_ingest_metadata;
+#[cfg(all(test, unix))]
+mod lean_ingest_streams;
+mod lean_read;
+mod lean_resources;
+mod lean_storage;
 pub mod proof;
 pub mod recovery;
 pub mod replica;

@@ -25,6 +25,7 @@ rusqlite.workspace = true
 serde.workspace = true
 synch-core.workspace = true
 synch-mpt.workspace = true
+synch-verified.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true

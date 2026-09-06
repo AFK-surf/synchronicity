@@ -79,7 +79,14 @@ impl<S: NodeStore + ?Sized> Trie<'_, S> {
         }
         let a = self.cursor_at(root_opt(old_root))?;
         let b = self.cursor_at(root_opt(new_root))?;
-        self.diff_walk(a, b, scope, &mut emit)
+        self.diff_walk(a, b, scope, &mut |change| {
+            // Traversing a grant's spine does not grant its branch value.
+            // Filter before resolving payloads during materialization.
+            if scope.admits_key_path(Nibbles::from_bytes(&change.key).as_slice()) {
+                emit(change)?;
+            }
+            Ok(())
+        })
     }
 
     /// Walks both tries in lockstep ([`Trie::descend`]), which is what holds
@@ -103,7 +110,6 @@ impl<S: NodeStore + ?Sized> Trie<'_, S> {
             // holds nothing this node was sent, so descending it would fail on
             // an absence that is the design working. Tested before the cursors
             // are taken, since taking them reads the absent node (§5.5).
-            // LEAN-MODEL: mpt-diff-scoped (ScopedSync.DiffReach)
             // `ScopedSync.DiffReach`; `diff_never_misses` is why, over a root
             // complete within the scope, this walk reads no absent node.
             if !scope.admits_path(path) {

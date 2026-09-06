@@ -221,7 +221,7 @@ async fn an_activated_path_with_nothing_published_resolves_to_nothing() {
 }
 
 #[cfg(all(
-    any(target_os = "linux", target_os = "macos", target_os = "openbsd"),
+    any(target_os = "linux", target_os = "macos"),
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 #[tokio::test]
@@ -249,7 +249,7 @@ async fn an_invalid_update_stays_activated_but_unavailable() {
 }
 
 #[cfg(all(
-    any(target_os = "linux", target_os = "macos", target_os = "openbsd"),
+    any(target_os = "linux", target_os = "macos"),
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 #[tokio::test]
@@ -304,7 +304,7 @@ async fn a_self_connection_runs_the_activated_program() {
 /// from the row it resolves under the authorization lock (`sockets.rs`), so a
 /// re-activation that lands mid-admission cannot hand a stale config through.
 #[cfg(all(
-    any(target_os = "linux", target_os = "macos", target_os = "openbsd"),
+    any(target_os = "linux", target_os = "macos"),
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 #[tokio::test]
@@ -376,7 +376,7 @@ SY_ENTRY sy_s64 entry(void) {
 /// the next connection, no further ceremony, and the program that answers is
 /// exactly the one the tree names.
 #[cfg(all(
-    any(target_os = "linux", target_os = "macos", target_os = "openbsd"),
+    any(target_os = "linux", target_os = "macos"),
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 #[tokio::test]
@@ -458,7 +458,7 @@ SY_ENTRY sy_s64 entry(void) {
 /// then exercise the complete async admit/run path inside it. A regression
 /// here aborts in debug builds at `Store::conn`, exactly as a real daemon does.
 #[cfg(all(
-    any(target_os = "linux", target_os = "macos", target_os = "openbsd"),
+    any(target_os = "linux", target_os = "macos"),
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 #[test]
@@ -521,7 +521,7 @@ fn a_daemon_style_runtime_can_activate_and_run_a_self_socket() {
 }
 
 #[cfg(all(
-    any(target_os = "linux", target_os = "macos", target_os = "openbsd"),
+    any(target_os = "linux", target_os = "macos"),
     any(target_arch = "x86_64", target_arch = "aarch64")
 ))]
 #[tokio::test]
