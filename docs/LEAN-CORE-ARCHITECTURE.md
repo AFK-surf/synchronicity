@@ -8,6 +8,9 @@ Current production rule: whole Lean operation or pure Rust, never Rust
 orchestration calling fine-grained Lean domain decisions. The user has frozen
 new migrations; previously mixed paths are restored to Rust. The broader design
 and historical checkpoints below do not authorize additional migrations.
+[LEAN-TRIE-CAS-MIGRATION-PLAN.md](LEAN-TRIE-CAS-MIGRATION-PLAN.md) is a
+proposal to lift that freeze for the Trie and CAS domains; it authorizes
+nothing until accepted.
 
 | Current owner | Operations |
 | --- | --- |
