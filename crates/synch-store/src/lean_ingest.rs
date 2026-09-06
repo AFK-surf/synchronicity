@@ -458,15 +458,19 @@ mod tests {
 
     #[test]
     fn native_small_file_growth_freezes_captured_bytes_without_reopening_changed_path() {
-        let (dir, store) = crate::testutil::store();
-        let path = dir.path().join("growing");
-        std::fs::write(&path, b"initial").unwrap();
-        let captured = data(32769);
-        let replaced = b"different stream after capture";
-        let (result, freezes) = ingest_changing_file(&store, &path, &captured, Some(replaced));
-        assert_eq!(freezes, 1);
-        assert_eq!(std::fs::read(&path).unwrap(), replaced);
-        assert_captured(&store, result.unwrap(), &captured);
+        // Include multiple 64-KiB reads and a partial final chunk. The Lean
+        // collector must preserve order when flattening reversed chunks.
+        for size in [32769, 131075, 2097155] {
+            let (dir, store) = crate::testutil::store();
+            let path = dir.path().join("growing");
+            std::fs::write(&path, b"initial").unwrap();
+            let captured = data(size);
+            let replaced = b"different stream after capture";
+            let (result, freezes) = ingest_changing_file(&store, &path, &captured, Some(replaced));
+            assert_eq!(freezes, 1);
+            assert_eq!(std::fs::read(&path).unwrap(), replaced);
+            assert_captured(&store, result.unwrap(), &captured);
+        }
     }
 
     #[test]

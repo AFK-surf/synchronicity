@@ -55,20 +55,28 @@ def inlineBytes (bytes : ByteArray) (now : Int64) (tier : IngestCommit.Tier) : A
     return reply.mapError Error.metadata
   return ⟨root, size⟩
 
+/-- Flatten only after EOF, without suspending while the fresh destination is
+being filled. The explicit capacity is the captured byte count; compiled append
+uses ByteArray.fastAppend/copySlice and can mutate this unshared destination.
+Keeping reversed chunks across host calls avoids repeatedly copying a prefix
+retained by the previous native continuation. -/
+def flattenCapture (total : Nat) (chunks : List ByteArray) : ByteArray :=
+  chunks.reverse.foldl (fun out chunk => out ++ chunk) (ByteArray.emptyWithCapacity total)
+
 /-- Preserve read-to-EOF for an initially small file, including growth across
 the inline threshold. Like the previous read-to-end path, this may retain the
 entire captured stream. Large initial inputs use bounded streaming instead.
 Fuel permits one request per byte plus the final EOF observation. -/
-def collectAux : Nat → UInt64 → ByteArray → Action ByteArray
-  | 0, _, _ => throw .protocol
-  | fuel + 1, handle, acc => do
-    let bytes ← source (.readSome handle acc.size.toUInt64 65536)
-    if bytes.size > 65536 || acc.size + bytes.size > 18446744073709551615 then throw .protocol
-    if bytes.isEmpty then return acc
-    collectAux fuel handle (acc ++ bytes)
+def collectAux : Nat → UInt64 → Nat → List ByteArray → Action ByteArray
+  | 0, _, _, _ => throw .protocol
+  | fuel + 1, handle, total, chunks => do
+    let bytes ← source (.readSome handle total.toUInt64 65536)
+    if bytes.size > 65536 || total + bytes.size > 18446744073709551615 then throw .protocol
+    if bytes.isEmpty then return flattenCapture total chunks
+    collectAux fuel handle (total + bytes.size) (bytes :: chunks)
 
 def collect (handle : UInt64) : Action ByteArray :=
-  collectAux 18446744073709551616 handle ByteArray.empty
+  collectAux 18446744073709551616 handle 0 []
 
 /-- A growing small file is frozen from exactly the bytes already captured;
 never reopen the mutable path to construct a root for a different stream. -/

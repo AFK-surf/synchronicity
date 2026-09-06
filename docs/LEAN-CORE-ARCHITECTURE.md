@@ -528,6 +528,40 @@ large files and large immutable byte inputs use bounded reads and do not build
 a whole outboard buffer. The small-file-growth path is not claimed to have
 bounded whole-object memory or transfer-copy parity.
 
+The EOF collector retains reversed bounded chunks and an explicit byte count,
+then flattens once into a preallocated buffer without an intervening host
+suspension. This removes repeated prefix appends whose old continuation could
+keep the accumulator shared and force quadratic copying. Universal Lean laws
+prove capacity-independent contents, ordered chunk append and exact total
+length; native growing-file fixtures include multiple 64-KiB reads and a
+partial final chunk. Freezing still copies the whole capture, so this does
+not make the exceptional path bounded-memory.
+
+The ignored Linux `lean_ingest_memory::isolated_ingestion_memory` probe runs
+each implementation/input-kind/size in a fresh child process. File fixtures
+are generated in bounded chunks and immutable byte fixtures are allocated
+before the baseline. `/proc/self/status` peak RSS includes Lean allocations,
+unlike a Rust-only allocator counter. It verifies roots and resource cleanup
+without materializing the result for measurement. The 4-MiB and 64-MiB inputs
+include three trailing bytes to exercise partial groups.
+
+Local release measurements under a 4-GiB scope (single build/test job):
+
+| 64 MiB + 3 bytes | Peak RSS rise | Elapsed |
+| --- | ---: | ---: |
+| Lean file ingestion | 1928 KiB | 376 ms |
+| Lean byte ingestion | 2176 KiB | 369 ms |
+| Existing Rust file ingestion | 336 KiB | 34 ms |
+| Existing Rust byte ingestion | 256 KiB | 56 ms |
+
+The Lean 4-MiB cases had 2176–2240 KiB peak rise: these measurements support
+bounded retention for ordinary large inputs, not a universal allocation or
+throughput claim. The observed 6.6–11.1x release-time gap is unfinished
+performance work. Per-chunk crypto/packet allocation and repeated bounded
+copies remain optimization targets; restoring a Rust tree planner is not an
+acceptable shortcut. The probe's loose memory gate does not assert timing
+parity or cover the growing-small-file path.
+
 The native raw resource pool shares one invocation-local handle allocator
 across source, frozen and temporary handles. Temporary creation uses
 `create_new`; a process-wide, canonical-datadir registry protects live names
@@ -576,9 +610,9 @@ UInt64 input), bounded I/O/hash requests, small/error executions and recursive
 program equations with concrete two-/three-group layouts. Large-buffer kernel
 evaluation was replaced by compositional equations after hitting evaluator
 limits; no unchecked evaluator or enlarged recursion limit is required.
-The additional root and slot-enumeration results below strengthen these
-checks, but a complete stateful outboard trace remains required before
-production cutover, alongside native primitive/layout tests. Invocation-owned source, payload and outboard
+The additional root, slot-enumeration and trace results below strengthen these
+checks. Their raw-host assumptions remain explicit; native primitive/layout
+tests and platform/performance gates still precede production cutover. Invocation-owned source, payload and outboard
 resources must be distinct; fresh temporary creation establishes this host
 resource contract before the internal constructor is called.
 
@@ -593,7 +627,7 @@ a grouped Lean recurrence under explicit bounded-input and successful-write
 contracts. Accepted roots have 32 bytes without assuming host honesty, and a
 successful branch requires both children and its pair write before its parent
 hash. The grouping proof below identifies its root with the ordinary chunk
-tree; complete stateful outboard placement remains a distinct obligation.
+tree; outboard placement is covered separately by layout and trace theorems.
 
 `BaoGroupingProofs` proves that group and chunk splitters choose the same
 boundary above 16 KiB, and that sufficient inner traversal fuel agrees with
@@ -610,9 +644,15 @@ and top-level UInt64 offset bounds. Its branch theorem is linked to the
 executable constructor's required 64-byte pair write. The pure postorder
 enumeration contains every in-region slot exactly once and no other slot;
 each enumerated slot is linked to a required successful 64-byte write in the
-recursive executable. Equality with an accumulated stateful host trace
-remains pending; these component results do not establish the complete
-cutover gate.
+recursive executable. `BaoTraceProofs.build_accumulated_writeTrace` additionally
+proves equality of the shared stateful interpreter's accumulated request log
+with the complete postorder slot enumeration, including any initial log.
+Payload and outboard handles must differ. Hashing and reads add no outboard
+writes. Raw replies are arbitrary but deterministic and independent of the
+log; the theorem does not establish correctness of native filesystems or
+general history-dependent responders. These assumptions and the remaining
+native gates must not be erased by describing the trace theorem as universal
+physical-I/O correctness.
 
 The private Rust primitive adapter uses the pinned BLAKE3 chunk compression
 and parent-compression APIs only. Its fixtures check standard empty/abc roots,

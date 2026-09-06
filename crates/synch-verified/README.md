@@ -49,8 +49,8 @@ Lean. Its raw capabilities are exact reads, positioned writes and chunk/parent
 cryptographic primitives. It is compiled from the same source as its geometry
 and effect proofs, but is **not yet called by production ingestion**. No new
 Rust subtree/planner facade is added. Whole-command staging/lease/publication
-orchestration and primitive integration are implemented below; the complete
-stateful layout proof and remaining native gates are required before deleting
+orchestration and primitive integration are implemented below; the remaining
+native platform/performance gates are required before deleting
 Rust ingestion. The architecture document
 records changing-file behavior, temporary-file/GC hazards and durability gates.
 
@@ -73,9 +73,16 @@ matrix, deferred COMMIT rollback and deterministic GC/publication concurrency.
 the whole builder with an ordinary chunk tree, assuming coherent immutable
 reads, successful writes and the raw compression contract—not a Rust tree.
 `BaoLayoutProofs` proves exact slot enumeration and links every slot to a
-required executable write. Equality with an accumulated stateful write trace,
-remaining transfer-memory checks and platform gates still precede production
-cutover and deletion of Rust ingestion.
+required executable write. `BaoTraceProofs` connects the entire sequence to
+the shared stateful interpreter's accumulated log, under explicit deterministic
+raw replies. The growing-small-file collector retains chunks and flattens
+once, with universal Lean order/length proofs, avoiding suspended prefix
+copies. Isolated Linux probes show bounded ordinary-large-input retention but
+a significant release-throughput gap; see the architecture document for
+measurements. Performance work and platform validation still precede
+production cutover and deletion of Rust ingestion. The focused CI/static-link
+gate now covers Linux, macOS and Windows; configuration is not execution
+evidence, and the growing-small-file path still retains whole captured input.
 The raw chunk/parent cryptography adapter is staged privately in the store
 crate; it contains no tree traversal or CAS decisions.
 

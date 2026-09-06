@@ -29,6 +29,7 @@ import Synchronicity.BaoHashProofs
 import Synchronicity.BaoBuildProofs
 import Synchronicity.BaoGroupingProofs
 import Synchronicity.BaoLayoutProofs
+import Synchronicity.BaoTraceProofs
 import Synchronicity.IngestCommitProofs
 import Synchronicity.IngestProgramProofs
 import Synchronicity.IngestInputProofs

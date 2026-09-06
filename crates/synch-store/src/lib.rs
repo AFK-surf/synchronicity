@@ -15,6 +15,8 @@ mod lean_history;
 mod lean_ingest;
 #[cfg(test)]
 mod lean_ingest_concurrency;
+#[cfg(all(test, target_os = "linux"))]
+mod lean_ingest_memory;
 mod lean_read;
 mod lean_resources;
 mod lean_storage;
