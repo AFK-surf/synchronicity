@@ -178,6 +178,10 @@ Rust facade files separate; the shared runtime must not import their policies.
 
 ## Proof obligations and non-regression gates
 
+The [CAS promises](CAS-PROMISES.md) state the user-facing laws, map them to
+checked theorems, and distinguish proof-host guarantees from native-host
+obligations.
+
 Prove executions of the actual programs under the explicit host contract, not
 only pure decisions or an independently authored state machine. Required
 properties include:

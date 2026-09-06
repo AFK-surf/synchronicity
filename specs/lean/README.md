@@ -7,7 +7,8 @@ runs: there is no separate model of Rust, no anchor pairing a model
 definition with a Rust site, and no checker for such pairings. What Rust
 still owns (SQL, the filesystem, cryptographic primitives, Bao layout, the
 FFI transport and the interpreters) is a stated trust boundary, not a
-modeled one.
+verified one. Proof hosts may model these raw effects explicitly; native
+interpreter refinement remains outside those theorems.
 
 The package depends only on the core and the pinned toolchain. No Mathlib.
 
@@ -19,6 +20,9 @@ lake build --wfail
 CI builds it with warnings as errors, rechecks every declaration with the
 standalone kernel checker and fails on `sorryAx` or an unapproved axiom.
 
+The user-facing [CAS promises](../../docs/CAS-PROMISES.md) map readable
+statements to their checked theorems and explicit host assumptions.
+
 ## Modules
 
 | Module | What it proves about the executable program |
@@ -26,6 +30,7 @@ standalone kernel checker and fails on `sorryAx` or an unapproved axiom.
 | `HostProgramProofs` | Composition and transaction failure traces of the shared free-monad carrier |
 | `HostWireProofs`, `WireBufferProofs`, `WireWordProofs` | Packet framing, continuation resumption and word/buffer encodings of the native transport |
 | `HostResourceProofs` | Bracketing of owned resources: cleanup runs once, on every path, and never hides the primary error |
+| `CasPromises`, `CasReadPromises`, `CasHealingPromises`, `CasStorePromises` | User-facing coverage, range/full-read, repair-obligation, ownership, and fresh store/read laws under explicit host semantics; see the CAS promises document for exact scopes |
 | `CasPlanProofs` | Group counting, size settlement, span normalization and the commit plan: membership, bounds, separation and exact completeness |
 | `CasProgramProofs`, `CasLifecycleProofs` | Pin acquisition and deletion: the executed outcome equals the proved decision; a failed transaction never cleans up; committed deletion attempts both files |
 | `CasReleaseProofs`, `CasExpiryProofs` | Release and expiry traces over scripted storage |
