@@ -122,24 +122,28 @@ cd specs/lean && lake build --wfail
 ### The generated boundary
 
 The host boundary is declared once, in Lean, and generated on both sides by
-`hostgen` (`crates/synch-verified/hostgen`, a Lean program that reflects over
-the executable core):
+`lean/Hostgen.lean`, a Lean program that reflects over the executable core:
 
 - the effect algebras (`lean/VerifiedCore/Host*.lean`, `Crypto.lean`) yield
   `lean/VerifiedCore/Host/Generated.lean` (tags, names, request encoders,
-  reply decoders and `WireEffect` instances) and, in `src/generated.rs`, the
-  Rust host traits, the request `Frame` enum with its decoder, the dispatch
-  of each frame to its service and the `host_unexpected!` stubs test doubles
-  fill their `impl` blocks with;
+  reply decoders and `WireEffect` instances) and, in Rust, the host traits,
+  the request `Frame` enum with its decoder, the dispatch of each frame to
+  its service and the `host_unexpected!` stubs test doubles fill their
+  `impl` blocks with;
 - the command and outcome types (`lean/VerifiedCore/Commands.lean` and the
   domain types it names) yield `lean/VerifiedCore/Commands/Generated.lean`
   (`Encode`/`Decode` instances) and the mirrored Rust enums and structs with
   their codecs.
 
-Only the tag table and the routing of each algebra to a Rust service are
-written by hand, in the generator. After changing an algebra or a command
-type, run `cd crates/synch-verified/hostgen && lake exe hostgen` and commit
-the output; CI runs `lake exe hostgen --check`. One native entry point,
+The Lean side is kept in the tree; the Rust side is a build product that
+`build.rs` prints into Cargo's output directory and `lib.rs` includes, so it
+is never committed. Only the tag table and the routing of each algebra to a
+Rust service are written by hand, in the generator. After changing an
+algebra or a command type, run
+`cd crates/synch-verified/lean && lake env lean --run Hostgen.lean` and
+commit the Lean output; `build.rs` and CI run it with `--check`, so a stale
+copy fails the build instead of drifting from the Rust it faces. One native
+entry point,
 `synch_lean_start`, takes an encoded `Command`; `Entry.lean` maps each
 operation's domain result onto its outcome type, and the Rust facades in
 `src/cas.rs`, `src/history.rs` and `src/trie.rs` only bind capabilities and

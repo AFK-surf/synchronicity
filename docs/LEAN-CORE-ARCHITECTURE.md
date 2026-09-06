@@ -350,15 +350,18 @@ match the pending effect's tag and consume the whole input, and decoders
 reject unknown versions/tags, wrong reply types, truncated or trailing data
 and lengths that cannot fit the remaining packet before allocation.
 
-The same generator prints `src/generated.rs`: the Rust host traits (with the
-Lean docstrings), the `Frame` enum with its decoder, the dispatch of every
-frame to the storage host or the capability that serves it, and the
+The same generator prints the Rust side: the host traits (with the Lean
+docstrings), the `Frame` enum with its decoder, the dispatch of every frame
+to the storage host or the capability that serves it, and the
 `host_unexpected!` macro test doubles use for the methods an operation never
-requests. The interpreter loop in `operation.rs` serves by hand only the
-frames that use the run's own resources: borrowed command inputs, the
-transfer into the output sink and the sink append. The generator's only
-tables are the wire tags and the routing of each algebra to a Rust service;
-CI fails if the checked-in output is stale.
+requests. That file is a build product: `build.rs` runs the generator over
+the compiled algebras and prints it into Cargo's output directory, where
+`lib.rs` includes it, so the Rust glue is never committed. The Lean codecs
+are kept in the tree, and `build.rs` fails the build when they are stale.
+The interpreter loop in `operation.rs` serves by hand only the frames that
+use the run's own resources: borrowed command inputs, the transfer into the
+output sink and the sink append. The generator's only tables are the wire
+tags and the routing of each algebra to a Rust service.
 
 Commands cross the same way. `Commands.lean` declares the `Command`
 inductive and the flat outcome types; `Commands/Generated.lean` and the Rust

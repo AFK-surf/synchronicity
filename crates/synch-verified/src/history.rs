@@ -141,7 +141,7 @@ mod tests {
         ) -> Result<u64, Self::Error> {
             panic!("unexpected delete")
         }
-        crate::host_unexpected!(
+        host_unexpected!(
             exists_rows,
             upsert,
             read_bytes,

@@ -8,13 +8,15 @@ import VerifiedCore.Host.Resources
 import VerifiedCore.Host.Source
 import VerifiedCore.Commands
 
-/-! `hostgen` reads the executable core's effect algebras and prints the two
-sides of the host boundary from them: the Lean request encoders and reply
-decoders (`lean/VerifiedCore/Host/Generated.lean`) and the Rust frames,
-decoder, dispatch, host traits and test-double stubs (`src/generated.rs`).
-Wire tags and the routing of each effect to a Rust service are the only
-tables it holds; the shapes come from the inductives. Run it after changing
-an algebra; CI runs it with `--check`. -/
+/-! `hostgen` reads the executable core's effect algebras and command types
+and prints the two sides of the host boundary from them: the Lean request
+encoders, reply decoders and command codecs (`VerifiedCore/Host/Generated.lean`,
+`VerifiedCore/Commands/Generated.lean`, kept in the tree) and the Rust frames,
+decoder, dispatch, host traits, mirrored types and test-double stubs
+(`generated.rs`, printed into Cargo's output directory by `build.rs`). Wire
+tags and the routing of each effect to a Rust service are the only tables it
+holds; the shapes come from the inductives. Run it after changing an algebra
+or a command type; `build.rs` and CI run it with `--check`. -/
 open Lean Meta
 
 namespace Hostgen
@@ -394,7 +396,7 @@ def rustMethod (ctor : Ctor) : String := Id.run do
 def rustTraits (all : Array Algebra) : String := Id.run do
   let mut out := ""
   for (trait, members) in rustTypeAll all (fun a c => route a.short c.short) do
-    out := out ++ traitDoc trait ++ "\n#[rustfmt::skip]\n" ++ s!"pub trait {trait} \{\n"
+    out := out ++ traitDoc trait ++ "\n" ++ s!"pub trait {trait} \{\n"
     out := out ++ "    /// Original host error, retained without converting it into a policy result.\n    type Error;\n"
     for (_, ctor) in members do
       out := out ++ rustMethod ctor
@@ -411,7 +413,10 @@ def rustUnexpected (all : Array Algebra) : String := Id.run do
         | .fileReply => s!"Result<{rustResultTy ctor.result}, $crate::host::FileFailure<Self::Error>>"
       let params := String.join (params.map (", " ++ ·))
       out := out ++ s!"    ({snake ctor.short}) => \{\n        fn {snake ctor.short}(&mut self{params}) -> {result} \{\n            panic!(\"unexpected {snake ctor.short}\")\n        }\n    };\n"
-  out := out ++ "    ($($method:ident),+ $(,)?) => {\n        $($crate::host_unexpected!($method);)+\n    };\n}\n"
+  -- The macro is defined by `include!`, so the crate itself may only name it
+  -- textually, never by path: the list arm recurses by bare name, and a
+  -- caller in another crate brings the name into scope with `use`.
+  out := out ++ "    ($($method:ident),+ $(,)?) => {\n        $(host_unexpected!($method);)+\n    };\n}\n"
   -- Trait names in the macro must be absolute for external test crates.
   return out.replace "Result<Scan<Self::Error>" "Result<$crate::host::Scan<Self::Error>"
     |>.replace "&Fields" "&$crate::host::Fields" |>.replace "&Selection" "&$crate::host::Selection"
@@ -423,14 +428,14 @@ def rustUnexpected (all : Array Algebra) : String := Id.run do
     |>.replace "Result<SyncStatus" "Result<$crate::host::SyncStatus"
 
 def rustFrames (all : Array Algebra) : String := Id.run do
-  let mut out := "/// One decoded request packet. Terminal packets carry the operation's\n/// result or failure; every other frame is one effect of one algebra.\n#[derive(Debug)]\n#[rustfmt::skip]\npub(crate) enum Frame<'a> {\n    Done(&'a [u8]),\n    Failure(u64, u64),\n"
+  let mut out := "/// One decoded request packet. Terminal packets carry the operation's\n/// result or failure; every other frame is one effect of one algebra.\n#[derive(Debug)]\npub(crate) enum Frame<'a> {\n    Done(&'a [u8]),\n    Failure(u64, u64),\n"
   for algebra in all do
     for ctor in algebra.ctors do
       let fields := ctor.fields.toList.map fun field => rustFrameTy field.ty
       out := out ++ s!"    {pascal ctor.short}" ++
         (if fields.isEmpty then "" else s!"({String.intercalate ", " fields})") ++ ",\n"
   out := out ++ "}\n\n"
-  out := out ++ "#[rustfmt::skip]\npub(crate) fn decode(packet: &[u8]) -> Result<Frame<'_>, ()> {\n    let mut r = Reader(packet);\n    if r.byte()? != 1 {\n        return Err(());\n    }\n    let frame = match r.byte()? {\n        0 => Frame::Done(r.byte_slice()?),\n        1 => Frame::Failure(r.word()?, r.word()?),\n"
+  out := out ++ "pub(crate) fn decode(packet: &[u8]) -> Result<Frame<'_>, ()> {\n    let mut r = Reader(packet);\n    if r.byte()? != 1 {\n        return Err(());\n    }\n    let frame = match r.byte()? {\n        0 => Frame::Done(r.byte_slice()?),\n        1 => Frame::Failure(r.word()?, r.word()?),\n"
   for algebra in all do
     for ctor in algebra.ctors do
       let fields := ctor.fields.toList.map fun field => rustDecoder field.ty
@@ -440,7 +445,7 @@ def rustFrames (all : Array Algebra) : String := Id.run do
   return out
 
 def rustDispatch (all : Array Algebra) : String := Id.run do
-  let mut out := "/// Serve one effect frame with the host it routes to. Terminal frames and\n/// the effects the interpreter loop serves itself are refused here.\n#[rustfmt::skip]\npub(crate) fn dispatch<S: Storage>(\n    storage: &mut S,\n    capabilities: &mut Capabilities<'_, S::Error>,\n    frame: Frame<'_>,\n    errors: &mut Vec<Option<S::Error>>,\n) -> Result<Vec<u8>, OperationError<S::Error>> {\n    Ok(match frame {\n"
+  let mut out := "/// Serve one effect frame with the host it routes to. Terminal frames and\n/// the effects the interpreter loop serves itself are refused here.\npub(crate) fn dispatch<S: Storage>(\n    storage: &mut S,\n    capabilities: &mut Capabilities<'_, S::Error>,\n    frame: Frame<'_>,\n    errors: &mut Vec<Option<S::Error>>,\n) -> Result<Vec<u8>, OperationError<S::Error>> {\n    Ok(match frame {\n"
   for algebra in all do
     for ctor in algebra.ctors do
       let binders := ctor.fields.toList.zipIdx.map fun (_, i) => s!"a{i}"
@@ -547,18 +552,18 @@ def rustMessage (message : Message) : String := Id.run do
   let visibility := if crateOnly.contains message.full then "pub(crate)" else "pub"
   let plain := message.ctors.all fun ctor => ctor.fields.isEmpty
   let derive := if plain then "#[derive(Debug, Clone, Copy, PartialEq, Eq)]" else "#[derive(Debug, Clone, PartialEq, Eq)]"
-  let mut out := docLines "" message.doc ++ derive ++ "\n#[rustfmt::skip]\n"
+  let mut out := docLines "" message.doc ++ derive ++ "\n"
   if message.isStructure then
     let ctor := message.ctors[0]!
     out := out ++ s!"{visibility} struct {name} \{\n"
     for field in ctor.fields do
       out := out ++ s!"    pub {snake field.name}: {rustMessageTy field.ty},\n"
     out := out ++ "}\n\n"
-    out := out ++ s!"#[rustfmt::skip]\nimpl Encode for {name} \{\n    fn encode(&self, out: &mut Vec<u8>) \{\n"
+    out := out ++ s!"impl Encode for {name} \{\n    fn encode(&self, out: &mut Vec<u8>) \{\n"
     for field in ctor.fields do
       out := out ++ s!"        self.{snake field.name}.encode(out);\n"
     out := out ++ "    }\n}\n\n"
-    out := out ++ s!"#[rustfmt::skip]\nimpl Decode for {name} \{\n    fn decode(r: &mut Reader<'_>) -> Result<Self, ()> \{\n        Ok(Self \{\n"
+    out := out ++ s!"impl Decode for {name} \{\n    fn decode(r: &mut Reader<'_>) -> Result<Self, ()> \{\n        Ok(Self \{\n"
     for field in ctor.fields do
       out := out ++ s!"            {snake field.name}: Decode::decode(r)?,\n"
     out := out ++ "        })\n    }\n}\n\n"
@@ -576,7 +581,7 @@ def rustMessage (message : Message) : String := Id.run do
         out := out ++ s!"        {snake field.name}: {rustMessageTy field.ty},\n"
       out := out ++ "    },\n"
   out := out ++ "}\n\n"
-  out := out ++ s!"#[rustfmt::skip]\nimpl Encode for {name} \{\n    fn encode(&self, out: &mut Vec<u8>) \{\n        match self \{\n"
+  out := out ++ s!"impl Encode for {name} \{\n    fn encode(&self, out: &mut Vec<u8>) \{\n        match self \{\n"
   for ctor in message.ctors, index in [:message.ctors.size] do
     let variant := pascal ctor.short
     match ctor.fields.toList with
@@ -589,7 +594,7 @@ def rustMessage (message : Message) : String := Id.run do
         out := out ++ s!"                {snake field.name}.encode(out);\n"
       out := out ++ "            }\n"
   out := out ++ "        }\n    }\n}\n\n"
-  out := out ++ s!"#[rustfmt::skip]\nimpl Decode for {name} \{\n    fn decode(r: &mut Reader<'_>) -> Result<Self, ()> \{\n        Ok(match r.byte()? \{\n"
+  out := out ++ s!"impl Decode for {name} \{\n    fn decode(r: &mut Reader<'_>) -> Result<Self, ()> \{\n        Ok(match r.byte()? \{\n"
   for ctor in message.ctors, index in [:message.ctors.size] do
     let variant := pascal ctor.short
     match ctor.fields.toList with
@@ -607,16 +612,27 @@ def rustMessages (all : Array Message) : String :=
   String.join (all.toList.map rustMessage)
 
 def rustFile (all : Array Algebra) (messages : Array Message) : String :=
-  "//! GENERATED by `hostgen` from the Lean effect algebras; do not edit.\n//!\n//! The host traits, the request frames with their decoder, the dispatch of\n//! each frame to its Rust service and the test-double stubs all follow from\n//! the constructors of the algebras in `lean/VerifiedCore/Host*.lean`.\n\nuse crate::host::*;\nuse crate::operation::{\n    file_reply, reply, scan_reply, Capabilities, Decode, Encode, EncodeReply, OperationError,\n    Reader,\n};\n\n"
+  "// Printed by lean/Hostgen.lean at build time from the Lean effect algebras\n// and command types; included from lib.rs, never edited or committed.\n\nuse crate::host::*;\nuse crate::operation::{\n    file_reply, reply, scan_reply, Capabilities, Decode, Encode, EncodeReply, OperationError,\n    Reader,\n};\n\n"
   ++ rustTraits all ++ rustFrames all ++ rustDispatch all ++ "\n" ++ rustUnexpected all ++ "\n"
   ++ (rustMessages messages).trimAsciiEnd.toString ++ "\n"
 
 end Hostgen
 
+/-! Usage, from `crates/synch-verified/lean`:
+
+    lake env lean --run Hostgen.lean [--check] [--rust FILE]
+
+The Lean codecs live in the tree, at `VerifiedCore/Host/Generated.lean` and
+`VerifiedCore/Commands/Generated.lean`: they are rewritten, or under `--check`
+compared with what the algebras and commands now say, exiting 1 when stale.
+The Rust glue is a build product, written only where `--rust` says: Cargo's
+build script prints it into its output directory and `lib.rs` includes it. -/
 open Hostgen in
 def main (args : List String) : IO UInt32 := do
   let check := args.contains "--check"
-  let root := (args.filter (· != "--check")).headD ".."
+  let rustPath? := match args.dropWhile (· != "--rust") with
+    | _ :: path :: _ => some path
+    | _ => none
   initSearchPath (← findSysroot)
   let modules : Array Name := #[`VerifiedCore.Host, `VerifiedCore.Crypto, `VerifiedCore.Host.Access,
     `VerifiedCore.Host.Construct, `VerifiedCore.Host.Upsert, `VerifiedCore.Host.Resources,
@@ -628,17 +644,17 @@ def main (args : List String) : IO UInt32 := do
       let messages ← messages.toArray.mapM readMessage
       return (leanFile all, leanCommandsFile messages, rustFile all messages))
     { fileName := "<hostgen>", fileMap := default } { env })
-  let outputs := [(s!"{root}/lean/VerifiedCore/Host/Generated.lean", lean),
-    (s!"{root}/lean/VerifiedCore/Commands/Generated.lean", commands),
-    (s!"{root}/src/generated.rs", rust)]
   let mut stale := false
-  for (path, text) in outputs do
+  for (path, text) in [("VerifiedCore/Host/Generated.lean", lean),
+      ("VerifiedCore/Commands/Generated.lean", commands)] do
+    let current ← IO.FS.readFile path <|> pure ""
+    if current == text then continue
     if check then
-      let current ← IO.FS.readFile path <|> pure ""
-      if current != text then
-        IO.eprintln s!"{path} is out of date; run hostgen"
-        stale := true
+      IO.eprintln s!"{path} is out of date; run `lake env lean --run Hostgen.lean` in crates/synch-verified/lean"
+      stale := true
     else
       IO.FS.writeFile path text
       IO.println s!"wrote {path}"
-  return if stale then 1 else 0
+  if let some path := rustPath? then
+    IO.FS.writeFile path rust
+  return (if stale then 1 else 0 : UInt32)

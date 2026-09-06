@@ -1095,12 +1095,12 @@ mod tests {
             Ok(())
         }
 
-        crate::host_unexpected!(read_at);
+        host_unexpected!(read_at);
     }
     impl Clock for OutputTestFiles {
         type Error = &'static str;
 
-        crate::host_unexpected!(now_ns);
+        host_unexpected!(now_ns);
     }
     struct FailingOutput {
         host: Option<bool>,
@@ -1201,7 +1201,7 @@ mod tests {
             Ok(())
         }
 
-        crate::host_unexpected!(read_at);
+        host_unexpected!(read_at);
     }
     #[test]
     fn failed_transfer_takes_back_the_grown_tail() {
@@ -1640,7 +1640,7 @@ mod tests {
             })
         }
 
-        crate::host_unexpected!(exists_rows, read_bytes, update, copy_rows, delete, write);
+        host_unexpected!(exists_rows, read_bytes, update, copy_rows, delete, write);
     }
 
     #[test]

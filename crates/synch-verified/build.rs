@@ -48,6 +48,7 @@ fn main() {
     for module in modules {
         println!("cargo:rerun-if-changed=lean/VerifiedCore/{module}.lean");
     }
+    println!("cargo:rerun-if-changed=lean/Hostgen.lean");
     println!("cargo:rerun-if-changed=lean/lean-toolchain");
     println!("cargo:rerun-if-changed=src/adapter.c");
     let target = env::var("TARGET").unwrap();
@@ -121,6 +122,18 @@ fn main() {
         ]);
         compiled_modules.push(generated);
     }
+    // The Rust side of the host boundary is a build product: the generator
+    // reflects over the compiled algebras and command types and prints it
+    // here, where lib.rs includes it. The Lean side lives in the tree, and a
+    // stale copy fails the build rather than drifting from the Rust it faces.
+    let glue = out.join("generated.rs");
+    lean(&[
+        "--run",
+        "Hostgen.lean",
+        "--check",
+        "--rust",
+        glue.to_str().unwrap(),
+    ]);
     let generated = out.join("VerifiedCore.c");
     lean(&["-c", generated.to_str().unwrap(), "VerifiedCore.lean"]);
     cc::Build::new()

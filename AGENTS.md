@@ -14,8 +14,7 @@ This is a Rust 2021 workspace (minimum Rust 1.91). Libraries and binaries live i
 - `cd control-plane && just dev` starts the backend on port 8080 and the Vite dev server.
 - `cd control-plane && just web-build` type-checks, tests, and builds the SPA.
 - `cd specs/lean && lake build --wfail` checks the Lean core proofs without tolerating warnings.
-- `cd crates/synch-verified/hostgen && lake exe hostgen` regenerates the host boundary (Lean codecs and Rust glue) after changing an effect algebra or command type; `--check` verifies the checked-in output.
-- `cd crates/synch-verified/hostgen && lake exe hostgen` regenerates the host boundary (Lean codecs and Rust glue) after changing an effect algebra or command type; `--check` verifies the checked-in output.
+- `cd crates/synch-verified/lean && lake env lean --run Hostgen.lean` regenerates the checked-in Lean codecs of the host boundary after changing an effect algebra or command type; `--check` verifies them. The Rust glue is printed into Cargo's output directory by `build.rs` and is never committed.
 
 Cloud and end-to-end suites require Docker, DNS tools, or provider emulators; follow the relevant README or CI workflow.
 

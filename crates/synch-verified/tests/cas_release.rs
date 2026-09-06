@@ -1,5 +1,6 @@
 use synch_verified::cas::{unpin, OperationError, PinHolder};
 use synch_verified::host::{Cell, Exclusion, Fields, Storage};
+use synch_verified::host_unexpected;
 
 const ROOT: [u8; 32] = [0xa7; 32];
 const TX: u64 = 73;
@@ -95,7 +96,7 @@ impl Storage for Script {
 
     // The relational host is one trait; these operations never request the
     // read-repair, copy or expression-upsert statements.
-    synch_verified::host_unexpected!(
+    host_unexpected!(
         scan_rows,
         read_rows,
         exists_rows,

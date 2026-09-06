@@ -1,5 +1,6 @@
 //! The native constructor drives literal host services for the entire read.
 use std::{cell::RefCell, rc::Rc};
+use synch_verified::host_unexpected;
 use synch_verified::{
     cas::{self, OperationError, ReadDomainError, ReadError, ReadRequest},
     host::{
@@ -181,7 +182,7 @@ impl Storage for Database {
         self.trace.borrow_mut().step("delete")?;
         Ok(2)
     }
-    synch_verified::host_unexpected!(
+    host_unexpected!(
         scan_rows,
         exists_rows,
         upsert,
@@ -249,7 +250,7 @@ impl FileIO for Files {
         assert_eq!(handle, HANDLE);
         self.trace.borrow_mut().step("close")
     }
-    synch_verified::host_unexpected!(read_at);
+    host_unexpected!(read_at);
 }
 struct Time(Shared);
 impl Clock for Time {

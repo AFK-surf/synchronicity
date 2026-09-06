@@ -2,4 +2,3 @@
 /specs/lean/.lake/
 /crates/synch-verified/lean/.lake/
 /.claude/worktrees/
-/crates/synch-verified/hostgen/.lake/
