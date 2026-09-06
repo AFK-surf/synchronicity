@@ -6,12 +6,13 @@
 
 pub use crate::generated::{
     CellType, Committed, DurableDomainError, IngestDomainError, IngestInput, Ingested,
-    LifecycleDomainError, Outcome, PinHolder, ReadDomainError, ServeDomainError, Served,
+    LifecycleDomainError, Outcome, PinHolder, ProvenSubtree, ReadDomainError, ReceiveDomainError,
+    ServeDomainError, Served,
 };
 pub use crate::host::IngestResources;
 pub use crate::operation::OperationError;
 use crate::{
-    host::{Bao, Clock, FileIO, Resources, Storage},
+    host::{Bao, Clock, FileIO, Lease, Resources, Storage},
     operation::{run, terminal, Capabilities, Command, Decode},
 };
 
@@ -63,6 +64,129 @@ pub enum ServeError<E> {
 
 /// What one exchange served: the encoded bytes and the group spans they cover.
 pub type ServedBytes = (Vec<u8>, Vec<(u64, u64)>);
+
+impl crate::operation::Encode for Vec<ProvenSubtree> {
+    fn encode(&self, out: &mut Vec<u8>) {
+        (self.len() as u64).encode(out);
+        for subtree in self {
+            subtree.encode(out);
+        }
+    }
+}
+impl Decode for Vec<ProvenSubtree> {
+    fn decode(r: &mut crate::operation::Reader<'_>) -> Result<Self, ()> {
+        r.list(Decode::decode)
+    }
+}
+
+/// Completed receive failure, preserving original host errors.
+#[derive(Debug)]
+pub enum ReceiveError<E> {
+    Operation(OperationError<E>),
+    Domain(ReceiveDomainError),
+}
+
+/// The services a receive directs besides its relational storage: the Bao
+/// tree and the object's write lease.
+pub struct ReceiveResources<'a, E> {
+    pub bao: &'a mut dyn Bao<Error = E>,
+    pub leases: &'a mut dyn Lease<Error = E>,
+}
+impl<E> std::fmt::Debug for ReceiveResources<'_, E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReceiveResources").finish_non_exhaustive()
+    }
+}
+
+fn receive<T: Decode, S: Storage>(
+    storage: &mut S,
+    resources: ReceiveResources<'_, S::Error>,
+    encoded: &[u8],
+    command: &Command,
+) -> Result<T, ReceiveError<S::Error>> {
+    let capabilities = Capabilities {
+        bao: Some(resources.bao),
+        leases: Some(resources.leases),
+        ..Capabilities::default()
+    };
+    let outcome: Result<T, ReceiveDomainError> =
+        finish(run(storage, capabilities, &[encoded], command)).map_err(ReceiveError::Operation)?;
+    outcome.map_err(ReceiveError::Domain)
+}
+
+/// Decode a received slice of the served groups and commit exactly the
+/// groups it verified. Lean owns the lease, the size refusal, the row read,
+/// the inline-versus-file policy, the flush before the commit and the trim
+/// of a completed object; the Bao service decodes what Lean names.
+#[allow(clippy::too_many_arguments)]
+pub fn write_slice<S: Storage>(
+    storage: &mut S,
+    resources: ReceiveResources<'_, S::Error>,
+    root: &[u8; 32],
+    size: u64,
+    served: &[(u64, u64)],
+    encoded: &[u8],
+    now: i64,
+    tier: IngestTier,
+) -> Result<Vec<(u64, u64)>, ReceiveError<S::Error>> {
+    let command = Command::CasWriteSlice {
+        root: root.to_vec(),
+        size,
+        served: served.to_vec(),
+        now,
+        cache: tier == IngestTier::Cache,
+    };
+    receive(storage, resources, encoded, &command)
+}
+
+/// Verify a received proof over the served groups and record its tree,
+/// answering the subtrees it established.
+#[allow(clippy::too_many_arguments)]
+pub fn write_proof<S: Storage>(
+    storage: &mut S,
+    resources: ReceiveResources<'_, S::Error>,
+    root: &[u8; 32],
+    size: u64,
+    served: &[(u64, u64)],
+    level: u8,
+    encoded: &[u8],
+    now: i64,
+    tier: IngestTier,
+) -> Result<Vec<ProvenSubtree>, ReceiveError<S::Error>> {
+    let command = Command::CasWriteProof {
+        root: root.to_vec(),
+        size,
+        served: served.to_vec(),
+        level: u64::from(level),
+        now,
+        cache: tier == IngestTier::Cache,
+    };
+    receive(storage, resources, encoded, &command)
+}
+
+/// Promote the donor's bytes for every proven subtree its tree agrees with,
+/// answering the groups newly committed.
+#[allow(clippy::too_many_arguments)]
+pub fn promote<S: Storage>(
+    storage: &mut S,
+    resources: ReceiveResources<'_, S::Error>,
+    donor: &[u8; 32],
+    root: &[u8; 32],
+    size: u64,
+    proven: &[ProvenSubtree],
+    now: i64,
+    tier: IngestTier,
+) -> Result<Vec<(u64, u64)>, ReceiveError<S::Error>> {
+    let command = Command::CasPromote {
+        donor: donor.to_vec(),
+        root: root.to_vec(),
+        size,
+        proven: proven.to_vec(),
+        now,
+        cache: tier == IngestTier::Cache,
+    };
+    receive(storage, resources, &[], &command)
+}
 
 /// Decode a run's terminal, or carry its host or protocol failure through.
 fn finish<T: Decode, E>(

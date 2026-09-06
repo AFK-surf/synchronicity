@@ -77,9 +77,11 @@ def messages : List Name := [
   ``VerifiedCore.Cas.Codec.CellType, ``VerifiedCore.Cas.PinHolder, ``VerifiedCore.Cas.Input.Kind,
   ``VerifiedCore.Cas.Outcome, ``VerifiedCore.Origin.Error, ``VerifiedCore.Trie.LookupError,
   ``VerifiedCore.Trie.Refusal, ``VerifiedCore.Trie.Verdict, ``VerifiedCore.Trie.MutationError,
+  ``VerifiedCore.Cas.Receive.ProvenSubtree,
   ``VerifiedCore.Commands.LifecycleDomainError, ``VerifiedCore.Commands.IngestDomainError,
   ``VerifiedCore.Commands.ReadDomainError, ``VerifiedCore.Commands.HistoryDomainError,
   ``VerifiedCore.Commands.DurableDomainError, ``VerifiedCore.Commands.ServeDomainError,
+  ``VerifiedCore.Commands.ReceiveDomainError,
   ``VerifiedCore.Commands.Ingested, ``VerifiedCore.Commands.Committed, ``VerifiedCore.Commands.Served,
   ``VerifiedCore.Commands.Command]
 
@@ -113,7 +115,9 @@ def tags : List (String × Nat) := [
   ("Lease.acquire", 47), ("Lease.release", 48),
   ("SourceIO.stat", 49), ("SourceIO.readSome", 50), ("SourceIO.freeze", 51),
   ("Digest.blake3", 53), ("ByteWrites.putBytes", 54),
-  ("Bao.encodeSlice", 55), ("Bao.encodeProof", 56)]
+  ("Bao.encodeSlice", 55), ("Bao.encodeProof", 56), ("Bao.decodeInline", 57),
+  ("Bao.decodeSlice", 58), ("Bao.flushObject", 59), ("Bao.trimObject", 60),
+  ("Bao.writeProof", 61), ("Bao.promoteRun", 62)]
 
 /-- Which Rust service answers an algebra by default. -/
 def defaultRoute : String → Route
@@ -139,7 +143,8 @@ because they hand their bytes to the sink). -/
 def route (algebra ctor : String) : Route :=
   match algebra ++ "." ++ ctor with
   | "Storage.readCounter" | "Storage.removeFile" => .capability "resources" "Resources"
-  | "Storage.readInput" | "FileIO.transfer" | "Bao.encodeSlice" | "Bao.encodeProof" => .special
+  | "Storage.readInput" | "FileIO.transfer" | "Bao.encodeSlice" | "Bao.encodeProof"
+  | "Bao.decodeInline" | "Bao.decodeSlice" | "Bao.writeProof" => .special
   | _ => defaultRoute algebra
 
 /-- Effects the interpreter loop dispatches by hand even though their service
@@ -166,7 +171,7 @@ def traitDoc : String → String
 /-- Trait methods the interpreter needs beyond the algebra's effects. -/
 def traitExtras : String → String
   | "FileIO" => "    /// Fill `buffer` from `offset`, returning `ShortRead` at EOF. The\n    /// interpreter hands over the tail of the operation's output sink, so a\n    /// transfer costs one read into the bytes the caller receives.\n    fn read_into(\n        &mut self,\n        handle: u64,\n        offset: u64,\n        buffer: &mut [u8],\n    ) -> Result<(), FileFailure<Self::Error>>;\n"
-  | "Bao" => "    /// Encode the Bao slice of exactly these half-open group spans of the\n    /// object, from its inline bytes or its payload and outboard files,\n    /// validating the local copy against the root.\n    fn encode_slice(\n        &mut self,\n        root: &[u8],\n        size: u64,\n        inline: Option<&[u8]>,\n        spans: &[(u64, u64)],\n    ) -> Result<Vec<u8>, Self::Error>;\n    /// Encode the interior tree nodes over these group spans, no deeper than\n    /// `level`, or answer `None` when the walk would exceed `budget` nodes.\n    fn encode_proof(\n        &mut self,\n        root: &[u8],\n        size: u64,\n        spans: &[(u64, u64)],\n        level: u64,\n        budget: u64,\n    ) -> Result<Option<Vec<u8>>, Self::Error>;\n"
+  | "Bao" => "    /// Encode the Bao slice of exactly these half-open group spans of the\n    /// object, from its inline bytes or its payload and outboard files,\n    /// validating the local copy against the root.\n    fn encode_slice(\n        &mut self,\n        root: &[u8],\n        size: u64,\n        inline: Option<&[u8]>,\n        spans: &[(u64, u64)],\n    ) -> Result<Vec<u8>, Self::Error>;\n    /// Encode the interior tree nodes over these group spans, no deeper than\n    /// `level`, or answer `None` when the walk would exceed `budget` nodes.\n    fn encode_proof(\n        &mut self,\n        root: &[u8],\n        size: u64,\n        spans: &[(u64, u64)],\n        level: u64,\n        budget: u64,\n    ) -> Result<Option<Vec<u8>>, Self::Error>;\n    /// Decode `input`, a slice of exactly these spans, against the root into\n    /// the object's inline buffer: `inline` when the row already holds one,\n    /// otherwise zeroes, filled out to `size`. A slice that does not verify\n    /// is this host's failure.\n    fn decode_inline(\n        &mut self,\n        root: &[u8],\n        size: u64,\n        inline: Option<&[u8]>,\n        spans: &[(u64, u64)],\n        input: &[u8],\n    ) -> Result<Vec<u8>, Self::Error>;\n    /// Decode `input`, a slice of exactly these spans, against the root into\n    /// the object's payload and outboard files, created as needed, grown only\n    /// as verified groups land and never shrunk, left unflushed.\n    fn decode_slice(\n        &mut self,\n        root: &[u8],\n        size: u64,\n        spans: &[(u64, u64)],\n        input: &[u8],\n    ) -> Result<(), Self::Error>;\n    /// Verify the run's byte input `input`, a proof over these spans no deeper\n    /// than `level`, by recomputation up to the root, and write its interior\n    /// nodes into the outboard as far as they reach, unflushed. Answers\n    /// whether any node was written and the subtrees proven: start, groups,\n    /// chaining value, whole.\n    fn write_proof(\n        &mut self,\n        root: &[u8],\n        size: u64,\n        spans: &[(u64, u64)],\n        level: u64,\n        input: &[u8],\n    ) -> Result<(bool, Vec<(u64, u64, Vec<u8>, bool)>), Self::Error>;\n"
   | "Output" => "    /// Extend the sink by `count` bytes and hand them back for an in-place\n    /// fill, so a file transfer lands directly in the result.\n    fn grow(&mut self, count: u64) -> Result<&mut [u8], Self::Error>;\n    /// Take back the last `count` bytes after a fill failed.\n    fn shrink(&mut self, count: u64);\n"
   | _ => ""
 
@@ -343,6 +348,7 @@ def rustParamTy : Ty → String
   | .bool => "bool"
   | .string => "&str"
   | .bytes => "&[u8]"
+  | .option .bytes => "Option<&[u8]>"
   | .list (.prod .string .cell) => "&Fields"
   | .list t => s!"&[{rustOwned t}]"
   | .selection => "&Selection"
@@ -359,7 +365,7 @@ def rustResultTy : Ty → String
 
 /-- Passing a frame field to a trait method. -/
 def rustArg (index : Nat) : Ty → String
-  | .u64 | .bool | .bytes => s!"a{index}"
+  | .u64 | .bool | .bytes | .option .bytes => s!"a{index}"
   | _ => s!"&a{index}"
 
 /-- Reading one field out of a request packet. -/
@@ -421,7 +427,7 @@ def rustMethod (ctor : Ctor) : String := Id.run do
 def rustTraits (all : Array Algebra) : String := Id.run do
   let mut out := ""
   for (trait, members) in rustTypeAll all (fun a c => route a.short c.short) do
-    out := out ++ traitDoc trait ++ "\n" ++ s!"pub trait {trait} \{\n"
+    out := out ++ traitDoc trait ++ "\n#[allow(clippy::too_many_arguments, clippy::type_complexity)]\n" ++ s!"pub trait {trait} \{\n"
     out := out ++ "    /// Original host error, retained without converting it into a policy result.\n    type Error;\n"
     for (_, ctor) in members do
       out := out ++ rustMethod ctor

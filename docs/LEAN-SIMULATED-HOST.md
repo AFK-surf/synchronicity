@@ -70,7 +70,10 @@ The Bao service is a trust parameter like the hash: `State.slice` and
 `State.proof` say what the host would encode for exactly the groups it is
 asked for (and whether a proof walk fits the budget); the encoding is
 appended to the private output, as a file transfer is, and never becomes a
-program value.
+program value. On the receiving side `State.decodeInline`,
+`State.decodeSlice`, `State.proven` and `State.agrees` say what a received
+encoding decodes to, whether it verifies, what a proof establishes and
+whether a donor's tree agrees with a run; flushes are recorded in `synced`.
 Literal predicates (`equals`, `notEquals`, delete bounds) have SQL `IS`
 semantics, as the store adapter renders them: NULL selects NULL and `IS NOT`
 NULL excludes it. Conflict detection and join correlation keep SQL `=`, where

@@ -9,6 +9,7 @@ import VerifiedCore.Trie.Verify
 import VerifiedCore.Trie.Mutate
 import VerifiedCore.Cas.Durable
 import VerifiedCore.Cas.Serve
+import VerifiedCore.Cas.Receive
 import VerifiedCore.Replication.History
 
 /-! The one native entry point. A command arrives as a packet, decoded with
@@ -115,6 +116,17 @@ def serving : Except Cas.Serve.Error Cas.Serve.Served → Host.Reply ByteArray
       | .overBudget level budget => .overBudget level budget
       | .host _ | .protocol => .malformed) : Except _ Served)
 
+def receiving [Encode A] : Except Cas.Receive.Error A → Host.Reply ByteArray
+  | .ok value => terminalOf (Except.ok value : Except ReceiveDomainError A)
+  | .error (.host hostFailure) => .error hostFailure
+  | .error .protocol => .error protocolFailure
+  | .error error => terminalOf (Except.error (match error with
+      | .malformed => ReceiveDomainError.malformed
+      | .columnType index column actual => .columnType index column actual
+      | .column column reason => .column column reason
+      | .sizeMismatch root recorded offered => .sizeMismatch root recorded offered
+      | .host _ | .protocol => .malformed) : Except _ A)
+
 def malformedRoot : Native := .pure (.error ⟨2, 0⟩)
 def protocol : Native := .pure (.error protocolFailure)
 
@@ -168,6 +180,15 @@ def dispatch : Command → Native
   | .casEncodeProof root requested level budget =>
     if root.size != 32 then protocol
     else command (Cas.Serve.encodeProof root requested level budget) serving
+  | .casWriteSlice root size served now cache =>
+    if root.size != 32 then protocol
+    else command (Cas.Receive.writeSlice root size served 0 now (if cache then .cache else .local)) receiving
+  | .casWriteProof root size served level now cache =>
+    if root.size != 32 then protocol
+    else command (Cas.Receive.writeProof root size served level 0 now (if cache then .cache else .local)) receiving
+  | .casPromote donor root size proven now cache =>
+    if root.size != 32 || donor.size != 32 then protocol
+    else command (Cas.Receive.promote donor root size proven now (if cache then .cache else .local)) receiving
 
 /-- Every command starts here: an undecodable packet is a protocol failure
 before any effect is requested. -/

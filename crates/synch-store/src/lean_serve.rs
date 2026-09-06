@@ -3,117 +3,13 @@
 //! much of that one exchange carries; this module is the Bao service that
 //! encodes exactly those groups, and the diagnostics of a refusal.
 
-use std::fs::File;
-
-use bao_tree::io::{outboard::PreOrderOutboard, sync::encode_ranges};
-use synch_core::{ChunkRanges, GroupRange, Hash, PROOF_NODE_LEN};
-use synch_verified::{cas, host};
+use synch_core::{ChunkRanges, Hash};
+use synch_verified::cas;
 
 use crate::{
-    cas::{to_bao_ranges, DataFile},
-    lean_diagnostics,
-    proof::{load_from_outboard, walk_proof},
-    Result, Store, StoreError,
+    lean_bao::{pairs_of, ranges_of, Bao},
+    lean_diagnostics, Result, Store, StoreError,
 };
-
-/// The Bao tree over this store's files: a trust assumption on `bao-tree`
-/// and `blake3`, exercised only for the groups the program names.
-struct Bao<'a>(&'a Store);
-
-fn ranges_of(spans: &[(u64, u64)]) -> ChunkRanges {
-    ChunkRanges::from_ranges(
-        spans
-            .iter()
-            .map(|&(start, end)| GroupRange::new(start, end)),
-    )
-}
-
-fn pairs_of(ranges: &ChunkRanges) -> Vec<(u64, u64)> {
-    ranges.ranges.iter().map(|r| (r.start, r.end)).collect()
-}
-
-fn root_of(root: &[u8]) -> Result<Hash> {
-    Hash::from_slice(root).map_err(|error| StoreError::invalid(error.to_string()))
-}
-
-impl host::Bao for Bao<'_> {
-    type Error = StoreError;
-
-    fn encode_slice(
-        &mut self,
-        root: &[u8],
-        size: u64,
-        inline: Option<&[u8]>,
-        spans: &[(u64, u64)],
-    ) -> Result<Vec<u8>> {
-        let root = root_of(root)?;
-        let tree = Store::tree(size);
-        let bao_ranges = to_bao_ranges(&ranges_of(spans));
-        let mut encoded = Vec::new();
-        let root_hash = blake3::Hash::from_bytes(root.0);
-        match inline {
-            Some(data) => {
-                let outboard = PreOrderOutboard {
-                    root: root_hash,
-                    tree,
-                    data: Vec::<u8>::new(),
-                };
-                encode_ranges(data, outboard, &bao_ranges, &mut encoded)
-            }
-            None => {
-                // Both files are read positionally, never slurped. An outboard
-                // is 1/256 of its object, so reading it whole costs 40 MB on a
-                // 10 GB object, and this runs once per served window (§6.4).
-                // What each call actually touches is the sibling hashes on the
-                // path to the requested groups.
-                let data = File::open(self.0.blob_path(&root))?;
-                let outboard = PreOrderOutboard {
-                    root: root_hash,
-                    tree,
-                    data: DataFile(File::open(self.0.outboard_path(&root))?),
-                };
-                encode_ranges(DataFile(data), outboard, &bao_ranges, &mut encoded)
-            }
-        }
-        .map_err(|error| StoreError::invalid(format!("encode slice: {error}")))?;
-        Ok(encoded)
-    }
-
-    fn encode_proof(
-        &mut self,
-        root: &[u8],
-        size: u64,
-        spans: &[(u64, u64)],
-        level: u64,
-        budget: u64,
-    ) -> Result<Option<Vec<u8>>> {
-        let root = root_of(root)?;
-        let level =
-            u8::try_from(level).map_err(|_| StoreError::invalid("proof level exceeds one byte"))?;
-        let wanted = ranges_of(spans);
-        // The outboard is read positionally, one node at a time, never
-        // slurped: the span-level round over a 100 GB object touches a few
-        // thousand of its nodes, where the outboard as a whole is hundreds of
-        // megabytes. The budget is checked before each node is loaded, so an
-        // over-budget request costs at most `budget` loads.
-        let outboard = PreOrderOutboard {
-            root: blake3::Hash::from_bytes(root.0),
-            tree: Store::tree(size),
-            data: DataFile(File::open(self.0.outboard_path(&root))?),
-        };
-        let (proof, truncated) = walk_proof(&root, size, &wanted, level, budget, false, |node| {
-            load_from_outboard(&outboard, &root, node)
-        })?;
-        if truncated.is_some() {
-            return Ok(None);
-        }
-        let mut encoded = Vec::with_capacity(proof.nodes.len() * PROOF_NODE_LEN);
-        for (_, pair) in &proof.nodes {
-            encoded.extend_from_slice(pair);
-        }
-        Ok(Some(encoded))
-    }
-}
 
 fn error(root: &Hash, error: cas::ServeError<StoreError>) -> StoreError {
     use cas::{OperationError, ServeDomainError as Domain, ServeError};
@@ -156,7 +52,7 @@ pub(crate) fn encode_slice(
     requested: &ChunkRanges,
 ) -> Result<(Vec<u8>, ChunkRanges)> {
     let mut storage = crate::lean_storage::Session::new(store);
-    let mut bao = Bao(store);
+    let mut bao = Bao::new(store);
     let (encoded, served) = cas::encode_slice(
         &mut storage,
         &mut bao,
@@ -175,7 +71,7 @@ pub(crate) fn encode_proof(
     budget: u64,
 ) -> Result<(Vec<u8>, ChunkRanges)> {
     let mut storage = crate::lean_storage::Session::new(store);
-    let mut bao = Bao(store);
+    let mut bao = Bao::new(store);
     let (encoded, served) = cas::encode_proof(
         &mut storage,
         &mut bao,
@@ -192,7 +88,8 @@ pub(crate) fn encode_proof(
 mod tests {
     use super::*;
     use crate::testutil::{data, store};
-    use synch_core::{group_count, MAX_PROOF_NODES};
+    use synch_core::{group_count, GroupRange, MAX_PROOF_NODES};
+    use synch_verified::host;
 
     /// The Bao service is asked only for groups the row holds, and a slice
     /// window never exceeds one exchange.
@@ -223,6 +120,52 @@ mod tests {
             self.asked.push(spans.to_vec());
             self.inner.encode_proof(root, size, spans, level, budget)
         }
+        fn decode_inline(
+            &mut self,
+            root: &[u8],
+            size: u64,
+            inline: Option<&[u8]>,
+            spans: &[(u64, u64)],
+            input: &[u8],
+        ) -> Result<Vec<u8>> {
+            self.inner.decode_inline(root, size, inline, spans, input)
+        }
+        fn decode_slice(
+            &mut self,
+            root: &[u8],
+            size: u64,
+            spans: &[(u64, u64)],
+            input: &[u8],
+        ) -> Result<()> {
+            self.inner.decode_slice(root, size, spans, input)
+        }
+        fn flush_object(&mut self, root: &[u8]) -> Result<()> {
+            self.inner.flush_object(root)
+        }
+        fn trim_object(&mut self, root: &[u8], size: u64) -> Result<()> {
+            self.inner.trim_object(root, size)
+        }
+        fn write_proof(
+            &mut self,
+            root: &[u8],
+            size: u64,
+            spans: &[(u64, u64)],
+            level: u64,
+            input: &[u8],
+        ) -> Result<(bool, Vec<(u64, u64, Vec<u8>, bool)>)> {
+            self.inner.write_proof(root, size, spans, level, input)
+        }
+        fn promote_run(
+            &mut self,
+            donor: &[u8],
+            root: &[u8],
+            size: u64,
+            start: u64,
+            groups: u64,
+            cv: &[u8],
+        ) -> Result<bool> {
+            self.inner.promote_run(donor, root, size, start, groups, cv)
+        }
     }
 
     #[test]
@@ -232,7 +175,7 @@ mod tests {
         let payload = data((groups * 16384) as usize);
         let root = store.ingest_bytes(&payload, 0).unwrap();
         let mut observed = Observed {
-            inner: Bao(&store),
+            inner: Bao::new(&store),
             asked: vec![],
         };
         let mut storage = crate::lean_storage::Session::new(&store);

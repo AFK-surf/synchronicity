@@ -8,6 +8,7 @@ import VerifiedCore.Trie.Verify
 import VerifiedCore.Trie.Mutate
 import VerifiedCore.Cas.Durable
 import VerifiedCore.Cas.Serve
+import VerifiedCore.Cas.Receive
 
 /-! The shapes that cross the command boundary: what a caller asks for and
 what a finished command reports. `hostgen` derives the codecs of every type
@@ -73,6 +74,17 @@ inductive Command where
   /-- Serve the interior tree over the requested group spans, no deeper than
   `level`, refused whole beyond `budget` nodes. -/
   | casEncodeProof (root : ByteArray) (requested : List (UInt64 × UInt64)) (level budget : UInt64)
+  /-- Decode a received slice (the run's first byte input) of the served
+  spans and commit exactly the groups it verified. -/
+  | casWriteSlice (root : ByteArray) (size : UInt64) (served : List (UInt64 × UInt64))
+      (now : Int64) (cache : Bool)
+  /-- Verify a received proof (the run's first byte input) over the served
+  spans at `level` and record its tree. -/
+  | casWriteProof (root : ByteArray) (size : UInt64) (served : List (UInt64 × UInt64))
+      (level : UInt64) (now : Int64) (cache : Bool)
+  /-- Promote the donor's bytes for every proven subtree its tree agrees with. -/
+  | casPromote (donor root : ByteArray) (size : UInt64) (proven : List Cas.Receive.ProvenSubtree)
+      (now : Int64) (cache : Bool)
 
 /-- Malformed metadata or a column of the wrong storage class, as pin
 acquisition and deletion report it. -/
@@ -116,6 +128,14 @@ inductive ServeDomainError where
   | columnType (index : Nat) (column : String) (actual : Cas.Codec.CellType)
   | column (column : String) (reason : String)
   | overBudget (level budget : UInt64)
+  deriving BEq, DecidableEq
+
+/-- How receiving refuses: a malformed row, or a claim the row cannot yield to. -/
+inductive ReceiveDomainError where
+  | malformed
+  | columnType (index : Nat) (column : String) (actual : Cas.Codec.CellType)
+  | column (column : String) (reason : String)
+  | sizeMismatch (root : ByteArray) (recorded offered : UInt64)
   deriving BEq, DecidableEq
 
 inductive HistoryDomainError where

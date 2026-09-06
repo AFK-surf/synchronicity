@@ -38,7 +38,11 @@ counter/unlink services; `synch-store`'s five SQL bodies are deleted and
 (`Cas/Serve.lean`: which requested groups the row holds, the one-exchange
 window, the single-group and over-budget answers) is a pair of whole
 commands over the row statement and a `Bao` host algebra whose encodings
-land in the private output sink; the Bao tree stays a Rust service. History retention now runs as a
+land in the private output sink; the Bao tree stays a Rust service.
+Receiving (`Cas/Receive.lean`: a verified slice, a tree proof, a donor
+promotion) is three whole commands over the same commit, the write lease
+and further `Bao` effects that decode, verify, copy, flush and trim exactly
+what the program names; `synch-store`'s orchestration is deleted. History retention now runs as a
 complete Lean operation over raw scans and a separate Ed25519 primitive; the
 Rust retention loop and receipt/fork helpers are removed. Raw scans retain
 rows before a trailing host failure so Lean owns first-error selection.

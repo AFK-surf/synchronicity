@@ -581,6 +581,14 @@ impl<E> Default for Capabilities<'_, E> {
     }
 }
 
+/// A protocol failure delivered into the program, so its own cleanup runs.
+fn protocol_failure() -> Vec<u8> {
+    let mut out = vec![1, 0];
+    word(&mut out, 3);
+    word(&mut out, 0);
+    out
+}
+
 /// Append a host encoding to the output sink and reply with the count it
 /// added, shaped by `wrap`. A sink that cannot grow is a protocol failure
 /// delivered into the program, so its own cleanup still runs.
@@ -710,6 +718,72 @@ fn execute<E>(
                         &mut errors,
                         EncodeReply::encode,
                     ),
+                }
+            }
+            // Received encodings are decoded out of the run's byte inputs
+            // straight into the object's files or inline buffer; the program
+            // names the input by handle and never holds the encoding.
+            Frame::DecodeInline(root, size, inline, spans, input) => {
+                let bao = capabilities
+                    .bao
+                    .as_deref_mut()
+                    .ok_or(OperationError::Protocol)?;
+                match usize::try_from(input)
+                    .ok()
+                    .and_then(|input| inputs.get(input))
+                {
+                    Some(encoded) => reply(
+                        57,
+                        bao.decode_inline(root, size, inline, &spans, encoded),
+                        &mut errors,
+                        EncodeReply::encode,
+                    ),
+                    None => protocol_failure(),
+                }
+            }
+            Frame::DecodeSlice(root, size, spans, input) => {
+                let bao = capabilities
+                    .bao
+                    .as_deref_mut()
+                    .ok_or(OperationError::Protocol)?;
+                match usize::try_from(input)
+                    .ok()
+                    .and_then(|input| inputs.get(input))
+                {
+                    Some(encoded) => reply(
+                        58,
+                        bao.decode_slice(root, size, &spans, encoded),
+                        &mut errors,
+                        EncodeReply::encode,
+                    ),
+                    None => protocol_failure(),
+                }
+            }
+            Frame::WriteProof(root, size, spans, level, input) => {
+                let bao = capabilities
+                    .bao
+                    .as_deref_mut()
+                    .ok_or(OperationError::Protocol)?;
+                match usize::try_from(input)
+                    .ok()
+                    .and_then(|input| inputs.get(input))
+                {
+                    Some(encoded) => reply(
+                        61,
+                        bao.write_proof(root, size, &spans, level, encoded),
+                        &mut errors,
+                        |out, (wrote, proven)| {
+                            out.push(u8::from(wrote));
+                            word(out, proven.len() as u64);
+                            for (start, groups, cv, whole) in proven {
+                                word(out, start);
+                                word(out, groups);
+                                bytes(out, &cv);
+                                out.push(u8::from(whole));
+                            }
+                        },
+                    ),
+                    None => protocol_failure(),
                 }
             }
             Frame::Append(bytes) => match capabilities.output.as_deref_mut() {

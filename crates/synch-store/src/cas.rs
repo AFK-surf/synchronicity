@@ -1367,56 +1367,64 @@ impl Store {
         encoded: &[u8],
         now: i64,
     ) -> Result<ChunkRanges> {
-        let groups = group_count(size);
-        let served = served.intersect(&ChunkRanges::single(0, groups));
-        if served.is_empty() {
-            return Ok(ChunkRanges::empty());
-        }
-        // Taken before the row is read and held past the commit: everything
-        // between is file IO with no lock held, and a sweep deciding this object
-        // is collectable in that window would unlink the bytes out from under
-        // the row this is about to write ([`Store::lease_write`]).
-        let _lease = self.lease_write(root);
-        let tree = Self::tree(size);
-        let bao_ranges = to_bao_ranges(&served);
-        let root_hash = blake3::Hash::from_bytes(root.0);
+        crate::lean_receive::write_slice(self, root, size, served, encoded, now)
+    }
 
-        // The cheap refusal; the commit decides again, transactionally. This
-        // one is here so a claim that cannot possibly stand never reaches the
-        // disk at all.
-        self.admit_size(root, size)?;
-        let existing = self.blob(root)?;
-        if existing.as_ref().is_some_and(|row| row.complete) {
-            return Ok(ChunkRanges::empty());
-        }
+    /// The inline half of the Bao slice service: decode `encoded`, a slice of
+    /// exactly `served`, against the root into the object's inline buffer,
+    /// starting from the bytes the row already holds and zero-filled to `size`.
+    pub(crate) fn decode_inline(
+        &self,
+        root: &Hash,
+        size: u64,
+        inline: Option<&[u8]>,
+        served: &ChunkRanges,
+        encoded: &[u8],
+    ) -> Result<Vec<u8>> {
+        let mut buffer = inline
+            .map(<[u8]>::to_vec)
+            .unwrap_or_else(|| vec![0u8; size as usize]);
+        buffer.resize(size as usize, 0);
+        let outboard = PreOrderOutboard {
+            root: blake3::Hash::from_bytes(root.0),
+            tree: Self::tree(size),
+            data: Vec::<u8>::new(),
+        };
+        decode_ranges(
+            std::io::Cursor::new(encoded),
+            &to_bao_ranges(served),
+            buffer.as_mut_slice(),
+            MemOutboard(outboard),
+        )
+        .map_err(|e| StoreError::Verification {
+            root: *root,
+            reason: e.to_string(),
+        })?;
+        Ok(buffer)
+    }
 
-        // Small objects are decoded in memory and inlined; larger ones stream
-        // into the sparse payload and outboard files.
-        if size <= INLINE_BLOB_MAX {
-            let mut buffer = existing
-                .as_ref()
-                .and_then(|r| r.inline.clone())
-                .unwrap_or_else(|| vec![0u8; size as usize]);
-            buffer.resize(size as usize, 0);
-            let outboard = PreOrderOutboard {
-                root: root_hash,
-                tree,
-                data: Vec::<u8>::new(),
-            };
-            decode_ranges(
-                std::io::Cursor::new(encoded),
-                &bao_ranges,
-                buffer.as_mut_slice(),
-                MemOutboard(outboard),
-            )
-            .map_err(|e| StoreError::Verification {
-                root: *root,
-                reason: e.to_string(),
-            })?;
-            self.commit_groups(root, size, &served, Some(buffer), now)?;
-            return Ok(served);
-        }
-
+    /// The file half of the Bao slice service: decode `encoded`, a slice of
+    /// exactly `served`, against the root into the object's sparse payload and
+    /// outboard, created as needed and left unflushed.
+    ///
+    /// Not pre-grown at all, and never shrunk. Never shrunk, because sizing a
+    /// file down on the strength of a claim is how an understated entry
+    /// destroys verified groups: bytes gone, bitmap bits intact, the node
+    /// advertising a group it can no longer serve ([`grow_to`],
+    /// `docs/DELTA-SYNC.md` §6). Not pre-grown, because `size` is a peer's
+    /// assertion off an entry and this runs *before* `decode_ranges` turns any
+    /// of it into fact: an entry claiming 32 TiB for any root would otherwise
+    /// have every node that attempts a fetch create a 32 TiB payload and a
+    /// 128 GiB outboard, fail verification, and leave both behind. The decode
+    /// extends the file as each verified group lands, so the payload never
+    /// gets longer than the bytes proven against the root.
+    pub(crate) fn decode_slice_into_files(
+        &self,
+        root: &Hash,
+        size: u64,
+        served: &ChunkRanges,
+        encoded: &[u8],
+    ) -> Result<()> {
         let payload_path = self.blob_path(root);
         if let Some(parent) = payload_path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -1427,24 +1435,6 @@ impl Store {
             .create(true)
             .truncate(false)
             .open(&payload_path)?;
-        // Not pre-grown at all, and never shrunk.
-        //
-        // Never shrunk, because sizing a file down on the strength of a claim
-        // is how an understated entry destroys verified groups — bytes gone,
-        // bitmap bits intact, the node advertising a group it can no longer
-        // serve ([`grow_to`], `docs/DELTA-SYNC.md` §6).
-        //
-        // Not pre-grown, because `size` is a peer's assertion off an entry and
-        // this runs *before* `decode_ranges` turns any of it into fact. An
-        // entry claiming 32 TiB for any root would otherwise have every node
-        // that attempts a fetch create a 32 TiB payload and a 128 GiB outboard,
-        // fail verification, and leave both behind — `trim_to_size` only runs
-        // on a commit that completed the object, so nothing reclaims them.
-        //
-        // Let the decode extend the file: `write_at` grows it as each verified
-        // group lands, so the
-        // payload never gets longer than the bytes that have been proven
-        // against the root, whatever the window's position.
         let outboard_file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -1452,60 +1442,40 @@ impl Store {
             .truncate(false)
             .open(self.outboard_path(root))?;
         let outboard = PreOrderOutboard {
-            root: root_hash,
-            tree,
+            root: blake3::Hash::from_bytes(root.0),
+            tree: Self::tree(size),
             data: outboard_file,
         };
-        let payload_for_sync = payload.try_clone().ok();
         decode_ranges(
             std::io::Cursor::new(encoded),
-            &bao_ranges,
+            &to_bao_ranges(served),
             DataFile(payload),
             outboard,
         )
         .map_err(|e| StoreError::Verification {
             root: *root,
             reason: e.to_string(),
-        })?;
+        })
+    }
 
-        // Persist the verified groups (payload and outboard) before the bitmap
-        // in the index advances to cover them — otherwise a crash could leave
-        // the index claiming groups the disk never received.
-        // Both flushes are checked. Swallowing them would let an EIO or ENOSPC
-        // on flush advance the bitmap over data that never reached stable
-        // storage — the exact inversion of the ordering this block exists to
-        // enforce. `try_clone` may likewise not fail silently: it fails under
-        // fd exhaustion, which is precisely when the machine is least able to
-        // afford an unflushed commit.
-        let payload = payload_for_sync.ok_or_else(|| StoreError::Verification {
-            root: *root,
-            reason: "could not duplicate the payload handle to flush it".into(),
-        })?;
-        fsync_file(&payload)?;
-        // The directory entries too, not only the contents. Both files are
-        // opened `create(true)`, so the first window of a fetch creates them —
-        // and `fsync` promises the bytes, not that the name they hang from
-        // survives. The mainstream Linux filesystems do persist a new file's
-        // dirent on its own `fsync`, so this is defence in depth rather than a
-        // live hole, but the two other creation sites here (`ingest_file` and
-        // `write_and_sync`) both do it, and unlike the orphan case a lost name
-        // under an advanced bitmap never self-heals: the row goes on claiming
-        // groups whose bytes are unreachable.
-        fsync_parent(&payload_path);
-        // Reopened for *write* to flush it. `File::open` hands back a read-only
-        // handle, and Windows refuses `FlushFileBuffers` on one with
-        // ERROR_ACCESS_DENIED — a hard failure here, since these flushes are
-        // checked rather than discarded. Unix does not care either way.
-        fsync_file(
-            &OpenOptions::new()
-                .write(true)
-                .open(self.outboard_path(root))?,
-        )?;
-        fsync_parent(&self.outboard_path(root));
-
-        let commit = self.commit_groups(root, size, &served, None, now)?;
-        self.trim_to_size(root, commit);
-        Ok(served)
+    /// Flush the object's payload and outboard, contents and directory
+    /// entries, to stable storage; a file that does not exist has nothing to
+    /// flush. Both flushes are checked: swallowing them would let an EIO or
+    /// ENOSPC on flush advance the bitmap over data that never reached stable
+    /// storage. The directory entries too, not only the contents: the first
+    /// window of a fetch creates the files, and `fsync` promises the bytes,
+    /// not that the name they hang from survives; unlike an orphaned file, a
+    /// lost name under an advanced bitmap never self-heals. Reopened for
+    /// *write* to flush, which is what Windows requires of a flush.
+    pub(crate) fn flush_object(&self, root: &Hash) -> Result<()> {
+        for path in [self.blob_path(root), self.outboard_path(root)] {
+            if !path.is_file() {
+                continue;
+            }
+            fsync_file(&OpenOptions::new().write(true).open(&path)?)?;
+            fsync_parent(&path);
+        }
+        Ok(())
     }
 }
 

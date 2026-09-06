@@ -42,6 +42,7 @@ fn main() {
         "Cas/Input",
         "Cas/Durable",
         "Cas/Serve",
+        "Cas/Receive",
         "Host/Wire",
         "Trie/Codec",
         "Trie/Program",

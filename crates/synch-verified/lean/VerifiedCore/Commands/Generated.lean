@@ -149,6 +149,18 @@ instance : Decode Trie.MutationError where
     | 4 => return .depthExceeded
     | _ => throw ()
 
+instance : Encode Cas.Receive.ProvenSubtree where
+  encode out value := match value with
+    | .mk a0 a1 a2 a3 => out |>.put a0 |>.put a1 |>.put a2 |>.put a3
+
+instance : Decode Cas.Receive.ProvenSubtree where
+  decode := do
+    let a0 ← Decode.decode
+    let a1 ← Decode.decode
+    let a2 ← Decode.decode
+    let a3 ← Decode.decode
+    return .mk a0 a1 a2 a3
+
 instance : Encode Commands.LifecycleDomainError where
   encode out value := match value with
     | .malformed => out.push 0
@@ -249,6 +261,22 @@ instance : Decode Commands.ServeDomainError where
     | 4 => return .overBudget (← Decode.decode) (← Decode.decode)
     | _ => throw ()
 
+instance : Encode Commands.ReceiveDomainError where
+  encode out value := match value with
+    | .malformed => out.push 0
+    | .columnType a0 a1 a2 => out.push 1 |>.put a0 |>.put a1 |>.put a2
+    | .column a0 a1 => out.push 2 |>.put a0 |>.put a1
+    | .sizeMismatch a0 a1 a2 => out.push 3 |>.put a0 |>.put a1 |>.put a2
+
+instance : Decode Commands.ReceiveDomainError where
+  decode := do
+    match ← readByte with
+    | 0 => return .malformed
+    | 1 => return .columnType (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 2 => return .column (← Decode.decode) (← Decode.decode)
+    | 3 => return .sizeMismatch (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | _ => throw ()
+
 instance : Encode Commands.Ingested where
   encode out value := match value with
     | .mk a0 a1 => out |>.put a0 |>.put a1
@@ -302,6 +330,9 @@ instance : Encode Commands.Command where
     | .casClearCache a0 => out.push 18 |>.put a0
     | .casEncodeSlice a0 a1 => out.push 19 |>.put a0 |>.put a1
     | .casEncodeProof a0 a1 a2 a3 => out.push 20 |>.put a0 |>.put a1 |>.put a2 |>.put a3
+    | .casWriteSlice a0 a1 a2 a3 a4 => out.push 21 |>.put a0 |>.put a1 |>.put a2 |>.put a3 |>.put a4
+    | .casWriteProof a0 a1 a2 a3 a4 a5 => out.push 22 |>.put a0 |>.put a1 |>.put a2 |>.put a3 |>.put a4 |>.put a5
+    | .casPromote a0 a1 a2 a3 a4 a5 => out.push 23 |>.put a0 |>.put a1 |>.put a2 |>.put a3 |>.put a4 |>.put a5
 
 instance : Decode Commands.Command where
   decode := do
@@ -327,6 +358,9 @@ instance : Decode Commands.Command where
     | 18 => return .casClearCache (← Decode.decode)
     | 19 => return .casEncodeSlice (← Decode.decode) (← Decode.decode)
     | 20 => return .casEncodeProof (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 21 => return .casWriteSlice (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 22 => return .casWriteProof (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 23 => return .casPromote (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode)
     | _ => throw ()
 
 end VerifiedCore

@@ -56,6 +56,17 @@ structure State where
     fun _ _ _ _ => ByteArray.empty
   proof : ByteArray → UInt64 → List (UInt64 × UInt64) → UInt64 → UInt64 → Option ByteArray :=
     fun _ _ _ _ _ => some ByteArray.empty
+  /-- What a received slice of these spans decodes to inline (`none`: it does
+  not verify), whether one decodes into the files, what a received proof
+  establishes (`none`: it does not verify), and whether a donor's tree agrees
+  with a run. -/
+  decodeInline : ByteArray → UInt64 → Option ByteArray → List (UInt64 × UInt64) → UInt64 →
+    Option ByteArray := fun _ _ inline _ _ => some (inline.getD ByteArray.empty)
+  decodeSlice : ByteArray → UInt64 → List (UInt64 × UInt64) → UInt64 → Bool := fun _ _ _ _ => true
+  proven : ByteArray → UInt64 → List (UInt64 × UInt64) → UInt64 → UInt64 →
+    Option (Bool × List (UInt64 × UInt64 × ByteArray × Bool)) := fun _ _ _ _ _ => some (false, [])
+  agrees : ByteArray → ByteArray → UInt64 → UInt64 → UInt64 → ByteArray → Bool :=
+    fun _ _ _ _ _ _ => false
 
 abbrev Result (A : Type) := A × State
 
@@ -290,6 +301,23 @@ def bao : Bao A → State → Result A
       | none => (.ok none, state)
       | some encoded =>
         (.ok (some encoded.size.toUInt64), { state with output := state.output ++ encoded.data.toList })
+  | .decodeInline root size inline spans input, state => reply state "bao:decodeInline" fun state =>
+      match state.decodeInline root size inline spans input with
+      | none => (.error invalid, state)
+      | some buffer => (.ok buffer, state)
+  | .decodeSlice root size spans input, state => reply state "bao:decodeSlice" fun state =>
+      if state.decodeSlice root size spans input then
+        (.ok (), { state with files := writeFile state.files ("cas_payload", root) ByteArray.empty })
+      else (.error invalid, state)
+  | .flushObject root, state => reply state "bao:flush" fun state =>
+      (.ok (), { state with synced := ("cas_payload", root) :: state.synced })
+  | .trimObject _ _, state => reply state "bao:trim" fun state => (.ok (), state)
+  | .writeProof root size spans level input, state => reply state "bao:writeProof" fun state =>
+      match state.proven root size spans level input with
+      | none => (.error invalid, state)
+      | some answer => (.ok answer, state)
+  | .promoteRun donor root size start groups cv, state => reply state "bao:promoteRun" fun state =>
+      (.ok (state.agrees donor root size start groups cv), state)
 
 /-- Capability composition is shared by every proof and every operation. -/
 class Interpreter (E : Type → Type) where

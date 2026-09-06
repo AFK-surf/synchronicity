@@ -263,29 +263,45 @@ in-memory outboard) stays Rust until C4. The requester-facing terminal
 carries the byte count and the served spans, so `SliceEnd`/`ProofEnd` are
 unchanged.
 
-**C2. Verified receive** (`Cas/Receive.lean`, `Cas/Delta.lean`). `writeSlice`
-owns the lease, `admit`, the row read, the complete short-circuit, the inline
-buffer versus never-pre-grown-never-shrunk file policy, the order of flushes
-(payload, then outboard, then parents) and the metadata commit: it asks the
-`Bao` service for one `decodeSlice` of the stream into the opened payload and
-outboard, takes the verified spans the service answers, and only then runs
-`IngestCommit.commitGroups` with them and `trim`. `writeProof` and `promote`
-likewise ask the service to verify a proof or to compare-then-copy a donor
-run, and own the outboard reach rule, the extent-equality check and the
-commit. The Bao tree, chaining values and slice formats stay in Rust: they
-are a trust assumption on `bao-tree`/`blake3`, tested against standard
-vectors and the same encoder the serve path reads, exactly as construction
-already is for ingestion. Proofs: the committed spans are exactly the spans
-the service reported verified, never a superset; flushes precede the commit;
-the outboard is never asked to be written beyond `reach`; promotion commits a
-run only when the service reported the extents equal; every effect failure
-leaves the row as it was, with the lease released. This slice also closes
-the existing gap: `commitGroups` with arbitrary spans and `admit` get
-execution theorems on the simulated host, composed with `CasReadPromises` so
-that "downloading more preserves what you have" becomes a statement about the
-executed receive, not only the planner. Cutover: `write_slice`, `write_proof`,
-`promote`, `trim_to_size`. No per-group round trips: the throughput of the
-Rust decoder is kept by construction.
+**C2. Verified receive** (`Cas/Receive.lean`). Done. `writeSlice`,
+`writeProof` and `promote` run as the whole commands `casWriteSlice`,
+`casWriteProof` and `casPromote` over the metadata commit's algebra, the
+`Lease` algebra and six more `Bao` effects (`decodeInline`, `decodeSlice`,
+`flushObject`, `trimObject`, `writeProof`, `promoteRun`). Lean owns the
+write lease bracket (taken before the row is read, released exactly once),
+`admit`, the row read and its complete short-circuit, the window within the
+object, the inline-buffer-versus-file split at 16 KiB, the flush before the
+commit, `commitGroups` with exactly the window, the trim of a completed
+object, the held-nothing row a proof with interior nodes records, and every
+promotion eligibility rule (no overlap with a held group; a single group or
+a whole subtree; the donor covers the run; equal extents in both objects;
+a donor with verified out-of-line groups and more than one of them). The
+service decodes a received encoding out of the run's byte input straight
+into the object's files or inline buffer, verifies a proof and writes its
+nodes as far as they reach, compares a chaining value and copies a run on
+a match, and flushes and trims files: the Bao tree, both formats, the walk,
+the chaining-value comparison and the reach stay Rust as a trust assumption
+on `bao-tree`/`blake3`. Proved (`CasReceiveProofs`): on the simulated host
+a slice into a fresh store commits exactly the window (the planner's row
+for `none` and the window, as `committed` spells it) with the lease
+bracketing the whole and the decode and flush strictly before the
+transaction; the inline path likewise; a proof with nodes records the
+held-nothing row after its flush and one without records nothing; an empty
+window takes no lease; a claim the row cannot yield to is refused before
+anything is decoded; a promotion asks the service only about eligible runs
+(never a held group: `eligible_disjoint`, `eligible_covered`,
+`eligible_whole`) and commits exactly the runs the donor's tree agreed
+with; and a failure at every effect before the commit leaves no row and no
+lease. Not proved: the "downloading more preserves what you have"
+composition with `CasReadPromises`, which needs the read path's row
+predicate stated over a bitmap row; `size_bracket.rs` and `proof.rs` tests
+remain that evidence. Cutover: `Store::write_slice`, `write_proof`,
+`promote` delegate; their orchestration, the eligibility checks and
+`open_donor`'s policy are deleted; the decode, verify, copy, flush and trim
+halves are the service (`lean_bao.rs`, `cas.rs`, `proof.rs`).
+`cache_trusted_range` (cloud) still calls `commit_groups` and
+`trim_to_size` directly until C4. No per-group round trips: one decode per
+window, as before.
 
 **C3. Durability transitions** (`Cas/Durable.lean`). Done. `markDurable`,
 `adoptDurable`, `healMissing`, `reconcileScratch` and `clearCache` run as

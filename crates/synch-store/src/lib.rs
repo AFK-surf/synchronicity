@@ -10,6 +10,7 @@ pub mod db;
 pub mod error;
 pub mod gc;
 pub mod heads;
+mod lean_bao;
 mod lean_diagnostics;
 mod lean_durable;
 mod lean_history;
@@ -23,6 +24,7 @@ mod lean_ingest_metadata;
 #[cfg(all(test, unix))]
 mod lean_ingest_streams;
 mod lean_read;
+mod lean_receive;
 mod lean_resources;
 mod lean_serve;
 mod lean_storage;

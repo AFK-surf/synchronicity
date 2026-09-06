@@ -400,6 +400,21 @@ Integration review has identified specific gates, not waived limitations:
   the slice and proof formats and the walk remain Rust (`lean_serve.rs`) as
   a trust assumption; the Rust window computation is deleted, and the
   cloud path's in-memory `encode_complete_proof` stays until C4.
+- Receiving is now the whole commands `casWriteSlice`, `casWriteProof` and
+  `casPromote` (`Cas/Receive.lean`) over the metadata commit, the write
+  lease and six further `Bao` effects. Lean owns the lease bracket, the
+  cheap size refusal, the row read and complete short-circuit, the window,
+  the inline-versus-file split, the flush before the commit, the commit of
+  exactly the window, the trim of a completed object, the held-nothing row a
+  proof records, and the promotion eligibility rules; the service decodes a
+  received encoding out of the run's byte input straight into the files or
+  the inline buffer, verifies a proof and writes its nodes to their reach,
+  compares a chaining value and copies a run on a match, flushes and trims.
+  `CasReceiveProofs` derives the committed row and the effect order on the
+  simulated host (decode and flush before the transaction, the lease around
+  everything, no row and no lease after any failure before the commit) and
+  proves a promotion never asks about a held group. The Rust orchestration
+  of `write_slice`, `write_proof` and `promote` is deleted.
 - Native tests now cover acquisition transport, every effect-failure position,
   repeated polling, malformed replies and terminal resume. Generic SQLite tests
   cover UPSERT identity/time preservation, raw cells, failed commit, abandoned

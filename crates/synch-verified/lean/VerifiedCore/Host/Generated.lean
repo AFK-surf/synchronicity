@@ -310,19 +310,43 @@ instance : WireEffect ByteWrites := ⟨ByteWrites.request, ByteWrites.reply⟩
 def Bao.tag : Bao A → UInt8
   | .encodeSlice _ _ _ _ => 55
   | .encodeProof _ _ _ _ _ => 56
+  | .decodeInline _ _ _ _ _ => 57
+  | .decodeSlice _ _ _ _ => 58
+  | .flushObject _ => 59
+  | .trimObject _ _ => 60
+  | .writeProof _ _ _ _ _ => 61
+  | .promoteRun _ _ _ _ _ _ => 62
 
 def Bao.name : Bao A → String
   | .encodeSlice _ _ _ _ => "encodeSlice"
   | .encodeProof _ _ _ _ _ => "encodeProof"
+  | .decodeInline _ _ _ _ _ => "decodeInline"
+  | .decodeSlice _ _ _ _ => "decodeSlice"
+  | .flushObject _ => "flushObject"
+  | .trimObject _ _ => "trimObject"
+  | .writeProof _ _ _ _ _ => "writeProof"
+  | .promoteRun _ _ _ _ _ _ => "promoteRun"
 
 def Bao.request : Bao A → ByteArray
   | .encodeSlice a0 a1 a2 a3 => header 55 |>.put a0 |>.put a1 |>.put a2 |>.put a3
   | .encodeProof a0 a1 a2 a3 a4 => header 56 |>.put a0 |>.put a1 |>.put a2 |>.put a3 |>.put a4
+  | .decodeInline a0 a1 a2 a3 a4 => header 57 |>.put a0 |>.put a1 |>.put a2 |>.put a3 |>.put a4
+  | .decodeSlice a0 a1 a2 a3 => header 58 |>.put a0 |>.put a1 |>.put a2 |>.put a3
+  | .flushObject a0 => header 59 |>.put a0
+  | .trimObject a0 a1 => header 60 |>.put a0 |>.put a1
+  | .writeProof a0 a1 a2 a3 a4 => header 61 |>.put a0 |>.put a1 |>.put a2 |>.put a3 |>.put a4
+  | .promoteRun a0 a1 a2 a3 a4 a5 => header 62 |>.put a0 |>.put a1 |>.put a2 |>.put a3 |>.put a4 |>.put a5
 
 def Bao.reply (effect : Bao A) (input : ByteArray) : A :=
   match effect with
   | .encodeSlice _ _ _ _ => decodeReply 55 Decode.decode input
   | .encodeProof _ _ _ _ _ => decodeReply 56 Decode.decode input
+  | .decodeInline _ _ _ _ _ => decodeReply 57 Decode.decode input
+  | .decodeSlice _ _ _ _ => decodeReply 58 Decode.decode input
+  | .flushObject _ => decodeReply 59 Decode.decode input
+  | .trimObject _ _ => decodeReply 60 Decode.decode input
+  | .writeProof _ _ _ _ _ => decodeReply 61 Decode.decode input
+  | .promoteRun _ _ _ _ _ _ => decodeReply 62 Decode.decode input
 
 instance : WireEffect Bao := ⟨Bao.request, Bao.reply⟩
 
