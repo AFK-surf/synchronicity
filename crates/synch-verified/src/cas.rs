@@ -9,6 +9,7 @@ pub enum Outcome {
     Applied,
 }
 
+use crate::operation::Capabilities;
 pub use crate::operation::OperationError;
 
 /// Input resource bound to the invocation's `input` namespace. Lean observes
@@ -31,7 +32,7 @@ pub enum DirectoryPolicy {
     AllowUnsupported,
 }
 
-pub use crate::host::WriteServices as IngestResources;
+pub use crate::host::IngestResources;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Ingested {
@@ -79,13 +80,15 @@ fn decode_column_type(
     Ok((index, column, actual))
 }
 
-fn decode_ingest(bytes: &[u8]) -> Result<Result<Ingested, IngestDomainError>, ()> {
+/// The metadata terminal every commit-shaped operation frames the same way:
+/// tag 0 carries the operation's own value, tags 1 to 4 the domain errors.
+fn decode_metadata<A>(
+    bytes: &[u8],
+    value: impl FnOnce(&mut crate::operation::Reader<'_>) -> Result<A, ()>,
+) -> Result<Result<A, IngestDomainError>, ()> {
     let mut reader = crate::operation::Reader(bytes);
     let result = match reader.byte()? {
-        0 => Ok(Ingested {
-            root: reader.byte_slice()?.try_into().map_err(|_| ())?,
-            size: reader.word()?,
-        }),
+        0 => Ok(value(&mut reader)?),
         1 => Err(IngestDomainError::Malformed),
         2 => {
             let (index, column, actual) = decode_column_type(&mut reader)?;
@@ -107,10 +110,119 @@ fn decode_ingest(bytes: &[u8]) -> Result<Result<Ingested, IngestDomainError>, ()
     Ok(result)
 }
 
+fn decode_ingest(bytes: &[u8]) -> Result<Result<Ingested, IngestDomainError>, ()> {
+    decode_metadata(bytes, |reader| {
+        Ok(Ingested {
+            root: reader.byte_slice()?.try_into().map_err(|_| ())?,
+            size: reader.word()?,
+        })
+    })
+}
+
+fn finish_metadata<A, E>(
+    result: Result<Vec<u8>, OperationError<E>>,
+    value: impl FnOnce(&mut crate::operation::Reader<'_>) -> Result<A, ()>,
+) -> Result<A, IngestError<E>> {
+    let bytes = result.map_err(IngestError::Operation)?;
+    decode_metadata(&bytes, value)
+        .map_err(|()| IngestError::Operation(OperationError::Protocol))?
+        .map_err(IngestError::Domain)
+}
+
+/// What a commit settled: the size the row records now, and whether every
+/// group of the object is present.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct Committed {
+    pub size: u64,
+    pub complete: bool,
+}
+
+fn encode_spans(spans: &[(u64, u64)]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(8 + spans.len() * 16);
+    out.extend_from_slice(&(spans.len() as u64).to_le_bytes());
+    for (start, stop) in spans {
+        out.extend_from_slice(&start.to_le_bytes());
+        out.extend_from_slice(&stop.to_le_bytes());
+    }
+    out
+}
+
+/// Record verified groups of an object through Lean's metadata commit: the
+/// offered size is settled against the row's claim inside the transaction,
+/// the groups are merged into what the row holds, and one row is written.
+/// Every writer of an object commits this way, whatever produced the bytes.
+pub fn commit_groups<S: crate::host::Storage>(
+    storage: &mut S,
+    root: &[u8; 32],
+    size: u64,
+    spans: &[(u64, u64)],
+    inline: Option<&[u8]>,
+    now: i64,
+    tier: IngestTier,
+) -> Result<Committed, IngestError<S::Error>> {
+    use crate::operation::Slice;
+    unsafe extern "C" {
+        fn synch_adapter_operation_commit_groups(
+            root: Slice,
+            spans: Slice,
+            size: u64,
+            has_inline: u8,
+            inline: Slice,
+            now: i64,
+            cache: u8,
+        ) -> *mut std::ffi::c_void;
+    }
+    let spans = encode_spans(spans);
+    // SAFETY: the runner initializes Lean and owns the fresh thread-confined
+    // continuation; the constructor copies every borrowed slice.
+    let result = unsafe {
+        crate::operation::run(storage, Capabilities::default(), &[], || {
+            synch_adapter_operation_commit_groups(
+                root.as_slice().into(),
+                spans.as_slice().into(),
+                size,
+                u8::from(inline.is_some()),
+                inline.unwrap_or(&[]).into(),
+                now,
+                u8::from(tier == IngestTier::Cache),
+            )
+        })
+    };
+    finish_metadata(result, |reader| {
+        let size = reader.word()?;
+        let complete = match reader.byte()? {
+            0 => false,
+            1 => true,
+            _ => return Err(()),
+        };
+        Ok(Committed { size, complete })
+    })
+}
+
+/// The cheap refusal: a size the row's claim cannot yield to is rejected
+/// before any bytes are decoded against it. The commit decides again.
+pub fn admit_size<S: crate::host::Storage>(
+    storage: &mut S,
+    root: &[u8; 32],
+    size: u64,
+) -> Result<(), IngestError<S::Error>> {
+    use crate::operation::Slice;
+    unsafe extern "C" {
+        fn synch_adapter_operation_admit_size(root: Slice, size: u64) -> *mut std::ffi::c_void;
+    }
+    // SAFETY: as for `commit_groups`.
+    let result = unsafe {
+        crate::operation::run(storage, Capabilities::default(), &[], || {
+            synch_adapter_operation_admit_size(root.as_slice().into(), size)
+        })
+    };
+    finish_metadata(result, |_| Ok(()))
+}
+
 /// Ingest one invocation-bound input through Lean's complete command, including
 /// capture, staging, leases, durability and atomic metadata publication. The
 /// bytes themselves are hashed and laid out by the host's construction service.
-pub fn ingest<S: crate::host::Upsert>(
+pub fn ingest<S: crate::host::Storage>(
     storage: &mut S,
     resources: IngestResources<'_, S::Error>,
     input: IngestInput,
@@ -133,8 +245,16 @@ pub fn ingest<S: crate::host::Upsert>(
     };
     // SAFETY: the runner initializes Lean and owns the fresh thread-confined
     // continuation; the constructor receives only copied scalar command values.
+    let capabilities = Capabilities {
+        files: Some(resources.files),
+        construct: Some(resources.construct),
+        temporary: Some(resources.temporary),
+        leases: Some(resources.leases),
+        source: Some(resources.source),
+        ..Capabilities::default()
+    };
     let result = unsafe {
-        crate::operation::run_ingest(storage, resources, || {
+        crate::operation::run(storage, capabilities, &[], || {
             synch_adapter_operation_ingest(
                 kind,
                 size,
@@ -273,7 +393,7 @@ fn finish_read<E>(result: &[u8], output: ReadOutput<E>) -> Result<Vec<u8>, ReadE
 /// Execute one complete local read with raw storage, file and clock services.
 /// The constructor copies its command inputs; no CAS metadata or mutation plan
 /// is interpreted by this facade.
-pub fn read<S: crate::host::Access>(
+pub fn read<S: crate::host::Storage>(
     storage: &mut S,
     files: &mut dyn crate::host::FileIO<Error = S::Error>,
     clock: &mut dyn crate::host::Clock<Error = S::Error>,
@@ -299,8 +419,14 @@ pub fn read<S: crate::host::Access>(
     };
     // SAFETY: the shared runner initializes Lean before constructing one fresh
     // owned continuation. The constructor copies the borrowed root bytes.
+    let capabilities = Capabilities {
+        files: Some(files),
+        clock: Some(clock),
+        output: Some(&mut output),
+        ..Capabilities::default()
+    };
     let result = unsafe {
-        crate::operation::run_read(storage, files, clock, &mut output, || {
+        crate::operation::run(storage, capabilities, &[], || {
             synch_adapter_operation_read(root.as_slice().into(), all, offset, length)
         })
     }
@@ -344,7 +470,7 @@ pub fn expire<S: crate::host::Storage>(
     // SAFETY: constructor copies borrowed arguments into a fresh owned program;
     // the shared runner initializes Lean before invoking it.
     let result = unsafe {
-        crate::operation::run(storage, &[], || {
+        crate::operation::run(storage, Capabilities::default(), &[], || {
             synch_adapter_operation_expire(payload.as_bytes().into(), kind, now as u64)
         })
     }?;
@@ -375,7 +501,7 @@ pub fn unpin<S: crate::host::Storage>(
     // SAFETY: the constructor copies borrowed arguments into a fresh owned
     // program; the shared runner initializes Lean before invoking it.
     let result = unsafe {
-        crate::operation::run(storage, &[], || {
+        crate::operation::run(storage, Capabilities::default(), &[], || {
             synch_adapter_operation_unpin(root.as_slice().into(), payload.as_bytes().into(), kind)
         })
     }?;
@@ -458,13 +584,21 @@ pub fn delete<S: crate::host::Storage>(
     }
     // SAFETY: constructor returns a fresh owned program; runner initializes Lean first.
     let result = unsafe {
-        crate::operation::run_with_resources(storage, resources, || {
-            synch_adapter_operation_delete(
-                root.as_slice().into(),
-                u8::from(before.is_some()),
-                before.unwrap_or(0) as u64,
-            )
-        })
+        crate::operation::run(
+            storage,
+            Capabilities {
+                resources: Some(resources),
+                ..Capabilities::default()
+            },
+            &[],
+            || {
+                synch_adapter_operation_delete(
+                    root.as_slice().into(),
+                    u8::from(before.is_some()),
+                    before.unwrap_or(0) as u64,
+                )
+            },
+        )
     };
     finish_lifecycle(result, |reader| match reader.byte()? {
         0 => Ok(Outcome::Skipped),
@@ -496,7 +630,7 @@ pub fn acquire<S: crate::host::Storage>(
     // SAFETY: constructor copies its arguments and returns a fresh owned program;
     // the shared runner initializes the runtime before invoking it.
     let result = unsafe {
-        crate::operation::run(storage, &[], || {
+        crate::operation::run(storage, Capabilities::default(), &[], || {
             synch_adapter_operation_acquire(
                 root.as_slice().into(),
                 holder.as_bytes().into(),

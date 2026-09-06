@@ -732,16 +732,9 @@ impl Store {
         // Held past the commit below, for the reason `write_slice` takes one: the
         // outboard is written with no lock held ([`Store::lease_write`]).
         let _lease = self.lease_write(root);
-        if let Some(row) = self.blob(root)? {
-            // The cheap refusal; `commit_groups` makes the same decision again
-            // inside the transaction that records it (`settle_size`).
-            let held = row.verified_groups();
-            crate::cas::settle_size(
-                root,
-                Some((row.size, row.complete, row.durable, &held)),
-                size,
-            )?;
-        }
+        // The cheap refusal; `commit_groups` makes the same decision again
+        // inside the transaction that records it.
+        self.admit_size(root, size)?;
         if !encoded.len().is_multiple_of(PROOF_NODE_LEN) {
             return Err(StoreError::Verification {
                 root: *root,
@@ -826,7 +819,7 @@ impl Store {
             //
             // This may affect an in-flight fetch: `commit_groups` also settles
             // the size, and a claim that moves the object's *group count* resets the bitmap
-            // (`settle_size`, rule 3), so a proof carrying a wrong size erases
+            // (settlement rule 3), so a proof carrying a wrong size erases
             // whatever a concurrent fetch had verified. Sixty-four bytes on the
             // wire, repeatable, and reachable from any origin that publishes a
             // false `f:` size for a root a peer is fetching.
@@ -843,7 +836,7 @@ impl Store {
             // proof established: an object's tree is the same shape for every
             // size inside its last 16 KiB chunk group, so a peer can overstate a
             // root by a few bytes and have the proof verify anyway. Nothing
-            // durable may rest on it, which is what `settle_size` is for — until
+            // durable may rest on it, which is what the settlement is for — until
             // the final group is held, the next writer's size wins, and the
             // decision is made inside the transaction that records it so that
             // two writers cannot each decide it on a stale snapshot.
@@ -958,17 +951,13 @@ impl Store {
         if size <= INLINE_BLOB_MAX || proven.is_empty() {
             return Ok(ChunkRanges::empty());
         }
+        // The cheap refusal; `commit_groups` decides again inside the
+        // transaction that records the result.
+        self.admit_size(root, size)?;
         let existing = self.blob(root)?;
         let mut held = ChunkRanges::empty();
         if let Some(row) = &existing {
             held = row.verified_groups();
-            // The cheap refusal; `commit_groups` decides again inside the
-            // transaction that records the result (`settle_size`).
-            crate::cas::settle_size(
-                root,
-                Some((row.size, row.complete, row.durable, &held)),
-                size,
-            )?;
             if row.complete {
                 return Ok(ChunkRanges::empty());
             }
@@ -1154,7 +1143,7 @@ impl Store {
     /// Neither file is sized to the object here, because at this point the
     /// object's length is a peer's claim off a trie entry and nothing has
     /// verified it: `walk_proof` verifies the tree's *shape*, never its length,
-    /// and `settle_size` has no row to argue with the first time a root is met.
+    /// and the settlement has no row to argue with the first time a root is met.
     /// Sizing them here would let a `size` of 32 TiB buy a 32 TiB sparse
     /// payload and a 128 GiB sparse outboard from every node that attempted
     /// the fetch, with nothing to reclaim them: `trim_to_size` runs only on a

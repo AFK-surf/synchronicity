@@ -1,5 +1,5 @@
 import VerifiedCore.Cas.ReadCodec
-import Synchronicity.Prelude
+import Synchronicity.Decidable
 
 /-! Same-source regression theorems for the executable CAS read decoder.
 These are deliberately not a second model of Rust decoding. -/
@@ -96,12 +96,12 @@ theorem runs_sorted_clipped_and_touching_merged :
     endpoints [4, 3, 9, 0, 2, 2, 3, 7, 6] 5 = [(0, 5)] := by
   change (normalizeSpans 5 [⟨3, 9⟩, ⟨0, 2⟩, ⟨2, 3⟩, ⟨7, 6⟩]).map
     (fun span => (span.start, span.stop)) = [(0, 5)]
-  simp [normalizeSpans, List.mergeSort, mergeSpans]
+  simp [normalizeSpans, sortSpans, insertSpan, mergeSpans]
 theorem separated_runs_not_filled :
     endpoints [2, 3, 4, 0, 1] 4 = [(0, 1), (3, 4)] := by
   change (normalizeSpans 4 [⟨3, 4⟩, ⟨0, 1⟩]).map
     (fun span => (span.start, span.stop)) = [(0, 1), (3, 4)]
-  simp [normalizeSpans, List.mergeSort, mergeSpans]
+  simp [normalizeSpans, sortSpans, insertSpan, mergeSpans]
 theorem outside_and_reversed_runs_discarded :
     endpoints [3, 4, 5, 2, 1, 1, 1] 4 = [] := by decide +kernel
 

@@ -110,7 +110,6 @@ impl Store {
 
     /// Drops one want, whether it was satisfied or has stopped being wanted.
     pub fn drop_want(&self, root: &Hash, holder: &PinHolder) -> Result<bool> {
-        // LEAN-MODEL: cas-drop-want (Cas.DropWant)
         // `Cas.DropWant` requires the replica leaf to have left the
         // materialized active view before its unsatisfied intent is retired;
         // the entry guard makes that requirement local to this DELETE.

@@ -9,17 +9,10 @@ open VerifiedCore.Host
 abbrev Effects := EffectSum Storage (EffectSum Access (EffectSum FileIO (EffectSum Clock Output)))
 abbrev Action (A : Type) := OperationOver Effects Error A
 
-def requestStorage (effect : Storage (Reply A)) : Action A :=
-  performOver Error.host (.left effect)
-
-def requestAccess (effect : Access (Reply A)) : Action A :=
-  performOver Error.host (.right (.left effect))
-
-def requestClock (effect : Clock (Reply A)) : Action A :=
-  performOver Error.host (.right (.right (.right (.left effect))))
-
-def requestOutput (bytes : ByteArray) : Action Unit :=
-  performOver Error.host (.right (.right (.right (.right (.append bytes)))))
+def requestStorage (effect : Storage (Reply A)) : Action A := raise Error.host effect
+def requestAccess (effect : Access (Reply A)) : Action A := raise Error.host effect
+def requestClock (effect : Clock (Reply A)) : Action A := raise Error.host effect
+def requestOutput (bytes : ByteArray) : Action Unit := raise Error.host (Output.append bytes)
 
 /-- The database's existing LIKE semantics deliberately apply to raw holder
 text. Repair does not parse or normalize holders, nor touch operator pins. -/
@@ -52,15 +45,14 @@ def healIn (tx : Transaction) (root : ByteArray) : Action Unit := do
 Any failed read, decode, mutation, clock or commit rolls back; a secondary
 rollback failure never replaces the primary error. -/
 def heal (root : ByteArray) : Action Unit :=
-  transactionOver EffectSum.left Error.host (fun tx => healIn tx root)
+  transactionOver Inject.inject Error.host (fun tx => healIn tx root)
 
 /-- Full and ranged reads share one metadata observation and recovery path. -/
 inductive Request where
   | all
   | range (offset length : UInt64)
 
-def requestFile (effect : FileIO A) : Action A :=
-  ExceptT.mk (.request (.right (.right (.left effect))) (fun reply => .pure (.ok reply)))
+def requestFile (effect : FileIO A) : Action A := observe effect
 
 /-- Only missing/truncated physical data invalidates the local claim. Repair
 failure takes precedence; otherwise the original opaque I/O error survives. -/

@@ -39,6 +39,56 @@ fn error(error: cas::IngestError<StoreError>) -> StoreError {
     }
 }
 
+fn tier(store: &Store) -> cas::IngestTier {
+    if store.complete_is_durable() {
+        cas::IngestTier::Local
+    } else {
+        cas::IngestTier::Cache
+    }
+}
+
+fn directory_policy() -> cas::DirectoryPolicy {
+    if cfg!(windows) {
+        cas::DirectoryPolicy::AllowUnsupported
+    } else {
+        cas::DirectoryPolicy::RequireSync
+    }
+}
+
+/// Records verified groups through the Lean metadata commit.
+pub(crate) fn commit_groups(
+    store: &Store,
+    root: &Hash,
+    size: u64,
+    groups: &synch_core::ChunkRanges,
+    inline: Option<Vec<u8>>,
+    now: i64,
+) -> Result<crate::cas::Commit> {
+    let spans: Vec<(u64, u64)> = groups.ranges.iter().map(|r| (r.start, r.end)).collect();
+    let mut storage = crate::lean_storage::Session::new(store);
+    let committed = cas::commit_groups(
+        &mut storage,
+        root.as_bytes(),
+        size,
+        &spans,
+        inline.as_deref(),
+        now,
+        tier(store),
+    )
+    .map_err(error)?;
+    Ok(crate::cas::Commit {
+        size: committed.size,
+        complete: committed.complete,
+    })
+}
+
+/// Refuses a size the row's claim cannot yield to, before any bytes are
+/// decoded against it.
+pub(crate) fn admit_size(store: &Store, root: &Hash, size: u64) -> Result<()> {
+    let mut storage = crate::lean_storage::Session::new(store);
+    cas::admit_size(&mut storage, root.as_bytes(), size).map_err(error)
+}
+
 pub(crate) fn ingest(store: &Store, input: Input<'_>, now: i64) -> Result<(Hash, u64)> {
     let kind = match input {
         Input::Bytes(bytes) => cas::IngestInput::Bytes {
@@ -64,16 +114,8 @@ pub(crate) fn ingest(store: &Store, input: Input<'_>, now: i64) -> Result<(Hash,
         },
         kind,
         now,
-        if store.complete_is_durable() {
-            cas::IngestTier::Local
-        } else {
-            cas::IngestTier::Cache
-        },
-        if cfg!(windows) {
-            cas::DirectoryPolicy::AllowUnsupported
-        } else {
-            cas::DirectoryPolicy::RequireSync
-        },
+        tier(store),
+        directory_policy(),
     )
     .map_err(error)?;
     Ok((

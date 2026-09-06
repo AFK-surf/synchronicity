@@ -2,7 +2,7 @@
 
 ## Project Structure & Module Organization
 
-This is a Rust 2021 workspace (minimum Rust 1.91). Libraries and binaries live in `crates/synch-*`; code belongs in each crate's `src/`, integration tests in `tests/`, and harnesses in `examples/`. `control-plane/` contains a Gleam/Erlang backend, `control-plane/web/` the React/TypeScript SPA, and `control-plane/e2e/` cross-system tests. Formal models live under `specs/` (TLA+ and Lean). Consult `DESIGN.md` for architecture and `docs/` for subsystem contracts. `vendor/russh/` is patched; change it only with corresponding patch documentation.
+This is a Rust 2021 workspace (minimum Rust 1.91). Libraries and binaries live in `crates/synch-*`; code belongs in each crate's `src/`, integration tests in `tests/`, and harnesses in `examples/`. `control-plane/` contains a Gleam/Erlang backend, `control-plane/web/` the React/TypeScript SPA, and `control-plane/e2e/` cross-system tests. Formal models live under `specs/`: the TLA+ recovery model, and Lean proofs about the executable Lean core in `crates/synch-verified`. Consult `DESIGN.md` for architecture and `docs/` for subsystem contracts. `vendor/russh/` is patched; change it only with corresponding patch documentation.
 
 ## Build, Test, and Development Commands
 
@@ -13,7 +13,7 @@ This is a Rust 2021 workspace (minimum Rust 1.91). Libraries and binaries live i
 - `cd control-plane && make -C csqlite && gleam test` builds the SQLite port and tests the backend.
 - `cd control-plane && just dev` starts the backend on port 8080 and the Vite dev server.
 - `cd control-plane && just web-build` type-checks, tests, and builds the SPA.
-- `cd specs/lean && lake build --wfail` checks Lean proofs without tolerating warnings.
+- `cd specs/lean && lake build --wfail` checks the Lean core proofs without tolerating warnings.
 
 Cloud and end-to-end suites require Docker, DNS tools, or provider emulators; follow the relevant README or CI workflow.
 
@@ -29,4 +29,4 @@ Place unit tests near implementation and integration tests in `<crate>/tests/*.r
 
 ## Commit & Pull Request Guidelines
 
-History favors concise, imperative subjects, optionally scoped (`mptsync: ...`, `fix(sock): ...`). Explain the user-visible or invariant-level outcome. Pull requests should include rationale, linked issues, commands run, and platform or migration impact. Include screenshots for dashboard changes and update docs or formal-model anchors when guarantees change. Never commit credentials; use documented `SYNCH_*` and `CP_*` environment variables.
+History favors concise, imperative subjects, optionally scoped (`mptsync: ...`, `fix(sock): ...`). Explain the user-visible or invariant-level outcome. Pull requests should include rationale, linked issues, commands run, and platform or migration impact. Include screenshots for dashboard changes and update docs and the core proofs when guarantees change. Never commit credentials; use documented `SYNCH_*` and `CP_*` environment variables.

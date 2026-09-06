@@ -1,5 +1,4 @@
 import VerifiedCore.Host
-import Synchronicity.Prelude
 
 /-! Laws and failure traces of the executable shared effect carrier. -/
 namespace Synchronicity.HostProgramProofs

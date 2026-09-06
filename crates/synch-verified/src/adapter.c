@@ -37,6 +37,9 @@ extern lean_object *synch_lean_cas_unpin(lean_object *, lean_object *, uint8_t);
 extern lean_object *synch_lean_cas_expire(lean_object *, uint8_t, uint64_t);
 extern lean_object *synch_lean_cas_read(lean_object *, uint8_t, uint64_t, uint64_t);
 extern lean_object *synch_lean_cas_ingest(uint8_t, uint64_t, uint64_t, uint8_t, uint8_t);
+extern lean_object *synch_lean_cas_commit_groups(lean_object *, lean_object *, uint64_t, uint8_t,
+                                                 lean_object *, uint64_t, uint8_t);
+extern lean_object *synch_lean_cas_admit_size(lean_object *, uint64_t);
 extern lean_object *synch_lean_trie_get(lean_object *, uint64_t);
 extern lean_object *synch_lean_history_prune(lean_object *, uint64_t);
 extern lean_object *synch_lean_operation_packet(lean_object *);
@@ -70,6 +73,17 @@ void *synch_adapter_operation_read(synch_slice root, uint8_t all,
 void *synch_adapter_operation_ingest(uint8_t kind, uint64_t size, int64_t now,
                                     uint8_t cache, uint8_t allow_unsupported) {
     return synch_lean_cas_ingest(kind, size, (uint64_t)now, cache, allow_unsupported);
+}
+
+void *synch_adapter_operation_commit_groups(synch_slice root, synch_slice spans, uint64_t size,
+                                           uint8_t has_inline, synch_slice inline_bytes,
+                                           int64_t now, uint8_t cache) {
+    return synch_lean_cas_commit_groups(bytes(root), bytes(spans), size, has_inline,
+                                        bytes(inline_bytes), (uint64_t)now, cache);
+}
+
+void *synch_adapter_operation_admit_size(synch_slice root, uint64_t size) {
+    return synch_lean_cas_admit_size(bytes(root), size);
 }
 
 void *synch_adapter_operation_packet(void *state) {

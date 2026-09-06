@@ -78,4 +78,21 @@ def decodeRawBitmap (input : ByteArray) : List GroupSpan :=
   | .error _ => []
   | .ok (spans, _) => spans
 
+/-- Minimal LEB128, the encoding postcard writes for a u64. -/
+def encodeUnsignedWith : Nat → Nat → List UInt8
+  | 0, n => [UInt8.ofNat n]
+  | fuel + 1, n =>
+    if n < 128 then [UInt8.ofNat n]
+    else UInt8.ofNat (n % 128 + 128) :: encodeUnsignedWith fuel (n / 128)
+
+/-- The value itself bounds its own group count, so the recursion is
+structural and proofs evaluate it by `decide`. -/
+def encodeUnsigned (n : Nat) : List UInt8 := encodeUnsignedWith n n
+
+/-- Encode spans as the local postcard Vec<(u64,u64)>: a count, then each
+span's endpoints. The inverse of `decodeRawBitmap` on what the plan produces. -/
+def encodeRawBitmap (spans : List GroupSpan) : ByteArray :=
+  ⟨(encodeUnsigned spans.length ++
+    spans.flatMap (fun span => encodeUnsigned span.start ++ encodeUnsigned span.stop)).toArray⟩
+
 end VerifiedCore.Cas.Codec

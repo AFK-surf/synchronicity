@@ -1,5 +1,5 @@
 import VerifiedCore.Cas.Read
-import Synchronicity.Prelude
+import Synchronicity.Decidable
 
 /-! Executions of the whole read program. The scripted interpreter
 supplies raw observations only, without availability or recovery decisions. -/
@@ -9,7 +9,6 @@ set_option Elab.async false
 
 /-- The production read owns its initial raw observation; Rust supplies no
 decoded row, bitmap or coverage snapshot to the operation. -/
-@[rust_impl "cas-local-read-operation"]
 theorem read_observes_metadata (key : ByteArray) (request : Request) :
     ∃ resume, (read key request).run = .request
       (.right (.left (.snapshot ⟨"blobs", [("root", .blob key)], []⟩

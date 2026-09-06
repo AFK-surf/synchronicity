@@ -1,5 +1,5 @@
 import VerifiedCore.Cas.Read
-import Synchronicity.Prelude
+import Synchronicity.Decidable
 
 /-! The actual repair program requests raw storage operations. These fixtures
 interpret its constructors, not a duplicate repair policy. Raw host contracts

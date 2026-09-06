@@ -8,24 +8,6 @@ import VerifiedCore.Replication.History
 /-! Domain command constructors. The transport itself imports no domain policy. -/
 namespace VerifiedCore.Entry
 
-private def ingestWriteEffect (effect : Host.Wire.WriteEffects A) : Host.Wire.NativeEffects A :=
-  .right (.right (.right (.right (.right (.right effect)))))
-
-private def ingestEffect (effect : Cas.Input.Effects A) : Host.Wire.NativeEffects A :=
-  match effect with
-  | .right source => ingestWriteEffect (.right (.right (.right (.right source))))
-  | .left effect => match effect with
-    | .left effect => match effect with
-      | .left file => .right (.right (.right (.left file)))
-      | .right construct => ingestWriteEffect (.left construct)
-    | .right effect => match effect with
-      | .left effect => match effect with
-        | .left storage => .left storage
-        | .right upsert => ingestWriteEffect (.right (.left upsert))
-      | .right effect => match effect with
-        | .left files => ingestWriteEffect (.right (.right (.left files)))
-        | .right lease => ingestWriteEffect (.right (.right (.right (.left lease))))
-
 /-- One column-type terminal, framed the same way by every CAS operation:
 the projection index, the column name and the observed storage class. -/
 private def columnTypeTerminal (tag : UInt8) (index : Nat) (column : String)
@@ -66,8 +48,43 @@ def ingest (kind : UInt8) (size : UInt64) (now : Int64) (cache allowUnsupported 
   | none => .pure (.error Host.Wire.protocolFailure)
   | some input => do
     let result ← (Cas.Input.run input now (if cache then .cache else .local)
-      (if allowUnsupported then .allowUnsupported else .requireSync)).run.mapEffects ingestEffect
+      (if allowUnsupported then .allowUnsupported else .requireSync)).run.mapEffects Host.Inject.inject
     return ingestResult result
+
+private def commitResult (encode : A → ByteArray) : Except Cas.IngestCommit.Error A → Host.Reply ByteArray
+  | .ok value => .ok (Host.Wire.octet 0 ++ encode value)
+  | .error error => ingestMetadataError error
+
+/-- Group spans arrive as a count followed by little-endian endpoint pairs. -/
+private def decodeSpans (bytes : ByteArray) : Option (List GroupSpan) :=
+  match (Host.Wire.readList (do
+      let start ← Host.Wire.readWord
+      let stop ← Host.Wire.readWord
+      pure (⟨start.toNat, stop.toNat⟩ : GroupSpan))).run ⟨bytes, 0⟩ with
+  | .error () => none
+  | .ok (spans, cursor) => if cursor.offset == bytes.size then some spans else none
+
+/-- One metadata commit for verified groups of an object, from any writer.
+The terminal carries the settled size and completeness. -/
+@[export synch_lean_cas_commit_groups]
+def commitGroups (root spans : ByteArray) (size : UInt64) (hasInline : Bool) (inline : ByteArray)
+    (now : Int64) (cache : Bool) : Host.Wire.NativeState :=
+  match root.size == 32, decodeSpans spans with
+  | true, some incoming => do
+    let outcome ← (Cas.IngestCommit.commitGroups root size incoming
+      (if hasInline then some inline else none) now (if cache then .cache else .local)).run.mapEffects
+      Host.Inject.inject
+    return commitResult (fun outcome => Host.Wire.word outcome.size ++
+      Host.Wire.octet (if outcome.complete then 1 else 0)) outcome
+  | _, _ => .pure (.error Host.Wire.protocolFailure)
+
+/-- The cheap refusal of a size the row cannot yield to, read outside a transaction. -/
+@[export synch_lean_cas_admit_size]
+def admitSize (root : ByteArray) (size : UInt64) : Host.Wire.NativeState :=
+  if root.size != 32 then .pure (.error Host.Wire.protocolFailure)
+  else do
+    let outcome ← (Cas.IngestCommit.admit root size).run.mapEffects Host.Inject.inject
+    return commitResult (fun () => ByteArray.empty) outcome
 
 /-- Decode the holder constructor, not its rendered storage spelling. In
 particular an opaque future holder can resemble a known role's spelling. -/
@@ -87,7 +104,7 @@ def unpin (root payload : ByteArray) (kind : UInt8) : Host.Wire.NativeState :=
   | none => .pure (.error Host.Wire.protocolFailure)
   | some holder => (do
       let dropped ← Cas.unpin root holder
-      return Host.Wire.octet (if dropped then 1 else 0) : Host.Operation ByteArray).run.mapEffects Host.EffectSum.left
+      return Host.Wire.octet (if dropped then 1 else 0) : Host.Operation ByteArray).run.mapEffects Host.Inject.inject
 
 @[export synch_lean_cas_expire]
 def expire (payload : ByteArray) (kind : UInt8) (now : Int64) : Host.Wire.NativeState :=
@@ -98,7 +115,7 @@ def expire (payload : ByteArray) (kind : UInt8) (now : Int64) : Host.Wire.Native
   | none => .pure (.error Host.Wire.protocolFailure)
   | some holder => (do
       let count ← Cas.expire holder now
-      return Host.Wire.word count.toUInt64 : Host.Operation ByteArray).run.mapEffects Host.EffectSum.left
+      return Host.Wire.word count.toUInt64 : Host.Operation ByteArray).run.mapEffects Host.Inject.inject
 
 /-- Acquisition and deletion share one terminal framing: tag 0 carries the
 operation's own value, tags 1 and 2 the malformed-metadata and column-type
@@ -114,7 +131,7 @@ def delete (root : ByteArray) (hasBefore : Bool) (before : Int64) : Host.Wire.Na
   if root.size != 32 then .pure (.error ⟨2, 0⟩)
   else do
     let outcome ← (Cas.delete root (if hasBefore then some before else none)).run.mapEffects
-      Host.EffectSum.left
+      Host.Inject.inject
     return encodeLifecycle (fun outcome => Host.Wire.octet (match outcome with
       | .skipped => 0 | .writing => 1 | .protectedClaim => 2 | .applied => 3)) outcome
 
@@ -124,7 +141,7 @@ def acquire (root holder : ByteArray) (now : Int64) (possession : Bool) : Host.W
   else match String.fromUTF8? holder with
   | none => .pure (.error ⟨2, 0⟩)
   | some holder => do
-    let acquired ← (Cas.acquire root holder now possession).run.mapEffects Host.EffectSum.left
+    let acquired ← (Cas.acquire root holder now possession).run.mapEffects Host.Inject.inject
     return encodeLifecycle (fun acquired => Host.Wire.octet (if acquired then 1 else 0)) acquired
 
 private def encodeLookup : Trie.LookupResult → ByteArray
@@ -139,7 +156,7 @@ private def encodeLookup : Trie.LookupResult → ByteArray
 @[export synch_lean_trie_get]
 def lookup (root : ByteArray) (keySize : UInt64) : Host.Wire.NativeState :=
   if root.size != 32 then .pure (.error ⟨2, 0⟩)
-  else (do return encodeLookup (← Trie.getInput root 0 keySize) : Host.Operation ByteArray).run.mapEffects Host.EffectSum.left
+  else (do return encodeLookup (← Trie.getInput root 0 keySize) : Host.Operation ByteArray).run.mapEffects Host.Inject.inject
 
 private def encodeHistory (result : Replication.History.Result Nat) : Host.Reply ByteArray :=
   open Host.Wire in
@@ -166,10 +183,7 @@ def pruneHistory (origin : ByteArray) (before : Int64) : Host.Wire.NativeState :
   match String.fromUTF8? origin with
   | none => .pure (.error Host.Wire.protocolFailure)
   | some origin => do
-    let result ← (Replication.History.prune origin before).run.mapEffects (fun effect =>
-      match effect with
-      | .left storage => .left storage
-      | .right crypto => .right (.left crypto))
+    let result ← (Replication.History.prune origin before).run.mapEffects Host.Inject.inject
     return encodeHistory result
 
 private def encodeRead (result : Except Cas.Read.Error UInt64) : Host.Reply ByteArray :=
@@ -194,15 +208,7 @@ def readRoot (root : ByteArray) (all : Bool) (offset length : UInt64) : Host.Wir
   if root.size != 32 then .pure (.error Host.Wire.protocolFailure)
   else do
     let result ← (Cas.Read.read root (if all then .all else .range offset length)).run.mapEffects
-      (fun effect => match effect with
-        | .left storage => .left storage
-        | .right other => .right (.right (match other with
-          | .left access => .left access
-          | .right other => .right (match other with
-            | .left file => .left file
-            | .right other => .right (match other with
-              | .left clock => .left clock
-              | .right output => .right (.left output))))))
+      Host.Inject.inject
     return encodeRead result
 
 end VerifiedCore.Entry

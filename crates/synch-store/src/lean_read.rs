@@ -143,7 +143,6 @@ fn error(root: &Hash, error: cas::ReadError<StoreError>) -> StoreError {
 pub(crate) fn read(store: &Store, root: &Hash, request: cas::ReadRequest) -> Result<Vec<u8>> {
     let mut storage = crate::lean_storage::Session::new(store);
     let mut files = Files::new(store);
-    // LEAN-MODEL: cas-local-read-operation (CasReadProgramProofs.read_observes_metadata)
     cas::read(
         &mut storage,
         &mut files,

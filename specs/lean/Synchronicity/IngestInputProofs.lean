@@ -183,8 +183,9 @@ large-byte fixture. It immediately starts owned staging under Ingest.run. -/
 theorem captured_delegates_exact_size (handle size : UInt64) (now : Int64)
     (tier : IngestCommit.Tier) (policy : Ingest.DirectoryPolicy) :
     (captured handle size now tier policy).run =
-      ((Ingest.run handle size now tier policy).run.mapEffects EffectSum.left).bind
-        (fun reply => .pure ((reply.mapError Error.ingestion).map (fun root => ⟨root, size⟩))) := rfl
+      (((Ingest.run handle size now tier policy).run.mapEffects Inject.inject).bind
+        (fun reply => .pure (reply.mapError Error.ingestion))).bind
+        (ExceptT.bindCont fun root => (pure ⟨root, size⟩ : Action Result)) := rfl
 
 private def twoBytes : ByteArray := ⟨#[41, 42]⟩
 

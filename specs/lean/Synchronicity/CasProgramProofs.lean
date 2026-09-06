@@ -1,5 +1,4 @@
 import VerifiedCore.Cas.Program
-import Synchronicity.Prelude
 
 /-! Executions of the actual CAS acquisition program against a scripted raw
 storage interpreter. The script does not implement any acquisition policy. -/
@@ -196,7 +195,6 @@ theorem decoded_execution (tx : Transaction) (root : ByteArray) (holder : String
 
 /-- Authorization is derived from the raw observations of the actual program:
 durability is required, and possession additionally requires a live want. -/
-@[rust_justifies "cas-lifecycle-acquisition"]
 theorem execution_authorized (tx : Transaction) (root : ByteArray) (holder : String)
     (now : Int64) (possession durable : Bool) (rows wanted : List Row)
     (decoded : decodeDurability rows = .ok durable) :
@@ -304,5 +302,3 @@ example (tx : Transaction) (root : ByteArray) (holder : String) (now : Int64) :
         [.commit tx]) := rfl
 
 end Synchronicity.CasProgramProofs
-
-#lint

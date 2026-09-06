@@ -58,7 +58,6 @@ pub fn get<S: ByteStorage>(
     root: &[u8; 32],
     key: &[u8],
 ) -> Result<Option<Vec<u8>>, LookupError<S::Error>> {
-    // LEAN-MODEL: mpt-trie-get-input (TrieProgramProofs.getInput_admitted)
     // SAFETY: constructor returns an owned program; runner initializes the
     // runtime and retains the borrowed key throughout all input effects.
     let result = unsafe {

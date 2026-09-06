@@ -1,6 +1,6 @@
 import VerifiedCore.Cas.IngestCommit
-import Synchronicity.VerifiedCoreProofs
-import Synchronicity.Prelude
+import Synchronicity.CasPlanProofs
+import Synchronicity.Decidable
 
 /-! Proofs of the internal ingestion metadata program itself. The production
 whole Lean command composes it; the outer resource, construction-request and
@@ -17,9 +17,9 @@ theorem full_input_accepted_complete (row durable complete : Bool) (recorded siz
       [⟨0, (groupCount size).toNat⟩]).accepted = true) :
     (planCasCommit row durable complete recorded size old
       [⟨0, (groupCount size).toNat⟩]).complete = true := by
-  apply VerifiedCoreProofs.cas_plan_coverage_completes
+  apply CasPlanProofs.cas_plan_coverage_completes
   intro group inside
-  have membership := VerifiedCoreProofs.cas_plan_membership row durable complete recorded size
+  have membership := CasPlanProofs.cas_plan_membership row durable complete recorded size
     old [⟨0, (groupCount size).toNat⟩] group
   dsimp only at membership
   apply membership.mpr
@@ -91,7 +91,8 @@ private def execute (script : Script) : Nat → Nat →
           step "claim" (resume (reply script index script.rows))
         else none
       | _ => none
-    | .right effect => match effect with
+    | .right (.right _) => none
+    | .right (.left effect) => match effect with
       | .write tx relation fields conflicts updates =>
         if tx == 7 && relation == "blobs" && conflicts == ["root"] &&
             fields == [("root", .blob root), ("size", .integer 8),

@@ -697,7 +697,6 @@ impl Store {
     ///
     /// Returns how many rows were dropped.
     pub fn prune_history_before(&self, origin: &OriginId, before: i64) -> Result<usize> {
-        // LEAN-MODEL: verified-history-prune (HistoryProgramProofs.prune_begins_transaction)
         // The complete Lean program owns the snapshot, validation, selection,
         // guarded deletion and commit/rollback. Rust retains only host services.
         crate::lean_history::prune(self, origin, before)

@@ -279,25 +279,24 @@ jobs:
           fi
 
   lean:
-    name: lean (CAS / mptsync / ingest)
+    name: lean (core proofs)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+      # Proofs over the executable core, built from the same source Cargo
+      # compiles. Every declaration is rechecked by the standalone kernel
+      # checker, and sorryAx or an unapproved axiom fails the job.
       - uses: leanprover/lean-action@v1
         with:
           lake-package-directory: specs/lean
           build: true
           build-args: --wfail
           test: false
-          use-mathlib-cache: true
-          # Recheck every compiled declaration with Lean's standalone kernel
-          # checker, then reject sorryAx and any unapproved custom axiom.
+          use-mathlib-cache: false
           leanchecker: true
           leanchecker-args: Synchronicity
           axiom-audit: true
-      - name: Check Rust/Lean implementation anchors
-        run: specs/lean/check-anchors.sh
 
   bench:
     name: benchmark (smoke)

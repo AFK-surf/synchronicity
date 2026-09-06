@@ -1,5 +1,5 @@
 import VerifiedCore.Cas.Ingest
-import Synchronicity.Prelude
+import Synchronicity.Decidable
 
 /-! Fault traces of the actual captured-source ingestion program. No host
 callback implements publication or metadata policy. These fixtures use an
@@ -63,11 +63,13 @@ private def execute (script : Script) : Nat → Program Effects (Except Error By
               step "claim" (resume (reply script "claim" [])) else none
           | _ => none
         | .right effect => match effect with
-          | .write tx relation fields conflicts updates =>
-            if tx == 7 && relation == "blobs" && conflicts == ["root"] &&
-                fields == VerifiedCore.Cas.IngestCommit.values digest 0 none 123 .local &&
-                updates == VerifiedCore.Cas.IngestCommit.assignments then
-              step "upsert" (resume (reply script "upsert" ())) else none
+          | .left effect => match effect with
+            | .write tx relation fields conflicts updates =>
+              if tx == 7 && relation == "blobs" && conflicts == ["root"] &&
+                  fields == VerifiedCore.Cas.IngestCommit.values digest 0 true none none 123 .local &&
+                  updates == VerifiedCore.Cas.IngestCommit.assignments then
+                step "upsert" (resume (reply script "upsert" ())) else none
+          | .right _ => none
       | .right effect => match effect with
         | .left effect => match effect with
           | .createTemporary space =>

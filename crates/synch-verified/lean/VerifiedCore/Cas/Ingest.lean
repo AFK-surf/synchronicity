@@ -29,28 +29,20 @@ inductive Error where
 
 abbrev Action (A : Type) := OperationOver Effects Error A
 
-def resource (effect : Resources (Reply A)) : Action A :=
-  performOver Error.host (.right (.right (.left effect)))
-
-def lease (effect : Lease (Reply A)) : Action A :=
-  performOver Error.host (.right (.right (.right effect)))
-
-def closeSource (source : UInt64) : Action Unit :=
-  performOver Error.host (.left (.left (.close source)))
+def resource (effect : Resources (Reply A)) : Action A := raise Error.host effect
+def lease (effect : Lease (Reply A)) : Action A := raise Error.host effect
+def closeSource (source : UInt64) : Action Unit := raise Error.host (FileIO.close source)
 
 /-- One host effect streams the captured source into the owned payload and
 outboard temporaries and returns the root. The program checks the root's
 width; a malformed reply is a protocol failure, never a published object. -/
 def construct (source payload outboard size : UInt64) : Action ByteArray := do
-  let root ← performOver Error.host (.left (.right (.build source payload outboard size)))
+  let root ← raise Error.host (Construct.build source payload outboard size)
   if root.size != 32 then throw .protocol
   return root
 
 def commit (root : ByteArray) (size : UInt64) (now : Int64) (tier : IngestCommit.Tier) : Action Unit :=
-  ExceptT.mk do
-    let result ← (IngestCommit.commitComplete root size none now tier).run.mapEffects
-      (fun effect => .right (.left effect))
-    return result.mapError Error.metadata
+  within Error.metadata (IngestCommit.commitComplete root size none now tier)
 
 /-- Unsupported directory synchronization is an explicit platform limitation,
 not an I/O failure silently swallowed by a filesystem adapter. -/

@@ -1,7 +1,7 @@
 //! Private synchronous transport for raw storage/resource and crypto effects.
 use crate::host::{
-    Access, ByteStorage, Cell, Clock, Exclusion, Fields, FileFailure, FileFailureKind, FileIO,
-    Join, Order, Resources, Row, Scan, Selection, SourceValue, Storage,
+    ByteStorage, Cell, Clock, Exclusion, Fields, FileFailure, FileFailureKind, FileIO, Join, Order,
+    Resources, Row, Scan, Selection, SourceValue, Storage,
 };
 use std::{ffi::c_void, marker::PhantomData, ptr::NonNull, rc::Rc};
 
@@ -494,7 +494,7 @@ fn file_reply<E, A>(
     }
 }
 
-fn dispatch_access<S: Access>(
+fn dispatch_access<S: Storage>(
     storage: &mut S,
     frame: AccessFrame,
     errors: &mut Vec<Option<S::Error>>,
@@ -530,6 +530,8 @@ fn byte_reply<E>(value: Result<Option<Vec<u8>>, E>, errors: &mut Vec<Option<E>>)
 
 // Backend dispatch is separate from continuation transport: byte-only commands
 // do not need a pretend relational store or a second layer of host errors.
+// Every relational frame lands here; the Lean effect split only says which
+// operations may request which of them.
 fn dispatch_storage<S: Storage>(
     storage: &mut S,
     frame: Frame<'_>,
@@ -569,6 +571,13 @@ fn dispatch_storage<S: Storage>(
             storage.scan_rows(tx, &table, &columns, &equals, &order, &joins),
             errors,
         ),
+        Frame::ExpressionUpsert(tx, relation, fields, conflicts, assignments) => reply(
+            41,
+            storage.write(tx, &relation, &fields, &conflicts, &assignments),
+            errors,
+            |_, ()| {},
+        ),
+        Frame::Access(frame) => dispatch_access(storage, frame, errors),
         _ => return Err(OperationError::Protocol),
     })
 }
@@ -584,16 +593,19 @@ fn dispatch_readonly<S: ByteStorage>(
     }
 }
 
-struct Capabilities<'a, E> {
-    resources: Option<&'a mut dyn Resources<Error = E>>,
-    crypto: Option<&'a mut dyn crate::host::Crypto<Error = E>>,
-    files: Option<&'a mut dyn FileIO<Error = E>>,
-    clock: Option<&'a mut dyn Clock<Error = E>>,
-    output: Option<&'a mut dyn crate::host::Output<Error = OperationError<E>>>,
-    construct: Option<&'a mut dyn crate::host::Construct<Error = E>>,
-    temporary: Option<&'a mut dyn crate::host::TemporaryFiles<Error = E>>,
-    leases: Option<&'a mut dyn crate::host::Lease<Error = E>>,
-    source: Option<&'a mut dyn crate::host::SourceIO<Error = E>>,
+/// The raw services an operation may direct besides relational storage. A
+/// request for a service the caller did not supply is a protocol failure:
+/// the Lean effect row of each operation says which services it can reach.
+pub(crate) struct Capabilities<'a, E> {
+    pub(crate) resources: Option<&'a mut dyn Resources<Error = E>>,
+    pub(crate) crypto: Option<&'a mut dyn crate::host::Crypto<Error = E>>,
+    pub(crate) files: Option<&'a mut dyn FileIO<Error = E>>,
+    pub(crate) clock: Option<&'a mut dyn Clock<Error = E>>,
+    pub(crate) output: Option<&'a mut dyn crate::host::Output<Error = OperationError<E>>>,
+    pub(crate) construct: Option<&'a mut dyn crate::host::Construct<Error = E>>,
+    pub(crate) temporary: Option<&'a mut dyn crate::host::TemporaryFiles<Error = E>>,
+    pub(crate) leases: Option<&'a mut dyn crate::host::Lease<Error = E>>,
+    pub(crate) source: Option<&'a mut dyn crate::host::SourceIO<Error = E>>,
 }
 
 impl<E> Default for Capabilities<'_, E> {
@@ -882,13 +894,16 @@ fn execute<E>(
     }
 }
 
-/// Run a domain constructor without exposing continuations to its caller.
+/// Run a domain constructor over the relational host and whatever raw
+/// services the operation may direct, without exposing continuations to
+/// its caller.
 ///
 /// # Safety
 /// `start` must return one fresh owned Lean Wire.NativeState. It is called only after
 /// this thread's runtime is initialized; borrowed input buffers live until return.
 pub(crate) unsafe fn run<S: Storage>(
     storage: &mut S,
+    capabilities: Capabilities<'_, S::Error>,
     inputs: &[&[u8]],
     start: impl FnOnce() -> *mut c_void,
 ) -> Result<Vec<u8>, OperationError<S::Error>> {
@@ -897,110 +912,7 @@ pub(crate) unsafe fn run<S: Storage>(
         Handle::new(start()),
         |frame, errors| dispatch_storage(storage, frame, errors),
         inputs,
-        Capabilities::default(),
-    )
-}
-
-/// Run a whole ingestion with independent raw capabilities.
-///
-/// # Safety
-/// `start` returns a fresh owned native program after runtime initialization.
-pub(crate) unsafe fn run_ingest<S: crate::host::Upsert>(
-    storage: &mut S,
-    resources: crate::host::WriteServices<'_, S::Error>,
-    start: impl FnOnce() -> *mut c_void,
-) -> Result<Vec<u8>, OperationError<S::Error>> {
-    crate::native::enter();
-    execute(
-        Handle::new(start()),
-        |frame, errors| match frame {
-            Frame::ExpressionUpsert(tx, relation, fields, conflicts, assignments) => Ok(reply(
-                41,
-                storage.write(tx, &relation, &fields, &conflicts, &assignments),
-                errors,
-                |_, ()| {},
-            )),
-            frame => dispatch_storage(storage, frame, errors),
-        },
-        &[],
-        Capabilities {
-            files: Some(resources.files),
-            construct: Some(resources.construct),
-            temporary: Some(resources.temporary),
-            leases: Some(resources.leases),
-            source: Some(resources.source),
-            ..Capabilities::default()
-        },
-    )
-}
-
-/// Run with separate raw resource capabilities.
-///
-/// # Safety
-/// `start` obeys the fresh owned constructor contract of `run`.
-pub(crate) unsafe fn run_with_resources<S: Storage>(
-    storage: &mut S,
-    resources: &mut dyn Resources<Error = S::Error>,
-    start: impl FnOnce() -> *mut c_void,
-) -> Result<Vec<u8>, OperationError<S::Error>> {
-    crate::native::enter();
-    execute(
-        Handle::new(start()),
-        |frame, errors| dispatch_storage(storage, frame, errors),
-        &[],
-        Capabilities {
-            resources: Some(resources),
-            ..Capabilities::default()
-        },
-    )
-}
-
-/// Run with separate primitive crypto capabilities.
-///
-/// # Safety
-/// `start` returns a fresh owned native program after runtime initialization.
-pub(crate) unsafe fn run_with_crypto<S: Storage>(
-    storage: &mut S,
-    crypto: &mut dyn crate::host::Crypto<Error = S::Error>,
-    start: impl FnOnce() -> *mut c_void,
-) -> Result<Vec<u8>, OperationError<S::Error>> {
-    crate::native::enter();
-    execute(
-        Handle::new(start()),
-        |frame, errors| dispatch_storage(storage, frame, errors),
-        &[],
-        Capabilities {
-            crypto: Some(crypto),
-            ..Capabilities::default()
-        },
-    )
-}
-
-/// Run with raw relational access, file I/O and clock capabilities.
-///
-/// # Safety
-/// `start` returns one fresh owned native program after runtime initialization.
-pub(crate) unsafe fn run_read<S: Access>(
-    storage: &mut S,
-    files: &mut dyn FileIO<Error = S::Error>,
-    clock: &mut dyn Clock<Error = S::Error>,
-    output: &mut dyn crate::host::Output<Error = OperationError<S::Error>>,
-    start: impl FnOnce() -> *mut c_void,
-) -> Result<Vec<u8>, OperationError<S::Error>> {
-    crate::native::enter();
-    execute(
-        Handle::new(start()),
-        |frame, errors| match frame {
-            Frame::Access(frame) => Ok(dispatch_access(storage, frame, errors)),
-            frame => dispatch_storage(storage, frame, errors),
-        },
-        &[],
-        Capabilities {
-            files: Some(files),
-            clock: Some(clock),
-            output: Some(output),
-            ..Capabilities::default()
-        },
+        capabilities,
     )
 }
 
@@ -1333,44 +1245,6 @@ mod tests {
         assert!(decode(&packet).is_err());
     }
 
-    impl Access for Script {
-        fn snapshot(
-            &mut self,
-            _: &Selection,
-            _: &[String],
-        ) -> Result<Scan<Self::Error>, Self::Error> {
-            self.step("snapshot")?;
-            Ok(Scan {
-                rows: vec![vec![
-                    Cell::Blob(vec![7; 32]),
-                    Cell::Integer(65540),
-                    Cell::Integer(1),
-                    Cell::Null,
-                    Cell::Null,
-                    Cell::Integer(0),
-                    Cell::Integer(1),
-                ]],
-                failure: None,
-            })
-        }
-        fn update(&mut self, _: u64, _: &Selection, _: &Fields) -> Result<u64, Self::Error> {
-            panic!("unexpected update")
-        }
-        fn copy_rows(
-            &mut self,
-            _: u64,
-            _: &str,
-            _: &Selection,
-            _: &[(String, SourceValue)],
-            _: &[String],
-        ) -> Result<u64, Self::Error> {
-            panic!("unexpected copy")
-        }
-        fn delete_selected(&mut self, _: u64, _: &Selection) -> Result<u64, Self::Error> {
-            panic!("unexpected delete")
-        }
-    }
-
     struct OutputTestFiles(Vec<&'static str>);
     impl FileIO for OutputTestFiles {
         type Error = &'static str;
@@ -1456,9 +1330,17 @@ mod tests {
             // SAFETY: the runner initializes this thread before the adapter
             // copies its input and returns a fresh owned read continuation.
             let result = unsafe {
-                run_read(&mut storage, &mut files, &mut clock, &mut output, || {
-                    synch_adapter_operation_read([7; 32].as_slice().into(), 1, 0, 0)
-                })
+                run(
+                    &mut storage,
+                    Capabilities {
+                        files: Some(&mut files),
+                        clock: Some(&mut clock),
+                        output: Some(&mut output),
+                        ..Capabilities::default()
+                    },
+                    &[],
+                    || synch_adapter_operation_read([7; 32].as_slice().into(), 1, 0, 0),
+                )
             };
             match host {
                 Some(true) => assert!(matches!(result, Err(OperationError::Host("sink")))),
@@ -1943,6 +1825,51 @@ mod tests {
         }
         fn read_bytes(&mut self, _: &str, _: &[u8]) -> Result<Option<Vec<u8>>, Self::Error> {
             panic!("unexpected byte read")
+        }
+        fn snapshot(
+            &mut self,
+            _: &Selection,
+            _: &[String],
+        ) -> Result<Scan<Self::Error>, Self::Error> {
+            self.step("snapshot")?;
+            Ok(Scan {
+                rows: vec![vec![
+                    Cell::Blob(vec![7; 32]),
+                    Cell::Integer(65540),
+                    Cell::Integer(1),
+                    Cell::Null,
+                    Cell::Null,
+                    Cell::Integer(0),
+                    Cell::Integer(1),
+                ]],
+                failure: None,
+            })
+        }
+        fn update(&mut self, _: u64, _: &Selection, _: &Fields) -> Result<u64, Self::Error> {
+            panic!("unexpected update")
+        }
+        fn copy_rows(
+            &mut self,
+            _: u64,
+            _: &str,
+            _: &Selection,
+            _: &[(String, SourceValue)],
+            _: &[String],
+        ) -> Result<u64, Self::Error> {
+            panic!("unexpected copy")
+        }
+        fn delete_selected(&mut self, _: u64, _: &Selection) -> Result<u64, Self::Error> {
+            panic!("unexpected delete")
+        }
+        fn write(
+            &mut self,
+            _: u64,
+            _: &str,
+            _: &Fields,
+            _: &[String],
+            _: &[(String, crate::host::ConflictValue)],
+        ) -> Result<(), Self::Error> {
+            panic!("unexpected expression upsert")
         }
     }
 

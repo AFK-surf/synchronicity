@@ -2,7 +2,7 @@
 //! commands and decodes final results; it contains no retention algorithm.
 use crate::{
     host::{Crypto, Storage},
-    operation::{OperationError, Reader, Slice},
+    operation::{Capabilities, OperationError, Reader, Slice},
 };
 
 /// Storage class observed at a Lean-selected invalid column.
@@ -102,9 +102,15 @@ pub fn prune<S: Storage>(
     // SAFETY: the runner initializes Lean; the constructor copies the input and
     // returns one fresh owned native continuation, confined to this call.
     let result = unsafe {
-        crate::operation::run_with_crypto(storage, crypto, || {
-            synch_adapter_operation_history_prune(origin.as_bytes().into(), before as u64)
-        })
+        crate::operation::run(
+            storage,
+            Capabilities {
+                crypto: Some(crypto),
+                ..Capabilities::default()
+            },
+            &[],
+            || synch_adapter_operation_history_prune(origin.as_bytes().into(), before as u64),
+        )
     }
     .map_err(Error::Operation)?;
     decode(&result)
@@ -232,6 +238,51 @@ mod tests {
         }
         fn read_bytes(&mut self, _: &str, _: &[u8]) -> Result<Option<Vec<u8>>, Self::Error> {
             panic!("unexpected bytes")
+        }
+
+        // The relational host is one trait; these operations never request the
+        // read-repair, copy or expression-upsert statements.
+        fn snapshot(
+            &mut self,
+            _: &crate::host::Selection,
+            _: &[String],
+        ) -> Result<crate::host::Scan<Self::Error>, Self::Error> {
+            panic!("unexpected snapshot")
+        }
+        fn update(
+            &mut self,
+            _: u64,
+            _: &crate::host::Selection,
+            _: &Fields,
+        ) -> Result<u64, Self::Error> {
+            panic!("unexpected update")
+        }
+        fn copy_rows(
+            &mut self,
+            _: u64,
+            _: &str,
+            _: &crate::host::Selection,
+            _: &[(String, crate::host::SourceValue)],
+            _: &[String],
+        ) -> Result<u64, Self::Error> {
+            panic!("unexpected row copy")
+        }
+        fn delete_selected(
+            &mut self,
+            _: u64,
+            _: &crate::host::Selection,
+        ) -> Result<u64, Self::Error> {
+            panic!("unexpected selected delete")
+        }
+        fn write(
+            &mut self,
+            _: u64,
+            _: &str,
+            _: &Fields,
+            _: &[String],
+            _: &[(String, crate::host::ConflictValue)],
+        ) -> Result<(), Self::Error> {
+            panic!("unexpected expression upsert")
         }
     }
     fn setup(origin: &str, result: Result<bool, &'static str>) -> (Rows, Primitive, Trace) {

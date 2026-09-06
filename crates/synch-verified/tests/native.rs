@@ -126,6 +126,51 @@ fn pin_acquisition_requires_durability_and_orders_possession_effects() {
         ) -> Result<Option<Vec<u8>>, Self::Error> {
             panic!("acquisition never reads payload bytes")
         }
+
+        // The relational host is one trait; these operations never request the
+        // read-repair, copy or expression-upsert statements.
+        fn snapshot(
+            &mut self,
+            _: &synch_verified::host::Selection,
+            _: &[String],
+        ) -> Result<synch_verified::host::Scan<Self::Error>, Self::Error> {
+            panic!("unexpected snapshot")
+        }
+        fn update(
+            &mut self,
+            _: u64,
+            _: &synch_verified::host::Selection,
+            _: &Fields,
+        ) -> Result<u64, Self::Error> {
+            panic!("unexpected update")
+        }
+        fn copy_rows(
+            &mut self,
+            _: u64,
+            _: &str,
+            _: &synch_verified::host::Selection,
+            _: &[(String, synch_verified::host::SourceValue)],
+            _: &[String],
+        ) -> Result<u64, Self::Error> {
+            panic!("unexpected row copy")
+        }
+        fn delete_selected(
+            &mut self,
+            _: u64,
+            _: &synch_verified::host::Selection,
+        ) -> Result<u64, Self::Error> {
+            panic!("unexpected selected delete")
+        }
+        fn write(
+            &mut self,
+            _: u64,
+            _: &str,
+            _: &Fields,
+            _: &[String],
+            _: &[(String, synch_verified::host::ConflictValue)],
+        ) -> Result<(), Self::Error> {
+            panic!("unexpected expression upsert")
+        }
     }
 
     for durable in [None, Some(0), Some(1), Some(-7), Some(i64::MIN)] {
@@ -297,6 +342,51 @@ fn deletion_protocol_checks_every_protection_and_orders_effects() {
         }
         fn read_bytes(&mut self, _: &str, _: &[u8]) -> Result<Option<Vec<u8>>, Self::Error> {
             panic!("unexpected byte read")
+        }
+
+        // The relational host is one trait; these operations never request the
+        // read-repair, copy or expression-upsert statements.
+        fn snapshot(
+            &mut self,
+            _: &synch_verified::host::Selection,
+            _: &[String],
+        ) -> Result<synch_verified::host::Scan<Self::Error>, Self::Error> {
+            panic!("unexpected snapshot")
+        }
+        fn update(
+            &mut self,
+            _: u64,
+            _: &synch_verified::host::Selection,
+            _: &Fields,
+        ) -> Result<u64, Self::Error> {
+            panic!("unexpected update")
+        }
+        fn copy_rows(
+            &mut self,
+            _: u64,
+            _: &str,
+            _: &synch_verified::host::Selection,
+            _: &[(String, synch_verified::host::SourceValue)],
+            _: &[String],
+        ) -> Result<u64, Self::Error> {
+            panic!("unexpected row copy")
+        }
+        fn delete_selected(
+            &mut self,
+            _: u64,
+            _: &synch_verified::host::Selection,
+        ) -> Result<u64, Self::Error> {
+            panic!("unexpected selected delete")
+        }
+        fn write(
+            &mut self,
+            _: u64,
+            _: &str,
+            _: &Fields,
+            _: &[String],
+            _: &[(String, synch_verified::host::ConflictValue)],
+        ) -> Result<(), Self::Error> {
+            panic!("unexpected expression upsert")
         }
     }
     impl Resources for Files {

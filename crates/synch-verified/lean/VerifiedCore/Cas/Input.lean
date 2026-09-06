@@ -29,47 +29,41 @@ structure Result where
 
 abbrev Action (A : Type) := OperationOver Effects Error A
 
-def source (effect : SourceIO (Reply A)) : Action A :=
-  performOver Error.host (.right effect)
+def source (effect : SourceIO (Reply A)) : Action A := raise Error.host effect
 
-def openSource : Action UInt64 := ExceptT.mk do
-  let reply ← Program.request (.left (.left (.left (.open "input" ByteArray.empty)))) Program.pure
-  return reply.mapError (fun error => Error.host error.failure)
+/-- A file reply's failure is the host's original failure. -/
+def file (effect : FileIO (FileReply A)) : Action A := do
+  match ← observe effect with
+  | .error failure => throw (.host failure.failure)
+  | .ok value => return value
 
-def closeSource (handle : UInt64) : Action Unit :=
-  performOver Error.host (.left (.left (.left (.close handle))))
+def openSource : Action UInt64 := file (.open "input" ByteArray.empty)
+def closeSource (handle : UInt64) : Action Unit := raise Error.host (FileIO.close handle)
 
 /-- Read exactly the requested bytes, preserving the original I/O failure.
 There is no CAS recovery on an ingestion input read. A malformed successful
 reply is rejected before hashing. -/
 def readExact (handle size : UInt64) : Action ByteArray := do
-  let reply ← ExceptT.mk (.request (.left (.left (.left (.readAt handle 0 size))))
-    (fun reply => .pure (.ok reply)))
-  match reply with
-  | .error failure => throw (.host failure.failure)
-  | .ok bytes =>
-    if bytes.size.toUInt64 != size then throw .protocol
-    return bytes
+  let bytes ← file (.readAt handle 0 size)
+  if bytes.size.toUInt64 != size then throw .protocol
+  return bytes
 
 /-- The root of bytes the program holds is a host reply whose width the
 program checks; the host never selects inline storage or commits metadata. -/
 def hashInline (bytes : ByteArray) : Action ByteArray := do
-  let root ← performOver Error.host (.left (.left (.right (.hash bytes))))
+  let root ← raise Error.host (Construct.hash bytes)
   if root.size != 32 then throw .protocol
   return root
 
 def captured (handle size : UInt64) (now : Int64) (tier : IngestCommit.Tier)
-    (policy : Ingest.DirectoryPolicy) : Action Result := ExceptT.mk do
-  let reply ← (Ingest.run handle size now tier policy).run.mapEffects EffectSum.left
-  return (reply.mapError Error.ingestion).map (fun root => ⟨root, size⟩)
+    (policy : Ingest.DirectoryPolicy) : Action Result := do
+  let root ← within Error.ingestion (Ingest.run handle size now tier policy)
+  return ⟨root, size⟩
 
 def inlineBytes (bytes : ByteArray) (now : Int64) (tier : IngestCommit.Tier) : Action Result := do
   let root ← hashInline bytes
   let size := bytes.size.toUInt64
-  let _ ← ExceptT.mk do
-    let reply ← (IngestCommit.commitComplete root size (some bytes) now tier).run.mapEffects
-      (fun effect => .left (.right (.left effect)))
-    return reply.mapError Error.metadata
+  within Error.metadata (IngestCommit.commitComplete root size (some bytes) now tier)
   return ⟨root, size⟩
 
 /-- Flatten only after EOF, without suspending while the fresh destination is

@@ -495,7 +495,6 @@ impl Syncer {
         // read the same floor, both decide they supersede it, and both write
         // the pending slot, so the lower one clobbers the higher and the higher
         // survives only in `head_history` with nothing to re-drive it.
-        // LEAN-MODEL: mpt-offer-pending (MptGc.OfferPending)
         // `MptGc.OfferPending` models the history row and pending slot written
         // here together; history is what places this root in trie GC retention.
         let outcome = self.store.transaction(|txn| -> Result<HeadOutcome> {
@@ -521,7 +520,6 @@ impl Syncer {
             // only `try_promote` knows both. A head this node has already
             // failed on is adopted here and retired there, which costs two
             // indexed writes rather than the diff.
-            // LEAN-MODEL: mpt-head-adopt (Convergence.adopt)
             // `Convergence.adopt`; `select_eq_of_mem_iff` is why the head a
             // node ends up with depends on which heads it heard, not their
             // order — it needs the total order the NB above insists on.
@@ -529,7 +527,6 @@ impl Syncer {
                 txn.put_head(Slot::Pending, head, now, now)?;
                 HeadOutcome::Pending
             } else {
-                // LEAN-MODEL: mpt-retain-only (MptGc.Retain)
                 // `MptGc.Retain`: the history row above keeps this root in
                 // the GC mark set even though no slot ever points at it.
                 HeadOutcome::NotNewer
@@ -609,11 +606,8 @@ impl Syncer {
         // What the transaction judged, for the fault arm: it rolls back, so the
         // head cannot be recovered from the slot afterwards.
         let judged: std::cell::RefCell<Option<Verdict>> = std::cell::RefCell::new(None);
-        // LEAN-MODEL: mpt-promote (MptGc.Promote)
         // `Safety` pairs `MptGc.Promote` with content materialization: the
         // completeness check, slot flip and derived views share this commit.
-        // LEAN-MODEL: cas-remote-promotion (Bridge.PromotionTxn)
-        // LEAN-MODEL: cas-ordinary-promotion (Bridge.PromotionTxn)
         // `Bridge.PromotionTxn` composes the entry removals/additions and each
         // pin-or-want decision made by `materialize_diff` below.
         let promoted = self.store.transaction(|txn| -> Result<Promotion> {
@@ -668,7 +662,6 @@ impl Syncer {
                     complete = displaced.as_ref().map(|h| h.seq).unwrap_or(0),
                     "dropping a pending head the complete slot has overtaken"
                 );
-                // LEAN-MODEL: mpt-drop-pending (MptGc.DropPending)
                 // `MptGc.DropPending` is every clearing of the pending slot
                 // that does not flip it: this one, the refusal above,
                 // `sweep_pending_heads`, and a read-scope change. The root
@@ -689,7 +682,6 @@ impl Syncer {
             // And with provenance for a confined origin: what has to be
             // present is what this node was served as that origin's, not
             // what it happens to hold from anyone's trie (§5.5).
-            // LEAN-MODEL: mpt-complete-owned-promote (Provenance.confined_head_vouched)
             // `Provenance.confined_head_vouched`: a member vouches for a
             // confined origin's head only if every node under it is one that
             // origin legitimately held.
@@ -759,12 +751,10 @@ impl Syncer {
             // signature when it took the slot. Recording it again here would be
             // a second rule writing the same row, kept honest only by
             // `INSERT OR IGNORE` (§10, v11).
-            // LEAN-MODEL: mpt-supersede (MptGc.Supersede)
             // The displaced root is no longer active or materialized; it
             // stays retained through `head_history` until pruned.
             txn.put_head(Slot::Complete, &pending.head, pending.received_at, now)?;
             txn.clear_head(origin, Slot::Pending)?;
-            // LEAN-MODEL: mpt-materialize-scoped (Convergence.ScopedView)
             // `Convergence.ScopedView`: what this derives is a function of the
             // root and the read scope alone (`scoped_view_deterministic`), and
             // every admitted key is readable here (`admitted_key_readable`).
@@ -857,7 +847,6 @@ impl Syncer {
                     // walk never commits part of a subtree it is inside, so
                     // every boundary it holds is a scope edge and pruning
                     // against it stays sound.
-                    // LEAN-MODEL: mpt-fetch-reference (ScopedSync.prune_sound_paired)
                     // `ScopedSync.prune_sound_paired`: the reference's
                     // `CompleteWithin` premise is established here, over the
                     // same provenance the walk below reads presence with.
@@ -929,7 +918,6 @@ impl Syncer {
                             );
                         }
                         let missing = walk.next_batch(&Trie::new(txn), MAX_BATCH)?;
-                        // LEAN-MODEL: mpt-complete-memo (ScopedSync.prune_sound)
                         // Pruning is sound only while the reference and the
                         // drained frontier belong to this same generation.
                         let certified = walk.is_exhausted()
@@ -1027,7 +1015,6 @@ impl Syncer {
                         // is one: a row per autocommit statement is a write
                         // connection and a WAL frame per boundary.
                         store.transaction(|txn| -> Result<()> {
-                            // LEAN-MODEL: mpt-learn-scoped (ScopedSync.Learn)
                             // `ScopedSync.Learn`: nodes, values and refusals
                             // enter a delegate's store from the responder
                             // alone; `reachable_confined` is what that buys.
@@ -1051,7 +1038,6 @@ impl Syncer {
                     // what §10 asks of a multi-step write; nothing is lost by a
                     // rollback either, since trie nodes are content-addressed
                     // and simply re-fetched.
-                    // LEAN-MODEL: mpt-fetch-batch (MptGc.LearnBatch)
                     // `MptGc.LearnBatch` abstracts the transaction that makes a
                     // connected verified batch visible; only the last may close
                     // the root and make `complete` true.
@@ -1067,7 +1053,6 @@ impl Syncer {
                                 // vouching for it: that is what provenance
                                 // records, in the same transaction as the
                                 // node (§5.5).
-                                // LEAN-MODEL: mpt-learn-owned (Provenance.learn)
                                 // `Provenance.Step.learn` writes `held` and
                                 // `owned` together.
                                 if let Some(origin) = &owner {
@@ -1189,7 +1174,6 @@ impl Syncer {
                 .await?;
             }
 
-            // LEAN-MODEL: mpt-fetch-progress (Convergence.FetchStep)
             // `Convergence.FetchStep`: a productive round learns an item the
             // finite trie bounds, so the fetch terminates
             // (`fetch_terminates`); a round that can learn nothing more from a

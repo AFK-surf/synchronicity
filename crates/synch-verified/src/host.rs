@@ -1,17 +1,17 @@
 //! Domain-neutral services requested by executable Lean operations.
 
-/// Separate raw capabilities supplied together to a write operation. The
-/// shared transport depends only on these service types, never domain commands.
-pub struct WriteServices<'a, E> {
+/// The raw services an ingestion directs besides its relational storage. The
+/// transport depends only on these service types, never on domain commands.
+pub struct IngestResources<'a, E> {
     pub files: &'a mut dyn FileIO<Error = E>,
     pub construct: &'a mut dyn Construct<Error = E>,
     pub temporary: &'a mut dyn TemporaryFiles<Error = E>,
     pub leases: &'a mut dyn Lease<Error = E>,
     pub source: &'a mut dyn SourceIO<Error = E>,
 }
-impl<E> std::fmt::Debug for WriteServices<'_, E> {
+impl<E> std::fmt::Debug for IngestResources<'_, E> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
-        f.debug_struct("WriteServices").finish_non_exhaustive()
+        f.debug_struct("IngestResources").finish_non_exhaustive()
     }
 }
 
@@ -62,18 +62,6 @@ pub enum ConflictValue {
     Excluded(String),
     Coalesce(Box<(Self, Self)>),
     Maximum(Box<(Self, Self)>),
-}
-
-/// One atomic INSERT with explicit conflict assignments, over raw bound cells.
-pub trait Upsert: Storage {
-    fn write(
-        &mut self,
-        tx: u64,
-        relation: &str,
-        values: &Fields,
-        conflicts: &[String],
-        assignments: &[(String, ConflictValue)],
-    ) -> Result<(), Self::Error>;
 }
 
 /// Raw input observations. Successful bounded reads may be short at EOF;
@@ -131,36 +119,6 @@ pub trait Lease {
     type Error;
     fn acquire(&mut self, space: &str, key: &[u8]) -> Result<u64, Self::Error>;
     fn release(&mut self, token: u64) -> Result<(), Self::Error>;
-}
-
-/// Raw relational access, without metadata interpretation or healing policy.
-pub trait Access: Storage {
-    /// Read outside an explicitly requested transaction, preserving a successful
-    /// raw row prefix and any trailing stepping error.
-    fn snapshot(
-        &mut self,
-        selection: &Selection,
-        columns: &[String],
-    ) -> Result<Scan<Self::Error>, Self::Error>;
-    /// Update explicit raw values for the matching rows in the named transaction.
-    fn update(
-        &mut self,
-        tx: u64,
-        selection: &Selection,
-        values: &Fields,
-    ) -> Result<u64, Self::Error>;
-    /// INSERT SELECT with literal values or source-column projections, ignoring
-    /// only conflicts on the specified target columns.
-    fn copy_rows(
-        &mut self,
-        tx: u64,
-        target: &str,
-        source: &Selection,
-        values: &[(String, SourceValue)],
-        conflicts: &[String],
-    ) -> Result<u64, Self::Error>;
-    /// Delete selected rows in one statement, returning the affected row count.
-    fn delete_selected(&mut self, tx: u64, selection: &Selection) -> Result<u64, Self::Error>;
 }
 
 /// Mechanical I/O classification; interpretation remains in Lean.
@@ -262,8 +220,9 @@ pub trait Resources {
     fn remove_file(&mut self, space: &str, key: &[u8]) -> Result<(), Self::Error>;
 }
 
-/// Host storage capabilities. The interpreter executes requests literally;
-/// algorithms, metadata interpretation and operation sequencing remain in Lean.
+/// The relational host: transactions, raw projections, mutations and byte
+/// reads. The interpreter executes requests literally; algorithms, metadata
+/// interpretation and operation sequencing remain in Lean.
 ///
 /// Transaction handles are local to one interpreter session. A failed commit
 /// does not acknowledge success. Dropping a session must release its resources
@@ -332,6 +291,42 @@ pub trait Storage {
     ) -> Result<u64, Self::Error>;
     /// Read opaque bytes by namespace and key, preserving absence versus empty.
     fn read_bytes(&mut self, space: &str, key: &[u8]) -> Result<Option<Vec<u8>>, Self::Error>;
+
+    /// Read outside an explicitly requested transaction, preserving a successful
+    /// raw row prefix and any trailing stepping error.
+    fn snapshot(
+        &mut self,
+        selection: &Selection,
+        columns: &[String],
+    ) -> Result<Scan<Self::Error>, Self::Error>;
+    /// Update explicit raw values for the matching rows in the named transaction.
+    fn update(
+        &mut self,
+        tx: u64,
+        selection: &Selection,
+        values: &Fields,
+    ) -> Result<u64, Self::Error>;
+    /// INSERT SELECT with literal values or source-column projections, ignoring
+    /// only conflicts on the specified target columns.
+    fn copy_rows(
+        &mut self,
+        tx: u64,
+        target: &str,
+        source: &Selection,
+        values: &[(String, SourceValue)],
+        conflicts: &[String],
+    ) -> Result<u64, Self::Error>;
+    /// Delete selected rows in one statement, returning the affected row count.
+    fn delete_selected(&mut self, tx: u64, selection: &Selection) -> Result<u64, Self::Error>;
+    /// One atomic INSERT with explicit conflict assignments over raw bound cells.
+    fn write(
+        &mut self,
+        tx: u64,
+        relation: &str,
+        values: &Fields,
+        conflicts: &[String],
+        assignments: &[(String, ConflictValue)],
+    ) -> Result<(), Self::Error>;
 }
 
 /// Raw prefix and optional trailing scan failure; no domain interpretation.

@@ -3,8 +3,8 @@ use std::{cell::RefCell, rc::Rc};
 use synch_verified::{
     cas::{self, OperationError, ReadDomainError, ReadError, ReadRequest},
     host::{
-        Access, Cell, Clock, Exclusion, Fields, FileFailure, FileFailureKind, FileIO, Join, Order,
-        Row, Scan, Selection, SourceValue, Storage,
+        Cell, Clock, Exclusion, Fields, FileFailure, FileFailureKind, FileIO, Join, Order, Row,
+        Scan, Selection, SourceValue, Storage,
     },
 };
 
@@ -139,8 +139,7 @@ impl Storage for Database {
     fn read_bytes(&mut self, _: &str, _: &[u8]) -> Result<Option<Vec<u8>>, Self::Error> {
         panic!("unexpected read_bytes")
     }
-}
-impl Access for Database {
+
     fn snapshot(
         &mut self,
         selection: &Selection,
@@ -218,6 +217,17 @@ impl Access for Database {
         assert_roles(selection);
         self.trace.borrow_mut().step("delete")?;
         Ok(2)
+    }
+
+    fn write(
+        &mut self,
+        _: u64,
+        _: &str,
+        _: &Fields,
+        _: &[String],
+        _: &[(String, synch_verified::host::ConflictValue)],
+    ) -> Result<(), Self::Error> {
+        panic!("unexpected expression upsert")
     }
 }
 struct Files {

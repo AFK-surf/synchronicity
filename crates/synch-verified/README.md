@@ -81,7 +81,7 @@ native tests check the C/Rust transport. Neither is a proof of physical I/O.
 
 Acquisition checkpoint validation (`e543883`): all 475 tests across `synch-verified`,
 `synch-store` and `synch-engine`; focused all-target Clippy with warnings denied;
-the full Lean warnings-as-errors build and anchor check. Builds were run
+the full Lean warnings-as-errors proof build. Builds were run
 sequentially with bounded compiler memory after the development-session OOM.
 This does not claim the remaining domains or new cross-platform CI are complete.
 
@@ -116,7 +116,7 @@ cargo test -p synch-mpt -p synch-store
 cargo test -p synch-engine --test delegation
 cargo build --release --bin synch
 cargo run --release -p synch-verified --example decisions
-cd specs/lean && lake build --wfail && ./check-anchors.sh
+cd specs/lean && lake build --wfail
 ```
 
 ### Windows
@@ -142,7 +142,8 @@ artifacts use `linux-gnu` instead of `linux-musl` and require system glibc.
 
 No generated C is checked in. Cargo generates it in its own `OUT_DIR`, so
 parallel target/profile builds do not race on shared generated artifacts.
-Mathlib is needed for the proof build, not the native build or runtime.
+The proof package in `specs/lean` depends only on this core; neither it nor
+the native build needs Mathlib.
 The build checks the Lean version and runtime target triple before linking.
 The toolchain's Std, Init, runtime, GMP and libuv archives are linked statically.
 Linux and Windows also link the bundled C++ support statically; macOS uses
@@ -155,11 +156,10 @@ Lean sources. Their individual theorem scopes and host assumptions remain
 explicit; they do not prove arbitrary filesystem/database behavior, native
 cryptographic primitives, the Rust interpreters, the C adapter or the compiler.
 
-Historical scope/walk/cache models and their Lean theorems remain available for
-mathematical reasoning. They have no fine-grained native exports, and those
-theorems must not be presented as verification of the restored Rust algorithms.
-Model-to-Rust review anchors elsewhere in the repository are not an isomorphism
-proof. End-to-end walk graph coverage remains unproved.
+Nothing in `specs/lean` models Rust. Scoped walks, completeness certificates,
+cloud and network ingestion and every other Rust path are covered by
+regression tests, not by Lean theorems, and no anchor pairs a Lean definition
+with a Rust site.
 
 ## ABI and ownership
 

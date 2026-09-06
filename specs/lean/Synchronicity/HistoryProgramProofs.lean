@@ -1,7 +1,7 @@
 import VerifiedCore.Replication.History
 import Std.Data.TreeMap.Lemmas
 import Std.Data.TreeSet.Lemmas
-import Synchronicity.Prelude
+import Synchronicity.Decidable
 
 /-! These properties concern the executable retention program, not a parallel model. -/
 namespace Synchronicity.HistoryProgramProofs
@@ -313,7 +313,8 @@ theorem selected_before_horizon (pointers : List Pointer) (before : Int64)
     (receipts : List Receipt) (receipt : Receipt) (chosen : receipt ∈ selected pointers before receipts) :
     receipt.recordedAt < before := by
   have allowed := (List.mem_filter.mp chosen).2
-  by_contra h
+  apply Classical.byContradiction
+  intro h
   rw [young_not_deletable _ _ _ _ h] at allowed
   contradiction
 
@@ -354,7 +355,6 @@ theorem prune_reads_pointers (tx : Transaction) (origin : String) (before : Int6
   exact ⟨_, rfl⟩
 
 /-- The public operation itself requests its snapshot lock, before any read. -/
-@[rust_impl "verified-history-prune"]
 theorem prune_begins_transaction (origin : String) (before : Int64) :
     ∃ resume, (prune origin before).run = .request (.left .begin) resume := by
   exact ⟨_, rfl⟩
@@ -546,5 +546,3 @@ example : runScript { forkScript with receipts := [receiptRow 2 1 10, receiptRow
   decide
 
 end Synchronicity.HistoryProgramProofs
-
-#lint
