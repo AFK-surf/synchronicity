@@ -21,6 +21,16 @@
 crates/synch-net/src/sigstore_tuf_root.json -text
 crates/synch-net/src/sigstore_trusted_root.json -text
 
+# The Lean side of the host boundary is generated and kept in the tree.
+# `Hostgen.lean --check`, which `build.rs` runs on every build of
+# synch-verified, compares these files byte-for-byte with what it would print
+# — and it prints LF. A CRLF checkout made every Windows job report both files
+# "out of date" against a source that had not changed. `eol=lf` pins the
+# working-tree bytes on every platform and normalizes a CRLF commit back to
+# what the generator writes.
+crates/synch-verified/lean/VerifiedCore/Host/Generated.lean text eol=lf
+crates/synch-verified/lean/VerifiedCore/Commands/Generated.lean text eol=lf
+
 # The control plane's copy of that same root, shipped in priv/ because Gleam
 # has no include-bytes. Its signatures are checked over canonical JSON built
 # from these bytes, so a CRLF checkout is a root that verifies nothing.
