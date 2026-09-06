@@ -464,6 +464,24 @@ Integration review has identified specific gates, not waived limitations:
   failure injected at every effect. The Rust serving arms, vouching, answer
   assembly and `Scope::admits_node` are deleted; the requesting walk's own
   scope predicates stay in Rust until the walk migrates.
+- Collecting the trie is now the whole command `trieCollect`
+  (`Trie/Collect.lean`), one immediate transaction over the head rows, raw
+  node reads, `Storage.deleteExcept` (one set-wise statement per relation
+  over a host temporary table) and the new `Memo.forgetExcept`, whose
+  forgetting the host binds to the transaction's edge as it binds a lease.
+  Lean owns the retained roots, the mark walk over one accumulating set
+  (written over a `MarkSet` interface: the command runs it over a hash set,
+  the proofs over a list, both proven lawful), which certificates survive
+  (the roots marked from, under the local scope and as each origin's own),
+  and the order of the sweeps. The memo keys themselves (`Trie/Memo.lean`)
+  are laid out in Lean and hashed by the host, and `Scope::memo_key` asks
+  Lean for them (`trieMemoKey`), so every reader and the sweep share one
+  layout. `TrieCollectProofs` proves the walk marks every node reachable
+  from a root it started from and every value a marked node names, leaves
+  the store untouched, and that a sweep keeps exactly the kept keys; pins the
+  key layout; and runs the pass on a concrete store with a failure injected
+  at every effect. The Rust mark loop, temp-table sweeps and key layout are
+  deleted; `Trie::reachable` stays a test oracle.
 - Native tests now cover acquisition transport, every effect-failure position,
   repeated polling, malformed replies and terminal resume. Generic SQLite tests
   cover UPSERT identity/time preservation, raw cells, failed commit, abandoned

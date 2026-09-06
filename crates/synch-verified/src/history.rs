@@ -144,6 +144,7 @@ mod tests {
         host_unexpected!(
             exists_rows,
             upsert,
+            delete_except,
             read_bytes,
             snapshot,
             update,

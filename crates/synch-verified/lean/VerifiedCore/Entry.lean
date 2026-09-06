@@ -13,6 +13,8 @@ import VerifiedCore.Cas.Receive
 import VerifiedCore.Cas.Collect
 import VerifiedCore.Cas.Project
 import VerifiedCore.Trie.Serve
+import VerifiedCore.Trie.Memo
+import VerifiedCore.Trie.Collect
 import VerifiedCore.Replication.History
 
 /-! The one native entry point. A command arrives as a packet, decoded with
@@ -141,6 +143,18 @@ def servingTrie [Encode A] : Except Trie.Serve.Error A → Host.Reply ByteArray
       | .column column reason => .column column reason
       | .host _ => .malformed) : Except _ A)
 
+def collectingTrie [Encode A] : Except Trie.Collect.Error A → Host.Reply ByteArray
+  | .ok value => terminalOf (Except.ok value : Except TrieCollectDomainError A)
+  | .error (.host hostFailure) => .error hostFailure
+  | .error error => terminalOf (Except.error (match error with
+      | .decode message => TrieCollectDomainError.decode message
+      | .malformed => .malformed
+      | .columnType index column actual => .columnType index column actual
+      | .column column reason => .column column reason
+      | .origin error => .origin error
+      | .exhausted => .exhausted
+      | .host _ => .malformed) : Except _ A)
+
 def projecting [Encode A] : Except Cas.Project.Error A → Host.Reply ByteArray
   | .ok value => terminalOf (Except.ok value : Except ProjectDomainError A)
   | .error (.host hostFailure) => .error hostFailure
@@ -243,6 +257,12 @@ def dispatch : Command → Native
   | .trieResolve root paths =>
     if root.size != 32 then protocol
     else command (Trie.Serve.resolvePaths root (paths.map (·.toList))) servingTrie
+  | .trieCollect prefixes exact =>
+    command (Trie.Collect.gcTrie (Std.HashSet ByteArray) ⟨prefixes, exact⟩)
+      (collectingTrie ∘ Except.map fun (nodes, values, roots) => Collected.mk nodes values roots)
+  | .trieMemoKey root prefixes exact owner =>
+    if root.size != 32 then protocol
+    else command (Trie.Memo.keyFor (E := Host.Digest) id ⟨prefixes, exact⟩ root owner) hostOnly
 
 /-- Every command starts here: an undecodable packet is a protocol failure
 before any effect is requested. -/

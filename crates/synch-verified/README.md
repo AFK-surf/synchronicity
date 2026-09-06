@@ -58,7 +58,12 @@ descent that resolves claimed positions, vouching under confined origins,
 admission, value authorization by the holder's coverage, the answer budget)
 is three whole commands over raw node reads and two snapshots, with the
 peer's scope and origins as Authorization inputs; `synch-net`'s serving
-arms, vouching and answer assembly are deleted. History retention now runs as a
+arms, vouching and answer assembly are deleted. Collecting the trie
+(`Trie/Collect.lean`: the retained roots, the mark walk, the certificates
+kept, the set-wise sweeps) is one whole command in one transaction over
+raw reads, `Storage.deleteExcept` and a `Memo` algebra, with the memo keys
+(`Trie/Memo.lean`) laid out in Lean for every reader; `synch-store`'s mark
+loop and sweeps and `synch-mpt`'s key layout are deleted. History retention now runs as a
 complete Lean operation over raw scans and a separate Ed25519 primitive; the
 Rust retention loop and receipt/fork helpers are removed. Raw scans retain
 rows before a trailing host failure so Lean owns first-error selection.

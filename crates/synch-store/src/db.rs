@@ -317,7 +317,7 @@ impl Completeness {
 /// committed or rolled back. Both edges advance the generation: a reader that
 /// starts during a transaction must not certify its pre-commit snapshot later.
 #[derive(Debug)]
-struct MemoMutation(Arc<CasCoord>);
+pub(crate) struct MemoMutation(Arc<CasCoord>);
 
 impl Drop for MemoMutation {
     fn drop(&mut self) {
@@ -850,9 +850,7 @@ impl Txn<'_> {
     ) {
         let mut guard = self.invalidation.borrow_mut();
         if guard.is_none() {
-            let mut memo = self.store.completeness();
-            memo.begin(keep);
-            *guard = Some(MemoMutation(self.store.cas_coord.clone()));
+            *guard = Some(self.store.begin_memo_mutation(keep));
         }
     }
 
@@ -1259,6 +1257,16 @@ impl Store {
             .temporaries
             .lock()
             .unwrap_or_else(PoisonError::into_inner)
+    }
+
+    /// Begins a memo mutation keeping only the certificates in `keep`; the
+    /// guard ends it, and must outlive the mutating transaction's edge.
+    pub(crate) fn begin_memo_mutation(
+        &self,
+        keep: &std::collections::HashSet<Hash>,
+    ) -> MemoMutation {
+        self.completeness().begin(keep);
+        MemoMutation(self.cas_coord.clone())
     }
 
     fn completeness(&self) -> MutexGuard<'_, Completeness> {

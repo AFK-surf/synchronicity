@@ -154,48 +154,33 @@ impl Scope {
     /// "Do I hold all of this?" is a question about a root *and* a scope: a
     /// memo keyed by the root alone would answer a wider scope with a narrower
     /// one's answer. Folding the scope in makes a widened scope re-derive
-    /// rather than inherit.
-    pub fn memo_key_for(&self, owner: Option<&synch_core::OriginId>, root: Hash) -> Hash {
-        match owner {
-            None => self.memo_key(root),
-            Some(origin) => {
-                // "Do I hold all of this *as this origin's*?" is a third
-                // question, distinct from both the unscoped and the scoped
-                // one: a trie held whole is not held whole with provenance,
-                // and the answers must not be confused.
-                let mut bytes = Vec::with_capacity(96);
-                bytes.extend_from_slice(b"owned-root/1");
-                bytes.extend_from_slice(self.memo_key(root).as_bytes());
-                bytes.extend_from_slice(origin.canonical().as_bytes());
-                Hash::new(&bytes)
-            }
-        }
+    /// rather than inherit. "Do I hold all of this *as this origin's*?" is a
+    /// third question, distinct from both: a trie held whole is not held
+    /// whole with provenance, and the answers must not be confused.
+    ///
+    /// The layout is Lean's (`Trie.Memo.keyFor`), shared with the sweep that
+    /// decides which certificates survive a collection; this side only hashes.
+    pub fn memo_key_for(
+        &self,
+        owner: Option<&synch_core::OriginId>,
+        root: Hash,
+    ) -> Result<Hash, crate::MptError> {
+        let owner = owner.map(|origin| origin.canonical());
+        synch_verified::trie::memo_key(
+            &mut crate::lean_storage::Blake3,
+            root.as_bytes(),
+            self.prefixes(),
+            &self.exact,
+            owner.as_deref(),
+        )
+        .map(Hash)
+        .map_err(crate::lean_storage::operation_error)
     }
 
-    /// The key a completeness answer for `root` may be memoized under.
-    ///
-    /// "Do I hold all of this?" is a question about a root *and* a scope: a
-    /// memo keyed by the root alone would answer a wider scope with a narrower
-    /// one's answer. Folding the scope in makes a widened scope re-derive
-    /// rather than inherit. With provenance in the question as well, see
-    /// [`Scope::memo_key_for`].
-    pub fn memo_key(&self, root: Hash) -> Hash {
-        match &self.prefixes {
-            None => root,
-            Some(prefixes) => {
-                let mut bytes = Vec::with_capacity(64);
-                bytes.extend_from_slice(b"scoped-root/1");
-                bytes.extend_from_slice(root.as_bytes());
-                for set in [prefixes, &self.exact] {
-                    bytes.extend_from_slice(&(set.len() as u32).to_le_bytes());
-                    for key in set {
-                        bytes.extend_from_slice(&(key.len() as u32).to_le_bytes());
-                        bytes.extend_from_slice(key);
-                    }
-                }
-                Hash::new(&bytes)
-            }
-        }
+    /// The key a completeness answer for `root` may be memoized under, with
+    /// no provenance in the question; see [`Scope::memo_key_for`].
+    pub fn memo_key(&self, root: Hash) -> Result<Hash, crate::MptError> {
+        self.memo_key_for(None, root)
     }
 }
 

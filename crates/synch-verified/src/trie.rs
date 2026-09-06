@@ -5,8 +5,8 @@ use crate::{
 };
 
 pub use crate::generated::{
-    LookupDomainError, MutationDomainError, NodeAnswer, NodeRefusal, NodeVerdict,
-    TrieServeDomainError, ValueAnswer,
+    Collected, LookupDomainError, MutationDomainError, NodeAnswer, NodeRefusal, NodeVerdict,
+    TrieCollectDomainError, TrieServeDomainError, ValueAnswer,
 };
 pub use crate::operation::OperationError;
 use crate::{host::Storage, operation::Decode};
@@ -643,4 +643,73 @@ mod write_tests {
             Err(OperationError::Host("original write failure"))
         ));
     }
+}
+
+/// Completed collection failure, preserving original host errors.
+#[derive(Debug)]
+pub enum CollectError<E> {
+    Operation(OperationError<E>),
+    Domain(TrieCollectDomainError),
+}
+
+/// The services a trie sweep directs besides its relational storage: the
+/// digest behind the memo keys, and the completeness memo itself.
+pub struct CollectResources<'a, E> {
+    pub digest: &'a mut dyn Digest<Error = E>,
+    pub memo: &'a mut dyn crate::host::Memo<Error = E>,
+}
+impl<E> std::fmt::Debug for CollectResources<'_, E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CollectResources").finish_non_exhaustive()
+    }
+}
+
+/// One mark-and-sweep pass over the trie, in one transaction: every head
+/// row's root is marked from, the completeness certificates of exactly those
+/// roots are kept (under the local scope `prefixes`/`exact`, and as each
+/// origin's own), and every node, provenance row and out-of-line value the
+/// mark missed is swept set-wise. Answers what was swept and how many roots
+/// were marked from.
+pub fn collect<S: Storage>(
+    storage: &mut S,
+    resources: CollectResources<'_, S::Error>,
+    prefixes: Option<&[Vec<u8>]>,
+    exact: &[Vec<u8>],
+) -> Result<Collected, CollectError<S::Error>> {
+    let command = Command::TrieCollect {
+        prefixes: prefixes.map(<[Vec<u8>]>::to_vec),
+        exact: exact.to_vec(),
+    };
+    let capabilities = operation::Capabilities {
+        digest: Some(resources.digest),
+        memo: Some(resources.memo),
+        ..operation::Capabilities::default()
+    };
+    let result =
+        operation::run(storage, capabilities, &[], &command).map_err(CollectError::Operation)?;
+    let outcome: Result<Collected, TrieCollectDomainError> =
+        terminal(&result).map_err(|()| CollectError::Operation(OperationError::Protocol))?;
+    outcome.map_err(CollectError::Domain)
+}
+
+/// The key a completeness answer for `root` under a scope, and as `owner`'s
+/// own when given, is memoized under: the root itself for the whole keyspace,
+/// digests over the root, the scope's sets and the owner otherwise. Lean
+/// owns the layout; the host only hashes.
+pub fn memo_key<D: Digest>(
+    digest: &mut D,
+    root: &[u8; 32],
+    prefixes: Option<&[Vec<u8>]>,
+    exact: &[Vec<u8>],
+    owner: Option<&str>,
+) -> Result<[u8; 32], OperationError<D::Error>> {
+    let command = Command::TrieMemoKey {
+        root: root.to_vec(),
+        prefixes: prefixes.map(<[Vec<u8>]>::to_vec),
+        exact: exact.to_vec(),
+        owner: owner.map(str::to_owned),
+    };
+    let result = operation::run_digest(digest, &[], &command)?;
+    let key: Vec<u8> = terminal(&result).map_err(|()| OperationError::Protocol)?;
+    key.try_into().map_err(|_| OperationError::Protocol)
 }

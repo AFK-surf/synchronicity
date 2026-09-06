@@ -94,10 +94,6 @@ def answerBudget : Nat := 8388608
 deepest key; the budget only retains the corrupted-store behaviour. -/
 def descentFuel : Nat := maxKeyBytes * 2 + 1
 
-/-- The zero root is the empty trie. -/
-def rootOf (root : ByteArray) : Option ByteArray :=
-  if root.data.all (· == 0) then none else some root
-
 /-! ## Positions -/
 
 /-- What stands `rest` below `current`, recording each position reached as

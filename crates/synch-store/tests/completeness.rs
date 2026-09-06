@@ -55,7 +55,7 @@ fn an_old_walk_cannot_recertify_a_dissolved_boundary() {
     assert!(walk.is_exhausted());
     other.put_node(&root, &bytes).unwrap();
     assert!(!store
-        .note_complete_at(&scope.memo_key(root), generation)
+        .note_complete_at(&scope.memo_key(root).unwrap(), generation)
         .unwrap());
     assert!(!Trie::new(&store).is_complete_scoped(root, &scope).unwrap());
 }
@@ -73,12 +73,12 @@ fn a_walk_started_during_an_invalidating_transaction_cannot_certify_after_commit
             // A separate WAL reader sees the old, refused boundary. It must not
             // cache that snapshot while this writer is uncommitted.
             let generation = reader.completeness_generation()?;
-            assert!(!reader.note_complete_at(&scope.memo_key(root), generation)?);
+            assert!(!reader.note_complete_at(&scope.memo_key(root).unwrap(), generation)?);
             Ok(generation)
         })
         .unwrap();
     assert!(!reader
-        .note_complete_at(&scope.memo_key(root), generation)
+        .note_complete_at(&scope.memo_key(root).unwrap(), generation)
         .unwrap());
     assert!(!Trie::new(&reader).is_complete_scoped(root, &scope).unwrap());
 }
@@ -96,7 +96,7 @@ fn rollback_releases_invalidation_but_does_not_reuse_its_generation() {
     });
     assert!(error.is_err());
     assert!(!store
-        .note_complete_at(&scope.memo_key(root), before)
+        .note_complete_at(&scope.memo_key(root).unwrap(), before)
         .unwrap());
     assert!(Trie::new(&store).is_complete_scoped(root, &scope).unwrap());
 }

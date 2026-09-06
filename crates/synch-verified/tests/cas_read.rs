@@ -183,6 +183,7 @@ impl Storage for Database {
         Ok(2)
     }
     host_unexpected!(
+        delete_except,
         scan_rows,
         exists_rows,
         upsert,

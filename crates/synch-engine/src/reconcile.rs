@@ -923,7 +923,7 @@ impl Syncer {
                         let certified = walk.is_exhausted()
                             && synch_mpt::NodeStore::note_complete_at(
                                 store.as_ref(),
-                                &walk_scope.memo_key_for(walk_owner.as_ref(), pending.root),
+                                &walk_scope.memo_key_for(walk_owner.as_ref(), pending.root)?,
                                 current,
                             )?;
                         Ok((missing, walk, current, certified))

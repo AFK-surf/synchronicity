@@ -35,3 +35,4 @@ import Synchronicity.CasReceiveProofs
 import Synchronicity.CasCollectProofs
 import Synchronicity.CasProjectProofs
 import Synchronicity.TrieServeProofs
+import Synchronicity.TrieCollectProofs

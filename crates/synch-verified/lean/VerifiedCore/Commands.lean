@@ -12,6 +12,7 @@ import VerifiedCore.Cas.Receive
 import VerifiedCore.Cas.Collect
 import VerifiedCore.Cas.Project
 import VerifiedCore.Trie.Serve
+import VerifiedCore.Trie.Collect
 
 /-! The shapes that cross the command boundary: what a caller asks for and
 what a finished command reports. `hostgen` derives the codecs of every type
@@ -121,6 +122,14 @@ inductive Command where
       (prefixes : Option (List ByteArray)) (exact : List ByteArray) (peerOrigins confined : List String)
   /-- What stands at each nibble position under a root. -/
   | trieResolve (root : ByteArray) (paths : List ByteArray)
+  /-- Sweep every trie node, provenance row and out-of-line value no retained
+  head reaches, keeping the completeness certificates of the retained roots
+  under the local scope (`prefixes`, `exact`), all in one transaction. -/
+  | trieCollect (prefixes : Option (List ByteArray)) (exact : List ByteArray)
+  /-- The key a completeness answer for `root` under a scope, and as
+  `owner`'s own when given, is memoized under. -/
+  | trieMemoKey (root : ByteArray) (prefixes : Option (List ByteArray)) (exact : List ByteArray)
+      (owner : Option String)
 
 /-- Malformed metadata or a column of the wrong storage class, as pin
 acquisition and deletion report it. -/
@@ -184,6 +193,18 @@ inductive TrieServeDomainError where
   | column (column : String) (reason : String)
   deriving BEq, DecidableEq
 
+/-- How a trie sweep refuses: a stored node that does not decode, a malformed
+head row, or a mark walk that outran its budget, in which case nothing is
+swept. -/
+inductive TrieCollectDomainError where
+  | decode (message : String)
+  | malformed
+  | columnType (index : Nat) (column : String) (actual : Cas.Codec.CellType)
+  | column (column : String) (reason : String)
+  | origin (error : Origin.Error)
+  | exhausted
+  deriving BEq, DecidableEq
+
 /-- How a projection refuses: a malformed row, a column of the wrong class,
 or a column whose value is not a root or a holder. -/
 inductive ProjectDomainError where
@@ -231,6 +252,13 @@ structure Served where
 structure Evicted where
   entries : UInt64
   freed : UInt64
+  deriving BEq, DecidableEq
+
+/-- What a trie sweep took, and how many retained roots it marked from. -/
+structure Collected where
+  nodes : UInt64
+  values : UInt64
+  roots : UInt64
   deriving BEq, DecidableEq
 
 end VerifiedCore.Commands

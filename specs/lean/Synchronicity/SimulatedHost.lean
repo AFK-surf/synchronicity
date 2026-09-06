@@ -5,6 +5,8 @@ import VerifiedCore.Host.Source
 import VerifiedCore.Crypto
 import VerifiedCore.Host.Bao
 import VerifiedCore.Host.Sweep
+import VerifiedCore.Host.Memo
+import VerifiedCore.Host.Digest
 import Synchronicity.Decidable
 
 /-! One stateful host for composed CAS proofs. Successful replies are computed
@@ -40,6 +42,10 @@ structure State where
   temporaries : List (UInt64 × Temporary) := []
   leases : List (UInt64 × ObjectKey) := []
   counters : List (ObjectKey × UInt64) := []
+  /-- The completeness certificates a host keeps, and how many mutations
+  have forgotten some of them. -/
+  certified : List ByteArray := []
+  memoGeneration : UInt64 := 0
   nextHandle : UInt64 := 1
   synced : List ObjectKey := []
   output : List UInt8 := []
@@ -148,6 +154,18 @@ def storage : Storage A → State → Result A
   | .existsRows tx relation fields, state =>
       reply state ("exists:" ++ relation) fun state => transaction state tx fun db =>
         ((rows db relation).any (fun row => equals row fields), db)
+  | .deleteExcept tx relation column keys, state =>
+      reply state ("sweep:" ++ relation) fun state => transaction state tx fun db =>
+        let table := rows db relation
+        -- SQL `NOT IN`: a NULL key is neither in nor out of the set, so the
+        -- row stays; any other key not in the set goes. Rows only: a
+        -- content-addressed relation's payloads (`readBytes`) are the
+        -- fixture's mirror of its rows, outside the transaction.
+        let remaining := table.filter fun row => match cell row column with
+          | .blob key => keys.contains key
+          | .null => true
+          | _ => false
+        (table.length - remaining.length, setRows db relation remaining)
   | .readCounter space key, state => reply state ("counter:" ++ space) fun state =>
       (.ok (counter state (space, key)), state)
   | .readBytes space key, state => reply state ("bytes:" ++ space) fun state =>
@@ -307,6 +325,10 @@ def lease : Lease A → State → Result A
 def crypto : Crypto A → State → Result A
   | .validateEd25519 bytes, state => reply state "crypto" fun state => (.ok (state.validateKey bytes), state)
 
+/-- The digest is the same trust parameter construction hashes with. -/
+def digest : Digest A → State → Result A
+  | .blake3 bytes, state => reply state "digest" fun state => (.ok (state.hash bytes), state)
+
 /-- Encodings land in the private output, as a transfer does; the program
 sees only the count. A refused proof appends nothing. -/
 def bao : Bao A → State → Result A
@@ -356,6 +378,12 @@ def sweep : Sweep A → State → Result A
         some ((objectRoots state).foldl (fun listed root => listed ++ root) ByteArray.empty)
       else none), state)
 
+/-- Forgetting keeps exactly the kept certificates and counts one mutation. -/
+def memo : Memo A → State → Result A
+  | .forgetExcept keep, state => reply state "memo:forget" fun state =>
+      let certified := state.certified.filter fun key => keep.contains key
+      (.ok (), { state with certified, memoGeneration := state.memoGeneration + 1 })
+
 /-- Capability composition is shared by every proof and every operation. -/
 class Interpreter (E : Type → Type) where
   handle : E A → State → Result A
@@ -371,8 +399,10 @@ instance : Interpreter Construct := ⟨construct⟩
 instance : Interpreter Resources := ⟨resources⟩
 instance : Interpreter Lease := ⟨lease⟩
 instance : Interpreter Crypto := ⟨crypto⟩
+instance : Interpreter Digest := ⟨digest⟩
 instance : Interpreter Bao := ⟨bao⟩
 instance : Interpreter Sweep := ⟨sweep⟩
+instance : Interpreter Memo := ⟨memo⟩
 instance [Interpreter L] [Interpreter R] : Interpreter (EffectSum L R) where
   handle
     | .left effect, state => Interpreter.handle effect state

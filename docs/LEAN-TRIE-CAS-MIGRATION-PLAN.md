@@ -47,7 +47,7 @@ of those as a metadata invariant.
 | `is_complete_scoped_for` and the memo protocol | `reconcile.rs`, `aae.rs`, `membership.rs` | `Trie/Complete.lean` |
 | `resolve_paths`, `Scope::admits_node` (serve-side admission) | `synch-net/src/mpt.rs:299-377` | `Trie/Serve.lean` (done; `Scope::admits_path`, `contains_subtree` and `admits_value` stay Rust on the requesting walk until T3/T6) |
 | `first_key_outside` | `reconcile.rs:735` | `Trie/Scope.lean` |
-| `reachable`, `reach_into` and `Store::gc_trie` mark-and-sweep | `synch-store/src/gc.rs:53-110` | `Trie/Collect.lean` |
+| `reachable`, `reach_into` and `Store::gc_trie` mark-and-sweep | `synch-store/src/gc.rs:53-110` | `Trie/Collect.lean` (done; `Trie::reachable` stays a Rust test oracle) |
 | `Scope` (`admits_path`, `contains_subtree`, `admits_key_path`, `memo_key_for`) | everywhere above | `Trie/Scope.lean` |
 | `prove`, `Proof::verify` (feature `proofs`, no production caller) | none | `Trie/Proof.lean`, last |
 
@@ -89,13 +89,13 @@ carries policy; each is a primitive the current Rust code already performs.
 | Algebra | Effects | Serves |
 |---|---|---|
 | `ByteStorage` (extend) | `existsBytes space key` | `has_value` without materializing the payload |
-| `Storage` (extend) | `deleteExcept tx relation keyColumn keys` (one statement over a host temp table) | set-wise GC sweep, never per-row callbacks |
+| `Storage` (extend) | `deleteExcept tx relation keyColumn keys` (one statement over a host temp table) | set-wise GC sweep, never per-row callbacks (done, T7) |
 | `Digest` (new; `Crypto` stays signature-only) | `blake3 bytes` | node hashing (done, T1) |
 | `ByteWrites` (new) | `putBytes space key bytes` | content-addressed node and value writes (T2) |
 | `FileIO` (extend) | `copyRange src dst offset len` (reflink or positional), `setLen handle len`, `blocks space key`, `list space`, `mtime space key` | promote, trim, eviction accounting, orphan sweep |
 | `Bao` (new, a whole host service like `Construct`) | `decodeSlice stream payload outboard size ranges` (verifies a slice stream against the root, writes only verified groups and their outboard nodes, answers the verified spans), `encodeSlice payload outboard size ranges → output`, `encodeProof`, `verifyProof`, `promoteRun` (compare-then-copy of one donor run) | every Bao computation: slice receive and serve, delta-sync proofs and promotion. Implemented in Rust on `bao-tree`/`blake3`, tested against standard vectors, and a stated trust assumption; Lean directs which ranges are asked for and what a reply means, never the tree |
 | `Provider` (new) | `head root`, `readRange root offset len into handle`, `readOutboard root into handle`, `putPair payload outboard`, `putPairBytes`, `scratchSweep`, with a raw failure kind `notFound | other` | cloud adoption, hydration, finalize; Lean applies the §6.4 rule, the host only classifies |
-| `Memo` (new) | `isKnown key`, `generation`, `certify key generation` | the completeness cache; invalidation on mutation edges is a host resource guarantee like `Lease` |
+| `Memo` (new) | `forgetExcept keep` (done, T7), `isKnown key`, `generation`, `certify key generation` | the completeness cache; invalidation on mutation edges is a host resource guarantee like `Lease` |
 | `Peer` (new) | `fetchNodes wants : Reply (List (path × hash × bytes))`, `fetchValues` | the reconcile fetch loop (§4, T3) |
 
 The tag table in `Hostgen.lean` grows accordingly. The simulated host gains
@@ -250,13 +250,44 @@ the prefix, in key order, up to the limit; `diff old new` is the symmetric
 difference of the two denotations; pruning identical subtrees is sound under
 F3. Cutover: `views.rs:1185`, `node.rs`, `replica.rs`.
 
-**T7. Trie collection** (`Trie/Collect.lean`). Mark from the retained roots
-through `readBytes`, compute the memo keys to keep, then one
-`Storage.deleteExcept` per relation (`trie_nodes`, `trie_node_origins`,
-`trie_values`) and one `Memo` invalidation, all inside the single immediate
-transaction `gc.rs` insists on. Proof: the marked set equals the union of
-reachable sets; a node reachable from a retained root is never deleted; a
-provenance row never outlives its node. Cutover: `gc_trie`.
+**T7. Trie collection** (`Trie/Collect.lean`). Done. `Store::gc_trie` is
+the whole command `trieCollect`: one immediate transaction that reads the
+head rows, marks from every retained root through `readBytes` into one
+accumulating mark set (a node already marked is not read again, a node the
+store does not hold is marked and skipped, so a partially fetched pending
+head marks what it has), computes the certificates to keep, forgets the
+rest through the new `Memo.forgetExcept`, and sweeps `trie_nodes`,
+`trie_node_origins` and `trie_values` with one `Storage.deleteExcept` each
+(one statement over a host temporary table). The walk is written over a
+`MarkSet` interface: the command runs it over `Std.HashSet`, the proofs over
+a list. The certificates kept are the roots marked from, their keys under
+the local scope, and their keys as each origin's own under the local scope
+and the whole keyspace; the key layout is Lean's (`Trie/Memo.lean`, over
+`Digest`), and `Scope::memo_key`/`memo_key_for` now ask Lean for it
+(`trieMemoKey`), so every reader and the sweep share one layout. The memo
+itself stays a host resource: forgetting begins the same mutation the
+store's own transactions begin, and the guard ends it after the storage
+session's transaction edge, exactly as `Txn` did. A walk that outran its
+budget (2^40 nodes) sweeps nothing. Proved (`TrieCollectProofs`): both set
+instances satisfy the laws the walk relies on; over any lawful set the walk
+leaves the store untouched, marks every frontier address, keeps the mark
+closed under children once the frontier is drained and every marked node's
+values marked, so every node reachable from a root it started from is
+marked (`mark_complete`) and every out-of-line value a marked node names is
+marked (`mark_values`); a set-wise sweep keeps exactly the rows whose key is
+kept (`sweep_keeps_only_kept`); the memo keys' byte layout is pinned
+(`scoped_layout`, `owned_layout`), the whole keyspace is keyed by the root
+with no digest asked for, and an owned key is one digest; and on a concrete
+store the pass keeps exactly the retained root's nodes, provenance and
+value and sweeps the displaced root, its provenance and the orphan value
+(`the_sweep_keeps_exactly_what_the_retained_root_reaches`), provenance
+names a surviving node, a store with no head is swept whole, a scoped store
+keeps the scoped certificate, and every injected failure rolls back. The
+graph-level claim "marked = reachable" is proved as completeness
+(`mark_complete`); soundness (nothing unreachable is marked) is not, and is
+not needed for safety. Cutover: `gc.rs`'s mark loop, `sweep_unmarked` and
+the memo-key layout in `synch-mpt` are deleted; `Trie::reachable` stays a
+test oracle; `retained_roots_in` stays under `cfg(test)`.
 
 **T8. Merkle proofs** (`Trie/Proof.lean`). `prove` is `get` with its node
 trace; `verify` is `get` over the proof's nodes as a raw snapshot. Both

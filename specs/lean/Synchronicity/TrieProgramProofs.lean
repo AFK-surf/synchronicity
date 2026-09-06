@@ -125,6 +125,7 @@ def executeReads (store : RawSnapshot) : Nat → Program Storage A → Option A
   | _ + 1, .request (.readCounter _ _) _ => none
   | _ + 1, .request (.removeFile _ _) _ => none
   | _ + 1, .request (.existsRows _ _ _) _ => none
+  | _ + 1, .request (.deleteExcept _ _ _ _) _ => none
 
 @[simp] theorem execute_pure (store : RawSnapshot) (fuel : Nat) (result : A) :
     executeReads store fuel (.pure result) = some result := by

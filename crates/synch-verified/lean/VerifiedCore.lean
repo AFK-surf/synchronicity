@@ -13,6 +13,8 @@ import VerifiedCore.Trie.Program
 import VerifiedCore.Trie.Verify
 import VerifiedCore.Trie.Mutate
 import VerifiedCore.Trie.Serve
+import VerifiedCore.Trie.Memo
+import VerifiedCore.Trie.Collect
 import VerifiedCore.Replication.History
 
 /-!

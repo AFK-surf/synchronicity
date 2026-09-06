@@ -112,6 +112,10 @@ inductive Storage : Type → Type where
   | deleteRows (tx : Transaction) (relation : String)
       (equals : Fields) (blockers : List Exclusion := [])
       (atMost : Fields := []) : Storage (Reply Nat)
+  /-- Delete every row of the relation whose key column names none of
+  `keys`, in one statement over a host-side set, and answer how many went. -/
+  | deleteExcept (tx : Transaction) (relation column : String) (keys : List ByteArray) :
+      Storage (Reply Nat)
   | readBytes (space : String) (key : ByteArray) : Storage (Reply (Option ByteArray))
   /-- Bounded access to an immutable command input, borrowed for this run. -/
   | readInput (handle offset count : UInt64) : Storage (Reply ByteArray)

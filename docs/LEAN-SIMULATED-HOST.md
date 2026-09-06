@@ -9,7 +9,8 @@ The former per-operation reply scripts and `Handlers.lean` are removed.
 
 `State` contains committed database tables, an optional transaction-local copy,
 files keyed by namespace and object key, open handles, temporaries, writer leases
-and counters, a private output buffer, the clock, and the effect trace.
+and counters, the completeness certificates and their generation, a private
+output buffer, the clock, and the effect trace.
 
 `Interpreter` has one implementation per raw capability. Its `EffectSum` instance
 composes capabilities without changing their behavior. `execute` interprets the
@@ -51,6 +52,15 @@ handle. Transfers check the requested bounds and append the actual slice. Missin
 files and short reads arise from file state, not configured success/failure
 replies. Temporaries are created, filled, flushed, replaced, and discarded through
 raw capabilities. Lease acquisition/release changes the counter collection reads.
+
+`Storage.deleteExcept` keeps exactly the rows whose key column names one of
+the kept keys, with SQL `NOT IN` semantics for NULL (a NULL key is neither in
+nor out of the set, so the row stays). It touches rows only: the payloads a
+content-addressed relation serves through `readBytes` live in the file
+namespace of the same name, which a fixture keeps consistent with the rows.
+`Memo.forgetExcept` filters `certified` down to the kept keys and advances
+`memoGeneration`; `Digest.blake3` answers with the same `hash` parameter
+construction hashes with.
 
 `faults` selects ordinary failures by effect index in the accumulated trace.
 `scanFault` models a failure after the returned scan prefix. Failed ordinary

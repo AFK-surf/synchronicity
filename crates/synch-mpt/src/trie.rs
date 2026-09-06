@@ -998,7 +998,7 @@ impl<'a, S: NodeStore + ?Sized> Trie<'a, S> {
         root: Hash,
         scope: &Scope,
     ) -> Result<bool, MptError> {
-        let memo = scope.memo_key_for(owner, root);
+        let memo = scope.memo_key_for(owner, root)?;
         if Self::wrap(self.store.is_known_complete(&memo))? {
             return Ok(true);
         }
@@ -1587,8 +1587,8 @@ mod tests {
         }
         // The two memos are distinct questions.
         assert_ne!(
-            Scope::full().memo_key_for(Some(&owner), root),
-            Scope::full().memo_key(root)
+            Scope::full().memo_key_for(Some(&owner), root).unwrap(),
+            Scope::full().memo_key(root).unwrap()
         );
     }
 

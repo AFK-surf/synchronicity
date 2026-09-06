@@ -11,6 +11,10 @@ def nodeSpace : String := "trie_nodes"
 def valueSpace : String := "trie_values"
 def maxKeyBytes : Nat := 4096
 
+/-- The zero root is the empty trie. -/
+def rootOf (root : ByteArray) : Option ByteArray :=
+  if root.data.all (· == 0) then none else some root
+
 inductive LookupError where
   | keyTooLong (bytes : Nat)
   | missingNode (address : ByteArray)

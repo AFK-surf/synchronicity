@@ -246,6 +246,17 @@ impl Storage for Session<'_> {
             .delete_rows(tx, relation, equals, unless, at_most)
     }
 
+    fn delete_except(
+        &mut self,
+        tx: u64,
+        relation: &str,
+        column: &str,
+        keys: &[&[u8]],
+    ) -> Result<u64> {
+        self.transaction()?
+            .delete_except(tx, relation, column, keys)
+    }
+
     fn read_bytes(&mut self, space: &str, key: &[u8]) -> Result<Option<Vec<u8>>> {
         if let Some(storage) = self.active.as_mut() {
             storage.read_bytes(space, key)
@@ -807,6 +818,37 @@ impl Storage for SqliteStorage<'_> {
         };
         let sql = format!("DELETE FROM \"{relation}\" AS \"target\"{predicate}");
         Ok(self.conn.execute(&sql, params_from_iter(bindings))? as u64)
+    }
+
+    fn delete_except(
+        &mut self,
+        tx: u64,
+        relation: &str,
+        column: &str,
+        keys: &[&[u8]],
+    ) -> Result<u64> {
+        self.require_live_transaction(tx)?;
+        let column = self::column(relation, column)?;
+        // The kept set goes through a temporary table rather than an
+        // `IN (?, ?, …)` list: it is the size of the live trie, far past
+        // SQLite's parameter limit, and one statement sweeps the rest.
+        self.conn.execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS lean_kept (key BLOB PRIMARY KEY);
+             DELETE FROM lean_kept;",
+        )?;
+        {
+            let mut insert = self
+                .conn
+                .prepare("INSERT OR IGNORE INTO lean_kept (key) VALUES (?1)")?;
+            for key in keys {
+                insert.execute(rusqlite::params![*key])?;
+            }
+        }
+        let sql =
+            format!("DELETE FROM \"{relation}\" WHERE {column} NOT IN (SELECT key FROM lean_kept)");
+        let swept = self.conn.execute(&sql, [])?;
+        self.conn.execute_batch("DELETE FROM lean_kept;")?;
+        Ok(swept as u64)
     }
 
     fn read_bytes(&mut self, space: &str, key: &[u8]) -> Result<Option<Vec<u8>>> {

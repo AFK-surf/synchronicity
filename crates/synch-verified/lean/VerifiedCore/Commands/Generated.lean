@@ -386,6 +386,26 @@ instance : Decode Commands.TrieServeDomainError where
     | 4 => return .column (← Decode.decode) (← Decode.decode)
     | _ => throw ()
 
+instance : Encode Commands.TrieCollectDomainError where
+  encode out value := match value with
+    | .decode a0 => out.push 0 |>.put a0
+    | .malformed => out.push 1
+    | .columnType a0 a1 a2 => out.push 2 |>.put a0 |>.put a1 |>.put a2
+    | .column a0 a1 => out.push 3 |>.put a0 |>.put a1
+    | .origin a0 => out.push 4 |>.put a0
+    | .exhausted => out.push 5
+
+instance : Decode Commands.TrieCollectDomainError where
+  decode := do
+    match ← readByte with
+    | 0 => return .decode (← Decode.decode)
+    | 1 => return .malformed
+    | 2 => return .columnType (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 3 => return .column (← Decode.decode) (← Decode.decode)
+    | 4 => return .origin (← Decode.decode)
+    | 5 => return .exhausted
+    | _ => throw ()
+
 instance : Encode Commands.Ingested where
   encode out value := match value with
     | .mk a0 a1 => out |>.put a0 |>.put a1
@@ -426,6 +446,17 @@ instance : Decode Commands.Evicted where
     let a1 ← Decode.decode
     return .mk a0 a1
 
+instance : Encode Commands.Collected where
+  encode out value := match value with
+    | .mk a0 a1 a2 => out |>.put a0 |>.put a1 |>.put a2
+
+instance : Decode Commands.Collected where
+  decode := do
+    let a0 ← Decode.decode
+    let a1 ← Decode.decode
+    let a2 ← Decode.decode
+    return .mk a0 a1 a2
+
 instance : Encode Commands.Command where
   encode out value := match value with
     | .acquire a0 a1 a2 a3 => out.push 0 |>.put a0 |>.put a1 |>.put a2 |>.put a3
@@ -464,6 +495,8 @@ instance : Encode Commands.Command where
     | .trieServeNodes a0 a1 a2 a3 a4 a5 => out.push 33 |>.put a0 |>.put a1 |>.put a2 |>.put a3 |>.put a4 |>.put a5
     | .trieServeValues a0 a1 a2 a3 a4 a5 => out.push 34 |>.put a0 |>.put a1 |>.put a2 |>.put a3 |>.put a4 |>.put a5
     | .trieResolve a0 a1 => out.push 35 |>.put a0 |>.put a1
+    | .trieCollect a0 a1 => out.push 36 |>.put a0 |>.put a1
+    | .trieMemoKey a0 a1 a2 a3 => out.push 37 |>.put a0 |>.put a1 |>.put a2 |>.put a3
 
 instance : Decode Commands.Command where
   decode := do
@@ -504,6 +537,8 @@ instance : Decode Commands.Command where
     | 33 => return .trieServeNodes (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode)
     | 34 => return .trieServeValues (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode)
     | 35 => return .trieResolve (← Decode.decode) (← Decode.decode)
+    | 36 => return .trieCollect (← Decode.decode) (← Decode.decode)
+    | 37 => return .trieMemoKey (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode)
     | _ => throw ()
 
 end VerifiedCore

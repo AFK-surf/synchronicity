@@ -4,7 +4,6 @@ use std::collections::HashSet;
 
 use rusqlite::{params, OptionalExtension};
 use synch_core::Hash;
-use synch_mpt::{Scope, Trie};
 
 use crate::{db::hash_column, db::Store, error::Result};
 
@@ -51,62 +50,12 @@ impl Store {
     /// `fetch_pending` commits one batch per transaction and `reachable`
     /// silently skips missing children.
     pub(crate) fn gc_trie(&self) -> Result<GcStats> {
-        // `MptGc.TrieGc` models this whole immediate transaction, not its
-        // individual reads and deletes; splitting it invalidates the theorem.
-        let mut stats = GcStats::default();
-        let scope = self.local_trie_scope()?;
-        let (swept_nodes, swept_values) = self.transaction(|txn| -> Result<(usize, usize)> {
-            let conn = txn.conn();
-            let roots = retained_roots_in(conn)?;
-            stats.roots_marked = roots.len();
-            // One accumulating mark set across every retained root, not one
-            // walk per root. Successive roots of an origin share all but
-            // the path that changed, so walking each into its own set would
-            // cost a store read per node *per root* — and `head_history`
-            // holds a row per publish for `root_retention`, so that
-            // multiplier is in the thousands for a node that publishes
-            // steadily. All of it inside the immediate transaction below,
-            // which holds the one write connection.
-            // `TrieGraph.GcSweep` states the graph-level obligation: every
-            // stored node reachable from any retained root is in the mark set.
-            let trie = Trie::new(txn);
-            let mut marked = synch_mpt::Reachable::default();
-            for root in &roots {
-                trie.reach_into(*root, &mut marked)?;
-            }
-            let (nodes, values) = (marked.nodes, marked.values);
-            // Keep certificates only for roots marked by this very
-            // snapshot. The generation still advances to reject walks
-            // that started before the sweep, including pruned fetches.
-            let mut keep: HashSet<Hash> = roots.iter().copied().collect();
-            keep.extend(roots.iter().map(|root| scope.memo_key(*root)));
-            let mut stmt = conn.prepare("SELECT DISTINCT origin_id, root FROM head_history")?;
-            let rows = stmt.query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
-            })?;
-            for row in rows {
-                let (origin, root) = row?;
-                let origin = crate::db::origin_column(origin, "head_history.origin_id")?;
-                let root = hash_column(root, "head_history.root")?;
-                keep.insert(scope.memo_key_for(Some(&origin), root));
-                keep.insert(Scope::full().memo_key_for(Some(&origin), root));
-            }
-            txn.invalidate_completeness_preserving(&keep);
-            // Deleted set-wise rather than row by row: pulling every hash
-            // into a `Vec` and issuing one `DELETE ... WHERE hash = ?` per
-            // unreferenced row is, on a large store, millions of statements
-            // under the write lock.
-            let n = sweep_unmarked(conn, "trie_nodes", &nodes)?;
-            // Provenance rows name nodes; a row for a swept node would
-            // vouch, for the next trie to carry that hash, for a node this
-            // store no longer holds as anyone's.
-            sweep_unmarked(conn, "trie_node_origins", &nodes)?;
-            let v = sweep_unmarked(conn, "trie_values", &values)?;
-            Ok((n, v))
-        })?;
-        stats.nodes = swept_nodes;
-        stats.values = swept_values;
-        Ok(stats)
+        // The whole pass is the Lean command `trieCollect`: the retained
+        // roots, the mark walk over one accumulating mark set, the memo
+        // certificates kept, and the set-wise sweeps, inside its one
+        // immediate transaction. Rust binds the storage session, the digest
+        // behind the memo keys and the memo, and names the diagnostics.
+        crate::lean_trie_collect::gc_trie(self)
     }
 
     /// Sweeps content objects that no retained entry references, that are not
@@ -393,6 +342,7 @@ pub(crate) fn mtime_nanos(meta: &std::fs::Metadata) -> Option<i64> {
 /// remove a row a slot still names, so every current head's root is here by
 /// construction. The union returned the same set — but stating the mark set
 /// twice, in two places, is how the two come to disagree.
+#[cfg(test)]
 pub(crate) fn retained_roots_in(conn: &rusqlite::Connection) -> Result<Vec<Hash>> {
     let mut stmt = conn.prepare("SELECT DISTINCT root FROM head_history")?;
     let rows = stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
@@ -403,40 +353,11 @@ pub(crate) fn retained_roots_in(conn: &rusqlite::Connection) -> Result<Vec<Hash>
     Ok(out)
 }
 
-/// Deletes every row of `table` whose hash is not in `marked`, in one
-/// statement, and reports how many went.
-///
-/// The marked set goes into a temporary table rather than an `IN (?, ?, …)`
-/// list: the set is the size of the live trie, which is far past SQLite's
-/// parameter limit.
-fn sweep_unmarked(
-    conn: &rusqlite::Connection,
-    table: &str,
-    marked: &HashSet<Hash>,
-) -> Result<usize> {
-    conn.execute_batch(
-        "CREATE TEMP TABLE IF NOT EXISTS gc_marked (hash BLOB PRIMARY KEY);
-         DELETE FROM gc_marked;",
-    )?;
-    {
-        let mut insert = conn.prepare("INSERT OR IGNORE INTO gc_marked (hash) VALUES (?1)")?;
-        for hash in marked {
-            insert.execute(params![hash.as_bytes().to_vec()])?;
-        }
-    }
-    let swept = conn.execute(
-        &format!("DELETE FROM {table} WHERE hash NOT IN (SELECT hash FROM gc_marked)"),
-        [],
-    )?;
-    conn.execute_batch("DELETE FROM gc_marked;")?;
-    Ok(swept)
-}
-
 #[cfg(test)]
 mod tests {
     use iroh_base::SecretKey;
     use synch_core::{file_key, FileEntry, Hash, SignedHead};
-    use synch_mpt::NodeStore;
+    use synch_mpt::{NodeStore, Trie};
 
     use super::*;
     use crate::heads::Slot;
@@ -476,7 +397,7 @@ mod tests {
             )
             .unwrap();
         store.set_read_scope(Some(&["s".to_string()])).unwrap();
-        let scoped = store.local_trie_scope().unwrap().memo_key(root);
+        let scoped = store.local_trie_scope().unwrap().memo_key(root).unwrap();
         assert_ne!(scoped, root, "a scoped memo is keyed by more than the root");
         store.note_complete(&scoped).unwrap();
 

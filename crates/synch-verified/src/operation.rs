@@ -585,6 +585,7 @@ pub(crate) struct Capabilities<'a, E> {
     pub(crate) writes: Option<&'a mut dyn crate::host::ByteWrites<Error = E>>,
     pub(crate) bao: Option<&'a mut dyn crate::host::Bao<Error = E>>,
     pub(crate) sweep: Option<&'a mut dyn crate::host::Sweep<Error = E>>,
+    pub(crate) memo: Option<&'a mut dyn crate::host::Memo<Error = E>>,
 }
 
 impl<E> Default for Capabilities<'_, E> {
@@ -603,6 +604,7 @@ impl<E> Default for Capabilities<'_, E> {
             writes: None,
             bao: None,
             sweep: None,
+            memo: None,
         }
     }
 }
@@ -1856,6 +1858,7 @@ mod tests {
 
         host_unexpected!(
             exists_rows,
+            delete_except,
             read_bytes,
             update,
             copy_rows,
