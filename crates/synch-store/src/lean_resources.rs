@@ -6,7 +6,7 @@ use std::{
     cell::RefCell,
     collections::BTreeMap,
     fs::{File, OpenOptions},
-    io,
+    io::{self, Read},
     path::{Path, PathBuf},
     rc::Rc,
 };
@@ -32,9 +32,17 @@ struct Temporary {
 #[derive(Debug)]
 enum Handle<'a> {
     Temporary(Temporary),
-    File(File),
+    File(SourceFile),
     Borrowed(&'a [u8]),
     Frozen(Vec<u8>),
+}
+
+#[derive(Debug)]
+struct SourceFile {
+    file: File,
+    /// Position advanced only by sequential SourceIO reads. Positioned FileIO
+    /// reads do not change the OS cursor or this accounting.
+    cursor: u64,
 }
 
 #[derive(Debug)]
@@ -145,7 +153,7 @@ impl<'a> Pool<'a> {
         match source {
             Handle::Borrowed(bytes) => slice_read(bytes, offset, count),
             Handle::Frozen(bytes) => slice_read(bytes, offset, count),
-            Handle::File(file) => file_read(file, offset, count),
+            Handle::File(source) => file_read(&source.file, offset, count),
             Handle::Temporary(temporary) => file_read(
                 temporary
                     .file
@@ -155,6 +163,35 @@ impl<'a> Pool<'a> {
                 count,
             ),
         }
+    }
+
+    fn source_read_some(&mut self, handle: u64, offset: u64, count: u64) -> Result<Vec<u8>> {
+        if count > 65536 {
+            return Err(StoreError::invalid(
+                "raw read exceeds bounded transfer size",
+            ));
+        }
+        if let Some(Handle::File(source)) = self.handles.get_mut(&handle) {
+            if offset == source.cursor {
+                // A sequential read preserves pipes and other non-seekable
+                // sources accepted by read-to-EOF. Non-sequential requests
+                // retain ordinary positioned-read semantics below.
+                let mut bytes = vec![0; count as usize];
+                let read = loop {
+                    match source.file.read(&mut bytes) {
+                        Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                        result => break result?,
+                    }
+                };
+                source.cursor = source
+                    .cursor
+                    .checked_add(read as u64)
+                    .ok_or_else(|| StoreError::invalid("source cursor overflow"))?;
+                bytes.truncate(read);
+                return Ok(bytes);
+            }
+        }
+        self.read_some(handle, offset, count)
     }
 }
 
@@ -323,7 +360,10 @@ impl FileIO for Files<'_> {
             let mut pool = self.0.borrow_mut();
             let value = match pool.input {
                 Input::Bytes(bytes) => Handle::Borrowed(bytes),
-                Input::File(path) => Handle::File(File::open(path)?),
+                Input::File(path) => Handle::File(SourceFile {
+                    file: File::open(path)?,
+                    cursor: 0,
+                }),
             };
             pool.insert(value)
         };
@@ -410,7 +450,7 @@ impl SourceIO for Files<'_> {
         }
     }
     fn read_some(&mut self, handle: u64, offset: u64, count: u64) -> Result<Vec<u8>> {
-        self.0.borrow().read_some(handle, offset, count)
+        self.0.borrow_mut().source_read_some(handle, offset, count)
     }
     fn freeze(&mut self, bytes: &[u8]) -> Result<u64> {
         let mut owned = Vec::new();

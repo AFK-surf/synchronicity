@@ -17,6 +17,10 @@ mod lean_ingest;
 mod lean_ingest_concurrency;
 #[cfg(all(test, target_os = "linux"))]
 mod lean_ingest_memory;
+#[cfg(test)]
+mod lean_ingest_metadata;
+#[cfg(all(test, unix))]
+mod lean_ingest_streams;
 mod lean_read;
 mod lean_resources;
 mod lean_storage;

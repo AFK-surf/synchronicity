@@ -55,24 +55,35 @@ unsafe extern "C" {
 
 // Never exported or made Send/Sync. The interpreter and all host resources
 // remain on the caller's stack and thread, including panic unwinding.
-struct Handle(NonNull<c_void>, PhantomData<Rc<()>>);
+// None exists only while an owned reference is being transferred to Lean.
+// Keeping that state explicit makes Rust unwinding unable to drop it twice.
+struct Handle(Option<NonNull<c_void>>, PhantomData<Rc<()>>);
 impl Handle {
     fn new(ptr: *mut c_void) -> Self {
         Self(
-            NonNull::new(ptr).expect("Lean returned a null object"),
+            Some(NonNull::new(ptr).expect("Lean returned a null object")),
             PhantomData,
         )
+    }
+    fn as_ptr(&self) -> *mut c_void {
+        self.0
+            .expect("Lean handle was already transferred")
+            .as_ptr()
     }
     fn packet(&self) -> Packet {
         // SAFETY: live thread-confined handle; adapter returns a fresh owned byte array.
         Packet(Self::new(unsafe {
-            synch_adapter_operation_packet(self.0.as_ptr())
+            synch_adapter_operation_packet(self.as_ptr())
         }))
     }
     fn resume(&mut self, reply: &[u8]) {
-        // SAFETY: adapter borrows state and copies reply; returned continuation is owned.
+        let state = self.0.take().expect("Lean handle was already transferred");
+        // SAFETY: transfer our sole owned reference, never a borrowed reference.
+        // The adapter copies reply before Lean consumes state. Generated Lean
+        // resume consumes state on both request and terminal branches. If the
+        // returned pointer is invalid and new panics, self is already disarmed.
         let next =
-            Self::new(unsafe { synch_adapter_operation_resume(self.0.as_ptr(), reply.into()) });
+            Self::new(unsafe { synch_adapter_operation_resume(state.as_ptr(), reply.into()) });
         *self = next;
     }
 }
@@ -85,18 +96,20 @@ impl Packet {
         // SAFETY: this live owned ByteArray keeps its immutable data allocated;
         // the returned slice borrows self and no mutable view is exposed.
         unsafe {
-            let count = synch_adapter_bytes_len(self.0 .0.as_ptr());
+            let count = synch_adapter_bytes_len(self.0.as_ptr());
             if count == 0 {
                 return &[];
             }
-            std::slice::from_raw_parts(synch_adapter_bytes_data(self.0 .0.as_ptr()), count)
+            std::slice::from_raw_parts(synch_adapter_bytes_data(self.0.as_ptr()), count)
         }
     }
 }
 impl Drop for Handle {
     fn drop(&mut self) {
-        // SAFETY: exactly one reference owned, runtime alive on this synchronous stack.
-        unsafe { synch_adapter_scope_drop(self.0.as_ptr()) }
+        if let Some(value) = self.0.take() {
+            // SAFETY: exactly one reference owned, runtime alive on this stack.
+            unsafe { synch_adapter_scope_drop(value.as_ptr()) }
+        }
     }
 }
 
@@ -1841,6 +1854,49 @@ mod tests {
         assert!(matches!(
             decode(second.as_bytes()),
             Ok(Frame::ReadRows(42, ..))
+        ));
+    }
+
+    #[test]
+    fn owned_resume_preserves_independent_packets_across_unwinding() {
+        let mut state = state();
+        let initial_packet = state.packet();
+        let mut begun = vec![1, 16];
+        word(&mut begun, 42);
+        state.resume(&begun);
+        let read_packet = state.packet();
+        let result = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+            state.resume(&[1, 17]);
+            assert!(matches!(
+                decode(state.packet().as_bytes()),
+                Ok(Frame::Rollback(42))
+            ));
+            panic!("injected unwind after ownership transfer");
+        }));
+        assert!(result.is_err());
+        assert_eq!(initial_packet.as_bytes(), [1, 16]);
+        assert!(matches!(
+            decode(read_packet.as_bytes()),
+            Ok(Frame::ReadRows(42, ..))
+        ));
+    }
+
+    #[test]
+    fn terminal_owned_resumes_cannot_reenter_or_invalidate_prior_packets() {
+        let mut state = state();
+        state.resume(&[1, 17]); // Failed begin: no transaction was acquired.
+        let terminal_packet = state.packet();
+        for _ in 0..64 {
+            state.resume(&[1, 16]);
+            assert!(matches!(
+                decode(state.packet().as_bytes()),
+                Ok(Frame::Failure(3, 0))
+            ));
+        }
+        drop(state);
+        assert!(matches!(
+            decode(terminal_packet.as_bytes()),
+            Ok(Frame::Failure(3, 0))
         ));
     }
 

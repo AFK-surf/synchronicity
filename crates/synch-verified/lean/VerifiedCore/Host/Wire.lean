@@ -15,9 +15,22 @@ namespace VerifiedCore.Host.Wire
 def octet (n : UInt8) : ByteArray := ⟨#[n]⟩
 
 def word (n : UInt64) : ByteArray :=
-  (List.range 8).foldl (fun out i => out.push (n >>> (i * 8).toUInt64).toUInt8) .empty
+  let out := ByteArray.emptyWithCapacity 8
+  let out := out.push (n >>> 0).toUInt8
+  let out := out.push (n >>> 8).toUInt8
+  let out := out.push (n >>> 16).toUInt8
+  let out := out.push (n >>> 24).toUInt8
+  let out := out.push (n >>> 32).toUInt8
+  let out := out.push (n >>> 40).toUInt8
+  let out := out.push (n >>> 48).toUInt8
+  out.push (n >>> 56).toUInt8
 
 def bytes (b : ByteArray) : ByteArray := word b.size.toUInt64 ++ b
+
+/-- Append a length-prefixed field directly to its packet accumulator, so
+large fields do not first allocate a separate length-plus-payload buffer. -/
+def appendBytes (out b : ByteArray) : ByteArray := (out ++ word b.size.toUInt64) ++ b
+
 def string (s : String) : ByteArray := bytes s.toUTF8
 def sequence (encode : A → ByteArray) (items : List A) : ByteArray :=
   items.foldl (fun out item => out ++ encode item) (word items.length.toUInt64)
@@ -297,17 +310,18 @@ def outputReply (effect : Output A) (input : ByteArray) : A :=
   | .append _ => decodeReply 37 (pure ()) input
 
 def writerRequest : ByteWriter A → ByteArray
-  | .writeAt handle offset chunk => octet 1 ++ octet 38 ++ word handle ++ word offset ++ bytes chunk
+  | .writeAt handle offset chunk =>
+      appendBytes (octet 1 ++ octet 38 ++ word handle ++ word offset) chunk
 
 def writerReply (effect : ByteWriter A) (input : ByteArray) : A :=
   match effect with
   | .writeAt .. => decodeReply 38 (pure ()) input
 
 def blake3Request : Blake3 A → ByteArray
-  | .chunk counter root chunk => octet 1 ++ octet 39 ++ word counter ++
-      octet (if root then 1 else 0) ++ bytes chunk
-  | .parent root left right => octet 1 ++ octet 40 ++ octet (if root then 1 else 0) ++
-      bytes left ++ bytes right
+  | .chunk counter root chunk =>
+      appendBytes (octet 1 ++ octet 39 ++ word counter ++ octet (if root then 1 else 0)) chunk
+  | .parent root left right =>
+      appendBytes (appendBytes (octet 1 ++ octet 40 ++ octet (if root then 1 else 0)) left) right
 
 def blake3Reply (effect : Blake3 A) (input : ByteArray) : A :=
   match effect with

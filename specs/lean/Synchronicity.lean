@@ -18,6 +18,8 @@ import Synchronicity.VerifiedCoreProofs
 import Synchronicity.CasLifecycleProofs
 import Synchronicity.HostProgramProofs
 import Synchronicity.HostWireProofs
+import Synchronicity.WireBufferProofs
+import Synchronicity.WireWordProofs
 import Synchronicity.CasProgramProofs
 import Synchronicity.CasReleaseProofs
 import Synchronicity.CasExpiryProofs

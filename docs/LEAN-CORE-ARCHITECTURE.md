@@ -537,6 +537,16 @@ length; native growing-file fixtures include multiple 64-KiB reads and a
 partial final chunk. Freezing still copies the whole capture, so this does
 not make the exceptional path bounded-memory.
 
+Raw source reads preserve the previous file API's non-seekable inputs. A
+source handle tracks its sequential cursor: matching offsets use sequential
+reads with interrupted-read retry, while other offsets retain positioned
+access (and may fail on streams). Positioned reads never advance that cursor.
+Unix FIFO fixtures cover inline and multi-chunk captures to actual EOF; this
+avoids adding a seekability requirement to initially small file ingestion.
+Metadata integration fixtures also exercise attested/unattested size changes,
+noninteger durability rejection, retained nonzero integer durability, and
+raw inline-cell preservation through the whole native operation.
+
 The ignored Linux `lean_ingest_memory::isolated_ingestion_memory` probe runs
 each implementation/input-kind/size in a fresh child process. File fixtures
 are generated in bounded chunks and immutable byte fixtures are allocated
@@ -561,6 +571,36 @@ performance work. Per-chunk crypto/packet allocation and repeated bounded
 copies remain optimization targets; restoring a Rust tree planner is not an
 acceptable shortcut. The probe's loose memory gate does not assert timing
 parity or cover the growing-small-file path.
+
+Transport optimization keeps this boundary intact: resume transfers the
+private owned continuation reference to Lean instead of retaining the old
+state while running the next continuation. Independently held packet owners
+remain live, and Rust disarms transferred handles before the foreign call so
+unwinding cannot drop them again. The C ownership convention is part of the
+native boundary's trust base, checked against generated code and native
+lifetime/unwind tests, not claimed as a Lean theorem about C.
+
+Lean's `appendBytes` encoder appends length-prefixed fields directly into the
+packet accumulator. It avoids constructing a separate length-plus-payload
+buffer for raw positioned writes and chunk/parent compression requests.
+`WireBufferProofs` proves exact equality to the previous wire format for
+arbitrary inputs; no new capability, tree operation or Rust domain decision
+is introduced.
+
+The fixed-width `word` encoder now uses eight constant shifts and a buffer
+reserved for eight bytes. `WireWordProofs.word_eq_fold` proves equality for
+every UInt64 to the previous little-endian fold specification. This replaces
+runtime loop/index arithmetic, not the wire protocol; reply validation and
+all domain control flow remain unchanged.
+
+Three interleaved release runs against a preserved pre-optimization binary
+gave 64-MiB median file/byte times of 387/363 ms before these transport changes
+and 365/339 ms afterward. The ranges overlap; this is a modest measured gain,
+not a resolved throughput gap. Peak retention stayed roughly 2 MiB. A separate
+raw-compression microbenchmark took about 75 ms for 65,537 chunk and 65,536
+parent calls without Lean transport or I/O. That benchmark uses a dependency
+chain, not a BLAKE3 tree, and is diagnostic only; it does not replace the root
+or layout tests or predict end-to-end performance.
 
 The native raw resource pool shares one invocation-local handle allocator
 across source, frozen and temporary handles. Temporary creation uses

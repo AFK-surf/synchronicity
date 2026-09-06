@@ -1,4 +1,5 @@
 import VerifiedCore.Host.Wire
+import Synchronicity.WireBufferProofs
 import VerifiedCore.Entry
 
 /-! Lean-side native packet transport and actual continuation behavior.
@@ -289,7 +290,8 @@ theorem chunk_request_preserves_counter_root_and_bytes (counter : UInt64) (root 
 
 theorem parent_request_preserves_root_and_children (root : Bool) (left right : ByteArray) :
     blake3Request (.parent root left right) = octet 1 ++ octet 40 ++
-      octet (if root then 1 else 0) ++ bytes left ++ bytes right := rfl
+      octet (if root then 1 else 0) ++ bytes left ++ bytes right :=
+  WireBufferProofs.parentRequest_preserves_bytes root left right
 
 theorem hash_wrong_variant_rejected :
     blake3Reply (.chunk 0 true .empty) (b [1, 40, 0, 0, 0, 0, 0, 0, 0, 0]) =

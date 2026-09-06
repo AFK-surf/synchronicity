@@ -83,6 +83,13 @@ measurements. Performance work and platform validation still precede
 production cutover and deletion of Rust ingestion. The focused CI/static-link
 gate now covers Linux, macOS and Windows; configuration is not execution
 evidence, and the growing-small-file path still retains whole captured input.
+Raw source reads now also preserve non-seekable Unix FIFO inputs, with
+sequential cursor tracking confined to the storage adapter. Whole-ingestion
+metadata fixtures cover conflicting sizes, durability typing and raw inline
+cells. Transport-only optimizations consume old continuation ownership and
+avoid intermediate packet copies; Lean proofs preserve the exact byte ABI,
+including the unrolled fixed-width encoder. Interleaved release measurements
+show a modest gain, not throughput parity.
 The raw chunk/parent cryptography adapter is staged privately in the store
 crate; it contains no tree traversal or CAS decisions.
 

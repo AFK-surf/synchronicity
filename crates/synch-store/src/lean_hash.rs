@@ -42,6 +42,33 @@ mod tests {
     use blake3::hazmat::HasherExt;
 
     #[test]
+    #[ignore = "release-mode raw compression microbenchmark; no I/O or Lean transport"]
+    fn raw_compression_cost_probe() {
+        let block = [0x69; 1024];
+        let chunks = 65537_u64;
+        let started = std::time::Instant::now();
+        let mut digest = chunk(0, false, &block).unwrap();
+        for counter in 1..chunks {
+            let input = if counter + 1 == chunks {
+                &block[..3]
+            } else {
+                &block[..]
+            };
+            let next = chunk(counter, false, std::hint::black_box(input)).unwrap();
+            // A dependency chain prevents optimizing away the primitive
+            // calls. This is deliberately NOT a BLAKE3 tree or CAS root;
+            // it measures the same number of raw chunk/parent calls only.
+            digest = parent(false, &digest, &next).unwrap();
+        }
+        std::hint::black_box(digest);
+        println!(
+            "RAW_COMPRESSION chunks={chunks} parents={} elapsed_us={}",
+            chunks - 1,
+            started.elapsed().as_micros()
+        );
+    }
+
+    #[test]
     fn root_chunk_matches_standard_empty_and_abc_vectors() {
         for (bytes, expected) in [
             (
