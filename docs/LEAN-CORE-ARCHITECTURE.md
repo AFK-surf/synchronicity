@@ -836,6 +836,14 @@ The uncommitted cloud-command experiment was withdrawn before native integration
 No cloud operation was switched, and no cloud-only raw host capability was added
 to the production interface.
 
+After stabilization, a second authorized phase reduces glue complexity within
+this same inventory: eliminate fake `Storage` implementations for byte-only
+operations, simplify capability routing, and consolidate repeated codecs/error
+conversions. Preserve whole Lean commands, strict framing, original errors,
+resource lifetimes and cleanup. Start that refactor only after known correctness
+defects are resolved and the relevant local/proof/platform checks pass; take
+small independently verified steps instead of replacing the entire FFI at once.
+
 ### Bounded development validation
 
 Native compilation and the repository's Lean packages limit each Lean compiler
