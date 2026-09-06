@@ -71,7 +71,7 @@ pub const INLINE_VALUE_MAX: usize = 128;
 ///
 /// The key side is bounded three ways — [`MAX_KEY_LEN`] on insert, twice that
 /// in nibbles at decode, and `MAX_DEPTH_NIBBLES` on every walk — but the value
-/// side had none: `check_invariants` bounds `ValueRef::Inline` at
+/// side had none: the ingress boundary bounds `ValueRef::Inline` at
 /// [`INLINE_VALUE_MAX`] and says nothing about `ValueRef::Hash`, so a value was
 /// bounded only by the frame, at 16 MiB each. That is the enabler for two costs
 /// a §12 sanity bound is supposed to cap: a `GetValues` answer is `MAX_BATCH`

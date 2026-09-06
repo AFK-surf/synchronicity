@@ -139,15 +139,20 @@ entry point; delete the Rust algorithm; extend the proofs. No selectable
 backend at any point.
 
 **T1. Encoder, canonicality and node hashing** (`Trie/Codec.lean`,
-`Trie/Verify.lean`). Lean gains `encode : Node → ByteArray` and
-`canonical : ByteArray → Except Error Node` (decode, re-encode, compare,
-`check_invariants`, nibble-run cap `MAX_KEY_LEN * 2`). `verify root bytes`
-requests `Hash.blake3 (tag ++ encoded)` and decides origin-fault versus
-peer-fault exactly as `verify_node` does. Proofs: `decode (encode n) = n`;
-`canonical bytes = ok n → encode n = bytes` (the roundtrip the architecture
-lists as a separate obligation); the depth ceiling is one predicate shared by
-`get`, the walk and `canonical`. Cutover: `reconcile.rs:1834` calls the Lean
-command; `hash_of_encoded` and `TrieNode::encode` are deleted from Rust.
+`Trie/Verify.lean`). Done. Lean has `encode : Node → ByteArray` and
+`admit : ByteArray → Except Refusal Node` (decode, re-encode, compare, the
+nibble-run cap `maxKeyBytes * 2`, the structural invariants). `verify
+expected bytes` requests `Digest.blake3 (tag ++ bytes)` and decides
+origin-fault versus peer-fault exactly as `verify_node` did. Proofs
+(`TrieCodecProofs`, `TrieVerifyProofs`): `decode (encode n) = ok n` for every
+well-formed node; `admit bytes = ok n → encode n = bytes`, the key bound and
+the invariants; acceptance and each fault follow from the host's digests
+alone; the borrowed input is read whole first. Cutover: `reconcile.rs`
+calls `TrieNode::verify_served`, which is the Lean command; `hash_of_encoded`
+is the Lean `admit` command; the Rust `hashes_to` and `check_invariants`
+are deleted. `TrieNode::encode` stays until T2 removes the Rust write path.
+`Digest` is the first F1 algebra; the byte-only runner gained a digest-only
+entry (`run_digest`) with no storage reachable.
 
 **T2. Mutation** (`Trie/Mutate.lean`). `insert`, `remove`, `apply` over
 `ByteStorage` reads/writes and `Hash.blake3`, with the inline/out-of-line

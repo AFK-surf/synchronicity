@@ -39,7 +39,7 @@ pub mod trie;
 pub use diff::{Change, ChangeKind, ChangeView};
 pub use error::MptError;
 pub use nibbles::Nibbles;
-pub use node::{TrieNode, ValueRef};
+pub use node::{TrieNode, ValueRef, Verdict};
 #[cfg(feature = "proofs")]
 pub use proof::Proof;
 pub use scope::Scope;

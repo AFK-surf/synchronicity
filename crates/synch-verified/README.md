@@ -21,7 +21,12 @@ The old acquisition snapshot/planner API and Rust orchestration are deleted.
 CAS deletion also owns raw protection reads, transaction completion and file
 cleanup; its snapshot/planner ABI and Rust phase executor are removed.
 Trie lookup also runs as a complete native Lean operation over raw byte reads;
-the former Rust lookup traversal is removed. History retention now runs as a
+the former Rust lookup traversal is removed. The canonical ingress boundary
+for peer-served nodes (`Trie/Verify.lean`: decode, re-encode identically,
+the shared key bound, the structural invariants, and the origin-versus-peer
+fault decision) is a Lean command over one `Digest.blake3` primitive; the
+Rust `hash_of_encoded`, `hashes_to` and `check_invariants` algorithms are
+deleted and `synch-mpt` only names the refusal. History retention now runs as a
 complete Lean operation over raw scans and a separate Ed25519 primitive; the
 Rust retention loop and receipt/fork helpers are removed. Raw scans retain
 rows before a trailing host failure so Lean owns first-error selection.

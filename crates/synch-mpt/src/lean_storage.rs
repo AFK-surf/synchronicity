@@ -37,3 +37,34 @@ pub(crate) fn lookup_error(error: synch_verified::trie::LookupError<MptError>) -
         LookupError::Protocol => protocol_error(),
     }
 }
+
+/// The digest primitive for the canonical ingress boundary: exactly the bytes
+/// Lean supplies, tag included, through BLAKE3. No node shape is interpreted.
+pub(crate) struct Blake3;
+
+impl synch_verified::host::Digest for Blake3 {
+    type Error = MptError;
+    fn blake3(&mut self, bytes: &[u8]) -> Result<Vec<u8>, MptError> {
+        Ok(blake3::hash(bytes).as_bytes().to_vec())
+    }
+}
+
+pub(crate) fn operation_error(error: synch_verified::trie::OperationError<MptError>) -> MptError {
+    use synch_verified::trie::OperationError;
+    match error {
+        OperationError::Host(error) => error,
+        OperationError::MalformedMetadata(_) | OperationError::Protocol => protocol_error(),
+    }
+}
+
+/// A refusal is one of the store's existing diagnostics, by name.
+pub(crate) fn refusal_error(refusal: synch_verified::trie::NodeRefusal) -> MptError {
+    use synch_verified::trie::NodeRefusal;
+    match refusal {
+        NodeRefusal::Decode(message) => MptError::Decode(message),
+        NodeRefusal::NonCanonical(message) => MptError::NonCanonical(message),
+        NodeRefusal::KeyTooLong(bytes) => {
+            MptError::KeyTooLong(usize::try_from(bytes).unwrap_or(usize::MAX))
+        }
+    }
+}

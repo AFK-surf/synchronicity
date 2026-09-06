@@ -38,6 +38,8 @@ statements to their checked theorems and explicit host assumptions.
 | `IngestCommitProofs` | The metadata commit every writer runs: the claim is read inside the transaction, a complete plan is recognized, and a refused size writes nothing |
 | `IngestProgramProofs`, `IngestInputProofs` | Captured-source ingestion and input policy: exact ordering of temporaries, construction, lease, publication and commit, with the cleanup trace of every failure point |
 | `TrieProgramProofs`, `TrieProgramTests` | Trie lookup soundness and completeness against a raw node graph read through the actual codec, plus decoder fixtures |
+| `TrieCodecProofs` | The node encoder and decoder roundtrip for every well-formed node, by induction over the executable parsers |
+| `TrieVerifyProofs` | The ingress boundary: only an encoder image is admitted, within the shared key bound and the structural invariants; acceptance and origin/peer fault follow from the host's digests alone; the served bytes are read whole before anything is decided |
 | `HistoryProgramProofs` | Head-history retention: fork, ceiling and witness protection derived from actual receipts, and shared-host executions with injected failures |
 | `OriginProgramProofs` | Origin syntax and key decoding |
 | `Decidable` | Decidable equality of `Except`, which core Lean lacks and the trace proofs decide with |

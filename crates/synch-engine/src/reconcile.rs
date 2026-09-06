@@ -1117,7 +1117,7 @@ impl Syncer {
                                 // A value small enough to be inline must *be*
                                 // inline. `ValueRef::for_value` makes that true of
                                 // everything this node builds, and nothing made it
-                                // true of what arrives: `check_invariants` rejects
+                                // true of what arrives: the ingress boundary rejects
                                 // an oversized inline value and had no rule the
                                 // other way, because the payload is not in the
                                 // node. This is the first place both are in hand.
@@ -1833,10 +1833,12 @@ fn take_served(
 /// that origin, at whichever origin sorted after it, and left the head pending
 /// for the sweep to retire and the next exchange to re-adopt.
 fn verify_node(expected: &synch_core::Hash, bytes: &[u8]) -> Result<()> {
-    match TrieNode::hash_of_encoded(bytes) {
-        Ok(hash) if &hash == expected => Ok(()),
-        Err(refused) if TrieNode::hashes_to(expected, bytes) => Err(EngineError::Mpt(refused)),
-        Ok(_) | Err(_) => Err(EngineError::Net(NetError::NodeHashMismatch {
+    // The decision is the Lean operation `Trie.verify`; a host or transport
+    // failure of that operation is this node's own, not a verdict.
+    match TrieNode::verify_served(expected, bytes)? {
+        synch_mpt::Verdict::Accepted => Ok(()),
+        synch_mpt::Verdict::OriginFault(refused) => Err(EngineError::Mpt(refused)),
+        synch_mpt::Verdict::PeerFault => Err(EngineError::Net(NetError::NodeHashMismatch {
             expected: *expected,
         })),
     }

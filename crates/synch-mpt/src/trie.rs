@@ -437,7 +437,7 @@ impl MissingWalk {
                 continue;
             };
             let node = TrieNode::decode(&data)?;
-            // The half of the extension invariant `check_invariants` cannot
+            // The half of the extension invariant the ingress boundary cannot
             // reach: an `Ext` must sit above a `Branch`, which needs the child
             // node. An `Ext` above a `Leaf` or another `Ext` reads fine through
             // `get`/`iter`/`diff` but gives one key/value map several distinct
@@ -698,9 +698,9 @@ impl<'a, S: NodeStore + ?Sized> Trie<'a, S> {
     /// key at [`MAX_KEY_LEN`] and this did not, so a peer could put a value
     /// past that depth with compressed nodes and `get` would answer for a key
     /// `iter`, `diff` and therefore `entries` can never see. The two readers
-    /// must agree about which keys exist — the whole of what
-    /// [`TrieNode::check_invariants`](crate::TrieNode::check_invariants) and
-    /// the ingest bound are for.
+    /// must agree about which keys exist — the whole of what the ingress
+    /// boundary ([`TrieNode::hash_of_encoded`](crate::TrieNode::hash_of_encoded))
+    /// and the ingest bound are for.
     // Lean owns input bounds, decoding, the depth budget and value resolution.
     // Empty extensions remain dead ends; exact-boundary keys retain their
     // final leaf/branch read. Rust supplies encoded storage bytes only.
@@ -1348,7 +1348,7 @@ impl<'a, S: NodeStore + ?Sized> Trie<'a, S> {
     /// have in common: a batch is the frontier of a single walk, so the cost is
     /// close to trie depth plus batch size, not their product.
     // `ScopedSync.At`; `At.unique` is why a position names one hash, given
-    // `check_invariants`' non-empty extension prefix.
+    // the ingress boundary's non-empty extension prefix.
     pub fn resolve_paths(
         &self,
         root: Hash,

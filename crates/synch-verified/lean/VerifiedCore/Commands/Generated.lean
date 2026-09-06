@@ -103,6 +103,34 @@ instance : Decode Trie.LookupError where
     | 4 => return .depthExceeded
     | _ => throw ()
 
+instance : Encode Trie.Refusal where
+  encode out value := match value with
+    | .decode a0 => out.push 0 |>.put a0
+    | .nonCanonical a0 => out.push 1 |>.put a0
+    | .keyTooLong a0 => out.push 2 |>.put a0
+
+instance : Decode Trie.Refusal where
+  decode := do
+    match ← readByte with
+    | 0 => return .decode (← Decode.decode)
+    | 1 => return .nonCanonical (← Decode.decode)
+    | 2 => return .keyTooLong (← Decode.decode)
+    | _ => throw ()
+
+instance : Encode Trie.Verdict where
+  encode out value := match value with
+    | .accepted => out.push 0
+    | .originFault a0 => out.push 1 |>.put a0
+    | .peerFault => out.push 2
+
+instance : Decode Trie.Verdict where
+  decode := do
+    match ← readByte with
+    | 0 => return .accepted
+    | 1 => return .originFault (← Decode.decode)
+    | 2 => return .peerFault
+    | _ => throw ()
+
 instance : Encode Commands.LifecycleDomainError where
   encode out value := match value with
     | .malformed => out.push 0
@@ -202,7 +230,9 @@ instance : Encode Commands.Command where
     | .commitGroups a0 a1 a2 a3 a4 a5 => out.push 6 |>.put a0 |>.put a1 |>.put a2 |>.put a3 |>.put a4 |>.put a5
     | .admitSize a0 a1 => out.push 7 |>.put a0 |>.put a1
     | .trieGet a0 a1 => out.push 8 |>.put a0 |>.put a1
-    | .pruneHistory a0 a1 => out.push 9 |>.put a0 |>.put a1
+    | .trieAdmit a0 => out.push 9 |>.put a0
+    | .trieVerify a0 a1 => out.push 10 |>.put a0 |>.put a1
+    | .pruneHistory a0 a1 => out.push 11 |>.put a0 |>.put a1
 
 instance : Decode Commands.Command where
   decode := do
@@ -216,7 +246,9 @@ instance : Decode Commands.Command where
     | 6 => return .commitGroups (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode)
     | 7 => return .admitSize (← Decode.decode) (← Decode.decode)
     | 8 => return .trieGet (← Decode.decode) (← Decode.decode)
-    | 9 => return .pruneHistory (← Decode.decode) (← Decode.decode)
+    | 9 => return .trieAdmit (← Decode.decode)
+    | 10 => return .trieVerify (← Decode.decode) (← Decode.decode)
+    | 11 => return .pruneHistory (← Decode.decode) (← Decode.decode)
     | _ => throw ()
 
 end VerifiedCore

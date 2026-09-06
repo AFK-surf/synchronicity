@@ -5,6 +5,7 @@ import VerifiedCore.Cas.Program
 import VerifiedCore.Cas.Read
 import VerifiedCore.Cas.Input
 import VerifiedCore.Trie.Program
+import VerifiedCore.Trie.Verify
 import VerifiedCore.Replication.History
 
 /-! The one native entry point. A command arrives as a packet, decoded with
@@ -114,6 +115,9 @@ def dispatch : Command → Native
     if root.size != 32 then protocol else command (Cas.IngestCommit.admit root size) metadata
   | .trieGet root keySize =>
     if root.size != 32 then malformedRoot else command (Trie.getInput root 0 keySize) hostOnly
+  | .trieAdmit size => command (Trie.admitInput 0 size) hostOnly
+  | .trieVerify expected size =>
+    if expected.size != 32 then protocol else command (Trie.verifyInput expected 0 size) hostOnly
   | .pruneHistory origin before => command (Replication.History.prune origin before) retention
 
 /-- Every command starts here: an undecodable packet is a protocol failure

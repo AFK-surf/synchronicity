@@ -463,20 +463,50 @@ pub(crate) fn terminal<T: Decode>(bytes: &[u8]) -> Result<T, ()> {
 }
 
 // Byte-only commands do not need a pretend relational store or a second
-// layer of host errors: only the raw byte read is served.
+// layer of host errors: only the raw byte read and the digest primitive are
+// served, each only when the caller supplied it.
 fn dispatch_readonly<S: ByteStorage>(
-    storage: &mut S,
+    storage: Option<&mut S>,
+    capabilities: &mut Capabilities<'_, S::Error>,
     frame: Frame<'_>,
     errors: &mut Vec<Option<S::Error>>,
 ) -> Result<Vec<u8>, OperationError<S::Error>> {
     match frame {
-        Frame::ReadBytes(space, key) => Ok(reply(
-            22,
-            storage.read_bytes(&space, key),
-            errors,
-            EncodeReply::encode,
-        )),
+        Frame::ReadBytes(space, key) => {
+            let storage = storage.ok_or(OperationError::Protocol)?;
+            Ok(reply(
+                22,
+                storage.read_bytes(&space, key),
+                errors,
+                EncodeReply::encode,
+            ))
+        }
+        Frame::Blake3(bytes) => {
+            let digest = capabilities
+                .digest
+                .as_deref_mut()
+                .ok_or(OperationError::Protocol)?;
+            Ok(reply(53, digest.blake3(bytes), errors, EncodeReply::encode))
+        }
         _ => Err(OperationError::Protocol),
+    }
+}
+
+/// A byte store that is never there: the type a digest-only run names for
+/// the storage it does not supply. A byte read is refused before this is
+/// ever asked, so the impossible method is unreachable by construction, and
+/// the type is uninhabited on purpose.
+#[allow(dead_code)]
+enum NoBytes<E> {
+    Never(std::convert::Infallible, std::marker::PhantomData<E>),
+}
+
+impl<E> ByteStorage for NoBytes<E> {
+    type Error = E;
+    fn read_bytes(&mut self, _: &str, _: &[u8]) -> Result<Option<Vec<u8>>, E> {
+        match *self {
+            NoBytes::Never(never, _) => match never {},
+        }
     }
 }
 
@@ -493,6 +523,7 @@ pub(crate) struct Capabilities<'a, E> {
     pub(crate) temporary: Option<&'a mut dyn crate::host::TemporaryFiles<Error = E>>,
     pub(crate) leases: Option<&'a mut dyn crate::host::Lease<Error = E>>,
     pub(crate) source: Option<&'a mut dyn crate::host::SourceIO<Error = E>>,
+    pub(crate) digest: Option<&'a mut dyn crate::host::Digest<Error = E>>,
 }
 
 impl<E> Default for Capabilities<'_, E> {
@@ -507,6 +538,7 @@ impl<E> Default for Capabilities<'_, E> {
             temporary: None,
             leases: None,
             source: None,
+            digest: None,
         }
     }
 }
@@ -662,9 +694,33 @@ pub(crate) fn run_readonly<S: ByteStorage>(
     let state = start(command);
     execute(
         state,
-        |frame, _, errors| dispatch_readonly(storage, frame, errors),
+        |frame, capabilities, errors| {
+            dispatch_readonly(Some(&mut *storage), capabilities, frame, errors)
+        },
         inputs,
         Capabilities::default(),
+    )
+}
+
+/// Same ownership contract as `run`, narrowed to the digest primitive: no
+/// storage of any kind is reachable, so a byte read is a protocol failure.
+pub(crate) fn run_digest<D: crate::host::Digest>(
+    digest: &mut D,
+    inputs: &[&[u8]],
+    command: &Command,
+) -> Result<Vec<u8>, OperationError<D::Error>> {
+    let state = start(command);
+    let capabilities = Capabilities {
+        digest: Some(digest),
+        ..Capabilities::default()
+    };
+    execute(
+        state,
+        |frame, capabilities, errors| {
+            dispatch_readonly::<NoBytes<D::Error>>(None, capabilities, frame, errors)
+        },
+        inputs,
+        capabilities,
     )
 }
 
@@ -717,7 +773,12 @@ mod tests {
             Frame::Delete(1, selection()),
         ] {
             assert!(matches!(
-                dispatch_readonly(&mut host, frame, &mut errors),
+                dispatch_readonly(
+                    Some(&mut host),
+                    &mut Capabilities::default(),
+                    frame,
+                    &mut errors
+                ),
                 Err(OperationError::Protocol)
             ));
         }
@@ -766,13 +827,14 @@ mod tests {
         let mut errors = Vec::new();
         let key = [1; 32];
         let frame = || Frame::ReadBytes("trie_nodes".into(), &key);
+        let mut none = Capabilities::default();
         assert_eq!(
-            dispatch_readonly(&mut host, frame(), &mut errors).unwrap(),
+            dispatch_readonly(Some(&mut host), &mut none, frame(), &mut errors).unwrap(),
             vec![1, 22, 0]
         );
         host.value = Some(vec![]);
         assert_eq!(
-            dispatch_readonly(&mut host, frame(), &mut errors).unwrap(),
+            dispatch_readonly(Some(&mut host), &mut none, frame(), &mut errors).unwrap(),
             vec![1, 22, 1, 0, 0, 0, 0, 0, 0, 0, 0]
         );
         assert_eq!(host.reads, 2);

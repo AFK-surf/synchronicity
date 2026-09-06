@@ -1,10 +1,45 @@
 //! Complete trie operations. No decoded node shapes cross this interface.
 use crate::{
-    host::ByteStorage,
-    operation::{self, terminal, Command, OperationError},
+    host::{ByteStorage, Digest},
+    operation::{self, terminal, Command},
 };
 
-pub use crate::generated::LookupDomainError;
+pub use crate::generated::{LookupDomainError, NodeRefusal, NodeVerdict};
+pub use crate::operation::OperationError;
+
+/// Admit node bytes at the canonical ingress boundary: decoded, re-encoded
+/// identically, within the shared key bound and shaped as the trie
+/// invariants require. Lean decides; the host only hashes the tagged bytes.
+/// The outer error is the host's or the transport's, the inner the refusal.
+pub fn admit<D: Digest>(
+    digest: &mut D,
+    bytes: &[u8],
+) -> Result<Result<[u8; 32], NodeRefusal>, OperationError<D::Error>> {
+    let command = Command::TrieAdmit(bytes.len() as u64);
+    let result = operation::run_digest(digest, &[bytes], &command)?;
+    let outcome: Result<Vec<u8>, NodeRefusal> =
+        terminal(&result).map_err(|()| OperationError::Protocol)?;
+    match outcome {
+        Ok(hash) => Ok(Ok(hash.try_into().map_err(|_| OperationError::Protocol)?)),
+        Err(refusal) => Ok(Err(refusal)),
+    }
+}
+
+/// Whether served node bytes are the node `expected` names and, when they are
+/// not, whose fault that is: the origin's for bytes the hash covers but this
+/// build refuses, the peer's for bytes that hash to nothing wanted.
+pub fn verify<D: Digest>(
+    digest: &mut D,
+    expected: &[u8; 32],
+    bytes: &[u8],
+) -> Result<NodeVerdict, OperationError<D::Error>> {
+    let command = Command::TrieVerify {
+        expected: expected.to_vec(),
+        size: bytes.len() as u64,
+    };
+    let result = operation::run_digest(digest, &[bytes], &command)?;
+    terminal(&result).map_err(|()| OperationError::Protocol)
+}
 
 /// A completed lookup failure, not an intermediate host observation.
 #[derive(Debug)]
@@ -173,6 +208,129 @@ mod tests {
         assert!(matches!(
             get(&mut store, &[1; 32], &[]),
             Err(LookupError::Decode(_))
+        ));
+    }
+}
+
+#[cfg(test)]
+mod boundary_tests {
+    use super::*;
+
+    /// A digest host that records what it was asked to hash and can fail once.
+    #[derive(Default)]
+    struct Hasher {
+        requests: Vec<Vec<u8>>,
+        fail: bool,
+    }
+
+    impl Digest for Hasher {
+        type Error = &'static str;
+        fn blake3(&mut self, bytes: &[u8]) -> Result<Vec<u8>, Self::Error> {
+            self.requests.push(bytes.to_vec());
+            if self.fail {
+                return Err("original digest failure");
+            }
+            Ok(blake3::hash(bytes).as_bytes().to_vec())
+        }
+    }
+
+    fn tagged(tag: &str, bytes: &[u8]) -> [u8; 32] {
+        let mut hasher = blake3::Hasher::new();
+        hasher.update(tag.as_bytes());
+        hasher.update(bytes);
+        *hasher.finalize().as_bytes()
+    }
+
+    // Leaf with a two-nibble key [10, 11] and inline value "xy", canonically.
+    const LEAF: [u8; 8] = [0, 2, 10, 11, 0, 2, 120, 121];
+
+    #[test]
+    fn a_canonical_node_is_admitted_under_its_own_tag_only() {
+        let mut hasher = Hasher::default();
+        let hash = admit(&mut hasher, &LEAF).unwrap().unwrap();
+        assert_eq!(hash, tagged("synch-mpt/1/leaf", &LEAF));
+        // One digest request, of the tagged bytes, nothing else.
+        assert_eq!(hasher.requests.len(), 1);
+        assert_eq!(hasher.requests[0][..16], *b"synch-mpt/1/leaf");
+        assert_eq!(
+            verify(&mut hasher, &hash, &LEAF).unwrap(),
+            NodeVerdict::Accepted
+        );
+        assert_eq!(
+            verify(&mut hasher, &tagged("synch-mpt/1/ext", &LEAF), &LEAF).unwrap(),
+            NodeVerdict::PeerFault
+        );
+    }
+
+    #[test]
+    fn a_non_canonical_image_is_refused_and_its_fault_follows_the_hash() {
+        // Non-minimal leaf tag and a trailing byte decode locally but never verify.
+        let padded = [128, 0, 2, 10, 11, 0, 2, 120, 121, 99];
+        let mut hasher = Hasher::default();
+        let refusal = admit(&mut hasher, &padded).unwrap().unwrap_err();
+        assert!(matches!(refusal, NodeRefusal::Decode(_)));
+        // Refusal is decided before any digest is requested.
+        assert!(hasher.requests.is_empty());
+        // Hashing to the requested address under a kind's tag is the origin's fault.
+        let expected = tagged("synch-mpt/1/branch", &padded);
+        assert!(matches!(
+            verify(&mut hasher, &expected, &padded).unwrap(),
+            NodeVerdict::OriginFault(NodeRefusal::Decode(_))
+        ));
+        // Hashing to nothing wanted is the peer's, after every tag was tried.
+        hasher.requests.clear();
+        assert_eq!(
+            verify(&mut hasher, &[7; 32], &padded).unwrap(),
+            NodeVerdict::PeerFault
+        );
+        assert_eq!(hasher.requests.len(), 3);
+    }
+
+    #[test]
+    fn structural_invariants_are_refused_by_name() {
+        // A one-occupant branch: fifteen absent children, one present, no value.
+        let mut lonely = vec![2u8];
+        lonely.extend(std::iter::repeat_n(0, 6));
+        lonely.push(1);
+        lonely.extend([9; 32]);
+        lonely.extend(std::iter::repeat_n(0, 9));
+        lonely.push(0);
+        let mut hasher = Hasher::default();
+        assert!(matches!(
+            admit(&mut hasher, &lonely).unwrap().unwrap_err(),
+            NodeRefusal::NonCanonical(message) if message == "a branch has fewer than two occupants"
+        ));
+        // An empty extension prefix.
+        let mut empty = vec![1u8, 0];
+        empty.extend([9; 32]);
+        assert!(matches!(
+            admit(&mut hasher, &empty).unwrap().unwrap_err(),
+            NodeRefusal::NonCanonical(message) if message == "an extension prefix is empty"
+        ));
+        // A nibble run past twice the key bound.
+        let mut long = vec![0u8, 129, 64];
+        long.extend(std::iter::repeat_n(0, 8193));
+        long.extend([0, 0]);
+        assert!(matches!(
+            admit(&mut hasher, &long).unwrap().unwrap_err(),
+            NodeRefusal::KeyTooLong(4096)
+        ));
+        assert!(hasher.requests.is_empty());
+    }
+
+    #[test]
+    fn digest_failures_are_the_hosts_own() {
+        let mut hasher = Hasher {
+            fail: true,
+            ..Hasher::default()
+        };
+        assert!(matches!(
+            admit(&mut hasher, &LEAF),
+            Err(OperationError::Host("original digest failure"))
+        ));
+        assert!(matches!(
+            verify(&mut hasher, &[0; 32], &LEAF),
+            Err(OperationError::Host("original digest failure"))
         ));
     }
 }

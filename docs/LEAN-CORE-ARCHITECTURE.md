@@ -333,9 +333,26 @@ Integration review has identified specific gates, not waived limitations:
   exempt. These policies now live in the Lean retention program, not SQL facts
   precomputed by Rust.
 - Trie lookup now has soundness/completeness proofs against a stable raw graph
-  interpreted by the actual decoder. Codec roundtripping/canonicality and
-  mutable-host refinement remain separate obligations. Native commands must
-  enforce the existing 32-byte root type before constructing an operation.
+  interpreted by the actual decoder. Mutable-host refinement remains a
+  separate obligation. Native commands must enforce the existing 32-byte root
+  type before constructing an operation.
+- The trie codec is now both directions in Lean (`Trie/Codec.lean`): the
+  parsers consume a list of octets and return the remainder, and the encoder
+  is the postcard image the write path stores. `TrieCodecProofs.decode_encode`
+  proves the roundtrip for every well-formed node by induction over the
+  executable parsers, including the ten-byte LEB128 bound. The canonical
+  ingress boundary for peer-served nodes (`Trie/Verify.lean`) is the
+  `trieAdmit`/`trieVerify` pair of whole commands: decode, re-encode
+  identically, the shared `maxKeyBytes` bound on one node's nibble run, the
+  structural invariants, and the origin-versus-peer fault decision, over one
+  `Digest.blake3` primitive. `TrieVerifyProofs` proves that only an encoder
+  image is admitted with its invariants, that acceptance and each fault follow
+  from the host's digests alone, and that the served bytes are read whole
+  before anything is decided. `synch-mpt`'s `hash_of_encoded`, `hashes_to`
+  and `check_invariants` algorithms are deleted; the crate supplies the
+  BLAKE3 primitive and names the refusal, and `reconcile.rs` maps the verdict.
+  Mutation, walking, completeness and the rest of the trie remain Rust, per
+  the migration plan's later slices.
 - Native tests now cover acquisition transport, every effect-failure position,
   repeated polling, malformed replies and terminal resume. Generic SQLite tests
   cover UPSERT identity/time preservation, raw cells, failed commit, abandoned

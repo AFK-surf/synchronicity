@@ -4,6 +4,7 @@ import VerifiedCore.Cas.Program
 import VerifiedCore.Cas.Input
 import VerifiedCore.Origin
 import VerifiedCore.Trie.Program
+import VerifiedCore.Trie.Verify
 
 /-! The shapes that cross the command boundary: what a caller asks for and
 what a finished command reports. `hostgen` derives the codecs of every type
@@ -38,6 +39,12 @@ inductive Command where
   | admitSize (root : ByteArray) (size : UInt64)
   /-- Look a key up in a trie; the key is the run's first byte input. -/
   | trieGet (root : ByteArray) (keySize : UInt64)
+  /-- Admit node bytes (the run's first byte input) at the canonical ingress
+  boundary and answer the hash they are stored under, or the refusal. -/
+  | trieAdmit (size : UInt64)
+  /-- Decide whether served node bytes (the run's first byte input) are the
+  node `expected` names and, when they are not, whose fault that is. -/
+  | trieVerify (expected : ByteArray) (size : UInt64)
   /-- Retire head history of an origin recorded before `before`. -/
   | pruneHistory (origin : String) (before : Int64)
 
