@@ -50,6 +50,9 @@ struct Pool<'a> {
     input: Input<'a>,
     next: u64,
     handles: BTreeMap<u64, Handle<'a>>,
+    // Failed discard consumes the public token, but abandonment must still
+    // retry unlink while the path remains protected from staging GC.
+    retired_temporaries: Vec<PathBuf>,
 }
 
 impl<'a> Pool<'a> {
@@ -128,14 +131,18 @@ impl<'a> Pool<'a> {
             return Ok(());
         };
         drop(temporary.file.take());
+        let path = temporary.path.clone();
+        self.handles.remove(&handle);
         let mut active = self.store.active_temporaries();
-        match std::fs::remove_file(&temporary.path) {
+        match std::fs::remove_file(&path) {
             Ok(()) => {}
             Err(error) if error.kind() == io::ErrorKind::NotFound => {}
-            Err(error) => return Err(error.into()),
+            Err(error) => {
+                self.retired_temporaries.push(path);
+                return Err(error.into());
+            }
         }
-        active.remove(&temporary.path);
-        self.handles.remove(&handle);
+        active.remove(&path);
         Ok(())
     }
 
@@ -207,6 +214,10 @@ impl Drop for Pool<'_> {
                 active.remove(&temporary.path);
             }
         }
+        for path in &self.retired_temporaries {
+            let _ = std::fs::remove_file(path);
+            active.remove(path);
+        }
     }
 }
 
@@ -223,6 +234,7 @@ impl<'a> Files<'a> {
             input,
             next: 1,
             handles: BTreeMap::new(),
+            retired_temporaries: Vec::new(),
         })))
     }
 }
@@ -622,7 +634,7 @@ mod tests {
     }
 
     #[test]
-    fn failed_discard_keeps_drop_cleanup_fallback() {
+    fn failed_discard_consumes_token_and_keeps_private_drop_cleanup() {
         let (_dir, store) = store();
         let mut files = Files::new(&store, Input::Bytes(&[]));
         let handle = files.create_temporary("cas_payload").unwrap();
@@ -632,10 +644,29 @@ mod tests {
         drop(files.0.borrow_mut().temporary(handle).unwrap().file.take());
         std::fs::remove_file(&path).unwrap();
         std::fs::create_dir(&path).unwrap();
-        assert!(files.discard(handle).is_err());
+        let expected_error = std::fs::remove_file(&path).unwrap_err();
+        let StoreError::Io(error) = files.discard(handle).unwrap_err() else {
+            panic!("discard must preserve the original filesystem error");
+        };
+        assert_eq!(error.kind(), expected_error.kind());
+        assert_eq!(error.raw_os_error(), expected_error.raw_os_error());
+        assert!(!files.0.borrow().handles.contains_key(&handle));
+        assert_eq!(files.0.borrow().retired_temporaries, vec![path.clone()]);
         assert!(store.active_temporaries().contains(&path));
         std::fs::remove_dir(&path).unwrap();
         std::fs::write(&path, b"retry cleanup").unwrap();
+        let root = Hash::new(b"retry cleanup");
+        assert!(files.flush(handle).is_err());
+        assert!(files.write_at(handle, 0, b"overwrite").is_err());
+        assert!(files.read_at(handle, 0, 1).is_err());
+        assert!(files.read_some(handle, 0, 1).is_err());
+        assert!(files
+            .replace(handle, "cas_payload", root.as_bytes())
+            .is_err());
+        assert!(!store.blob_path(&root).exists());
+        files.discard(handle).unwrap();
+        assert_eq!(std::fs::read(&path).unwrap(), b"retry cleanup");
+        assert!(store.active_temporaries().contains(&path));
         drop(files);
         assert!(!path.exists());
         assert!(store.active_temporaries().is_empty());
