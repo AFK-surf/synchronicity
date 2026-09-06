@@ -269,11 +269,17 @@ impl Store {
         // Keep the lock through unlink, not merely the exclusion check: an
         // invocation creates and registers its temporary under this same lock.
         // Canonical keys also cover independently opened Store path aliases.
-        let active = self.active_temporaries();
-        let mut swept = sweep_stale_files(&self.staging_dir(), before, &|path| {
-            path.canonicalize()
-                .map_or(true, |key| !active.contains(&key))
-        })?;
+        // The lock covers only the staging sweep: the legacy CAS-root sweep
+        // never consults the registry, and holding the process-wide lock
+        // across its listing would stall every concurrent ingest's
+        // temporary creation for the length of a shard scan.
+        let mut swept = {
+            let active = self.active_temporaries();
+            sweep_stale_files(&self.staging_dir(), before, &|path| {
+                path.canonicalize()
+                    .map_or(true, |key| !active.contains(&key))
+            })?
+        };
         swept += sweep_stale_files(&self.cas_dir(), before, &is_legacy_staging)?;
         Ok(swept)
     }

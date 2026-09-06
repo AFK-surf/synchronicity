@@ -219,7 +219,9 @@ jobs:
           while IFS= read -r tag; do args+=(-t "$tag"); done <<< "$TAGS"
           for digest in *; do args+=("$IMAGE@sha256:$digest"); done
           docker buildx imagetools create "${args[@]}"
-          first_tag="${TAGS%%$'\\n'*}"
+          # metadata-action emits one tag per line; inspect the first. A
+          # doubled backslash here would leave the whole list in `first_tag`.
+          first_tag=$(printf '%s\n' "$TAGS" | head -n 1)
           digest=$(docker buildx imagetools inspect "$first_tag" --format '{{json .Manifest}}' | jq -r .digest)
           echo "digest=$digest" >> "$GITHUB_OUTPUT"
       - uses: actions/attest-build-provenance@v2

@@ -1,9 +1,32 @@
 //! Mechanical host diagnostic conversions shared by native CAS adapters.
 //! Domain-specific messages and recovery decisions stay with their callers.
 
-use synch_verified::{cas::CellType, host};
+use synch_verified::{
+    cas::{CellType, LifecycleDomainError, LifecycleError, OperationError},
+    host,
+};
 
 use crate::StoreError;
+
+/// Translate a completed acquisition or deletion failure. `malformed` names
+/// the operation in the one diagnostic the terminal leaves unspecified.
+pub(crate) fn lifecycle_error(error: LifecycleError<StoreError>, malformed: &str) -> StoreError {
+    match error {
+        LifecycleError::Operation(OperationError::Host(error)) => error,
+        LifecycleError::Domain(LifecycleDomainError::ColumnType {
+            index,
+            column,
+            actual,
+        }) => column_type(index, column, actual),
+        LifecycleError::Domain(LifecycleDomainError::Malformed)
+        | LifecycleError::Operation(OperationError::MalformedMetadata(_)) => {
+            StoreError::Decode(malformed.into())
+        }
+        LifecycleError::Operation(OperationError::Protocol) => {
+            StoreError::invalid("invalid native storage-operation protocol")
+        }
+    }
+}
 
 pub(crate) fn column_type(index: u64, column: String, actual: CellType) -> StoreError {
     let kind = match actual {

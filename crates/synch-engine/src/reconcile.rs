@@ -57,6 +57,20 @@ pub const MAX_RETAINED_FORKS: usize = 8;
 /// sweep, and the two together are what §5.2 means by no wedging.
 pub const MAX_UNPRODUCTIVE_ROUNDS: u32 = 3;
 
+/// How many times one fetch re-walks a trie it found whole but the store
+/// refused to certify, before handing the head to promotion as it stands.
+///
+/// Certification is refused while another handle on the same database holds
+/// a memo-invalidating transaction, or when the generation counter has
+/// saturated. Neither is a peer's fault, so [`MAX_UNPRODUCTIVE_ROUNDS`] does
+/// not apply; but each retry is a full descent of the trie inside a write
+/// transaction, and a refusal that persists (a long GC sweep on the other
+/// handle, or saturation, which never clears) would otherwise spin this
+/// fetch on the blocking pool for as long as it lasts. Promotion rechecks
+/// completeness in its own transaction, so leaving it to the next reconcile
+/// round costs nothing but the wait.
+const MAX_UNCERTIFIED_WALKS: u32 = 3;
+
 /// What a promotion attempt concluded.
 ///
 /// Four states rather than a `bool`: a trie still arriving, a memoized refusal,
@@ -890,6 +904,7 @@ impl Syncer {
             scope.clone(),
         );
         let mut unproductive = 0u32;
+        let mut uncertified = 0u32;
         loop {
             // One walk across the whole fetch, resumed rather than restarted:
             // beginning again at the root for every batch makes a cold fetch
@@ -934,6 +949,22 @@ impl Syncer {
                     break;
                 }
                 if walk.is_exhausted() {
+                    // Whole, but the store would not vouch for the snapshot.
+                    // Re-walk from the root without trusting the old frontier,
+                    // a bounded number of times: the refusal is not a peer's
+                    // doing, and promotion below rechecks completeness in its
+                    // own transaction anyway.
+                    uncertified += 1;
+                    if uncertified >= MAX_UNCERTIFIED_WALKS {
+                        tracing::debug!(
+                            origin = %origin,
+                            seq = pending.seq,
+                            walks = uncertified,
+                            "trie drained but certification kept being refused; \
+                             leaving the head to promotion"
+                        );
+                        break;
+                    }
                     walk = synch_mpt::MissingWalk::for_origin(
                         owner.clone(),
                         None,
@@ -1217,9 +1248,11 @@ impl Syncer {
             walk.resume();
         }
 
-        // The drained walk was certified in its snapshot above. Promotion
-        // rechecks completeness in its own transaction in case that generation
-        // changed, and atomically materializes the diff with the head flip.
+        // The drained walk was certified in its snapshot above, or drained and
+        // refused certification [`MAX_UNCERTIFIED_WALKS`] times. Promotion
+        // rechecks completeness in its own transaction in either case — the
+        // generation may have changed, or never been certifiable — and
+        // atomically materializes the diff with the head flip.
         let syncer = self.clone();
         let origin = origin.clone();
         let promoted =

@@ -1868,7 +1868,9 @@ mod tests {
                 };
                 assert!(matches!(
                     acquire(&mut script, &[9; 32], "holder", -11, true),
-                    Err(OperationError::Host("primary"))
+                    Err(crate::cas::LifecycleError::Operation(OperationError::Host(
+                        "primary"
+                    )))
                 ));
                 let mut expected = normal[..=index].to_vec();
                 if index > 0 {

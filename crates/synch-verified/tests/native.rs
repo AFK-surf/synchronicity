@@ -144,9 +144,15 @@ fn pin_acquisition_requires_durability_and_orders_possession_effects() {
                     possession,
                 )
                 .unwrap();
-                let expected = durable.is_some_and(|value| value != 0) && (!possession || wanted);
+                let durable = durable.is_some_and(|value| value != 0);
+                let expected = durable && (!possession || wanted);
                 assert_eq!(accepted, expected);
-                let mut trace = vec!["begin", "read durable", "read want"];
+                let mut trace = vec!["begin", "read durable"];
+                // A plain pin has no use for the want; possession consults
+                // it only once the row is known durable.
+                if durable && possession {
+                    trace.push("read want");
+                }
                 if expected {
                     if possession {
                         trace.push("delete want");
@@ -376,7 +382,9 @@ fn deletion_protocol_checks_every_protection_and_orders_effects() {
         let result = delete(&mut sql, &mut files, &[9; 32], None);
         assert!(matches!(
             result,
-            Err(synch_verified::cas::OperationError::Host("primary failure"))
+            Err(synch_verified::cas::LifecycleError::Operation(
+                synch_verified::cas::OperationError::Host("primary failure")
+            ))
         ));
         let success = [
             "begin", "pins", "entries", "access", "writers", "delete", "commit",

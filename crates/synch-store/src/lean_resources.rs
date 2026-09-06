@@ -3,7 +3,7 @@
 
 use std::{
     cell::RefCell,
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     fs::{File, OpenOptions},
     io::{self, Read},
     path::{Path, PathBuf},
@@ -53,6 +53,13 @@ struct Pool<'a> {
     // Failed discard consumes the public token, but abandonment must still
     // retry unlink while the path remains protected from staging GC.
     retired_temporaries: Vec<PathBuf>,
+    // Shard directories `replace` had to create. Only a new shard leaves a
+    // new entry in the CAS root that a directory flush has to reach.
+    created_directories: HashSet<PathBuf>,
+    // Directories flushed since the last `replace`. Lean asks for a sync per
+    // published file; the two files of one ingest share a shard, so the
+    // second request finds nothing left to flush.
+    synced_directories: HashSet<PathBuf>,
 }
 
 impl<'a> Pool<'a> {
@@ -235,6 +242,8 @@ impl<'a> Files<'a> {
             next: 1,
             handles: BTreeMap::new(),
             retired_temporaries: Vec::new(),
+            created_directories: HashSet::new(),
+            synced_directories: HashSet::new(),
         })))
     }
 }
@@ -276,10 +285,15 @@ impl TemporaryFiles for Files<'_> {
         let destination = target(pool.store, space, key)?;
         let original = pool.temporary(handle)?.path.clone();
         if let Some(parent) = destination.parent() {
-            std::fs::create_dir_all(parent)?;
+            if !parent.is_dir() {
+                std::fs::create_dir_all(parent)?;
+                pool.created_directories.insert(parent.to_path_buf());
+            }
         }
         // Failure retains temporary ownership for explicit cleanup or Drop.
         synch_core::fs::replace_file(&original, &destination)?;
+        // A new entry in the shard: whatever was flushed before is stale.
+        pool.synced_directories.clear();
         pool.store.active_temporaries().remove(&original);
         pool.handles.remove(&handle);
         Ok(())
@@ -290,34 +304,49 @@ impl TemporaryFiles for Files<'_> {
     }
 
     fn sync_parent(&mut self, space: &str, key: &[u8]) -> Result<host::DirectorySync> {
-        let pool = self.0.borrow();
+        let mut pool = self.0.borrow_mut();
         let path = target(pool.store, space, key)?;
         #[cfg(windows)]
         {
-            let _ = path;
+            let _ = (path, &mut pool);
             Ok(host::DirectorySync::Unsupported)
         }
         #[cfg(not(windows))]
         {
             let directory = path
                 .parent()
-                .ok_or_else(|| StoreError::invalid("file has no parent"))?;
-            // The shard may have been created by replace. Flushing only its
-            // contents does not persist the new shard entry in the CAS root.
-            // Include the namespace ancestors down to the pre-existing store
-            // directory; durability of that configured directory is a setup
-            // precondition, not an ingestion decision.
-            let cas_directory = pool.store.cas_dir();
+                .ok_or_else(|| StoreError::invalid("file has no parent"))?
+                .to_path_buf();
+            // A shard `replace` created is a new entry in the CAS root, so the
+            // root is flushed too. The CAS root itself exists from `Store::open`
+            // on; durability of that configured directory is a setup
+            // precondition, not an ingestion decision. Each directory is
+            // flushed once per publication round: Lean requests a sync per
+            // published file, and both files of one ingest share a shard.
+            let mut pending = vec![];
+            if !pool.synced_directories.contains(&directory) {
+                pending.push(directory.clone());
+                if pool.created_directories.contains(&directory) {
+                    let cas_directory = pool.store.cas_dir();
+                    if !pool.synced_directories.contains(&cas_directory) {
+                        pending.push(cas_directory);
+                    }
+                }
+            }
             let mut status = host::DirectorySync::Synced;
-            for directory in [directory, cas_directory.as_path(), pool.store.data_dir()] {
-                match File::open(directory)?.sync_all() {
+            for directory in pending {
+                match File::open(&directory)?.sync_all() {
                     Ok(()) => {}
                     Err(error) if error.kind() == io::ErrorKind::Unsupported => {
                         status = host::DirectorySync::Unsupported;
                     }
                     Err(error) => return Err(error.into()),
                 }
+                pool.synced_directories.insert(directory);
             }
+            // The root now carries this shard's entry durably; later
+            // publications into the shard flush the shard alone.
+            pool.created_directories.remove(&directory);
             Ok(status)
         }
     }
@@ -673,6 +702,89 @@ mod tests {
             files.sync_parent("cas_payload", root.as_bytes()).unwrap(),
             host::DirectorySync::Unsupported
         );
+    }
+
+    /// Lean asks for a directory sync per published file. Both files of one
+    /// ingest land in the same shard, so the second request has nothing left
+    /// to flush; the CAS root is flushed only when the shard is new; and a
+    /// later publication into a flushed shard makes it flushable again.
+    #[cfg(not(windows))]
+    #[test]
+    fn directory_syncs_are_shared_by_one_publication_round() {
+        let synced = |files: &Files<'_>| {
+            let mut synced: Vec<PathBuf> = files
+                .0
+                .borrow()
+                .synced_directories
+                .iter()
+                .cloned()
+                .collect();
+            synced.sort();
+            synced
+        };
+        let publish = |files: &mut Files<'_>, root: &Hash| {
+            for space in ["cas_payload", "cas_outboard"] {
+                let handle = files.create_temporary(space).unwrap();
+                files.write_at(handle, 0, b"bytes").unwrap();
+                files.replace(handle, space, root.as_bytes()).unwrap();
+            }
+        };
+        let (_dir, store) = store();
+        let mut files = Files::new(&store, Input::Bytes(&[]));
+        let root = Hash::new(b"first publication");
+        let shard = store.blob_path(&root).parent().unwrap().to_path_buf();
+        assert!(!shard.exists());
+        publish(&mut files, &root);
+        assert!(files.0.borrow().created_directories.contains(&shard));
+        assert!(synced(&files).is_empty());
+
+        assert_eq!(
+            files.sync_parent("cas_payload", root.as_bytes()).unwrap(),
+            host::DirectorySync::Synced
+        );
+        let mut expected = vec![shard.clone(), store.cas_dir()];
+        expected.sort();
+        assert_eq!(synced(&files), expected);
+        assert_eq!(
+            files.sync_parent("cas_outboard", root.as_bytes()).unwrap(),
+            host::DirectorySync::Synced
+        );
+        assert_eq!(
+            synced(&files),
+            expected,
+            "the second request flushed nothing new"
+        );
+
+        // A new file in a flushed shard: the shard is due again, the root is
+        // not, because the shard entry it holds is already durable.
+        let sibling = {
+            let mut candidate = 0u64;
+            loop {
+                let hash = Hash::new(&candidate.to_le_bytes());
+                if store.blob_path(&hash).parent().unwrap() == shard && hash != root {
+                    break hash;
+                }
+                candidate += 1;
+            }
+        };
+        publish(&mut files, &sibling);
+        assert!(synced(&files).is_empty());
+        files
+            .sync_parent("cas_payload", sibling.as_bytes())
+            .unwrap();
+        assert_eq!(synced(&files), vec![shard.clone()]);
+
+        // A pre-existing shard never puts the root on the list.
+        let mut other = Files::new(&store, Input::Bytes(&[]));
+        let stranger = Hash::new(b"published into an existing shard");
+        let stranger_shard = store.blob_path(&stranger).parent().unwrap().to_path_buf();
+        std::fs::create_dir_all(&stranger_shard).unwrap();
+        publish(&mut other, &stranger);
+        assert!(other.0.borrow().created_directories.is_empty());
+        other
+            .sync_parent("cas_outboard", stranger.as_bytes())
+            .unwrap();
+        assert_eq!(synced(&other), vec![stranger_shard]);
     }
 
     #[test]

@@ -35,6 +35,8 @@ runs:
         "CC_x86_64_pc_windows_gnullvm=$bin/clang.exe" >> $env:GITHUB_ENV
         "AR_x86_64_pc_windows_gnullvm=$bin/llvm-ar.exe" >> $env:GITHUB_ENV
         "$bin" >> $env:GITHUB_PATH
-    - if: runner.os == 'Windows'
-      shell: pwsh
-      run: cargo test -p synch-verified --lib --tests
+    # No smoke test here: every consuming job builds synch-verified itself
+    # right after restoring its Rust cache, and `verified-core` runs the
+    # crate's tests. A cold `cargo test` inside the action compiled the Lean
+    # core twice per Windows job and ran unit tests the release workflow
+    # never asked for.

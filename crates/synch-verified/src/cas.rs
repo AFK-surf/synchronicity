@@ -61,6 +61,24 @@ pub enum IngestError<E> {
     Domain(IngestDomainError),
 }
 
+/// The column-type terminal every CAS operation frames the same way: the
+/// projection index, the column name and the observed storage class.
+fn decode_column_type(
+    reader: &mut crate::operation::Reader<'_>,
+) -> Result<(u64, String, CellType), ()> {
+    let index = reader.word()?;
+    let column = reader.string()?;
+    let actual = match reader.byte()? {
+        0 => CellType::Null,
+        1 => CellType::Integer,
+        2 => CellType::Real,
+        3 => CellType::Text,
+        4 => CellType::Blob,
+        _ => return Err(()),
+    };
+    Ok((index, column, actual))
+}
+
 fn decode_ingest(bytes: &[u8]) -> Result<Result<Ingested, IngestDomainError>, ()> {
     let mut reader = crate::operation::Reader(bytes);
     let result = match reader.byte()? {
@@ -69,18 +87,14 @@ fn decode_ingest(bytes: &[u8]) -> Result<Result<Ingested, IngestDomainError>, ()
             size: reader.word()?,
         }),
         1 => Err(IngestDomainError::Malformed),
-        2 => Err(IngestDomainError::ColumnType {
-            index: reader.word()?,
-            column: reader.string()?,
-            actual: match reader.byte()? {
-                0 => CellType::Null,
-                1 => CellType::Integer,
-                2 => CellType::Real,
-                3 => CellType::Text,
-                4 => CellType::Blob,
-                _ => return Err(()),
-            },
-        }),
+        2 => {
+            let (index, column, actual) = decode_column_type(&mut reader)?;
+            Err(IngestDomainError::ColumnType {
+                index,
+                column,
+                actual,
+            })
+        }
         3 => Err(IngestDomainError::SizeMismatch {
             root: reader.byte_slice()?.try_into().map_err(|_| ())?,
             recorded: reader.word()?,
@@ -195,18 +209,14 @@ fn decode_read(bytes: &[u8]) -> Result<Result<u64, ReadDomainError>, ()> {
         3 => Err(ReadDomainError::Unavailable),
         4 => Err(ReadDomainError::ShortInline),
         5 => Err(ReadDomainError::Malformed),
-        6 => Err(ReadDomainError::ColumnType {
-            index: reader.word()?,
-            column: reader.string()?,
-            actual: match reader.byte()? {
-                0 => CellType::Null,
-                1 => CellType::Integer,
-                2 => CellType::Real,
-                3 => CellType::Text,
-                4 => CellType::Blob,
-                _ => return Err(()),
-            },
-        }),
+        6 => {
+            let (index, column, actual) = decode_column_type(&mut reader)?;
+            Err(ReadDomainError::ColumnType {
+                index,
+                column,
+                actual,
+            })
+        }
         7 => Err(ReadDomainError::Column {
             column: reader.string()?,
             reason: reader.string()?,
@@ -361,13 +371,68 @@ pub fn unpin<S: crate::host::Storage>(
     }
 }
 
+/// Domain failure selected by a complete Lean acquisition or deletion.
+///
+/// The column-type terminal carries the same fields as ingestion's and the
+/// read path's, so the host translates all three with one conversion.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LifecycleDomainError {
+    Malformed,
+    ColumnType {
+        index: u64,
+        column: String,
+        actual: CellType,
+    },
+}
+
+/// Completed acquisition or deletion failure, preserving original host errors.
+#[derive(Debug)]
+pub enum LifecycleError<E> {
+    Operation(OperationError<E>),
+    Domain(LifecycleDomainError),
+}
+
+/// Frame shared by acquisition and deletion: tag 0 carries the operation's
+/// own value, tags 1 and 2 the malformed-metadata and column-type errors.
+fn decode_lifecycle<A>(
+    bytes: &[u8],
+    value: impl FnOnce(&mut crate::operation::Reader<'_>) -> Result<A, ()>,
+) -> Result<Result<A, LifecycleDomainError>, ()> {
+    let mut reader = crate::operation::Reader(bytes);
+    let result = match reader.byte()? {
+        0 => Ok(value(&mut reader)?),
+        1 => Err(LifecycleDomainError::Malformed),
+        2 => {
+            let (index, column, actual) = decode_column_type(&mut reader)?;
+            Err(LifecycleDomainError::ColumnType {
+                index,
+                column,
+                actual,
+            })
+        }
+        _ => return Err(()),
+    };
+    reader.end()?;
+    Ok(result)
+}
+
+fn finish_lifecycle<A, E>(
+    result: Result<Vec<u8>, OperationError<E>>,
+    value: impl FnOnce(&mut crate::operation::Reader<'_>) -> Result<A, ()>,
+) -> Result<A, LifecycleError<E>> {
+    let bytes = result.map_err(LifecycleError::Operation)?;
+    decode_lifecycle(&bytes, value)
+        .map_err(|()| LifecycleError::Operation(OperationError::Protocol))?
+        .map_err(LifecycleError::Domain)
+}
+
 /// Delete one object through its complete Lean storage/resource program.
 pub fn delete<S: crate::host::Storage>(
     storage: &mut S,
     resources: &mut dyn crate::host::Resources<Error = S::Error>,
     root: &[u8; 32],
     before: Option<i64>,
-) -> Result<Outcome, OperationError<S::Error>> {
+) -> Result<Outcome, LifecycleError<S::Error>> {
     use crate::operation::Slice;
     unsafe extern "C" {
         fn synch_adapter_operation_delete(
@@ -385,14 +450,14 @@ pub fn delete<S: crate::host::Storage>(
                 before.unwrap_or(0) as u64,
             )
         })
-    }?;
-    match result.as_slice() {
-        [0] => Ok(Outcome::Skipped),
-        [1] => Ok(Outcome::Writing),
-        [2] => Ok(Outcome::Protected),
-        [3] => Ok(Outcome::Applied),
-        _ => Err(OperationError::Protocol),
-    }
+    };
+    finish_lifecycle(result, |reader| match reader.byte()? {
+        0 => Ok(Outcome::Skipped),
+        1 => Ok(Outcome::Writing),
+        2 => Ok(Outcome::Protected),
+        3 => Ok(Outcome::Applied),
+        _ => Err(()),
+    })
 }
 
 /// Execute complete pin/possession acquisition over raw storage capabilities.
@@ -403,7 +468,7 @@ pub fn acquire<S: crate::host::Storage>(
     holder: &str,
     now: i64,
     possession: bool,
-) -> Result<bool, OperationError<S::Error>> {
+) -> Result<bool, LifecycleError<S::Error>> {
     use crate::operation::Slice;
     unsafe extern "C" {
         fn synch_adapter_operation_acquire(
@@ -424,11 +489,69 @@ pub fn acquire<S: crate::host::Storage>(
                 u8::from(possession),
             )
         })
-    }?;
-    match result.as_slice() {
-        [0] => Ok(false),
-        [1] => Ok(true),
-        _ => Err(OperationError::Protocol),
+    };
+    finish_lifecycle(result, |reader| match reader.byte()? {
+        0 => Ok(false),
+        1 => Ok(true),
+        _ => Err(()),
+    })
+}
+
+#[cfg(test)]
+mod lifecycle_terminal_tests {
+    use super::*;
+
+    fn acquired(reader: &mut crate::operation::Reader<'_>) -> Result<bool, ()> {
+        match reader.byte()? {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(()),
+        }
+    }
+
+    #[test]
+    fn lifecycle_values_are_exactly_framed() {
+        assert_eq!(decode_lifecycle(&[0, 0], acquired), Ok(Ok(false)));
+        assert_eq!(decode_lifecycle(&[0, 1], acquired), Ok(Ok(true)));
+        assert_eq!(
+            decode_lifecycle(&[1], acquired),
+            Ok(Err(LifecycleDomainError::Malformed))
+        );
+        for malformed in [&[][..], &[0], &[0, 2], &[0, 1, 0], &[1, 0], &[2], &[3]] {
+            assert_eq!(decode_lifecycle(malformed, acquired), Err(()));
+        }
+    }
+
+    #[test]
+    fn lifecycle_column_type_carries_index_name_and_class() {
+        for (octet, actual) in [
+            (0, CellType::Null),
+            (1, CellType::Integer),
+            (2, CellType::Real),
+            (3, CellType::Text),
+            (4, CellType::Blob),
+        ] {
+            let mut packet = vec![2];
+            packet.extend_from_slice(&0_u64.to_le_bytes());
+            packet.extend_from_slice(&7_u64.to_le_bytes());
+            packet.extend_from_slice(b"durable");
+            packet.push(octet);
+            assert_eq!(
+                decode_lifecycle(&packet, acquired),
+                Ok(Err(LifecycleDomainError::ColumnType {
+                    index: 0,
+                    column: "durable".into(),
+                    actual,
+                }))
+            );
+            packet.push(0);
+            assert_eq!(decode_lifecycle(&packet, acquired), Err(()));
+        }
+        let mut unknown = vec![2];
+        unknown.extend_from_slice(&0_u64.to_le_bytes());
+        unknown.extend_from_slice(&0_u64.to_le_bytes());
+        unknown.push(5);
+        assert_eq!(decode_lifecycle(&unknown, acquired), Err(()));
     }
 }
 

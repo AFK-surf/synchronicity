@@ -50,12 +50,12 @@ theorem lifecycle_plan_bounds (request : LifecycleRequest) :
 /-- Any failed transactional execution terminates deletion without requesting
 file cleanup. The transaction's own proofs cover rollback and primary errors. -/
 theorem failed_transaction_has_no_cleanup (root : ByteArray) (before : Option Int64)
-    (failure : Failure)
-    (failed : (transaction (fun tx => deleteIn tx root before)).run =
+    (failure : Error)
+    (failed : (transactionWith Error.host (fun tx => deleteIn tx root before)).run =
       Program.pure (.error failure)) :
     (delete root before).run = Program.pure (.error failure) := by
   unfold delete
-  change Program.bind (transaction (fun tx => deleteIn tx root before)).run _ = _
+  change Program.bind (transactionWith Error.host (fun tx => deleteIn tx root before)).run _ = _
   rw [failed]
   rfl
 
@@ -83,13 +83,13 @@ theorem cleanup_attempts_both_files (root : ByteArray) :
 
 /-- File effects are downstream of successful transaction completion. -/
 theorem committed_deletion_runs_cleanup (root : ByteArray) (before : Option Int64)
-    (committed : (transaction (fun tx => deleteIn tx root before)).run =
+    (committed : (transactionWith Error.host (fun tx => deleteIn tx root before)).run =
       Program.pure (.ok .applied)) :
     (delete root before).run = Program.request (.removeFile "cas_payload" root) (fun _ =>
       Program.request (.removeFile "cas_outboard" root) (fun _ =>
         Program.pure (.ok .applied))) := by
   unfold delete
-  change Program.bind (transaction (fun tx => deleteIn tx root before)).run _ = _
+  change Program.bind (transactionWith Error.host (fun tx => deleteIn tx root before)).run _ = _
   rw [committed]
   change Program.bind (cleanup root).run _ = _
   rw [cleanup_attempts_both_files]
@@ -133,9 +133,10 @@ theorem deletion_execution_outcome (root : ByteArray) (accessed : Option Int64)
       ⟨accessed.isSome, writers != 0, pinned, referenced, accessed.getD 0⟩ before)).outcome := by
   cases accessed <;> cases before <;> cases pinned <;> cases referenced <;>
     by_cases writing : writers = 0 <;>
-    simp [delete, deleteIn, cleanup, transaction, transactionWith, transactionOver, perform, execute, answer, event,
+    simp [delete, deleteIn, cleanup, transactionWith, transactionOver, request, performWith,
+      execute, answer, event, Except.mapError, Except.map,
       bind, pure, Program.bind, ExceptT.bind, ExceptT.bindCont, ExceptT.pure,
-      ExceptT.run, ExceptT.mk, decodeAccess, planLifecycle, writing]
+      ExceptT.run, ExceptT.mk, decodeAccess, Codec.integerField, planLifecycle, writing]
   all_goals (try split_ifs) <;> rfl
 
 open CasProgramProofs in
