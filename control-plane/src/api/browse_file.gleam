@@ -4,7 +4,11 @@
 //// A download ties an HTTP response to a tunnel stream. The registry grants
 //// the attached daemon a small credit window; each chunk relayed to the
 //// browser and flushed returns one credit, so a slow browser stalls the read
-//// at its source and this process never holds more than the window.
+//// at its source and this process never holds more than the window. The
+//// response carries a `Content-Length` — the size the daemon resolved, or
+//// the range of it asked for — rather than chunked transfer coding, so a
+//// client sees how much is coming and knows a short body for what it is
+//// (`api/sized_body`).
 ////
 //// Every response is `Content-Disposition: attachment`, `application/octet-
 //// stream`, `X-Content-Type-Options: nosniff`. Stored files are hostile
@@ -17,10 +21,12 @@ import api/agent.{type Session}
 import api/browse_api.{type Browse}
 import api/cloud_writer
 import api/middleware
+import api/sized_body
 import auth/api_key
 import auth/principal.{type Principal, Cookie, Principal}
 import auth/session
 import envoy
+import exception
 import gleam/bit_array
 import gleam/bytes_tree
 import gleam/crypto
@@ -40,10 +46,6 @@ import store/pool.{type Pool}
 
 @external(erlang, "cp_sys_ffi", "now_unix")
 fn now_unix() -> Int
-
-/// How often the relay's watchdog fires. A stream that has produced nothing
-/// between two ticks is a dead tunnel dressed as a slow one.
-const watchdog_ms = 60_000
 
 /// What one download needs to know about itself: the concurrency slot it has
 /// to give back and who to give it back for, plus the path the filename in
@@ -548,7 +550,8 @@ fn deny_range(size: Int) -> HttpResponse(mist.ResponseData) {
   |> response.set_header("content-range", "bytes */" <> int.to_string(size))
 }
 
-/// Opens the chunked response and relays the stream into it.
+/// Writes the head, `Content-Length: length` included, and relays the stream
+/// into a body of exactly that many bytes.
 fn stream(
   req: HttpRequest(mist.Connection),
   session: Session,
@@ -592,42 +595,94 @@ fn stream(
       False -> []
     }
   ]
-  let head =
-    list.fold(headers, response.new(status), fn(acc, pair) {
-      response.set_header(acc, pair.0, pair.1)
-    })
-  mist.chunked(
-    request: req,
-    response: head,
-    init: fn(sink: Subject(agent.Event)) {
-      process.send(session.inbox, agent.Fetch(root, size, start, length, sink))
-      let _ = process.send_after(sink, watchdog_ms, agent.Idle)
-      #(agent.relay(session), sink)
-    },
-    loop: fn(state, event, conn) {
-      let #(relay, sink) = state
-      case event {
-        agent.Idle -> {
-          let _ = process.send_after(sink, watchdog_ms, agent.Idle)
-          Nil
+  let response =
+    sized_body.respond(
+      request: req,
+      status: status,
+      headers: headers,
+      length: length,
+      body: fn(sink) {
+        let inbox = process.new_subject()
+        process.send(
+          session.inbox,
+          agent.Fetch(root, size, start, length, inbox),
+        )
+        relay(agent.relay(session), inbox, sink, length)
+      },
+    )
+  // Outside the body, which `respond` runs under a rescue: the slot goes back
+  // however the relay ended, a crash included. Left inside, a crash would hold
+  // it until the lease reclaims it an hour on.
+  record(download)
+  response
+}
+
+/// Feeds the session's events to the relay until the stream ends, one way or
+/// the other.
+///
+/// The wait for each event is the watchdog. `Idle` stands in for the event a
+/// silent wait did not bring; the relay tolerates one such wait after the
+/// tunnel last moved and ends the stream on the next, since a tunnel silent
+/// that long is a dead one dressed as slow, and a download that hangs forever
+/// is worse for whoever is waiting than one that fails. A tunnel that never
+/// spoke at all is ended on the first.
+fn relay(
+  state: agent.Relay,
+  inbox: Subject(agent.Event),
+  sink: sized_body.Sink,
+  length: Int,
+) -> sized_body.Outcome {
+  let event = case process.receive(inbox, agent.relay_timeout()) {
+    Ok(event) -> event
+    Error(Nil) -> agent.Idle
+  }
+  // The head has promised a count, and a client reading to it would take
+  // any surplus for the file's tail. The daemon is the data authority, so a
+  // stream that would overrun what it resolved is a daemon at fault, and it
+  // is cut before the byte that would, never passed on.
+  let overrun = case event {
+    agent.Body(_, data) ->
+      agent.relay_sent(state) + bit_array.byte_size(data) > length
+    _ -> False
+  }
+  case overrun {
+    True -> {
+      agent.relay_cancel(state)
+      sized_body.Aborted(
+        "the daemon sent more than the "
+        <> int.to_string(length)
+        <> " bytes it resolved",
+      )
+    }
+    False ->
+      // Rescued here, where the stream's id is known: a relay that falls over
+      // cancels its stream at the daemon, which would otherwise hold the read
+      // open until the credit window drained and keep the entry for the life
+      // of the tunnel. `respond` then closes the socket on the abort.
+      case exception.rescue(fn() { agent.relay_step(state, event, sink) }) {
+        Error(crash) -> {
+          agent.relay_cancel(state)
+          sized_body.Aborted("the relay crashed: " <> string.inspect(crash))
         }
-        _ -> Nil
+        Ok(agent.Relaying(next)) -> relay(next, inbox, sink, length)
+        Ok(agent.Finished(next)) ->
+          case agent.relay_sent(next) == length {
+            True -> sized_body.Complete
+            // Ended cleanly at the daemon, but short of what it resolved: an
+            // abort here, so the client's count comes out wrong at once
+            // rather than after its own timeout.
+            False ->
+              sized_body.Aborted(
+                "the daemon sent "
+                <> int.to_string(agent.relay_sent(next))
+                <> " of the "
+                <> int.to_string(length)
+                <> " bytes it resolved",
+              )
+          }
+        Ok(agent.Failed(_next, why)) -> sized_body.Aborted(why)
       }
-      case agent.relay_step(relay, event, conn) {
-        agent.Relaying(next) -> mist.ChunkContinue(#(next, sink))
-        agent.Finished(_next) -> {
-          record(download)
-          mist.ChunkStop
-        }
-        agent.Failed(_next, why) -> {
-          record(download)
-          // Aborted rather than closed cleanly: a truncated body must never
-          // reach a browser as a complete file.
-          mist.ChunkAbort(why)
-        }
-      }
-    },
-  )
+  }
 }
 
 /// Gives the download's concurrency slot back, however the stream ended.
