@@ -35,12 +35,19 @@ fn public_and_internal_ingest_nonseekable_streams_to_actual_eof() {
         for internal in [false, true] {
             let directory = tempfile::tempdir().unwrap();
             let path = directory.path().join("input.fifo");
-            rustix::fs::mkfifoat(
-                rustix::fs::CWD,
-                &path,
-                rustix::fs::Mode::RUSR | rustix::fs::Mode::WUSR,
-            )
-            .unwrap();
+            // rustix::fs::mkfifoat is unavailable on Apple platforms. The
+            // POSIX utility creates the same fixture on Linux and macOS,
+            // without adding test-only unsafe platform bindings.
+            let created = std::process::Command::new("mkfifo")
+                .args(["-m", "600"])
+                .arg(&path)
+                .output()
+                .expect("run POSIX mkfifo for the stream fixture");
+            assert!(
+                created.status.success(),
+                "mkfifo failed: {}",
+                String::from_utf8_lossy(&created.stderr)
+            );
             assert_eq!(std::fs::metadata(&path).unwrap().len(), 0);
             let (completed_tx, completed_rx) = mpsc::channel();
             let writer_path = path.clone();
