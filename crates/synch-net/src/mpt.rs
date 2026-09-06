@@ -16,7 +16,6 @@ use synch_core::{
     now_ns, BlobAd, DeclaredScope, Hash, HeadSummary, MptMessage, NodeId, OriginId, SignedHead,
     MAX_BATCH, MAX_BATCH_PATH_BYTES, MAX_HEADS_PER_MESSAGE, MAX_PROVIDER_ADS, PROTO_VERSION,
 };
-use synch_mpt::{NodeStore, Trie, TrieNode};
 use synch_store::Store;
 
 use crate::{
@@ -299,72 +298,19 @@ impl MptProtocol {
             MptMessage::GetNodes { root, wants } => {
                 check_wants(&wants)?;
                 let store = self.store().clone();
+                // The whole judgement is Lean's `Trie.Serve.serveNodes` (§5.5):
+                // a scoped peer's positions are resolved against a root this
+                // node vouches for and never trusted; a position holding
+                // nothing is `missing` under the hash the caller named; a
+                // node under a confined origin's root goes out only with this
+                // store's provenance for it; what a node *reveals* is judged
+                // at every position it is named at, and only the payload is
+                // deduplicated; and the answer stops at the byte budget. A
+                // short answer is an ordinary answer: the requester's walk
+                // defers everything it asked for and re-offers what did not
+                // come back (`MissingWalk::resume`).
                 let (nodes, missing, redacted) = crate::blocking::offload(move || {
-                    let scope = store.scope_for_key(&peer, now_ns())?;
-                    let admitted = admit(&store, peer, root, &wants)?;
-                    let vouch = Vouch::for_root(&store, root)?;
-                    let mut answer = Answer::new();
-                    let mut missing = Distinct::default();
-                    let mut redacted = Distinct::default();
-                    // Every position is judged, and only the *payload* is
-                    // deduplicated: a scoped peer may name one node at two
-                    // spine positions and be entitled to it at just one of
-                    // them, so a verdict reached about the first position
-                    // must not be the answer for the second — in either
-                    // order, which is why the payload check comes *after* the
-                    // scope judgement and a node can come back both served
-                    // and redacted. `admit` ran first — the request is
-                    // authorized by position and only then deduplicated by
-                    // what those positions resolved to.
-                    for (at, (path, claimed)) in admitted.into_iter().zip(wants.iter()) {
-                        // A position holding nothing is reported against the
-                        // hash the caller named, so an honest walk sees the
-                        // ordinary `missing` it already handles.
-                        let Some(hash) = at else {
-                            missing.push(*claimed);
-                            continue;
-                        };
-                        let Some(data) = store.get_node(&hash)? else {
-                            missing.push(hash);
-                            continue;
-                        };
-                        // Held is not the same as vouched for: under a
-                        // confined origin's root only a node this store was
-                        // served as that origin's goes out, to any peer.
-                        if !vouch.covers(&store, &hash)? {
-                            missing.push(hash);
-                            continue;
-                        }
-                        // Position admits the node; what the node *reveals* may
-                        // still run out of scope. A compressed node carries key
-                        // material of its own — an extension's prefix, a leaf's
-                        // remaining key and value — and one sitting on the spine
-                        // can describe a key range the peer was never granted.
-                        // `ScopedSync.ServeNode`/`Redacts`;
-                        // `served_reveals_within_scope` is the privacy claim.
-                        if !scope.is_full()
-                            && !TrieNode::decode(&data)
-                                .map(|node| scope.admits_node(path, &node))
-                                .unwrap_or(false)
-                        {
-                            redacted.push(hash);
-                            continue;
-                        }
-                        if answer.served(&hash) {
-                            continue;
-                        }
-                        // A short answer is an ordinary answer: the requester's
-                        // walk defers everything it asked for and re-offers what
-                        // did not come back (`MissingWalk::resume`).
-                        if !answer.push(hash, data) {
-                            break;
-                        }
-                    }
-                    Ok((
-                        answer.into_payloads(),
-                        missing.into_vec(),
-                        redacted.into_vec(),
-                    ))
+                    Ok(store.serve_trie_nodes(&peer, &root, &wants)?)
                 })
                 .await?;
                 write_frame(
@@ -384,79 +330,17 @@ impl MptProtocol {
                 // arbitrary bytes, so the count cap alone is not a cost cap.
                 // `MAX_TRIE_VALUE_LEN` is the enforced bound, and the budget
                 // below is what keeps even a full batch of them inside a frame.
+                //
+                // Lean's `Trie.Serve.serveValues`: a value is authorized by
+                // the position of the node that holds it, resolved on this
+                // store, vouched for under the root's origins, and serving
+                // the value only if the node genuinely carries it and its
+                // coverage — not just its position — lies inside the grant.
+                // An unscoped peer is answered by hash, and pays for no
+                // descent.
                 let store = self.store().clone();
                 let (values, missing) = crate::blocking::offload(move || {
-                    // A value is authorized by the position of the node that
-                    // holds it: resolve that node, and serve the value only if
-                    // the node genuinely carries it. Without the second half a
-                    // scoped peer could name an in-scope node and any value
-                    // hash it liked.
-                    //
-                    // For an unscoped peer there is nothing to authorize — any
-                    // payload this store holds may go — so it is answered by
-                    // hash exactly as it always was, and the descent that finds
-                    // the holder is not paid for at all.
-                    let scope = store.scope_for_key(&peer, now_ns())?;
-                    let holders = match scope.is_full() {
-                        true => None,
-                        false => Some(admit(&store, peer, root, &wants)?),
-                    };
-                    let vouch = Vouch::for_root(&store, root)?;
-                    let mut answer = Answer::new();
-                    let mut missing = Distinct::default();
-                    for (i, wanted) in wants.iter().enumerate() {
-                        if answer.served(&wanted.1) {
-                            continue;
-                        }
-                        if let Some(holders) = &holders {
-                            // The holder must be vouched for as well as
-                            // admitted: a value under a confined origin's root
-                            // travels only with the node that carries it.
-                            let vouched = match holders[i] {
-                                Some(h) => vouch.covers(&store, &h)?,
-                                None => false,
-                            };
-                            let carried = vouched
-                                && match holders[i].map(|h| store.get_node(&h)).transpose()? {
-                                    Some(Some(data)) => TrieNode::decode(&data)
-                                        .map(|node| {
-                                            // Coverage, not just position — the
-                                            // value-specific authorization.
-                                            // `GetNodes` may expose a spine
-                                            // branch's child hashes without
-                                            // granting its own value. A node at an
-                                            // in-scope position can still
-                                            // describe a key that runs out of
-                                            // scope: a `Leaf` spells the rest
-                                            // of its key, and that key's value
-                                            // is the payload being asked for.
-                                            // Checking only the position here
-                                            // let one handler redact a node the
-                                            // other served the contents of, for
-                                            // the price of knowing its value
-                                            // hash.
-                                            // `ScopedSync.ServeValue`.
-                                            node.value_hashes().contains(&wanted.1)
-                                                && scope.admits_value(&wanted.0, &node)
-                                        })
-                                        .unwrap_or(false),
-                                    _ => false,
-                                };
-                            if !carried {
-                                missing.push(wanted.1);
-                                continue;
-                            }
-                        }
-                        match store.get_value(&wanted.1)? {
-                            Some(data) => {
-                                if !answer.push(wanted.1, data) {
-                                    break;
-                                }
-                            }
-                            None => missing.push(wanted.1),
-                        }
-                    }
-                    Ok((answer.into_payloads(), missing.into_vec()))
+                    Ok(store.serve_trie_values(&peer, &root, &wants)?)
                 })
                 .await?;
                 write_frame(send, &MptMessage::Values { values, missing }).await?;
@@ -524,225 +408,12 @@ impl MptProtocol {
 ///
 /// Half a frame, so the postcard framing and the `missing` list have room and a
 /// short answer is never produced for lack of a few hundred bytes.
+///
+/// The budget is enforced by Lean (`Trie.Serve.answerBudget`); this is the
+/// figure the tests below state the bound through, and
+/// `a_values_answer_is_bounded_in_bytes` is what keeps the two agreeing.
+#[cfg(test)]
 const ANSWER_BYTE_BUDGET: usize = synch_core::MAX_FRAME_LEN / 2;
-
-/// Assembles one bounded batch answer: at most [`ANSWER_BYTE_BUDGET`] payload
-/// bytes, one payload per distinct hash.
-///
-/// The one holder of the two rules `Nodes` and `Values` answers share — and
-/// must share, because each is a §12 bound the other restating is a second
-/// place to lose it:
-///
-/// - **One payload per distinct hash.** A requester may only take one —
-///   `take_served` refuses a repeated payload as a protocol violation and ends
-///   the exchange — so serving a hash named twice literally would make this
-///   node look hostile for a fault on the asking side. Deduplicating also
-///   stops a repeated hash from turning one bounded batch into [`MAX_BATCH`]
-///   copies of the same payload. Only the payload is deduplicated, not the
-///   judgement: a scoped walk legitimately names one node at two spine
-///   positions (§5.5), and the position refused must not answer for the
-///   position admitted.
-/// - **One payload always goes, whatever its size.** A stored payload larger
-///   than the whole budget predates the ceiling, and answering nothing would
-///   stall the requester's walk forever. It is the whole answer, though:
-///   anything after it would push the frame past `MAX_FRAME_LEN`, and then the
-///   requester gets an error instead of the payload, every round, without ever
-///   advancing `unproductive`.
-struct Answer {
-    budget: usize,
-    answered: std::collections::HashSet<Hash>,
-    payloads: Vec<(Hash, Vec<u8>)>,
-}
-
-impl Answer {
-    fn new() -> Answer {
-        Answer {
-            budget: ANSWER_BYTE_BUDGET,
-            answered: std::collections::HashSet::new(),
-            payloads: Vec::new(),
-        }
-    }
-
-    /// Whether `hash`'s payload is already in the answer.
-    fn served(&self, hash: &Hash) -> bool {
-        self.answered.contains(hash)
-    }
-
-    /// Adds one payload under the budget; `false` once the answer is full and
-    /// the assembling loop should stop.
-    fn push(&mut self, hash: Hash, data: Vec<u8>) -> bool {
-        self.answered.insert(hash);
-        match self.budget.checked_sub(data.len()) {
-            Some(left) => {
-                self.budget = left;
-                self.payloads.push((hash, data));
-                true
-            }
-            None if self.payloads.is_empty() => {
-                self.payloads.push((hash, data));
-                false
-            }
-            None => false,
-        }
-    }
-
-    fn into_payloads(self) -> Vec<(Hash, Vec<u8>)> {
-        self.payloads
-    }
-}
-
-/// A `missing` or `redacted` list that names each hash once, in first-seen
-/// order, however many positions resolved to it.
-#[derive(Default)]
-struct Distinct {
-    seen: std::collections::HashSet<Hash>,
-    order: Vec<Hash>,
-}
-
-impl Distinct {
-    fn push(&mut self, hash: Hash) {
-        if self.seen.insert(hash) {
-            self.order.push(hash);
-        }
-    }
-
-    fn into_vec(self) -> Vec<Hash> {
-        self.order
-    }
-}
-
-/// Whose trie a request walks, and what each of those origins demands before
-/// this store vouches for a node under it (§5.5).
-///
-/// A root this store holds a head for belongs to one origin — in principle to
-/// several, if two origins signed identical tries — and for a confined one a
-/// node is served only if this store was served it as that origin's
-/// (`NodeStore::owns_node`). Holding the node is not enough: a member holds
-/// every node of the issuer's trie, and a delegate can place any withheld
-/// subtree's hash in its own trie. Enforced for every peer, scoped or not — a
-/// full member that was handed the node under the grafting root would record
-/// provenance for it and complete the head, and the leak would only have moved
-/// one hop. A root this store holds no head for demands nothing: `admit` has
-/// already refused it for a scoped peer, and an unscoped peer may have any
-/// node this store holds.
-// `Provenance.Vouched`; `Provenance.serve_legit` is why what a responder hands
-// out under any root is legitimately the reader's to hold.
-struct Vouch {
-    owners: Vec<Option<OriginId>>,
-}
-
-impl Vouch {
-    fn for_root(store: &Store, root: Hash) -> Result<Vouch, NetError> {
-        let now = now_ns();
-        let mut owners = Vec::new();
-        for origin in store.head_root_origins(&root)? {
-            owners.push(store.provenance_owner(&origin, now)?);
-        }
-        Ok(Vouch { owners })
-    }
-
-    fn covers(&self, store: &Store, hash: &Hash) -> Result<bool, NetError> {
-        if self.owners.is_empty() {
-            return Ok(true);
-        }
-        for owner in &self.owners {
-            match owner {
-                None => return Ok(true),
-                Some(origin) => {
-                    if NodeStore::owns_node(store, origin, hash)? {
-                        return Ok(true);
-                    }
-                }
-            }
-        }
-        Ok(false)
-    }
-}
-
-/// Resolves a batch of claimed positions and returns what stands at each,
-/// refusing the whole request if any position lies outside the peer's scope.
-///
-/// This is where a scoped peer's view is enforced (§5.5). The peer says where it
-/// believes a node sits; this descends from a root *this* node holds and
-/// reports what is really there, so a fabricated root fails at the first step
-/// and a lie about the position simply resolves to whatever is genuinely at
-/// the path named — which is in scope by construction.
-///
-/// An out-of-scope position is refused rather than answered `missing`, because
-/// it is not a race: an honest peer prunes its own frontier at the boundary
-/// and never asks. A request that crosses it is a probe, and saying so is
-/// worth more than quietly returning nothing.
-// `ScopedSync.Admit`; `admit_ignores_claim` and `admit_unique` are "a hash
-// cannot be authorized; a position can".
-fn admit(
-    store: &Store,
-    peer: NodeId,
-    root: Hash,
-    wants: &[(Vec<u8>, Hash)],
-) -> Result<Vec<Option<Hash>>, NetError> {
-    let (scope, origins) = store.scope_for_key_with_origins(&peer, now_ns())?;
-    if scope.is_full() {
-        // Nothing to authorize: an unscoped peer may have any node this store
-        // holds, so the request is answered by hash exactly as it always was
-        // and the position it carried is not consulted.
-        return Ok(wants.iter().map(|(_, claimed)| Some(*claimed)).collect());
-    }
-    // The position is only meaningful relative to a trie this node vouches
-    // for: given a root of the caller's choosing, the empty path resolves to
-    // that root itself and every position below it is whatever the caller put
-    // there — so authorization by position would authorize nothing at all.
-    // The peer's own roots are excluded for the same reason: a delegate signs
-    // and publishes its own trie, which this node records once the signature
-    // and binding verify, so a root of the caller's choosing is exactly what
-    // a peer's own head is — and with one it could read every withheld
-    // subtree, one level at a time.
-    if !store.is_head_root(&root, &origins)? {
-        tracing::warn!(
-            peer = %peer.fmt_short(),
-            "refusing a trie request against a root this node holds no head for"
-        );
-        return Err(NetError::Unexpected(
-            "requested positions against a root this node holds no head for".to_string(),
-        ));
-    }
-    // Refuse an out-of-scope position without failing the whole batch. Scope
-    // may differ briefly while a widened delegation replicates; the caller
-    // already represents the refused position as missing.
-    let mut refused = 0usize;
-    let paths: Vec<Vec<u8>> = wants.iter().map(|(path, _)| path.clone()).collect();
-    let admitted: Vec<bool> = paths
-        .iter()
-        .map(|path| {
-            let ok = scope.admits_path(path);
-            refused += usize::from(!ok);
-            ok
-        })
-        .collect();
-    if refused > 0 {
-        tracing::warn!(
-            peer = %peer.fmt_short(),
-            refused,
-            of = wants.len(),
-            "refusing trie positions outside the peer's scope"
-        );
-    }
-    // For a scoped peer the position is the *only* authorization, so what is
-    // served is what the descent found and never what the request claimed.
-    //
-    // The distinction is the whole of the boundary. A delegate necessarily
-    // holds the hash of every subtree withheld from it — the hash is inside the
-    // branch node that makes the signed root recompute — so falling back to the
-    // claimed hash where a position resolves to nothing would hand over any of
-    // them for the price of naming an in-scope position that happens to be
-    // empty. A position that resolves to nothing holds nothing, and that is the
-    // answer.
-    let resolved = Trie::new(store).resolve_paths(root, &paths)?;
-    Ok(resolved
-        .into_iter()
-        .zip(admitted)
-        .map(|(at, ok)| ok.then_some(at).flatten())
-        .collect())
-}
 
 /// Bounds one positioned batch on both axes.
 ///
@@ -1120,6 +791,7 @@ mod tests {
     use super::*;
     use crate::testing::{bare_endpoint, test_store, trusting_pair, StalledPeer};
     use synch_core::{BlobAd, ALPN_MPT};
+    use synch_mpt::Trie;
 
     /// How long a test waits before calling a request hung rather than slow.
     const PATIENCE: std::time::Duration = std::time::Duration::from_secs(10);

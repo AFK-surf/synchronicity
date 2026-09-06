@@ -203,6 +203,27 @@ instance : Decode Cas.Project.Pin where
     let a3 ← Decode.decode
     return .mk a0 a1 a2 a3
 
+instance : Encode Trie.Serve.NodeAnswer where
+  encode out value := match value with
+    | .mk a0 a1 a2 => out |>.put a0 |>.put a1 |>.put a2
+
+instance : Decode Trie.Serve.NodeAnswer where
+  decode := do
+    let a0 ← Decode.decode
+    let a1 ← Decode.decode
+    let a2 ← Decode.decode
+    return .mk a0 a1 a2
+
+instance : Encode Trie.Serve.ValueAnswer where
+  encode out value := match value with
+    | .mk a0 a1 => out |>.put a0 |>.put a1
+
+instance : Decode Trie.Serve.ValueAnswer where
+  decode := do
+    let a0 ← Decode.decode
+    let a1 ← Decode.decode
+    return .mk a0 a1
+
 instance : Encode Commands.LifecycleDomainError where
   encode out value := match value with
     | .malformed => out.push 0
@@ -347,6 +368,24 @@ instance : Decode Commands.ProjectDomainError where
     | 2 => return .column (← Decode.decode) (← Decode.decode)
     | _ => throw ()
 
+instance : Encode Commands.TrieServeDomainError where
+  encode out value := match value with
+    | .unvouchedRoot => out.push 0
+    | .decode a0 => out.push 1 |>.put a0
+    | .malformed => out.push 2
+    | .columnType a0 a1 a2 => out.push 3 |>.put a0 |>.put a1 |>.put a2
+    | .column a0 a1 => out.push 4 |>.put a0 |>.put a1
+
+instance : Decode Commands.TrieServeDomainError where
+  decode := do
+    match ← readByte with
+    | 0 => return .unvouchedRoot
+    | 1 => return .decode (← Decode.decode)
+    | 2 => return .malformed
+    | 3 => return .columnType (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 4 => return .column (← Decode.decode) (← Decode.decode)
+    | _ => throw ()
+
 instance : Encode Commands.Ingested where
   encode out value := match value with
     | .mk a0 a1 => out |>.put a0 |>.put a1
@@ -422,6 +461,9 @@ instance : Encode Commands.Command where
     | .casBlobCandidates => out.push 30
     | .casPins a0 => out.push 31 |>.put a0
     | .casPinnedBlobs => out.push 32
+    | .trieServeNodes a0 a1 a2 a3 a4 a5 => out.push 33 |>.put a0 |>.put a1 |>.put a2 |>.put a3 |>.put a4 |>.put a5
+    | .trieServeValues a0 a1 a2 a3 a4 a5 => out.push 34 |>.put a0 |>.put a1 |>.put a2 |>.put a3 |>.put a4 |>.put a5
+    | .trieResolve a0 a1 => out.push 35 |>.put a0 |>.put a1
 
 instance : Decode Commands.Command where
   decode := do
@@ -459,6 +501,9 @@ instance : Decode Commands.Command where
     | 30 => return .casBlobCandidates
     | 31 => return .casPins (← Decode.decode)
     | 32 => return .casPinnedBlobs
+    | 33 => return .trieServeNodes (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 34 => return .trieServeValues (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 35 => return .trieResolve (← Decode.decode) (← Decode.decode)
     | _ => throw ()
 
 end VerifiedCore

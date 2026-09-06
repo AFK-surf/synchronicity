@@ -11,6 +11,7 @@ import VerifiedCore.Cas.Serve
 import VerifiedCore.Cas.Receive
 import VerifiedCore.Cas.Collect
 import VerifiedCore.Cas.Project
+import VerifiedCore.Trie.Serve
 
 /-! The shapes that cross the command boundary: what a caller asks for and
 what a finished command reports. `hostgen` derives the codecs of every type
@@ -108,6 +109,18 @@ inductive Command where
   | casPins (root : Option ByteArray)
   /-- Every pinned object, in root order. -/
   | casPinnedBlobs
+  /-- Serve the nodes a peer asked for by `(nibble path, claimed hash)` under
+  a root: positions a scoped peer may see, what stands there, what a node
+  reveals, one answer's budget. The scope and the confined origins are the
+  Authorization domain's inputs. -/
+  | trieServeNodes (root : ByteArray) (wants : List (ByteArray × ByteArray))
+      (prefixes : Option (List ByteArray)) (exact : List ByteArray) (peerOrigins confined : List String)
+  /-- Serve the out-of-line values a peer asked for, each authorized by the
+  position of the node that holds it when the view is scoped. -/
+  | trieServeValues (root : ByteArray) (wants : List (ByteArray × ByteArray))
+      (prefixes : Option (List ByteArray)) (exact : List ByteArray) (peerOrigins confined : List String)
+  /-- What stands at each nibble position under a root. -/
+  | trieResolve (root : ByteArray) (paths : List ByteArray)
 
 /-- Malformed metadata or a column of the wrong storage class, as pin
 acquisition and deletion report it. -/
@@ -159,6 +172,16 @@ inductive ReceiveDomainError where
   | columnType (index : Nat) (column : String) (actual : Cas.Codec.CellType)
   | column (column : String) (reason : String)
   | sizeMismatch (root : ByteArray) (recorded offered : UInt64)
+  deriving BEq, DecidableEq
+
+/-- How serving a trie refuses: a root a scoped peer may not read positions
+of, a stored node that does not decode, or a malformed head row. -/
+inductive TrieServeDomainError where
+  | unvouchedRoot
+  | decode (message : String)
+  | malformed
+  | columnType (index : Nat) (column : String) (actual : Cas.Codec.CellType)
+  | column (column : String) (reason : String)
   deriving BEq, DecidableEq
 
 /-- How a projection refuses: a malformed row, a column of the wrong class,

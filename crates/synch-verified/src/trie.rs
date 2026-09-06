@@ -4,8 +4,104 @@ use crate::{
     operation::{self, terminal, Command},
 };
 
-pub use crate::generated::{LookupDomainError, MutationDomainError, NodeRefusal, NodeVerdict};
+pub use crate::generated::{
+    LookupDomainError, MutationDomainError, NodeAnswer, NodeRefusal, NodeVerdict,
+    TrieServeDomainError, ValueAnswer,
+};
 pub use crate::operation::OperationError;
+use crate::{host::Storage, operation::Decode};
+
+/// Completed serving failure, preserving original host errors.
+#[derive(Debug)]
+pub enum ServeError<E> {
+    Operation(OperationError<E>),
+    Domain(TrieServeDomainError),
+}
+
+/// Which part of a trie a peer may see: allowed nibble prefixes, or every
+/// prefix when `None`, and exact keys. An Authorization-domain input.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ServeScope {
+    pub prefixes: Option<Vec<Vec<u8>>>,
+    pub exact: Vec<Vec<u8>>,
+}
+
+fn served<T: Decode, S: Storage>(
+    storage: &mut S,
+    command: &Command,
+) -> Result<T, ServeError<S::Error>> {
+    let result = operation::run(storage, operation::Capabilities::default(), &[], command)
+        .map_err(ServeError::Operation)?;
+    let outcome: Result<T, TrieServeDomainError> =
+        terminal(&result).map_err(|()| ServeError::Operation(OperationError::Protocol))?;
+    outcome.map_err(ServeError::Domain)
+}
+
+fn wanted(wants: &[(Vec<u8>, [u8; 32])]) -> Vec<(Vec<u8>, Vec<u8>)> {
+    wants
+        .iter()
+        .map(|(path, claimed)| (path.clone(), claimed.to_vec()))
+        .collect()
+}
+
+/// Serve the nodes a peer asked for by `(nibble path, claimed hash)` under a
+/// root. Lean decides which positions the scope admits, what stands there,
+/// whether a node's contents run out of scope, whether this store vouches
+/// for it under the root's origins, and how much one answer carries; the
+/// scope, the peer's own origins and the confined origins are the caller's
+/// Authorization-domain inputs.
+pub fn serve_nodes<S: Storage>(
+    storage: &mut S,
+    root: &[u8; 32],
+    wants: &[(Vec<u8>, [u8; 32])],
+    scope: ServeScope,
+    peer_origins: Vec<String>,
+    confined: Vec<String>,
+) -> Result<NodeAnswer, ServeError<S::Error>> {
+    let command = Command::TrieServeNodes {
+        root: root.to_vec(),
+        wants: wanted(wants),
+        prefixes: scope.prefixes,
+        exact: scope.exact,
+        peer_origins,
+        confined,
+    };
+    served(storage, &command)
+}
+
+/// Serve the out-of-line values a peer asked for, each authorized by the
+/// position of the node that holds it when the peer's view is scoped.
+pub fn serve_values<S: Storage>(
+    storage: &mut S,
+    root: &[u8; 32],
+    wants: &[(Vec<u8>, [u8; 32])],
+    scope: ServeScope,
+    peer_origins: Vec<String>,
+    confined: Vec<String>,
+) -> Result<ValueAnswer, ServeError<S::Error>> {
+    let command = Command::TrieServeValues {
+        root: root.to_vec(),
+        wants: wanted(wants),
+        prefixes: scope.prefixes,
+        exact: scope.exact,
+        peer_origins,
+        confined,
+    };
+    served(storage, &command)
+}
+
+/// What stands at each nibble position under a root, in the caller's order.
+pub fn resolve_paths<S: Storage>(
+    storage: &mut S,
+    root: &[u8; 32],
+    paths: &[Vec<u8>],
+) -> Result<Vec<Option<Vec<u8>>>, ServeError<S::Error>> {
+    let command = Command::TrieResolve {
+        root: root.to_vec(),
+        paths: paths.to_vec(),
+    };
+    served(storage, &command)
+}
 
 /// Admit node bytes at the canonical ingress boundary: decoded, re-encoded
 /// identically, within the shared key bound and shaped as the trie

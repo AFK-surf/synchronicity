@@ -12,6 +12,7 @@ import VerifiedCore.Cas.Serve
 import VerifiedCore.Cas.Receive
 import VerifiedCore.Cas.Collect
 import VerifiedCore.Cas.Project
+import VerifiedCore.Trie.Serve
 import VerifiedCore.Replication.History
 
 /-! The one native entry point. A command arrives as a packet, decoded with
@@ -129,6 +130,17 @@ def receiving [Encode A] : Except Cas.Receive.Error A → Host.Reply ByteArray
       | .sizeMismatch root recorded offered => .sizeMismatch root recorded offered
       | .host _ | .protocol => .malformed) : Except _ A)
 
+def servingTrie [Encode A] : Except Trie.Serve.Error A → Host.Reply ByteArray
+  | .ok value => terminalOf (Except.ok value : Except TrieServeDomainError A)
+  | .error (.host hostFailure) => .error hostFailure
+  | .error error => terminalOf (Except.error (match error with
+      | .unvouchedRoot => TrieServeDomainError.unvouchedRoot
+      | .decode message => .decode message
+      | .malformed => .malformed
+      | .columnType index column actual => .columnType index column actual
+      | .column column reason => .column column reason
+      | .host _ => .malformed) : Except _ A)
+
 def projecting [Encode A] : Except Cas.Project.Error A → Host.Reply ByteArray
   | .ok value => terminalOf (Except.ok value : Except ProjectDomainError A)
   | .error (.host hostFailure) => .error hostFailure
@@ -222,6 +234,15 @@ def dispatch : Command → Native
   | .casPins root =>
     if root.any (·.size != 32) then protocol else command (Cas.Project.pins root) projecting
   | .casPinnedBlobs => command Cas.Project.pinnedBlobs projecting
+  | .trieServeNodes root wants prefixes exact peerOrigins confined =>
+    if root.size != 32 then protocol
+    else command (Trie.Serve.serveNodes root wants ⟨prefixes, exact⟩ peerOrigins confined) servingTrie
+  | .trieServeValues root wants prefixes exact peerOrigins confined =>
+    if root.size != 32 then protocol
+    else command (Trie.Serve.serveValues root wants ⟨prefixes, exact⟩ peerOrigins confined) servingTrie
+  | .trieResolve root paths =>
+    if root.size != 32 then protocol
+    else command (Trie.Serve.resolvePaths root (paths.map (·.toList))) servingTrie
 
 /-- Every command starts here: an undecodable packet is a protocol failure
 before any effect is requested. -/

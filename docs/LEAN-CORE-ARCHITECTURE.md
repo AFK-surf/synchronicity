@@ -446,6 +446,24 @@ Integration review has identified specific gates, not waived limitations:
   the ordered listings with a failure injected at every effect. The Rust
   SQL projections and the pins reader are deleted; the in-transaction row
   read and advertisement rule of the publish path stay with Publication.
+- Serving a trie to a peer is now the whole commands `trieServeNodes`,
+  `trieServeValues` and `trieResolve` (`Trie/Serve.lean`) over raw node
+  reads and two snapshots (`head_history` for the root's origins,
+  `trie_node_origins` for provenance). Lean owns the scope predicates a
+  served view is cut along, the merged trail-sharing descent that resolves
+  claimed positions, vouching under confined origins, admission (an
+  unscoped peer by hash, a scoped peer refused on an unvouched root, an
+  out-of-scope position missing under the claimed hash, a node judged by
+  what it reveals at every position), value authorization by the holder's
+  coverage, and the answer budget. The peer's scope and origins and the
+  confined origins are Authorization inputs computed in Rust.
+  `TrieServeProofs` proves the spine and boundary properties of scope, that
+  nothing inside a grant is redacted, that a descent and the merged descent
+  answer only hashes the stored graph places at the position asked about,
+  the early admission decisions, the budget invariant, and fixtures with a
+  failure injected at every effect. The Rust serving arms, vouching, answer
+  assembly and `Scope::admits_node` are deleted; the requesting walk's own
+  scope predicates stay in Rust until the walk migrates.
 - Native tests now cover acquisition transport, every effect-failure position,
   repeated polling, malformed replies and terminal resume. Generic SQLite tests
   cover UPSERT identity/time preservation, raw cells, failed commit, abandoned

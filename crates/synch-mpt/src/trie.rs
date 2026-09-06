@@ -376,8 +376,8 @@ impl MissingWalk {
                 // position: an honest one (`Ext`/`Leaf` running out of scope)
                 // is about where the node sits, and the same node at another
                 // spine position may lead back into the grant. The distinction
-                // lives where the node is: `Scope::admits_node`, which no
-                // longer refuses a branch it can serve.
+                // lives where the node is: Lean's `Trie.Serve.Scope.admitsNode`,
+                // which does not refuse a branch it can serve.
                 //
                 // And only for an *absent* node. A node this store holds —
                 // served at another position it shares by structure, whatever
@@ -1028,6 +1028,11 @@ impl<'a, S: NodeStore + ?Sized> Trie<'a, S> {
     /// close to trie depth plus batch size, not their product.
     // `ScopedSync.At`; `At.unique` is why a position names one hash, given
     // the ingress boundary's non-empty extension prefix.
+    //
+    // Production resolution is Lean's `Trie.Serve.resolvePaths`
+    // (`Store::resolve_trie_paths`); this is the walk tests' oracle over an
+    // in-memory store.
+    #[cfg(test)]
     pub fn resolve_paths(
         &self,
         root: Hash,

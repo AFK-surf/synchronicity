@@ -422,6 +422,19 @@ impl Encode for Vec<(u64, u64)> {
         }
     }
 }
+macro_rules! encode_list {
+    ($($item:ty),+ $(,)?) => {
+        $(impl Encode for Vec<$item> {
+            fn encode(&self, out: &mut Vec<u8>) {
+                word(out, self.len() as u64);
+                for item in self {
+                    item.encode(out);
+                }
+            }
+        })+
+    };
+}
+encode_list!(Vec<u8>, String, (Vec<u8>, Vec<u8>));
 
 /// How a terminal value is read back once a run has finished.
 pub(crate) trait Decode: Sized {

@@ -13,11 +13,13 @@ fn boundary() -> (Scope, Hash, Vec<u8>) {
     };
     let mut children = [None; 16];
     children[6] = Some(TrieNode::hash_of_encoded(&leaf.encode()).unwrap());
+    // A branch at the root with an inline value: the serving side
+    // (`Trie.Serve.Scope.admitsNode`) refuses it whole to a scoped peer, so it
+    // is the boundary a scoped walk meets.
     let node = TrieNode::Branch {
         children,
         value: Some(ValueRef::Inline(vec![2])),
     };
-    assert!(!scope.admits_node(&[], &node));
     let bytes = node.encode();
     (scope, TrieNode::hash_of_encoded(&bytes).unwrap(), bytes)
 }

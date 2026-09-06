@@ -45,7 +45,7 @@ of those as a metadata invariant.
 | `diff`, `diff_each_scoped`, `for_each_resolved_change_scoped` | `synch-store/src/views.rs:1185` (materialization) | `Trie/Diff.lean` |
 | `MissingWalk` (`next_batch`, `resume`, `is_exhausted`, faults, dedup, deferral) | `reconcile.rs:889-962` | `Trie/Walk.lean` |
 | `is_complete_scoped_for` and the memo protocol | `reconcile.rs`, `aae.rs`, `membership.rs` | `Trie/Complete.lean` |
-| `resolve_paths`, `Scope::admits_node` (serve-side admission) | `synch-net/src/mpt.rs:299-377` | `Trie/Serve.lean` |
+| `resolve_paths`, `Scope::admits_node` (serve-side admission) | `synch-net/src/mpt.rs:299-377` | `Trie/Serve.lean` (done; `Scope::admits_path`, `contains_subtree` and `admits_value` stay Rust on the requesting walk until T3/T6) |
 | `first_key_outside` | `reconcile.rs:735` | `Trie/Scope.lean` |
 | `reachable`, `reach_into` and `Store::gc_trie` mark-and-sweep | `synch-store/src/gc.rs:53-110` | `Trie/Collect.lean` |
 | `Scope` (`admits_path`, `contains_subtree`, `admits_key_path`, `memo_key_for`) | everywhere above | `Trie/Scope.lean` |
@@ -205,13 +205,41 @@ destructive mutation) is stated, and the existing `db.rs:275-330` tests
 remain its evidence. Cutover: the four `reconcile.rs` sites, `aae.rs`,
 `membership.rs`.
 
-**T5. Serve-side admission** (`Trie/Serve.lean`). `resolvePaths` and the
-admission decision (`admits_node`, redaction) as one command. The set of
-origins the requesting peer is vouched for is an Authorization-domain result
-and enters as a command argument; provenance itself is read from the raw
-`trie_node_origins` rows. Proof: a served node stands at the claimed position
-in the served root; a redacted reply is issued only for a node the scope
-does not cover. Cutover: `synch-net/src/mpt.rs:299-377`.
+**T5. Serve-side admission** (`Trie/Serve.lean`). Done. The `GetNodes` and
+`GetValues` answers run as the whole commands `trieServeNodes` and
+`trieServeValues`, and position resolution as `trieResolve`, over raw node
+reads and two snapshots. Lean owns the scope predicates a served view is
+cut along (`Scope.admitsPath`, `containsSubtree`, `admitsKeyPath`,
+`admitsNode`, `admitsValue`), the merged descent that resolves a batch of
+claimed positions by one trail-sharing walk, the vouching rule (the root's
+origins from `head_history`, ownership from `trie_node_origins`, a confined
+origin vouching only for what this store was served as its), admission (an
+unscoped peer answered by hash, a scoped peer refused whole on a root no
+origin other than its own signed, an out-of-scope position answered as
+missing under the claimed hash, a node judged by what it reveals at every
+position it is named at), value authorization by the holder's coverage, and
+one answer's byte budget with its one-payload-always rule. The scope, the
+peer's origins and the confined origins are Authorization-domain inputs
+computed in Rust (`lean_trie_serve.rs`). Proved (`TrieServeProofs`): the
+spine property (`admitsPath_of_append`), the boundary property
+(`containsSubtree_append`), no redaction inside a grant
+(`no_redaction_inside_grant`), a value goes out only from a node that could
+travel whole (`admitsNode_of_admitsValue`); whatever a descent answers, the
+stored graph places it at the position descended to (`descend_sound`); the
+trail holds only positions the graph places their hashes at
+(`descend_trail`), so a merged descent never answers for a position it did
+not reach (`resolveSorted_sound`, `resolvePaths_sound`: a position cannot
+be claimed into existence); an unscoped peer and an unvouched root are
+decided before any node is read (`admit_full`, `admit_unvouched`); the
+budget invariant of `Answer.push`; and on a five-node trie the served,
+missing and redacted lists for a scoped, an unscoped and a confined view,
+value serving by coverage, and a failure injected at every effect. Cutover:
+the two `mpt.rs` arms delegate to `Store::serve_trie_nodes` and
+`serve_trie_values`; the Rust `admit`, `Vouch`, `Answer`, `Distinct` and
+`Scope::admits_node` are deleted, and `Trie::resolve_paths` is kept only as
+the walk tests' in-memory oracle. `Scope::admits_path`, `contains_subtree`
+and `admits_value` remain in Rust for the *requesting* walk (`MissingWalk`)
+and move with T3/T6.
 
 **T6. Scan, iteration and diff** (`Trie/Scan.lean`, `Trie/Diff.lean`).
 `scan prefix startAfter limit` with the positional redaction check; `diff`

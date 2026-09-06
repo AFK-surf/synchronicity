@@ -79,7 +79,15 @@ macro_rules! decode_list {
         })+
     };
 }
-decode_list!(ProjectedBlob, ProjectedSummary, ProjectedPin, Vec<u8>);
+decode_list!(
+    ProjectedBlob,
+    ProjectedSummary,
+    ProjectedPin,
+    Vec<u8>,
+    (Vec<u8>, Vec<u8>),
+    Option<Vec<u8>>,
+    String
+);
 
 fn project<T: Decode, S: Storage>(
     storage: &mut S,

@@ -51,6 +51,7 @@ fn main() {
         "Trie/Program",
         "Trie/Verify",
         "Trie/Mutate",
+        "Trie/Serve",
         "Replication/History",
         "Commands",
         "Commands/Generated",

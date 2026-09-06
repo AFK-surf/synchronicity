@@ -379,6 +379,7 @@ fn columns_for(relation: &str) -> Result<&'static [&'static str]> {
             "recorded_at",
         ]),
         "trie_nodes" | "trie_values" => Ok(&["hash", "data"]),
+        "trie_node_origins" => Ok(&["origin_id", "hash"]),
         "config" => Ok(&["key", "value"]),
         _ => Err(StoreError::invalid("unsupported storage relation")),
     }

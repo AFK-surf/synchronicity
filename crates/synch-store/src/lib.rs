@@ -31,6 +31,7 @@ mod lean_resources;
 mod lean_serve;
 mod lean_storage;
 mod lean_sweep;
+mod lean_trie_serve;
 pub mod proof;
 pub mod recovery;
 pub mod replica;

@@ -62,6 +62,17 @@ impl Scope {
         self.prefixes.is_none()
     }
 
+    /// The allowed nibble prefixes, or `None` for the whole keyspace: what a
+    /// scope is, for the serving side to hand to Lean (`Trie.Serve.Scope`).
+    pub fn prefixes(&self) -> Option<&[Vec<u8>]> {
+        self.prefixes.as_deref()
+    }
+
+    /// The allowed exact keys, as nibble paths.
+    pub fn exact(&self) -> &[Vec<u8>] {
+        &self.exact
+    }
+
     /// True if a node sitting at nibble `path` may be served.
     ///
     /// A node at `path` commits to every key beginning with `path`, so it is
@@ -104,51 +115,13 @@ impl Scope {
         self.contains_subtree(key) || self.exact.iter().any(|k| k == key)
     }
 
-    /// True if a node at `path` may be served whole, given what it reveals.
-    ///
-    /// Position alone is not enough. A `Branch` reveals only child hashes, so
-    /// its position is the whole story — but the trie compresses, and a
-    /// compressed node carries key material: an `Ext` spells the nibbles
-    /// between its position and its child, a `Leaf` the rest of a key and its
-    /// value. Both sit on the spine the scope legitimately admits while
-    /// describing a key range running out of it entirely, so serving one hands
-    /// over the name of a space never granted — and in a leaf's case its
-    /// record too.
-    ///
-    /// What is tested here is the node's *coverage*, not its position.
-    // `ScopedSync.AdmitsNode`; `no_redaction_inside_grant` is why a position
-    // inside a granted prefix is never refused.
-    pub fn admits_node(&self, path: &[u8], node: &crate::node::TrieNode) -> bool {
-        if self.is_full() {
-            return true;
-        }
-        match node {
-            // A branch's child hashes are the spine itself, and one may lead
-            // into the grant — refusing the node whole over its value costs
-            // the peer every subtree below it. Only an `Inline` value forces
-            // that: its bytes are in the node, so it cannot travel. A `Hash`
-            // value contributes only a hash, like every redacted child; the
-            // payload is refused separately when the peer asks.
-            crate::node::TrieNode::Branch { value, .. } => match value {
-                None => true,
-                Some(crate::node::ValueRef::Hash(_)) => true,
-                Some(crate::node::ValueRef::Inline(_)) => self.admits_key_path(path),
-            },
-            crate::node::TrieNode::Ext { prefix, .. } => {
-                let mut covered = path.to_vec();
-                covered.extend_from_slice(prefix.as_slice());
-                self.admits_path(&covered)
-            }
-            crate::node::TrieNode::Leaf { key_rest, .. } => {
-                let mut key = path.to_vec();
-                key.extend_from_slice(key_rest.as_slice());
-                self.admits_key_path(&key)
-            }
-        }
-    }
-
     /// Whether the value carried by a node belongs to a granted key. A branch
     /// may travel on the spine without granting the value at the branch itself.
+    ///
+    /// The requesting walk's half of the value rule: which payloads it asks
+    /// for. The serving half — whether a node at a position may travel whole
+    /// given what it reveals, and whether a value it carries goes out — is
+    /// Lean's `Trie.Serve.Scope.admitsNode` and `admitsValue`.
     pub fn admits_value(&self, path: &[u8], node: &crate::node::TrieNode) -> bool {
         match node {
             crate::node::TrieNode::Leaf { key_rest, .. } => {
@@ -235,36 +208,6 @@ mod tests {
     }
 
     #[test]
-    fn a_branch_keeps_its_children_when_its_value_is_out_of_line() {
-        // `photos` is a key in its own right and `photos-raw` is the grant, so
-        // the branch at `f:photos` carries a value the peer may not have while
-        // sitting on the spine into a subtree it may. Refusing it whole cost
-        // all sixteen children; only an inline value forces that now.
-        let scope = Scope::of(&synch_core::ScopeKeys {
-            prefixes: vec![b"f:photos-raw/".to_vec()],
-            exact: Vec::new(),
-        });
-        let at = path(b"f:photos");
-        let children: [Option<Hash>; 16] = std::array::from_fn(|_| None);
-        let out_of_line = crate::node::TrieNode::Branch {
-            children,
-            value: Some(crate::node::ValueRef::Hash(Hash::new(b"record"))),
-        };
-        assert!(
-            scope.admits_node(&at, &out_of_line),
-            "a hash reveals no more than the child hashes already in the node"
-        );
-        let inline = crate::node::TrieNode::Branch {
-            children,
-            value: Some(crate::node::ValueRef::Inline(b"record".to_vec())),
-        };
-        assert!(
-            !scope.admits_node(&at, &inline),
-            "inline bytes are the record itself, so the node cannot travel"
-        );
-    }
-
-    #[test]
     fn scope_extremes_admit_or_grant_nothing() {
         let scope = Scope::full();
         assert!(scope.is_full());
@@ -332,32 +275,14 @@ mod tests {
         assert!(!scope.admits_key(b"f:photos-raw/a.jpg"));
     }
 
-    /// A compressed node is judged by what it reveals, not by where it sits.
+    /// The serving side reads a scope back as exactly what it was built from.
     #[test]
-    fn a_node_is_judged_by_its_coverage() {
-        use crate::node::TrieNode;
+    fn a_scope_hands_its_parts_to_the_serving_side() {
+        assert_eq!(Scope::full().prefixes(), None);
+        assert!(Scope::full().exact().is_empty());
         let scope = Scope::of(&synch_core::scope_prefixes(&["photos".to_string()]));
-        let spine = path(b"f:");
-        // An extension leading into the grant may travel; one leading away
-        // spells the other space's name in its own prefix and may not.
-        let toward = TrieNode::Ext {
-            prefix: Nibbles::from_bytes(b"photos/"),
-            child: Hash::new(b"c"),
-        };
-        let away = TrieNode::Ext {
-            prefix: Nibbles::from_bytes(b"finance/"),
-            child: Hash::new(b"c"),
-        };
-        assert!(scope.admits_node(&spine, &toward));
-        assert!(!scope.admits_node(&spine, &away));
-        // A leaf completes a whole key, and carries that key's value with it.
-        let leaf = |rest: &[u8]| TrieNode::Leaf {
-            key_rest: Nibbles::from_bytes(rest),
-            value: crate::node::ValueRef::Inline(vec![1]),
-        };
-        assert!(scope.admits_node(&spine, &leaf(b"photos/a.jpg")));
-        assert!(!scope.admits_node(&spine, &leaf(b"finance/q3.pdf")));
-        // A full scope judges nothing.
-        assert!(Scope::full().admits_node(&spine, &away));
+        let prefixes = scope.prefixes().expect("a delegated scope is bounded");
+        assert!(prefixes.contains(&path(b"f:photos/")));
+        assert!(scope.exact().contains(&path(b"m:space/photos")));
     }
 }

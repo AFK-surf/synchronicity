@@ -80,11 +80,12 @@ def messages : List Name := [
   ``VerifiedCore.Trie.Refusal, ``VerifiedCore.Trie.Verdict, ``VerifiedCore.Trie.MutationError,
   ``VerifiedCore.Cas.Receive.ProvenSubtree, ``VerifiedCore.Cas.Project.Blob,
   ``VerifiedCore.Cas.Project.Summary, ``VerifiedCore.Cas.Project.Pin,
+  ``VerifiedCore.Trie.Serve.NodeAnswer, ``VerifiedCore.Trie.Serve.ValueAnswer,
   ``VerifiedCore.Commands.LifecycleDomainError, ``VerifiedCore.Commands.IngestDomainError,
   ``VerifiedCore.Commands.ReadDomainError, ``VerifiedCore.Commands.HistoryDomainError,
   ``VerifiedCore.Commands.DurableDomainError, ``VerifiedCore.Commands.ServeDomainError,
   ``VerifiedCore.Commands.ReceiveDomainError, ``VerifiedCore.Commands.CollectDomainError,
-  ``VerifiedCore.Commands.ProjectDomainError,
+  ``VerifiedCore.Commands.ProjectDomainError, ``VerifiedCore.Commands.TrieServeDomainError,
   ``VerifiedCore.Commands.Ingested, ``VerifiedCore.Commands.Committed, ``VerifiedCore.Commands.Served,
   ``VerifiedCore.Commands.Evicted, ``VerifiedCore.Commands.Command]
 

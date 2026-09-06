@@ -44,8 +44,9 @@ async fn a_spine_branch_exposes_its_children_but_not_its_own_payload() {
     );
     let root = issuer.root();
     let path = Nibbles::from_bytes(&private_key).as_slice().to_vec();
-    let carrier = Trie::new(issuer.store.as_ref())
-        .resolve_paths(root, std::slice::from_ref(&path))
+    let carrier = issuer
+        .store
+        .resolve_trie_paths(&root, std::slice::from_ref(&path))
         .unwrap()[0]
         .unwrap();
     assert!(matches!(
@@ -560,7 +561,7 @@ async fn revocation_is_deletion_and_cuts_the_delegate_off() {
 
 /// `GetValues` refuses on coverage, not only on position: the two handlers
 /// must draw the same boundary. `GetNodes` applies the position check *and*
-/// `Scope::admits_node`, because a node at an admitted position can still
+/// `Trie.Serve.Scope.admitsNode`, because a node at an admitted position can still
 /// describe a key that runs out of scope — a leaf spells the rest of its key,
 /// and that key's value is the record.
 #[tokio::test]

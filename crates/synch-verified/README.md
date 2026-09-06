@@ -52,7 +52,13 @@ the Rust eviction, pre-filter and per-file sweep loops are deleted. The
 projections (`Cas/Project.lean`: one row, every row, the summary, the
 claims, the pinned roots) are five whole read transactions that validate
 rows as the read path does and merge a joined pin state in one pass; the
-Rust SQL projections are deleted. History retention now runs as a
+Rust SQL projections are deleted. Serving a trie to a peer
+(`Trie/Serve.lean`: the scope a served view is cut along, the merged
+descent that resolves claimed positions, vouching under confined origins,
+admission, value authorization by the holder's coverage, the answer budget)
+is three whole commands over raw node reads and two snapshots, with the
+peer's scope and origins as Authorization inputs; `synch-net`'s serving
+arms, vouching and answer assembly are deleted. History retention now runs as a
 complete Lean operation over raw scans and a separate Ed25519 primitive; the
 Rust retention loop and receipt/fork helpers are removed. Raw scans retain
 rows before a trailing host failure so Lean owns first-error selection.

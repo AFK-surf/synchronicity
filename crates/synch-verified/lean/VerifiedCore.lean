@@ -12,6 +12,7 @@ import VerifiedCore.Entry
 import VerifiedCore.Trie.Program
 import VerifiedCore.Trie.Verify
 import VerifiedCore.Trie.Mutate
+import VerifiedCore.Trie.Serve
 import VerifiedCore.Replication.History
 
 /-!
