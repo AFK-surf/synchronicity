@@ -1,4 +1,4 @@
-//! Storage failures must leave the Lean-selected read pending, not complete.
+//! Storage failures must leave the Rust walk's selected read pending, not complete.
 
 use std::{cell::Cell, io};
 

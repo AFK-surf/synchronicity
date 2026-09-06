@@ -130,7 +130,7 @@ pub fn groups_for_byte_range(start: u64, end: u64) -> GroupRange {
 
 /// The number of chunk groups an object of `size` bytes occupies.
 pub fn group_count(size: u64) -> u64 {
-    synch_verified::group_count(size)
+    size.div_ceil(CHUNK_GROUP_SIZE).max(1)
 }
 
 #[cfg(test)]
@@ -147,6 +147,18 @@ mod tests {
         assert!(groups_for_byte_range(5, 5).is_empty());
         assert_eq!(group_count(0), 1);
         assert_eq!(group_count(CHUNK_GROUP_SIZE + 1), 2);
+    }
+
+    #[test]
+    fn group_math_preserves_unsigned_boundaries() {
+        for size in [1, CHUNK_GROUP_SIZE, i64::MAX as u64, 1u64 << 63, u64::MAX] {
+            let expected = u128::from(size).div_ceil(u128::from(CHUNK_GROUP_SIZE));
+            assert_eq!(u128::from(group_count(size)), expected);
+        }
+        assert_eq!(
+            groups_for_byte_range(u64::MAX - 1, u64::MAX),
+            GroupRange::new((u64::MAX - 1) / CHUNK_GROUP_SIZE, group_count(u64::MAX))
+        );
     }
 
     #[test]

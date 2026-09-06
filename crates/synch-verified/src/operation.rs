@@ -50,7 +50,7 @@ unsafe extern "C" {
     fn synch_adapter_operation_resume(state: *mut c_void, reply: Slice) -> *mut c_void;
     fn synch_adapter_bytes_len(bytes: *mut c_void) -> usize;
     fn synch_adapter_bytes_data(bytes: *mut c_void) -> *const u8;
-    fn synch_adapter_scope_drop(value: *mut c_void);
+    fn synch_adapter_object_drop(value: *mut c_void);
 }
 
 // Never exported or made Send/Sync. The interpreter and all host resources
@@ -108,7 +108,7 @@ impl Drop for Handle {
     fn drop(&mut self) {
         if let Some(value) = self.0.take() {
             // SAFETY: exactly one reference owned, runtime alive on this stack.
-            unsafe { synch_adapter_scope_drop(value.as_ptr()) }
+            unsafe { synch_adapter_object_drop(value.as_ptr()) }
         }
     }
 }

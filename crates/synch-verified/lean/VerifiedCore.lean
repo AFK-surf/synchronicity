@@ -11,10 +11,10 @@ import VerifiedCore.Trie.Program
 import VerifiedCore.Replication.History
 
 /-!
-Executable production decisions. This module imports Lean's standard library:
-proofs in specs/lean import this exact source, never a copied model.
-No unsafe replacement, external implementation, or noncomputable definition
-is used for a decision. Export wrappers are the only native entry points.
+Whole-operation production modules and historical mathematical models.
+Scope, walk and completeness definitions below are no longer native exports:
+their Rust implementations are independent and these proofs do not verify Rust.
+Production native entry points are the complete operations imported from Entry.
 -/
 namespace VerifiedCore
 
@@ -63,20 +63,16 @@ def admitsValue (s : Scope) (path : List Nat) : Shape → Bool
 def pathOf (bytes : ByteArray) : List Nat := bytes.data.toList.map UInt8.toNat
 
 /-- Construct an immutable scope; all allocation and path conversion is here. -/
-@[export synch_lean_scope_new]
 def scopeNew (full : Bool) (prefixes exact : Array ByteArray) : Scope :=
   ⟨full, prefixes.toList.map pathOf, exact.toList.map pathOf⟩
 
 /-- Exported subtree predicate. -/
-@[export synch_lean_scope_subtree]
 def scopeSubtree (s : Scope) (path : ByteArray) : Bool := containsSubtree s (pathOf path)
 
 /-- Exported key predicate. -/
-@[export synch_lean_scope_key]
 def scopeKey (s : Scope) (path : ByteArray) : Bool := admitsKey s (pathOf path)
 
 /-- Exported position predicate. -/
-@[export synch_lean_scope_path]
 def scopePath (s : Scope) (path : ByteArray) : Bool := admitsPath s (pathOf path)
 
 /-- Decode the adapter's shape tag. Invalid tags are refused by the exports. -/
@@ -86,7 +82,6 @@ def shapeOf (tag : UInt8) (inlineValue : Bool) (suffix : ByteArray) : Option Sha
   else if tag == 2 then some (.leaf (pathOf suffix)) else none
 
 /-- Exported node authorization; unknown discriminants fail closed. -/
-@[export synch_lean_scope_node]
 def scopeNode (s : Scope) (path : ByteArray) (tag : UInt8) (inlineValue : Bool)
     (suffix : ByteArray) : Bool :=
   match shapeOf tag inlineValue suffix with
@@ -94,7 +89,6 @@ def scopeNode (s : Scope) (path : ByteArray) (tag : UInt8) (inlineValue : Bool)
   | none => false
 
 /-- Exported payload authorization; an extension never carries a value. -/
-@[export synch_lean_scope_value]
 def scopeValue (s : Scope) (path : ByteArray) (tag : UInt8) (suffix : ByteArray) : Bool :=
   match shapeOf tag false suffix with
   | some shape => admitsValue s (pathOf path) shape
@@ -142,32 +136,25 @@ def knownComplete (s : CertificateCache) (key : List Nat) : Bool :=
   s.mutating == 0 && s.roots.contains key
 
 /-- Create an empty cache. -/
-@[export synch_lean_cache_new]
 def cacheNew (capacity : UInt64) : CertificateCache := ⟨[], 0, 0, capacity.toNat⟩
 
 /-- Read a snapshot epoch. -/
-@[export synch_lean_cache_epoch]
 def cacheEpoch (s : CertificateCache) : UInt64 := s.epoch
 
 /-- Export the exact certification guard. -/
-@[export synch_lean_cache_can_certify]
 def cacheCanCertify (s : CertificateCache) (epoch : UInt64) : Bool := canCertify s epoch
 
 /-- Export the certificate lookup using the same byte interpretation as scope. -/
-@[export synch_lean_cache_known]
 def cacheKnown (s : CertificateCache) (key : ByteArray) : Bool := knownComplete s (pathOf key)
 
 /-- Export the mutation-begin transition. -/
-@[export synch_lean_cache_begin]
 def cacheBegin (s : CertificateCache) (keep : Array ByteArray) : CertificateCache :=
   beginMutation s (keep.toList.map pathOf)
 
 /-- Export the mutation-finish transition. -/
-@[export synch_lean_cache_finish]
 def cacheFinish (s : CertificateCache) : CertificateCache := finishMutation s
 
 /-- Export the certification transition. -/
-@[export synch_lean_cache_certify]
 def cacheCertify (s : CertificateCache) (epoch : UInt64) (key : ByteArray) : CertificateCache :=
   certify s epoch (pathOf key)
 
@@ -281,28 +268,23 @@ def enqueueWalk (s : MissingWalk) (reference : Option (List Nat))
     else s
 
 /-- Construct a walk; an empty root or unadmitted root has no frontier. -/
-@[export synch_lean_walk_new]
 def walkNew (scope : Scope) (reference root : ByteArray) (maxDepth : UInt64) : MissingWalk :=
   { scope, maxDepth := maxDepth.toNat
     frontier := if root.isEmpty || !admitsPath scope [] then [] else
       [⟨if reference.isEmpty then none else some (pathOf reference), pathOf root, []⟩] }
 
 /-- Exhaustion requires no frontier, deferred work, pending read or fault. -/
-@[export synch_lean_walk_exhausted]
 def walkExhausted (s : MissingWalk) : Bool :=
   s.frontier.isEmpty && s.deferred.isEmpty && s.fault.isNone && !s.awaiting
 
 /-- Exported polling transition. -/
-@[export synch_lean_walk_poll]
 def walkPoll (s : MissingWalk) : MissingWalk := pollWalk s
 
 /-- Poll result tag: drained, current position, or canonicality failure. -/
-@[export synch_lean_walk_status]
 def walkStatus (s : MissingWalk) : UInt8 :=
   if s.fault.isSome then 2 else if s.current.isSome then 1 else 0
 
 /-- Export a current-position field, without exposing Lean object layout. -/
-@[export synch_lean_walk_field]
 def walkField (s : MissingWalk) (field : UInt8) : ByteArray :=
   if field == 3 then bytesOf s.faultHash else
   if field == 4 then bytesOf s.requestHash else
@@ -312,18 +294,15 @@ def walkField (s : MissingWalk) (field : UInt8) : ByteArray :=
       if field == 1 then p.hash else p.path)
 
 /-- Diagnostic depth for a failed poll. -/
-@[export synch_lean_walk_depth]
 def walkDepth (s : MissingWalk) : UInt64 := UInt64.ofNat (s.fault.getD 0)
 
 /-- Exported defer transition. -/
 def walkDefer (s : MissingWalk) : MissingWalk := deferWalk s
 
 /-- Exported resume transition. -/
-@[export synch_lean_walk_resume]
 def walkResume (s : MissingWalk) : MissingWalk := resumeWalk s
 
 /-- Start a batch with independent payload deduplication. -/
-@[export synch_lean_walk_batch]
 def walkBatch (s : MissingWalk) : MissingWalk := { s with asked := {} }
 
 /-- Export child-path construction and authorization. -/
@@ -379,7 +358,6 @@ def expandWalk (s : MissingWalk) (reference node : WalkNode) : MissingWalk :=
     (fun s (reference, hash, step) => enqueueWalk s reference hash step) s
 
 /-- Marshal decoded fields; empty branch slots are absent hashes, not empty children. -/
-@[export synch_lean_walk_node]
 def walkNode (tag : UInt8) (children : Array ByteArray) (segment child : ByteArray) : WalkNode :=
   if tag == 0 then .branch (children.toList.map fun h =>
     if h.isEmpty then none else some (pathOf h))
@@ -461,19 +439,16 @@ def finishObservation (s next : MissingWalk) : MissingWalk :=
   else failWalk s 3 0 []
 
 /-- Export a positional refusal observation, acknowledging exactly one pending read. -/
-@[export synch_lean_walk_absent]
 def walkAbsent (s : MissingWalk) (redacted : Bool) : MissingWalk :=
   finishObservation s (observeAbsent s redacted)
 
 /-- Export a decoded-node observation, with absent payload represented by empty bytes. -/
-@[export synch_lean_walk_present]
 def walkPresent (s : MissingWalk) (reference node : WalkNode) (childShape : UInt8)
     (payload : ByteArray) (present : Bool) : MissingWalk :=
   finishObservation s (observePresent s reference node childShape
     (if payload.isEmpty then none else some (pathOf payload)) present)
 
 /-- Scalar diagnostics/output tag, with all decisions made by the transitions. -/
-@[export synch_lean_walk_result]
 def walkResult (s : MissingWalk) (field : UInt8) : UInt8 :=
   if field == 0 then s.faultKind else s.requestKind
 

@@ -15,11 +15,9 @@ def settleSize (row durable complete finalHeld : Bool) (recorded claimed : UInt6
   else if groupCount recorded == groupCount claimed then 1 else 2
 
 /-- Scalar ABI for the proved group count. -/
-@[export synch_lean_group_count]
 def groupCountExport (size : UInt64) : UInt64 := groupCount size
 
 /-- Scalar ABI for the proved settlement decision. -/
-@[export synch_lean_settle_size]
 def settleSizeExport (row durable complete finalHeld : Bool) (recorded claimed : UInt64) : UInt8 :=
   settleSize row durable complete finalHeld recorded claimed
 
@@ -77,18 +75,15 @@ def spansOf : List UInt64 → List GroupSpan
   | [_] => []
 
 /-- Native entry point for the pure CAS plan. -/
-@[export synch_lean_cas_plan]
 def casPlan (row durable complete : Bool) (recorded claimed : UInt64)
     (old incoming : Array UInt64) : CasPlan :=
   planCasCommit row durable complete recorded claimed (spansOf old.toList) (spansOf incoming.toList)
 
 /-- Scalar plan outcome: refused, partial, or complete. -/
-@[export synch_lean_cas_plan_status]
 def casPlanStatus (plan : CasPlan) : UInt8 :=
   if !plan.accepted then 0 else if plan.complete then 2 else 1
 
 /-- Export normalized endpoints without exposing the runtime's object layout. -/
-@[export synch_lean_cas_plan_spans]
 def casPlanSpans (plan : CasPlan) : Array UInt64 :=
   (plan.spans.flatMap fun r => [UInt64.ofNat r.start, UInt64.ofNat r.stop]).toArray
 

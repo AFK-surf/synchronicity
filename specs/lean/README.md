@@ -9,18 +9,21 @@ boundaries against the implementation.
 A mandatory production core now lives in
 [`crates/synch-verified`](../../crates/synch-verified/README.md). Its executable
 Lean source is compiled and statically linked from Rust; this proof package
-imports that same source and proves its decisions match the abstract models
-in `VerifiedCoreProofs`. This closes the handwritten implementation/model gap
-for those decisions, not for the
+imports that same source and proves properties of the migrated whole operations.
+This closes the handwritten implementation/model gap
+for those operations, not for the
 entire Rust engine or its FFI/storage effects. The native package imports no
 Mathlib. Builds require the pinned Lean toolchain on Linux GNU, macOS, or
-Windows GNU/LLVM; there is no alternative Rust implementation.
+Windows GNU/LLVM; migrated whole operations have no alternative Rust implementation.
+Scoped authorization, missing-walk orchestration and completeness certificates
+remain entirely Rust. Their Lean models and retained decision proofs are
+specifications, not production-native verification of those Rust operations.
 
 Local `Store::ingest_bytes`/`ingest_file` now execute the whole `Cas/Input` and
 `Cas/Ingest` Lean programs. Input, cleanup, metadata, chunk-tree and outboard
 trace proofs import their actual executable source; the deleted Rust complete
 ingestion implementation no longer has a manual pairing anchor. Cloud and
-partial/network ingestion remain separate unfinished migrations, and native
+partial/network ingestion remain Rust operations, and native
 cryptography, filesystem behavior and FFI ownership remain explicit trust
 boundaries.
 
@@ -34,7 +37,7 @@ both files regardless of unlink errors. `TrieProgramProofs` proves lookup soundn
 stable raw graph interpreted by the actual codec; codec roundtrip/canonicality
 remains separate. History proofs derive fork, ceiling and witness protection
 from actual receipts. Trie lookup is a native cutover over raw byte storage;
-history retention remains staged. The borrowed-input wrapper is also proved to
+history retention also executes its whole Lean program. The borrowed-input wrapper is also proved to
 reject oversized keys before requesting their bytes and to run the proved
 lookup only after receiving an exact-sized input.
 
@@ -100,6 +103,10 @@ verifier and filesystem implementation must satisfy them. The accounting
 model is intentionally coarser and is not, by itself, a physical-byte proof.
 
 ## Scoped synchronization and certificates
+
+This section describes model correspondence for the Rust implementation.
+The named anchors do not establish a refinement proof of Rust, and the retained
+Lean scope, walk and certificate decision functions are not its runtime.
 
 The responder authorizes by position under a known head. `ServeNode` protects
 node coverage; `ServeValue` separately uses `AdmitsValue`. A spine branch can

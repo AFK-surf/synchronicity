@@ -126,7 +126,6 @@ def Complete (c : Cell H) : Prop := ∀ g, g < groupCount c.size → g ∈ c.hel
 /-- `cas.rs::size_is_attested`.  Only the final group attests to a size: every
 other group's chaining value is the same whatever the object's length, so
 holding the first half says nothing about where the object ends. -/
-@[rust_impl "cas-size-attested"]
 def Attested (c : Cell H) : Prop := Complete c ∨ groupCount c.size - 1 ∈ c.held
 
 theorem complete_is_attested {c : Cell H} (h : Complete c) : Attested c := Or.inl h
@@ -139,7 +138,6 @@ def Settled (c : Cell H) : Prop := c.durable ∨ Attested c
 With no row the claim stands; a settled size must agree, and a writer offering
 a different one is offering bytes for some other object; an unsettled size is
 a peer's claim off an entry and yields to this writer's. -/
-@[rust_impl "cas-size-settlement"]
 def Settles (c : Cell H) (claimed : Nat) : Prop := c.row → claimed = c.size ∨ ¬Settled c
 
 /-- What a commit of `groups` under a size settled to `size` leaves held: the
@@ -635,7 +633,6 @@ variable {k : Kind H}
 no step leaves the row standing under a different size: a commit claiming
 another size is refused (`settle_size`, rule 1), and an adoption must agree
 with what the row records. -/
-@[rust_justifies "cas-size-refusal"]
 theorem settled_size_is_stable (h : (Trans k).rel c c') (row : c.row) (settled : Settled c)
     (row' : c'.row) : c'.size = c.size := by
   cases k <;> simp only [transition] at h <;> obtain ⟨hg, rfl⟩ := h <;> grind [Settles]

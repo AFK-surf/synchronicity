@@ -4,6 +4,21 @@ Status: implementation architecture, 2026-09-06. This supersedes the incremental
 predicate/snapshot-planner approach in PR #127. It is a target and migration
 contract, not a claim that the repository already implements it everywhere.
 
+Current production rule: whole Lean operation or pure Rust, never Rust
+orchestration calling fine-grained Lean domain decisions. The user has frozen
+new migrations; previously mixed paths are restored to Rust. The broader design
+and historical checkpoints below do not authorize additional migrations.
+
+| Current owner | Operations |
+| --- | --- |
+| Lean with raw Rust host effects | Complete local ingestion, local read/repair, CAS acquire/delete/unpin/expiry, trie lookup, history retention |
+| Rust without Lean decision calls | Partial/cloud CAS orchestration and bitmap settlement, scope authorization, missing-node walk, completeness cache coordination, other unmigrated operations |
+
+Scalar/planner/scope/walk/cache FFI exports have been removed. Historical Lean
+models remain mathematical models; their proofs do not verify the restored Rust
+implementations. Only the retained whole-operation sources carry native
+same-source proof claims, subject to each theorem's explicit assumptions.
+
 ## Objective and boundary
 
 Lean implements the core system, not a second model consulted by a Rust core.
@@ -811,6 +826,33 @@ and cleanup checks passed. These are process-level observations, not universal
 allocation bounds or release-throughput measurements.
 
 ### Current scope: stabilize migrated modules
+
+#### Updated boundary: whole operations or Rust
+
+The subsequent user direction rejects partially migrated production paths:
+an operation must either be wholly implemented in Lean with raw host services,
+or remain wholly implemented in Rust. Rust orchestration calling fine-grained
+Lean domain decisions is not an accepted intermediate architecture. Together
+with the existing freeze on new domain migrations, this means restoring mixed
+paths to Rust, not extending their Lean migration.
+
+CAS scalar settlement/commit-plan calls, mptsync scope/walk and completeness
+coordination have been restored to Rust. Correctness fixes introduced during
+migration are retained: depth-aware deduplication, retryable interrupted reads,
+shared-payload waiters, terminal-epoch refusal and bounded certificate retention.
+Complete local ingestion/read/repair, CAS lifecycle commands, trie lookup and
+history retention remain in Lean. Fine-grained exports/adapters are deleted,
+not merely unused; proof claims and anchors distinguish executable Lean
+guarantees from models of restored Rust paths.
+
+Local validation: 431 tests passed across core/mpt/store/verified (seven ignored,
+including the separately run fanout stress tests); all-target Clippy with
+warnings denied, formatting, the full Lean build (1000 jobs), bidirectional
+anchor validation and the complete-lookup link smoke test passed. New-head
+cross-platform CI remains necessary before claiming platform validation.
+
+The stabilization/refactor checkpoint below describes the preceding cycle, not
+completion of this new all-or-nothing boundary change.
 
 The current user-approved scope is correctness and stabilization of modules
 already substantially migrated to Lean. Do not start or continue migrations of

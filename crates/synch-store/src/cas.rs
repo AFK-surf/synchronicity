@@ -453,34 +453,24 @@ pub(crate) fn settle_size(
     existing: Option<(u64, bool, bool, &ChunkRanges)>,
     claimed: u64,
 ) -> Result<Settlement> {
-    // LEAN-MODEL: cas-size-settlement (Cas.Settles)
-    // `Cas.Settles` is this decision as the guard on every groups commit: no
-    // row, or the recorded size, or a size neither durable nor attested.
-    let (row, recorded, complete, durable, final_held) = match existing {
-        None => (false, 0, false, false, false),
-        Some((recorded, complete, durable, held)) => (
-            true,
-            recorded,
-            complete,
-            durable,
-            held.contains(synch_verified::group_count(recorded) - 1),
-        ),
+    let Some((recorded, complete, durable, held)) = existing else {
+        return Ok(Settlement {
+            size: claimed,
+            reset_held: false,
+        });
     };
     // Only complete or final-group evidence attests the recorded size; every
     // earlier group can verify for multiple lengths in the same tree shape.
-    // LEAN-MODEL: cas-size-attested (Cas.Attested)
-    // LEAN-MODEL: cas-size-refusal (Cas.settled_size_is_stable)
-    // LEAN-MODEL: verified-size-settlement (VerifiedCoreProofs.settlement_refines_model)
-    match synch_verified::settle_size(row, durable, complete, final_held, recorded, claimed) {
-        synch_verified::Settlement::Refuse => Err(StoreError::Verification {
+    if recorded != claimed && (durable || complete || held.contains(group_count(recorded) - 1)) {
+        return Err(StoreError::Verification {
             root: *root,
             reason: format!("size mismatch: have {recorded}, offered {claimed}"),
-        }),
-        decision => Ok(Settlement {
-            size: claimed,
-            reset_held: decision == synch_verified::Settlement::Reset,
-        }),
+        });
     }
+    Ok(Settlement {
+        size: claimed,
+        reset_held: group_count(recorded) != group_count(claimed),
+    })
 }
 
 /// What a bitmap commit settled.
@@ -497,7 +487,7 @@ struct RowClaim {
     size: u64,
     complete: bool,
     durable: bool,
-    ranges: Vec<(u64, u64)>,
+    held: ChunkRanges,
 }
 
 /// Extends a file to at least `len`, and never shortens it.
@@ -628,8 +618,7 @@ fn upsert_blob_row(conn: &rusqlite::Connection, row: BlobRowWrite<'_>) -> Result
 
 /// What an object's row currently claims, read on a given connection.
 ///
-/// Decode raw claims only; the Lean planner interprets them against the row's
-/// own size before deciding whether the caller's size may replace it.
+/// Interpret the bitmap against the recorded size before settling a new claim.
 fn read_claim(conn: &rusqlite::Connection, root: &Hash) -> Result<Option<RowClaim>> {
     let row: Option<(i64, i64, i64, Option<Vec<u8>>)> = conn
         .query_row(
@@ -641,17 +630,19 @@ fn read_claim(conn: &rusqlite::Connection, root: &Hash) -> Result<Option<RowClai
     Ok(row.map(|(size, complete, durable, bitmap)| {
         let size = size as u64;
         let complete = complete != 0;
-        // Lean interprets complete rows, settles the size, and normalizes the
-        // retained and incoming ranges against the accepted size.
-        let ranges = bitmap
-            .as_deref()
-            .and_then(|bytes| postcard::from_bytes(bytes).ok())
-            .unwrap_or_default();
+        let held = if complete {
+            ChunkRanges::single(0, group_count(size))
+        } else {
+            bitmap
+                .as_deref()
+                .map(|bytes| blob_to_ranges(bytes, group_count(size)))
+                .unwrap_or_default()
+        };
         RowClaim {
             size,
             complete,
             durable: durable != 0,
-            ranges,
+            held,
         }
     }))
 }
@@ -782,39 +773,29 @@ impl Store {
     ) -> Result<Commit> {
         self.with_immediate_tx(|tx| {
             let claim = read_claim(tx, root)?;
-            let incoming: Vec<_> = groups.ranges.iter().map(|r| (r.start, r.end)).collect();
-            let (recorded, complete, durable, old) =
-                claim.as_ref().map_or((0, false, false, &[][..]), |c| {
-                    (c.size, c.complete, c.durable, c.ranges.as_slice())
-                });
-            // LEAN-MODEL: cas-native-plan-membership (VerifiedCoreProofs.cas_plan_membership)
-            // LEAN-MODEL: cas-native-plan-complete (VerifiedCoreProofs.cas_plan_complete_covers)
-            // Lean owns settlement, bitmap reset/union/clipping and completion.
-            // Rust executes the returned plan within this same SQL transaction.
-            let plan = synch_verified::plan_cas_commit(
-                claim.is_some(),
-                durable,
-                complete,
-                recorded,
+            let settlement = settle_size(
+                root,
+                claim
+                    .as_ref()
+                    .map(|c| (c.size, c.complete, c.durable, &c.held)),
                 size,
-                old,
-                &incoming,
-            )
-            .ok_or_else(|| StoreError::Verification {
-                root: *root,
-                reason: format!("size mismatch: have {recorded}, offered {size}"),
-            })?;
-            // LEAN-MODEL: cas-native-plan-canonical (VerifiedCoreProofs.cas_plan_separated)
-            // The proved output already satisfies the range container's ordering
-            // and non-overlap contract; do not duplicate normalization in Rust.
-            let verified = ChunkRanges {
-                ranges: plan
-                    .ranges
-                    .into_iter()
-                    .map(|(start, end)| GroupRange { start, end })
-                    .collect(),
+            )?;
+            let size = settlement.size;
+            let total = group_count(size);
+            // A changed tree shape invalidates only an unattested bitmap.
+            let held = match (settlement.reset_held, claim) {
+                (false, Some(claim)) => claim.held,
+                _ => ChunkRanges::empty(),
             };
-            let complete = plan.complete;
+            // Normalize even malformed incoming ranges before deciding coverage;
+            // runtime and memory depend on runs, never on the claimed byte size.
+            let verified = ChunkRanges::from_ranges(
+                held.ranges
+                    .iter()
+                    .chain(&groups.ranges)
+                    .map(|r| GroupRange::new(r.start, r.end.min(total))),
+            );
+            let complete = verified.covers(0, total);
             let durable = self.complete_is_durable();
             upsert_blob_row(
                 tx,
@@ -2800,6 +2781,174 @@ mod tests {
                 all,
                 "round {round}: one writer's groups were lost"
             );
+        }
+    }
+
+    #[test]
+    fn partial_commit_normalizes_ranges_at_unsigned_size_boundaries() {
+        let (_d, store) = store();
+        for size in [i64::MAX as u64, 1u64 << 63, u64::MAX] {
+            let root = Hash::new(&size.to_le_bytes());
+            let total = group_count(size);
+            let malformed = ChunkRanges {
+                ranges: vec![
+                    GroupRange::new(total, u64::MAX),
+                    GroupRange::new(2, 4),
+                    GroupRange::new(4, 2),
+                    GroupRange::new(0, 3),
+                ],
+            };
+            let partial = store
+                .commit_groups(&root, size, &malformed, None, 0)
+                .unwrap();
+            assert_eq!(partial.size, size);
+            assert!(!partial.complete);
+            assert_eq!(
+                store.blob(&root).unwrap().unwrap().verified_groups(),
+                ChunkRanges::single(0, 4)
+            );
+            let complete = store
+                .commit_groups(&root, size, &ChunkRanges::single(4, u64::MAX), None, 0)
+                .unwrap();
+            assert!(complete.complete);
+            // A complete row denotes all groups even though its bitmap is NULL.
+            assert!(
+                store
+                    .commit_groups(&root, size, &ChunkRanges::empty(), None, 0)
+                    .unwrap()
+                    .complete
+            );
+            assert!(matches!(
+                store.commit_groups(&root, size - 1, &ChunkRanges::empty(), None, 0),
+                Err(StoreError::Verification { .. })
+            ));
+            assert_eq!(store.blob(&root).unwrap().unwrap().size, size);
+        }
+    }
+
+    #[test]
+    fn partial_size_settlement_only_replaces_unattested_claims() {
+        let root = Hash::new(b"settlement cases");
+        let recorded = 4 * CHUNK_GROUP_SIZE;
+        let prefix = ChunkRanges::single(0, 1);
+        let final_group = ChunkRanges::single(3, 4);
+        for (complete, durable, held) in [
+            (true, false, &prefix),
+            (false, true, &prefix),
+            (false, false, &final_group),
+        ] {
+            assert!(
+                settle_size(&root, Some((recorded, complete, durable, held)), recorded).is_ok()
+            );
+            assert!(matches!(
+                settle_size(
+                    &root,
+                    Some((recorded, complete, durable, held)),
+                    recorded - 1
+                ),
+                Err(StoreError::Verification { .. })
+            ));
+        }
+        let same_shape =
+            settle_size(&root, Some((recorded, false, false, &prefix)), recorded - 1).unwrap();
+        assert!(!same_shape.reset_held);
+        let changed_shape =
+            settle_size(&root, Some((recorded, false, false, &prefix)), recorded + 1).unwrap();
+        assert!(changed_shape.reset_held);
+        assert_eq!(changed_shape.size, recorded + 1);
+    }
+
+    #[test]
+    fn partial_commit_resets_unattested_tree_shape_and_handles_empty_objects() {
+        let (_d, store) = store();
+        let empty = Hash::new(b"empty commit");
+        assert!(
+            store
+                .commit_groups(&empty, 0, &ChunkRanges::single(0, u64::MAX), None, 0)
+                .unwrap()
+                .complete
+        );
+        let root = Hash::new(b"changed shape");
+        store
+            .commit_groups(
+                &root,
+                4 * CHUNK_GROUP_SIZE,
+                &ChunkRanges::single(0, 2),
+                None,
+                0,
+            )
+            .unwrap();
+        let result = store
+            .commit_groups(
+                &root,
+                8 * CHUNK_GROUP_SIZE,
+                &ChunkRanges::single(7, u64::MAX),
+                None,
+                0,
+            )
+            .unwrap();
+        assert!(!result.complete);
+        assert_eq!(
+            store.blob(&root).unwrap().unwrap().verified_groups(),
+            ChunkRanges::single(7, 8)
+        );
+    }
+
+    proptest::proptest! {
+        #[test]
+        fn partial_settlement_matches_the_integer_contract(
+            recorded in proptest::prelude::any::<u64>(), claimed in proptest::prelude::any::<u64>(),
+            row in proptest::prelude::any::<bool>(), durable in proptest::prelude::any::<bool>(),
+            complete in proptest::prelude::any::<bool>(), final_held in proptest::prelude::any::<bool>(),
+        ) {
+            let count = |size: u64| u128::from(size).div_ceil(u128::from(CHUNK_GROUP_SIZE)).max(1) as u64;
+            proptest::prop_assert_eq!(group_count(recorded), count(recorded));
+            let held = if final_held { ChunkRanges::single(count(recorded) - 1, count(recorded)) } else { ChunkRanges::empty() };
+            let actual = settle_size(&Hash::new(b"property"), row.then_some((recorded, complete, durable, &held)), claimed);
+            if row && recorded != claimed && (durable || complete || final_held) {
+                proptest::prop_assert!(actual.is_err());
+            } else {
+                let actual = actual.unwrap();
+                proptest::prop_assert_eq!(actual.size, claimed);
+                proptest::prop_assert_eq!(actual.reset_held, row && count(recorded) != count(claimed));
+            }
+        }
+
+        #[test]
+        fn partial_commits_match_pointwise_group_membership(
+            row in proptest::prelude::any::<bool>(), durable in proptest::prelude::any::<bool>(), complete in proptest::prelude::any::<bool>(),
+            recorded in 0u64..(128 * CHUNK_GROUP_SIZE), claimed in 0u64..(128 * CHUNK_GROUP_SIZE),
+            old in proptest::collection::vec((0u64..150, 0u64..150), 0..32),
+            incoming in proptest::collection::vec((0u64..150, 0u64..150), 0..32),
+        ) {
+            let (_d, store) = store();
+            let root = Hash::new(b"bitmap property");
+            if row {
+                store.conn().execute(
+                    "INSERT INTO blobs (root, size, complete, durable, bitmap, last_access) VALUES (?1, ?2, ?3, ?4, ?5, 0)",
+                    params![root.as_bytes().to_vec(), recorded as i64, complete, durable, postcard::to_stdvec(&old).unwrap()],
+                ).unwrap();
+            }
+            let contains = |ranges: &[(u64, u64)], g| ranges.iter().any(|&(a, b)| a <= g && g < b);
+            let prior = |g| row && (if complete { g < group_count(recorded) } else { contains(&old, g) });
+            let refused = row && recorded != claimed && (durable || complete || prior(group_count(recorded) - 1));
+            let incoming_ranges = ChunkRanges { ranges: incoming.iter().map(|&(a, b)| GroupRange::new(a, b)).collect() };
+            let actual = store.commit_groups(&root, claimed, &incoming_ranges, None, 0);
+            if refused {
+                proptest::prop_assert!(actual.is_err());
+            } else {
+                let actual = actual.unwrap();
+                let total = group_count(claimed);
+                let reset = row && group_count(recorded) != total;
+                let expected = |g| g < total && (contains(&incoming, g) || (!reset && prior(g)));
+                let ranges = store.blob(&root).unwrap().unwrap().verified_groups();
+                for g in 0..151 {
+                    proptest::prop_assert_eq!(ranges.contains(g), expected(g));
+                }
+                proptest::prop_assert_eq!(actual.complete, (0..total).all(expected));
+                proptest::prop_assert!(ranges.ranges.iter().all(|r| r.start < r.end && r.end <= total));
+                proptest::prop_assert!(ranges.ranges.windows(2).all(|rs| rs[0].end < rs[1].start));
+            }
         }
     }
 

@@ -271,16 +271,45 @@ struct CasCoord {
 /// Completeness answers avoid a full trie walk on every Hello. They remain
 /// valid only until a non-monotone mutation, including adding a formerly
 /// refused node to a provenance view. Lost certificates cost a fresh walk.
-#[derive(Debug)]
+#[derive(Debug, Default)]
 struct Completeness {
-    state: synch_verified::CertificateCache,
+    roots: std::collections::HashSet<Hash>,
+    generation: u64,
+    mutating: usize,
 }
 
-impl Default for Completeness {
-    fn default() -> Self {
-        Self {
-            state: synch_verified::CertificateCache::new(COMPLETE_ROOTS_MAX as u64),
+impl Completeness {
+    fn begin(&mut self, keep: &std::collections::HashSet<Hash>) {
+        // Never wrap the depth and accidentally enable certification. Each
+        // live mutation owns a guard, so this bound cannot be reached in memory.
+        self.mutating = self
+            .mutating
+            .checked_add(1)
+            .expect("too many memo mutations");
+        self.roots.retain(|root| keep.contains(root));
+        self.generation = self.generation.saturating_add(1);
+    }
+
+    fn finish(&mut self) {
+        if self.mutating != 0 {
+            self.generation = self.generation.saturating_add(1);
+            self.mutating -= 1;
         }
+    }
+
+    fn contains(&self, root: &Hash) -> bool {
+        self.mutating == 0 && self.roots.contains(root)
+    }
+
+    fn certify(&mut self, root: &Hash, generation: u64) -> bool {
+        if self.mutating != 0 || self.generation != generation || generation == u64::MAX {
+            return false;
+        }
+        if self.roots.len() >= COMPLETE_ROOTS_MAX {
+            self.roots.clear();
+        }
+        self.roots.insert(*root);
+        true
     }
 }
 
@@ -292,13 +321,12 @@ struct MemoMutation(Arc<CasCoord>);
 
 impl Drop for MemoMutation {
     fn drop(&mut self) {
-        // LEAN-MODEL: verified-memo-finish (VerifiedCoreProofs.cache_finish)
         let mut memo = self
             .0
             .completeness
             .lock()
             .unwrap_or_else(PoisonError::into_inner);
-        memo.state.finish();
+        memo.finish();
     }
 }
 
@@ -821,12 +849,10 @@ impl Txn<'_> {
         &self,
         keep: &std::collections::HashSet<Hash>,
     ) {
-        // LEAN-MODEL: verified-memo-begin (VerifiedCoreProofs.cache_begin_retains)
         let mut guard = self.invalidation.borrow_mut();
         if guard.is_none() {
             let mut memo = self.store.completeness();
-            let keep: Vec<&[u8]> = keep.iter().map(|root| root.as_bytes().as_slice()).collect();
-            memo.state.begin(&keep);
+            memo.begin(keep);
             *guard = Some(MemoMutation(self.store.cas_coord.clone()));
         }
     }
@@ -1184,9 +1210,8 @@ impl NodeStore for Store {
     }
 
     fn is_known_complete(&self, root: &Hash) -> Result<bool> {
-        // LEAN-MODEL: verified-memo-known (VerifiedCoreProofs.cache_known)
         let memo = self.completeness();
-        Ok(memo.state.contains(root.as_bytes()))
+        Ok(memo.contains(root))
     }
 
     fn note_complete(&self, root: &Hash) -> Result<()> {
@@ -1195,13 +1220,12 @@ impl NodeStore for Store {
     }
 
     fn completeness_generation(&self) -> Result<u64> {
-        Ok(self.completeness().state.epoch())
+        Ok(self.completeness().generation)
     }
 
     fn note_complete_at(&self, root: &Hash, generation: u64) -> Result<bool> {
-        // LEAN-MODEL: verified-memo-certify (VerifiedCoreProofs.cache_certify_sound)
         let mut memo = self.completeness();
-        Ok(memo.state.certify(generation, root.as_bytes()))
+        Ok(memo.certify(root, generation))
     }
 
     /// Redaction is durable, unlike the completeness memo above.
@@ -1433,6 +1457,66 @@ mod tests {
     use crate::testutil;
     use rusqlite::OptionalExtension;
     use synch_mpt::Trie;
+
+    #[test]
+    fn completeness_nested_mutations_hide_and_intersect_retained_roots() {
+        let a = Hash::new(b"a");
+        let b = Hash::new(b"b");
+        let mut memo = Completeness::default();
+        assert!(memo.certify(&a, 0));
+        assert!(memo.certify(&b, 0));
+        memo.begin(&[a, b].into_iter().collect());
+        assert!(!memo.contains(&a));
+        assert!(!memo.certify(&a, 1));
+        memo.begin(&[a].into_iter().collect());
+        assert_eq!(memo.generation, 2);
+        memo.finish();
+        assert_eq!(memo.generation, 3);
+        assert!(!memo.contains(&a));
+        assert!(!memo.certify(&a, 3));
+        memo.finish();
+        assert_eq!(memo.generation, 4);
+        assert!(memo.contains(&a));
+        assert!(!memo.contains(&b));
+        assert!(!memo.certify(&b, 0));
+        assert!(memo.certify(&b, 4));
+        memo.finish();
+        assert_eq!(memo.generation, 4);
+    }
+
+    #[test]
+    fn completeness_terminal_epoch_never_certifies() {
+        let root = Hash::new(b"retained");
+        let mut memo = Completeness {
+            generation: u64::MAX - 1,
+            ..Completeness::default()
+        };
+        assert!(memo.certify(&root, u64::MAX - 1));
+        memo.begin(&[root].into_iter().collect());
+        memo.finish();
+        assert_eq!(memo.generation, u64::MAX);
+        // Existing retained certificates remain readable; no new walk can
+        // certify against a saturated ticket, even after another mutation.
+        assert!(memo.contains(&root));
+        assert!(!memo.certify(&root, u64::MAX));
+        memo.begin(&Default::default());
+        memo.finish();
+        assert!(!memo.contains(&root));
+        assert!(!memo.certify(&root, u64::MAX));
+    }
+
+    #[test]
+    fn completeness_capacity_clears_before_even_duplicate_certification() {
+        let mut memo = Completeness::default();
+        for index in 0..COMPLETE_ROOTS_MAX {
+            assert!(memo.certify(&Hash::new(&index.to_le_bytes()), 0));
+        }
+        assert_eq!(memo.roots.len(), COMPLETE_ROOTS_MAX);
+        let root = Hash::new(&0usize.to_le_bytes());
+        assert!(memo.certify(&root, 0));
+        assert_eq!(memo.roots.len(), 1);
+        assert!(memo.contains(&root));
+    }
 
     /// The config surface round-trips through a reopen, appends never rewrite
     /// what is already there (§9.4), and the self-origin is one config key

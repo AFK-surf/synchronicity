@@ -4,7 +4,10 @@ import Mathlib.Order.MinMax
 import Synchronicity.ScopedSync
 import Synchronicity.Cas
 
-/-! Proofs about the executable source statically linked by synch-verified.
+/-! Proofs about executable Lean definitions retained in VerifiedCore.
+The fine-grained scope, walk, certificate and CAS planning definitions proved
+here are specifications, not the runtime for the corresponding Rust operations.
+Migrated whole-operation proofs live in their dedicated program proof modules.
 The native package has no dependency on this proof package or on Mathlib. -/
 namespace Synchronicity.VerifiedCoreProofs
 
@@ -76,13 +79,11 @@ theorem admitsValue_correct (s : VerifiedCore.Scope) (path : Path) (n : ScopedSy
     | some v => cases v <;> exact admitsKey_correct s _
 
 /-- The exported ByteArray predicate invokes the proved implementation. -/
-@[rust_justifies "verified-native-path"]
 theorem exported_path_correct (s : VerifiedCore.Scope) (path : ByteArray) :
     VerifiedCore.scopePath s path = true ↔
       (scopeModel s).AdmitsPath (VerifiedCore.pathOf path) := admitsPath_correct s _
 
 /-- The exported node decision is the model predicate for its decoded shape. -/
-@[rust_justifies "verified-native-node"]
 theorem exported_node_correct (s : VerifiedCore.Scope) (path suffix : ByteArray)
     (tag : UInt8) (inlineValue : Bool) (n : ScopedSync.Node)
     (shape : VerifiedCore.shapeOf tag inlineValue suffix = some (shapeModel n)) :
@@ -91,7 +92,6 @@ theorem exported_node_correct (s : VerifiedCore.Scope) (path suffix : ByteArray)
   simpa [VerifiedCore.scopeNode, shape] using admitsNode_correct s (VerifiedCore.pathOf path) n
 
 /-- The exported payload decision does not conflate node and value admission. -/
-@[rust_justifies "verified-native-value"]
 theorem exported_value_correct (s : VerifiedCore.Scope) (path suffix : ByteArray)
     (tag : UInt8) (n : ScopedSync.Node)
     (shape : VerifiedCore.shapeOf tag false suffix = some (shapeModel n)) :
@@ -155,7 +155,6 @@ theorem settlement_reset_iff (row durable complete finalHeld : Bool) (recorded c
 /-- Connect the exported settlement decision to the existing CAS transition
 guard. Row decoding/bitmap membership must supply these representation facts;
 the proof does not assume acceptance or the desired postcondition. -/
-@[rust_justifies "verified-size-settlement"]
 theorem settlement_refines_model {c : Cas.Cell H}
     (row durable complete finalHeld : Bool) (recorded claimed : UInt64)
     (hrow : row = true ↔ c.row) (hdurable : durable = true ↔ c.durable)
@@ -180,7 +179,6 @@ theorem cache_can_certify (s : VerifiedCore.CertificateCache) (epoch : UInt64) :
   simp [VerifiedCore.canCertify, and_assoc]
 
 /-- A usable exported certificate is present and no mutation is outstanding. -/
-@[rust_justifies "verified-memo-known"]
 theorem cache_known (s : VerifiedCore.CertificateCache) (key : ByteArray) :
     VerifiedCore.cacheKnown s key = true ↔
       s.mutating = 0 ∧ VerifiedCore.pathOf key ∈ s.roots := by
@@ -199,7 +197,6 @@ theorem cache_begin_hides (s : VerifiedCore.CertificateCache) (keep : Array Byte
     VerifiedCore.beginMutation]
 
 /-- Beginning a transaction cannot invent a certificate. -/
-@[rust_justifies "verified-memo-begin"]
 theorem cache_begin_retains (s : VerifiedCore.CertificateCache) (keep : Array ByteArray)
     (key : List Nat) : key ∈ (VerifiedCore.cacheBegin s keep).roots ↔
       key ∈ s.roots ∧ key ∈ keep.toList.map VerifiedCore.pathOf := by
@@ -215,7 +212,6 @@ theorem cache_certify_roots (s : VerifiedCore.CertificateCache) (epoch : UInt64)
 
 /-- Soundness is proved about the executable update, not a Rust lookalike.
 The completed walk must supply validity of the newly certified query. -/
-@[rust_justifies "verified-memo-certify"]
 theorem cache_certify_sound (valid : List Nat → Prop) (s : VerifiedCore.CertificateCache)
     (epoch : UInt64) (key : List Nat) (prior : ∀ q ∈ s.roots, valid q)
     (completed : valid key) : ∀ q ∈ (VerifiedCore.certify s epoch key).roots, valid q := by
@@ -277,7 +273,6 @@ theorem cache_epoch_advances (epoch : UInt64) (h : epoch ≠ 1844674407370955161
 
 /-- Finishing a real mutation decrements exactly one nesting level and
 advances the epoch; the cache cannot manufacture or drop a retained query. -/
-@[rust_justifies "verified-memo-finish"]
 theorem cache_finish (s : VerifiedCore.CertificateCache) (active : s.mutating ≠ 0) :
     (VerifiedCore.cacheFinish s).roots = s.roots ∧
     (VerifiedCore.cacheFinish s).mutating = s.mutating - 1 ∧
@@ -308,7 +303,6 @@ theorem walk_payload_retry (s : VerifiedCore.MissingWalk) (hash : ByteArray) :
 
 /-- Every selected read came from the frontier, is depth-bounded, and has
 neither a complete-reference shortcut nor an already-expanded visit key. -/
-@[rust_justifies "verified-walk-poll"]
 theorem walk_poll_selected (scope : VerifiedCore.Scope) (limit : Nat)
     (seen : Std.TreeSet VerifiedCore.WalkVisit)
     (frontier : List VerifiedCore.WalkPosition) (p : VerifiedCore.WalkPosition)
@@ -380,7 +374,6 @@ theorem paired_edges_exact (reference node : VerifiedCore.WalkNode)
     exact ⟨step, hash, edge, rfl, rfl, rfl⟩
 
 /-- Any retained reference hash is reached by exactly the target edge's step. -/
-@[rust_justifies "verified-walk-pairing"]
 theorem paired_reference_same_step (reference node : VerifiedCore.WalkNode)
     (r hash step : List Nat)
     (paired : (some r, hash, step) ∈ VerifiedCore.pairedEdges reference node) :
@@ -424,7 +417,6 @@ theorem expand_preserves_current (s : VerifiedCore.MissingWalk)
     rw [ih, enqueue_preserves_current]
 
 /-- Refusals cannot hide an absent node inside a granted subtree. -/
-@[rust_justifies "verified-walk-absence"]
 theorem absent_inside_grant (s : VerifiedCore.MissingWalk) (p : VerifiedCore.WalkPosition)
     (current : s.current = some p) (healthy : s.fault = none)
     (pending : s.awaiting = true)
@@ -925,7 +917,6 @@ theorem cas_plan_complete_refusal (recorded claimed : UInt64)
 
 /-- The actual commit planner retains exactly the authorized old groups plus
 incoming verified groups, clipped to the claimed size. A refusal holds none. -/
-@[rust_justifies "cas-native-plan-membership"]
 theorem cas_plan_membership (row durable complete : Bool) (recorded claimed : UInt64)
     (old incoming : List VerifiedCore.GroupSpan) (group : Nat) :
     let prior := if row then
@@ -954,7 +945,6 @@ theorem cas_plan_membership (row durable complete : Bool) (recorded claimed : UI
 
 /-- A planner's complete result actually covers every group of the claimed
 object, including the one-group representation of an empty object. -/
-@[rust_justifies "cas-native-plan-complete"]
 theorem cas_plan_complete_covers (row durable complete : Bool) (recorded claimed : UInt64)
     (old incoming : List VerifiedCore.GroupSpan)
     (done : (VerifiedCore.planCasCommit row durable complete recorded claimed old incoming).complete = true)
@@ -1125,7 +1115,6 @@ theorem normalize_spans_separated (total : Nat) (spans : List VerifiedCore.Group
     simpa only [List.mem_mergeSort] using member
 
 /-- Every accepted or refused production plan has canonical separated ranges. -/
-@[rust_justifies "cas-native-plan-canonical"]
 theorem cas_plan_separated (row durable complete : Bool) (recorded claimed : UInt64)
     (old incoming : List VerifiedCore.GroupSpan) :
     (VerifiedCore.planCasCommit row durable complete recorded claimed old incoming).spans.Pairwise
@@ -1211,7 +1200,6 @@ theorem spans_encoding_roundtrip (spans : List VerifiedCore.GroupSpan)
 
 /-- The production native endpoint export is lossless: decoding its UInt64
 pairs recovers exactly the planner's intervals, with no modular truncation. -/
-@[rust_justifies "cas-native-plan-encoding"]
 theorem cas_plan_encoding_roundtrip (row durable complete : Bool) (recorded claimed : UInt64)
     (old incoming : List VerifiedCore.GroupSpan) :
     let plan := VerifiedCore.planCasCommit row durable complete recorded claimed old incoming
