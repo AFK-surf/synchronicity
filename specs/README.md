@@ -4,7 +4,7 @@ TLA+ models and Lean proofs for mechanisms whose correctness rests on
 interleavings rather than on any single code path. The Rust test suite samples
 those interleavings; TLC explores bounded state spaces and Lean proves
 inductive invariants. A spec here verifies the *algorithm* the design document
-states, not the Rust compiler output; checked anchors keep the model and its
+states, not the Rust compiler output; the Lean proofs import the executable core and its
 implementation linearization points reviewably aligned.
 
 ## Running
@@ -55,49 +55,21 @@ recovery quiesce reaches every peer. That assumption — not the gap, not
 the timer — is what carries the guarantee; the partitioned config is the
 proof.
 
-## Lean — CAS / mptsync / ingest safety
+## Lean — proofs of the executable core
 
-[`lean/`](lean/) contains unbounded inductive proofs, all instances of one
-generic transition system (`Prelude.System`) and all over one statement of the
-CAS transitions (`Cas`, generic in the holder type): the root/holder-indexed
-system model whose live relations are the content leaves materialized from
-active tries (`SystemSafety`), a multi-root model of trie mark/sweep that
-projects onto the per-root head-slot abstraction (`TrieGraph` onto `MptGc`),
-the same system model with the durable backend allowed to lose what it
-acknowledged (`FaultTolerant`, four added steps over the shared invariant), and a positional model of mptsync
-over partial tries — the scoped fetch walk a delegate runs, its pruning against
-a reference root, the responder's authorization by position, and the privacy
-theorem that a delegate holds nothing that spells a key outside its scope
-(`ScopedSync`), together with the three pieces convergence decomposes into —
-head selection is an order-independent join, the derived view is a function of
-root and scope, and a fetch terminates and is complete when it can take no
-further step — under stated delivery and finiteness assumptions
-(`Convergence`); and a multi-party model of provenance across the delegation
-boundary, whose `privacy` and `integrity` theorems hold in every reachable
-state, with the graft of #115 as the witness that they exclude it
-(`Provenance`). The system theorem says every
-live source leaf names available content and every live replica leaf names
-either pinned available content or a want for that same holder and root. It
-covers protection removal as well as acquisition, protected explicit deletion,
-writer abort, cache eviction, the staged (non-durable) commit and the
-unprotected removal of such rows, partial rows — the groups a row holds, the
-size it records, and the settlement that lets a claimed size yield and a
-durable or attested one stand — and the two GC phases. The CAS/trie bridge
-(`Bridge`) pairs each publication and promotion with its head flip across every
-content root the transaction touches, on that same system model, and
-`Publication` reads that bridge along whole executions: for as long as a
-source's tree names its content, the holder pins it, it is available, and its
-size is the one recorded when it was published, and the step that published
-it committed an active, materialized head. Under backend loss, the surviving theorem is that
-a role's pin stands on content that is available or that the backend lost and
-the heal has not yet converted into a want. Rust and Lean carry matching checked
-anchors at their linearization points; run `lean/check-anchors.sh` after
-changing either side.
+[`lean/`](lean/) proves properties of the Lean programs that Cargo compiles
+into `synch` from `crates/synch-verified`: local ingestion and its metadata
+commit, local reads and repair, the CAS lifecycle commands, trie lookup and
+head-history retention. The proofs import that executable source, so they
+are about the code that runs rather than about a model of it; they say what
+each program requests of its host and how it answers every host reply,
+under stated assumptions about the host. SQLite, the filesystem, the
+cryptographic primitives and the Rust transport are trust boundaries. See
+[`lean/README.md`](lean/README.md) for the module list.
 
 ```sh
 cd specs/lean
 lake build --wfail
-./check-anchors.sh
 ```
 
 ## What Recovery.tla deliberately does not model
@@ -106,10 +78,7 @@ Signatures (perfect by assumption; only the origin's key signs its
 heads), trie contents and fetch (a head stands atomically for its trie —
 pending-head promotion has interleavings of its own and belongs in a
 separate spec), and wall-clock time (the adversarial schedule already
-contains every early-timer interleaving). The Lean model now covers pending
-promotion and GC at the root/content level, `TrieGraph` covers the retained
-node reachability obligation, and `ScopedSync` covers the fetch walk itself —
-which positions it asks for, when its "complete within scope" answer may be
-believed after pruning, and what a scoped peer is served. SQLite, filesystem, and Rust operational
-semantics remain trusted behind the named linearization points; the anchor
-checker is traceability, not a compiler-to-Lean refinement proof.
+contains every early-timer interleaving). Pending-head promotion, GC and the
+scoped fetch walk are Rust with regression tests, not Lean theorems; the Lean
+proofs cover the executable core listed above. SQLite, filesystem and Rust
+operational semantics remain trusted behind the interpreters.

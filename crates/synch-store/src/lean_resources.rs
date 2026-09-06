@@ -305,13 +305,13 @@ impl TemporaryFiles for Files<'_> {
         self.0.borrow_mut().discard(handle)
     }
 
-    fn sync_parent(&mut self, space: &str, key: &[u8]) -> Result<host::DirectorySync> {
+    fn sync_parent(&mut self, space: &str, key: &[u8]) -> Result<host::SyncStatus> {
         let mut pool = self.0.borrow_mut();
         let path = target(pool.store, space, key)?;
         #[cfg(windows)]
         {
             let _ = (path, &mut pool);
-            Ok(host::DirectorySync::Unsupported)
+            Ok(host::SyncStatus::Unsupported)
         }
         #[cfg(not(windows))]
         {
@@ -335,12 +335,12 @@ impl TemporaryFiles for Files<'_> {
                     }
                 }
             }
-            let mut status = host::DirectorySync::Synced;
+            let mut status = host::SyncStatus::Synced;
             for directory in pending {
                 match File::open(&directory)?.sync_all() {
                     Ok(()) => {}
                     Err(error) if error.kind() == io::ErrorKind::Unsupported => {
-                        status = host::DirectorySync::Unsupported;
+                        status = host::SyncStatus::Unsupported;
                     }
                     Err(error) => return Err(error.into()),
                 }
@@ -826,7 +826,7 @@ mod tests {
         #[cfg(windows)]
         assert_eq!(
             files.sync_parent("cas_payload", root.as_bytes()).unwrap(),
-            host::DirectorySync::Unsupported
+            host::SyncStatus::Unsupported
         );
     }
 
@@ -866,14 +866,14 @@ mod tests {
 
         assert_eq!(
             files.sync_parent("cas_payload", root.as_bytes()).unwrap(),
-            host::DirectorySync::Synced
+            host::SyncStatus::Synced
         );
         let mut expected = vec![shard.clone(), store.cas_dir()];
         expected.sort();
         assert_eq!(synced(&files), expected);
         assert_eq!(
             files.sync_parent("cas_outboard", root.as_bytes()).unwrap(),
-            host::DirectorySync::Synced
+            host::SyncStatus::Synced
         );
         assert_eq!(
             synced(&files),

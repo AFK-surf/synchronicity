@@ -1,10 +1,11 @@
 //! The native constructor drives literal host services for the entire read.
 use std::{cell::RefCell, rc::Rc};
+use synch_verified::host_unexpected;
 use synch_verified::{
     cas::{self, OperationError, ReadDomainError, ReadError, ReadRequest},
     host::{
-        Access, Cell, Clock, Exclusion, Fields, FileFailure, FileFailureKind, FileIO, Join, Order,
-        Row, Scan, Selection, SourceValue, Storage,
+        Cell, Clock, Fields, FileFailure, FileFailureKind, FileIO, Join, Order, Row, Scan,
+        Selection, SourceValue, Storage,
     },
 };
 
@@ -102,45 +103,7 @@ impl Storage for Database {
         self.trace.borrow_mut().step("size")?;
         Ok(vec![vec![Cell::Integer(4)]])
     }
-    fn scan_rows(
-        &mut self,
-        _: u64,
-        _: &str,
-        _: &[String],
-        _: &Fields,
-        _: &[Order],
-        _: &[Join],
-    ) -> Result<Scan<Self::Error>, Self::Error> {
-        panic!("unexpected scan_rows")
-    }
-    fn exists_rows(&mut self, _: u64, _: &str, _: &Fields) -> Result<bool, Self::Error> {
-        panic!("unexpected exists_rows")
-    }
-    fn upsert(
-        &mut self,
-        _: u64,
-        _: &str,
-        _: &Fields,
-        _: &[String],
-        _: &[String],
-    ) -> Result<(), Self::Error> {
-        panic!("unexpected upsert")
-    }
-    fn delete_rows(
-        &mut self,
-        _: u64,
-        _: &str,
-        _: &Fields,
-        _: &[Exclusion],
-        _: &Fields,
-    ) -> Result<u64, Self::Error> {
-        panic!("unexpected delete_rows")
-    }
-    fn read_bytes(&mut self, _: &str, _: &[u8]) -> Result<Option<Vec<u8>>, Self::Error> {
-        panic!("unexpected read_bytes")
-    }
-}
-impl Access for Database {
+
     fn snapshot(
         &mut self,
         selection: &Selection,
@@ -213,12 +176,20 @@ impl Access for Database {
         self.trace.borrow_mut().step("copy")?;
         Ok(2)
     }
-    fn delete_selected(&mut self, tx: u64, selection: &Selection) -> Result<u64, Self::Error> {
+    fn delete(&mut self, tx: u64, selection: &Selection) -> Result<u64, Self::Error> {
         assert_eq!(tx, TX);
         assert_roles(selection);
         self.trace.borrow_mut().step("delete")?;
         Ok(2)
     }
+    host_unexpected!(
+        scan_rows,
+        exists_rows,
+        upsert,
+        delete_rows,
+        read_bytes,
+        write
+    );
 }
 struct Files {
     trace: Shared,
@@ -246,9 +217,6 @@ impl FileIO for Files {
             });
         }
         Ok(HANDLE)
-    }
-    fn read_at(&mut self, _: u64, _: u64, _: u64) -> Result<Vec<u8>, FileFailure<Self::Error>> {
-        panic!("a local read transfers into the sink instead of replying with bytes")
     }
     fn read_into(
         &mut self,
@@ -282,6 +250,7 @@ impl FileIO for Files {
         assert_eq!(handle, HANDLE);
         self.trace.borrow_mut().step("close")
     }
+    host_unexpected!(read_at);
 }
 struct Time(Shared);
 impl Clock for Time {

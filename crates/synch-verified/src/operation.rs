@@ -1,7 +1,8 @@
 //! Private synchronous transport for raw storage/resource and crypto effects.
+pub(crate) use crate::generated::{decode, dispatch, Command, Frame};
 use crate::host::{
-    Access, ByteStorage, Cell, Clock, Exclusion, Fields, FileFailure, FileFailureKind, FileIO,
-    Join, Order, Resources, Row, Scan, Selection, SourceValue, Storage,
+    ByteStorage, Cell, Clock, ConflictValue, Exclusion, Fields, FileFailure, FileFailureKind,
+    FileIO, Join, Order, Resources, Row, Scan, Selection, SourceValue, Storage, SyncStatus,
 };
 use std::{ffi::c_void, marker::PhantomData, ptr::NonNull, rc::Rc};
 
@@ -46,6 +47,7 @@ impl From<&[u8]> for Slice {
 }
 
 unsafe extern "C" {
+    fn synch_adapter_start(command: Slice) -> *mut c_void;
     fn synch_adapter_operation_packet(state: *mut c_void) -> *mut c_void;
     fn synch_adapter_operation_resume(state: *mut c_void, reply: Slice) -> *mut c_void;
     fn synch_adapter_bytes_len(bytes: *mut c_void) -> usize;
@@ -115,12 +117,11 @@ impl Drop for Handle {
 
 pub(crate) struct Reader<'a>(pub(crate) &'a [u8]);
 impl<'a> Reader<'a> {
-    fn conflict_value(
+    fn conflict_expression(
         &mut self,
         depth: usize,
         budget: &mut usize,
-    ) -> Result<crate::host::ConflictValue, ()> {
-        use crate::host::ConflictValue;
+    ) -> Result<ConflictValue, ()> {
         if depth > 32 || *budget == 0 {
             return Err(());
         }
@@ -129,8 +130,8 @@ impl<'a> Reader<'a> {
             0 => ConflictValue::Current(self.string()?),
             1 => ConflictValue::Excluded(self.string()?),
             tag @ (2 | 3) => {
-                let left = self.conflict_value(depth + 1, budget)?;
-                let right = self.conflict_value(depth + 1, budget)?;
+                let left = self.conflict_expression(depth + 1, budget)?;
+                let right = self.conflict_expression(depth + 1, budget)?;
                 let pair = Box::new((left, right));
                 if tag == 2 {
                     ConflictValue::Coalesce(pair)
@@ -140,6 +141,20 @@ impl<'a> Reader<'a> {
             }
             _ => return Err(()),
         })
+    }
+    /// Conflict assignments share one expression budget across the whole
+    /// list, bounding both nesting and total node count of hostile packets.
+    pub(crate) fn assignments(&mut self) -> Result<Vec<(String, ConflictValue)>, ()> {
+        let count = self.count()?;
+        let mut budget = 4096;
+        if count > budget || count > self.0.len() {
+            return Err(());
+        }
+        let mut assignments = Vec::new();
+        for _ in 0..count {
+            assignments.push((self.string()?, self.conflict_expression(0, &mut budget)?));
+        }
+        Ok(assignments)
     }
     fn take(&mut self, count: usize) -> Result<&'a [u8], ()> {
         if count > self.0.len() {
@@ -170,14 +185,24 @@ impl<'a> Reader<'a> {
     pub(crate) fn string(&mut self) -> Result<String, ()> {
         String::from_utf8(self.bytes()?).map_err(|_| ())
     }
-    fn list<T>(&mut self, read: impl Fn(&mut Self) -> Result<T, ()>) -> Result<Vec<T>, ()> {
+    pub(crate) fn boolean(&mut self) -> Result<bool, ()> {
+        match self.byte()? {
+            0 => Ok(false),
+            1 => Ok(true),
+            _ => Err(()),
+        }
+    }
+    pub(crate) fn list<T>(
+        &mut self,
+        read: impl Fn(&mut Self) -> Result<T, ()>,
+    ) -> Result<Vec<T>, ()> {
         let count = self.count()?;
         if count > self.0.len() {
             return Err(());
         }
         (0..count).map(|_| read(self)).collect()
     }
-    fn cell(&mut self) -> Result<Cell, ()> {
+    pub(crate) fn cell(&mut self) -> Result<Cell, ()> {
         Ok(match self.byte()? {
             0 => Cell::Null,
             1 => Cell::Integer(self.word()? as i64),
@@ -188,14 +213,40 @@ impl<'a> Reader<'a> {
             _ => return Err(()),
         })
     }
-    fn fields(&mut self) -> Result<Fields, ()> {
+    pub(crate) fn fields(&mut self) -> Result<Fields, ()> {
         self.list(|r| Ok((r.string()?, r.cell()?)))
     }
-    fn selection(&mut self) -> Result<Selection, ()> {
+    pub(crate) fn selection(&mut self) -> Result<Selection, ()> {
         Ok(Selection {
             relation: self.string()?,
             equals: self.fields()?,
             like_any: self.list(|r| Ok((r.string()?, r.string()?)))?,
+        })
+    }
+    pub(crate) fn order(&mut self) -> Result<Order, ()> {
+        Ok(Order {
+            column: self.string()?,
+            descending: self.boolean()?,
+        })
+    }
+    pub(crate) fn join(&mut self) -> Result<Join, ()> {
+        Ok(Join {
+            relation: self.string()?,
+            keys: self.list(|r| Ok((r.string()?, r.string()?)))?,
+        })
+    }
+    pub(crate) fn exclusion(&mut self) -> Result<Exclusion, ()> {
+        Ok(Exclusion {
+            relation: self.string()?,
+            equals: self.fields()?,
+            keys: self.list(|r| Ok((r.string()?, r.string()?)))?,
+        })
+    }
+    pub(crate) fn source_value(&mut self) -> Result<SourceValue, ()> {
+        Ok(match self.byte()? {
+            0 => SourceValue::Literal(self.cell()?),
+            1 => SourceValue::Column(self.string()?),
+            _ => return Err(()),
         })
     }
     pub(crate) fn end(&self) -> Result<(), ()> {
@@ -249,191 +300,7 @@ fn rows(out: &mut Vec<u8>, values: Vec<Row>) {
     }
 }
 
-enum Frame<'a> {
-    Done(&'a [u8]),
-    Failure(u64, u64),
-    Begin,
-    Commit(u64),
-    Rollback(u64),
-    ReadRows(u64, String, Vec<String>, Fields, Vec<Order>, Vec<Join>),
-    Upsert(u64, String, Fields, Vec<String>, Vec<String>),
-    DeleteRows(u64, String, Fields, Vec<Exclusion>, Fields),
-    ReadBytes(String, Vec<u8>),
-    ReadInput(u64, u64, u64),
-    ReadCounter(String, Vec<u8>),
-    RemoveFile(String, Vec<u8>),
-    ExistsRows(u64, String, Fields),
-    ValidateEd25519(Vec<u8>),
-    ScanRows(u64, String, Vec<String>, Fields, Vec<Order>, Vec<Join>),
-    Access(AccessFrame),
-    Open(String, Vec<u8>),
-    ReadAt(u64, u64, u64),
-    Close(u64),
-    Now,
-    Append(&'a [u8]),
-    Build(u64, u64, u64, u64),
-    Hash(&'a [u8]),
-    ExpressionUpsert(
-        u64,
-        String,
-        Fields,
-        Vec<String>,
-        Vec<(String, crate::host::ConflictValue)>,
-    ),
-    CreateTemporary(String),
-    Flush(u64),
-    Replace(u64, String, &'a [u8]),
-    Discard(u64),
-    SyncParent(String, &'a [u8]),
-    LeaseAcquire(String, &'a [u8]),
-    LeaseRelease(u64),
-    SourceStat(String, &'a [u8]),
-    ReadSome(u64, u64, u64),
-    Freeze(&'a [u8]),
-    Transfer(u64, u64, u64),
-}
-
-enum AccessFrame {
-    Snapshot(Selection, Vec<String>),
-    Update(u64, Selection, Fields),
-    CopyRows(
-        u64,
-        String,
-        Selection,
-        Vec<(String, SourceValue)>,
-        Vec<String>,
-    ),
-    DeleteSelected(u64, Selection),
-}
-
-fn decode(packet: &[u8]) -> Result<Frame<'_>, ()> {
-    let mut r = Reader(packet);
-    if r.byte()? != 1 {
-        return Err(());
-    }
-    let frame = match r.byte()? {
-        0 => Frame::Done(r.byte_slice()?),
-        1 => Frame::Failure(r.word()?, r.word()?),
-        16 => Frame::Begin,
-        17 => Frame::Commit(r.word()?),
-        18 => Frame::Rollback(r.word()?),
-        kind @ (19 | 28) => {
-            let frame = Frame::ReadRows(
-                r.word()?,
-                r.string()?,
-                r.list(Reader::string)?,
-                r.fields()?,
-                r.list(|r| {
-                    let column = r.string()?;
-                    let descending = match r.byte()? {
-                        0 => false,
-                        1 => true,
-                        _ => return Err(()),
-                    };
-                    Ok(Order { column, descending })
-                })?,
-                r.list(|r| {
-                    Ok(Join {
-                        relation: r.string()?,
-                        keys: r.list(|r| Ok((r.string()?, r.string()?)))?,
-                    })
-                })?,
-            );
-            match frame {
-                Frame::ReadRows(tx, table, columns, equals, order, joins) if kind == 28 => {
-                    Frame::ScanRows(tx, table, columns, equals, order, joins)
-                }
-                frame => frame,
-            }
-        }
-        20 => Frame::Upsert(
-            r.word()?,
-            r.string()?,
-            r.fields()?,
-            r.list(Reader::string)?,
-            r.list(Reader::string)?,
-        ),
-        21 => Frame::DeleteRows(
-            r.word()?,
-            r.string()?,
-            r.fields()?,
-            r.list(|r| {
-                Ok(Exclusion {
-                    relation: r.string()?,
-                    equals: r.fields()?,
-                    keys: r.list(|r| Ok((r.string()?, r.string()?)))?,
-                })
-            })?,
-            r.fields()?,
-        ),
-        22 => Frame::ReadBytes(r.string()?, r.bytes()?),
-        23 => Frame::ReadInput(r.word()?, r.word()?, r.word()?),
-        24 => Frame::ReadCounter(r.string()?, r.bytes()?),
-        25 => Frame::RemoveFile(r.string()?, r.bytes()?),
-        26 => Frame::ExistsRows(r.word()?, r.string()?, r.fields()?),
-        27 => Frame::ValidateEd25519(r.bytes()?),
-        29 => Frame::Access(AccessFrame::Snapshot(
-            r.selection()?,
-            r.list(Reader::string)?,
-        )),
-        30 => Frame::Access(AccessFrame::Update(r.word()?, r.selection()?, r.fields()?)),
-        31 => Frame::Access(AccessFrame::CopyRows(
-            r.word()?,
-            r.string()?,
-            r.selection()?,
-            r.list(|r| {
-                let target = r.string()?;
-                let value = match r.byte()? {
-                    0 => SourceValue::Literal(r.cell()?),
-                    1 => SourceValue::Column(r.string()?),
-                    _ => return Err(()),
-                };
-                Ok((target, value))
-            })?,
-            r.list(Reader::string)?,
-        )),
-        32 => Frame::Access(AccessFrame::DeleteSelected(r.word()?, r.selection()?)),
-        33 => Frame::Open(r.string()?, r.bytes()?),
-        34 => Frame::ReadAt(r.word()?, r.word()?, r.word()?),
-        35 => Frame::Close(r.word()?),
-        36 => Frame::Now,
-        37 => Frame::Append(r.byte_slice()?),
-        38 => Frame::Build(r.word()?, r.word()?, r.word()?, r.word()?),
-        39 => Frame::Hash(r.byte_slice()?),
-        41 => {
-            let tx = r.word()?;
-            let relation = r.string()?;
-            let fields = r.fields()?;
-            let conflicts = r.list(Reader::string)?;
-            let count = r.count()?;
-            let mut budget = 4096;
-            if count > budget || count > r.0.len() {
-                return Err(());
-            }
-            let mut assignments = Vec::new();
-            for _ in 0..count {
-                assignments.push((r.string()?, r.conflict_value(0, &mut budget)?));
-            }
-            Frame::ExpressionUpsert(tx, relation, fields, conflicts, assignments)
-        }
-        42 => Frame::CreateTemporary(r.string()?),
-        43 => Frame::Flush(r.word()?),
-        44 => Frame::Replace(r.word()?, r.string()?, r.byte_slice()?),
-        45 => Frame::Discard(r.word()?),
-        46 => Frame::SyncParent(r.string()?, r.byte_slice()?),
-        47 => Frame::LeaseAcquire(r.string()?, r.byte_slice()?),
-        48 => Frame::LeaseRelease(r.word()?),
-        49 => Frame::SourceStat(r.string()?, r.byte_slice()?),
-        50 => Frame::ReadSome(r.word()?, r.word()?, r.word()?),
-        51 => Frame::Freeze(r.byte_slice()?),
-        52 => Frame::Transfer(r.word()?, r.word()?, r.word()?),
-        _ => return Err(()),
-    };
-    r.end()?;
-    Ok(frame)
-}
-
-fn reply<E, A>(
+pub(crate) fn reply<E, A>(
     tag: u8,
     value: Result<A, E>,
     errors: &mut Vec<Option<E>>,
@@ -455,7 +322,11 @@ fn reply<E, A>(
     }
 }
 
-fn scan_reply<E>(tag: u8, scan: Result<Scan<E>, E>, errors: &mut Vec<Option<E>>) -> Vec<u8> {
+pub(crate) fn scan_reply<E>(
+    tag: u8,
+    scan: Result<Scan<E>, E>,
+    errors: &mut Vec<Option<E>>,
+) -> Vec<u8> {
     match scan {
         Err(error) => reply(tag, Err::<(), _>(error), errors, |_, ()| {}),
         Ok(scan) => {
@@ -474,7 +345,7 @@ fn scan_reply<E>(tag: u8, scan: Result<Scan<E>, E>, errors: &mut Vec<Option<E>>)
     }
 }
 
-fn file_reply<E, A>(
+pub(crate) fn file_reply<E, A>(
     tag: u8,
     value: Result<A, FileFailure<E>>,
     errors: &mut Vec<Option<E>>,
@@ -494,106 +365,217 @@ fn file_reply<E, A>(
     }
 }
 
-fn dispatch_access<S: Access>(
-    storage: &mut S,
-    frame: AccessFrame,
-    errors: &mut Vec<Option<S::Error>>,
-) -> Vec<u8> {
-    match frame {
-        AccessFrame::Snapshot(selection, columns) => {
-            scan_reply(29, storage.snapshot(&selection, &columns), errors)
+/// How a successful reply value is written after its tag. Scans are the one
+/// exception: a trailing failure registers its own error token.
+pub(crate) trait EncodeReply {
+    fn encode(out: &mut Vec<u8>, value: Self);
+}
+impl EncodeReply for () {
+    fn encode(_: &mut Vec<u8>, (): Self) {}
+}
+impl EncodeReply for u64 {
+    fn encode(out: &mut Vec<u8>, value: Self) {
+        word(out, value);
+    }
+}
+impl EncodeReply for i64 {
+    fn encode(out: &mut Vec<u8>, value: Self) {
+        word(out, value as u64);
+    }
+}
+impl EncodeReply for bool {
+    fn encode(out: &mut Vec<u8>, value: Self) {
+        out.push(u8::from(value));
+    }
+}
+impl EncodeReply for Vec<u8> {
+    fn encode(out: &mut Vec<u8>, value: Self) {
+        bytes(out, &value);
+    }
+}
+impl EncodeReply for Option<Vec<u8>> {
+    fn encode(out: &mut Vec<u8>, value: Self) {
+        match value {
+            None => out.push(0),
+            Some(value) => {
+                out.push(1);
+                bytes(out, &value);
+            }
         }
-        AccessFrame::Update(tx, selection, values) => {
-            reply(30, storage.update(tx, &selection, &values), errors, word)
+    }
+}
+impl EncodeReply for Vec<Row> {
+    fn encode(out: &mut Vec<u8>, value: Self) {
+        rows(out, value);
+    }
+}
+impl EncodeReply for SyncStatus {
+    fn encode(out: &mut Vec<u8>, value: Self) {
+        out.push(match value {
+            SyncStatus::Synced => 0,
+            SyncStatus::Unsupported => 1,
+        });
+    }
+}
+
+/// How a command argument is written into the packet that starts a run.
+pub(crate) trait Encode {
+    fn encode(&self, out: &mut Vec<u8>);
+}
+impl Encode for u64 {
+    fn encode(&self, out: &mut Vec<u8>) {
+        word(out, *self);
+    }
+}
+impl Encode for i64 {
+    fn encode(&self, out: &mut Vec<u8>) {
+        word(out, *self as u64);
+    }
+}
+impl Encode for bool {
+    fn encode(&self, out: &mut Vec<u8>) {
+        out.push(u8::from(*self));
+    }
+}
+impl Encode for Vec<u8> {
+    fn encode(&self, out: &mut Vec<u8>) {
+        bytes(out, self);
+    }
+}
+impl Encode for String {
+    fn encode(&self, out: &mut Vec<u8>) {
+        bytes(out, self.as_bytes());
+    }
+}
+impl<T: Encode> Encode for Option<T> {
+    fn encode(&self, out: &mut Vec<u8>) {
+        match self {
+            None => out.push(0),
+            Some(value) => {
+                out.push(1);
+                value.encode(out);
+            }
         }
-        AccessFrame::CopyRows(tx, target, source, values, conflicts) => reply(
-            31,
-            storage.copy_rows(tx, &target, &source, &values, &conflicts),
-            errors,
-            word,
-        ),
-        AccessFrame::DeleteSelected(tx, selection) => {
-            reply(32, storage.delete_selected(tx, &selection), errors, word)
+    }
+}
+impl<A: Encode, B: Encode> Encode for (A, B) {
+    fn encode(&self, out: &mut Vec<u8>) {
+        self.0.encode(out);
+        self.1.encode(out);
+    }
+}
+impl Encode for Vec<(u64, u64)> {
+    fn encode(&self, out: &mut Vec<u8>) {
+        word(out, self.len() as u64);
+        for pair in self {
+            pair.encode(out);
         }
     }
 }
 
-fn byte_reply<E>(value: Result<Option<Vec<u8>>, E>, errors: &mut Vec<Option<E>>) -> Vec<u8> {
-    reply(22, value, errors, |out, value| match value {
-        None => out.push(0),
-        Some(value) => {
-            out.push(1);
-            bytes(out, &value);
-        }
-    })
+/// How a terminal value is read back once a run has finished.
+pub(crate) trait Decode: Sized {
+    fn decode(r: &mut Reader<'_>) -> Result<Self, ()>;
+}
+impl Decode for () {
+    fn decode(_: &mut Reader<'_>) -> Result<Self, ()> {
+        Ok(())
+    }
+}
+impl Decode for u64 {
+    fn decode(r: &mut Reader<'_>) -> Result<Self, ()> {
+        r.word()
+    }
+}
+impl Decode for i64 {
+    fn decode(r: &mut Reader<'_>) -> Result<Self, ()> {
+        Ok(r.word()? as i64)
+    }
+}
+impl Decode for bool {
+    fn decode(r: &mut Reader<'_>) -> Result<Self, ()> {
+        r.boolean()
+    }
+}
+impl Decode for Vec<u8> {
+    fn decode(r: &mut Reader<'_>) -> Result<Self, ()> {
+        r.bytes()
+    }
+}
+impl Decode for String {
+    fn decode(r: &mut Reader<'_>) -> Result<Self, ()> {
+        r.string()
+    }
+}
+impl<T: Decode> Decode for Option<T> {
+    fn decode(r: &mut Reader<'_>) -> Result<Self, ()> {
+        Ok(match r.byte()? {
+            0 => None,
+            1 => Some(Decode::decode(r)?),
+            _ => return Err(()),
+        })
+    }
+}
+impl<A: Decode, B: Decode> Decode for (A, B) {
+    fn decode(r: &mut Reader<'_>) -> Result<Self, ()> {
+        Ok((Decode::decode(r)?, Decode::decode(r)?))
+    }
+}
+impl Decode for Vec<(u64, u64)> {
+    fn decode(r: &mut Reader<'_>) -> Result<Self, ()> {
+        r.list(Decode::decode)
+    }
+}
+/// A finished command: its value, or the domain error that ended it.
+impl<A: Decode, E: Decode> Decode for Result<A, E> {
+    fn decode(r: &mut Reader<'_>) -> Result<Self, ()> {
+        Ok(match r.byte()? {
+            0 => Ok(Decode::decode(r)?),
+            1 => Err(Decode::decode(r)?),
+            _ => return Err(()),
+        })
+    }
 }
 
-// Backend dispatch is separate from continuation transport: byte-only commands
-// do not need a pretend relational store or a second layer of host errors.
-fn dispatch_storage<S: Storage>(
-    storage: &mut S,
-    frame: Frame<'_>,
-    errors: &mut Vec<Option<S::Error>>,
-) -> Result<Vec<u8>, OperationError<S::Error>> {
-    Ok(match frame {
-        Frame::Begin => reply(16, storage.begin(), errors, word),
-        Frame::Commit(tx) => reply(17, storage.commit(tx), errors, |_, ()| {}),
-        Frame::Rollback(tx) => reply(18, storage.rollback(tx), errors, |_, ()| {}),
-        Frame::ReadRows(tx, table, columns, equals, order, joins) => reply(
-            19,
-            storage.read_rows(tx, &table, &columns, &equals, &order, &joins),
-            errors,
-            rows,
-        ),
-        Frame::Upsert(tx, table, values, conflict, updates) => reply(
-            20,
-            storage.upsert(tx, &table, &values, &conflict, &updates),
-            errors,
-            |_, ()| {},
-        ),
-        Frame::DeleteRows(tx, table, equals, unless, at_most) => reply(
-            21,
-            storage.delete_rows(tx, &table, &equals, &unless, &at_most),
-            errors,
-            word,
-        ),
-        Frame::ReadBytes(space, key) => byte_reply(storage.read_bytes(&space, &key), errors),
-        Frame::ExistsRows(tx, table, equals) => reply(
-            26,
-            storage.exists_rows(tx, &table, &equals),
-            errors,
-            |out, exists| out.push(u8::from(exists)),
-        ),
-        Frame::ScanRows(tx, table, columns, equals, order, joins) => scan_reply(
-            28,
-            storage.scan_rows(tx, &table, &columns, &equals, &order, &joins),
-            errors,
-        ),
-        _ => return Err(OperationError::Protocol),
-    })
+/// Decode a whole terminal, refusing trailing bytes.
+pub(crate) fn terminal<T: Decode>(bytes: &[u8]) -> Result<T, ()> {
+    let mut reader = Reader(bytes);
+    let value = Decode::decode(&mut reader)?;
+    reader.end()?;
+    Ok(value)
 }
 
+// Byte-only commands do not need a pretend relational store or a second
+// layer of host errors: only the raw byte read is served.
 fn dispatch_readonly<S: ByteStorage>(
     storage: &mut S,
     frame: Frame<'_>,
     errors: &mut Vec<Option<S::Error>>,
 ) -> Result<Vec<u8>, OperationError<S::Error>> {
     match frame {
-        Frame::ReadBytes(space, key) => Ok(byte_reply(storage.read_bytes(&space, &key), errors)),
+        Frame::ReadBytes(space, key) => Ok(reply(
+            22,
+            storage.read_bytes(&space, key),
+            errors,
+            EncodeReply::encode,
+        )),
         _ => Err(OperationError::Protocol),
     }
 }
 
-struct Capabilities<'a, E> {
-    resources: Option<&'a mut dyn Resources<Error = E>>,
-    crypto: Option<&'a mut dyn crate::host::Crypto<Error = E>>,
-    files: Option<&'a mut dyn FileIO<Error = E>>,
-    clock: Option<&'a mut dyn Clock<Error = E>>,
-    output: Option<&'a mut dyn crate::host::Output<Error = OperationError<E>>>,
-    construct: Option<&'a mut dyn crate::host::Construct<Error = E>>,
-    temporary: Option<&'a mut dyn crate::host::TemporaryFiles<Error = E>>,
-    leases: Option<&'a mut dyn crate::host::Lease<Error = E>>,
-    source: Option<&'a mut dyn crate::host::SourceIO<Error = E>>,
+/// The raw services an operation may direct besides relational storage. A
+/// request for a service the caller did not supply is a protocol failure:
+/// the Lean effect row of each operation says which services it can reach.
+pub(crate) struct Capabilities<'a, E> {
+    pub(crate) resources: Option<&'a mut dyn Resources<Error = E>>,
+    pub(crate) crypto: Option<&'a mut dyn crate::host::Crypto<Error = E>>,
+    pub(crate) files: Option<&'a mut dyn FileIO<Error = E>>,
+    pub(crate) clock: Option<&'a mut dyn Clock<Error = E>>,
+    pub(crate) output: Option<&'a mut dyn crate::host::Output<Error = OperationError<E>>>,
+    pub(crate) construct: Option<&'a mut dyn crate::host::Construct<Error = E>>,
+    pub(crate) temporary: Option<&'a mut dyn crate::host::TemporaryFiles<Error = E>>,
+    pub(crate) leases: Option<&'a mut dyn crate::host::Lease<Error = E>>,
+    pub(crate) source: Option<&'a mut dyn crate::host::SourceIO<Error = E>>,
 }
 
 impl<E> Default for Capabilities<'_, E> {
@@ -614,7 +596,11 @@ impl<E> Default for Capabilities<'_, E> {
 
 fn execute<E>(
     mut state: Handle,
-    mut dispatch: impl FnMut(Frame<'_>, &mut Vec<Option<E>>) -> Result<Vec<u8>, OperationError<E>>,
+    mut host: impl FnMut(
+        Frame<'_>,
+        &mut Capabilities<'_, E>,
+        &mut Vec<Option<E>>,
+    ) -> Result<Vec<u8>, OperationError<E>>,
     inputs: &[&[u8]],
     mut capabilities: Capabilities<'_, E>,
 ) -> Result<Vec<u8>, OperationError<E>> {
@@ -623,53 +609,6 @@ fn execute<E>(
         let packet = state.packet();
         let frame = decode(packet.as_bytes()).map_err(|()| OperationError::Protocol)?;
         let response = match frame {
-            Frame::SourceStat(space, key) => {
-                let source = capabilities
-                    .source
-                    .as_deref_mut()
-                    .ok_or(OperationError::Protocol)?;
-                reply(49, source.stat(&space, key), &mut errors, word)
-            }
-            Frame::ReadSome(handle, offset, count) => {
-                let source = capabilities
-                    .source
-                    .as_deref_mut()
-                    .ok_or(OperationError::Protocol)?;
-                reply(
-                    50,
-                    source.read_some(handle, offset, count),
-                    &mut errors,
-                    |out, value| bytes(out, &value),
-                )
-            }
-            Frame::Freeze(input) => {
-                let source = capabilities
-                    .source
-                    .as_deref_mut()
-                    .ok_or(OperationError::Protocol)?;
-                reply(51, source.freeze(input), &mut errors, word)
-            }
-            Frame::Build(source, payload, outboard, size) => {
-                let construct = capabilities
-                    .construct
-                    .as_deref_mut()
-                    .ok_or(OperationError::Protocol)?;
-                reply(
-                    38,
-                    construct.build(source, payload, outboard, size),
-                    &mut errors,
-                    |out, value| bytes(out, &value),
-                )
-            }
-            Frame::Hash(input) => {
-                let construct = capabilities
-                    .construct
-                    .as_deref_mut()
-                    .ok_or(OperationError::Protocol)?;
-                reply(39, construct.hash(input), &mut errors, |out, value| {
-                    bytes(out, &value)
-                })
-            }
             // The transferred bytes go from the file straight into the tail of
             // the output sink; they are never a reply payload. A sink that
             // cannot grow is a protocol failure delivered as a file failure,
@@ -709,70 +648,6 @@ fn execute<E>(
                     }
                 }
             }
-            Frame::CreateTemporary(space) => {
-                let temporary = capabilities
-                    .temporary
-                    .as_deref_mut()
-                    .ok_or(OperationError::Protocol)?;
-                reply(42, temporary.create_temporary(&space), &mut errors, word)
-            }
-            Frame::Flush(handle) => {
-                let temporary = capabilities
-                    .temporary
-                    .as_deref_mut()
-                    .ok_or(OperationError::Protocol)?;
-                reply(43, temporary.flush(handle), &mut errors, |_, ()| {})
-            }
-            Frame::Replace(handle, space, key) => {
-                let temporary = capabilities
-                    .temporary
-                    .as_deref_mut()
-                    .ok_or(OperationError::Protocol)?;
-                reply(
-                    44,
-                    temporary.replace(handle, &space, key),
-                    &mut errors,
-                    |_, ()| {},
-                )
-            }
-            Frame::Discard(handle) => {
-                let temporary = capabilities
-                    .temporary
-                    .as_deref_mut()
-                    .ok_or(OperationError::Protocol)?;
-                reply(45, temporary.discard(handle), &mut errors, |_, ()| {})
-            }
-            Frame::SyncParent(space, key) => {
-                let temporary = capabilities
-                    .temporary
-                    .as_deref_mut()
-                    .ok_or(OperationError::Protocol)?;
-                reply(
-                    46,
-                    temporary.sync_parent(&space, key),
-                    &mut errors,
-                    |out, value| {
-                        out.push(match value {
-                            crate::host::DirectorySync::Synced => 0,
-                            crate::host::DirectorySync::Unsupported => 1,
-                        })
-                    },
-                )
-            }
-            Frame::LeaseAcquire(space, key) => {
-                let leases = capabilities
-                    .leases
-                    .as_deref_mut()
-                    .ok_or(OperationError::Protocol)?;
-                reply(47, leases.acquire(&space, key), &mut errors, word)
-            }
-            Frame::LeaseRelease(token) => {
-                let leases = capabilities
-                    .leases
-                    .as_deref_mut()
-                    .ok_or(OperationError::Protocol)?;
-                reply(48, leases.release(token), &mut errors, |_, ()| {})
-            }
             Frame::Append(bytes) => match capabilities.output.as_deref_mut() {
                 Some(output) => match output.append(bytes) {
                     Ok(()) => vec![1, 37],
@@ -789,53 +664,6 @@ fn execute<E>(
                         out
                     }
                 },
-                None => return Err(OperationError::Protocol),
-            },
-            Frame::Open(space, key) => match capabilities.files.as_deref_mut() {
-                Some(files) => file_reply(33, files.open(&space, &key), &mut errors, word),
-                None => return Err(OperationError::Protocol),
-            },
-            Frame::ReadAt(handle, offset, count) => match capabilities.files.as_deref_mut() {
-                Some(files) => file_reply(
-                    34,
-                    files.read_at(handle, offset, count),
-                    &mut errors,
-                    |out, value| bytes(out, &value),
-                ),
-                None => return Err(OperationError::Protocol),
-            },
-            Frame::Close(handle) => match capabilities.files.as_deref_mut() {
-                Some(files) => reply(35, files.close(handle), &mut errors, |_, ()| {}),
-                None => return Err(OperationError::Protocol),
-            },
-            Frame::Now => match capabilities.clock.as_deref_mut() {
-                Some(clock) => reply(36, clock.now_ns(), &mut errors, |out, value| {
-                    word(out, value as u64)
-                }),
-                None => return Err(OperationError::Protocol),
-            },
-            Frame::ValidateEd25519(bytes) => match capabilities.crypto.as_deref_mut() {
-                Some(crypto) => reply(
-                    27,
-                    crypto.validate_ed25519(&bytes),
-                    &mut errors,
-                    |out, valid| out.push(u8::from(valid)),
-                ),
-                None => return Err(OperationError::Protocol),
-            },
-            Frame::ReadCounter(space, key) => match capabilities.resources.as_deref_mut() {
-                Some(resources) => {
-                    reply(24, resources.read_counter(&space, &key), &mut errors, word)
-                }
-                None => return Err(OperationError::Protocol),
-            },
-            Frame::RemoveFile(space, key) => match capabilities.resources.as_deref_mut() {
-                Some(resources) => reply(
-                    25,
-                    resources.remove_file(&space, &key),
-                    &mut errors,
-                    |_, ()| {},
-                ),
                 None => return Err(OperationError::Protocol),
             },
             Frame::ReadInput(handle, offset, count) => {
@@ -873,7 +701,7 @@ fn execute<E>(
                     _ => OperationError::Protocol,
                 })
             }
-            frame => dispatch(frame, &mut errors)?,
+            frame => host(frame, &mut capabilities, &mut errors)?,
         };
         // No request borrows packet data past this point. Release the packet
         // before constructing the next continuation to limit peak retention.
@@ -882,138 +710,49 @@ fn execute<E>(
     }
 }
 
-/// Run a domain constructor without exposing continuations to its caller.
+/// Start a Lean command. The packet is copied by the adapter; the fresh
+/// continuation is owned here until the run ends.
 ///
 /// # Safety
-/// `start` must return one fresh owned Lean Wire.NativeState. It is called only after
-/// this thread's runtime is initialized; borrowed input buffers live until return.
-pub(crate) unsafe fn run<S: Storage>(
+/// This thread's runtime must be initialized (`native::enter`).
+unsafe fn start(command: &Command) -> Handle {
+    let mut packet = Vec::new();
+    command.encode(&mut packet);
+    Handle::new(unsafe { synch_adapter_start(packet.as_slice().into()) })
+}
+
+/// Run one command over the relational host and whatever raw services it may
+/// direct, without exposing continuations to the caller. Borrowed input
+/// buffers live until the run returns.
+pub(crate) fn run<S: Storage>(
     storage: &mut S,
+    capabilities: Capabilities<'_, S::Error>,
     inputs: &[&[u8]],
-    start: impl FnOnce() -> *mut c_void,
+    command: &Command,
 ) -> Result<Vec<u8>, OperationError<S::Error>> {
     crate::native::enter();
+    // SAFETY: the runtime was initialized for this thread just above.
+    let state = unsafe { start(command) };
     execute(
-        Handle::new(start()),
-        |frame, errors| dispatch_storage(storage, frame, errors),
+        state,
+        |frame, capabilities, errors| dispatch(storage, capabilities, frame, errors),
         inputs,
-        Capabilities::default(),
-    )
-}
-
-/// Run a whole ingestion with independent raw capabilities.
-///
-/// # Safety
-/// `start` returns a fresh owned native program after runtime initialization.
-pub(crate) unsafe fn run_ingest<S: crate::host::Upsert>(
-    storage: &mut S,
-    resources: crate::host::WriteServices<'_, S::Error>,
-    start: impl FnOnce() -> *mut c_void,
-) -> Result<Vec<u8>, OperationError<S::Error>> {
-    crate::native::enter();
-    execute(
-        Handle::new(start()),
-        |frame, errors| match frame {
-            Frame::ExpressionUpsert(tx, relation, fields, conflicts, assignments) => Ok(reply(
-                41,
-                storage.write(tx, &relation, &fields, &conflicts, &assignments),
-                errors,
-                |_, ()| {},
-            )),
-            frame => dispatch_storage(storage, frame, errors),
-        },
-        &[],
-        Capabilities {
-            files: Some(resources.files),
-            construct: Some(resources.construct),
-            temporary: Some(resources.temporary),
-            leases: Some(resources.leases),
-            source: Some(resources.source),
-            ..Capabilities::default()
-        },
-    )
-}
-
-/// Run with separate raw resource capabilities.
-///
-/// # Safety
-/// `start` obeys the fresh owned constructor contract of `run`.
-pub(crate) unsafe fn run_with_resources<S: Storage>(
-    storage: &mut S,
-    resources: &mut dyn Resources<Error = S::Error>,
-    start: impl FnOnce() -> *mut c_void,
-) -> Result<Vec<u8>, OperationError<S::Error>> {
-    crate::native::enter();
-    execute(
-        Handle::new(start()),
-        |frame, errors| dispatch_storage(storage, frame, errors),
-        &[],
-        Capabilities {
-            resources: Some(resources),
-            ..Capabilities::default()
-        },
-    )
-}
-
-/// Run with separate primitive crypto capabilities.
-///
-/// # Safety
-/// `start` returns a fresh owned native program after runtime initialization.
-pub(crate) unsafe fn run_with_crypto<S: Storage>(
-    storage: &mut S,
-    crypto: &mut dyn crate::host::Crypto<Error = S::Error>,
-    start: impl FnOnce() -> *mut c_void,
-) -> Result<Vec<u8>, OperationError<S::Error>> {
-    crate::native::enter();
-    execute(
-        Handle::new(start()),
-        |frame, errors| dispatch_storage(storage, frame, errors),
-        &[],
-        Capabilities {
-            crypto: Some(crypto),
-            ..Capabilities::default()
-        },
-    )
-}
-
-/// Run with raw relational access, file I/O and clock capabilities.
-///
-/// # Safety
-/// `start` returns one fresh owned native program after runtime initialization.
-pub(crate) unsafe fn run_read<S: Access>(
-    storage: &mut S,
-    files: &mut dyn FileIO<Error = S::Error>,
-    clock: &mut dyn Clock<Error = S::Error>,
-    output: &mut dyn crate::host::Output<Error = OperationError<S::Error>>,
-    start: impl FnOnce() -> *mut c_void,
-) -> Result<Vec<u8>, OperationError<S::Error>> {
-    crate::native::enter();
-    execute(
-        Handle::new(start()),
-        |frame, errors| match frame {
-            Frame::Access(frame) => Ok(dispatch_access(storage, frame, errors)),
-            frame => dispatch_storage(storage, frame, errors),
-        },
-        &[],
-        Capabilities {
-            files: Some(files),
-            clock: Some(clock),
-            output: Some(output),
-            ..Capabilities::default()
-        },
+        capabilities,
     )
 }
 
 /// Same ownership contract as `run`, narrowed to byte-reading capabilities.
-pub(crate) unsafe fn run_readonly<S: ByteStorage>(
+pub(crate) fn run_readonly<S: ByteStorage>(
     storage: &mut S,
     inputs: &[&[u8]],
-    start: impl FnOnce() -> *mut c_void,
+    command: &Command,
 ) -> Result<Vec<u8>, OperationError<S::Error>> {
     crate::native::enter();
+    // SAFETY: the runtime was initialized for this thread just above.
+    let state = unsafe { start(command) };
     execute(
-        Handle::new(start()),
-        |frame, errors| dispatch_readonly(storage, frame, errors),
+        state,
+        |frame, _, errors| dispatch_readonly(storage, frame, errors),
         inputs,
         Capabilities::default(),
     )
@@ -1022,6 +761,7 @@ pub(crate) unsafe fn run_readonly<S: ByteStorage>(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::generated::IngestInput;
 
     #[derive(Default)]
     struct ByteHost {
@@ -1060,17 +800,11 @@ mod tests {
             Frame::DeleteRows(1, "table".into(), vec![], vec![], vec![]),
             Frame::ExistsRows(1, "table".into(), vec![]),
             Frame::ScanRows(1, "table".into(), vec![], vec![], vec![], vec![]),
-            Frame::ExpressionUpsert(1, "table".into(), vec![], vec![], vec![]),
-            Frame::Access(AccessFrame::Snapshot(selection(), vec![])),
-            Frame::Access(AccessFrame::Update(1, selection(), vec![])),
-            Frame::Access(AccessFrame::CopyRows(
-                1,
-                "table".into(),
-                selection(),
-                vec![],
-                vec![],
-            )),
-            Frame::Access(AccessFrame::DeleteSelected(1, selection())),
+            Frame::Write(1, "table".into(), vec![], vec![], vec![]),
+            Frame::Snapshot(selection(), vec![]),
+            Frame::Update(1, selection(), vec![]),
+            Frame::CopyRows(1, "table".into(), selection(), vec![], vec![]),
+            Frame::Delete(1, selection()),
         ] {
             assert!(matches!(
                 dispatch_readonly(&mut host, frame, &mut errors),
@@ -1084,18 +818,15 @@ mod tests {
     #[test]
     fn byte_only_native_runner_rejects_transactional_programs() {
         let mut host = ByteHost::default();
-        // SAFETY: the constructor returns a fresh owned state; this deliberately
-        // supplies only byte capabilities to a program whose first effect is begin.
-        let result = unsafe {
-            run_readonly(&mut host, &[], || {
-                synch_adapter_operation_acquire(
-                    [9; 32].as_slice().into(),
-                    b"holder".as_slice().into(),
-                    0,
-                    1,
-                )
-            })
+        // This deliberately supplies only byte capabilities to a program whose
+        // first effect is begin.
+        let command = Command::Acquire {
+            root: vec![9; 32],
+            holder: "holder".into(),
+            now: 0,
+            possession: true,
         };
+        let result = run_readonly(&mut host, &[], &command);
         assert!(matches!(result, Err(OperationError::Protocol)));
         assert_eq!(host.reads, 0);
     }
@@ -1123,7 +854,8 @@ mod tests {
     fn byte_only_dispatch_distinguishes_absence_from_empty_bytes() {
         let mut host = ByteHost::default();
         let mut errors = Vec::new();
-        let frame = || Frame::ReadBytes("trie_nodes".into(), vec![1; 32]);
+        let key = [1; 32];
+        let frame = || Frame::ReadBytes("trie_nodes".into(), &key);
         assert_eq!(
             dispatch_readonly(&mut host, frame(), &mut errors).unwrap(),
             vec![1, 22, 0]
@@ -1139,27 +871,33 @@ mod tests {
 
     #[test]
     fn native_ingestion_constructor_owns_input_admission_and_failure_continuation() {
-        unsafe extern "C" {
-            fn synch_adapter_operation_ingest(
-                kind: u8,
-                size: u64,
-                now: i64,
-                cache: u8,
-                allow_unsupported: u8,
-            ) -> *mut c_void;
-        }
         crate::native::enter();
-        for kind in [0, 1, 255] {
-            // SAFETY: runtime initialized; constructor returns one fresh owned
-            // native continuation and receives only scalar arguments.
-            let mut state =
-                Handle::new(unsafe { synch_adapter_operation_ingest(kind, 0, i64::MIN, 0, 0) });
+        let commands = [
+            (0, Some(IngestInput::Bytes(0))),
+            (1, Some(IngestInput::File)),
+            (255, None),
+        ];
+        for (kind, input) in commands {
+            // SAFETY: runtime initialized; the adapter copies the packet and
+            // returns one fresh owned native continuation. An undecodable
+            // packet is the third case: a protocol failure before any effect.
+            let mut state = match input {
+                Some(input) => unsafe {
+                    start(&Command::Ingest {
+                        input,
+                        now: i64::MIN,
+                        cache: false,
+                        allow_unsupported: false,
+                    })
+                },
+                None => Handle::new(unsafe { synch_adapter_start([255u8].as_slice().into()) }),
+            };
             match (kind, decode(state.packet().as_bytes()).unwrap()) {
                 (0, Frame::Open(space, key)) => {
                     assert_eq!(space, "input");
                     assert!(key.is_empty());
                 }
-                (1, Frame::SourceStat(space, key)) => {
+                (1, Frame::Stat(space, key)) => {
                     assert_eq!(space, "input");
                     assert!(key.is_empty());
                 }
@@ -1235,16 +973,16 @@ mod tests {
         let mut deep = vec![2; 34];
         deep.push(0);
         bytes(&mut deep, b"size");
-        assert!(Reader(&deep).conflict_value(0, &mut 4096).is_err());
+        assert!(Reader(&deep).conflict_expression(0, &mut 4096).is_err());
         let leaf = [0, 0, 0, 0, 0, 0, 0, 0, 0];
-        assert!(Reader(&leaf).conflict_value(0, &mut 0).is_err());
-        assert!(Reader(&[4]).conflict_value(0, &mut 4096).is_err());
+        assert!(Reader(&leaf).conflict_expression(0, &mut 0).is_err());
+        assert!(Reader(&[4]).conflict_expression(0, &mut 4096).is_err());
         let mut pair = vec![3];
         pair.extend_from_slice(&leaf);
         pair.extend_from_slice(&leaf);
-        assert!(Reader(&pair).conflict_value(0, &mut 2).is_err());
+        assert!(Reader(&pair).conflict_expression(0, &mut 2).is_err());
         assert!(matches!(
-            Reader(&pair).conflict_value(0, &mut 3),
+            Reader(&pair).conflict_expression(0, &mut 3),
             Ok(crate::host::ConflictValue::Maximum(_))
         ));
         let mut packet = vec![1, 41];
@@ -1333,53 +1071,12 @@ mod tests {
         assert!(decode(&packet).is_err());
     }
 
-    impl Access for Script {
-        fn snapshot(
-            &mut self,
-            _: &Selection,
-            _: &[String],
-        ) -> Result<Scan<Self::Error>, Self::Error> {
-            self.step("snapshot")?;
-            Ok(Scan {
-                rows: vec![vec![
-                    Cell::Blob(vec![7; 32]),
-                    Cell::Integer(65540),
-                    Cell::Integer(1),
-                    Cell::Null,
-                    Cell::Null,
-                    Cell::Integer(0),
-                    Cell::Integer(1),
-                ]],
-                failure: None,
-            })
-        }
-        fn update(&mut self, _: u64, _: &Selection, _: &Fields) -> Result<u64, Self::Error> {
-            panic!("unexpected update")
-        }
-        fn copy_rows(
-            &mut self,
-            _: u64,
-            _: &str,
-            _: &Selection,
-            _: &[(String, SourceValue)],
-            _: &[String],
-        ) -> Result<u64, Self::Error> {
-            panic!("unexpected copy")
-        }
-        fn delete_selected(&mut self, _: u64, _: &Selection) -> Result<u64, Self::Error> {
-            panic!("unexpected delete")
-        }
-    }
-
     struct OutputTestFiles(Vec<&'static str>);
     impl FileIO for OutputTestFiles {
         type Error = &'static str;
         fn open(&mut self, _: &str, _: &[u8]) -> Result<u64, FileFailure<Self::Error>> {
             self.0.push("open");
             Ok(9)
-        }
-        fn read_at(&mut self, _: u64, _: u64, _: u64) -> Result<Vec<u8>, FileFailure<Self::Error>> {
-            panic!("a local read transfers into the sink, it does not reply with bytes")
         }
         fn read_into(
             &mut self,
@@ -1397,12 +1094,13 @@ mod tests {
             self.0.push("close");
             Ok(())
         }
+
+        host_unexpected!(read_at);
     }
     impl Clock for OutputTestFiles {
         type Error = &'static str;
-        fn now_ns(&mut self) -> Result<i64, Self::Error> {
-            panic!("unexpected clock")
-        }
+
+        host_unexpected!(now_ns);
     }
     struct FailingOutput {
         host: Option<bool>,
@@ -1435,14 +1133,6 @@ mod tests {
     }
     #[test]
     fn output_failures_resume_lean_and_close_before_termination() {
-        unsafe extern "C" {
-            fn synch_adapter_operation_read(
-                root: Slice,
-                all: u8,
-                offset: u64,
-                length: u64,
-            ) -> *mut c_void;
-        }
         for host in [Some(true), Some(false), None] {
             let mut storage = Script::default();
             let mut files = OutputTestFiles(vec![]);
@@ -1453,13 +1143,20 @@ mod tests {
                 grown: 0,
                 shrunk: 0,
             };
-            // SAFETY: the runner initializes this thread before the adapter
-            // copies its input and returns a fresh owned read continuation.
-            let result = unsafe {
-                run_read(&mut storage, &mut files, &mut clock, &mut output, || {
-                    synch_adapter_operation_read([7; 32].as_slice().into(), 1, 0, 0)
-                })
-            };
+            let result = run(
+                &mut storage,
+                Capabilities {
+                    files: Some(&mut files),
+                    clock: Some(&mut clock),
+                    output: Some(&mut output),
+                    ..Capabilities::default()
+                },
+                &[],
+                &Command::Read {
+                    root: vec![7; 32],
+                    range: None,
+                },
+            );
             match host {
                 Some(true) => assert!(matches!(result, Err(OperationError::Host("sink")))),
                 Some(false) => assert!(matches!(result, Err(OperationError::Protocol))),
@@ -1488,9 +1185,6 @@ mod tests {
         fn open(&mut self, _: &str, _: &[u8]) -> Result<u64, FileFailure<Self::Error>> {
             Ok(9)
         }
-        fn read_at(&mut self, _: u64, _: u64, _: u64) -> Result<Vec<u8>, FileFailure<Self::Error>> {
-            panic!("unexpected read")
-        }
         fn read_into(
             &mut self,
             _: u64,
@@ -1506,6 +1200,8 @@ mod tests {
         fn close(&mut self, _: u64) -> Result<(), Self::Error> {
             Ok(())
         }
+
+        host_unexpected!(read_at);
     }
     #[test]
     fn failed_transfer_takes_back_the_grown_tail() {
@@ -1560,7 +1256,7 @@ mod tests {
         word(&mut snapshot, 1);
         bytes(&mut snapshot, b"value");
         match decode(&snapshot).unwrap() {
-            Frame::Access(AccessFrame::Snapshot(selection, columns)) => {
+            Frame::Snapshot(selection, columns) => {
                 assert_eq!(selection.relation, "raw_table");
                 assert_eq!(selection.equals, [("id".into(), Cell::Blob(vec![0, 255]))]);
                 assert_eq!(selection.like_any, [("name".into(), "prefix/%".into())]);
@@ -1575,10 +1271,7 @@ mod tests {
         word(&mut update, 1);
         bytes(&mut update, b"value");
         cell(&mut update, &Cell::Integer(i64::MIN));
-        assert!(matches!(
-            decode(&update),
-            Ok(Frame::Access(AccessFrame::Update(9, _, _)))
-        ));
+        assert!(matches!(decode(&update), Ok(Frame::Update(9, _, _))));
         packets.push(update);
         let mut copy = vec![1, 31];
         word(&mut copy, 9);
@@ -1595,7 +1288,7 @@ mod tests {
         word(&mut copy, 1);
         bytes(&mut copy, b"literal");
         match decode(&copy).unwrap() {
-            Frame::Access(AccessFrame::CopyRows(9, target, _, values, conflicts)) => {
+            Frame::CopyRows(9, target, _, values, conflicts) => {
                 assert_eq!(target, "destination");
                 assert_eq!(
                     values,
@@ -1621,10 +1314,7 @@ mod tests {
         let mut delete = vec![1, 32];
         word(&mut delete, 9);
         selection_packet(&mut delete);
-        assert!(matches!(
-            decode(&delete),
-            Ok(Frame::Access(AccessFrame::DeleteSelected(9, _)))
-        ));
+        assert!(matches!(decode(&delete), Ok(Frame::Delete(9, _))));
         packets.push(delete);
         let mut open = vec![1, 33];
         bytes(&mut open, b"files");
@@ -1650,7 +1340,7 @@ mod tests {
             Ok(Frame::Transfer(42, u64::MAX, 65536))
         ));
         packets.push(transfer);
-        assert!(matches!(decode(&[1, 36]), Ok(Frame::Now)));
+        assert!(matches!(decode(&[1, 36]), Ok(Frame::NowNs)));
         packets.push(vec![1, 36]);
         for mut packet in packets {
             for length in 0..packet.len() {
@@ -1821,14 +1511,6 @@ mod tests {
         delete.push(0);
         assert!(decode(&delete).is_err());
     }
-    unsafe extern "C" {
-        fn synch_adapter_operation_acquire(
-            root: Slice,
-            holder: Slice,
-            now: u64,
-            possession: u8,
-        ) -> *mut c_void;
-    }
 
     #[derive(Default)]
     struct Script {
@@ -1865,9 +1547,6 @@ mod tests {
         }
 
         type Error = &'static str;
-        fn exists_rows(&mut self, _: u64, _: &str, _: &Fields) -> Result<bool, Self::Error> {
-            panic!("unexpected existence query")
-        }
         fn begin(&mut self) -> Result<u64, Self::Error> {
             self.step("begin")?;
             Ok(42)
@@ -1941,9 +1620,27 @@ mod tests {
             self.step("delete")?;
             Ok(1)
         }
-        fn read_bytes(&mut self, _: &str, _: &[u8]) -> Result<Option<Vec<u8>>, Self::Error> {
-            panic!("unexpected byte read")
+        fn snapshot(
+            &mut self,
+            _: &Selection,
+            _: &[String],
+        ) -> Result<Scan<Self::Error>, Self::Error> {
+            self.step("snapshot")?;
+            Ok(Scan {
+                rows: vec![vec![
+                    Cell::Blob(vec![7; 32]),
+                    Cell::Integer(65540),
+                    Cell::Integer(1),
+                    Cell::Null,
+                    Cell::Null,
+                    Cell::Integer(0),
+                    Cell::Integer(1),
+                ]],
+                failure: None,
+            })
         }
+
+        host_unexpected!(exists_rows, read_bytes, update, copy_rows, delete, write);
     }
 
     #[test]
@@ -1983,15 +1680,15 @@ mod tests {
 
     fn state() -> Handle {
         crate::native::enter();
-        // SAFETY: initialized thread, adapter copies slices and returns owned state.
-        Handle::new(unsafe {
-            synch_adapter_operation_acquire(
-                [9; 32].as_slice().into(),
-                b"holder".as_slice().into(),
-                0,
-                1,
-            )
-        })
+        // SAFETY: initialized thread; the adapter copies the packet and returns owned state.
+        unsafe {
+            start(&Command::Acquire {
+                root: vec![9; 32],
+                holder: "holder".into(),
+                now: 0,
+                possession: true,
+            })
+        }
     }
 
     #[test]

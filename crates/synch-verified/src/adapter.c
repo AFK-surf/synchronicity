@@ -31,58 +31,21 @@ static lean_object *bytes(synch_slice slice) {
     return result;
 }
 
-extern lean_object *synch_lean_cas_acquire(lean_object *, lean_object *, uint64_t, uint8_t);
-extern lean_object *synch_lean_cas_delete(lean_object *, uint8_t, uint64_t);
-extern lean_object *synch_lean_cas_unpin(lean_object *, lean_object *, uint8_t);
-extern lean_object *synch_lean_cas_expire(lean_object *, uint8_t, uint64_t);
-extern lean_object *synch_lean_cas_read(lean_object *, uint8_t, uint64_t, uint64_t);
-extern lean_object *synch_lean_cas_ingest(uint8_t, uint64_t, uint64_t, uint8_t, uint8_t);
-extern lean_object *synch_lean_trie_get(lean_object *, uint64_t);
-extern lean_object *synch_lean_history_prune(lean_object *, uint64_t);
+extern lean_object *synch_lean_start(lean_object *);
 extern lean_object *synch_lean_operation_packet(lean_object *);
 extern lean_object *synch_lean_operation_resume(lean_object *, lean_object *);
 
-/* Operation handles are private, synchronous and thread-confined. Packet
- * inspection borrows a state reference; resume consumes one owned reference.
- * No continuation is interpreted by Rust. */
-void *synch_adapter_operation_acquire(synch_slice root, synch_slice holder,
-                                     uint64_t now, uint8_t possession) {
-    return synch_lean_cas_acquire(bytes(root), bytes(holder), now, possession);
-}
-
-void *synch_adapter_operation_delete(synch_slice root, uint8_t has_before, uint64_t before) {
-    return synch_lean_cas_delete(bytes(root), has_before, before);
-}
-
-void *synch_adapter_operation_unpin(synch_slice root, synch_slice payload, uint8_t kind) {
-    return synch_lean_cas_unpin(bytes(root), bytes(payload), kind);
-}
-
-void *synch_adapter_operation_expire(synch_slice payload, uint8_t kind, uint64_t now) {
-    return synch_lean_cas_expire(bytes(payload), kind, now);
-}
-
-void *synch_adapter_operation_read(synch_slice root, uint8_t all,
-                                  uint64_t offset, uint64_t length) {
-    return synch_lean_cas_read(bytes(root), all, offset, length);
-}
-
-void *synch_adapter_operation_ingest(uint8_t kind, uint64_t size, int64_t now,
-                                    uint8_t cache, uint8_t allow_unsupported) {
-    return synch_lean_cas_ingest(kind, size, (uint64_t)now, cache, allow_unsupported);
+/* One entry point: the command packet is decoded in Lean. Operation handles
+ * are private, synchronous and thread-confined. Packet inspection borrows a
+ * state reference; resume consumes one owned reference. No continuation is
+ * interpreted by Rust. */
+void *synch_adapter_start(synch_slice command) {
+    return synch_lean_start(bytes(command));
 }
 
 void *synch_adapter_operation_packet(void *state) {
     lean_inc((lean_object *)state);
     return synch_lean_operation_packet((lean_object *)state);
-}
-
-void *synch_adapter_operation_trie_get(synch_slice root, uint64_t key_size) {
-    return synch_lean_trie_get(bytes(root), key_size);
-}
-
-void *synch_adapter_operation_history_prune(synch_slice origin, uint64_t before) {
-    return synch_lean_history_prune(bytes(origin), before);
 }
 
 void *synch_adapter_operation_resume(void *state, synch_slice reply) {
@@ -91,7 +54,6 @@ void *synch_adapter_operation_resume(void *state, synch_slice reply) {
      * while applying it, since that forces avoidable copy-on-write buffers. */
     return synch_lean_operation_resume((lean_object *)state, bytes(reply));
 }
-
 
 void synch_adapter_object_drop(void *value) { lean_dec((lean_object *)value); }
 size_t synch_adapter_bytes_len(void *value) { return lean_sarray_size((lean_object *)value); }

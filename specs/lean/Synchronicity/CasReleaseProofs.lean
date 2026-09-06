@@ -20,7 +20,6 @@ def mutation (tx : Transaction) (root : ByteArray) (holder : PinHolder) : Event 
 
 /-- There are no metadata reads or secondary mutations: the single DELETE
 carries the guard, and its affected-row count is returned only after commit. -/
-@[rust_impl "cas-release-operation"]
 theorem successful_execution (tx : Transaction) (root : ByteArray)
     (holder : PinHolder) (count : Nat) :
     run { begin := .ok tx, delete := .ok count } root holder =
@@ -84,5 +83,3 @@ theorem commit_failure (tx : Transaction) (failure : Failure) (rollback : Reply 
       (.error failure, [.begin, mutation tx root holder, .commit tx, .rollback tx]) := rfl
 
 end Synchronicity.CasReleaseProofs
-
-#lint

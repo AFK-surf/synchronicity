@@ -400,79 +400,6 @@ impl BlobRow {
     }
 }
 
-/// What a size claim settled to, and what that costs the bits already held.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
-pub(crate) struct Settlement {
-    /// The size the row should record.
-    pub(crate) size: u64,
-    /// True when the recorded size changed the object's *group count*, so the
-    /// verified-group bitmap describes a tree that is no longer the one being
-    /// written and must be started again.
-    pub(crate) reset_held: bool,
-}
-
-/// Decides the size an object's row should record when a writer arrives
-/// claiming `claimed`, or refuses the writer.
-///
-/// Three answers, and the order matters:
-///
-/// 1. A size the disk attests to (complete or final-group-held) is a fact, and a writer
-///    offering a different one is offering bytes for some other object: refused.
-/// 2. A size no group attests to is a peer's claim off an entry, and yields to
-///    this writer's — that is what keeps an overstated entry from bricking an
-///    honest root forever (§5.1, §6.2).
-/// 3. It yields *completely*, including the bits already held.
-///
-/// Rule 3 does *not* refuse a claim that changes the object's group count
-/// while a group is held. The tempting reasoning — a changed count changes the
-/// shape of the tree, so no slice for it could have verified — is wrong, and
-/// inverts the rule it would be protecting. bao splits at the largest
-/// power of two below the chunk count, so every size in one bracket shares a
-/// left subtree: 20 groups and 24 groups both split at 16, and a slice covering
-/// groups 0..16 verifies identically under either — the right sibling's
-/// chaining value is opaque bytes from the encoder that join to the same root.
-/// An entry overstating the size within its bracket therefore produced a row
-/// that verified, held real bits, and refused every honest writer of that root
-/// for good: exactly the brick rule 2 exists to prevent, reached through rule 3.
-///
-/// So bits set under a size nothing attests to are themselves only a claim. A
-/// writer offering a different size takes the row, and if the group count moves
-/// the bitmap starts again — a re-fetch, which is cheap next to an object no
-/// one can ever complete. Rule 1 is what stops this churning: the first writer
-/// to hold the final group settles the size permanently, because that is the
-/// one group whose chaining value a wrong size cannot survive.
-///
-/// The decision belongs inside the transaction that writes the row. Read
-/// outside it, rule 1 is a check against a snapshot: an honest writer finishing
-/// an object could see "not attested yet", and a claim of a different size
-/// could land between the look and the commit, leaving the row complete under a
-/// size no byte on the disk supports — attested from then on, unreadable, and
-/// refusing every honest writer for good (`docs/DELTA-SYNC.md` §6).
-pub(crate) fn settle_size(
-    root: &Hash,
-    existing: Option<(u64, bool, bool, &ChunkRanges)>,
-    claimed: u64,
-) -> Result<Settlement> {
-    let Some((recorded, complete, durable, held)) = existing else {
-        return Ok(Settlement {
-            size: claimed,
-            reset_held: false,
-        });
-    };
-    // Only complete or final-group evidence attests the recorded size; every
-    // earlier group can verify for multiple lengths in the same tree shape.
-    if recorded != claimed && (durable || complete || held.contains(group_count(recorded) - 1)) {
-        return Err(StoreError::Verification {
-            root: *root,
-            reason: format!("size mismatch: have {recorded}, offered {claimed}"),
-        });
-    }
-    Ok(Settlement {
-        size: claimed,
-        reset_held: group_count(recorded) != group_count(claimed),
-    })
-}
-
 /// What a bitmap commit settled.
 #[derive(Debug, Clone, Copy)]
 pub(crate) struct Commit {
@@ -480,14 +407,6 @@ pub(crate) struct Commit {
     pub(crate) size: u64,
     /// True if every group of the object is present.
     pub(crate) complete: bool,
-}
-
-/// What an object's row already claims, as the commit path needs it.
-struct RowClaim {
-    size: u64,
-    complete: bool,
-    durable: bool,
-    held: ChunkRanges,
 }
 
 /// Extends a file to at least `len`, and never shortens it.
@@ -569,82 +488,6 @@ pub(crate) fn bitmap_to_ranges(bits: &[u8], groups: u64) -> ChunkRanges {
         ranges.push(GroupRange::new(s, groups));
     }
     ChunkRanges::from_ranges(ranges)
-}
-
-/// Writes an object's index row, creating it or replacing what it claimed.
-struct BlobRowWrite<'a> {
-    root: &'a Hash,
-    size: u64,
-    complete: bool,
-    bitmap: Option<Vec<u8>>,
-    inline: Option<Vec<u8>>,
-    now: i64,
-    durable: bool,
-}
-
-fn upsert_blob_row(conn: &rusqlite::Connection, row: BlobRowWrite<'_>) -> Result<()> {
-    let BlobRowWrite {
-        root,
-        size,
-        complete,
-        bitmap,
-        inline,
-        now,
-        durable,
-    } = row;
-    conn.execute(
-        "INSERT INTO blobs
-           (root, size, complete, bitmap, inline, last_access, durable)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
-         ON CONFLICT(root) DO UPDATE SET
-           size = excluded.size,
-           complete = excluded.complete,
-           bitmap = excluded.bitmap,
-           inline = COALESCE(excluded.inline, blobs.inline),
-           last_access = excluded.last_access,
-           durable = max(blobs.durable, excluded.durable)",
-        params![
-            root.as_bytes().to_vec(),
-            size as i64,
-            complete as i64,
-            bitmap,
-            inline,
-            now,
-            (complete && durable) as i64
-        ],
-    )?;
-    Ok(())
-}
-
-/// What an object's row currently claims, read on a given connection.
-///
-/// Interpret the bitmap against the recorded size before settling a new claim.
-fn read_claim(conn: &rusqlite::Connection, root: &Hash) -> Result<Option<RowClaim>> {
-    let row: Option<(i64, i64, i64, Option<Vec<u8>>)> = conn
-        .query_row(
-            "SELECT size, complete, durable, bitmap FROM blobs WHERE root = ?1",
-            params![root.as_bytes().to_vec()],
-            |row| Ok((row.get(0)?, row.get(1)?, row.get(2)?, row.get(3)?)),
-        )
-        .optional()?;
-    Ok(row.map(|(size, complete, durable, bitmap)| {
-        let size = size as u64;
-        let complete = complete != 0;
-        let held = if complete {
-            ChunkRanges::single(0, group_count(size))
-        } else {
-            bitmap
-                .as_deref()
-                .map(|bytes| blob_to_ranges(bytes, group_count(size)))
-                .unwrap_or_default()
-        };
-        RowClaim {
-            size,
-            complete,
-            durable: durable != 0,
-            held,
-        }
-    }))
 }
 
 /// Converts our group ranges into bao chunk ranges.
@@ -742,27 +585,13 @@ impl Store {
     /// Two writers of one root is the ordinary case rather than an exotic one:
     /// checkout reconciliation, a `synch cat` and the gateway's range read all resolve to
     /// the same content, and a promotion commits a whole span in a single step.
-    /// Reading the bitmap, unioning, and writing it back as three separate
-    /// statements loses one of two interleaved writers' progress every time —
-    /// harmlessly, because bits only ever grow and the bytes are already on the
-    /// disk, but the groups it dropped are then fetched all over again, and a
-    /// promotion's share of that loss is a whole span rather than a slice.
-    ///
-    /// So the read, the union and the write happen inside one transaction on
-    /// the store's single connection. The expensive part — decoding, hashing,
-    /// copying, fsyncing — stays outside it, as it must: this is a row update,
-    /// not a lock over the file IO that earned it.
-    ///
-    /// The **size** decision is made in here too, and for the same reason
-    /// ([`settle_size`]). Deciding whether a writer's claimed length may stand
-    /// is a read of the row followed by a write of it, and every committer used
-    /// to make that decision on its own snapshot before doing the work: two
-    /// writers of one root — the honest one finishing the object, the other
-    /// carrying a size a hundred bytes long off a peer's entry — could each see
-    /// an unattested row and each go ahead, and whichever committed second left
-    /// the row complete under a size no byte on the disk supports. Attested from
-    /// then on, unreadable, refusing every honest writer, and pinned against the
-    /// collector by the entry that named it. One decision, one transaction.
+    /// So the read, the settlement, the union and the write happen inside one
+    /// transaction, and the expensive part (decoding, hashing, copying,
+    /// fsyncing) stays outside it. The Lean commit owns that decision: the
+    /// offered size is settled against the row's claim, a claim only a
+    /// complete, durable or final-group-holding row can refuse; a changed
+    /// tree shape resets an unattested bitmap; and the merged groups are
+    /// written as ranges, `NULL` when there are none or all.
     pub(crate) fn commit_groups(
         &self,
         root: &Hash,
@@ -771,51 +600,15 @@ impl Store {
         inline: Option<Vec<u8>>,
         now: i64,
     ) -> Result<Commit> {
-        self.with_immediate_tx(|tx| {
-            let claim = read_claim(tx, root)?;
-            let settlement = settle_size(
-                root,
-                claim
-                    .as_ref()
-                    .map(|c| (c.size, c.complete, c.durable, &c.held)),
-                size,
-            )?;
-            let size = settlement.size;
-            let total = group_count(size);
-            // A changed tree shape invalidates only an unattested bitmap.
-            let held = match (settlement.reset_held, claim) {
-                (false, Some(claim)) => claim.held,
-                _ => ChunkRanges::empty(),
-            };
-            // Normalize even malformed incoming ranges before deciding coverage;
-            // runtime and memory depend on runs, never on the claimed byte size.
-            let verified = ChunkRanges::from_ranges(
-                held.ranges
-                    .iter()
-                    .chain(&groups.ranges)
-                    .map(|r| GroupRange::new(r.start, r.end.min(total))),
-            );
-            let complete = verified.covers(0, total);
-            let durable = self.complete_is_durable();
-            upsert_blob_row(
-                tx,
-                BlobRowWrite {
-                    root,
-                    size,
-                    complete,
-                    // `NULL` is the canonical spelling of "no verified
-                    // groups".  Besides saving an allocation, the missing-
-                    // durable heal uses that spelling to distinguish a cold
-                    // row with no cache payload from a partial cache worth
-                    // retaining.
-                    bitmap: (!complete && !verified.is_empty()).then(|| ranges_to_blob(&verified)),
-                    inline,
-                    now,
-                    durable,
-                },
-            )?;
-            Ok(Commit { size, complete })
-        })
+        crate::lean_ingest::commit_groups(self, root, size, groups, inline, now)
+    }
+
+    /// The cheap refusal of a size the row's claim cannot yield to, decided
+    /// by the same Lean settlement outside a transaction, so a writer never
+    /// decodes bytes (and writes an outboard of the wrong shape) against a
+    /// claim the commit would refuse anyway.
+    pub(crate) fn admit_size(&self, root: &Hash, size: u64) -> Result<()> {
+        crate::lean_ingest::admit_size(self, root, size)
     }
 
     /// Shortens an object's payload and outboard to the size a commit settled.
@@ -941,7 +734,6 @@ impl Store {
     /// Reconstructs a cold durable row after metadata restore, once the remote
     /// backend has confirmed that the final payload/outboard pair exists.
     pub(crate) fn adopt_durable_blob(&self, root: &Hash, size: u64, now: i64) -> Result<()> {
-        // LEAN-MODEL: cas-adopt-durable (Cas.AdoptRemote)
         // `Cas.AdoptRemote` is this row creation from a remote pair
         // the backend has just confirmed; it only ever adds availability.
         self.with_immediate_tx(|tx| {
@@ -979,7 +771,6 @@ impl Store {
     /// The durable claim is withdrawn. A row with no verified cache bytes is
     /// removed altogether; otherwise it remains a partial peer-fetched cache.
     pub(crate) fn heal_missing_durable_blob(&self, root: &Hash) -> Result<bool> {
-        // LEAN-MODEL: cas-heal-missing-durable (FaultTolerant.HealRemote)
         // `FaultTolerant.HealRemote` is this transaction: the durable claim is
         // withdrawn, role pins become wants, the operator's pin is left alone.
         // The backend losing the object is the environment step before it.
@@ -1104,7 +895,6 @@ impl Store {
     /// claim. The row changes first, so a crash can leave only harmless orphan
     /// files, never a warm-cache claim with missing bytes.
     pub(crate) fn clear_blob_cache(&self, root: &Hash) -> Result<bool> {
-        // LEAN-MODEL: cas-cache-evict (Cas.CacheEvict)
         // `Cas.CacheEvict` retains remote durability when local cache
         // bytes disappear; callers select durable cache rows.
         let conn = self.conn();
@@ -1112,7 +902,6 @@ impl Store {
         if self.is_being_written(root) {
             return Ok(false);
         }
-        // LEAN-MODEL: cas-drop-staged-row (Cas.DropStaged)
         // `Cas.DropStaged` is this row removal of a non-durable cache
         // claim, and the same transition behind `reconcile_scratch_generation`
         // and the `commit_cas_migration` discard. None of the three consults
@@ -1284,7 +1073,6 @@ impl Store {
         let mut storage = crate::lean_storage::SqliteStorage::new(&conn);
         // Lean requests begin before reading metadata and owns every normal
         // completion/failure path. Rust holds host resources, not policy facts.
-        // LEAN-MODEL: cas-lifecycle-acquisition (CasProgramProofs.execution_authorized)
         acquire(
             &mut storage,
             root.as_bytes(),
@@ -1308,13 +1096,12 @@ impl Store {
         use synch_verified::cas::{unpin, OperationError, PinHolder as Holder};
         let holder = match holder {
             PinHolder::Operator => Holder::Operator,
-            PinHolder::Source(space) => Holder::Source(space),
-            PinHolder::Replica(space) => Holder::Replica(space),
-            PinHolder::Other(text) => Holder::Other(text),
+            PinHolder::Source(space) => Holder::Source(space.clone()),
+            PinHolder::Replica(space) => Holder::Replica(space.clone()),
+            PinHolder::Other(text) => Holder::Other(text.clone()),
         };
         self.with_connection_scope(|conn| {
             let mut storage = crate::lean_storage::SqliteStorage::new(conn);
-            // LEAN-MODEL: cas-release-operation (CasReleaseProofs.successful_execution)
             unpin(&mut storage, root.as_bytes(), holder).map_err(|error| match error {
                 OperationError::Host(error) => error,
                 OperationError::MalformedMetadata(_) | OperationError::Protocol => {
@@ -1366,13 +1153,12 @@ impl Store {
         use synch_verified::cas::{expire, OperationError, PinHolder as Holder};
         let holder = holder.map(|holder| match holder {
             PinHolder::Operator => Holder::Operator,
-            PinHolder::Source(space) => Holder::Source(space),
-            PinHolder::Replica(space) => Holder::Replica(space),
-            PinHolder::Other(text) => Holder::Other(text),
+            PinHolder::Source(space) => Holder::Source(space.clone()),
+            PinHolder::Replica(space) => Holder::Replica(space.clone()),
+            PinHolder::Other(text) => Holder::Other(text.clone()),
         });
         self.with_connection_scope(|conn| {
             let mut storage = crate::lean_storage::SqliteStorage::new(conn);
-            // LEAN-MODEL: cas-expiry-operation (CasExpiryProofs.successful_execution)
             let count = expire(&mut storage, holder, now).map_err(|error| match error {
                 OperationError::Host(error) => error,
                 OperationError::MalformedMetadata(_) | OperationError::Protocol => {
@@ -1497,7 +1283,7 @@ impl Store {
             Outcome::Writing => Err(StoreError::invalid(format!(
                 "blob {root} is being written and cannot be deleted"
             ))),
-            Outcome::Protected => Err(StoreError::invalid(format!(
+            Outcome::ProtectedClaim => Err(StoreError::invalid(format!(
                 "blob {root} is referenced or pinned and cannot be deleted"
             ))),
             Outcome::Applied => Ok(()),
@@ -1518,7 +1304,6 @@ impl Store {
         let _ordered_against_writers = self.cas_order();
         let mut storage = crate::lean_storage::SqliteStorage::new(&conn);
         let mut resources = crate::lean_storage::Resources(self);
-        // LEAN-MODEL: cas-lifecycle-deletion (CasLifecycleProofs.executed_deletion_authorized)
         delete(&mut storage, &mut resources, root.as_bytes(), before).map_err(|error| {
             crate::lean_diagnostics::lifecycle_error(error, "invalid CAS deletion metadata")
         })
@@ -1692,16 +1477,9 @@ impl Store {
         }
 
         let _lease = self.lease_write(root);
-        if let Some(row) = self.blob(root)? {
-            let held = row.verified_groups();
-            settle_size(
-                root,
-                Some((row.size, row.complete, row.durable, &held)),
-                size,
-            )?;
-            if row.complete {
-                return Ok(ChunkRanges::empty());
-            }
+        self.admit_size(root, size)?;
+        if self.blob(root)?.is_some_and(|row| row.complete) {
+            return Ok(ChunkRanges::empty());
         }
 
         if size <= INLINE_BLOB_MAX {
@@ -1759,20 +1537,13 @@ impl Store {
         let bao_ranges = to_bao_ranges(&served);
         let root_hash = blake3::Hash::from_bytes(root.0);
 
+        // The cheap refusal; the commit decides again, transactionally. This
+        // one is here so a claim that cannot possibly stand never reaches the
+        // disk at all.
+        self.admit_size(root, size)?;
         let existing = self.blob(root)?;
-        if let Some(row) = &existing {
-            // The cheap refusal. [`settle_size`] decides again, transactionally,
-            // at the commit — this one is here so a claim that cannot possibly
-            // stand never reaches the disk at all.
-            let held = row.verified_groups();
-            settle_size(
-                root,
-                Some((row.size, row.complete, row.durable, &held)),
-                size,
-            )?;
-            if row.complete {
-                return Ok(ChunkRanges::empty());
-            }
+        if existing.as_ref().is_some_and(|row| row.complete) {
+            return Ok(ChunkRanges::empty());
         }
 
         // Small objects are decoded in memory and inlined; larger ones stream
@@ -1853,7 +1624,6 @@ impl Store {
             reason: e.to_string(),
         })?;
 
-        // LEAN-MODEL: cas-verified-groups-flush (Ingestion.Flush)
         // Persist the verified groups (payload and outboard) before the bitmap
         // in the index advances to cover them — otherwise a crash could leave
         // the index claiming groups the disk never received.
@@ -2794,36 +2564,77 @@ mod tests {
         }
     }
 
+    /// Seeds a row the way a writer left it, bypassing the commit path.
+    fn seed_claim(
+        store: &Store,
+        root: &Hash,
+        size: u64,
+        complete: bool,
+        durable: bool,
+        held: &[(u64, u64)],
+    ) {
+        store
+            .conn()
+            .execute(
+                "INSERT OR REPLACE INTO blobs (root, size, complete, durable, bitmap, last_access)
+                 VALUES (?1, ?2, ?3, ?4, ?5, 0)",
+                params![
+                    root.as_bytes().to_vec(),
+                    size as i64,
+                    complete,
+                    durable,
+                    postcard::to_stdvec(held).unwrap()
+                ],
+            )
+            .unwrap();
+    }
+
     #[test]
     fn partial_size_settlement_only_replaces_unattested_claims() {
+        let (_d, store) = store();
         let root = Hash::new(b"settlement cases");
         let recorded = 4 * CHUNK_GROUP_SIZE;
-        let prefix = ChunkRanges::single(0, 1);
-        let final_group = ChunkRanges::single(3, 4);
+        let prefix = [(0, 1)];
+        let final_group = [(3, 4)];
+        assert!(
+            store.admit_size(&root, recorded).is_ok(),
+            "no row admits any size"
+        );
         for (complete, durable, held) in [
-            (true, false, &prefix),
-            (false, true, &prefix),
-            (false, false, &final_group),
+            (true, false, &prefix[..]),
+            (false, true, &prefix[..]),
+            (false, false, &final_group[..]),
         ] {
-            assert!(
-                settle_size(&root, Some((recorded, complete, durable, held)), recorded).is_ok()
-            );
+            seed_claim(&store, &root, recorded, complete, durable, held);
+            assert!(store.admit_size(&root, recorded).is_ok());
             assert!(matches!(
-                settle_size(
-                    &root,
-                    Some((recorded, complete, durable, held)),
-                    recorded - 1
-                ),
+                store.admit_size(&root, recorded - 1),
                 Err(StoreError::Verification { .. })
             ));
         }
-        let same_shape =
-            settle_size(&root, Some((recorded, false, false, &prefix)), recorded - 1).unwrap();
-        assert!(!same_shape.reset_held);
-        let changed_shape =
-            settle_size(&root, Some((recorded, false, false, &prefix)), recorded + 1).unwrap();
-        assert!(changed_shape.reset_held);
+        // An unattested claim yields: the same tree shape keeps its bits and a
+        // changed one starts over.
+        seed_claim(&store, &root, recorded, false, false, &prefix);
+        store.admit_size(&root, recorded - 1).unwrap();
+        let same_shape = store
+            .commit_groups(&root, recorded - 1, &ChunkRanges::empty(), None, 0)
+            .unwrap();
+        assert_eq!(same_shape.size, recorded - 1);
+        assert_eq!(
+            store.blob(&root).unwrap().unwrap().verified_groups(),
+            ChunkRanges::single(0, 1)
+        );
+        store.admit_size(&root, recorded + 1).unwrap();
+        let changed_shape = store
+            .commit_groups(&root, recorded + 1, &ChunkRanges::empty(), None, 0)
+            .unwrap();
         assert_eq!(changed_shape.size, recorded + 1);
+        assert!(store
+            .blob(&root)
+            .unwrap()
+            .unwrap()
+            .verified_groups()
+            .is_empty());
     }
 
     #[test]
@@ -2865,20 +2676,29 @@ mod tests {
     proptest::proptest! {
         #[test]
         fn partial_settlement_matches_the_integer_contract(
-            recorded in proptest::prelude::any::<u64>(), claimed in proptest::prelude::any::<u64>(),
-            row in proptest::prelude::any::<bool>(), durable in proptest::prelude::any::<bool>(),
-            complete in proptest::prelude::any::<bool>(), final_held in proptest::prelude::any::<bool>(),
+            row in proptest::prelude::any::<bool>(), durable in proptest::prelude::any::<bool>(), complete in proptest::prelude::any::<bool>(),
+            final_held in proptest::prelude::any::<bool>(), recorded in 0u64..(128 * CHUNK_GROUP_SIZE), claimed in 0u64..(128 * CHUNK_GROUP_SIZE),
         ) {
             let count = |size: u64| u128::from(size).div_ceil(u128::from(CHUNK_GROUP_SIZE)).max(1) as u64;
             proptest::prop_assert_eq!(group_count(recorded), count(recorded));
-            let held = if final_held { ChunkRanges::single(count(recorded) - 1, count(recorded)) } else { ChunkRanges::empty() };
-            let actual = settle_size(&Hash::new(b"property"), row.then_some((recorded, complete, durable, &held)), claimed);
+            let (_d, store) = store();
+            let root = Hash::new(b"property");
+            if row {
+                let held: &[(u64, u64)] = if final_held { &[(count(recorded) - 1, count(recorded))] } else { &[] };
+                seed_claim(&store, &root, recorded, complete, durable, held);
+            }
+            let admitted = store.admit_size(&root, claimed);
+            let actual = store.commit_groups(&root, claimed, &ChunkRanges::empty(), None, 0);
             if row && recorded != claimed && (durable || complete || final_held) {
+                proptest::prop_assert!(admitted.is_err());
                 proptest::prop_assert!(actual.is_err());
             } else {
+                proptest::prop_assert!(admitted.is_ok());
                 let actual = actual.unwrap();
                 proptest::prop_assert_eq!(actual.size, claimed);
-                proptest::prop_assert_eq!(actual.reset_held, row && count(recorded) != count(claimed));
+                let reset = row && count(recorded) != count(claimed);
+                let kept = store.blob(&root).unwrap().unwrap().verified_groups();
+                proptest::prop_assert_eq!(kept.is_empty(), reset || !(row && (final_held || complete)));
             }
         }
 
@@ -3007,12 +2827,12 @@ mod tests {
         }
     }
 
-    /// An ingest is a writer like any other and meets `settle_size`: a claim
+    /// An ingest is a writer like any other and meets the size settlement: a claim
     /// a partial fetch left behind under a size nothing attests to yields to
     /// the ingest, bitmap and all, and the object is complete at the length
     /// its bytes have. A size the disk attests to is never rewritten, not
     /// even by the writer that hashed the bytes — the only way the two can
-    /// disagree is a root two objects share (`Cas.settled_size_is_stable`).
+    /// disagree is a root two objects share (`CasPlanProofs.settlement_accepts_iff`).
     #[test]
     fn an_ingest_settles_size_like_any_other_writer() {
         let (_d1, provider) = store();

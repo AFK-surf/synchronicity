@@ -1,208 +1,127 @@
 import VerifiedCore.Host.Wire
+import VerifiedCore.Commands
+import VerifiedCore.Commands.Generated
 import VerifiedCore.Cas.Program
 import VerifiedCore.Cas.Read
 import VerifiedCore.Cas.Input
 import VerifiedCore.Trie.Program
 import VerifiedCore.Replication.History
 
-/-! Domain command constructors. The transport itself imports no domain policy. -/
+/-! The one native entry point. A command arrives as a packet, decoded with
+the generated codec of `Commands.Command`; it runs as a whole Lean operation
+over the native effect algebra; and its outcome leaves as a terminal encoded
+with the generated codec of its outcome type. What remains here is the
+domain-to-outcome mapping: which of an operation's errors are the host's own,
+which are protocol violations, and which are the command's to report. -/
 namespace VerifiedCore.Entry
+open Host.Wire Commands
 
-private def ingestWriteEffect (effect : Host.Wire.WriteEffects A) : Host.Wire.NativeEffects A :=
-  .right (.right (.right (.right (.right (.right effect)))))
+abbrev Native := Host.Wire.NativeState
 
-private def ingestEffect (effect : Cas.Input.Effects A) : Host.Wire.NativeEffects A :=
-  match effect with
-  | .right source => ingestWriteEffect (.right (.right (.right (.right source))))
-  | .left effect => match effect with
-    | .left effect => match effect with
-      | .left file => .right (.right (.right (.left file)))
-      | .right construct => ingestWriteEffect (.left construct)
-    | .right effect => match effect with
-      | .left effect => match effect with
-        | .left storage => .left storage
-        | .right upsert => ingestWriteEffect (.right (.left upsert))
-      | .right effect => match effect with
-        | .left files => ingestWriteEffect (.right (.right (.left files)))
-        | .right lease => ingestWriteEffect (.right (.right (.right (.left lease))))
+/-- Run an operation over the native algebra and finish with its terminal. -/
+def command (operation : Host.OperationOver E ε A) [Host.Inject E Host.Wire.NativeEffects]
+    (finish : Except ε A → Host.Reply ByteArray) : Native := do
+  let result ← operation.run.mapEffects Host.Inject.inject
+  return finish result
 
-/-- One column-type terminal, framed the same way by every CAS operation:
-the projection index, the column name and the observed storage class. -/
-private def columnTypeTerminal (tag : UInt8) (index : Nat) (column : String)
-    (actual : Cas.Codec.CellType) : ByteArray :=
-  Host.Wire.octet tag ++ Host.Wire.word index.toUInt64 ++ Host.Wire.string column ++
-    Host.Wire.octet (match actual with
-      | .null => 0 | .integer => 1 | .real => 2 | .text => 3 | .blob => 4)
+/-- A value the caller decodes as is. -/
+def terminalOf [Encode A] (value : A) : Host.Reply ByteArray := .ok (terminal value)
 
-private def ingestMetadataError : Cas.IngestCommit.Error → Host.Reply ByteArray
-  | .host failure => .error failure
-  | .metadata .malformed => .ok (Host.Wire.octet 1)
-  | .metadata (.columnType index column actual) => .ok (columnTypeTerminal 2 index column actual)
-  | .sizeMismatch root recorded offered => .ok (Host.Wire.octet 3 ++ Host.Wire.bytes root ++
-      Host.Wire.word recorded ++ Host.Wire.word offered)
+/-- Operations whose only failures are the host's. -/
+def hostOnly [Encode A] : Except Host.Failure A → Host.Reply ByteArray
+  | .ok value => terminalOf value
+  | .error hostFailure => .error hostFailure
 
-private def ingestResourceError : Cas.Ingest.Error → Host.Reply ByteArray
-  | .host failure => .error failure
-  | .metadata error => ingestMetadataError error
-  | .protocol => .error Host.Wire.protocolFailure
-  | .directorySyncUnsupported => .ok (Host.Wire.octet 4)
-
-private def ingestResult : Except Cas.Input.Error Cas.Input.Result → Host.Reply ByteArray
-  | .ok result => .ok (Host.Wire.octet 0 ++ Host.Wire.bytes result.root ++ Host.Wire.word result.size)
-  | .error (.host failure) => .error failure
-  | .error (.ingestion error) => ingestResourceError error
-  | .error (.metadata error) => ingestMetadataError error
-  | .error .protocol => .error Host.Wire.protocolFailure
-
-/-- One whole byte/file command. No captured-source or metadata planner is
-exported; object construction is a host service the command directs. The
-input path/buffer is an invocation-owned capability. -/
-@[export synch_lean_cas_ingest]
-def ingest (kind : UInt8) (size : UInt64) (now : Int64) (cache allowUnsupported : Bool) :
-    Host.Wire.NativeState :=
-  let input := if kind == 0 then some (Cas.Input.Kind.bytes size)
-    else if kind == 1 && size == 0 then some Cas.Input.Kind.file else none
-  match input with
-  | none => .pure (.error Host.Wire.protocolFailure)
-  | some input => do
-    let result ← (Cas.Input.run input now (if cache then .cache else .local)
-      (if allowUnsupported then .allowUnsupported else .requireSync)).run.mapEffects ingestEffect
-    return ingestResult result
-
-/-- Decode the holder constructor, not its rendered storage spelling. In
-particular an opaque future holder can resemble a known role's spelling. -/
-private def decodeHolder (kind : UInt8) (payload : ByteArray) : Option Cas.PinHolder := do
-  let text ← String.fromUTF8? payload
-  match kind.toNat with
-  | 0 => if text.isEmpty then some .operator else none
-  | 1 => some (.source text)
-  | 2 => some (.replica text)
-  | 3 => some (.other text)
-  | _ => none
-
-@[export synch_lean_cas_unpin]
-def unpin (root payload : ByteArray) (kind : UInt8) : Host.Wire.NativeState :=
-  if root.size != 32 then .pure (.error Host.Wire.protocolFailure)
-  else match decodeHolder kind payload with
-  | none => .pure (.error Host.Wire.protocolFailure)
-  | some holder => (do
-      let dropped ← Cas.unpin root holder
-      return Host.Wire.octet (if dropped then 1 else 0) : Host.Operation ByteArray).run.mapEffects Host.EffectSum.left
-
-@[export synch_lean_cas_expire]
-def expire (payload : ByteArray) (kind : UInt8) (now : Int64) : Host.Wire.NativeState :=
-  let holder : Option (Option Cas.PinHolder) :=
-    if kind == 4 then (if payload.size == 0 then some none else none)
-    else (decodeHolder kind payload).map some
-  match holder with
-  | none => .pure (.error Host.Wire.protocolFailure)
-  | some holder => (do
-      let count ← Cas.expire holder now
-      return Host.Wire.word count.toUInt64 : Host.Operation ByteArray).run.mapEffects Host.EffectSum.left
-
-/-- Acquisition and deletion share one terminal framing: tag 0 carries the
-operation's own value, tags 1 and 2 the malformed-metadata and column-type
-domain errors, and a host failure is returned as itself. -/
-private def encodeLifecycle (value : A → ByteArray) : Except Cas.Error A → Host.Reply ByteArray
-  | .ok result => .ok (Host.Wire.octet 0 ++ value result)
-  | .error (.host failure) => .error failure
-  | .error .malformed => .ok (Host.Wire.octet 1)
-  | .error (.columnType index column actual) => .ok (columnTypeTerminal 2 index column actual)
-
-@[export synch_lean_cas_delete]
-def delete (root : ByteArray) (hasBefore : Bool) (before : Int64) : Host.Wire.NativeState :=
-  if root.size != 32 then .pure (.error ⟨2, 0⟩)
-  else do
-    let outcome ← (Cas.delete root (if hasBefore then some before else none)).run.mapEffects
-      Host.EffectSum.left
-    return encodeLifecycle (fun outcome => Host.Wire.octet (match outcome with
-      | .skipped => 0 | .writing => 1 | .protectedClaim => 2 | .applied => 3)) outcome
-
-@[export synch_lean_cas_acquire]
-def acquire (root holder : ByteArray) (now : Int64) (possession : Bool) : Host.Wire.NativeState :=
-  if root.size != 32 then .pure (.error ⟨2, 0⟩)
-  else match String.fromUTF8? holder with
-  | none => .pure (.error ⟨2, 0⟩)
-  | some holder => do
-    let acquired ← (Cas.acquire root holder now possession).run.mapEffects Host.EffectSum.left
-    return encodeLifecycle (fun acquired => Host.Wire.octet (if acquired then 1 else 0)) acquired
-
-private def encodeLookup : Trie.LookupResult → ByteArray
-  | .ok none => Host.Wire.octet 0
-  | .ok (some value) => Host.Wire.octet 1 ++ Host.Wire.bytes value
-  | .error (.keyTooLong size) => Host.Wire.octet 2 ++ Host.Wire.word size.toUInt64
-  | .error (.missingNode address) => Host.Wire.octet 3 ++ Host.Wire.bytes address
-  | .error (.missingValue address) => Host.Wire.octet 4 ++ Host.Wire.bytes address
-  | .error (.decode message) => Host.Wire.octet 5 ++ Host.Wire.string message
-  | .error .depthExceeded => Host.Wire.octet 6
-
-@[export synch_lean_trie_get]
-def lookup (root : ByteArray) (keySize : UInt64) : Host.Wire.NativeState :=
-  if root.size != 32 then .pure (.error ⟨2, 0⟩)
-  else (do return encodeLookup (← Trie.getInput root 0 keySize) : Host.Operation ByteArray).run.mapEffects Host.EffectSum.left
-
-private def encodeHistory (result : Replication.History.Result Nat) : Host.Reply ByteArray :=
-  open Host.Wire in
-  match result with
-  | .ok count => .ok (octet 0 ++ word count.toUInt64)
+def lifecycle [Encode A] : Except Cas.Error A → Host.Reply ByteArray
+  | .ok value => terminalOf (Except.ok value : Except LifecycleDomainError A)
   | .error (.host hostFailure) => .error hostFailure
-  | .error .malformed => .ok (octet 1)
-  | .error (.columnType index column actual) => .ok
-      (octet 2 ++ word index.toUInt64 ++ string column ++ octet (match actual with
-        | .null => 0 | .integer => 1 | .real => 2 | .text => 3 | .blob => 4))
-  | .error (.invalidText text) => .ok (octet 3 ++ bytes ⟨text.toArray⟩)
-  | .error (.column column reason) => .ok (octet 4 ++ string column ++ string reason)
-  | .error (.origin error) => .ok (octet 5 ++ match error with
-      | .label original => octet 0 ++ string original
-      | .domain original => octet 1 ++ string original
-      | .keyDecode => octet 2
-      | .keyData => octet 3
-      | .shape original => octet 4 ++ string original)
+  | .error .malformed => terminalOf (Except.error LifecycleDomainError.malformed : Except _ A)
+  | .error (.columnType index column actual) =>
+    terminalOf (Except.error (LifecycleDomainError.columnType index column actual) : Except _ A)
 
-/-- Complete retention command; terminal domain errors do not enter the host
-effect protocol or require Rust to repeat record validation. -/
-@[export synch_lean_history_prune]
-def pruneHistory (origin : ByteArray) (before : Int64) : Host.Wire.NativeState :=
-  match String.fromUTF8? origin with
-  | none => .pure (.error Host.Wire.protocolFailure)
-  | some origin => do
-    let result ← (Replication.History.prune origin before).run.mapEffects (fun effect =>
-      match effect with
-      | .left storage => .left storage
-      | .right crypto => .right (.left crypto))
-    return encodeHistory result
-
-private def encodeRead (result : Except Cas.Read.Error UInt64) : Host.Reply ByteArray :=
-  open Host.Wire in
-  match result with
-  | .ok count => .ok (octet 0 ++ word count)
+def metadata [Encode A] : Except Cas.IngestCommit.Error A → Host.Reply ByteArray
+  | .ok value => terminalOf (Except.ok value : Except IngestDomainError A)
   | .error (.host hostFailure) => .error hostFailure
-  | .error .missingBlob => .ok (octet 1)
-  | .error (.range start stop size) => .ok (octet 2 ++ word start ++ word stop ++ word size)
-  | .error .unavailable => .ok (octet 3)
-  | .error .shortInline => .ok (octet 4)
-  | .error .malformed => .ok (octet 5)
-  | .error (.columnType index column actual) => .ok (columnTypeTerminal 6 index column actual)
-  | .error (.column column reason) => .ok (octet 7 ++ string column ++ string reason)
-  | .error .protocol => .ok (octet 8)
+  | .error (.metadata .malformed) => terminalOf (Except.error IngestDomainError.malformed : Except _ A)
+  | .error (.metadata (.columnType index column actual)) =>
+    terminalOf (Except.error (IngestDomainError.columnType index column actual) : Except _ A)
+  | .error (.sizeMismatch root recorded offered) =>
+    terminalOf (Except.error (IngestDomainError.sizeMismatch root recorded offered) : Except _ A)
 
-/-- One complete local read, including metadata admission, physical reads and
-repair. Effect injection preserves capability separation without exposing any
-CAS policy or intermediate availability state to the native caller. -/
-@[export synch_lean_cas_read]
-def readRoot (root : ByteArray) (all : Bool) (offset length : UInt64) : Host.Wire.NativeState :=
-  if root.size != 32 then .pure (.error Host.Wire.protocolFailure)
-  else do
-    let result ← (Cas.Read.read root (if all then .all else .range offset length)).run.mapEffects
-      (fun effect => match effect with
-        | .left storage => .left storage
-        | .right other => .right (.right (match other with
-          | .left access => .left access
-          | .right other => .right (match other with
-            | .left file => .left file
-            | .right other => .right (match other with
-              | .left clock => .left clock
-              | .right output => .right (.left output))))))
-    return encodeRead result
+def ingestion : Except Cas.Input.Error Cas.Input.Result → Host.Reply ByteArray
+  | .ok result => terminalOf (Except.ok (Ingested.mk result.root result.size) : Except IngestDomainError _)
+  | .error (.host hostFailure) => .error hostFailure
+  | .error .protocol => .error protocolFailure
+  | .error (.metadata error) => metadata (A := Ingested) (.error error)
+  | .error (.ingestion (.host hostFailure)) => .error hostFailure
+  | .error (.ingestion .protocol) => .error protocolFailure
+  | .error (.ingestion (.metadata error)) => metadata (A := Ingested) (.error error)
+  | .error (.ingestion .directorySyncUnsupported) =>
+    terminalOf (Except.error IngestDomainError.directorySyncUnsupported : Except _ Ingested)
+
+def reading : Except Cas.Read.Error UInt64 → Host.Reply ByteArray
+  | .ok count => terminalOf (Except.ok count : Except ReadDomainError UInt64)
+  | .error (.host hostFailure) => .error hostFailure
+  | .error .protocol => .error protocolFailure
+  | .error error => terminalOf (Except.error (match error with
+      | .missingBlob => ReadDomainError.missingBlob
+      | .range start stop size => .range start stop size
+      | .unavailable => .unavailable
+      | .shortInline => .shortInline
+      | .malformed => .malformed
+      | .columnType index column actual => .columnType index column actual
+      | .column column reason => .column column reason
+      | .host _ | .protocol => .malformed) : Except _ UInt64)
+
+def retention : Replication.History.Result Nat → Host.Reply ByteArray
+  | .ok count => terminalOf (Except.ok count : Except HistoryDomainError Nat)
+  | .error (.host hostFailure) => .error hostFailure
+  | .error error => terminalOf (Except.error (match error with
+      | .malformed => HistoryDomainError.malformed
+      | .columnType index column actual => .columnType index column actual
+      | .invalidText bytes => .invalidText ⟨bytes.toArray⟩
+      | .column column reason => .column column reason
+      | .origin error => .origin error
+      | .host _ => .malformed) : Except _ Nat)
+
+def malformedRoot : Native := .pure (.error ⟨2, 0⟩)
+def protocol : Native := .pure (.error protocolFailure)
+
+def dispatch : Command → Native
+  | .acquire root holder now possession =>
+    if root.size != 32 then malformedRoot
+    else command (Cas.acquire root holder now possession) lifecycle
+  | .delete root before =>
+    if root.size != 32 then malformedRoot else command (Cas.delete root before) lifecycle
+  | .unpin root holder =>
+    if root.size != 32 then protocol else command (Cas.unpin root holder) hostOnly
+  | .expire holder now => command (Cas.expire holder now) hostOnly
+  | .read root range =>
+    if root.size != 32 then protocol
+    else command (Cas.Read.read root (match range with
+      | none => .all
+      | some (offset, length) => .range offset length)) reading
+  | .ingest input now cache allowUnsupported =>
+    command (Cas.Input.run input now (if cache then .cache else .local)
+      (if allowUnsupported then .allowUnsupported else .requireSync)) ingestion
+  | .commitGroups root spans size inline now cache =>
+    if root.size != 32 then protocol
+    else command (Cas.IngestCommit.commitGroups root size
+      (spans.map fun (start, stop) => ⟨start.toNat, stop.toNat⟩) inline now
+      (if cache then .cache else .local))
+      (metadata ∘ Except.map fun outcome => Committed.mk outcome.size outcome.complete)
+  | .admitSize root size =>
+    if root.size != 32 then protocol else command (Cas.IngestCommit.admit root size) metadata
+  | .trieGet root keySize =>
+    if root.size != 32 then malformedRoot else command (Trie.getInput root 0 keySize) hostOnly
+  | .pruneHistory origin before => command (Replication.History.prune origin before) retention
+
+/-- Every command starts here: an undecodable packet is a protocol failure
+before any effect is requested. -/
+@[export synch_lean_start]
+def start (packet : ByteArray) : Native :=
+  match (decodeAll packet : Option Command) with
+  | none => protocol
+  | some command => dispatch command
 
 end VerifiedCore.Entry

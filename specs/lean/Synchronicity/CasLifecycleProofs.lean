@@ -1,8 +1,6 @@
 import VerifiedCore.Cas
 import VerifiedCore.Cas.Program
 import Synchronicity.CasProgramProofs
-import Synchronicity.Prelude
-import Synchronicity.Anchors
 
 /-! Proofs of complete CAS lifecycle plans. No trie or sync model imports. -/
 namespace Synchronicity.CasLifecycleProofs
@@ -17,15 +15,15 @@ theorem deletion_authorized (s : DeletionSnapshot) (before : Option Int64) :
   rcases s with ⟨row, writing, pinned, referenced, lastAccess⟩
   cases before <;> cases row <;> cases writing <;> cases pinned <;> cases referenced <;>
     simp [planLifecycle]
-  split_ifs <;> simp_all
+  split <;> simp_all
 
 /-- Failed lifecycle requests have no mutation or cleanup effects. -/
 theorem refusal_effect_free (request : LifecycleRequest)
     (refused : (planLifecycle request).outcome ≠ .applied) :
     (planLifecycle request).transaction = [] ∧ (planLifecycle request).afterCommit = [] := by
-  cases request
-  simp only [planLifecycle] at refused ⊢
-  split_ifs at refused ⊢ <;> simp_all
+  obtain ⟨⟨row, writing, pinned, referenced, lastAccess⟩, before⟩ := request
+  cases before <;> cases row <;> cases writing <;> cases pinned <;> cases referenced <;>
+    simp [planLifecycle] at refused ⊢ <;> (try split) <;> simp_all
 
 /-- Every nonempty cleanup phase follows a transaction deleting exactly the
 object row. The plan is now consumed only inside Lean's deletion program. -/
@@ -34,17 +32,17 @@ theorem cleanup_requires_row_deletion (request : LifecycleRequest)
     (planLifecycle request).transaction = [.deleteRow] ∧
     (planLifecycle request).afterCommit = [.payload, .outboard] ∧
     (planLifecycle request).outcome = .applied := by
-  cases request
-  simp only [planLifecycle] at cleanup ⊢
-  split_ifs at cleanup ⊢ <;> simp_all
+  obtain ⟨⟨row, writing, pinned, referenced, lastAccess⟩, before⟩ := request
+  cases before <;> cases row <;> cases writing <;> cases pinned <;> cases referenced <;>
+    simp [planLifecycle] at cleanup ⊢ <;> (try split) <;> simp_all
 
 /-- The fixed-width ABI has room for every action; there is no truncated plan. -/
 theorem lifecycle_plan_bounds (request : LifecycleRequest) :
     (planLifecycle request).transaction.length ≤ 2 ∧
     (planLifecycle request).afterCommit.length ≤ 2 := by
-  cases request
-  simp only [planLifecycle]
-  split_ifs <;> simp
+  obtain ⟨⟨row, writing, pinned, referenced, lastAccess⟩, before⟩ := request
+  cases before <;> cases row <;> cases writing <;> cases pinned <;> cases referenced <;>
+    simp [planLifecycle] <;> (try split) <;> simp
 
 
 /-- Any failed transactional execution terminates deletion without requesting
@@ -137,12 +135,11 @@ theorem deletion_execution_outcome (root : ByteArray) (accessed : Option Int64)
       execute, answer, event, Except.mapError, Except.map,
       bind, pure, Program.bind, ExceptT.bind, ExceptT.bindCont, ExceptT.pure,
       ExceptT.run, ExceptT.mk, decodeAccess, Codec.integerField, planLifecycle, writing]
-  all_goals (try split_ifs) <;> rfl
+  all_goals (try split) <;> rfl
 
 open CasProgramProofs in
 /-- Authorization of the executed operation follows from the internal decision
 theorem through the checked execution equality, with no Rust model premise. -/
-@[rust_justifies "cas-lifecycle-deletion"]
 theorem executed_deletion_authorized (root : ByteArray) (accessed : Option Int64)
     (pinned referenced : Bool) (writers : UInt64) (before : Option Int64) :
     (execute
@@ -158,5 +155,3 @@ theorem executed_deletion_authorized (root : ByteArray) (accessed : Option Int64
     ⟨accessed.isSome, writers != 0, pinned, referenced, accessed.getD 0⟩ before
 
 end Synchronicity.CasLifecycleProofs
-
-#lint

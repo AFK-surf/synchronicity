@@ -2,7 +2,7 @@
 The trie domain's existing postcard representation. This is internal domain
 code, not a codec service exposed to Rust. Local reads deliberately accept
 non-minimal varints and trailing bytes, as postcard::from_bytes does. Ingress
-canonicality additionally requires equality with `encode`.
+canonicality is the Rust codec's concern; this module only decodes.
 -/
 namespace VerifiedCore.Trie
 
@@ -94,32 +94,5 @@ private def node : Parser Node := do
 /-- Local storage decoding: unused input is intentionally ignored. -/
 def decode (input : ByteArray) : Except String Node :=
   (node.run ⟨input, 0⟩).map Prod.fst
-
-private def encodeNat (n : Nat) : List UInt8 :=
-  if h : n < 128 then [UInt8.ofNat n]
-  else UInt8.ofNat (n % 128 + 128) :: encodeNat (n / 128)
-termination_by n
-decreasing_by omega
-
-private def encodeSequence (b : ByteArray) : List UInt8 :=
-  encodeNat b.size ++ b.toList
-
-private def encodeValue : Value → List UInt8
-  | .inline b => 0 :: encodeSequence b
-  | .hash h => 1 :: h.toList
-
-private def encodeOption (f : α → List UInt8) : Option α → List UInt8
-  | none => [0]
-  | some a => 1 :: f a
-
-/-- Canonical bytes for the existing wire format; malformed internal nodes
-must not be constructed by callers (hashes have 32 bytes and branches 16 slots).
--/
-def encode : Node → ByteArray
-  | .leaf suffix v => ⟨(0 :: (encodeSequence suffix ++ encodeValue v)).toArray⟩
-  | .extension segment child =>
-    ⟨(1 :: (encodeSequence segment ++ child.toList)).toArray⟩
-  | .branch cs v =>
-    ⟨(2 :: (cs.flatMap (encodeOption ByteArray.toList) ++ encodeOption encodeValue v)).toArray⟩
 
 end VerifiedCore.Trie

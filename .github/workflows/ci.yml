@@ -279,25 +279,30 @@ jobs:
           fi
 
   lean:
-    name: lean (CAS / mptsync / ingest)
+    name: lean (core proofs)
     runs-on: ubuntu-latest
     timeout-minutes: 30
     steps:
       - uses: actions/checkout@v4
+      # Proofs over the executable core, built from the same source Cargo
+      # compiles. Every declaration is rechecked by the standalone kernel
+      # checker, and sorryAx or an unapproved axiom fails the job.
       - uses: leanprover/lean-action@v1
         with:
           lake-package-directory: specs/lean
           build: true
           build-args: --wfail
           test: false
-          use-mathlib-cache: true
-          # Recheck every compiled declaration with Lean's standalone kernel
-          # checker, then reject sorryAx and any unapproved custom axiom.
+          use-mathlib-cache: false
           leanchecker: true
           leanchecker-args: Synchronicity
           axiom-audit: true
-      - name: Check Rust/Lean implementation anchors
-        run: specs/lean/check-anchors.sh
+      # The host boundary is generated from the Lean effect algebras and
+      # command types. The Lean codecs are kept in the tree and must match
+      # what the generator prints for the current source; the Rust glue is
+      # printed into Cargo's output directory by every build.
+      - name: Check the generated Lean codecs
+        run: cd crates/synch-verified/lean && lake env lean --run Hostgen.lean --check
 
   bench:
     name: benchmark (smoke)

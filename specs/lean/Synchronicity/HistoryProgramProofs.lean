@@ -1,7 +1,7 @@
 import VerifiedCore.Replication.History
 import Std.Data.TreeMap.Lemmas
 import Std.Data.TreeSet.Lemmas
-import Synchronicity.Prelude
+import Synchronicity.Handlers
 
 /-! These properties concern the executable retention program, not a parallel model. -/
 namespace Synchronicity.HistoryProgramProofs
@@ -313,7 +313,8 @@ theorem selected_before_horizon (pointers : List Pointer) (before : Int64)
     (receipts : List Receipt) (receipt : Receipt) (chosen : receipt ∈ selected pointers before receipts) :
     receipt.recordedAt < before := by
   have allowed := (List.mem_filter.mp chosen).2
-  by_contra h
+  apply Classical.byContradiction
+  intro h
   rw [young_not_deletable _ _ _ _ h] at allowed
   contradiction
 
@@ -354,7 +355,6 @@ theorem prune_reads_pointers (tx : Transaction) (origin : String) (before : Int6
   exact ⟨_, rfl⟩
 
 /-- The public operation itself requests its snapshot lock, before any read. -/
-@[rust_impl "verified-history-prune"]
 theorem prune_begins_transaction (origin : String) (before : Int64) :
     ∃ resume, (prune origin before).run = .request (.left .begin) resume := by
   exact ⟨_, rfl⟩
@@ -432,36 +432,47 @@ private def failure : Failure := ⟨1, 99⟩
 private def scriptReply (script : Script) (index : Nat) (value : A) : Reply A :=
   if script.failAt == some index then .error failure else .ok value
 
-private def runScript (script : Script) : Nat → Nat →
-    Program Effects (Result Nat) → Option (Result Nat × List String)
-  | 0, _, _ => none
-  | _ + 1, _, .pure value => some (value, [])
-  | fuel + 1, index, .request effect resume =>
-    let step (label : String) (next : Program Effects (Result Nat)) :=
-      (runScript script fuel (index + 1) next).map fun (result, trace) => (result, label :: trace)
-    match effect with
-    | .right effect => match effect with
-      | .validateEd25519 _ => step "crypto" (resume (scriptReply script index (!script.invalidKey)))
-    | .left effect => match effect with
-      | .begin => step "begin" (resume (scriptReply script index 7))
-      | .commit _ => step "commit" (resume (scriptReply script index ()))
-      | .rollback _ => step "rollback" (resume (scriptReply script index ()))
-      | .scanRows _ relation columns equals order joined => step relation (resume
-        (if relation == "heads" && columns == headColumns && joined == headJoin && order.isEmpty then
-           scriptReply script index ⟨(if equals.contains ("slot", .text "complete") then script.pointers else []), none⟩
-         else if relation == "head_history" && order == [⟨"seq", true⟩, ⟨"root", true⟩] then
-           scriptReply script index ⟨script.receipts, script.scanFailure⟩
-         else .error failure))
-      | .deleteRows _ relation equals blockers atMost => step "delete" (resume
-        (if relation == "head_history" && blockers == [⟨"heads", equals, []⟩] && atMost.isEmpty then
-          scriptReply script index 1 else .error failure))
-      | .readRows .. => step "unexpected eager read" (resume (.error failure))
-      | .upsert _ _ _ _ _ => step "unexpected upsert" (resume (.error failure))
-      | .readBytes _ _ => step "unexpected byte read" (resume (.error failure))
-      | .readInput .. => step "unexpected input read" (resume (.error failure))
-      | .readCounter .. => step "unexpected counter read" (resume (.error failure))
-      | .removeFile .. => step "unexpected file removal" (resume (.error failure))
-      | .existsRows .. => step "unexpected existence query" (resume (.error failure))
+private structure State where
+  script : Script
+  index : Nat
+
+private def step (state : State) (label : String) (value : A) : Option (String × Reply A × State) :=
+  some (label, scriptReply state.script state.index value, { state with index := state.index + 1 })
+
+private def refused (state : State) (label : String) : Option (String × Reply A × State) :=
+  some (label, .error failure, { state with index := state.index + 1 })
+
+private instance : Handlers.Handler Crypto State String where
+  handle
+    | .validateEd25519 _, s => step s "crypto" (!s.script.invalidKey)
+
+private instance : Handlers.Handler Storage State String where
+  handle
+    | .begin, s => step s "begin" 7
+    | .commit _, s => step s "commit" ()
+    | .rollback _, s => step s "rollback" ()
+    | .scanRows _ relation columns equals order joined, s =>
+      if relation == "heads" && columns == headColumns && joined == headJoin && order.isEmpty then
+        step s relation ⟨(if equals.contains ("slot", .text "complete") then s.script.pointers else []), none⟩
+      else if relation == "head_history" && order == [⟨"seq", true⟩, ⟨"root", true⟩] then
+        step s relation ⟨s.script.receipts, s.script.scanFailure⟩
+      else refused s relation
+    | .deleteRows _ relation equals blockers atMost, s =>
+      if relation == "head_history" && blockers == [⟨"heads", equals, []⟩] && atMost.isEmpty then
+        step s "delete" 1 else refused s "delete"
+    | .readRows .., s => refused s "unexpected eager read"
+    | .upsert _ _ _ _ _, s => refused s "unexpected upsert"
+    | .readBytes _ _, s => refused s "unexpected byte read"
+    | .readInput .., s => refused s "unexpected input read"
+    | .readCounter .., s => refused s "unexpected counter read"
+    | .removeFile .., s => refused s "unexpected file removal"
+    | .existsRows .., s => refused s "unexpected existence query"
+
+/-- Scripted execution of the actual free-monadic program from a given effect
+index, so every failure position of the successful trace can be scripted. -/
+private def runScript (script : Script) (fuel index : Nat) (program : Program Effects (Result Nat)) :
+    Option (Result Nat × List String) :=
+  Handlers.run fuel program (⟨script, index⟩ : State)
 
 private def forkScript : Script :=
   { receipts := [receiptRow 1 1 10, receiptRow 1 2 10, receiptRow 2 3 10] }
@@ -546,5 +557,3 @@ example : runScript { forkScript with receipts := [receiptRow 2 1 10, receiptRow
   decide
 
 end Synchronicity.HistoryProgramProofs
-
-#lint

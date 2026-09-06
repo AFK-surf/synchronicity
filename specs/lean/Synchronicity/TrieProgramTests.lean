@@ -102,10 +102,4 @@ private def malformed (raw : List UInt8) : Bool :=
 -- Bounds are checked before reading even a nonzero root.
 #guard run [] (Trie.get root (b (List.replicate 4097 0))).run == some ((2, []), [])
 
--- Encoder fixtures pin the hash-covered existing bytes without using serde.
-#guard (encode (.leaf (b [10, 11]) (.inline (b [120, 121])))).toList ==
-  [0, 2, 10, 11, 0, 2, 120, 121]
-#guard (encode (.extension (b [10]) (address 2))).toList ==
-  [1, 1, 10] ++ (address 2).toList
-
 end Synchronicity.TrieProgramTests

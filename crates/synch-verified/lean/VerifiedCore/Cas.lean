@@ -14,13 +14,6 @@ def settleSize (row durable complete finalHeld : Bool) (recorded claimed : UInt6
   else if durable || complete || finalHeld then 0
   else if groupCount recorded == groupCount claimed then 1 else 2
 
-/-- Scalar ABI for the proved group count. -/
-def groupCountExport (size : UInt64) : UInt64 := groupCount size
-
-/-- Scalar ABI for the proved settlement decision. -/
-def settleSizeExport (row durable complete finalHeld : Bool) (recorded claimed : UInt64) : UInt8 :=
-  settleSize row durable complete finalHeld recorded claimed
-
 /-- Half-open CAS group interval, interpreted with unbounded arithmetic. -/
 structure GroupSpan where
   start : Nat
@@ -34,12 +27,24 @@ def mergeSpans (head : GroupSpan) : List GroupSpan → List GroupSpan
       mergeSpans ⟨min head.start next.start, max head.stop next.stop⟩ rest
     else head :: mergeSpans next rest
 
+/-- Insert into a sequence sorted by start, ahead of any equal start. -/
+def insertSpan (span : GroupSpan) : List GroupSpan → List GroupSpan
+  | [] => [span]
+  | head :: rest =>
+    if span.start ≤ head.start then span :: head :: rest else head :: insertSpan span rest
+
+/-- Insertion sort by start. Runs are few, and structural recursion lets the
+proofs evaluate whole plans. -/
+def sortSpans : List GroupSpan → List GroupSpan
+  | [] => []
+  | head :: rest => insertSpan head (sortSpans rest)
+
 /-- Clamp first, then sort and merge. Work depends on runs, never on blob size. -/
 def normalizeSpans (total : Nat) (spans : List GroupSpan) : List GroupSpan :=
   let clipped := spans.filterMap fun r =>
     let stop := min r.stop total
     if r.start < stop then some (⟨r.start, stop⟩ : GroupSpan) else none
-  match clipped.mergeSort (fun a b => a.start ≤ b.start) with
+  match sortSpans clipped with
   | [] => []
   | head :: rest => mergeSpans head rest
 
@@ -67,25 +72,6 @@ def planCasCommit (row durable complete : Bool) (recorded claimed : UInt64)
     let total := (groupCount claimed).toNat
     let spans := normalizeSpans total (retained ++ incoming)
     ⟨true, spansContain spans 0 && spans.any (fun r => r.start == 0 && r.stop == total), spans⟩
-
-/-- Decode paired UInt64 endpoints; an unmatched final endpoint contributes nothing. -/
-def spansOf : List UInt64 → List GroupSpan
-  | start :: stop :: rest => ⟨start.toNat, stop.toNat⟩ :: spansOf rest
-  | [] => []
-  | [_] => []
-
-/-- Native entry point for the pure CAS plan. -/
-def casPlan (row durable complete : Bool) (recorded claimed : UInt64)
-    (old incoming : Array UInt64) : CasPlan :=
-  planCasCommit row durable complete recorded claimed (spansOf old.toList) (spansOf incoming.toList)
-
-/-- Scalar plan outcome: refused, partial, or complete. -/
-def casPlanStatus (plan : CasPlan) : UInt8 :=
-  if !plan.accepted then 0 else if plan.complete then 2 else 1
-
-/-- Export normalized endpoints without exposing the runtime's object layout. -/
-def casPlanSpans (plan : CasPlan) : Array UInt64 :=
-  (plan.spans.flatMap fun r => [UInt64.ofNat r.start, UInt64.ofNat r.stop]).toArray
 
 namespace Cas
 

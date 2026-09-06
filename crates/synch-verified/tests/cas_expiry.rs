@@ -1,5 +1,6 @@
 use synch_verified::cas::{expire, OperationError, PinHolder};
-use synch_verified::host::{Cell, Exclusion, Fields, Join, Order, Row, Scan, Storage};
+use synch_verified::host::{Cell, Exclusion, Fields, Storage};
+use synch_verified::host_unexpected;
 
 const TX: u64 = 81;
 
@@ -89,48 +90,20 @@ impl Storage for Script {
         Ok(self.affected)
     }
 
-    fn scan_rows(
-        &mut self,
-        _: u64,
-        _: &str,
-        _: &[String],
-        _: &Fields,
-        _: &[Order],
-        _: &[Join],
-    ) -> Result<Scan<Self::Error>, Self::Error> {
-        panic!("expiry must not scan rows")
-    }
-
-    fn read_rows(
-        &mut self,
-        _: u64,
-        _: &str,
-        _: &[String],
-        _: &Fields,
-        _: &[Order],
-        _: &[Join],
-    ) -> Result<Vec<Row>, Self::Error> {
-        panic!("expiry must not read rows")
-    }
-
-    fn exists_rows(&mut self, _: u64, _: &str, _: &Fields) -> Result<bool, Self::Error> {
-        panic!("expiry protection must be atomic with deletion")
-    }
-
-    fn upsert(
-        &mut self,
-        _: u64,
-        _: &str,
-        _: &Fields,
-        _: &[String],
-        _: &[String],
-    ) -> Result<(), Self::Error> {
-        panic!("expiry must not upsert")
-    }
-
-    fn read_bytes(&mut self, _: &str, _: &[u8]) -> Result<Option<Vec<u8>>, Self::Error> {
-        panic!("expiry must not read bytes")
-    }
+    // The relational host is one trait; these operations never request the
+    // read-repair, copy or expression-upsert statements.
+    host_unexpected!(
+        scan_rows,
+        read_rows,
+        exists_rows,
+        upsert,
+        read_bytes,
+        snapshot,
+        update,
+        copy_rows,
+        delete,
+        write
+    );
 }
 
 #[test]
@@ -138,17 +111,23 @@ fn expiry_is_one_atomic_mutation_for_optional_typed_holder_and_signed_time() {
     let cases = [
         (None, None),
         (Some(PinHolder::Operator), Some("operator")),
-        (Some(PinHolder::Source("space")), Some("source:space")),
-        (Some(PinHolder::Replica("space")), Some("replica:space")),
-        (Some(PinHolder::Other("source:x")), Some("source:x")),
-        (Some(PinHolder::Other("")), Some("")),
-        (Some(PinHolder::Source("雪:a")), Some("source:雪:a")),
+        (
+            Some(PinHolder::Source("space".into())),
+            Some("source:space"),
+        ),
+        (
+            Some(PinHolder::Replica("space".into())),
+            Some("replica:space"),
+        ),
+        (Some(PinHolder::Other("source:x".into())), Some("source:x")),
+        (Some(PinHolder::Other("".into())), Some("")),
+        (Some(PinHolder::Source("雪:a".into())), Some("source:雪:a")),
     ];
     for (holder, rendered) in cases {
         for now in [i64::MIN, -1, 0, i64::MAX] {
             for affected in [0, 1, 2, u64::MAX] {
                 let mut script = Script::new(rendered, now, affected);
-                assert_eq!(expire(&mut script, holder, now).unwrap(), affected);
+                assert_eq!(expire(&mut script, holder.clone(), now).unwrap(), affected);
                 assert_eq!(script.trace, ["begin", "delete", "commit"]);
             }
         }

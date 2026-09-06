@@ -28,6 +28,20 @@ inductive EffectSum (Left Right : Type → Type) : Type → Type where
   | left {A : Type} (effect : Left A) : EffectSum Left Right A
   | right {A : Type} (effect : Right A) : EffectSum Left Right A
 
+/-- `E` is one of the capabilities `F` composes, or a sum of some of them.
+Injection is by position in `F`; every capability appears at most once in an
+operation's algebra, so the position is unique and the instances below never
+disagree. A sum injects leaf by leaf, so a whole sub-operation lifts into a
+larger algebra with `Inject.inject`. -/
+class Inject (E F : Type → Type) where
+  inject : E A → F A
+
+instance : Inject E E := ⟨fun effect => effect⟩
+instance [Inject E F] : Inject E (EffectSum F G) := ⟨fun effect => .left (Inject.inject effect)⟩
+instance [Inject E G] : Inject E (EffectSum F G) := ⟨fun effect => .right (Inject.inject effect)⟩
+instance [Inject L F] [Inject R F] : Inject (EffectSum L R) F :=
+  ⟨fun | .left effect => Inject.inject effect | .right effect => Inject.inject effect⟩
+
 /-- Code 1 tokens identify original host errors retained by the interpreter.
 Code 2 uses the token as domain error detail (zero for an unspecified malformed
 record), never as a host-error registry index. Code 3 is a protocol failure. -/
@@ -119,6 +133,23 @@ def performWith (hostError : Failure → Error) (effect : Storage (Reply A)) : O
 
 def performOver (hostError : Failure → Error) (effect : E (Reply A)) : OperationOver E Error A :=
   ExceptT.mk (.request effect (fun result => .pure (result.mapError hostError)))
+
+/-- Request one capability's effect from inside a composed algebra, lifting a
+host failure into the operation's error. -/
+def raise [Inject E F] (hostError : Failure → Error) (effect : E (Reply A)) :
+    OperationOver F Error A :=
+  performOver hostError (Inject.inject effect)
+
+/-- Request an effect whose reply is not a plain host reply (a file reply, for
+instance); the operation interprets it itself. -/
+def observe [Inject E F] (effect : E B) : OperationOver F Error B :=
+  ExceptT.mk (.request (Inject.inject effect) (fun reply => .pure (.ok reply)))
+
+/-- Run a sub-operation inside a larger algebra, translating its error. -/
+def within [Inject E F] (translate : ε → Error) (program : OperationOver E ε A) :
+    OperationOver F Error A :=
+  ExceptT.mk (program.run.mapEffects Inject.inject |>.bind
+    (fun result => .pure (result.mapError translate)))
 
 /-- Immediate transaction. A failed body or commit requests rollback, whose
 failure must not replace the primary failure. Host RAII handles abandonment;

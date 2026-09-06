@@ -6,7 +6,7 @@ use rusqlite::{
     Connection, OptionalExtension, ToSql,
 };
 use synch_verified::host::{
-    Access, Cell, ConflictValue, Fields, Row, Scan, Selection, SourceValue, Storage, Upsert,
+    Cell, ConflictValue, Fields, Row, Scan, Selection, SourceValue, Storage,
 };
 
 use crate::{Result, StoreError};
@@ -207,9 +207,7 @@ impl Storage for Session<'_> {
             self.snapshot_storage()?.read_bytes(space, key)
         }
     }
-}
 
-impl Access for Session<'_> {
     fn snapshot(&mut self, selection: &Selection, columns: &[String]) -> Result<Scan<StoreError>> {
         self.snapshot_storage()?.snapshot(selection, columns)
     }
@@ -227,22 +225,10 @@ impl Access for Session<'_> {
         self.transaction()?
             .copy_rows(tx, target, source, fields, conflicts)
     }
-    fn delete_selected(&mut self, tx: u64, selection: &Selection) -> Result<u64> {
-        self.transaction()?.delete_selected(tx, selection)
+    fn delete(&mut self, tx: u64, selection: &Selection) -> Result<u64> {
+        self.transaction()?.delete(tx, selection)
     }
-}
 
-impl Drop for SqliteStorage<'_> {
-    fn drop(&mut self) {
-        if self.active.is_some() && !self.conn.is_autocommit() {
-            // Cancellation releases an uncommitted host resource. Normal
-            // recovery and error selection are requested by the Lean program.
-            let _ = self.conn.execute_batch("ROLLBACK");
-        }
-    }
-}
-
-impl Upsert for Session<'_> {
     fn write(
         &mut self,
         tx: u64,
@@ -253,6 +239,16 @@ impl Upsert for Session<'_> {
     ) -> Result<()> {
         self.transaction()?
             .write(tx, relation, fields, conflicts, assignments)
+    }
+}
+
+impl Drop for SqliteStorage<'_> {
+    fn drop(&mut self) {
+        if self.active.is_some() && !self.conn.is_autocommit() {
+            // Cancellation releases an uncommitted host resource. Normal
+            // recovery and error selection are requested by the Lean program.
+            let _ = self.conn.execute_batch("ROLLBACK");
+        }
     }
 }
 
@@ -292,61 +288,6 @@ fn conflict_expression(
             };
             Ok(format!("{function}({left}, {right})"))
         }
-    }
-}
-
-impl Upsert for SqliteStorage<'_> {
-    fn write(
-        &mut self,
-        tx: u64,
-        relation: &str,
-        fields: &Fields,
-        conflicts: &[String],
-        assignments: &[(String, ConflictValue)],
-    ) -> Result<()> {
-        self.require_live_transaction(tx)?;
-        columns_for(relation)?;
-        if fields.is_empty() {
-            return Err(StoreError::invalid("empty expression UPSERT"));
-        }
-        let names: Vec<_> = fields.iter().map(|(name, _)| name.clone()).collect();
-        unique_columns(relation, &names)?;
-        unique_columns(relation, conflicts)?;
-        unique_columns(
-            relation,
-            &assignments
-                .iter()
-                .map(|(name, _)| name.clone())
-                .collect::<Vec<_>>(),
-        )?;
-        let conflict = if conflicts.is_empty() {
-            String::new()
-        } else {
-            format!(" ({})", projection(relation, conflicts)?)
-        };
-        let mut remaining = 4096;
-        let updates = assignments
-            .iter()
-            .map(|(name, value)| {
-                Ok(format!(
-                    "{} = {}",
-                    column(relation, name)?,
-                    conflict_expression(relation, value, 0, &mut remaining)?
-                ))
-            })
-            .collect::<Result<Vec<_>>>()?;
-        let update = if updates.is_empty() {
-            "DO NOTHING".to_owned()
-        } else {
-            format!("DO UPDATE SET {}", updates.join(", "))
-        };
-        let sql = format!(
-            "INSERT INTO \"{relation}\" ({}) VALUES ({}) ON CONFLICT{conflict} {update}",
-            projection(relation, &names)?,
-            vec!["?"; fields.len()].join(", ")
-        );
-        self.conn.execute(&sql, params_from_iter(values(fields)))?;
-        Ok(())
     }
 }
 
@@ -518,105 +459,6 @@ fn raw_scan(
         }
     }
     Ok(scan)
-}
-
-impl Access for SqliteStorage<'_> {
-    fn snapshot(&mut self, selection: &Selection, columns: &[String]) -> Result<Scan<StoreError>> {
-        if self.active.is_some() || !self.conn.is_autocommit() {
-            return Err(StoreError::invalid("snapshot during storage transaction"));
-        }
-        if columns.is_empty() {
-            return Err(StoreError::invalid("empty storage projection"));
-        }
-        let (predicate, bindings) = selection_sql(selection)?;
-        let sql = format!(
-            "SELECT {} FROM \"{}\"{predicate}",
-            projection(&selection.relation, columns)?,
-            selection.relation
-        );
-        raw_scan(&self.conn, &sql, &bindings, columns.len())
-    }
-
-    fn update(&mut self, tx: u64, selection: &Selection, fields: &Fields) -> Result<u64> {
-        self.require_live_transaction(tx)?;
-        if fields.is_empty() {
-            return Err(StoreError::invalid("empty storage write"));
-        }
-        let mut assignments = Vec::new();
-        let mut bindings = Vec::new();
-        for (index, (name, value)) in fields.iter().enumerate() {
-            if fields[..index].iter().any(|(prior, _)| prior == name) {
-                return Err(StoreError::invalid("duplicate storage write column"));
-            }
-            assignments.push(format!("{} = ?", column(&selection.relation, name)?));
-            bindings.push(value.clone());
-        }
-        let (predicate, selected) = selection_sql(selection)?;
-        bindings.extend(selected);
-        let sql = format!(
-            "UPDATE \"{}\" SET {}{predicate}",
-            selection.relation,
-            assignments.join(", ")
-        );
-        Ok(self
-            .conn
-            .execute(&sql, params_from_iter(bindings.iter().map(BoundCell)))? as u64)
-    }
-
-    fn copy_rows(
-        &mut self,
-        tx: u64,
-        target: &str,
-        source: &Selection,
-        fields: &[(String, SourceValue)],
-        conflicts: &[String],
-    ) -> Result<u64> {
-        self.require_live_transaction(tx)?;
-        columns_for(target)?;
-        if fields.is_empty() {
-            return Err(StoreError::invalid("empty storage write"));
-        }
-        let mut names = Vec::new();
-        let mut projected = Vec::new();
-        let mut bindings = Vec::new();
-        for (name, value) in fields {
-            if names.contains(name) {
-                return Err(StoreError::invalid("duplicate storage write column"));
-            }
-            names.push(name.clone());
-            projected.push(match value {
-                SourceValue::Column(name) => column(&source.relation, name)?,
-                SourceValue::Literal(value) => {
-                    bindings.push(value.clone());
-                    "?".to_owned()
-                }
-            });
-        }
-        if conflicts.iter().any(|name| !names.contains(name)) {
-            return Err(StoreError::invalid("UPSERT names a column without a value"));
-        }
-        let (predicate, selected) = selection_sql(source)?;
-        bindings.extend(selected);
-        let conflict = if conflicts.is_empty() {
-            String::new()
-        } else {
-            format!(" ({})", projection(target, conflicts)?)
-        };
-        let sql = format!("INSERT INTO \"{target}\" ({}) SELECT {} FROM \"{}\"{predicate} ON CONFLICT{conflict} DO NOTHING",
-            projection(target, &names)?, projected.join(", "), source.relation);
-        Ok(self
-            .conn
-            .execute(&sql, params_from_iter(bindings.iter().map(BoundCell)))? as u64)
-    }
-
-    fn delete_selected(&mut self, tx: u64, selection: &Selection) -> Result<u64> {
-        self.require_live_transaction(tx)?;
-        let (predicate, bindings) = selection_sql(selection)?;
-        let sql = format!("DELETE FROM \"{}\"{predicate}", selection.relation);
-        Ok(self
-            .conn
-            .execute(&sql, params_from_iter(bindings.iter().map(BoundCell)))? as u64)
-    }
 }
 
 impl Storage for SqliteStorage<'_> {
@@ -912,6 +754,156 @@ impl Storage for SqliteStorage<'_> {
             .optional()
             .map_err(Into::into)
     }
+
+    fn snapshot(&mut self, selection: &Selection, columns: &[String]) -> Result<Scan<StoreError>> {
+        if self.active.is_some() || !self.conn.is_autocommit() {
+            return Err(StoreError::invalid("snapshot during storage transaction"));
+        }
+        if columns.is_empty() {
+            return Err(StoreError::invalid("empty storage projection"));
+        }
+        let (predicate, bindings) = selection_sql(selection)?;
+        let sql = format!(
+            "SELECT {} FROM \"{}\"{predicate}",
+            projection(&selection.relation, columns)?,
+            selection.relation
+        );
+        raw_scan(&self.conn, &sql, &bindings, columns.len())
+    }
+
+    fn update(&mut self, tx: u64, selection: &Selection, fields: &Fields) -> Result<u64> {
+        self.require_live_transaction(tx)?;
+        if fields.is_empty() {
+            return Err(StoreError::invalid("empty storage write"));
+        }
+        let mut assignments = Vec::new();
+        let mut bindings = Vec::new();
+        for (index, (name, value)) in fields.iter().enumerate() {
+            if fields[..index].iter().any(|(prior, _)| prior == name) {
+                return Err(StoreError::invalid("duplicate storage write column"));
+            }
+            assignments.push(format!("{} = ?", column(&selection.relation, name)?));
+            bindings.push(value.clone());
+        }
+        let (predicate, selected) = selection_sql(selection)?;
+        bindings.extend(selected);
+        let sql = format!(
+            "UPDATE \"{}\" SET {}{predicate}",
+            selection.relation,
+            assignments.join(", ")
+        );
+        Ok(self
+            .conn
+            .execute(&sql, params_from_iter(bindings.iter().map(BoundCell)))? as u64)
+    }
+
+    fn copy_rows(
+        &mut self,
+        tx: u64,
+        target: &str,
+        source: &Selection,
+        fields: &[(String, SourceValue)],
+        conflicts: &[String],
+    ) -> Result<u64> {
+        self.require_live_transaction(tx)?;
+        columns_for(target)?;
+        if fields.is_empty() {
+            return Err(StoreError::invalid("empty storage write"));
+        }
+        let mut names = Vec::new();
+        let mut projected = Vec::new();
+        let mut bindings = Vec::new();
+        for (name, value) in fields {
+            if names.contains(name) {
+                return Err(StoreError::invalid("duplicate storage write column"));
+            }
+            names.push(name.clone());
+            projected.push(match value {
+                SourceValue::Column(name) => column(&source.relation, name)?,
+                SourceValue::Literal(value) => {
+                    bindings.push(value.clone());
+                    "?".to_owned()
+                }
+            });
+        }
+        if conflicts.iter().any(|name| !names.contains(name)) {
+            return Err(StoreError::invalid("UPSERT names a column without a value"));
+        }
+        let (predicate, selected) = selection_sql(source)?;
+        bindings.extend(selected);
+        let conflict = if conflicts.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", projection(target, conflicts)?)
+        };
+        let sql = format!("INSERT INTO \"{target}\" ({}) SELECT {} FROM \"{}\"{predicate} ON CONFLICT{conflict} DO NOTHING",
+            projection(target, &names)?, projected.join(", "), source.relation);
+        Ok(self
+            .conn
+            .execute(&sql, params_from_iter(bindings.iter().map(BoundCell)))? as u64)
+    }
+
+    fn delete(&mut self, tx: u64, selection: &Selection) -> Result<u64> {
+        self.require_live_transaction(tx)?;
+        let (predicate, bindings) = selection_sql(selection)?;
+        let sql = format!("DELETE FROM \"{}\"{predicate}", selection.relation);
+        Ok(self
+            .conn
+            .execute(&sql, params_from_iter(bindings.iter().map(BoundCell)))? as u64)
+    }
+
+    fn write(
+        &mut self,
+        tx: u64,
+        relation: &str,
+        fields: &Fields,
+        conflicts: &[String],
+        assignments: &[(String, ConflictValue)],
+    ) -> Result<()> {
+        self.require_live_transaction(tx)?;
+        columns_for(relation)?;
+        if fields.is_empty() {
+            return Err(StoreError::invalid("empty expression UPSERT"));
+        }
+        let names: Vec<_> = fields.iter().map(|(name, _)| name.clone()).collect();
+        unique_columns(relation, &names)?;
+        unique_columns(relation, conflicts)?;
+        unique_columns(
+            relation,
+            &assignments
+                .iter()
+                .map(|(name, _)| name.clone())
+                .collect::<Vec<_>>(),
+        )?;
+        let conflict = if conflicts.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", projection(relation, conflicts)?)
+        };
+        let mut remaining = 4096;
+        let updates = assignments
+            .iter()
+            .map(|(name, value)| {
+                Ok(format!(
+                    "{} = {}",
+                    column(relation, name)?,
+                    conflict_expression(relation, value, 0, &mut remaining)?
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let update = if updates.is_empty() {
+            "DO NOTHING".to_owned()
+        } else {
+            format!("DO UPDATE SET {}", updates.join(", "))
+        };
+        let sql = format!(
+            "INSERT INTO \"{relation}\" ({}) VALUES ({}) ON CONFLICT{conflict} {update}",
+            projection(relation, &names)?,
+            vec!["?"; fields.len()].join(", ")
+        );
+        self.conn.execute(&sql, params_from_iter(values(fields)))?;
+        Ok(())
+    }
 }
 
 #[cfg(test)]
@@ -964,7 +956,7 @@ mod tests {
                 .unwrap(),
             2
         );
-        assert_eq!(storage.delete_selected(tx, &selection).unwrap(), 2);
+        assert_eq!(storage.delete(tx, &selection).unwrap(), 2);
         storage.commit(tx).unwrap();
         assert_eq!(
             storage
@@ -1105,7 +1097,7 @@ mod tests {
                 &[]
             )
             .is_err());
-        assert!(storage.delete_selected(tx, &invalid).is_err());
+        assert!(storage.delete(tx, &invalid).is_err());
         storage.rollback(tx).unwrap();
     }
 

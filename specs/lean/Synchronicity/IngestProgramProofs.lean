@@ -1,5 +1,5 @@
 import VerifiedCore.Cas.Ingest
-import Synchronicity.Prelude
+import Synchronicity.Handlers
 
 /-! Fault traces of the actual captured-source ingestion program. No host
 callback implements publication or metadata policy. These fixtures use an
@@ -30,73 +30,72 @@ private def reply (script : Script) (label : String) (value : A) : Reply A :=
   else if (script.cleanupFails || (script.lateCleanupFails && label != "close")) && cleanup label then .error secondary
   else .ok value
 
-private def execute (script : Script) : Nat → Program Effects (Except Error ByteArray) →
-    Option (Except Error ByteArray × List String)
-  | 0, _ => none
-  | _ + 1, .pure value => some (value, [])
-  | fuel + 1, .request effect resume =>
-    let step (label : String) (next : Program Effects (Except Error ByteArray)) :=
-      (execute script fuel next).map fun (result, trace) => (result, label :: trace)
-    match effect with
-    | .left effect => match effect with
-      | .left effect => match effect with
-        | .open _ _ => none
-        | .close handle => if handle == 1 then
-            step "close" (resume (reply script "close" ())) else none
-        | .readAt _ _ _ => none
-        | .transfer _ _ _ => none
-      | .right effect => match effect with
-        | .build source payload outboard size =>
-          if source == 1 && payload == 2 && outboard == 3 && size == 0 then
-            step "build" (resume (reply script "build"
-              (if script.narrowRoot then narrow else digest))) else none
-        | .hash _ => none
-    | .right effect => match effect with
-      | .left effect => match effect with
-        | .left effect => match effect with
-          | .begin => step "begin" (resume (reply script "begin" 7))
-          | .commit tx => if tx == 7 then step "commit" (resume (reply script "commit" ())) else none
-          | .rollback tx => if tx == 7 then step "rollback" (resume (.ok ())) else none
-          | .readRows tx relation columns equals order joins =>
-            if tx == 7 && relation == "blobs" && columns == ["size", "complete", "durable", "bitmap"] &&
-                equals == [("root", .blob digest)] && order.isEmpty && joins.isEmpty then
-              step "claim" (resume (reply script "claim" [])) else none
-          | _ => none
-        | .right effect => match effect with
-          | .write tx relation fields conflicts updates =>
-            if tx == 7 && relation == "blobs" && conflicts == ["root"] &&
-                fields == VerifiedCore.Cas.IngestCommit.values digest 0 none 123 .local &&
-                updates == VerifiedCore.Cas.IngestCommit.assignments then
-              step "upsert" (resume (reply script "upsert" ())) else none
-      | .right effect => match effect with
-        | .left effect => match effect with
-          | .createTemporary space =>
-            if space == "cas_payload" then step "temp-payload" (resume (reply script "temp-payload" 2))
-            else if space == "cas_outboard" then step "temp-outboard"
-              (resume (reply script "temp-outboard" (if script.duplicate then 2 else 3))) else none
-          | .flush handle =>
-            let label := if handle == 2 then "flush-payload" else "flush-outboard"
-            if handle == 2 || handle == 3 then step label (resume (reply script label ())) else none
-          | .replace handle space key =>
-            let label := if handle == 2 then "replace-payload" else "replace-outboard"
-            if key == digest && ((handle == 2 && space == "cas_payload") ||
-                (handle == 3 && space == "cas_outboard")) then
-              step label (resume (reply script label ())) else none
-          | .discard handle =>
-            let label := if handle == 2 then "discard-payload" else "discard-outboard"
-            if handle == 2 || handle == 3 then step label (resume (reply script label ())) else none
-          | .syncParent space key =>
-            let label := if space == "cas_payload" then "sync-payload" else "sync-outboard"
-            if key == digest && (space == "cas_payload" || space == "cas_outboard") then
-              step label (resume (reply script label
-                (if script.unsupported then .unsupported else .synced))) else none
-        | .right effect => match effect with
-          | .acquire space key => if space == "cas_writers" && key == digest then
-              step "lease" (resume (reply script "lease" 9)) else none
-          | .release token => if token == 9 then step "release" (resume (reply script "release" ())) else none
+private def step (script : Script) (label : String) (value : A) : Option (String × Reply A × Script) :=
+  some (label, reply script label value, script)
+
+private instance : Handlers.Handler FileIO Script String where
+  handle
+    | .close handle, script => if handle == 1 then step script "close" () else none
+    | _, _ => none
+
+private instance : Handlers.Handler Construct Script String where
+  handle
+    | .build source payload outboard size, script =>
+      if source == 1 && payload == 2 && outboard == 3 && size == 0 then
+        step script "build" (if script.narrowRoot then narrow else digest) else none
+    | .hash _, _ => none
+
+private instance : Handlers.Handler Storage Script String where
+  handle
+    | .begin, script => step script "begin" 7
+    | .commit tx, script => if tx == 7 then step script "commit" () else none
+    | .rollback tx, script => if tx == 7 then some ("rollback", .ok (), script) else none
+    | .readRows tx relation columns equals order joins, script =>
+      if tx == 7 && relation == "blobs" && columns == ["size", "complete", "durable", "bitmap"] &&
+          equals == [("root", .blob digest)] && order.isEmpty && joins.isEmpty then
+        step script "claim" [] else none
+    | _, _ => none
+
+private instance : Handlers.Handler Upsert Script String where
+  handle
+    | .write tx relation fields conflicts updates, script =>
+      if tx == 7 && relation == "blobs" && conflicts == ["root"] &&
+          fields == VerifiedCore.Cas.IngestCommit.values digest 0 true none none 123 .local &&
+          updates == VerifiedCore.Cas.IngestCommit.assignments then
+        step script "upsert" () else none
+
+private instance : Handlers.Handler Access Script String := Handlers.refuse
+
+private instance : Handlers.Handler Resources Script String where
+  handle
+    | .createTemporary space, script =>
+      if space == "cas_payload" then step script "temp-payload" 2
+      else if space == "cas_outboard" then
+        step script "temp-outboard" (if script.duplicate then 2 else 3) else none
+    | .flush handle, script =>
+      let label := if handle == 2 then "flush-payload" else "flush-outboard"
+      if handle == 2 || handle == 3 then step script label () else none
+    | .replace handle space key, script =>
+      let label := if handle == 2 then "replace-payload" else "replace-outboard"
+      if key == digest && ((handle == 2 && space == "cas_payload") ||
+          (handle == 3 && space == "cas_outboard")) then
+        step script label () else none
+    | .discard handle, script =>
+      let label := if handle == 2 then "discard-payload" else "discard-outboard"
+      if handle == 2 || handle == 3 then step script label () else none
+    | .syncParent space key, script =>
+      let label := if space == "cas_payload" then "sync-payload" else "sync-outboard"
+      if key == digest && (space == "cas_payload" || space == "cas_outboard") then
+        step script label (if script.unsupported then .unsupported else .synced) else none
+
+private instance : Handlers.Handler Lease Script String where
+  handle
+    | .acquire space key, script =>
+      if space == "cas_writers" && key == digest then step script "lease" 9 else none
+    | .release token, script => if token == 9 then step script "release" () else none
 
 private def check (script : Script) (policy : DirectoryPolicy := .requireSync) :=
-  execute script 32 (run 1 0 123 .local policy).run
+  Handlers.run 32 (run 1 0 123 .local policy).run script
 
 private def beforePublish := ["temp-payload", "temp-outboard", "build", "close", "lease"]
 private def publication := ["flush-payload", "flush-outboard", "replace-payload", "replace-outboard",

@@ -90,12 +90,25 @@ storage capabilities include:
   requests chosen by Lean, not host-side application queries. Batch requests
   must preserve set-shaped behavior and index access for large collections.
 
-`EffectSum` composes typed capabilities without merging their algebras. History
-uses storage plus a separate `Crypto.validateEd25519` primitive. Its requests
-carry only key bytes and return validity or an opaque host failure, never a
-decoded origin/head. `transactionOver` injects storage requests into the chosen
-composition; storage-only `transactionWith` remains a specialization of that
-same algorithm. Adding crypto does not add crypto methods to storage services.
+`EffectSum` composes typed capabilities without merging their algebras, and
+the `Inject E F` class finds the path from one capability into a composed row
+so a program says `raise Error.host (Storage.readRows ..)` and never spells
+the `.left`/`.right` ladder. `raise` issues an effect whose reply is a host
+`Reply`; `observe` issues one with a richer reply (a `FileReply`);
+`within` lifts a whole sub-operation into a wider row and translates its
+error type; `transactionOver` brackets a sub-operation in begin/commit/rollback,
+and storage-only `transactionWith` is its specialization.
+History uses storage plus a separate `Crypto.validateEd25519` primitive. Its
+requests carry only key bytes and return validity or an opaque host failure,
+never a decoded origin/head. Adding crypto does not add crypto methods to
+storage services.
+
+On the Rust side one relational `Storage` trait is the host every operation
+runs over, and one runner, `operation::run`, takes it together with a
+`Capabilities` struct of the optional raw services (files, clock, output sink,
+construction, temporaries, leases, source input, resources, crypto). A
+request for a service the caller did not supply is a protocol failure, so the
+Lean effect row of an operation is what says which services it can reach.
 
 Raw cells preserve all SQLite storage classes: NULL, signed 64-bit integer,
 REAL bits, text (including invalid UTF-8 bytes), and blobs. Lean owns the
@@ -182,11 +195,11 @@ properties include:
 For each vertical migration: record the existing behavior and regression tests;
 implement the whole program and its host interpreter; execute real storage
 tests including failures at each effect; replace the production entry point;
-delete its Rust algorithm and obsolete low-level exports; update proof anchors.
+delete its Rust algorithm and obsolete low-level exports; extend the proofs.
 Do not retain a selectable Rust backend. Staged, unintegrated code is allowed
 during development but must be identified as such, not counted as completion.
 
-Run Lean `lake build --wfail` and anchors, focused Rust tests and Clippy during
+Run the Lean proof build (`lake build --wfail`), focused Rust tests and Clippy during
 development. Before merging run workspace tests/lints and relevant engine,
 cloud, recovery, hostile-input and native platform CI gates. Existing binary,
 DB, wire, filesystem, error and cancellation behavior are regression contracts.
@@ -322,14 +335,42 @@ Integration review has identified specific gates, not waived limitations:
 
 ### Current native transport
 
-`Host/Wire.lean` encodes raw requests and decodes replies. `Entry.lean` alone
-imports domains to construct commands; the shared transport imports no domain
-policy. Packets begin with version 1 and a discriminant, with little-endian u64
-integers/lengths and length-delimited UTF-8/bytes. Requests encode explicit
-relation/projection/equality/upsert values. Replies preserve raw signed cells,
-NULL, empty values, absence and original host failures. Decoders reject unknown
-versions/tags, wrong effect reply types, truncated or trailing data and lengths
-that cannot fit the remaining packet before allocation.
+The boundary is declared once, in Lean, and generated on both sides.
+`Host/Codec.lean` holds the transport primitives: little-endian u64 words,
+length-delimited bytes and strings, the `Encode`/`Decode` classes with an
+instance per raw type, the reply and file-reply decoders, and the
+`WireEffect` class whose `EffectSum` instance puts any composed algebra on the
+wire. `Host/Generated.lean` is printed by `hostgen` from the effect
+inductives: each algebra's tags, names, request encoder, reply decoder and
+`WireEffect` instance. `Host/Wire.lean` only steps a program: `packet`
+renders a terminal or the pending request, `resume` feeds a reply to the
+pending continuation, and the two native exports specialize them to the
+native algebra. Packets begin with version 1 and a discriminant; replies must
+match the pending effect's tag and consume the whole input, and decoders
+reject unknown versions/tags, wrong reply types, truncated or trailing data
+and lengths that cannot fit the remaining packet before allocation.
+
+The same generator prints the Rust side: the host traits (with the Lean
+docstrings), the `Frame` enum with its decoder, the dispatch of every frame
+to the storage host or the capability that serves it, and the
+`host_unexpected!` macro test doubles use for the methods an operation never
+requests. That file is a build product: `build.rs` runs the generator over
+the compiled algebras and prints it into Cargo's output directory, where
+`lib.rs` includes it, so the Rust glue is never committed. The Lean codecs
+are kept in the tree, and `build.rs` fails the build when they are stale.
+The interpreter loop in `operation.rs` serves by hand only the frames that
+use the run's own resources: borrowed command inputs, the transfer into the
+output sink and the sink append. The generator's only tables are the wire
+tags and the routing of each algebra to a Rust service.
+
+Commands cross the same way. `Commands.lean` declares the `Command`
+inductive and the flat outcome types; `Commands/Generated.lean` and the Rust
+mirrors with their codecs are generated. One export, `synch_lean_start`,
+decodes the packet and dispatches; `Entry.lean` keeps only the mapping from
+each operation's domain errors to its outcome type, host failures and
+protocol failures. The Rust facades bind capabilities, encode the command and
+decode the terminal; no per-command C constructor, extern declaration or
+hand-written terminal codec remains.
 
 The native state now carries the sum of storage and crypto effects. Storage-only
 commands inject their effects into that sum without changing their sequencing;
@@ -356,8 +397,7 @@ the runner checks capability/range validity and copies only that range. In
 particular, lookup rejects oversized keys in Lean before requesting any bytes,
 preserving cheap rejection without duplicating the key-limit policy in Rust.
 Byte-only operations use a narrow `ByteStorage` host interface; they do not
-require SQL or transaction services. Domain command construction and terminal
-result decoding live in the domain facades, not the common continuation runner.
+require SQL or transaction services.
 
 Deletion extends the host algebra with raw relational existence, keyed counter
 reads and keyed file removal. Existence queries avoid materializing every pin
@@ -545,9 +585,8 @@ or file command. Its Rust wrapper binds raw services and translates terminal
 diagnostics only. Lean observes file metadata, chooses exact-length versus
 EOF reads, selects inline storage, and composes `Cas/Ingest.run` for out-of-line
 publication. `Store::ingest_bytes` and `Store::ingest_file` only supply a raw
-input capability and translate the completed result. The obsolete
-`cas-write-complete-commit` Rust/abstract-model pairing anchor is removed;
-same-source program proofs cover the executed local ingestion path.
+input capability and translate the completed result. Same-source program
+proofs cover the executed local ingestion path.
 
 An initially small file still captures to EOF, even if it grows beyond 16 KiB.
 That exceptional branch retains its captured bytes, as the previous whole-file
@@ -767,13 +806,14 @@ migration are retained: depth-aware deduplication, retryable interrupted reads,
 shared-payload waiters, terminal-epoch refusal and bounded certificate retention.
 Complete local ingestion/read/repair, CAS lifecycle commands, trie lookup and
 history retention remain in Lean. Fine-grained exports/adapters are deleted,
-not merely unused; proof claims and anchors distinguish executable Lean
-guarantees from models of restored Rust paths.
+not merely unused. The proof package holds only theorems about that
+executable core; the standalone models of Rust paths, and the anchors that
+paired them with Rust sites, are gone.
 
 Local validation: 431 tests passed across core/mpt/store/verified (seven ignored,
 including the separately run fanout stress tests); all-target Clippy with
-warnings denied, formatting, the full Lean build (1000 jobs), bidirectional
-anchor validation and the complete-lookup link smoke test passed. New-head
+warnings denied, formatting, the full Lean build (1000 jobs) and the
+complete-lookup link smoke test passed. New-head
 cross-platform CI remains necessary before claiming platform validation.
 
 The stabilization/refactor checkpoint below describes the preceding cycle, not

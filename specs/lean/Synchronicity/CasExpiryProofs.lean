@@ -23,7 +23,6 @@ def mutation (tx : Transaction) (holder : Option PinHolder) (now : Int64) : Even
 
 /-- No rows are pre-read, interpreted in Rust, or individually deleted. The
 exact affected-row count is returned after successful commit, including zero. -/
-@[rust_impl "cas-expiry-operation"]
 theorem successful_execution (tx : Transaction) (holder : Option PinHolder)
     (now : Int64) (count : Nat) :
     run { begin := .ok tx, delete := .ok count } holder now =
@@ -75,5 +74,3 @@ theorem commit_failure (tx : Transaction) (failure : Failure) (rollback : Reply 
       (.error failure, [.begin, mutation tx holder now, .commit tx, .rollback tx]) := rfl
 
 end Synchronicity.CasExpiryProofs
-
-#lint

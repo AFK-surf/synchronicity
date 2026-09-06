@@ -1,5 +1,5 @@
 import VerifiedCore.Origin
-import Synchronicity.Prelude
+import Synchronicity.Decidable
 
 namespace Synchronicity.OriginProgramProofs
 open VerifiedCore.Origin

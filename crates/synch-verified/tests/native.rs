@@ -1,3 +1,5 @@
+use synch_verified::host_unexpected;
+
 #[test]
 fn pin_acquisition_requires_durability_and_orders_possession_effects() {
     use synch_verified::host::{Cell, Fields, Row, Storage};
@@ -33,9 +35,6 @@ fn pin_acquisition_requires_durability_and_orders_possession_effects() {
         }
 
         type Error = &'static str;
-        fn exists_rows(&mut self, _: u64, _: &str, _: &Fields) -> Result<bool, Self::Error> {
-            panic!("unexpected existence query")
-        }
 
         fn begin(&mut self) -> Result<u64, Self::Error> {
             self.trace.push("begin");
@@ -45,9 +44,6 @@ fn pin_acquisition_requires_durability_and_orders_possession_effects() {
             assert_eq!(tx, 7);
             self.trace.push("commit");
             Ok(())
-        }
-        fn rollback(&mut self, _tx: u64) -> Result<(), Self::Error> {
-            panic!("no failed storage reply in this script")
         }
         fn read_rows(
             &mut self,
@@ -119,13 +115,20 @@ fn pin_acquisition_requires_durability_and_orders_possession_effects() {
             self.trace.push("delete want");
             Ok(1)
         }
-        fn read_bytes(
-            &mut self,
-            _space: &str,
-            _key: &[u8],
-        ) -> Result<Option<Vec<u8>>, Self::Error> {
-            panic!("acquisition never reads payload bytes")
-        }
+
+        // The relational host is one trait; these operations never request the
+        // read-repair, copy or expression-upsert statements.
+
+        host_unexpected!(
+            exists_rows,
+            rollback,
+            read_bytes,
+            snapshot,
+            update,
+            copy_rows,
+            delete,
+            write
+        );
     }
 
     for durable in [None, Some(0), Some(1), Some(-7), Some(i64::MIN)] {
@@ -270,16 +273,6 @@ fn deletion_protocol_checks_every_protection_and_orders_effects() {
                 .map(|n| vec![vec![Cell::Integer(n)]])
                 .unwrap_or_default())
         }
-        fn upsert(
-            &mut self,
-            _: u64,
-            _: &str,
-            _: &Fields,
-            _: &[String],
-            _: &[String],
-        ) -> Result<(), Self::Error> {
-            panic!("unexpected upsert")
-        }
         fn delete_rows(
             &mut self,
             tx: u64,
@@ -295,9 +288,11 @@ fn deletion_protocol_checks_every_protection_and_orders_effects() {
             step(&self.trace, self.fail_at, "delete")?;
             Ok(u64::from(self.accessed.is_some()))
         }
-        fn read_bytes(&mut self, _: &str, _: &[u8]) -> Result<Option<Vec<u8>>, Self::Error> {
-            panic!("unexpected byte read")
-        }
+
+        // The relational host is one trait; these operations never request the
+        // read-repair, copy or expression-upsert statements.
+
+        host_unexpected!(upsert, read_bytes, snapshot, update, copy_rows, delete, write);
     }
     impl Resources for Files {
         type Error = &'static str;
@@ -341,7 +336,7 @@ fn deletion_protocol_checks_every_protection_and_orders_effects() {
                             let expected = if writing {
                                 Writing
                             } else if pinned || referenced {
-                                Protected
+                                ProtectedClaim
                             } else if before.is_some_and(|cutoff| !row || last >= cutoff) {
                                 Skipped
                             } else {
