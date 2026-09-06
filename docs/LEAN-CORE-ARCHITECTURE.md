@@ -832,6 +832,14 @@ claims in the migrated paths; do not expand their scope to remove every remainin
 Rust domain algorithm. Performance measurements remain explicit limitations,
 not correctness or throughput-parity claims.
 
+The user explicitly accepts retaining the documented walk proof limitation:
+exhaustion is not yet proved to imply complete graph coverage, and certificate
+soundness assumes validity supplied by the completed walk. Completing that
+end-to-end theorem is not a prerequisite for this stabilization/refactor cycle.
+Keep the limitation visible; do not strengthen the claimed guarantee. The gate
+for starting glue refactoring is resolution of known defects and passing the
+relevant tests, existing proof checks and supported-platform CI.
+
 The uncommitted cloud-command experiment was withdrawn before native integration.
 No cloud operation was switched, and no cloud-only raw host capability was added
 to the production interface.
