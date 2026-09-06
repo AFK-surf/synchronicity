@@ -5,7 +5,9 @@ use rusqlite::{
     types::{ToSqlOutput, ValueRef},
     Connection, OptionalExtension, ToSql,
 };
-use synch_verified::host::{Access, Cell, Fields, Row, Scan, Selection, SourceValue, Storage};
+use synch_verified::host::{
+    Access, Cell, ConflictValue, Fields, Row, Scan, Selection, SourceValue, Storage, Upsert,
+};
 
 use crate::{Result, StoreError};
 
@@ -237,6 +239,114 @@ impl Drop for SqliteStorage<'_> {
             // recovery and error selection are requested by the Lean program.
             let _ = self.conn.execute_batch("ROLLBACK");
         }
+    }
+}
+
+impl Upsert for Session<'_> {
+    fn write(
+        &mut self,
+        tx: u64,
+        relation: &str,
+        fields: &Fields,
+        conflicts: &[String],
+        assignments: &[(String, ConflictValue)],
+    ) -> Result<()> {
+        self.transaction()?
+            .write(tx, relation, fields, conflicts, assignments)
+    }
+}
+
+fn unique_columns(relation: &str, names: &[String]) -> Result<()> {
+    let mut seen = std::collections::BTreeSet::new();
+    for name in names {
+        column(relation, name)?;
+        if !seen.insert(name) {
+            return Err(StoreError::invalid("duplicate expression UPSERT column"));
+        }
+    }
+    Ok(())
+}
+
+fn conflict_expression(
+    relation: &str,
+    value: &ConflictValue,
+    depth: usize,
+    remaining: &mut usize,
+) -> Result<String> {
+    if depth > 32 || *remaining == 0 {
+        return Err(StoreError::invalid(
+            "expression UPSERT exceeds complexity limit",
+        ));
+    }
+    *remaining -= 1;
+    match value {
+        ConflictValue::Current(name) => Ok(format!("\"{relation}\".{}", column(relation, name)?)),
+        ConflictValue::Excluded(name) => Ok(format!("excluded.{}", column(relation, name)?)),
+        ConflictValue::Coalesce(pair) | ConflictValue::Maximum(pair) => {
+            let left = conflict_expression(relation, &pair.0, depth + 1, remaining)?;
+            let right = conflict_expression(relation, &pair.1, depth + 1, remaining)?;
+            let function = if matches!(value, ConflictValue::Coalesce(_)) {
+                "coalesce"
+            } else {
+                "max"
+            };
+            Ok(format!("{function}({left}, {right})"))
+        }
+    }
+}
+
+impl Upsert for SqliteStorage<'_> {
+    fn write(
+        &mut self,
+        tx: u64,
+        relation: &str,
+        fields: &Fields,
+        conflicts: &[String],
+        assignments: &[(String, ConflictValue)],
+    ) -> Result<()> {
+        self.require_live_transaction(tx)?;
+        columns_for(relation)?;
+        if fields.is_empty() {
+            return Err(StoreError::invalid("empty expression UPSERT"));
+        }
+        let names: Vec<_> = fields.iter().map(|(name, _)| name.clone()).collect();
+        unique_columns(relation, &names)?;
+        unique_columns(relation, conflicts)?;
+        unique_columns(
+            relation,
+            &assignments
+                .iter()
+                .map(|(name, _)| name.clone())
+                .collect::<Vec<_>>(),
+        )?;
+        let conflict = if conflicts.is_empty() {
+            String::new()
+        } else {
+            format!(" ({})", projection(relation, conflicts)?)
+        };
+        let mut remaining = 4096;
+        let updates = assignments
+            .iter()
+            .map(|(name, value)| {
+                Ok(format!(
+                    "{} = {}",
+                    column(relation, name)?,
+                    conflict_expression(relation, value, 0, &mut remaining)?
+                ))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        let update = if updates.is_empty() {
+            "DO NOTHING".to_owned()
+        } else {
+            format!("DO UPDATE SET {}", updates.join(", "))
+        };
+        let sql = format!(
+            "INSERT INTO \"{relation}\" ({}) VALUES ({}) ON CONFLICT{conflict} {update}",
+            projection(relation, &names)?,
+            vec!["?"; fields.len()].join(", ")
+        );
+        self.conn.execute(&sql, params_from_iter(values(fields)))?;
+        Ok(())
     }
 }
 
@@ -1628,6 +1738,183 @@ mod tests {
             ("created_at".into(), Cell::Integer(created_at)),
             ("release_after".into(), release),
         ]
+    }
+
+    #[test]
+    fn expression_upsert_preserves_raw_coalesce_and_max_semantics() {
+        let conn = connection();
+        conn.execute_batch("INSERT INTO blobs VALUES(X'01', 9, 0, NULL, X'', 0, -7)")
+            .unwrap();
+        let mut storage = SqliteStorage::new(&conn);
+        let tx = storage.begin().unwrap();
+        let assignments = vec![
+            (
+                "inline".into(),
+                ConflictValue::Coalesce(Box::new((
+                    ConflictValue::Excluded("inline".into()),
+                    ConflictValue::Current("inline".into()),
+                ))),
+            ),
+            (
+                "durable".into(),
+                ConflictValue::Maximum(Box::new((
+                    ConflictValue::Current("durable".into()),
+                    ConflictValue::Excluded("durable".into()),
+                ))),
+            ),
+        ];
+        for (incoming, expected) in [
+            (Cell::Integer(-9), Cell::Integer(-7)),
+            (Cell::Integer(3), Cell::Integer(3)),
+            (Cell::Real(3.5_f64.to_bits()), Cell::Real(3.5_f64.to_bits())),
+            (Cell::RawText(vec![255]), Cell::RawText(vec![255])),
+            (Cell::Blob(vec![0]), Cell::Blob(vec![0])),
+            (Cell::Null, Cell::Null),
+        ] {
+            storage
+                .write(
+                    tx,
+                    "blobs",
+                    &vec![
+                        ("root".into(), Cell::Blob(vec![1])),
+                        ("inline".into(), Cell::Null),
+                        ("durable".into(), incoming),
+                    ],
+                    &names(&["root"]),
+                    &assignments,
+                )
+                .unwrap();
+            let rows = storage
+                .read_rows(
+                    tx,
+                    "blobs",
+                    &names(&["inline", "durable"]),
+                    &vec![],
+                    &[],
+                    &[],
+                )
+                .unwrap();
+            assert_eq!(rows, vec![vec![Cell::Blob(vec![]), expected]]);
+        }
+        storage.rollback(tx).unwrap();
+    }
+
+    #[test]
+    fn expression_upsert_validates_names_duplicates_and_depth_before_mutation() {
+        let conn = connection();
+        let mut storage = SqliteStorage::new(&conn);
+        let tx = storage.begin().unwrap();
+        let fields = vec![("root".into(), Cell::Blob(vec![1]))];
+        let current = ConflictValue::Current("size".into());
+        let mut deep = current.clone();
+        for _ in 0..34 {
+            deep = ConflictValue::Coalesce(Box::new((deep, current.clone())));
+        }
+        for assignments in [
+            vec![("size".into(), ConflictValue::Excluded("bad".into()))],
+            vec![("bad".into(), current.clone())],
+            vec![
+                ("size".into(), current.clone()),
+                ("size".into(), current.clone()),
+            ],
+            vec![("size".into(), deep)],
+        ] {
+            assert!(storage
+                .write(tx, "blobs", &fields, &names(&["root"]), &assignments)
+                .is_err());
+        }
+        assert!(storage
+            .write(
+                tx,
+                "blobs",
+                &vec![fields[0].clone(), fields[0].clone()],
+                &[],
+                &[]
+            )
+            .is_err());
+        assert!(storage
+            .write(tx, "blobs", &fields, &names(&["root", "root"]), &[])
+            .is_err());
+        assert!(storage.write(tx, "bad", &fields, &[], &[]).is_err());
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM blobs", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
+        storage.rollback(tx).unwrap();
+    }
+
+    #[test]
+    fn expression_upsert_failure_is_atomic_and_drop_rolls_back() {
+        let conn = connection();
+        conn.execute_batch("INSERT INTO blobs VALUES(X'01', 9, 0, NULL, NULL, 0, 0);
+            CREATE TRIGGER reject_update BEFORE UPDATE ON blobs BEGIN SELECT RAISE(ABORT, 'rejected'); END;").unwrap();
+        {
+            let mut storage = SqliteStorage::new(&conn);
+            let tx = storage.begin().unwrap();
+            let fields = vec![
+                ("root".into(), Cell::Blob(vec![1])),
+                ("size".into(), Cell::Integer(10)),
+            ];
+            assert!(storage
+                .write(
+                    tx,
+                    "blobs",
+                    &fields,
+                    &names(&["root"]),
+                    &[("size".into(), ConflictValue::Excluded("size".into()))]
+                )
+                .is_err());
+            assert_eq!(
+                conn.query_row("SELECT size FROM blobs", [], |r| r.get::<_, i64>(0))
+                    .unwrap(),
+                9
+            );
+            storage
+                .write(
+                    tx,
+                    "blobs",
+                    &vec![("root".into(), Cell::Blob(vec![2]))],
+                    &names(&["root"]),
+                    &[],
+                )
+                .unwrap();
+        }
+        assert!(conn.is_autocommit());
+        assert_eq!(
+            conn.query_row("SELECT count(*) FROM blobs", [], |r| r.get::<_, i64>(0))
+                .unwrap(),
+            1
+        );
+    }
+
+    #[test]
+    fn expression_upsert_session_abandonment_rolls_back() {
+        let (_dir, store) = crate::testutil::store();
+        {
+            let mut session = Session::new(&store);
+            let tx = session.begin().unwrap();
+            session
+                .write(
+                    tx,
+                    "trie_values",
+                    &vec![
+                        ("hash".into(), Cell::Blob(vec![1; 32])),
+                        ("data".into(), Cell::Blob(vec![7])),
+                    ],
+                    &names(&["hash"]),
+                    &[],
+                )
+                .unwrap();
+        }
+        assert_eq!(
+            store
+                .conn()
+                .query_row("SELECT count(*) FROM trie_values", [], |r| r
+                    .get::<_, i64>(0))
+                .unwrap(),
+            0
+        );
     }
 
     fn insert_pin(storage: &mut SqliteStorage<'_>, tx: u64) -> Result<()> {

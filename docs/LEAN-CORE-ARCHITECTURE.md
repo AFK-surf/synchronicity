@@ -545,6 +545,22 @@ native primitive/layout tests. Invocation-owned source, payload and outboard
 resources must be distinct; fresh temporary creation establishes this host
 resource contract before the internal constructor is called.
 
+The inner-tree proof additionally interprets the executable free-monadic
+program under arbitrary raw replies: every accepted digest has width 32.
+Under an explicit valid-input chunk/parent primitive contract, it agrees with
+a pure Lean tree recurrence. This is not a proof of native cryptography or of
+the outer streaming constructor's complete root/outboard correctness.
+
+`Cas/IngestCommit.lean` stages the metadata portion as an internal Lean
+transaction: read the exact claim projection, decode and settle it, then issue
+one atomic raw upsert. Its accepted full-input plan is proved complete; scripted
+effect proofs check validation order, conflict rejection and rollback on read,
+write and commit failures. This stage is not a public Rust operation and does
+not establish the preceding file/lease/durability obligations. The generic
+upsert capability carries only current/excluded column references, coalesce
+and maximum expressions; Rust validates identifiers and executes a single
+parameter-bound SQL statement without interpreting CAS state.
+
 The whole ingestion command must preserve these observed input semantics:
 
 - A small initial file stat selects read-to-EOF; the captured bytes' actual

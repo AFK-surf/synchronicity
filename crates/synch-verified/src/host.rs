@@ -39,6 +39,28 @@ pub enum SourceValue {
     Column(String),
 }
 
+/// Raw SQLite conflict expressions. These preserve SQLite NULL, storage-class,
+/// collation and scalar maximum semantics; they do not interpret domain data.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConflictValue {
+    Current(String),
+    Excluded(String),
+    Coalesce(Box<(Self, Self)>),
+    Maximum(Box<(Self, Self)>),
+}
+
+/// One atomic INSERT with explicit conflict assignments, over raw bound cells.
+pub trait Upsert: Storage {
+    fn write(
+        &mut self,
+        tx: u64,
+        relation: &str,
+        values: &Fields,
+        conflicts: &[String],
+        assignments: &[(String, ConflictValue)],
+    ) -> Result<(), Self::Error>;
+}
+
 /// Raw relational access, without metadata interpretation or healing policy.
 pub trait Access: Storage {
     /// Read outside an explicitly requested transaction, preserving a successful

@@ -1,5 +1,4 @@
-import VerifiedCore.Host
-import VerifiedCore.Cas
+import VerifiedCore.Cas.Codec
 
 /-!
 Internal CAS read decoding. Rust supplies raw SQLite cells and bytes only;
@@ -9,9 +8,7 @@ namespace VerifiedCore.Cas.Read
 
 open Host
 
-inductive CellType where
-  | null | integer | real | text | blob
-  deriving BEq, DecidableEq
+abbrev CellType := Codec.CellType
 
 inductive Error where
   | host (failure : Failure)
@@ -31,25 +28,16 @@ structure Metadata where
   bitmap : Option ByteArray
   inline : Option ByteArray
 
-def cellType : Cell → CellType
-  | .null => .null
-  | .integer _ => .integer
-  | .real _ => .real
-  | .text _ | .rawText _ => .text
-  | .blob _ => .blob
+abbrev cellType := Codec.cellType
 
-def integerField (index : Nat) (column : String) : Cell → Except Error Int64
-  | .integer value => .ok value
-  | value => .error (.columnType index column (cellType value))
+def integerField (index : Nat) (column : String) : Cell → Except Error Int64 :=
+  Codec.integerField (Error.columnType index column)
 
-def blobField (index : Nat) (column : String) : Cell → Except Error ByteArray
-  | .blob value => .ok value
-  | value => .error (.columnType index column (cellType value))
+def blobField (index : Nat) (column : String) : Cell → Except Error ByteArray :=
+  Codec.blobField (Error.columnType index column)
 
-def optionalBlobField (index : Nat) (column : String) : Cell → Except Error (Option ByteArray)
-  | .null => .ok none
-  | .blob value => .ok (some value)
-  | value => .error (.columnType index column (cellType value))
+def optionalBlobField (index : Nat) (column : String) : Cell → Except Error (Option ByteArray) :=
+  Codec.optionalBlobField (Error.columnType index column)
 
 /-- Preserve the original row reader's ordered column validation. The omitted
 pin EXISTS projection was always an integer; later diagnostics retain its
@@ -75,53 +63,16 @@ def decodeSize : List Row → Except Error (Option Int64)
   | [[value]] => (integerField 0 "size" value).map some
   | _ => .error .malformed
 
-private structure Cursor where
-  input : ByteArray
-  offset : Nat := 0
+/-- Decode the local postcard Vec<(u64,u64)> representation without interpreting
+the row's size or completeness. Trailing bytes and non-minimal integers retain
+their established acceptance behavior; malformed input yields no spans.
+Commit settlement consumes these raw spans before choosing its accepted size. -/
+abbrev decodeRawBitmap := Codec.decodeRawBitmap
 
-private abbrev Parser := StateT Cursor (Except Unit)
-
-private def byte : Parser UInt8 := do
-  let cursor ← get
-  if cursor.offset >= cursor.input.size then throw ()
-  set { cursor with offset := cursor.offset + 1 }
-  return cursor.input.data[cursor.offset]!
-
-/-- Postcard's u64 LEB128 permits non-minimal encodings but rejects an
-overflowing tenth octet. At most ten bytes are consumed per integer. -/
-private def unsignedAux : Nat → Nat → Nat → Parser Nat
-  | 0, _, _ => throw ()
-  | fuel + 1, shift, acc => do
-    let digit := (← byte).toNat
-    if fuel == 0 && digit > 1 then throw ()
-    let value := acc + (digit % 128) * 2 ^ shift
-    if digit < 128 then return value
-    unsignedAux fuel (shift + 7) value
-
-private def unsigned : Parser Nat := unsignedAux 10 0 0
-
-private def pairs : Nat → List GroupSpan → Parser (List GroupSpan)
-  | 0, acc => return acc.reverse
-  | count + 1, acc => do
-    let start ← unsigned
-    let stop ← unsigned
-    pairs count (⟨start, stop⟩ :: acc)
-
-private def bitmap : Parser (List GroupSpan) := do
-  let count ← unsigned
-  let cursor ← get
-  -- Every pair requires at least two octets. Reject impossible counts before
-  -- traversing/allocating from an untrusted serialized length.
-  if count > (cursor.input.size - cursor.offset) / 2 then throw ()
-  pairs count []
-
-/-- Local postcard Vec<(u64,u64)> decoding ignores trailing bytes, exactly as
-the established local format requires. Malformed bytes mean no availability.
-Normalization sorts/merges runs; no work is proportional to object size. -/
+/-- Local-read availability additionally clamps and normalizes the decoded
+spans against the observed size. Work depends on runs, not object size. -/
 def decodeBitmap (input : ByteArray) (groups : UInt64) : List GroupSpan :=
-  match bitmap.run ⟨input, 0⟩ with
-  | .error _ => []
-  | .ok (spans, _) => normalizeSpans groups.toNat spans
+  normalizeSpans groups.toNat (decodeRawBitmap input)
 
 /-- Coverage of a half-open byte request. Complete cache state overrides any
 bitmap; a durable-tier promise does not establish local availability. -/

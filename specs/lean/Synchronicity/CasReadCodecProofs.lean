@@ -4,6 +4,18 @@ import Synchronicity.Prelude
 /-! Same-source regression theorems for the executable CAS read decoder.
 These are deliberately not a second model of Rust decoding. -/
 namespace Synchronicity.CasReadCodecProofs
+theorem raw_bitmap_preserves_order_and_unclipped_endpoints :
+    ((VerifiedCore.Cas.Read.decodeRawBitmap ⟨#[2, 9, 12, 1, 0]⟩).map
+      (fun span => (span.start, span.stop))) = [(9, 12), (1, 0)] := by decide
+
+theorem raw_bitmap_preserves_trailing_byte_acceptance :
+    ((VerifiedCore.Cas.Read.decodeRawBitmap ⟨#[1, 2, 4, 255]⟩).map
+      (fun span => (span.start, span.stop))) = [(2, 4)] := by decide
+
+theorem read_bitmap_normalizes_shared_raw_decoder (bytes : ByteArray) (groups : UInt64) :
+    VerifiedCore.Cas.Read.decodeBitmap bytes groups =
+      VerifiedCore.normalizeSpans groups.toNat (VerifiedCore.Cas.Read.decodeRawBitmap bytes) := rfl
+
 open VerifiedCore VerifiedCore.Host VerifiedCore.Cas.Read
 set_option maxRecDepth 4096
 

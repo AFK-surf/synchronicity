@@ -53,6 +53,12 @@ orchestration, primitive integration and conditional root/layout correctness
 remain required before deleting Rust ingestion. The architecture document
 records changing-file behavior, temporary-file/GC hazards and durability gates.
 
+The staged `Cas/IngestCommit.lean` owns claim decoding, settlement and atomic
+metadata mutation over raw storage effects, without exposing a Rust planner
+facade. Its transaction/error proofs and the inner hash tree's conditional
+Lean recurrence proof strengthen this stage; neither constitutes a whole
+ingestion cutover or a proof of native cryptographic correctness.
+
 The acquisition cutover is checked against real SQLite, including abandoned
 transactions, automatic rollback, deferred commit failure, UPSERT timestamp
 preservation and the existing typed errors for corrupt durability cells.

@@ -25,6 +25,8 @@ import Synchronicity.CasReadCodecProofs
 import Synchronicity.CasReadHealingProofs
 import Synchronicity.CasReadProgramProofs
 import Synchronicity.BaoProgramProofs
+import Synchronicity.BaoHashProofs
+import Synchronicity.IngestCommitProofs
 import Synchronicity.TrieProgramProofs
 import Synchronicity.TrieProgramTests
 import Synchronicity.HistoryProgramProofs
