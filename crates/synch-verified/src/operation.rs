@@ -115,13 +115,6 @@ impl Drop for Handle {
 
 pub(crate) struct Reader<'a>(pub(crate) &'a [u8]);
 impl<'a> Reader<'a> {
-    fn boolean(&mut self) -> Result<bool, ()> {
-        match self.byte()? {
-            0 => Ok(false),
-            1 => Ok(true),
-            _ => Err(()),
-        }
-    }
     fn conflict_value(
         &mut self,
         depth: usize,
@@ -278,9 +271,8 @@ enum Frame<'a> {
     Close(u64),
     Now,
     Append(&'a [u8]),
-    WriteAt(u64, u64, &'a [u8]),
-    HashChunk(u64, bool, &'a [u8]),
-    HashParent(bool, &'a [u8], &'a [u8]),
+    Build(u64, u64, u64, u64),
+    Hash(&'a [u8]),
     ExpressionUpsert(
         u64,
         String,
@@ -298,6 +290,7 @@ enum Frame<'a> {
     SourceStat(String, &'a [u8]),
     ReadSome(u64, u64, u64),
     Freeze(&'a [u8]),
+    Transfer(u64, u64, u64),
 }
 
 enum AccessFrame {
@@ -405,9 +398,8 @@ fn decode(packet: &[u8]) -> Result<Frame<'_>, ()> {
         35 => Frame::Close(r.word()?),
         36 => Frame::Now,
         37 => Frame::Append(r.byte_slice()?),
-        38 => Frame::WriteAt(r.word()?, r.word()?, r.byte_slice()?),
-        39 => Frame::HashChunk(r.word()?, r.boolean()?, r.byte_slice()?),
-        40 => Frame::HashParent(r.boolean()?, r.byte_slice()?, r.byte_slice()?),
+        38 => Frame::Build(r.word()?, r.word()?, r.word()?, r.word()?),
+        39 => Frame::Hash(r.byte_slice()?),
         41 => {
             let tx = r.word()?;
             let relation = r.string()?;
@@ -434,6 +426,7 @@ fn decode(packet: &[u8]) -> Result<Frame<'_>, ()> {
         49 => Frame::SourceStat(r.string()?, r.byte_slice()?),
         50 => Frame::ReadSome(r.word()?, r.word()?, r.word()?),
         51 => Frame::Freeze(r.byte_slice()?),
+        52 => Frame::Transfer(r.word()?, r.word()?, r.word()?),
         _ => return Err(()),
     };
     r.end()?;
@@ -597,8 +590,7 @@ struct Capabilities<'a, E> {
     files: Option<&'a mut dyn FileIO<Error = E>>,
     clock: Option<&'a mut dyn Clock<Error = E>>,
     output: Option<&'a mut dyn crate::host::Output<Error = OperationError<E>>>,
-    writer: Option<&'a mut dyn crate::host::ByteWriter<Error = E>>,
-    blake3: Option<&'a mut dyn crate::host::Blake3<Error = E>>,
+    construct: Option<&'a mut dyn crate::host::Construct<Error = E>>,
     temporary: Option<&'a mut dyn crate::host::TemporaryFiles<Error = E>>,
     leases: Option<&'a mut dyn crate::host::Lease<Error = E>>,
     source: Option<&'a mut dyn crate::host::SourceIO<Error = E>>,
@@ -612,8 +604,7 @@ impl<E> Default for Capabilities<'_, E> {
             files: None,
             clock: None,
             output: None,
-            writer: None,
-            blake3: None,
+            construct: None,
             temporary: None,
             leases: None,
             source: None,
@@ -658,41 +649,65 @@ fn execute<E>(
                     .ok_or(OperationError::Protocol)?;
                 reply(51, source.freeze(input), &mut errors, word)
             }
-            Frame::WriteAt(handle, offset, bytes) => {
-                let writer = capabilities
-                    .writer
+            Frame::Build(source, payload, outboard, size) => {
+                let construct = capabilities
+                    .construct
                     .as_deref_mut()
                     .ok_or(OperationError::Protocol)?;
                 reply(
                     38,
-                    writer.write_at(handle, offset, bytes),
-                    &mut errors,
-                    |_, ()| {},
-                )
-            }
-            Frame::HashChunk(counter, root, input) => {
-                let hash = capabilities
-                    .blake3
-                    .as_deref_mut()
-                    .ok_or(OperationError::Protocol)?;
-                reply(
-                    39,
-                    hash.chunk(counter, root, input),
+                    construct.build(source, payload, outboard, size),
                     &mut errors,
                     |out, value| bytes(out, &value),
                 )
             }
-            Frame::HashParent(root, left, right) => {
-                let hash = capabilities
-                    .blake3
+            Frame::Hash(input) => {
+                let construct = capabilities
+                    .construct
                     .as_deref_mut()
                     .ok_or(OperationError::Protocol)?;
-                reply(
-                    40,
-                    hash.parent(root, left, right),
-                    &mut errors,
-                    |out, value| bytes(out, &value),
-                )
+                reply(39, construct.hash(input), &mut errors, |out, value| {
+                    bytes(out, &value)
+                })
+            }
+            // The transferred bytes go from the file straight into the tail of
+            // the output sink; they are never a reply payload. A sink that
+            // cannot grow is a protocol failure delivered as a file failure,
+            // so the program's close-before-return continuation still runs.
+            Frame::Transfer(handle, offset, count) => {
+                let files = capabilities
+                    .files
+                    .as_deref_mut()
+                    .ok_or(OperationError::Protocol)?;
+                let output = capabilities
+                    .output
+                    .as_deref_mut()
+                    .ok_or(OperationError::Protocol)?;
+                match output.grow(count) {
+                    Ok(buffer) => match files.read_into(handle, offset, buffer) {
+                        Ok(()) => vec![1, 52],
+                        Err(failure) => {
+                            output.shrink(count);
+                            file_reply(52, Err::<(), _>(failure), &mut errors, |_, ()| {})
+                        }
+                    },
+                    Err(OperationError::Host(error)) => file_reply(
+                        52,
+                        Err::<(), _>(FileFailure {
+                            error,
+                            kind: FileFailureKind::Other,
+                        }),
+                        &mut errors,
+                        |_, ()| {},
+                    ),
+                    Err(_) => {
+                        let mut out = vec![1, 0];
+                        word(&mut out, 3);
+                        word(&mut out, 0);
+                        out.push(2);
+                        out
+                    }
+                }
             }
             Frame::CreateTemporary(space) => {
                 let temporary = capabilities
@@ -910,8 +925,7 @@ pub(crate) unsafe fn run_ingest<S: crate::host::Upsert>(
         &[],
         Capabilities {
             files: Some(resources.files),
-            writer: Some(resources.writer),
-            blake3: Some(resources.hash),
+            construct: Some(resources.construct),
             temporary: Some(resources.temporary),
             leases: Some(resources.leases),
             source: Some(resources.source),
@@ -1168,14 +1182,12 @@ mod tests {
 
     #[test]
     fn ingestion_frames_are_exact_and_borrow_payloads() {
-        let mut packet = vec![1, 38];
-        word(&mut packet, 7);
-        word(&mut packet, u64::MAX);
+        let mut packet = vec![1, 39];
         bytes(&mut packet, &[41, 42]);
         match decode(&packet).unwrap() {
-            Frame::WriteAt(7, u64::MAX, payload) => {
+            Frame::Hash(payload) => {
                 assert_eq!(payload, [41, 42]);
-                assert_eq!(payload.as_ptr(), packet[26..].as_ptr());
+                assert_eq!(payload.as_ptr(), packet[10..].as_ptr());
             }
             _ => panic!("unexpected frame"),
         }
@@ -1184,6 +1196,19 @@ mod tests {
         }
         packet.push(0);
         assert!(decode(&packet).is_err());
+        let mut build = vec![1, 38];
+        for value in [1, 2, 3, u64::MAX] {
+            word(&mut build, value);
+        }
+        assert!(matches!(
+            decode(&build),
+            Ok(Frame::Build(1, 2, 3, u64::MAX))
+        ));
+        for end in 0..build.len() {
+            assert!(decode(&build[..end]).is_err());
+        }
+        build.push(0);
+        assert!(decode(&build).is_err());
         for tag in [43, 45, 48] {
             let mut packet = vec![1, tag];
             word(&mut packet, 7);
@@ -1194,23 +1219,15 @@ mod tests {
     }
 
     #[test]
-    fn hash_frames_reject_non_boolean_flags_and_hostile_lengths() {
-        for flag in [2, 255] {
-            let mut chunk = vec![1, 39];
-            word(&mut chunk, 0);
-            chunk.push(flag);
-            bytes(&mut chunk, &[]);
-            assert!(decode(&chunk).is_err());
-            let mut parent = vec![1, 40, flag];
-            bytes(&mut parent, &[0; 32]);
-            bytes(&mut parent, &[0; 32]);
-            assert!(decode(&parent).is_err());
-        }
+    fn hash_frames_reject_hostile_lengths_and_stale_tags() {
         let mut packet = vec![1, 39];
         word(&mut packet, u64::MAX);
-        packet.push(0);
-        word(&mut packet, u64::MAX);
         assert!(decode(&packet).is_err());
+        // The retired per-chunk primitive tag is no longer a request.
+        let mut parent = vec![1, 40, 1];
+        bytes(&mut parent, &[0; 32]);
+        bytes(&mut parent, &[0; 32]);
+        assert!(decode(&parent).is_err());
     }
 
     #[test]
@@ -1241,7 +1258,7 @@ mod tests {
 
     #[test]
     fn ingestion_failures_preserve_opaque_errors_in_generic_replies() {
-        for tag in 38..=51 {
+        for tag in 38..=52 {
             let mut errors = Vec::new();
             let response = reply(tag, Err::<(), _>("original"), &mut errors, |_, ()| {});
             assert_eq!(errors, vec![Some("original")]);
@@ -1361,16 +1378,19 @@ mod tests {
             self.0.push("open");
             Ok(9)
         }
-        fn read_at(
+        fn read_at(&mut self, _: u64, _: u64, _: u64) -> Result<Vec<u8>, FileFailure<Self::Error>> {
+            panic!("a local read transfers into the sink, it does not reply with bytes")
+        }
+        fn read_into(
             &mut self,
             handle: u64,
             offset: u64,
-            count: u64,
-        ) -> Result<Vec<u8>, FileFailure<Self::Error>> {
-            assert_eq!(handle, 9);
-            assert!(matches!((offset, count), (0, 65536) | (65536, 4)));
-            self.0.push("read");
-            Ok(vec![7; count as usize])
+            buffer: &mut [u8],
+        ) -> Result<(), FileFailure<Self::Error>> {
+            assert_eq!((handle, offset, buffer.len()), (9, 0, 65540));
+            self.0.push("transfer");
+            buffer.fill(7);
+            Ok(())
         }
         fn close(&mut self, handle: u64) -> Result<(), Self::Error> {
             assert_eq!(handle, 9);
@@ -1385,24 +1405,32 @@ mod tests {
         }
     }
     struct FailingOutput {
-        host: bool,
-        calls: usize,
-        fail_on: usize,
+        host: Option<bool>,
+        bytes: Vec<u8>,
+        grown: usize,
+        shrunk: usize,
     }
     impl crate::host::Output for FailingOutput {
         type Error = OperationError<&'static str>;
-        fn append(&mut self, bytes: &[u8]) -> Result<(), Self::Error> {
-            assert_eq!(bytes.len(), if self.calls == 0 { 65536 } else { 4 });
-            assert!(bytes.iter().all(|byte| *byte == 7));
-            self.calls += 1;
-            if self.calls != self.fail_on {
-                return Ok(());
+        fn append(&mut self, _: &[u8]) -> Result<(), Self::Error> {
+            panic!("a file read never appends a reply payload")
+        }
+        fn grow(&mut self, count: u64) -> Result<&mut [u8], Self::Error> {
+            assert_eq!(count, 65540);
+            self.grown += 1;
+            match self.host {
+                Some(true) => Err(OperationError::Host("sink")),
+                Some(false) => Err(OperationError::Protocol),
+                None => {
+                    let start = self.bytes.len();
+                    self.bytes.resize(start + count as usize, 0);
+                    Ok(&mut self.bytes[start..])
+                }
             }
-            Err(if self.host {
-                OperationError::Host("sink")
-            } else {
-                OperationError::Protocol
-            })
+        }
+        fn shrink(&mut self, count: u64) {
+            self.shrunk += 1;
+            self.bytes.truncate(self.bytes.len() - count as usize);
         }
     }
     #[test]
@@ -1415,40 +1443,103 @@ mod tests {
                 length: u64,
             ) -> *mut c_void;
         }
-        for host in [true, false] {
-            for fail_on in [1, 2] {
-                let mut storage = Script::default();
-                let mut files = OutputTestFiles(vec![]);
-                let mut clock = OutputTestFiles(vec![]);
-                let mut output = FailingOutput {
-                    host,
-                    calls: 0,
-                    fail_on,
-                };
-                // SAFETY: the runner initializes this thread before the adapter
-                // copies its input and returns a fresh owned read continuation.
-                let result = unsafe {
-                    run_read(&mut storage, &mut files, &mut clock, &mut output, || {
-                        synch_adapter_operation_read([7; 32].as_slice().into(), 1, 0, 0)
-                    })
-                };
-                if host {
-                    assert!(matches!(result, Err(OperationError::Host("sink"))));
-                } else {
-                    assert!(matches!(result, Err(OperationError::Protocol)));
+        for host in [Some(true), Some(false), None] {
+            let mut storage = Script::default();
+            let mut files = OutputTestFiles(vec![]);
+            let mut clock = OutputTestFiles(vec![]);
+            let mut output = FailingOutput {
+                host,
+                bytes: vec![],
+                grown: 0,
+                shrunk: 0,
+            };
+            // SAFETY: the runner initializes this thread before the adapter
+            // copies its input and returns a fresh owned read continuation.
+            let result = unsafe {
+                run_read(&mut storage, &mut files, &mut clock, &mut output, || {
+                    synch_adapter_operation_read([7; 32].as_slice().into(), 1, 0, 0)
+                })
+            };
+            match host {
+                Some(true) => assert!(matches!(result, Err(OperationError::Host("sink")))),
+                Some(false) => assert!(matches!(result, Err(OperationError::Protocol))),
+                None => {
+                    assert_eq!(result.unwrap(), [0, 4, 0, 1, 0, 0, 0, 0, 0]);
+                    assert!(output.bytes.iter().all(|byte| *byte == 7));
+                    assert_eq!(output.bytes.len(), 65540);
                 }
-                assert_eq!(storage.calls, ["snapshot"]);
-                assert_eq!(
-                    files.0,
-                    if fail_on == 1 {
-                        vec!["open", "read", "close"]
-                    } else {
-                        vec!["open", "read", "read", "close"]
-                    }
-                );
-                assert_eq!(output.calls, fail_on);
             }
+            assert_eq!(storage.calls, ["snapshot"]);
+            assert_eq!(
+                files.0,
+                if host.is_some() {
+                    vec!["open", "close"]
+                } else {
+                    vec!["open", "transfer", "close"]
+                }
+            );
+            assert_eq!((output.grown, output.shrunk), (1, 0));
         }
+    }
+
+    struct ShortFile;
+    impl FileIO for ShortFile {
+        type Error = &'static str;
+        fn open(&mut self, _: &str, _: &[u8]) -> Result<u64, FileFailure<Self::Error>> {
+            Ok(9)
+        }
+        fn read_at(&mut self, _: u64, _: u64, _: u64) -> Result<Vec<u8>, FileFailure<Self::Error>> {
+            panic!("unexpected read")
+        }
+        fn read_into(
+            &mut self,
+            _: u64,
+            _: u64,
+            buffer: &mut [u8],
+        ) -> Result<(), FileFailure<Self::Error>> {
+            buffer.fill(1);
+            Err(FileFailure {
+                error: "truncated",
+                kind: FileFailureKind::ShortRead,
+            })
+        }
+        fn close(&mut self, _: u64) -> Result<(), Self::Error> {
+            Ok(())
+        }
+    }
+    #[test]
+    fn failed_transfer_takes_back_the_grown_tail() {
+        let mut errors = Vec::new();
+        let mut files = ShortFile;
+        let mut sink = FailingOutput {
+            host: None,
+            bytes: vec![9, 9],
+            grown: 0,
+            shrunk: 0,
+        };
+        let response = {
+            let files: &mut dyn FileIO<Error = &'static str> = &mut files;
+            let output: &mut dyn crate::host::Output<Error = OperationError<&'static str>> =
+                &mut sink;
+            match output.grow(65540) {
+                Ok(buffer) => match files.read_into(9, 0, buffer) {
+                    Ok(()) => vec![1, 52],
+                    Err(failure) => {
+                        output.shrink(65540);
+                        file_reply(52, Err::<(), _>(failure), &mut errors, |_, ()| {})
+                    }
+                },
+                Err(_) => panic!("the sink grows"),
+            }
+        };
+        assert_eq!(sink.bytes, [9, 9]);
+        assert_eq!((sink.grown, sink.shrunk), (1, 1));
+        assert_eq!(errors, [Some("truncated")]);
+        let mut expected = vec![1, 0];
+        word(&mut expected, 1);
+        word(&mut expected, 1);
+        expected.push(1);
+        assert_eq!(response, expected);
     }
 
     fn selection_packet(out: &mut Vec<u8>) {
@@ -1550,6 +1641,15 @@ mod tests {
         word(&mut close, 42);
         assert!(matches!(decode(&close), Ok(Frame::Close(42))));
         packets.push(close);
+        let mut transfer = vec![1, 52];
+        for value in [42, u64::MAX, 65536] {
+            word(&mut transfer, value);
+        }
+        assert!(matches!(
+            decode(&transfer),
+            Ok(Frame::Transfer(42, u64::MAX, 65536))
+        ));
+        packets.push(transfer);
         assert!(matches!(decode(&[1, 36]), Ok(Frame::Now)));
         packets.push(vec![1, 36]);
         for mut packet in packets {
@@ -1868,7 +1968,9 @@ mod tests {
                 };
                 assert!(matches!(
                     acquire(&mut script, &[9; 32], "holder", -11, true),
-                    Err(OperationError::Host("primary"))
+                    Err(crate::cas::LifecycleError::Operation(OperationError::Host(
+                        "primary"
+                    )))
                 ));
                 let mut expected = normal[..=index].to_vec();
                 if index > 0 {

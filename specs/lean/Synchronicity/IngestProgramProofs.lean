@@ -3,12 +3,14 @@ import Synchronicity.Prelude
 
 /-! Fault traces of the actual captured-source ingestion program. No host
 callback implements publication or metadata policy. These fixtures use an
-empty captured source to avoid large-buffer evaluator assumptions. -/
+empty captured source; construction itself is one host effect whose reply
+the program only width-checks. -/
 namespace Synchronicity.IngestProgramProofs
 open VerifiedCore.Host VerifiedCore.Cas.Ingest
 set_option Elab.async false
 
 private def digest : ByteArray := ⟨Array.replicate 32 0⟩
+private def narrow : ByteArray := ⟨Array.replicate 31 0⟩
 private def primary : Failure := ⟨1, 71⟩
 private def secondary : Failure := ⟨1, 72⟩
 
@@ -18,6 +20,7 @@ private structure Script where
   lateCleanupFails : Bool := false
   duplicate : Bool := false
   unsupported : Bool := false
+  narrowRoot : Bool := false
 
 private def cleanup (label : String) : Bool :=
   ["close", "release", "discard-outboard", "discard-payload"].contains label
@@ -40,17 +43,14 @@ private def execute (script : Script) : Nat → Program Effects (Except Error By
         | .open _ _ => none
         | .close handle => if handle == 1 then
             step "close" (resume (reply script "close" ())) else none
-        | .readAt handle offset count => if handle == 1 && offset == 0 && count == 0 then
-            step "read" (resume ((reply script "read" ByteArray.empty).mapError
-              (fun error => ⟨error, .other⟩))) else none
+        | .readAt _ _ _ => none
+        | .transfer _ _ _ => none
       | .right effect => match effect with
-        | .left effect => match effect with
-          | .writeAt handle offset bytes => if handle == 2 && offset == 0 && bytes.isEmpty then
-              step "write" (resume (reply script "write" ())) else none
-        | .right effect => match effect with
-          | .chunk counter root bytes => if counter == 0 && root && bytes.isEmpty then
-              step "hash" (resume (reply script "hash" digest)) else none
-          | .parent _ _ _ => none
+        | .build source payload outboard size =>
+          if source == 1 && payload == 2 && outboard == 3 && size == 0 then
+            step "build" (resume (reply script "build"
+              (if script.narrowRoot then narrow else digest))) else none
+        | .hash _ => none
     | .right effect => match effect with
       | .left effect => match effect with
         | .left effect => match effect with
@@ -98,7 +98,7 @@ private def execute (script : Script) : Nat → Program Effects (Except Error By
 private def check (script : Script) (policy : DirectoryPolicy := .requireSync) :=
   execute script 32 (run 1 0 123 .local policy).run
 
-private def beforePublish := ["temp-payload", "temp-outboard", "read", "write", "hash", "close", "lease"]
+private def beforePublish := ["temp-payload", "temp-outboard", "build", "close", "lease"]
 private def publication := ["flush-payload", "flush-outboard", "replace-payload", "replace-outboard",
   "sync-payload", "sync-outboard"]
 private def finalCleanup := ["release", "discard-outboard", "discard-payload"]
@@ -113,16 +113,24 @@ theorem second_acquisition_failure_discards_first_temporary :
     check { failOn := some "temp-outboard", cleanupFails := true } =
       some (.error (.host primary), ["temp-payload", "temp-outboard", "close", "discard-payload"]) := by decide
 
-theorem duplicate_temporary_rejected_before_writes : check { duplicate := true } =
+theorem duplicate_temporary_rejected_before_construction : check { duplicate := true } =
     some (.error .protocol, ["temp-payload", "temp-outboard", "close", "discard-payload"]) := by decide
 
+/-- Construction is requested only over the two owned temporaries and the
+captured source, exactly once, and its failure survives cleanup failures. -/
 theorem construction_failure_survives_cleanup_failures :
-    check { failOn := some "read", cleanupFails := true } =
-      some (.error (.construction (.host primary)),
-        ["temp-payload", "temp-outboard", "read", "close", "discard-outboard", "discard-payload"]) := by decide
+    check { failOn := some "build", cleanupFails := true } =
+      some (.error (.host primary),
+        ["temp-payload", "temp-outboard", "build", "close", "discard-outboard", "discard-payload"]) := by decide
+
+/-- A root of the wrong width never reaches a lease, a flush or a name: the
+program rejects it as a protocol failure before anything is published. -/
+theorem narrow_root_reply_publishes_nothing : check { narrowRoot := true } =
+    some (.error .protocol,
+      ["temp-payload", "temp-outboard", "build", "close", "discard-outboard", "discard-payload"]) := by decide
 
 theorem failed_source_close_is_not_retried : check { failOn := some "close" } =
-    some (.error (.host primary), ["temp-payload", "temp-outboard", "read", "write", "hash", "close",
+    some (.error (.host primary), ["temp-payload", "temp-outboard", "build", "close",
       "discard-outboard", "discard-payload"]) := by decide
 
 theorem second_flush_failure_publishes_nothing : check { failOn := some "flush-outboard" } =
@@ -174,10 +182,8 @@ This is exhaustive for this execution shape, not all possible source sizes. -/
 private def failureCases : List (String × Error × List String) :=
   [("temp-payload", .host primary, ["temp-payload", "close"]),
    ("temp-outboard", .host primary, ["temp-payload", "temp-outboard", "close", "discard-payload"]),
-   ("read", .construction (.host primary), ["temp-payload", "temp-outboard", "read", "close", "discard-outboard", "discard-payload"]),
-   ("write", .construction (.host primary), ["temp-payload", "temp-outboard", "read", "write", "close", "discard-outboard", "discard-payload"]),
-   ("hash", .construction (.host primary), ["temp-payload", "temp-outboard", "read", "write", "hash", "close", "discard-outboard", "discard-payload"]),
-   ("close", .host primary, ["temp-payload", "temp-outboard", "read", "write", "hash", "close", "discard-outboard", "discard-payload"]),
+   ("build", .host primary, ["temp-payload", "temp-outboard", "build", "close", "discard-outboard", "discard-payload"]),
+   ("close", .host primary, ["temp-payload", "temp-outboard", "build", "close", "discard-outboard", "discard-payload"]),
    ("lease", .host primary, beforePublish ++ ["discard-outboard", "discard-payload"])] ++
   (publication.zipIdx.map fun (label, index) =>
     (label, .host primary, beforePublish ++ publication.take (index + 1) ++ finalCleanup)) ++

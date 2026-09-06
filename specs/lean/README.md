@@ -19,13 +19,14 @@ Scoped authorization, missing-walk orchestration and completeness certificates
 remain entirely Rust. Their Lean models and retained decision proofs are
 specifications, not production-native verification of those Rust operations.
 
-Local `Store::ingest_bytes`/`ingest_file` now execute the whole `Cas/Input` and
-`Cas/Ingest` Lean programs. Input, cleanup, metadata, chunk-tree and outboard
-trace proofs import their actual executable source; the deleted Rust complete
-ingestion implementation no longer has a manual pairing anchor. Cloud and
-partial/network ingestion remain Rust operations, and native
-cryptography, filesystem behavior and FFI ownership remain explicit trust
-boundaries.
+Local `Store::ingest_bytes`/`ingest_file` execute the whole `Cas/Input` and
+`Cas/Ingest` Lean programs. Input, cleanup and metadata trace proofs import
+their actual executable source; the deleted Rust complete ingestion
+implementation no longer has a manual pairing anchor. Object construction
+(the BLAKE3 tree and Bao outboard) and payload transfer are host services the
+programs direct, so they have no Lean model here. Cloud and partial/network
+ingestion remain Rust operations, and native cryptography, Bao layout,
+filesystem behavior and FFI ownership remain explicit trust boundaries.
 
 The [operation architecture](../../docs/LEAN-CORE-ARCHITECTURE.md) requires
 proofs over complete executable Lean programs, not host-prepared snapshots.

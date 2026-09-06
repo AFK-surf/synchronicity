@@ -3,8 +3,8 @@ import Synchronicity.VerifiedCoreProofs
 import Synchronicity.Prelude
 
 /-! Proofs of the internal ingestion metadata program itself. The production
-whole Lean command composes it; outer resource and construction obligations
-are covered separately by the corresponding ingestion and Bao proof modules. -/
+whole Lean command composes it; the outer resource, construction-request and
+input obligations are covered by the ingestion program and input modules. -/
 namespace Synchronicity.IngestCommitProofs
 open VerifiedCore VerifiedCore.Host VerifiedCore.Cas.IngestCommit
 set_option Elab.async false

@@ -1,16 +1,18 @@
-import VerifiedCore.Cas.Bao
 import VerifiedCore.Cas.IngestCommit
+import VerifiedCore.Host.Access
+import VerifiedCore.Host.Construct
 import VerifiedCore.Host.Resources
 
 /-! Internal captured-source ingestion, composed by the production Input command.
 The source is already opened and its length captured. Input owns inline selection
 and input acquisition; Rust interprets only the raw resource effects.
-This program owns the source immediately on entry, builds out-of-line data,
-publishes the two files and commits metadata under one root-keyed lease. -/
+This program owns the source immediately on entry, has the host build the
+out-of-line data into owned temporaries, publishes the two files and commits
+metadata under one root-keyed lease. -/
 namespace VerifiedCore.Cas.Ingest
 open VerifiedCore.Host
 
-abbrev Effects := EffectSum Bao.Effects
+abbrev Effects := EffectSum (EffectSum FileIO Construct)
   (EffectSum IngestCommit.Effects (EffectSum Resources Lease))
 
 /-- Immutable platform/backend durability policy, not an implementation toggle. -/
@@ -20,7 +22,6 @@ inductive DirectoryPolicy where
 
 inductive Error where
   | host (failure : Failure)
-  | construction (error : Bao.Error)
   | metadata (error : IngestCommit.Error)
   | protocol
   | directorySyncUnsupported
@@ -37,10 +38,13 @@ def lease (effect : Lease (Reply A)) : Action A :=
 def closeSource (source : UInt64) : Action Unit :=
   performOver Error.host (.left (.left (.close source)))
 
-def construct (source payload outboard size : UInt64) : Action ByteArray :=
-  ExceptT.mk do
-    let result ← (Bao.build source payload outboard size).run.mapEffects EffectSum.left
-    return result.mapError Error.construction
+/-- One host effect streams the captured source into the owned payload and
+outboard temporaries and returns the root. The program checks the root's
+width; a malformed reply is a protocol failure, never a published object. -/
+def construct (source payload outboard size : UInt64) : Action ByteArray := do
+  let root ← performOver Error.host (.left (.right (.build source payload outboard size)))
+  if root.size != 32 then throw .protocol
+  return root
 
 def commit (root : ByteArray) (size : UInt64) (now : Int64) (tier : IngestCommit.Tier) : Action Unit :=
   ExceptT.mk do
@@ -74,7 +78,7 @@ def publish (payload outboard : UInt64) (root : ByteArray) (size : UInt64)
 
 /-- Whole captured-source, out-of-line path. Every successful temporary
 acquisition is bracketed immediately. If acquisition itself fails, source
-ownership ends there; otherwise it ends immediately after Bao construction.
+ownership ends there; otherwise it ends immediately after construction.
 Thus source close is requested exactly once, even when close reports failure.
 The root lease brackets flush, publication, directory sync and metadata commit.
 No hash/group/span/settlement plan crosses this operation's boundary. -/
@@ -84,8 +88,8 @@ def run (source size : UInt64) (now : Int64) (tier : IngestCommit.Tier)
   ensure (do
     let outboard ← onFailure (resource (.createTemporary "cas_outboard")) (closeSource source)
     if outboard == payload then
-      -- A malformed host reply must not start writes or double-discard the
-      -- same temporary. The outer scope owns this one token's cleanup.
+      -- A malformed host reply must not start construction or double-discard
+      -- the same temporary. The outer scope owns this one token's cleanup.
       ensure (throw .protocol) (closeSource source)
     else
       ensure (do

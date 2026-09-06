@@ -1278,7 +1278,7 @@ impl Store {
         now: i64,
         possession: bool,
     ) -> Result<bool> {
-        use synch_verified::cas::{acquire, OperationError};
+        use synch_verified::cas::acquire;
         let conn = self.conn();
         let _ordered_against_writers = self.cas_order();
         let mut storage = crate::lean_storage::SqliteStorage::new(&conn);
@@ -1292,24 +1292,8 @@ impl Store {
             now,
             possession,
         )
-        .map_err(|error| match error {
-            OperationError::Host(error) => error,
-            OperationError::MalformedMetadata(detail @ (1..=3 | 7)) => {
-                let kind = match detail {
-                    1 => rusqlite::types::Type::Null,
-                    2 => rusqlite::types::Type::Text,
-                    3 => rusqlite::types::Type::Blob,
-                    7 => rusqlite::types::Type::Real,
-                    _ => unreachable!("matched native durable-column error detail"),
-                };
-                rusqlite::Error::InvalidColumnType(0, "durable".into(), kind).into()
-            }
-            OperationError::MalformedMetadata(_) => {
-                StoreError::Decode("invalid CAS acquisition metadata".into())
-            }
-            OperationError::Protocol => {
-                StoreError::invalid("invalid native storage-operation protocol")
-            }
+        .map_err(|error| {
+            crate::lean_diagnostics::lifecycle_error(error, "invalid CAS acquisition metadata")
         })
     }
 
@@ -1529,30 +1513,14 @@ impl Store {
         root: &Hash,
         before: Option<i64>,
     ) -> Result<synch_verified::cas::Outcome> {
-        use synch_verified::cas::{delete, OperationError};
+        use synch_verified::cas::delete;
         let conn = self.conn();
         let _ordered_against_writers = self.cas_order();
         let mut storage = crate::lean_storage::SqliteStorage::new(&conn);
         let mut resources = crate::lean_storage::Resources(self);
         // LEAN-MODEL: cas-lifecycle-deletion (CasLifecycleProofs.executed_deletion_authorized)
-        delete(&mut storage, &mut resources, root.as_bytes(), before).map_err(|error| match error {
-            OperationError::Host(error) => error,
-            OperationError::MalformedMetadata(detail @ (4..=6 | 8)) => {
-                let kind = match detail {
-                    4 => rusqlite::types::Type::Null,
-                    5 => rusqlite::types::Type::Text,
-                    6 => rusqlite::types::Type::Blob,
-                    8 => rusqlite::types::Type::Real,
-                    _ => unreachable!("matched native access-column error detail"),
-                };
-                rusqlite::Error::InvalidColumnType(0, "last_access".into(), kind).into()
-            }
-            OperationError::MalformedMetadata(_) => {
-                StoreError::Decode("invalid CAS deletion metadata".into())
-            }
-            OperationError::Protocol => {
-                StoreError::invalid("invalid native storage-operation protocol")
-            }
+        delete(&mut storage, &mut resources, root.as_bytes(), before).map_err(|error| {
+            crate::lean_diagnostics::lifecycle_error(error, "invalid CAS deletion metadata")
         })
     }
 

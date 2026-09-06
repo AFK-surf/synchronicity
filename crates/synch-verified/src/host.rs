@@ -4,8 +4,7 @@
 /// shared transport depends only on these service types, never domain commands.
 pub struct WriteServices<'a, E> {
     pub files: &'a mut dyn FileIO<Error = E>,
-    pub writer: &'a mut dyn ByteWriter<Error = E>,
-    pub hash: &'a mut dyn Blake3<Error = E>,
+    pub construct: &'a mut dyn Construct<Error = E>,
     pub temporary: &'a mut dyn TemporaryFiles<Error = E>,
     pub leases: &'a mut dyn Lease<Error = E>,
     pub source: &'a mut dyn SourceIO<Error = E>,
@@ -77,12 +76,6 @@ pub trait Upsert: Storage {
     ) -> Result<(), Self::Error>;
 }
 
-/// Exact positioned writes; success does not imply flush or publication.
-pub trait ByteWriter {
-    type Error;
-    fn write_at(&mut self, handle: u64, offset: u64, bytes: &[u8]) -> Result<(), Self::Error>;
-}
-
 /// Raw input observations. Successful bounded reads may be short at EOF;
 /// freeze retains an immutable copy under an invocation-owned input handle.
 pub trait SourceIO {
@@ -92,11 +85,27 @@ pub trait SourceIO {
     fn freeze(&mut self, bytes: &[u8]) -> Result<u64, Self::Error>;
 }
 
-/// Fixed unkeyed cryptographic primitives, never subtree traversal.
-pub trait Blake3 {
+/// Bulk object construction over resources the requesting operation owns.
+///
+/// The operation decides what is built, from which opened source and into
+/// which owned temporaries; the host streams the bytes, hashes them into the
+/// BLAKE3 tree and lays out the Bao outboard. Neither call publishes, flushes
+/// or records anything.
+pub trait Construct {
     type Error;
-    fn chunk(&mut self, counter: u64, root: bool, bytes: &[u8]) -> Result<Vec<u8>, Self::Error>;
-    fn parent(&mut self, root: bool, left: &[u8], right: &[u8]) -> Result<Vec<u8>, Self::Error>;
+    /// Stream exactly `size` bytes of `source`, from its start, into the
+    /// `payload` temporary, write the object's outboard into the `outboard`
+    /// temporary and return the 32-byte root. A source shorter than `size`
+    /// is an error, not a shorter object.
+    fn build(
+        &mut self,
+        source: u64,
+        payload: u64,
+        outboard: u64,
+        size: u64,
+    ) -> Result<Vec<u8>, Self::Error>;
+    /// The BLAKE3 root of bytes the operation already holds.
+    fn hash(&mut self, bytes: &[u8]) -> Result<Vec<u8>, Self::Error>;
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -182,6 +191,15 @@ pub trait FileIO {
         offset: u64,
         count: u64,
     ) -> Result<Vec<u8>, FileFailure<Self::Error>>;
+    /// Fill `buffer` from `offset`, returning `ShortRead` at EOF. The
+    /// interpreter hands over the tail of the operation's output sink, so a
+    /// transfer costs one read into the bytes the caller receives.
+    fn read_into(
+        &mut self,
+        handle: u64,
+        offset: u64,
+        buffer: &mut [u8],
+    ) -> Result<(), FileFailure<Self::Error>>;
     fn close(&mut self, handle: u64) -> Result<(), Self::Error>;
 }
 
@@ -196,6 +214,11 @@ pub trait Clock {
 pub trait Output {
     type Error;
     fn append(&mut self, bytes: &[u8]) -> Result<(), Self::Error>;
+    /// Extend the sink by `count` bytes and hand them back for an in-place
+    /// fill, so a file transfer lands directly in the result.
+    fn grow(&mut self, count: u64) -> Result<&mut [u8], Self::Error>;
+    /// Take back the last `count` bytes after a fill failed.
+    fn shrink(&mut self, count: u64);
 }
 
 /// Ordering by the column's stored type, not a domain reinterpretation.

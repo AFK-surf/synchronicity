@@ -11,17 +11,6 @@ use crate::{
     Result, Store, StoreError,
 };
 
-struct Hashes;
-impl host::Blake3 for Hashes {
-    type Error = StoreError;
-    fn chunk(&mut self, counter: u64, root: bool, bytes: &[u8]) -> Result<Vec<u8>> {
-        crate::lean_hash::chunk(counter, root, bytes).map(|digest| digest.to_vec())
-    }
-    fn parent(&mut self, root: bool, left: &[u8], right: &[u8]) -> Result<Vec<u8>> {
-        crate::lean_hash::parent(root, left, right).map(|digest| digest.to_vec())
-    }
-}
-
 struct PublicationGate<'a> {
     files: Files<'a>,
     published: SyncSender<()>,
@@ -79,7 +68,7 @@ fn whole_native_ingestion_holds_gc_lease_across_both_file_publications() {
         // Rc-backed capability clones are made and retained exclusively on
         // this worker. Only channel messages cross the resource boundary.
         let mut files = Files::new(&writer, Input::Bytes(&bytes));
-        let mut output = files.clone();
+        let mut construct = files.clone();
         let mut source = files.clone();
         let mut temporary = PublicationGate {
             files: files.clone(),
@@ -88,14 +77,12 @@ fn whole_native_ingestion_holds_gc_lease_across_both_file_publications() {
             replacements: 0,
         };
         let mut leases = Leases::new(&writer);
-        let mut hashes = Hashes;
         let mut storage = crate::lean_storage::Session::new(&writer);
         let result = cas::ingest(
             &mut storage,
             cas::IngestResources {
                 files: &mut files,
-                writer: &mut output,
-                hash: &mut hashes,
+                construct: &mut construct,
                 temporary: &mut temporary,
                 leases: &mut leases,
                 source: &mut source,

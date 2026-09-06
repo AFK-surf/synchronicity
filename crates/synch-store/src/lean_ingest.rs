@@ -1,25 +1,16 @@
 //! Mandatory whole native Lean ingestion integration. Rust binds raw services
-//! and maps terminal diagnostics only; no alternative ingestion algorithm lives here.
+//! and maps terminal diagnostics only; the operation's ordering, resource
+//! lifecycle and metadata commit live in Lean, and the byte streaming,
+//! hashing and outboard layout in the resource pool's construction service.
 
 use synch_core::Hash;
-use synch_verified::{cas, host};
+use synch_verified::cas;
 
 use crate::{
     lean_diagnostics,
     lean_resources::{Files, Input, Leases},
     Result, Store, StoreError,
 };
-
-struct Hashes;
-impl host::Blake3 for Hashes {
-    type Error = StoreError;
-    fn chunk(&mut self, counter: u64, root: bool, bytes: &[u8]) -> Result<Vec<u8>> {
-        crate::lean_hash::chunk(counter, root, bytes).map(|digest| digest.to_vec())
-    }
-    fn parent(&mut self, root: bool, left: &[u8], right: &[u8]) -> Result<Vec<u8>> {
-        crate::lean_hash::parent(root, left, right).map(|digest| digest.to_vec())
-    }
-}
 
 fn error(error: cas::IngestError<StoreError>) -> StoreError {
     use cas::{IngestDomainError as Domain, IngestError, OperationError};
@@ -58,17 +49,15 @@ pub(crate) fn ingest(store: &Store, input: Input<'_>, now: i64) -> Result<(Hash,
     };
     let mut storage = crate::lean_storage::Session::new(store);
     let mut files = Files::new(store, input);
-    let mut writer = files.clone();
+    let mut construct = files.clone();
     let mut temporary = files.clone();
     let mut source = files.clone();
-    let mut hashes = Hashes;
     let mut leases = Leases::new(store);
     let result = cas::ingest(
         &mut storage,
         cas::IngestResources {
             files: &mut files,
-            writer: &mut writer,
-            hash: &mut hashes,
+            construct: &mut construct,
             temporary: &mut temporary,
             leases: &mut leases,
             source: &mut source,
@@ -96,6 +85,7 @@ pub(crate) fn ingest(store: &Store, input: Input<'_>, now: i64) -> Result<(Hash,
 #[cfg(test)]
 mod tests {
     use super::*;
+    use synch_verified::host;
 
     #[derive(Default)]
     struct FaultState {
@@ -152,28 +142,35 @@ mod tests {
             self.step("read").map_err(file_error)?;
             self.inner.read_at(handle, offset, count)
         }
+        fn read_into(
+            &mut self,
+            handle: u64,
+            offset: u64,
+            buffer: &mut [u8],
+        ) -> std::result::Result<(), host::FileFailure<StoreError>> {
+            self.inner.read_into(handle, offset, buffer)
+        }
         fn close(&mut self, handle: u64) -> Result<()> {
             self.inner.close(handle)?;
             self.fault.borrow_mut().opened.remove(&handle);
             self.step("close")
         }
     }
-    impl<T: host::ByteWriter<Error = StoreError>> host::ByteWriter for Faulty<T> {
+    impl<T: host::Construct<Error = StoreError>> host::Construct for Faulty<T> {
         type Error = StoreError;
-        fn write_at(&mut self, handle: u64, offset: u64, bytes: &[u8]) -> Result<()> {
-            self.step("write")?;
-            self.inner.write_at(handle, offset, bytes)
+        fn build(
+            &mut self,
+            source: u64,
+            payload: u64,
+            outboard: u64,
+            size: u64,
+        ) -> Result<Vec<u8>> {
+            self.step("build")?;
+            self.inner.build(source, payload, outboard, size)
         }
-    }
-    impl<T: host::Blake3<Error = StoreError>> host::Blake3 for Faulty<T> {
-        type Error = StoreError;
-        fn chunk(&mut self, counter: u64, root: bool, bytes: &[u8]) -> Result<Vec<u8>> {
-            self.step("chunk")?;
-            self.inner.chunk(counter, root, bytes)
-        }
-        fn parent(&mut self, root: bool, left: &[u8], right: &[u8]) -> Result<Vec<u8>> {
-            self.step("parent")?;
-            self.inner.parent(root, left, right)
+        fn hash(&mut self, bytes: &[u8]) -> Result<Vec<u8>> {
+            self.step("hash")?;
+            self.inner.hash(bytes)
         }
     }
     impl<T: host::TemporaryFiles<Error = StoreError>> host::TemporaryFiles for Faulty<T> {
@@ -235,12 +232,7 @@ mod tests {
             ("open", 1),
             ("create", 1),
             ("create", 2),
-            ("read", 1),
-            ("read", 2),
-            ("write", 1),
-            ("write", 2),
-            ("chunk", 1),
-            ("parent", 1),
+            ("build", 1),
             ("close", 1),
             ("flush", 1),
             ("flush", 2),
@@ -266,7 +258,7 @@ mod tests {
                 inner: pool.clone(),
                 fault: fault.clone(),
             };
-            let mut writer = Faulty {
+            let mut construct = Faulty {
                 inner: pool.clone(),
                 fault: fault.clone(),
             };
@@ -278,10 +270,6 @@ mod tests {
                 inner: pool,
                 fault: fault.clone(),
             };
-            let mut hash = Faulty {
-                inner: Hashes,
-                fault: fault.clone(),
-            };
             let mut leases = Faulty {
                 inner: Leases::new(&store),
                 fault: fault.clone(),
@@ -291,8 +279,7 @@ mod tests {
                 &mut storage,
                 cas::IngestResources {
                     files: &mut files,
-                    writer: &mut writer,
-                    hash: &mut hash,
+                    construct: &mut construct,
                     temporary: &mut temporary,
                     leases: &mut leases,
                     source: &mut source,
@@ -392,7 +379,7 @@ mod tests {
     ) -> (Result<cas::Ingested>, usize) {
         let mut storage = crate::lean_storage::Session::new(store);
         let mut files = Files::new(store, Input::File(path));
-        let mut writer = files.clone();
+        let mut construct = files.clone();
         let mut temporary = files.clone();
         let mut source = ChangingSource {
             inner: files.clone(),
@@ -402,14 +389,12 @@ mod tests {
             stats: 0,
             freezes: 0,
         };
-        let mut hashes = Hashes;
         let mut leases = Leases::new(store);
         let result = cas::ingest(
             &mut storage,
             cas::IngestResources {
                 files: &mut files,
-                writer: &mut writer,
-                hash: &mut hashes,
+                construct: &mut construct,
                 temporary: &mut temporary,
                 leases: &mut leases,
                 source: &mut source,

@@ -1,9 +1,11 @@
-//! Raw invocation-owned resources for mandatory Lean ingestion. No hash-tree,
-//! commit or publication policy lives here.
+//! Raw invocation-owned resources for mandatory Lean ingestion, and the bulk
+//! construction service that streams, hashes and lays out an object into
+//! them. No commit or publication policy lives here: Lean decides what is
+//! built, into which owned temporaries, and everything before and after.
 
 use std::{
     cell::RefCell,
-    collections::BTreeMap,
+    collections::{BTreeMap, HashSet},
     fs::{File, OpenOptions},
     io::{self, Read},
     path::{Path, PathBuf},
@@ -12,7 +14,7 @@ use std::{
 
 use bao_tree::io::sync::{ReadAt, WriteAt};
 use synch_core::Hash;
-use synch_verified::host::{self, ByteWriter, FileIO, Lease, SourceIO, TemporaryFiles};
+use synch_verified::host::{self, Construct, FileIO, Lease, SourceIO, TemporaryFiles};
 
 use crate::{db::WriteLease, lean_diagnostics::io_failure, Result, Store, StoreError};
 
@@ -53,6 +55,13 @@ struct Pool<'a> {
     // Failed discard consumes the public token, but abandonment must still
     // retry unlink while the path remains protected from staging GC.
     retired_temporaries: Vec<PathBuf>,
+    // Shard directories `replace` had to create. Only a new shard leaves a
+    // new entry in the CAS root that a directory flush has to reach.
+    created_directories: HashSet<PathBuf>,
+    // Directories flushed since the last `replace`. Lean asks for a sync per
+    // published file; the two files of one ingest share a shard, so the
+    // second request finds nothing left to flush.
+    synced_directories: HashSet<PathBuf>,
 }
 
 impl<'a> Pool<'a> {
@@ -235,6 +244,8 @@ impl<'a> Files<'a> {
             next: 1,
             handles: BTreeMap::new(),
             retired_temporaries: Vec::new(),
+            created_directories: HashSet::new(),
+            synced_directories: HashSet::new(),
         })))
     }
 }
@@ -276,10 +287,15 @@ impl TemporaryFiles for Files<'_> {
         let destination = target(pool.store, space, key)?;
         let original = pool.temporary(handle)?.path.clone();
         if let Some(parent) = destination.parent() {
-            std::fs::create_dir_all(parent)?;
+            if !parent.is_dir() {
+                std::fs::create_dir_all(parent)?;
+                pool.created_directories.insert(parent.to_path_buf());
+            }
         }
         // Failure retains temporary ownership for explicit cleanup or Drop.
         synch_core::fs::replace_file(&original, &destination)?;
+        // A new entry in the shard: whatever was flushed before is stale.
+        pool.synced_directories.clear();
         pool.store.active_temporaries().remove(&original);
         pool.handles.remove(&handle);
         Ok(())
@@ -290,51 +306,176 @@ impl TemporaryFiles for Files<'_> {
     }
 
     fn sync_parent(&mut self, space: &str, key: &[u8]) -> Result<host::DirectorySync> {
-        let pool = self.0.borrow();
+        let mut pool = self.0.borrow_mut();
         let path = target(pool.store, space, key)?;
         #[cfg(windows)]
         {
-            let _ = path;
+            let _ = (path, &mut pool);
             Ok(host::DirectorySync::Unsupported)
         }
         #[cfg(not(windows))]
         {
             let directory = path
                 .parent()
-                .ok_or_else(|| StoreError::invalid("file has no parent"))?;
-            // The shard may have been created by replace. Flushing only its
-            // contents does not persist the new shard entry in the CAS root.
-            // Include the namespace ancestors down to the pre-existing store
-            // directory; durability of that configured directory is a setup
-            // precondition, not an ingestion decision.
-            let cas_directory = pool.store.cas_dir();
+                .ok_or_else(|| StoreError::invalid("file has no parent"))?
+                .to_path_buf();
+            // A shard `replace` created is a new entry in the CAS root, so the
+            // root is flushed too. The CAS root itself exists from `Store::open`
+            // on; durability of that configured directory is a setup
+            // precondition, not an ingestion decision. Each directory is
+            // flushed once per publication round: Lean requests a sync per
+            // published file, and both files of one ingest share a shard.
+            let mut pending = vec![];
+            if !pool.synced_directories.contains(&directory) {
+                pending.push(directory.clone());
+                if pool.created_directories.contains(&directory) {
+                    let cas_directory = pool.store.cas_dir();
+                    if !pool.synced_directories.contains(&cas_directory) {
+                        pending.push(cas_directory);
+                    }
+                }
+            }
             let mut status = host::DirectorySync::Synced;
-            for directory in [directory, cas_directory.as_path(), pool.store.data_dir()] {
-                match File::open(directory)?.sync_all() {
+            for directory in pending {
+                match File::open(&directory)?.sync_all() {
                     Ok(()) => {}
                     Err(error) if error.kind() == io::ErrorKind::Unsupported => {
                         status = host::DirectorySync::Unsupported;
                     }
                     Err(error) => return Err(error.into()),
                 }
+                pool.synced_directories.insert(directory);
             }
+            // The root now carries this shard's entry durably; later
+            // publications into the shard flush the shard alone.
+            pool.created_directories.remove(&directory);
             Ok(status)
         }
     }
 }
 
-impl ByteWriter for Files<'_> {
-    type Error = StoreError;
-    fn write_at(&mut self, handle: u64, offset: u64, bytes: &[u8]) -> Result<()> {
-        self.0
-            .borrow_mut()
-            .temporary(handle)?
-            .file
-            .as_mut()
-            .ok_or_else(|| StoreError::invalid("temporary file is closed"))?
-            .write_all_at(offset, bytes)?;
-        Ok(())
+/// The bytes of a source handle, read positioned from its start so that the
+/// sequential SourceIO cursor and the OS file position are left alone. Every
+/// byte handed out is also written to the payload temporary at the same
+/// offset, so hashing the object and staging it take one pass.
+struct Tee<'a> {
+    source: &'a Handle<'a>,
+    payload: &'a mut File,
+    position: u64,
+}
+
+impl Read for Tee<'_> {
+    fn read(&mut self, buf: &mut [u8]) -> io::Result<usize> {
+        let count = match self.source {
+            Handle::Borrowed(bytes) => copy_from(bytes, self.position, buf),
+            Handle::Frozen(bytes) => copy_from(bytes, self.position, buf),
+            Handle::File(source) => loop {
+                match source.file.read_at(self.position, buf) {
+                    Err(error) if error.kind() == io::ErrorKind::Interrupted => continue,
+                    result => break result?,
+                }
+            },
+            Handle::Temporary(_) => {
+                return Err(io::Error::other("a temporary is not a construction source"))
+            }
+        };
+        self.payload.write_all_at(self.position, &buf[..count])?;
+        self.position += count as u64;
+        Ok(count)
     }
+}
+
+fn copy_from(bytes: &[u8], position: u64, buf: &mut [u8]) -> usize {
+    let start = usize::try_from(position)
+        .unwrap_or(usize::MAX)
+        .min(bytes.len());
+    let count = buf.len().min(bytes.len() - start);
+    buf[..count].copy_from_slice(&bytes[start..start + count]);
+    count
+}
+
+impl Construct for Files<'_> {
+    type Error = StoreError;
+
+    /// One streaming pass: the source is read in tree groups, each group is
+    /// written to the payload temporary and hashed, and the outboard is
+    /// accumulated in memory (64 bytes per group pair) and written whole.
+    /// A source shorter than `size` fails with `UnexpectedEof` after the
+    /// bytes read so far were staged; the caller discards the temporaries.
+    fn build(&mut self, source: u64, payload: u64, outboard: u64, size: u64) -> Result<Vec<u8>> {
+        if source == payload || source == outboard || payload == outboard {
+            return Err(StoreError::invalid(
+                "construction needs distinct source, payload and outboard handles",
+            ));
+        }
+        let mut pool = self.0.borrow_mut();
+        // Both destinations are taken out of the registry for the duration
+        // and put back whatever happens, so the temporaries stay owned and
+        // discardable after a failed construction.
+        let mut payload_file = pool
+            .temporary(payload)?
+            .file
+            .take()
+            .ok_or_else(|| StoreError::invalid("temporary file is closed"))?;
+        let mut outboard_file = match pool.temporary(outboard).and_then(|temporary| {
+            temporary
+                .file
+                .take()
+                .ok_or_else(|| StoreError::invalid("temporary file is closed"))
+        }) {
+            Ok(file) => file,
+            Err(error) => {
+                pool.temporary(payload)?.file = Some(payload_file);
+                return Err(error);
+            }
+        };
+        let built = (|| -> Result<Vec<u8>> {
+            let handle = pool
+                .handles
+                .get(&source)
+                .ok_or_else(|| StoreError::invalid("unknown file handle"))?;
+            let tree = Store::tree(size);
+            let mut outboard_bytes = Vec::new();
+            outboard_bytes
+                .try_reserve_exact(
+                    usize::try_from(tree.outboard_size())
+                        .map_err(|_| StoreError::invalid("outboard exceeds address space"))?,
+                )
+                .map_err(|_| StoreError::invalid("outboard allocation failed"))?;
+            outboard_bytes.resize(tree.outboard_size() as usize, 0);
+            let root = crate::cas::compute_outboard(
+                Tee {
+                    source: handle,
+                    payload: &mut payload_file,
+                    position: 0,
+                },
+                tree,
+                &mut outboard_bytes,
+            )?;
+            outboard_file.write_all_at(0, &outboard_bytes)?;
+            Ok(root.as_bytes().to_vec())
+        })();
+        pool.temporary(payload)?.file = Some(payload_file);
+        pool.temporary(outboard)?.file = Some(outboard_file);
+        built
+    }
+
+    fn hash(&mut self, bytes: &[u8]) -> Result<Vec<u8>> {
+        Ok(blake3::hash(bytes).as_bytes().to_vec())
+    }
+}
+
+#[cfg(test)]
+fn write_at(files: &mut Files<'_>, handle: u64, offset: u64, bytes: &[u8]) -> Result<()> {
+    files
+        .0
+        .borrow_mut()
+        .temporary(handle)?
+        .file
+        .as_mut()
+        .ok_or_else(|| StoreError::invalid("temporary file is closed"))?
+        .write_all_at(offset, bytes)?;
+    Ok(())
 }
 
 fn input_key(space: &str, key: &[u8]) -> Result<()> {
@@ -394,6 +535,20 @@ impl FileIO for Files<'_> {
             Ok(bytes)
         };
         read().map_err(io_failure)
+    }
+
+    fn read_into(
+        &mut self,
+        handle: u64,
+        offset: u64,
+        buffer: &mut [u8],
+    ) -> std::result::Result<(), host::FileFailure<StoreError>> {
+        // Ingestion inputs are read as replies; the output sink belongs to
+        // the local-read operation.
+        let _ = (handle, offset, buffer);
+        Err(io_failure(StoreError::invalid(
+            "ingestion has no output sink to transfer into",
+        )))
     }
 
     fn close(&mut self, handle: u64) -> Result<()> {
@@ -553,7 +708,7 @@ mod tests {
         let mut files = Files::new(&store, Input::Bytes(&[]));
         let handle = files.create_temporary("cas_payload").unwrap();
         let path = temporary_path(&files, handle);
-        files.write_at(handle, 0, b"live").unwrap();
+        write_at(&mut files, handle, 0, b"live").unwrap();
         let stale = store.staging_dir().join("abandoned.tmp");
         std::fs::write(&stale, b"stale").unwrap();
         assert_eq!(other.gc_staging(i64::MAX).unwrap(), 1);
@@ -571,7 +726,7 @@ mod tests {
         let handle = files.create_temporary("cas_outboard").unwrap();
         let path = temporary_path(&files, handle);
         let mut writer = files.clone();
-        writer.write_at(handle, 0, b"bytes").unwrap();
+        write_at(&mut writer, handle, 0, b"bytes").unwrap();
         drop(files);
         assert!(path.exists());
         drop(writer);
@@ -587,7 +742,7 @@ mod tests {
         let mut files = Files::new(&store, Input::Bytes(&[]));
         let handle = files.create_temporary("cas_payload").unwrap();
         let path = temporary_path(&files, handle);
-        files.write_at(handle, 0, b"staged").unwrap();
+        write_at(&mut files, handle, 0, b"staged").unwrap();
         files.flush(handle).unwrap();
         assert!(files
             .replace(handle, "cas_payload", root.as_bytes())
@@ -606,7 +761,7 @@ mod tests {
         let mut files = Files::new(&store, Input::Bytes(&[]));
         let handle = files.create_temporary("cas_payload").unwrap();
         let path = temporary_path(&files, handle);
-        files.write_at(handle, 0, b"published").unwrap();
+        write_at(&mut files, handle, 0, b"published").unwrap();
         files.flush(handle).unwrap();
         files
             .replace(handle, "cas_payload", root.as_bytes())
@@ -644,7 +799,7 @@ mod tests {
         std::fs::write(&path, b"retry cleanup").unwrap();
         let root = Hash::new(b"retry cleanup");
         assert!(files.flush(handle).is_err());
-        assert!(files.write_at(handle, 0, b"overwrite").is_err());
+        assert!(write_at(&mut files, handle, 0, b"overwrite").is_err());
         assert!(files.read_at(handle, 0, 1).is_err());
         assert!(files.read_some(handle, 0, 1).is_err());
         assert!(files
@@ -675,6 +830,89 @@ mod tests {
         );
     }
 
+    /// Lean asks for a directory sync per published file. Both files of one
+    /// ingest land in the same shard, so the second request has nothing left
+    /// to flush; the CAS root is flushed only when the shard is new; and a
+    /// later publication into a flushed shard makes it flushable again.
+    #[cfg(not(windows))]
+    #[test]
+    fn directory_syncs_are_shared_by_one_publication_round() {
+        let synced = |files: &Files<'_>| {
+            let mut synced: Vec<PathBuf> = files
+                .0
+                .borrow()
+                .synced_directories
+                .iter()
+                .cloned()
+                .collect();
+            synced.sort();
+            synced
+        };
+        let publish = |files: &mut Files<'_>, root: &Hash| {
+            for space in ["cas_payload", "cas_outboard"] {
+                let handle = files.create_temporary(space).unwrap();
+                write_at(files, handle, 0, b"bytes").unwrap();
+                files.replace(handle, space, root.as_bytes()).unwrap();
+            }
+        };
+        let (_dir, store) = store();
+        let mut files = Files::new(&store, Input::Bytes(&[]));
+        let root = Hash::new(b"first publication");
+        let shard = store.blob_path(&root).parent().unwrap().to_path_buf();
+        assert!(!shard.exists());
+        publish(&mut files, &root);
+        assert!(files.0.borrow().created_directories.contains(&shard));
+        assert!(synced(&files).is_empty());
+
+        assert_eq!(
+            files.sync_parent("cas_payload", root.as_bytes()).unwrap(),
+            host::DirectorySync::Synced
+        );
+        let mut expected = vec![shard.clone(), store.cas_dir()];
+        expected.sort();
+        assert_eq!(synced(&files), expected);
+        assert_eq!(
+            files.sync_parent("cas_outboard", root.as_bytes()).unwrap(),
+            host::DirectorySync::Synced
+        );
+        assert_eq!(
+            synced(&files),
+            expected,
+            "the second request flushed nothing new"
+        );
+
+        // A new file in a flushed shard: the shard is due again, the root is
+        // not, because the shard entry it holds is already durable.
+        let sibling = {
+            let mut candidate = 0u64;
+            loop {
+                let hash = Hash::new(&candidate.to_le_bytes());
+                if store.blob_path(&hash).parent().unwrap() == shard && hash != root {
+                    break hash;
+                }
+                candidate += 1;
+            }
+        };
+        publish(&mut files, &sibling);
+        assert!(synced(&files).is_empty());
+        files
+            .sync_parent("cas_payload", sibling.as_bytes())
+            .unwrap();
+        assert_eq!(synced(&files), vec![shard.clone()]);
+
+        // A pre-existing shard never puts the root on the list.
+        let mut other = Files::new(&store, Input::Bytes(&[]));
+        let stranger = Hash::new(b"published into an existing shard");
+        let stranger_shard = store.blob_path(&stranger).parent().unwrap().to_path_buf();
+        std::fs::create_dir_all(&stranger_shard).unwrap();
+        publish(&mut other, &stranger);
+        assert!(other.0.borrow().created_directories.is_empty());
+        other
+            .sync_parent("cas_outboard", stranger.as_bytes())
+            .unwrap();
+        assert_eq!(synced(&other), vec![stranger_shard]);
+    }
+
     #[test]
     fn input_and_frozen_handles_share_allocator_but_not_mutability() {
         let (_dir, store) = store();
@@ -690,12 +928,12 @@ mod tests {
         assert_eq!(files.read_at(frozen, 0, 6).unwrap(), b"frozen");
         assert!(files.read_at(frozen, 0, 7).is_err());
         assert!(files.read_some(source, 0, 65537).is_err());
-        files.write_at(temporary, 0, b"staged").unwrap();
+        write_at(&mut files, temporary, 0, b"staged").unwrap();
         assert_eq!(files.read_at(temporary, 0, 6).unwrap(), b"staged");
-        assert!(files.write_at(frozen, 0, b"bad").is_err());
+        assert!(write_at(&mut files, frozen, 0, b"bad").is_err());
         files.close(temporary).unwrap();
         assert!(files.read_at(temporary, 0, 1).is_err());
-        assert!(files.write_at(temporary, 0, b"bad").is_err());
+        assert!(write_at(&mut files, temporary, 0, b"bad").is_err());
         assert!(files.flush(temporary).is_err());
         assert!(files.close(temporary).is_err());
         assert_eq!(store.active_temporaries().len(), 1);
@@ -735,5 +973,76 @@ mod tests {
         assert_ne!(first, second);
         drop(leases);
         assert_eq!(store.writer_count(&root), 0);
+    }
+    #[test]
+    fn construction_streams_source_into_owned_temporaries() {
+        let (dir, store) = store();
+        let bytes: Vec<u8> = (0..100_003).map(|n| (n % 251) as u8).collect();
+        let path = dir.path().join("source");
+        std::fs::write(&path, &bytes).unwrap();
+        for input in [Input::Bytes(&bytes), Input::File(&path)] {
+            let mut files = Files::new(&store, input);
+            let source = files.open("input", &[]).unwrap();
+            let payload = files.create_temporary("cas_payload").unwrap();
+            let outboard = files.create_temporary("cas_outboard").unwrap();
+            let root = files
+                .build(source, payload, outboard, bytes.len() as u64)
+                .unwrap();
+            assert_eq!(root, blake3::hash(&bytes).as_bytes());
+            assert_eq!(
+                std::fs::read(temporary_path(&files, payload)).unwrap(),
+                bytes
+            );
+            let tree = Store::tree(bytes.len() as u64);
+            let mut expected = vec![0; tree.outboard_size() as usize];
+            crate::cas::compute_outboard(&bytes[..], tree, &mut expected).unwrap();
+            assert_eq!(
+                std::fs::read(temporary_path(&files, outboard)).unwrap(),
+                expected
+            );
+            // The temporaries stay owned, flushable and discardable.
+            files.flush(payload).unwrap();
+            files.flush(outboard).unwrap();
+            assert_eq!(files.read_at(payload, 100, 3).unwrap(), bytes[100..103]);
+            // The source cursor was not moved by the positioned pass.
+            assert_eq!(files.read_some(source, 0, 4).unwrap(), bytes[..4]);
+            files.close(source).unwrap();
+            files.discard(payload).unwrap();
+            files.discard(outboard).unwrap();
+            assert!(store.active_temporaries().is_empty());
+        }
+    }
+
+    #[test]
+    fn construction_refuses_short_sources_and_confused_handles() {
+        let (_dir, store) = store();
+        let bytes = vec![7u8; 20_000];
+        let mut files = Files::new(&store, Input::Bytes(&bytes));
+        let source = files.open("input", &[]).unwrap();
+        let payload = files.create_temporary("cas_payload").unwrap();
+        let outboard = files.create_temporary("cas_outboard").unwrap();
+        let short = files.build(source, payload, outboard, 20_001).unwrap_err();
+        assert!(
+            matches!(short, StoreError::Io(ref error) if error.kind() == io::ErrorKind::UnexpectedEof)
+        );
+        for (from, into, aside) in [
+            (source, payload, payload),
+            (payload, payload, outboard),
+            (source, source, outboard),
+            (99, payload, outboard),
+            (source, 99, outboard),
+            (source, payload, 99),
+        ] {
+            assert!(files.build(from, into, aside, 20_000).is_err());
+        }
+        // A failed pass leaves the temporaries owned and discardable.
+        assert_eq!(
+            files.build(source, payload, outboard, 20_000).unwrap(),
+            blake3::hash(&bytes).as_bytes()
+        );
+        files.discard(payload).unwrap();
+        files.discard(outboard).unwrap();
+        assert!(store.active_temporaries().is_empty());
+        assert_eq!(files.hash(b"abc").unwrap(), blake3::hash(b"abc").as_bytes());
     }
 }

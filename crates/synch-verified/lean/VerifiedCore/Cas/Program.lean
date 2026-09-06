@@ -1,57 +1,75 @@
 import VerifiedCore.Host
 import VerifiedCore.Cas
+import VerifiedCore.Cas.Codec
 
 /-! Complete CAS operations over raw storage effects. No host policy snapshots. -/
 namespace VerifiedCore.Cas
 open Host
 
-/-- Malformed projected metadata is distinct from an absent object. -/
+/-- Host-level failure token for a projection no domain decoder can accept.
+Scripted interpreters answer requests outside a program's contract with it;
+the operations below report their own decoding failures as `Error`. -/
 def malformedMetadata : Failure := ⟨2, 0⟩
 
+/-- Terminal failures of acquisition and deletion, alongside the raw host
+failure they preserve. A column of the wrong storage class is reported with
+its position, name and observed class — the same terminal ingestion and reads
+emit — so Rust translates it mechanically rather than decoding detail codes. -/
+inductive Error where
+  | host (failure : Failure)
+  | malformed
+  | columnType (index : Nat) (column : String) (actual : Codec.CellType)
+  deriving BEq, DecidableEq
+
+/-- A storage program whose failures are the lifecycle domain's own. -/
+abbrev Lifecycle (A : Type) := OperationWith Error A
+
+def request (effect : Storage (Reply A)) : Lifecycle A :=
+  performWith Error.host effect
+
 /-- The existing database interprets every nonzero durable integer as true.
-Neither NULL nor another cell type is silently coerced into a claim. Failure
-details 1/2/3 preserve the NULL/text/blob column-type error at the public API;
-they describe an error selected here, not metadata for Rust to interpret. -/
-def decodeDurability : List Row → Reply Bool
+Neither NULL nor another cell type is silently coerced into a claim: the
+column-type error names the class that was observed, and a projection of any
+other shape is malformed metadata rather than an absent object. -/
+def decodeDurability : List Row → Except Error Bool
   | [] => .ok false
-  | [[.integer value]] => .ok (value != 0)
-  | [[.null]] => .error ⟨2, 1⟩
-  | [[.text _]] => .error ⟨2, 2⟩
-  | [[.rawText _]] => .error ⟨2, 2⟩
-  | [[.blob _]] => .error ⟨2, 3⟩
-  | [[.real _]] => .error ⟨2, 7⟩
-  | _ => .error malformedMetadata
+  | [[cell]] => (Codec.integerField (Error.columnType 0 "durable") cell).map (· != 0)
+  | _ => .error .malformed
 
 /-- Acquire one holder's pin inside an already-owned transaction. The database
 adapter receives raw projections and unconditional mutations only. UPSERT's
 explicit update list preserves an old pin's creation time while clearing its
-scheduled release, exactly as the existing storage format requires. -/
+scheduled release, exactly as the existing storage format requires.
+A plain pin never consults the holder's want; possession must find and
+consume the holder's live want in the same transaction, so a late fetch cannot
+resurrect an orphan role claim after role removal. -/
 def acquireIn (tx : Transaction) (root : ByteArray) (holder : String)
-    (now : Int64) (possession : Bool) : Operation Bool := do
-  let rows ← perform (.readRows tx "blobs" ["durable"] [("root", .blob root)])
+    (now : Int64) (possession : Bool) : Lifecycle Bool := do
+  let rows ← request (.readRows tx "blobs" ["durable"] [("root", .blob root)])
   let durable ← match decodeDurability rows with
     | .ok durable => pure durable
-    | .error failure => throw failure
-  let wanted ← perform (.readRows tx "content_want" ["root"]
-    [("root", .blob root), ("holder", .text holder)])
-  if durable && (!possession || !wanted.isEmpty) then
-    if possession then
-      let _ ← perform (.deleteRows tx "content_want"
-        [("root", .blob root), ("holder", .text holder)])
-    perform (.upsert tx "pins"
-      [("root", .blob root), ("holder", .text holder),
-        ("created_at", .integer now), ("release_after", .null)]
-      ["root", "holder"] ["release_after"])
-    return true
-  else
+    | .error error => throw error
+  if !durable then
     return false
+  if possession then
+    let wanted ← request (.readRows tx "content_want" ["root"]
+      [("root", .blob root), ("holder", .text holder)])
+    if wanted.isEmpty then
+      return false
+    let _ ← request (.deleteRows tx "content_want"
+      [("root", .blob root), ("holder", .text holder)])
+  request (.upsert tx "pins"
+    [("root", .blob root), ("holder", .text holder),
+      ("created_at", .integer now), ("release_after", .null)]
+    ["root", "holder"] ["release_after"])
+  return true
 
 /-- Complete pin or possession acquisition: begin before metadata reads and
 return only after commit; any failed effect is handled by the shared verified
 transaction program. Other Lean operations can compose `acquireIn` directly. -/
 def acquire (root : ByteArray) (holder : String) (now : Int64)
-    (possession : Bool) : Operation Bool :=
-  transaction fun tx => acquireIn tx root holder now possession
+    (possession : Bool) : Lifecycle Bool :=
+  transactionWith Error.host fun tx => acquireIn tx root holder now possession
 
 /-- A public holder value, not a parsed database spelling. In particular an
 unknown holder whose spelling resembles a role does not acquire that role's
@@ -113,43 +131,38 @@ def expire (holder : Option PinHolder) (now : Int64) : Operation Nat :=
   transaction fun tx => expireIn tx holder now
 
 /-- Preserve absence and signed access time; do not coerce malformed cells. -/
-def decodeAccess : List Row → Reply (Option Int64)
+def decodeAccess : List Row → Except Error (Option Int64)
   | [] => .ok none
-  | [[.integer value]] => .ok (some value)
-  | [[.null]] => .error ⟨2, 4⟩
-  | [[.text _]] => .error ⟨2, 5⟩
-  | [[.rawText _]] => .error ⟨2, 5⟩
-  | [[.blob _]] => .error ⟨2, 6⟩
-  | [[.real _]] => .error ⟨2, 8⟩
-  | _ => .error malformedMetadata
+  | [[cell]] => (Codec.integerField (Error.columnType 0 "last_access") cell).map some
+  | _ => .error .malformed
 
 /-- All protection observations occur within the immediate transaction and
 the host's surrounding ordering session. Existence reads are bounded queries,
 not host-supplied protection decisions. -/
-def deleteIn (tx : Transaction) (root : ByteArray) (before : Option Int64) : Operation Outcome := do
-  let pinned ← perform (.existsRows tx "pins" [("root", .blob root)])
-  let referenced ← perform (.existsRows tx "entries" [("content", .blob root)])
-  let rows ← perform (.readRows tx "blobs" ["last_access"] [("root", .blob root)])
+def deleteIn (tx : Transaction) (root : ByteArray) (before : Option Int64) : Lifecycle Outcome := do
+  let pinned ← request (.existsRows tx "pins" [("root", .blob root)])
+  let referenced ← request (.existsRows tx "entries" [("content", .blob root)])
+  let rows ← request (.readRows tx "blobs" ["last_access"] [("root", .blob root)])
   let accessed ← match decodeAccess rows with
     | .ok value => pure value
-    | .error failure => throw failure
-  let writers ← perform (.readCounter "cas_writers" root)
+    | .error error => throw error
+  let writers ← request (.readCounter "cas_writers" root)
   let plan := planLifecycle (.delete
     ⟨accessed.isSome, writers != 0, pinned, referenced, accessed.getD 0⟩ before)
   for mutation in plan.transaction do
     match mutation with
-    | .deleteRow => let _ ← perform (.deleteRows tx "blobs" [("root", .blob root)])
+    | .deleteRow => let _ ← request (.deleteRows tx "blobs" [("root", .blob root)])
   return plan.outcome
 
 /-- Best-effort cleanup is requested only after successful transaction
 completion. Failure of one unlink does not prevent the second attempt. -/
-def cleanup (root : ByteArray) : Operation Unit := do
-  try perform (.removeFile "cas_payload" root) catch _ => pure ()
-  try perform (.removeFile "cas_outboard" root) catch _ => pure ()
+def cleanup (root : ByteArray) : Lifecycle Unit := do
+  try request (.removeFile "cas_payload" root) catch _ => pure ()
+  try request (.removeFile "cas_outboard" root) catch _ => pure ()
 
 /-- Complete deletion, including cleanup. No mutation plan leaves Lean. -/
-def delete (root : ByteArray) (before : Option Int64) : Operation Outcome := do
-  let outcome ← transaction fun tx => deleteIn tx root before
+def delete (root : ByteArray) (before : Option Int64) : Lifecycle Outcome := do
+  let outcome ← transactionWith Error.host fun tx => deleteIn tx root before
   match outcome with
   | .applied => cleanup root
   | _ => pure ()

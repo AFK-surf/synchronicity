@@ -97,13 +97,17 @@ def execute (script : Script) : Program Storage A → A × List Event
 
 /-- Execute the production operation from its first transaction request. -/
 def run (script : Script) (root : ByteArray) (holder : String) (now : Int64)
-    (possession : Bool) : Reply Bool × List Event :=
+    (possession : Bool) : Except Error Bool × List Event :=
   execute script (acquire root holder now possession).run
 
-/-- The exact raw projections expected under the transaction token. -/
-def reads (tx : Transaction) (root : ByteArray) (holder : String) : List Event :=
-  [.readRows tx "blobs" ["durable"] [("root", .blob root)],
-   .readRows tx "content_want" ["root"] [("root", .blob root), ("holder", .text holder)]]
+/-- The exact raw projections expected under the transaction token. The want
+is projected only when the program consults it: a durable row and a
+possession request. A plain pin never asks for it. -/
+def reads (tx : Transaction) (root : ByteArray) (holder : String) (want : Bool) : List Event :=
+  [.readRows tx "blobs" ["durable"] [("root", .blob root)]] ++
+  (if want then
+    [.readRows tx "content_want" ["root"] [("root", .blob root), ("holder", .text holder)]]
+   else [])
 
 /-- Exact authorized mutations, including UPSERT conflict/update columns. -/
 def writes (tx : Transaction) (root : ByteArray) (holder : String) (now : Int64)
@@ -123,24 +127,28 @@ theorem durability_nonzero (value : Int64) :
 /-- Missing rows are not durable; malformed columns are errors, not absence. -/
 theorem missing_not_durable : decodeDurability [] = .ok false := rfl
 
-theorem null_not_durable : decodeDurability [[.null]] = .error ⟨2, 1⟩ := rfl
+theorem null_not_durable : decodeDurability [[.null]] = .error (.columnType 0 "durable" .null) := rfl
 
 /-- Text, including numeric-looking text, retains its column-type error. -/
 theorem text_not_durable (value : String) :
-    decodeDurability [[.text value]] = .error ⟨2, 2⟩ := rfl
+    decodeDurability [[.text value]] = .error (.columnType 0 "durable" .text) := rfl
 
 /-- Opaque bytes cannot be coerced into a durable integer. -/
 theorem blob_not_durable (value : ByteArray) :
-    decodeDurability [[.blob value]] = .error ⟨2, 3⟩ := rfl
+    decodeDurability [[.blob value]] = .error (.columnType 0 "durable" .blob) := rfl
 
 /-- Raw malformed text is still a text-type error for an integer projection;
 attempting UTF-8 conversion first would change the original field error. -/
 theorem raw_text_not_durable (value : ByteArray) :
-    decodeDurability [[.rawText value]] = .error ⟨2, 2⟩ := rfl
+    decodeDurability [[.rawText value]] = .error (.columnType 0 "durable" .text) := rfl
 
 /-- REAL cells remain distinguishable until the domain selects its type error. -/
 theorem real_not_durable (bits : UInt64) :
-    decodeDurability [[.real bits]] = .error ⟨2, 7⟩ := rfl
+    decodeDurability [[.real bits]] = .error (.columnType 0 "durable" .real) := rfl
+
+/-- A projection of any other shape is malformed metadata, not absence. -/
+theorem wide_row_malformed (cell extra : Cell) :
+    decodeDurability [[cell, extra]] = .error .malformed := rfl
 
 /-- With successful storage, the complete program requests exactly its guarded
 mutations between the raw reads and commit. A direct pin does not delete wants. -/
@@ -148,7 +156,7 @@ theorem successful_execution (tx : Transaction) (root : ByteArray) (holder : Str
     (now : Int64) (possession : Bool) (wanted : List Row) :
     run { begin := .ok tx, wanted := .ok wanted } root holder now possession =
       (.ok (!possession || !wanted.isEmpty),
-        [.begin] ++ reads tx root holder ++
+        [.begin] ++ reads tx root holder possession ++
           (if !possession || !wanted.isEmpty then writes tx root holder now possession else []) ++
           [.commit tx]) := by
   cases possession <;> cases wanted <;> rfl
@@ -158,7 +166,7 @@ theorem missing_row_refused (tx : Transaction) (root : ByteArray) (holder : Stri
     (now : Int64) (possession : Bool) (wanted : List Row) :
     run { begin := .ok tx, durable := .ok [], wanted := .ok wanted }
         root holder now possession =
-      (.ok false, [.begin] ++ reads tx root holder ++ [.commit tx]) := by
+      (.ok false, [.begin] ++ reads tx root holder false ++ [.commit tx]) := by
   cases possession <;> rfl
 
 /-- Zero is a staged/non-durable row, not permission to acquire a durable pin. -/
@@ -166,7 +174,7 @@ theorem staged_row_refused (tx : Transaction) (root : ByteArray) (holder : Strin
     (now : Int64) (possession : Bool) (wanted : List Row) :
     run { begin := .ok tx, durable := .ok [[.integer 0]], wanted := .ok wanted }
         root holder now possession =
-      (.ok false, [.begin] ++ reads tx root holder ++ [.commit tx]) := by
+      (.ok false, [.begin] ++ reads tx root holder false ++ [.commit tx]) := by
   cases possession <;> rfl
 
 /-- Successful execution depends on Lean's raw-row decoder, not a host-provided
@@ -177,11 +185,12 @@ theorem decoded_execution (tx : Transaction) (root : ByteArray) (holder : String
     run { begin := .ok tx, durable := .ok rows, wanted := .ok wanted }
         root holder now possession =
       (.ok (durable && (!possession || !wanted.isEmpty)),
-        [.begin] ++ reads tx root holder ++
+        [.begin] ++ reads tx root holder (durable && possession) ++
           (if durable && (!possession || !wanted.isEmpty)
             then writes tx root holder now possession else []) ++ [.commit tx]) := by
   cases durable <;> cases possession <;> cases wanted <;>
-    simp [run, acquire, transaction, transactionWith, transactionOver, acquireIn, perform, execute, answer, event,
+    simp [run, acquire, transactionWith, transactionOver, acquireIn, request, performWith,
+      execute, answer, event, Except.mapError,
       bind, pure, Program.bind, ExceptT.bind, ExceptT.bindCont, ExceptT.pure,
       ExceptT.run, ExceptT.mk, decoded, reads, writes]
 
@@ -204,7 +213,7 @@ theorem possession_ordered (tx : Transaction) (root : ByteArray) (holder : Strin
     (decoded : decodeDurability rows = .ok true) (live : wanted ≠ []) :
     run { begin := .ok tx, durable := .ok rows, wanted := .ok wanted }
         root holder now true =
-      (.ok true, [.begin] ++ reads tx root holder ++ writes tx root holder now true ++
+      (.ok true, [.begin] ++ reads tx root holder true ++ writes tx root holder now true ++
         [.commit tx]) := by
   rw [decoded_execution tx root holder now true true rows wanted decoded]
   cases wanted <;> simp_all
@@ -213,7 +222,7 @@ theorem possession_ordered (tx : Transaction) (root : ByteArray) (holder : Strin
 theorem begin_failure (failure : Failure) (root : ByteArray) (holder : String)
     (now : Int64) (possession : Bool) :
     run { begin := .error failure } root holder now possession =
-      (.error failure, [.begin]) := rfl
+      (.error (.host failure), [.begin]) := rfl
 
 /-- Failed metadata reads immediately roll back; even rollback failure cannot
 replace the original host error. No mutation can follow this observation. -/
@@ -222,7 +231,7 @@ theorem durable_read_failure (tx : Transaction) (failure : Failure)
     (now : Int64) (possession : Bool) :
     run { begin := .ok tx, durable := .error failure, rollback := rollback }
         root holder now possession =
-      (.error failure, [.begin,
+      (.error (.host failure), [.begin,
         .readRows tx "blobs" ["durable"] [("root", .blob root)], .rollback tx]) := rfl
 
 /-- A raw NULL durable flag is a metadata error and triggers rollback before
@@ -231,23 +240,30 @@ theorem malformed_row_failure (tx : Transaction) (rollback : Reply Unit)
     (root : ByteArray) (holder : String) (now : Int64) (possession : Bool) :
     run { begin := .ok tx, durable := .ok [[.null]], rollback := rollback }
         root holder now possession =
-      (.error ⟨2, 1⟩, [.begin,
+      (.error (.columnType 0 "durable" .null), [.begin,
         .readRows tx "blobs" ["durable"] [("root", .blob root)], .rollback tx]) := rfl
 
 /-- A failed want read cannot be mistaken for an absent or still-live want. -/
 theorem want_read_failure (tx : Transaction) (failure : Failure)
-    (rollback : Reply Unit) (root : ByteArray) (holder : String)
-    (now : Int64) (possession : Bool) :
+    (rollback : Reply Unit) (root : ByteArray) (holder : String) (now : Int64) :
     run { begin := .ok tx, wanted := .error failure, rollback := rollback }
-        root holder now possession =
-      (.error failure, [.begin] ++ reads tx root holder ++ [.rollback tx]) := rfl
+        root holder now true =
+      (.error (.host failure), [.begin] ++ reads tx root holder true ++ [.rollback tx]) := rfl
+
+/-- A plain pin never projects the want: even a failing want reply is never
+requested, and the pin lands on durability alone. -/
+theorem plain_pin_ignores_want (tx : Transaction) (failure : Failure)
+    (root : ByteArray) (holder : String) (now : Int64) :
+    run { begin := .ok tx, wanted := .error failure } root holder now false =
+      (.ok true, [.begin] ++ reads tx root holder false ++ writes tx root holder now false ++
+        [.commit tx]) := rfl
 
 /-- If consuming the want fails, no pin UPSERT or commit is requested. -/
 theorem want_delete_failure (tx : Transaction) (failure : Failure)
     (rollback : Reply Unit) (root : ByteArray) (holder : String) (now : Int64) :
     run { begin := .ok tx, delete := .error failure, rollback := rollback }
         root holder now true =
-      (.error failure, [.begin] ++ reads tx root holder ++
+      (.error (.host failure), [.begin] ++ reads tx root holder true ++
         [.deleteRows tx "content_want" [("root", .blob root), ("holder", .text holder)],
           .rollback tx]) := rfl
 
@@ -258,7 +274,7 @@ theorem pin_upsert_failure (tx : Transaction) (failure : Failure)
     (now : Int64) (possession : Bool) :
     run { begin := .ok tx, upsert := .error failure, rollback := rollback }
         root holder now possession =
-      (.error failure, [.begin] ++ reads tx root holder ++
+      (.error (.host failure), [.begin] ++ reads tx root holder possession ++
         writes tx root holder now possession ++ [.rollback tx]) := by
   cases possession <;> rfl
 
@@ -269,7 +285,7 @@ theorem commit_failure (tx : Transaction) (failure : Failure)
     (now : Int64) (possession : Bool) :
     run { begin := .ok tx, commit := .error failure, rollback := rollback }
         root holder now possession =
-      (.error failure, [.begin] ++ reads tx root holder ++
+      (.error (.host failure), [.begin] ++ reads tx root holder possession ++
         writes tx root holder now possession ++ [.commit tx, .rollback tx]) := by
   cases possession <;> rfl
 
@@ -278,13 +294,13 @@ theorem refused_commit_failure (tx : Transaction) (failure : Failure)
     (rollback : Reply Unit) (root : ByteArray) (holder : String) (now : Int64) :
     run { begin := .ok tx, wanted := .ok [], commit := .error failure, rollback := rollback }
         root holder now true =
-      (.error failure, [.begin] ++ reads tx root holder ++ [.commit tx, .rollback tx]) := rfl
+      (.error (.host failure), [.begin] ++ reads tx root holder true ++ [.commit tx, .rollback tx]) := rfl
 
 /-- Runtime regression for legacy non-Boolean durable integers. -/
 example (tx : Transaction) (root : ByteArray) (holder : String) (now : Int64) :
     run { begin := .ok tx, durable := .ok [[.integer (-7)]] }
         root holder now true =
-      (.ok true, [.begin] ++ reads tx root holder ++ writes tx root holder now true ++
+      (.ok true, [.begin] ++ reads tx root holder true ++ writes tx root holder now true ++
         [.commit tx]) := rfl
 
 end Synchronicity.CasProgramProofs

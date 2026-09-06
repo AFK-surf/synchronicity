@@ -274,32 +274,51 @@ theorem native_write_injection_preserves_reply (effect : WriteEffects A) (input 
     nativeReply (.right (.right (.right (.right (.right (.right effect)))))) input =
       writeReply effect input := rfl
 
-theorem writer_request_has_only_handle_offset_and_bytes (handle offset : UInt64) (chunk : ByteArray) :
-    writerRequest (.writeAt handle offset chunk) =
-      octet 1 ++ octet 38 ++ word handle ++ word offset ++ bytes chunk := rfl
+theorem build_request_carries_handles_and_size_only (source payload outboard size : UInt64) :
+    constructRequest (.build source payload outboard size) =
+      octet 1 ++ octet 38 ++ word source ++ word payload ++ word outboard ++ word size := rfl
 
-theorem writer_requires_exact_unit_reply :
-    writerReply (.writeAt 9 8 .empty) (b [1, 38, 0]) = .error protocolFailure := by decide
+theorem build_reply_requires_root_bytes :
+    constructReply (.build 1 2 3 0) (b [1, 38, 0]) = .error protocolFailure := by decide
 
-theorem writer_accepts_acknowledgement :
-    writerReply (.writeAt 9 8 .empty) (b [1, 38]) = .ok () := by decide
-
-theorem chunk_request_preserves_counter_root_and_bytes (counter : UInt64) (root : Bool)
-    (chunk : ByteArray) : blake3Request (.chunk counter root chunk) =
-      octet 1 ++ octet 39 ++ word counter ++ octet (if root then 1 else 0) ++ bytes chunk := rfl
-
-theorem parent_request_preserves_root_and_children (root : Bool) (left right : ByteArray) :
-    blake3Request (.parent root left right) = octet 1 ++ octet 40 ++
-      octet (if root then 1 else 0) ++ bytes left ++ bytes right :=
-  WireBufferProofs.parentRequest_preserves_bytes root left right
-
-theorem hash_wrong_variant_rejected :
-    blake3Reply (.chunk 0 true .empty) (b [1, 40, 0, 0, 0, 0, 0, 0, 0, 0]) =
+theorem build_reply_rejects_hash_variant :
+    constructReply (.build 1 2 3 0) (b [1, 39, 0, 0, 0, 0, 0, 0, 0, 0]) =
       .error protocolFailure := by decide
 
-theorem hash_truncated_payload_rejected :
-    blake3Reply (.parent false .empty .empty) (b [1, 40, 1, 0, 0, 0, 0, 0, 0, 0]) =
+theorem build_reply_preserves_original_failure :
+    constructReply (.build 1 2 3 0)
+      (b [1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0]) = .error ⟨1, 9⟩ := by rfl
+
+theorem hash_request_preserves_bytes (chunk : ByteArray) :
+    constructRequest (.hash chunk) = octet 1 ++ octet 39 ++ bytes chunk :=
+  WireBufferProofs.hashRequest_preserves_bytes chunk
+
+theorem hash_reply_rejects_build_variant :
+    constructReply (.hash .empty) (b [1, 38, 0, 0, 0, 0, 0, 0, 0, 0]) =
       .error protocolFailure := by decide
+
+theorem hash_reply_rejects_truncated_payload :
+    constructReply (.hash .empty) (b [1, 39, 1, 0, 0, 0, 0, 0, 0, 0]) =
+      .error protocolFailure := by decide
+
+theorem transfer_request_carries_handle_offset_and_count (handle offset count : UInt64) :
+    fileRequest (.transfer handle offset count) =
+      octet 1 ++ octet 52 ++ word handle ++ word offset ++ word count := rfl
+
+theorem transfer_requires_exact_acknowledgement :
+    fileReply (.transfer 7 0 1) (b [1, 52, 0]) = .error ⟨protocolFailure, .other⟩ := by rfl
+
+theorem transfer_accepts_acknowledgement :
+    fileReply (.transfer 7 0 1) (b [1, 52]) = .ok () := by rfl
+
+theorem transfer_rejects_read_reply :
+    fileReply (.transfer 7 0 1) (b [1, 34, 0, 0, 0, 0, 0, 0, 0, 0]) =
+      .error ⟨protocolFailure, .other⟩ := by rfl
+
+theorem transfer_preserves_short_read_classification :
+    fileReply (.transfer 7 0 1)
+      (b [1, 0, 1, 0, 0, 0, 0, 0, 0, 0, 9, 0, 0, 0, 0, 0, 0, 0, 1]) =
+      .error ⟨⟨1, 9⟩, .shortRead⟩ := by rfl
 
 theorem conflict_expression_tree_tags (column : String) :
     conflictValue (.coalesce (.excluded column) (.max (.current column) (.excluded column))) =

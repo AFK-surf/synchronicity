@@ -14,19 +14,8 @@ theorem appendBytes_eq (out payload : ByteArray) :
     appendBytes out payload = out ++ bytes payload := by
   exact ByteArray.append_assoc
 
-theorem writerRequest_preserves_bytes (handle offset : UInt64) (chunk : ByteArray) :
-    writerRequest (.writeAt handle offset chunk) =
-      octet 1 ++ octet 38 ++ word handle ++ word offset ++ bytes chunk := by
-  simp only [writerRequest, appendBytes_eq]
-
-theorem chunkRequest_preserves_bytes (counter : UInt64) (root : Bool) (chunk : ByteArray) :
-    blake3Request (.chunk counter root chunk) =
-      octet 1 ++ octet 39 ++ word counter ++ octet (if root then 1 else 0) ++ bytes chunk := by
-  simp only [blake3Request, appendBytes_eq]
-
-theorem parentRequest_preserves_bytes (root : Bool) (left right : ByteArray) :
-    blake3Request (.parent root left right) =
-      octet 1 ++ octet 40 ++ octet (if root then 1 else 0) ++ bytes left ++ bytes right := by
-  simp only [blake3Request, appendBytes_eq]
+theorem hashRequest_preserves_bytes (chunk : ByteArray) :
+    constructRequest (.hash chunk) = octet 1 ++ octet 39 ++ bytes chunk := by
+  simp only [constructRequest, appendBytes_eq]
 
 end Synchronicity.WireBufferProofs
