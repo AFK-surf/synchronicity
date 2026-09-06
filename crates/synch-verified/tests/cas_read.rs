@@ -225,7 +225,6 @@ struct Files {
     bytes: Vec<u8>,
     open_failure: Option<FileFailureKind>,
     failure: Option<FileFailureKind>,
-    failure_after: usize,
     reads: Vec<(u64, u64)>,
 }
 impl FileIO for Files {
@@ -248,33 +247,36 @@ impl FileIO for Files {
         }
         Ok(HANDLE)
     }
-    fn read_at(
+    fn read_at(&mut self, _: u64, _: u64, _: u64) -> Result<Vec<u8>, FileFailure<Self::Error>> {
+        panic!("a local read transfers into the sink instead of replying with bytes")
+    }
+    fn read_into(
         &mut self,
         handle: u64,
         offset: u64,
-        count: u64,
-    ) -> Result<Vec<u8>, FileFailure<Self::Error>> {
+        buffer: &mut [u8],
+    ) -> Result<(), FileFailure<Self::Error>> {
         assert_eq!(handle, HANDLE);
-        self.reads.push((offset, count));
+        self.reads.push((offset, buffer.len() as u64));
         self.trace
             .borrow_mut()
-            .step("read")
+            .step("transfer")
             .map_err(|error| FileFailure {
                 error,
                 kind: FileFailureKind::Other,
             })?;
-        if let Some(kind) = self
-            .failure
-            .filter(|_| self.reads.len() > self.failure_after)
-        {
+        if let Some(kind) = self.failure {
+            // A failed transfer may have touched the sink's tail; the
+            // interpreter takes it back and the caller sees no bytes.
+            buffer.fill(255);
             return Err(FileFailure {
                 error: "physical read",
                 kind,
             });
         }
         let offset = usize::try_from(offset).unwrap();
-        let count = usize::try_from(count).unwrap();
-        Ok(self.bytes[offset..offset + count].to_vec())
+        buffer.copy_from_slice(&self.bytes[offset..offset + buffer.len()]);
+        Ok(())
     }
     fn close(&mut self, handle: u64) -> Result<(), Self::Error> {
         assert_eq!(handle, HANDLE);
@@ -301,7 +303,6 @@ fn fixture(size: i64, complete: bool, inline: Cell) -> (Shared, Database, Files,
         bytes: vec![],
         open_failure: None,
         failure: None,
-        failure_after: 0,
         reads: vec![],
     };
     let time = Time(trace.clone());
@@ -315,15 +316,15 @@ fn assert_host(result: Result<Vec<u8>, ReadError<&'static str>>, expected: &str)
 }
 
 #[test]
-fn native_complete_read_uses_one_handle_and_bounded_chunks() {
+fn native_complete_read_uses_one_handle_and_one_transfer() {
     let (trace, mut db, mut files, mut clock) = fixture(65543, true, Cell::Null);
     files.bytes = (0..65543).map(|n| (n % 251) as u8).collect();
     let result = cas::read(&mut db, &mut files, &mut clock, &ROOT, ReadRequest::All).unwrap();
     assert_eq!(result, files.bytes);
-    assert_eq!(files.reads, [(0, 65536), (65536, 7)]);
+    assert_eq!(files.reads, [(0, 65543)]);
     assert_eq!(
         trace.borrow().calls,
-        ["snapshot", "open", "read", "read", "close"]
+        ["snapshot", "open", "transfer", "close"]
     );
 }
 
@@ -339,17 +340,16 @@ fn native_partial_output_is_discarded_on_later_read_close_or_repair_failure() {
         let (trace, mut db, mut files, mut clock) = fixture(65540, true, Cell::Null);
         files.bytes = vec![1; 65540];
         files.failure = physical_failure;
-        files.failure_after = 1;
         trace.borrow_mut().fail = host_failure;
         assert_host(
             cas::read(&mut db, &mut files, &mut clock, &ROOT, ReadRequest::All),
             host_failure.unwrap_or("physical read"),
         );
-        assert_eq!(files.reads, [(0, 65536), (65536, 4)]);
+        assert_eq!(files.reads, [(0, 65540)]);
         let calls = &trace.borrow().calls;
-        assert_eq!(&calls[..5], ["snapshot", "open", "read", "read", "close"]);
+        assert_eq!(&calls[..4], ["snapshot", "open", "transfer", "close"]);
         if let Some(begin) = calls.iter().position(|step| *step == "begin") {
-            assert_eq!(begin, 5, "healing must start after closing the file");
+            assert_eq!(begin, 4, "healing must start after closing the file");
         }
     }
 }
@@ -370,10 +370,10 @@ fn native_ranged_read_offsets_and_clamps_in_lean() {
     )
     .unwrap();
     assert_eq!(result, files.bytes[3..]);
-    assert_eq!(files.reads, [(3, 65536), (65539, 11)]);
+    assert_eq!(files.reads, [(3, 65547)]);
     assert_eq!(
         trace.borrow().calls,
-        ["snapshot", "open", "read", "read", "close"]
+        ["snapshot", "open", "transfer", "close"]
     );
 }
 
@@ -466,8 +466,8 @@ fn native_complete_read_preserves_each_host_failure_and_closes_before_return() {
     for (fail, expected_calls) in [
         ("snapshot", vec!["snapshot"]),
         ("open", vec!["snapshot", "open"]),
-        ("read", vec!["snapshot", "open", "read", "close"]),
-        ("close", vec!["snapshot", "open", "read", "close"]),
+        ("transfer", vec!["snapshot", "open", "transfer", "close"]),
+        ("close", vec!["snapshot", "open", "transfer", "close"]),
     ] {
         let (trace, mut db, mut files, mut clock) = fixture(4, true, Cell::Null);
         trace.borrow_mut().fail = Some(fail);
@@ -483,8 +483,8 @@ fn native_complete_read_preserves_each_host_failure_and_closes_before_return() {
 #[test]
 fn native_healing_is_atomic_and_primary_failures_survive_rollback_failures() {
     let path = [
-        "snapshot", "open", "read", "close", "begin", "size", "update", "clock", "copy", "delete",
-        "commit",
+        "snapshot", "open", "transfer", "close", "begin", "size", "update", "clock", "copy",
+        "delete", "commit",
     ];
     for kind in [FileFailureKind::Missing, FileFailureKind::ShortRead] {
         for fail in [

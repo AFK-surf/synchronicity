@@ -108,7 +108,8 @@ fn decode_ingest(bytes: &[u8]) -> Result<Result<Ingested, IngestDomainError>, ()
 }
 
 /// Ingest one invocation-bound input through Lean's complete command, including
-/// capture, hashing, staging, leases, durability and atomic metadata publication.
+/// capture, staging, leases, durability and atomic metadata publication. The
+/// bytes themselves are hashed and laid out by the host's construction service.
 pub fn ingest<S: crate::host::Upsert>(
     storage: &mut S,
     resources: IngestResources<'_, S::Error>,
@@ -238,10 +239,24 @@ impl<E> crate::host::Output for ReadOutput<E> {
     type Error = OperationError<E>;
     fn append(&mut self, bytes: &[u8]) -> Result<(), Self::Error> {
         self.bytes
-            .try_reserve(bytes.len())
+            .try_reserve_exact(bytes.len())
             .map_err(|_| OperationError::Protocol)?;
         self.bytes.extend_from_slice(bytes);
         Ok(())
+    }
+    fn grow(&mut self, count: u64) -> Result<&mut [u8], Self::Error> {
+        let count = usize::try_from(count).map_err(|_| OperationError::Protocol)?;
+        let start = self.bytes.len();
+        let end = start.checked_add(count).ok_or(OperationError::Protocol)?;
+        self.bytes
+            .try_reserve_exact(count)
+            .map_err(|_| OperationError::Protocol)?;
+        self.bytes.resize(end, 0);
+        Ok(&mut self.bytes[start..])
+    }
+    fn shrink(&mut self, count: u64) {
+        let count = usize::try_from(count).unwrap_or(usize::MAX);
+        self.bytes.truncate(self.bytes.len().saturating_sub(count));
     }
 }
 

@@ -62,10 +62,6 @@ impl host::FileIO for Files<'_> {
         offset: u64,
         count: u64,
     ) -> std::result::Result<Vec<u8>, host::FileFailure<Self::Error>> {
-        let file = self
-            .opened
-            .get(&handle)
-            .ok_or_else(|| file_protocol("unknown file handle"))?;
         let count =
             usize::try_from(count).map_err(|_| file_protocol("file read exceeds address space"))?;
         let mut bytes = Vec::new();
@@ -73,9 +69,24 @@ impl host::FileIO for Files<'_> {
             .try_reserve_exact(count)
             .map_err(|_| file_protocol("file read allocation failed"))?;
         bytes.resize(count, 0);
-        file.read_exact_at(offset, &mut bytes)
-            .map_err(|error| lean_diagnostics::io_failure(error.into()))?;
+        self.read_into(handle, offset, &mut bytes)?;
         Ok(bytes)
+    }
+
+    /// One positioned read into the sink's tail: the payload is copied once,
+    /// from the page cache into the bytes the caller receives.
+    fn read_into(
+        &mut self,
+        handle: u64,
+        offset: u64,
+        buffer: &mut [u8],
+    ) -> std::result::Result<(), host::FileFailure<Self::Error>> {
+        let file = self
+            .opened
+            .get(&handle)
+            .ok_or_else(|| file_protocol("unknown file handle"))?;
+        file.read_exact_at(offset, buffer)
+            .map_err(|error| lean_diagnostics::io_failure(error.into()))
     }
 
     fn close(&mut self, handle: u64) -> Result<()> {
@@ -156,7 +167,7 @@ mod tests {
     struct ObservedFiles<'a> {
         inner: Files<'a>,
         root: Hash,
-        reads: Vec<(u64, u64)>,
+        transfers: Vec<(u64, usize)>,
         opens: usize,
         closes: usize,
     }
@@ -175,13 +186,21 @@ mod tests {
         }
         fn read_at(
             &mut self,
+            _: u64,
+            _: u64,
+            _: u64,
+        ) -> std::result::Result<Vec<u8>, host::FileFailure<Self::Error>> {
+            panic!("a local read transfers into the sink instead of replying with bytes")
+        }
+        fn read_into(
+            &mut self,
             handle: u64,
             offset: u64,
-            count: u64,
-        ) -> std::result::Result<Vec<u8>, host::FileFailure<Self::Error>> {
+            buffer: &mut [u8],
+        ) -> std::result::Result<(), host::FileFailure<Self::Error>> {
             assert!(self.inner.store.blob(&self.root).unwrap().is_some());
-            self.reads.push((offset, count));
-            self.inner.read_at(handle, offset, count)
+            self.transfers.push((offset, buffer.len()));
+            self.inner.read_into(handle, offset, buffer)
         }
         fn close(&mut self, handle: u64) -> Result<()> {
             self.closes += 1;
@@ -190,14 +209,14 @@ mod tests {
     }
 
     #[test]
-    fn large_read_uses_one_file_bounded_chunks_and_no_connection_during_io() {
+    fn large_read_uses_one_file_one_transfer_and_no_connection_during_io() {
         let (_dir, store) = store();
         let payload = data(1024 * 1024 + 17);
         let root = store.ingest_bytes(&payload, 0).unwrap();
         let mut files = ObservedFiles {
             inner: Files::new(&store),
             root,
-            reads: vec![],
+            transfers: vec![],
             opens: 0,
             closes: 0,
         };
@@ -214,10 +233,24 @@ mod tests {
             payload
         );
         assert_eq!((files.opens, files.closes), (1, 1));
-        assert_eq!(files.reads.len(), 17);
-        assert!(files.reads.iter().all(|(_, count)| *count <= 65536));
-        assert_eq!(files.reads.last(), Some(&(1024 * 1024, 17)));
+        assert_eq!(files.transfers, [(0, 1024 * 1024 + 17)]);
         assert!(files.inner.opened.is_empty());
+        let mut storage = crate::lean_storage::Session::new(&store);
+        assert_eq!(
+            cas::read(
+                &mut storage,
+                &mut files,
+                &mut Clock,
+                root.as_bytes(),
+                cas::ReadRequest::Range {
+                    offset: 1024 * 1024 - 5,
+                    length: 100,
+                }
+            )
+            .unwrap(),
+            payload[1024 * 1024 - 5..]
+        );
+        assert_eq!(files.transfers.last(), Some(&(1024 * 1024 - 5, 22)));
     }
 
     #[test]

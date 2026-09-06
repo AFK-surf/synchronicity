@@ -21,8 +21,7 @@ fn main() {
     let modules = [
         "Host",
         "Host/Access",
-        "Host/Hash",
-        "Host/Write",
+        "Host/Construct",
         "Host/Upsert",
         "Host/Resources",
         "Host/Source",
@@ -33,7 +32,6 @@ fn main() {
         "Cas/Program",
         "Cas/ReadCodec",
         "Cas/Read",
-        "Cas/Bao",
         "Cas/IngestCommit",
         "Cas/Ingest",
         "Cas/Input",

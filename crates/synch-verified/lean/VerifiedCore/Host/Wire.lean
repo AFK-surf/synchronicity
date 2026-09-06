@@ -1,8 +1,7 @@
 import VerifiedCore.Host
 import VerifiedCore.Crypto
 import VerifiedCore.Host.Access
-import VerifiedCore.Host.Write
-import VerifiedCore.Host.Hash
+import VerifiedCore.Host.Construct
 import VerifiedCore.Host.Upsert
 import VerifiedCore.Host.Resources
 import VerifiedCore.Host.Source
@@ -218,8 +217,8 @@ def resume (state : State) (input : ByteArray) : State :=
 
 /-- One native continuation transport, with storage and crypto kept as distinct
 typed capabilities. Existing storage packets retain their exact representation. -/
-abbrev WriteEffects := EffectSum ByteWriter (EffectSum Blake3
-  (EffectSum Upsert (EffectSum Resources (EffectSum Lease SourceIO))))
+abbrev WriteEffects := EffectSum Construct
+  (EffectSum Upsert (EffectSum Resources (EffectSum Lease SourceIO)))
 abbrev NativeEffects := EffectSum Storage (EffectSum Crypto
   (EffectSum Access (EffectSum FileIO (EffectSum Clock (EffectSum Output WriteEffects)))))
 abbrev NativeState := Program NativeEffects (Reply ByteArray)
@@ -266,6 +265,7 @@ def accessReply (effect : Access A) (input : ByteArray) : A :=
 def fileRequest : FileIO A → ByteArray
   | .open space key => octet 1 ++ octet 33 ++ string space ++ bytes key
   | .readAt handle offset count => octet 1 ++ octet 34 ++ word handle ++ word offset ++ word count
+  | .transfer handle offset count => octet 1 ++ octet 52 ++ word handle ++ word offset ++ word count
   | .close handle => octet 1 ++ octet 35 ++ word handle
 
 def readFileReply (expected : UInt8) (read : Reader A) : Reader (FileReply A) := do
@@ -293,6 +293,7 @@ def fileReply (effect : FileIO A) (input : ByteArray) : A :=
   match effect with
   | .open .. => decodeFileReply 33 readWord input
   | .readAt .. => decodeFileReply 34 readBytes input
+  | .transfer .. => decodeFileReply 52 (pure ()) input
   | .close .. => decodeReply 35 (pure ()) input
 
 def clockRequest : Clock A → ByteArray
@@ -309,24 +310,18 @@ def outputReply (effect : Output A) (input : ByteArray) : A :=
   match effect with
   | .append _ => decodeReply 37 (pure ()) input
 
-def writerRequest : ByteWriter A → ByteArray
-  | .writeAt handle offset chunk =>
-      appendBytes (octet 1 ++ octet 38 ++ word handle ++ word offset) chunk
+/-- Construction carries handles and a size only; the payload bytes of a
+built object never enter a packet. The inline hash request appends its bytes
+directly into the packet accumulator. -/
+def constructRequest : Construct A → ByteArray
+  | .build source payload outboard size =>
+      octet 1 ++ octet 38 ++ word source ++ word payload ++ word outboard ++ word size
+  | .hash chunk => appendBytes (octet 1 ++ octet 39) chunk
 
-def writerReply (effect : ByteWriter A) (input : ByteArray) : A :=
+def constructReply (effect : Construct A) (input : ByteArray) : A :=
   match effect with
-  | .writeAt .. => decodeReply 38 (pure ()) input
-
-def blake3Request : Blake3 A → ByteArray
-  | .chunk counter root chunk =>
-      appendBytes (octet 1 ++ octet 39 ++ word counter ++ octet (if root then 1 else 0)) chunk
-  | .parent root left right =>
-      appendBytes (appendBytes (octet 1 ++ octet 40 ++ octet (if root then 1 else 0)) left) right
-
-def blake3Reply (effect : Blake3 A) (input : ByteArray) : A :=
-  match effect with
-  | .chunk .. => decodeReply 39 readBytes input
-  | .parent .. => decodeReply 40 readBytes input
+  | .build .. => decodeReply 38 readBytes input
+  | .hash .. => decodeReply 39 readBytes input
 
 def conflictValue : ConflictValue → ByteArray
   | .current column => octet 0 ++ string column
@@ -385,29 +380,25 @@ def sourceReply (effect : SourceIO A) (input : ByteArray) : A :=
 
 def writeRequest (effect : WriteEffects A) : ByteArray :=
   match effect with
-  | .left writer => writerRequest writer
+  | .left construct => constructRequest construct
   | .right effect => match effect with
-    | .left blake3 => blake3Request blake3
+    | .left upsert => upsertRequest upsert
     | .right effect => match effect with
-      | .left upsert => upsertRequest upsert
+      | .left resources => resourcesRequest resources
       | .right effect => match effect with
-        | .left resources => resourcesRequest resources
-        | .right effect => match effect with
-          | .left lease => leaseRequest lease
-          | .right source => sourceRequest source
+        | .left lease => leaseRequest lease
+        | .right source => sourceRequest source
 
 def writeReply (effect : WriteEffects A) (input : ByteArray) : A :=
   match effect with
-  | .left writer => writerReply writer input
+  | .left construct => constructReply construct input
   | .right effect => match effect with
-    | .left blake3 => blake3Reply blake3 input
+    | .left upsert => upsertReply upsert input
     | .right effect => match effect with
-      | .left upsert => upsertReply upsert input
+      | .left resources => resourcesReply resources input
       | .right effect => match effect with
-        | .left resources => resourcesReply resources input
-        | .right effect => match effect with
-          | .left lease => leaseReply lease input
-          | .right source => sourceReply source input
+        | .left lease => leaseReply lease input
+        | .right source => sourceReply source input
 
 def nativeRequest (effect : NativeEffects A) : ByteArray :=
   match effect with

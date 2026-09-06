@@ -13,20 +13,18 @@ private def ingestWriteEffect (effect : Host.Wire.WriteEffects A) : Host.Wire.Na
 
 private def ingestEffect (effect : Cas.Input.Effects A) : Host.Wire.NativeEffects A :=
   match effect with
-  | .right source => ingestWriteEffect (.right (.right (.right (.right (.right source)))))
+  | .right source => ingestWriteEffect (.right (.right (.right (.right source))))
   | .left effect => match effect with
     | .left effect => match effect with
       | .left file => .right (.right (.right (.left file)))
-      | .right effect => match effect with
-        | .left writer => ingestWriteEffect (.left writer)
-        | .right hash => ingestWriteEffect (.right (.left hash))
+      | .right construct => ingestWriteEffect (.left construct)
     | .right effect => match effect with
       | .left effect => match effect with
         | .left storage => .left storage
-        | .right upsert => ingestWriteEffect (.right (.right (.left upsert)))
+        | .right upsert => ingestWriteEffect (.right (.left upsert))
       | .right effect => match effect with
-        | .left files => ingestWriteEffect (.right (.right (.right (.left files))))
-        | .right lease => ingestWriteEffect (.right (.right (.right (.right (.left lease)))))
+        | .left files => ingestWriteEffect (.right (.right (.left files)))
+        | .right lease => ingestWriteEffect (.right (.right (.right (.left lease))))
 
 /-- One column-type terminal, framed the same way by every CAS operation:
 the projection index, the column name and the observed storage class. -/
@@ -43,13 +41,8 @@ private def ingestMetadataError : Cas.IngestCommit.Error → Host.Reply ByteArra
   | .sizeMismatch root recorded offered => .ok (Host.Wire.octet 3 ++ Host.Wire.bytes root ++
       Host.Wire.word recorded ++ Host.Wire.word offered)
 
-private def ingestConstructionError : Cas.Bao.Error → Host.Reply ByteArray
-  | .host failure => .error failure
-  | .protocol => .error Host.Wire.protocolFailure
-
 private def ingestResourceError : Cas.Ingest.Error → Host.Reply ByteArray
   | .host failure => .error failure
-  | .construction error => ingestConstructionError error
   | .metadata error => ingestMetadataError error
   | .protocol => .error Host.Wire.protocolFailure
   | .directorySyncUnsupported => .ok (Host.Wire.octet 4)
@@ -58,12 +51,12 @@ private def ingestResult : Except Cas.Input.Error Cas.Input.Result → Host.Repl
   | .ok result => .ok (Host.Wire.octet 0 ++ Host.Wire.bytes result.root ++ Host.Wire.word result.size)
   | .error (.host failure) => .error failure
   | .error (.ingestion error) => ingestResourceError error
-  | .error (.construction error) => ingestConstructionError error
   | .error (.metadata error) => ingestMetadataError error
   | .error .protocol => .error Host.Wire.protocolFailure
 
-/-- One whole byte/file command. No captured-source, hash-tree or metadata
-planner is exported. The input path/buffer is an invocation-owned capability. -/
+/-- One whole byte/file command. No captured-source or metadata planner is
+exported; object construction is a host service the command directs. The
+input path/buffer is an invocation-owned capability. -/
 @[export synch_lean_cas_ingest]
 def ingest (kind : UInt8) (size : UInt64) (now : Int64) (cache allowUnsupported : Bool) :
     Host.Wire.NativeState :=

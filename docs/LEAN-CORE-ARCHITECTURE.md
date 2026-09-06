@@ -51,7 +51,7 @@ not be input services furnished by Rust to Lean.
 
 | Lean domain | Owns | Host services, not policy |
 |---|---|---|
-| CAS | Ingest/read/serve/import/promote; Bao tree and group arithmetic; metadata codecs; size attestation; holds/wants; healing, eviction and collection; durability ordering | Raw metadata records, object reads/writes, flush/truncate/remove, provider I/O, primitive hashes |
+| CAS | Ingest/read/serve/import/promote; group arithmetic; metadata codecs; size attestation; holds/wants; healing, eviction and collection; durability ordering | Raw metadata records, object reads/writes, flush/truncate/remove, provider I/O, primitive hashes |
 | Trie | Node codec and canonicality; keys/nibbles; lookup/update/diff/proofs; scoped traversal; completeness and certificate validity; trie collection | Encoded node/value storage, raw ownership/redaction records, primitive hashes |
 | Authorization | Binding liveness, delegated closure, rootedness, scope and provenance rules | Raw binding/head records, authenticated transport identity, signature primitive, DNS response/clock inputs |
 | Replication | Head ordering/history, adoption/reconciliation, provider selection, retries, delta/fetch orchestration, retention | Raw records, send/receive, time and entropy, CAS/Trie/Authorization **Lean** interfaces |
@@ -430,9 +430,10 @@ Subsequent CAS work is ordered by cohesive operation requirements:
   healing fails. Host callbacks cannot supply verified groups or heal domain
   state on Lean's behalf. See the local-read boundary below.
 - Ingest needs bounded file capabilities, unique staging, rename, flush,
-  truncate, directory durability and writer leases. Lean owns Bao construction
-  and publication ordering. Preserve streaming and keep expensive I/O outside
-  SQL transactions; a whole outboard builder is not a primitive hash service.
+  truncate, directory durability and writer leases. Lean owns input policy,
+  resource lifetime and publication ordering; the host streams, hashes and
+  lays out the object as one construction service over owned temporaries.
+  Keep expensive I/O outside SQL transactions.
 - Remote adoption/finalization must compose raw provider I/O around metadata
   transitions. Moving only a durable-flag setter leaves the core ordering in
   Rust; provider pair validation/upload is likewise CAS policy, not a primitive.
@@ -453,9 +454,10 @@ of the old slicing panic.
 
 Local read migration alone does not complete cloud reads. The cloud wrapper
 still owns adoption, missing-group hydration and success-only access touch;
-eventually compose those in Lean over raw provider ranges. Bao slice serving
-and import additionally require Lean traversal/verification. Do not relabel the
-existing Rust range hydrator or Bao encoder/decoder as a raw host capability.
+eventually compose those in Lean over raw provider ranges. Bao slice serving,
+import and verification are bulk byte work and stay in Rust: verified
+streaming is out of scope for the Lean core, which directs those services
+rather than reimplementing them.
 
 #### Local read/healing operation and bounded output
 
@@ -467,29 +469,34 @@ raw file resources, diagnostics and a scoped SQLite session. This completes
 only the local-read operation, not the surrounding cloud or Bao operations.
 
 The program owns ordered raw row validation, postcard bitmap decoding and
-coverage, range arithmetic, inline validation, physical reads and repair/error
-ordering. Reads retain one open file handle across at-most-64-KiB transfers and
-close it before repair or return. A separate raw `Output.append(bytes)` effect
-emits bounded chunks into a private, command-owned Rust buffer. Lean does not
-retain or serialize a whole-object result. The terminal success carries only
-the byte count; the facade checks framing and count before moving the buffer
-to the caller. No partially emitted bytes escape on domain, host, protocol,
-close or repair failure. The output service has no CAS metadata, range or
-recovery concepts and no buffer IDs or domain-specific finalization callback.
-Allocation failure is returned through the effect reply so Lean still closes
-opened files. Rust owns allocation; Lean owns which bytes to emit and when.
-A malformed successful file reply is an error,
-not a silently shortened result. Missing/truncated data triggers repair;
-unrelated I/O failures do not. Successful repair returns the original I/O error,
-whereas repair failure takes precedence. The on-demand clock follows metadata
-invalidation, preserving the existing ordering.
+coverage, range arithmetic, inline validation, the physical read request and
+repair/error ordering. It opens the payload once, asks the host for one
+`FileIO.transfer(handle, offset, count)` of the whole admitted range and
+closes the handle before repair or return. The transfer lands the bytes
+directly in a private, command-owned Rust buffer: the payload of a file read
+is never a Lean value, a reply packet or a chunk to re-append, so a local
+read costs the one copy from the page cache into the bytes the caller
+receives. Inline payloads, which the snapshot already delivered, reach the
+same buffer through `Output.append`. The terminal success carries only the
+byte count; the facade checks framing and count before moving the buffer to
+the caller. No partially emitted bytes escape on domain, host, protocol,
+close or repair failure: a failed transfer takes back the tail it grew. The
+output service has no CAS metadata, range or recovery concepts and no buffer
+IDs or domain-specific finalization callback. A sink that cannot grow is
+reported through the transfer reply as an unrelated I/O failure, so Lean
+still closes the opened file. Rust owns allocation and byte movement; Lean
+owns which bytes are asked for and what their absence means.
+Missing/truncated data triggers repair; unrelated I/O failures do not.
+Successful repair returns the original I/O error, whereas repair failure
+takes precedence. The on-demand clock follows metadata invalidation,
+preserving the existing ordering.
 
 `Host/Access.lean` describes **raw** capabilities separately from domain
 commands: statement-scoped snapshot scans, literal updates, atomic INSERT SELECT
 with conflict-ignore behavior, and selected bulk deletes. A selection supplies
 literal equality fields plus an optional disjunction of SQL LIKE terms. The
-file capability provides open, exact positioned reads and close; clock and
-output are separate algebras. Native integration shares the existing
+file capability provides open, exact positioned reads, a transfer into the
+output buffer and close; clock and output are separate algebras. Native integration shares the existing
 whitelisted query construction and transaction handling, not a second SQL
 policy engine.
 Snapshot connections end at statement completion; only the healing transaction
@@ -499,17 +506,14 @@ for rollback; failed rollback leaves final cleanup to session destruction.
 
 Validation covers exact native effect traces, original-error and rollback
 precedence, malformed replies, SQLite statement atomicity, real missing and
-truncated files, retained open-file identity, and released connection scopes
-during chunked I/O. Isolated ignored 64-MiB read probes compare native output
-allocation against a raw-file baseline; run each in a fresh memory-capped
-process. Small chunk requests alone are not evidence of bounded memory: the
-first buffered-terminal implementation still made whole-object copies.
-On this Linux development host, fresh debug test processes reading 64 MiB
-reported 661,820 KiB peak RSS with the buffered terminal, 83,128 KiB with bounded
-output, and 83,000 KiB for the raw-file baseline. Each probe ran alone under a
-1-GiB OS memory cap. Native read time was about 371 ms versus 16 ms for the raw
-file call; these diagnostic runs establish the allocation improvement, not
-throughput parity or release-build/platform performance guarantees.
+truncated files, retained open-file identity, released connection scopes
+during the transfer, and a failed transfer leaving the sink as it was.
+Isolated ignored 64-MiB read probes compare native output allocation against
+a raw-file baseline; run each in a fresh memory-capped process. The earlier
+chunked design, which routed every 64 KiB through a reply packet, a Lean
+`ByteArray`, an append packet and the sink, made about eight copies of every
+byte and read 16 MiB in 25 ms against 3 ms for a plain positioned read; the
+transfer removes those copies by construction rather than by tuning them.
 Proofs check actual Lean decoder fixtures and operation executions. They do
 not establish the native interpreter, allocator or physical storage contracts;
 those remain explicit trusted host services tested independently.
@@ -520,12 +524,21 @@ a replacement build while its original process is still alive.
 
 ### Complete ingestion: construction and publication boundary
 
-Production local `ingest_bytes`/`ingest_file` now execute as **whole Lean
+Production local `ingest_bytes`/`ingest_file` execute as **whole Lean
 operations**. Their Rust orchestration, `write_payload`, `commit_complete` and
-old ingestion-only pause hooks have been deleted. The internal construction
-algorithm lives in `Cas/Bao.lean`; Rust provides raw storage and cryptographic
-primitives, never an outboard, verified spans or an attested-size snapshot.
-No standalone Bao/planner facade or alternative Rust local ingestion exists.
+old ingestion-only pause hooks have been deleted. Lean owns input policy,
+inline selection, the temporary-resource lifecycle, writer-lease lifetime,
+publication ordering, directory durability policy and the metadata
+transaction. The bytes of the object are the host's: one
+`Construct.build(source, payload, outboard, size)` effect streams exactly
+`size` bytes of the opened source into the owned payload temporary, hashes
+them into the BLAKE3 tree and writes the Bao outboard into the owned outboard
+temporary, replying with the root. `Construct.hash(bytes)` answers the root
+of an inline object the program already holds. Verified streaming, the
+BLAKE3 tree and the outboard layout are out of scope for the Lean core: they
+are bulk byte work performed by `bao-tree`/`blake3` in the store's resource
+pool, the same code the cloud ingestion paths use. Lean checks the width of
+every root it receives and never sees a payload byte on this path.
 
 The mandatory native integration invokes the **whole** `Cas/Input.run` byte
 or file command. Its Rust wrapper binds raw services and translates terminal
@@ -539,10 +552,77 @@ same-source program proofs cover the executed local ingestion path.
 An initially small file still captures to EOF, even if it grows beyond 16 KiB.
 That exceptional branch retains its captured bytes, as the previous whole-file
 read did; it freezes those bytes under an immutable raw handle before invoking
-streaming construction. It never reopens the mutable path. Ordinary initially
-large files and large immutable byte inputs use bounded reads and do not build
-a whole outboard buffer. The small-file-growth path is not claimed to have
-bounded whole-object memory or transfer-copy parity.
+construction. It never reopens the mutable path. Construction reads the source
+positioned from its start in tree groups and never moves the sequential
+source cursor; an appended suffix is ignored and a truncated source fails
+with `UnexpectedEof` after the temporaries were partly staged, which the
+program then discards. The outboard is accumulated in memory, 64 bytes per
+group pair, and written whole; a 64 MiB object's outboard is 256 KiB.
+
+The previous design drove construction from Lean at 1 KiB BLAKE3 granularity:
+about 35,800 host round-trips and nine copies of every byte for a 16 MiB
+object, with BLAKE3's multi-chunk SIMD path unreachable. The CI smoke
+benchmark measured 139 MiB/s for that ingest against 860 MiB/s before the
+Lean core. Moving construction to the host restores the single streaming
+pass; the boundary the proofs cover is the request and its use, not the
+tree.
+
+Transport optimization keeps this boundary intact: resume transfers the
+private owned continuation reference to Lean instead of retaining the old
+state while running the next continuation. Independently held packet owners
+remain live, and Rust disarms transferred handles before the foreign call so
+unwinding cannot drop them again. The C ownership convention is part of the
+native boundary's trust base, checked against generated code and native
+lifetime/unwind tests, not claimed as a Lean theorem about C.
+
+Lean's `appendBytes` encoder appends length-prefixed fields directly into the
+packet accumulator. It avoids constructing a separate length-plus-payload
+buffer for the inline hash request. `WireBufferProofs` proves exact equality
+to the plain wire format for arbitrary inputs; no new capability or Rust
+domain decision is introduced.
+
+The fixed-width `word` encoder now uses eight constant shifts and a buffer
+reserved for eight bytes. `WireWordProofs.word_eq_fold` proves equality for
+every UInt64 to the previous little-endian fold specification. This replaces
+runtime loop/index arithmetic, not the wire protocol; reply validation and
+all domain control flow remain unchanged.
+
+The native raw resource pool shares one invocation-local handle allocator
+across source, frozen and temporary handles. Temporary creation uses
+`create_new`; a process-wide, canonical-datadir registry protects live names
+against staging GC across independently opened Store values. GC holds its
+registry lock through exclusion and unlink. Raw keyed leases reuse the existing
+connection/CAS ordering and counted writer protection. Unix directory-sync
+failures propagate, including flushes of the new shard's namespace ancestors
+down to the configured store directory; Windows reports unsupported under explicit platform policy
+and retains the existing write-through replacement helper.
+
+Native fixtures check standard roots, payloads and Bao outboard bytes across
+chunk/group boundaries using real SQLite and files, plus metadata failure
+cleanup. A 14-case raw-effect fault matrix checks original errors and explicit
+cleanup before adapter destruction; a deferred foreign-key failure checks
+rollback when COMMIT itself fails. A channel-gated test across independently
+opened stores checks GC exclusion between payload and outboard publication,
+then collection after lease release. The resource pool's own tests check
+that construction stages the source into the owned temporaries, leaves them
+flushable and discardable, refuses short sources and confused handles, and
+leaves the sequential source cursor alone. Raw capability framing tests
+reject truncated/trailing packets and excessive conflict expression
+depth/node counts. Source capture/inline decisions remain absent from the
+Rust interpreter.
+
+Lean owns input length policy, inline choice, temporary resource lifecycle,
+writer-lease lifetime, durability ordering and transactional row settlement.
+The host supplies construction and the inline hash as whole services; their
+cryptographic and layout correctness is a stated trust assumption on
+`blake3` and `bao-tree`, tested against standard vectors and against the
+same outboard encoder the slice serving path reads. There is no per-chunk
+primitive, no Lean tree recurrence and no outboard placement proof: what
+the ingestion proofs establish is that the program requests exactly one
+construction over the two owned temporaries and the captured source,
+rejects a root of the wrong width before any lease, flush or name, and
+runs the same cleanup on a construction failure as on any other effect
+failure.
 
 The EOF collector retains reversed bounded chunks and an explicit byte count,
 then flattens once into a preallocated buffer without an intervening host
@@ -570,155 +650,6 @@ before the baseline. `/proc/self/status` peak RSS includes Lean allocations,
 unlike a Rust-only allocator counter. It verifies roots and resource cleanup
 without materializing the result for measurement. The 4-MiB and 64-MiB inputs
 include three trailing bytes to exercise partial groups.
-
-Local release measurements under a 4-GiB scope (single build/test job):
-
-| 64 MiB + 3 bytes | Peak RSS rise | Elapsed |
-| --- | ---: | ---: |
-| Lean file ingestion | 1928 KiB | 376 ms |
-| Lean byte ingestion | 2176 KiB | 369 ms |
-| Existing Rust file ingestion | 336 KiB | 34 ms |
-| Existing Rust byte ingestion | 256 KiB | 56 ms |
-
-The Lean 4-MiB cases had 2176–2240 KiB peak rise: these measurements support
-bounded retention for ordinary large inputs, not a universal allocation or
-throughput claim. The observed 6.6–11.1x release-time gap is unfinished
-performance work. Per-chunk crypto/packet allocation and repeated bounded
-copies remain optimization targets; restoring a Rust tree planner is not an
-acceptable shortcut. The probe's loose memory gate does not assert timing
-parity or cover the growing-small-file path.
-
-Transport optimization keeps this boundary intact: resume transfers the
-private owned continuation reference to Lean instead of retaining the old
-state while running the next continuation. Independently held packet owners
-remain live, and Rust disarms transferred handles before the foreign call so
-unwinding cannot drop them again. The C ownership convention is part of the
-native boundary's trust base, checked against generated code and native
-lifetime/unwind tests, not claimed as a Lean theorem about C.
-
-Lean's `appendBytes` encoder appends length-prefixed fields directly into the
-packet accumulator. It avoids constructing a separate length-plus-payload
-buffer for raw positioned writes and chunk/parent compression requests.
-`WireBufferProofs` proves exact equality to the previous wire format for
-arbitrary inputs; no new capability, tree operation or Rust domain decision
-is introduced.
-
-The fixed-width `word` encoder now uses eight constant shifts and a buffer
-reserved for eight bytes. `WireWordProofs.word_eq_fold` proves equality for
-every UInt64 to the previous little-endian fold specification. This replaces
-runtime loop/index arithmetic, not the wire protocol; reply validation and
-all domain control flow remain unchanged.
-
-Three interleaved release runs against a preserved pre-optimization binary
-gave 64-MiB median file/byte times of 387/363 ms before these transport changes
-and 365/339 ms afterward. The ranges overlap; this is a modest measured gain,
-not a resolved throughput gap. Peak retention stayed roughly 2 MiB. A separate
-raw-compression microbenchmark took about 75 ms for 65,537 chunk and 65,536
-parent calls without Lean transport or I/O. That benchmark uses a dependency
-chain, not a BLAKE3 tree, and is diagnostic only; it does not replace the root
-or layout tests or predict end-to-end performance.
-
-The native raw resource pool shares one invocation-local handle allocator
-across source, frozen and temporary handles. Temporary creation uses
-`create_new`; a process-wide, canonical-datadir registry protects live names
-against staging GC across independently opened Store values. GC holds its
-registry lock through exclusion and unlink. Raw keyed leases reuse the existing
-connection/CAS ordering and counted writer protection. Unix directory-sync
-failures propagate, including flushes of the new shard's namespace ancestors
-down to the configured store directory; Windows reports unsupported under explicit platform policy
-and retains the existing write-through replacement helper.
-
-Native fixtures check standard roots, payloads and Bao outboard bytes across
-chunk/group boundaries using real SQLite and files, plus metadata failure
-cleanup. A 19-case raw-effect fault matrix checks original errors and explicit
-cleanup before adapter destruction; a deferred foreign-key failure checks
-rollback when COMMIT itself fails. A channel-gated test across independently
-opened stores checks GC exclusion between payload and outboard publication,
-then collection after lease release. These are integration checks, not a substitute for the remaining
-standard-root and complete-layout Lean proofs. Raw capability framing tests
-reject truncated/trailing packets, invalid booleans and excessive conflict
-expression depth/node counts. Source capture/inline decisions remain absent
-from the Rust interpreter.
-
-Lean owns the binary BLAKE3 tree, group boundaries, preorder outboard placement,
-input length policy, tee ordering, inline choice, temporary resource lifecycle,
-writer-lease lifetime, durability ordering and transactional row settlement.
-Primitive cryptography supplies only unkeyed BLAKE3 chunk compression (at most
-1024 bytes, explicit chunk counter/root flag) and parent compression of two
-32-byte chaining values. There is no host hash-subtree or Bao constructor.
-Successful primitive replies are width-checked before use. Cryptographic
-correctness of the primitive remains a stated trust assumption.
-
-Construction reads at most 16 KiB through one retained source handle, writes
-the captured bytes to an unpublished payload resource, and computes all chunk
-and parent combinations in Lean. Above the group layer, a subtree containing
-more than one group splits at the largest power-of-two group boundary strictly
-before its end. For a pair at byte offset `base` with `leftGroups` groups, its
-children's pair regions begin at `base + 64` and `base + 64 * leftGroups`.
-Children are computed before their parent pair is written at its preorder
-offset. This needs bounded working buffers and a logarithmic traversal stack,
-not a payload-sized or outboard-sized Lean accumulator. Raw positioned writes
-do not imply flush, publication or a CAS state transition.
-
-The construction proof module checks the executable splitter's positivity,
-alignment, strict shrinking and power-of-two fuel budgets (including every
-UInt64 input), bounded I/O/hash requests, small/error executions and recursive
-program equations with concrete two-/three-group layouts. Large-buffer kernel
-evaluation was replaced by compositional equations after hitting evaluator
-limits; no unchecked evaluator or enlarged recursion limit is required.
-The additional root, slot-enumeration and trace results below strengthen these
-checks. Their raw-host assumptions remain explicit; native primitive/layout
-tests check the native boundary, with the measured throughput gap remaining
-explicit performance work. Invocation-owned source, payload and outboard
-resources must be distinct; fresh temporary creation establishes this host
-resource contract before the internal constructor is called.
-
-The inner-tree proof additionally interprets the executable free-monadic
-program under arbitrary raw replies: every accepted digest has width 32.
-Under an explicit valid-input chunk/parent primitive contract, it agrees with
-a pure Lean tree recurrence. This is not a proof of native cryptography or of
-the outer streaming constructor's complete root/outboard correctness.
-
-The outer executable constructor additionally has conditional agreement with
-a grouped Lean recurrence under explicit bounded-input and successful-write
-contracts. Accepted roots have 32 bytes without assuming host honesty, and a
-successful branch requires both children and its pair write before its parent
-hash. The grouping proof below identifies its root with the ordinary chunk
-tree; outboard placement is covered separately by layout and trace theorems.
-
-`BaoGroupingProofs` proves that group and chunk splitters choose the same
-boundary above 16 KiB, and that sufficient inner traversal fuel agrees with
-a fuel-free ordinary chunk tree. Its coherent-source theorem connects the
-outer grouped recurrence to that tree for every sufficiently fueled slice,
-including absolute chunk counters. `build_matches_chunkTree` composes this
-with the actual free-monadic builder for every UInt64 source length. The
-assumptions are explicit: bounded reads are slices of one immutable byte
-sequence, writes succeed, and raw chunk/parent compression satisfies its
-contract. There is no assumed Rust tree or Rust/Lean equivalence relation.
-`BaoLayoutProofs` proves
-exact pair counts, contiguous and disjoint parent/child regions, alignment,
-and top-level UInt64 offset bounds. Its branch theorem is linked to the
-executable constructor's required 64-byte pair write. The pure postorder
-enumeration contains every in-region slot exactly once and no other slot;
-each enumerated slot is linked to a required successful 64-byte write in the
-recursive executable. `BaoTraceProofs.build_accumulated_writeTrace` additionally
-proves equality of the shared stateful interpreter's accumulated request log
-with the complete postorder slot enumeration, including any initial log.
-Payload and outboard handles must differ. Hashing and reads add no outboard
-writes. Raw replies are arbitrary but deterministic and independent of the
-log; the theorem does not establish correctness of native filesystems or
-general history-dependent responders. These assumptions and the remaining
-native gates must not be erased by describing the trace theorem as universal
-physical-I/O correctness.
-
-The private Rust primitive adapter uses the pinned BLAKE3 chunk compression
-and parent-compression APIs only. Its fixtures check standard empty/abc roots,
-chunk counters, root flags, malformed sizes and parent order. The chunk
-wrapper narrowly permits the dependency's deprecated `guts::ChunkState` API:
-the newer byte-offset helper rejects empty non-root input and cannot express
-the full UInt64 chunk-counter domain accepted by the raw Lean contract. This
-is an explicit cryptographic trust boundary, not a Rust tree implementation
-whose correctness must be manually paired with a separate Lean model.
 
 `Cas/IngestCommit.lean` stages the metadata portion as an internal Lean
 transaction: read the exact claim projection, decode and settle it, then issue
@@ -759,9 +690,10 @@ Required raw host resources and compatibility improvements:
   ownership until replacement/removal. Current PID/counter names combined
   with `File::create` can collide after process-ID reuse; `create_new` is
   required. Protect live temporary resources from age-only staging GC.
-- Exact/EOF reads, positioned writes, checked file flush, close, atomic
-  replacement and explicit removal are independent effects. Lean requests
-  cleanup and selects primary failures; RAII covers abandonment.
+- Exact/EOF reads, one construction pass into owned temporaries, checked
+  file flush, close, atomic replacement and explicit removal are independent
+  effects. Lean requests cleanup and selects primary failures; RAII covers
+  abandonment.
 - Unify payload publication behind flush-before-replace. The old large-file
   branch replaces before reopening and flushing, unlike byte ingestion.
   Windows requires a writable flush handle and replacement semantics equivalent
@@ -771,15 +703,15 @@ Required raw host resources and compatibility improvements:
   justify a theorem claiming checked directory durability. Specify the
   supported-platform contract before wiring a stronger publication guarantee.
 
-The captured-source ingestion program composes the constructor and metadata
-transaction internally. This is not a host callback for publishing a CAS
-object: the host sees individual raw resource requests. Its ownership schedule
-is:
+The captured-source ingestion program composes the construction request and
+the metadata transaction internally. This is not a host callback for
+publishing a CAS object: the host sees the construction request and the
+individual raw resource requests. Its ownership schedule is:
 
 | Phase | Live resources | Database transaction |
 | --- | --- | --- |
 | Acquire fresh payload/outboard temporaries | Source and distinct unpublished files | None |
-| Construct captured payload and outboard | Source and both temporaries | None |
+| Host constructs payload and outboard from the source | Source and both temporaries | None |
 | Close source, acquire keyed writer lease | Both temporaries and lease | None |
 | Flush both files, replace both names, sync parents | Lease; each temporary until replacement | None |
 | Decode claim and commit metadata | Lease protecting published files | One transaction |
@@ -809,21 +741,14 @@ captured-source command is composed by the whole `Cas/Input.run`
 command described above; it is not separately exported as a Rust planner.
 The production local entrypoints use that command unconditionally.
 
-Local cutover validation includes executable construction/layout proofs, actual primitive and
-outboard fixtures, single-pass changing-file tests, native transfer/allocation
-checks, failure injection across every file/lease/SQL effect, and deterministic
-GC-versus-publication tests. Performance parity is not claimed: the measured
-gap remains to be reduced without restoring Rust domain logic. Cloud
-adoption/finalization and Bao serving/import remain unfinished migrations;
-`compute_outboard` and `TeeReader` still have production cloud callers, so they
-cannot yet be removed globally. Those operations must compose the internal
-Lean construction/codec machinery, not call back into Rust domain operations.
-The memory probe now exercises only the mandatory public entrypoints;
-historical Rust measurements are documentation, not a retained fallback.
-Post-cutover isolated debug checks measured 2152/2280 KiB additional peak RSS
-for 4/64 MiB + 3 byte file inputs, and 2344/2216 KiB for byte inputs. All root
-and cleanup checks passed. These are process-level observations, not universal
-allocation bounds or release-throughput measurements.
+Local cutover validation includes the ingestion program's effect-trace
+proofs, root and outboard fixtures, single-pass changing-file tests, native
+transfer/allocation checks, failure injection across every file/construction/
+lease/SQL effect, and deterministic GC-versus-publication tests. Cloud
+adoption/finalization remain unfinished migrations; Bao construction, serving
+and import are host services shared with them, so `compute_outboard` and the
+resource pool's tee are production code, not a retained fallback. The memory
+probe exercises only the mandatory public entrypoints.
 
 ### Current scope: stabilize migrated modules
 

@@ -59,9 +59,6 @@ inductive Request where
   | all
   | range (offset length : UInt64)
 
-/-- Bounded transfer; the opened file identity is retained across chunks. -/
-def chunkSize : Nat := 65536
-
 def requestFile (effect : FileIO A) : Action A :=
   ExceptT.mk (.request (.right (.right (.left effect))) (fun reply => .pure (.ok reply)))
 
@@ -72,57 +69,22 @@ def failedFile (root : ByteArray) (failure : FileFailure) : Action Unit := do
     heal root
   throw (.host failure.failure)
 
-/-- The finite chunk bound follows from the requested byte count, not from
-host-provided CAS groups. A successful host read must be exact; malformed
-success replies are protocol failures, never silently shortened payloads.
-Each exact reply is appended to the private result buffer before requesting
-the next chunk; no accumulated payload survives in a Lean continuation. -/
-def readChunks : Nat → UInt64 → Nat → Nat → Action (FileReply Unit)
-  | fuel, handle, offset, remaining => do
-    if remaining == 0 then return .ok ()
-    match fuel with
-    | 0 => throw .protocol
-    | fuel + 1 =>
-      let count := min remaining chunkSize
-      match ← requestFile (.readAt handle offset.toUInt64 count.toUInt64) with
-      | .error failure => return .error failure
-      | .ok bytes =>
-        if bytes.size != count then throw .protocol
-        requestOutput bytes
-        readChunks fuel handle (offset + count) (remaining - count)
-
-/-- Close an opened handle before healing or returning any error. Host RAII
-also closes handles if this suspended program is abandoned. -/
+/-- The requested bytes move from the opened file into the private result
+buffer in one host transfer; the program chooses the object, the range and
+what a failure means, and never holds the payload itself. The handle is
+closed before healing or returning any error. Host RAII also closes handles
+if this suspended program is abandoned. -/
 def readPayload (root : ByteArray) (offset count : Nat) : Action Unit := do
   match ← requestFile (.open "cas_payload" root) with
   | .error failure => failedFile root failure
   | .ok handle =>
-    let result ← (do
-      try
-        return .ok (← readChunks ((count + chunkSize - 1) / chunkSize)
-          handle offset count)
-      catch error => return .error error
-      : Action (Except Error (FileReply Unit)))
+    let result ← requestFile (.transfer handle offset.toUInt64 count.toUInt64)
     match ← requestFile (.close handle) with
     | .error failure => throw (.host failure)
     | .ok () => pure ()
     match result with
-    | .error error => throw error
-    | .ok (.error failure) => failedFile root failure
-    | .ok (.ok ()) => return ()
-
-/-- Inline payloads use the same bounded raw append capability. A stored
-inline cell is already in memory, but its requested range is never assembled
-or transported as a second whole-object result. -/
-def inlineChunks : Nat → ByteArray → Nat → Nat → Action Unit
-  | fuel, bytes, offset, remaining => do
-    if remaining == 0 then return ()
-    match fuel with
-    | 0 => throw .protocol
-    | fuel + 1 =>
-      let count := min remaining chunkSize
-      requestOutput (bytes.extract offset (offset + count))
-      inlineChunks fuel bytes (offset + count) (remaining - count)
+    | .error failure => failedFile root failure
+    | .ok () => return ()
 
 /-- One raw statement, whose connection scope ends before file I/O. The
 synthetic pinned EXISTS column is omitted: it cannot fail type conversion and
@@ -157,7 +119,7 @@ def read (root : ByteArray) (request : Request) : Action UInt64 := do
   match row.inline with
   | some bytes =>
     if stop > bytes.size then throw .shortInline
-    inlineChunks ((stop - offset + chunkSize - 1) / chunkSize) bytes offset (stop - offset)
+    requestOutput (bytes.extract offset stop)
   | none => readPayload root offset (stop - offset)
   return (stop - offset).toUInt64
 
