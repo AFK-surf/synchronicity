@@ -4,7 +4,7 @@ use crate::host::{
     ByteStorage, Cell, Clock, ConflictValue, Exclusion, Fields, FileFailure, FileFailureKind,
     FileIO, Join, Order, Resources, Row, Scan, Selection, SourceValue, Storage, SyncStatus,
 };
-use std::{ffi::c_void, marker::PhantomData, ptr::NonNull, rc::Rc};
+use crate::native::{self, Handle};
 
 #[derive(Debug)]
 pub enum OperationError<E> {
@@ -28,89 +28,6 @@ impl<E: std::error::Error + 'static> std::error::Error for OperationError<E> {
         match self {
             Self::Host(error) => Some(error),
             _ => None,
-        }
-    }
-}
-
-#[repr(C)]
-pub(crate) struct Slice {
-    ptr: *const u8,
-    len: usize,
-}
-impl From<&[u8]> for Slice {
-    fn from(value: &[u8]) -> Self {
-        Self {
-            ptr: value.as_ptr(),
-            len: value.len(),
-        }
-    }
-}
-
-unsafe extern "C" {
-    fn synch_adapter_start(command: Slice) -> *mut c_void;
-    fn synch_adapter_operation_packet(state: *mut c_void) -> *mut c_void;
-    fn synch_adapter_operation_resume(state: *mut c_void, reply: Slice) -> *mut c_void;
-    fn synch_adapter_bytes_len(bytes: *mut c_void) -> usize;
-    fn synch_adapter_bytes_data(bytes: *mut c_void) -> *const u8;
-    fn synch_adapter_object_drop(value: *mut c_void);
-}
-
-// Never exported or made Send/Sync. The interpreter and all host resources
-// remain on the caller's stack and thread, including panic unwinding.
-// None exists only while an owned reference is being transferred to Lean.
-// Keeping that state explicit makes Rust unwinding unable to drop it twice.
-struct Handle(Option<NonNull<c_void>>, PhantomData<Rc<()>>);
-impl Handle {
-    fn new(ptr: *mut c_void) -> Self {
-        Self(
-            Some(NonNull::new(ptr).expect("Lean returned a null object")),
-            PhantomData,
-        )
-    }
-    fn as_ptr(&self) -> *mut c_void {
-        self.0
-            .expect("Lean handle was already transferred")
-            .as_ptr()
-    }
-    fn packet(&self) -> Packet {
-        // SAFETY: live thread-confined handle; adapter returns a fresh owned byte array.
-        Packet(Self::new(unsafe {
-            synch_adapter_operation_packet(self.as_ptr())
-        }))
-    }
-    fn resume(&mut self, reply: &[u8]) {
-        let state = self.0.take().expect("Lean handle was already transferred");
-        // SAFETY: transfer our sole owned reference, never a borrowed reference.
-        // The adapter copies reply before Lean consumes state. Generated Lean
-        // resume consumes state on both request and terminal branches. If the
-        // returned pointer is invalid and new panics, self is already disarmed.
-        let next =
-            Self::new(unsafe { synch_adapter_operation_resume(state.as_ptr(), reply.into()) });
-        *self = next;
-    }
-}
-
-// Owns the adapter's immutable Lean ByteArray reference. A borrowed packet view
-// cannot outlive this owner, and ownership retains Handle's thread confinement.
-struct Packet(Handle);
-impl Packet {
-    fn as_bytes(&self) -> &[u8] {
-        // SAFETY: this live owned ByteArray keeps its immutable data allocated;
-        // the returned slice borrows self and no mutable view is exposed.
-        unsafe {
-            let count = synch_adapter_bytes_len(self.0.as_ptr());
-            if count == 0 {
-                return &[];
-            }
-            std::slice::from_raw_parts(synch_adapter_bytes_data(self.0.as_ptr()), count)
-        }
-    }
-}
-impl Drop for Handle {
-    fn drop(&mut self) {
-        if let Some(value) = self.0.take() {
-            // SAFETY: exactly one reference owned, runtime alive on this stack.
-            unsafe { synch_adapter_object_drop(value.as_ptr()) }
         }
     }
 }
@@ -710,15 +627,12 @@ fn execute<E>(
     }
 }
 
-/// Start a Lean command. The packet is copied by the adapter; the fresh
-/// continuation is owned here until the run ends.
-///
-/// # Safety
-/// This thread's runtime must be initialized (`native::enter`).
-unsafe fn start(command: &Command) -> Handle {
+/// Start a Lean command; the fresh continuation is owned here until the run
+/// ends.
+fn start(command: &Command) -> Handle {
     let mut packet = Vec::new();
     command.encode(&mut packet);
-    Handle::new(unsafe { synch_adapter_start(packet.as_slice().into()) })
+    native::start(&packet)
 }
 
 /// Run one command over the relational host and whatever raw services it may
@@ -730,9 +644,7 @@ pub(crate) fn run<S: Storage>(
     inputs: &[&[u8]],
     command: &Command,
 ) -> Result<Vec<u8>, OperationError<S::Error>> {
-    crate::native::enter();
-    // SAFETY: the runtime was initialized for this thread just above.
-    let state = unsafe { start(command) };
+    let state = start(command);
     execute(
         state,
         |frame, capabilities, errors| dispatch(storage, capabilities, frame, errors),
@@ -747,9 +659,7 @@ pub(crate) fn run_readonly<S: ByteStorage>(
     inputs: &[&[u8]],
     command: &Command,
 ) -> Result<Vec<u8>, OperationError<S::Error>> {
-    crate::native::enter();
-    // SAFETY: the runtime was initialized for this thread just above.
-    let state = unsafe { start(command) };
+    let state = start(command);
     execute(
         state,
         |frame, _, errors| dispatch_readonly(storage, frame, errors),
@@ -871,26 +781,22 @@ mod tests {
 
     #[test]
     fn native_ingestion_constructor_owns_input_admission_and_failure_continuation() {
-        crate::native::enter();
         let commands = [
             (0, Some(IngestInput::Bytes(0))),
             (1, Some(IngestInput::File)),
             (255, None),
         ];
         for (kind, input) in commands {
-            // SAFETY: runtime initialized; the adapter copies the packet and
-            // returns one fresh owned native continuation. An undecodable
+            // Each command starts one fresh owned continuation. An undecodable
             // packet is the third case: a protocol failure before any effect.
             let mut state = match input {
-                Some(input) => unsafe {
-                    start(&Command::Ingest {
-                        input,
-                        now: i64::MIN,
-                        cache: false,
-                        allow_unsupported: false,
-                    })
-                },
-                None => Handle::new(unsafe { synch_adapter_start([255u8].as_slice().into()) }),
+                Some(input) => start(&Command::Ingest {
+                    input,
+                    now: i64::MIN,
+                    cache: false,
+                    allow_unsupported: false,
+                }),
+                None => native::start(&[255]),
             };
             match (kind, decode(state.packet().as_bytes()).unwrap()) {
                 (0, Frame::Open(space, key)) => {
@@ -1679,16 +1585,12 @@ mod tests {
     }
 
     fn state() -> Handle {
-        crate::native::enter();
-        // SAFETY: initialized thread; the adapter copies the packet and returns owned state.
-        unsafe {
-            start(&Command::Acquire {
-                root: vec![9; 32],
-                holder: "holder".into(),
-                now: 0,
-                possession: true,
-            })
-        }
+        start(&Command::Acquire {
+            root: vec![9; 32],
+            holder: "holder".into(),
+            now: 0,
+            possession: true,
+        })
     }
 
     #[test]
