@@ -108,7 +108,7 @@ x86-64 GNU/LLVM. OpenBSD and Linux musl are not supported by this Rust/native pa
 rejects incompatible runtime architecture/ABI instead of linking host archives
 into a cross-target binary. Release CI uses architecture-matched runners.
 
-Install Lean 4.30.0 through elan, then from the repository root:
+Install Lean 4.33.1 through elan, then from the repository root:
 
 ```sh
 cargo test -p synch-verified

@@ -55,7 +55,7 @@ theorem lookup_read_bound (fuel : Nat) (address : Option ByteArray) (key : List 
             | leaf suffix value =>
               dsimp only
               split
-              · simpa [Nat.add_comm] using read_bound_mono (k := fuel) (resolve_read_bound value)
+              · simpa [Nat.add_comm, ExceptT.run] using read_bound_mono (k := fuel) (resolve_read_bound value)
               · exact .done _
             | extension segment child =>
               dsimp only
@@ -68,7 +68,7 @@ theorem lookup_read_bound (fuel : Nat) (address : Option ByteArray) (key : List 
                 cases value with
                 | none => exact .done _
                 | some v =>
-                  simpa [Nat.add_comm] using read_bound_mono (k := fuel) (resolve_read_bound v)
+                  simpa [Nat.add_comm, ExceptT.run] using read_bound_mono (k := fuel) (resolve_read_bound v)
               | cons nibble rest => exact ih _ _
 
 /-- A caller cannot cause writes, transactions or unrelated namespace reads;

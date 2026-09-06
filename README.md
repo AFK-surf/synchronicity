@@ -9,7 +9,7 @@ membership, per-node published versions, and SQLite-backed local metadata.
 
 ## Build
 
-Install Rust and the pinned Lean 4.30.0 toolchain through elan. Scope
+Install Rust and the pinned Lean 4.33.1 toolchain through elan. Scope
 authorization and CAS size decisions are implemented only in Lean and
 statically linked into every build; no feature flag or Rust fallback exists.
 Supported platforms are Linux GNU and macOS (x86-64/arm64), and Windows

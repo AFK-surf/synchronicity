@@ -77,8 +77,8 @@ fn main() {
     };
     let version = lean(&["--version"]);
     assert!(
-        version.starts_with("Lean (version 4.30.0,"),
-        "expected the pinned Lean 4.30.0 toolchain, got {version}"
+        version.starts_with("Lean (version 4.33.1,"),
+        "expected the pinned Lean 4.33.1 toolchain, got {version}"
     );
     let sysroot = PathBuf::from(lean(&["--print-prefix"]));
     let triple = output(

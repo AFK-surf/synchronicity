@@ -396,6 +396,7 @@ theorem joined_signature_width_required (origin : String) (seq created received 
         .pure (.error (.column "heads.sig" "not 64 bytes")) := by
   simp [decodeJoinedHead, decodeJoinedFields, textField, integerField, blobField,
     bind, Except.bind, bad, ExceptT.run, ExceptT.mk, ExceptT.bind, ExceptT.bindCont, Program.bind, pure]
+  rfl
 
 /-- Later raw anomalies cannot replace the first field error or invoke crypto. -/
 theorem joined_first_field_error (seq root created key sig received verified : Cell) :
