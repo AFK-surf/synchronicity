@@ -4,6 +4,7 @@ import VerifiedCore.Cas.Program
 import VerifiedCore.Cas.Read
 import VerifiedCore.Cas.Bao
 import VerifiedCore.Cas.IngestCommit
+import VerifiedCore.Cas.Ingest
 import VerifiedCore.Entry
 import VerifiedCore.Trie.Program
 import VerifiedCore.Replication.History

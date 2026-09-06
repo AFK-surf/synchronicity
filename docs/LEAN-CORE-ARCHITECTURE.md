@@ -551,6 +551,22 @@ Under an explicit valid-input chunk/parent primitive contract, it agrees with
 a pure Lean tree recurrence. This is not a proof of native cryptography or of
 the outer streaming constructor's complete root/outboard correctness.
 
+The outer executable constructor additionally has conditional agreement with
+a grouped Lean recurrence under explicit bounded-input and successful-write
+contracts. Accepted roots have 32 bytes without assuming host honesty, and a
+successful branch requires both children and its pair write before its parent
+hash. Identifying the grouped recurrence with the standard BLAKE3 root and
+proving the entire outboard placement remain distinct obligations.
+
+The private Rust primitive adapter uses the pinned BLAKE3 chunk compression
+and parent-compression APIs only. Its fixtures check standard empty/abc roots,
+chunk counters, root flags, malformed sizes and parent order. The chunk
+wrapper narrowly permits the dependency's deprecated `guts::ChunkState` API:
+the newer byte-offset helper rejects empty non-root input and cannot express
+the full UInt64 chunk-counter domain accepted by the raw Lean contract. This
+is an explicit cryptographic trust boundary, not a Rust tree implementation
+whose correctness must be manually paired with a separate Lean model.
+
 `Cas/IngestCommit.lean` stages the metadata portion as an internal Lean
 transaction: read the exact claim projection, decode and settle it, then issue
 one atomic raw upsert. Its accepted full-input plan is proved complete; scripted
@@ -601,6 +617,44 @@ Required raw host resources and compatibility improvements:
   failure. Existing `fsync_parent` swallows errors, so the current host cannot
   justify a theorem claiming checked directory durability. Specify the
   supported-platform contract before wiring a stronger publication guarantee.
+
+The captured-source ingestion program composes the constructor and metadata
+transaction internally. This is not a host callback for publishing a CAS
+object: the host sees individual raw resource requests. Its ownership schedule
+is:
+
+| Phase | Live resources | Database transaction |
+| --- | --- | --- |
+| Acquire fresh payload/outboard temporaries | Source and distinct unpublished files | None |
+| Construct captured payload and outboard | Source and both temporaries | None |
+| Close source, acquire keyed writer lease | Both temporaries and lease | None |
+| Flush both files, replace both names, sync parents | Lease; each temporary until replacement | None |
+| Decode claim and commit metadata | Lease protecting published files | One transaction |
+| Release resources | No source, temporary or lease ownership retained | Closed |
+
+The raw temporary allocator must use exclusive creation and register ownership
+atomically against staging GC. That registry must be shared by independently
+opened stores on the same canonical data directory, just like writer leases.
+Checking an active set and then unlinking outside its synchronization is not
+sufficient. No database guard is held during expensive file I/O, or while
+acquiring a lease that itself follows the existing connection/CAS lock order.
+
+Close and lease release consume their tokens even if they report failure.
+Successful replacement transfers the temporary's pathname into the target;
+subsequent idempotent discard of that token must never unlink the target.
+Failed replacement leaves cleanup ownership with the invocation. Cleanup
+always runs, but cannot replace a prior construction/publication/SQL error.
+On successful work a cleanup failure remains observable. Host RAII releases
+resources on abandonment; it does not make these domain sequencing decisions.
+
+Directory synchronization uses an explicit backend policy: require successful
+sync, or accept a reported unsupported operation on a configured platform.
+Actual I/O failure is never accepted. The latter policy does not prove
+directory persistence and cannot be described as such; Windows replacement
+must still retain the existing write-through/retry semantics. The staged
+captured-source command does not yet replace initial stat/read-to-EOF policy,
+inline selection or native invocation setup, so it is not the production
+`ingest_bytes`/`ingest_file` cutover.
 
 Cutover gates are executable construction/layout proofs, actual primitive and
 outboard fixtures, single-pass changing-file tests, native transfer/allocation

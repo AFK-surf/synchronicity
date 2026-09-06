@@ -59,6 +59,16 @@ facade. Its transaction/error proofs and the inner hash tree's conditional
 Lean recurrence proof strengthen this stage; neither constitutes a whole
 ingestion cutover or a proof of native cryptographic correctness.
 
+`Cas/Ingest.lean` now composes construction and metadata commit with raw
+temporary-file and keyed-lease effects for an already captured, out-of-line
+source. Lean owns cleanup, both flushes before publication, directory-sync
+policy, and lease release after the transaction. Fault traces cover every
+effect on the empty-source execution path. This remains internal staged code:
+input acquisition, inline/EOF policy and the native resource interpreter must
+be integrated before deleting the production Rust ingestion implementation.
+The raw chunk/parent cryptography adapter is staged privately in the store
+crate; it contains no tree traversal or CAS decisions.
+
 The acquisition cutover is checked against real SQLite, including abandoned
 transactions, automatic rollback, deferred commit failure, UPSERT timestamp
 preservation and the existing typed errors for corrupt durability cells.

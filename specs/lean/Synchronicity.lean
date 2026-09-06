@@ -26,7 +26,10 @@ import Synchronicity.CasReadHealingProofs
 import Synchronicity.CasReadProgramProofs
 import Synchronicity.BaoProgramProofs
 import Synchronicity.BaoHashProofs
+import Synchronicity.BaoBuildProofs
 import Synchronicity.IngestCommitProofs
+import Synchronicity.IngestProgramProofs
+import Synchronicity.HostResourceProofs
 import Synchronicity.TrieProgramProofs
 import Synchronicity.TrieProgramTests
 import Synchronicity.HistoryProgramProofs
