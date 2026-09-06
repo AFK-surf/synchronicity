@@ -49,8 +49,9 @@ Lean. Its raw capabilities are exact reads, positioned writes and chunk/parent
 cryptographic primitives. It is compiled from the same source as its geometry
 and effect proofs, but is **not yet called by production ingestion**. No new
 Rust subtree/planner facade is added. Whole-command staging/lease/publication
-orchestration, primitive integration and conditional root/layout correctness
-remain required before deleting Rust ingestion. The architecture document
+orchestration and primitive integration are implemented below; the complete
+stateful layout proof and remaining native gates are required before deleting
+Rust ingestion. The architecture document
 records changing-file behavior, temporary-file/GC hazards and durability gates.
 
 The staged `Cas/IngestCommit.lean` owns claim decoding, settlement and atomic
@@ -66,9 +67,15 @@ policy, and lease release after the transaction. Fault traces cover every
 effect on the empty-source execution path. `Cas/Input.run` now adds byte/file
 input acquisition and inline/EOF policy, with a whole-command native facade
 and a raw filesystem/lease interpreter. Real SQLite/file tests check roots,
-payloads, Bao layout and failure cleanup. Production Rust ingestion still
-awaits deletion at cutover; full layout/root proofs and the remaining fault,
-concurrency and platform gates must finish first.
+payloads, Bao layout and failure cleanup, including a 19-case effect-failure
+matrix, deferred COMMIT rollback and deterministic GC/publication concurrency.
+`BaoGroupingProofs.build_matches_chunkTree` proves conditional agreement of
+the whole builder with an ordinary chunk tree, assuming coherent immutable
+reads, successful writes and the raw compression contract—not a Rust tree.
+`BaoLayoutProofs` proves exact slot enumeration and links every slot to a
+required executable write. Equality with an accumulated stateful write trace,
+remaining transfer-memory checks and platform gates still precede production
+cutover and deletion of Rust ingestion.
 The raw chunk/parent cryptography adapter is staged privately in the store
 crate; it contains no tree traversal or CAS decisions.
 

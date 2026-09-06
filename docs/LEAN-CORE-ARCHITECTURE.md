@@ -540,7 +540,11 @@ and retains the existing write-through replacement helper.
 
 Native fixtures check standard roots, payloads and Bao outboard bytes across
 chunk/group boundaries using real SQLite and files, plus metadata failure
-cleanup. These are integration checks, not a substitute for the remaining
+cleanup. A 19-case raw-effect fault matrix checks original errors and explicit
+cleanup before adapter destruction; a deferred foreign-key failure checks
+rollback when COMMIT itself fails. A channel-gated test across independently
+opened stores checks GC exclusion between payload and outboard publication,
+then collection after lease release. These are integration checks, not a substitute for the remaining
 standard-root and complete-layout Lean proofs. Raw capability framing tests
 reject truncated/trailing packets, invalid booleans and excessive conflict
 expression depth/node counts. Source capture/inline decisions remain absent
@@ -572,10 +576,9 @@ UInt64 input), bounded I/O/hash requests, small/error executions and recursive
 program equations with concrete two-/three-group layouts. Large-buffer kernel
 evaluation was replaced by compositional equations after hitting evaluator
 limits; no unchecked evaluator or enlarged recursion limit is required.
-These checks do not yet prove full conditional root correctness, enumeration
-of every outboard pair, or preservation of every offset bound through the
-whole execution. Those are required before production cutover, alongside
-native primitive/layout tests. Invocation-owned source, payload and outboard
+The additional root and slot-enumeration results below strengthen these
+checks, but a complete stateful outboard trace remains required before
+production cutover, alongside native primitive/layout tests. Invocation-owned source, payload and outboard
 resources must be distinct; fresh temporary creation establishes this host
 resource contract before the internal constructor is called.
 
@@ -589,8 +592,27 @@ The outer executable constructor additionally has conditional agreement with
 a grouped Lean recurrence under explicit bounded-input and successful-write
 contracts. Accepted roots have 32 bytes without assuming host honesty, and a
 successful branch requires both children and its pair write before its parent
-hash. Identifying the grouped recurrence with the standard BLAKE3 root and
-proving the entire outboard placement remain distinct obligations.
+hash. The grouping proof below identifies its root with the ordinary chunk
+tree; complete stateful outboard placement remains a distinct obligation.
+
+`BaoGroupingProofs` proves that group and chunk splitters choose the same
+boundary above 16 KiB, and that sufficient inner traversal fuel agrees with
+a fuel-free ordinary chunk tree. Its coherent-source theorem connects the
+outer grouped recurrence to that tree for every sufficiently fueled slice,
+including absolute chunk counters. `build_matches_chunkTree` composes this
+with the actual free-monadic builder for every UInt64 source length. The
+assumptions are explicit: bounded reads are slices of one immutable byte
+sequence, writes succeed, and raw chunk/parent compression satisfies its
+contract. There is no assumed Rust tree or Rust/Lean equivalence relation.
+`BaoLayoutProofs` proves
+exact pair counts, contiguous and disjoint parent/child regions, alignment,
+and top-level UInt64 offset bounds. Its branch theorem is linked to the
+executable constructor's required 64-byte pair write. The pure postorder
+enumeration contains every in-region slot exactly once and no other slot;
+each enumerated slot is linked to a required successful 64-byte write in the
+recursive executable. Equality with an accumulated stateful host trace
+remains pending; these component results do not establish the complete
+cutover gate.
 
 The private Rust primitive adapter uses the pinned BLAKE3 chunk compression
 and parent-compression APIs only. Its fixtures check standard empty/abc roots,

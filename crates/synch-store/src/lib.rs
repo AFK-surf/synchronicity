@@ -13,6 +13,8 @@ pub mod heads;
 mod lean_hash;
 mod lean_history;
 mod lean_ingest;
+#[cfg(test)]
+mod lean_ingest_concurrency;
 mod lean_read;
 mod lean_resources;
 mod lean_storage;

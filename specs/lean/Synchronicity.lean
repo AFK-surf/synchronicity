@@ -27,6 +27,8 @@ import Synchronicity.CasReadProgramProofs
 import Synchronicity.BaoProgramProofs
 import Synchronicity.BaoHashProofs
 import Synchronicity.BaoBuildProofs
+import Synchronicity.BaoGroupingProofs
+import Synchronicity.BaoLayoutProofs
 import Synchronicity.IngestCommitProofs
 import Synchronicity.IngestProgramProofs
 import Synchronicity.IngestInputProofs
