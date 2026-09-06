@@ -810,6 +810,32 @@ for 4/64 MiB + 3 byte file inputs, and 2344/2216 KiB for byte inputs. All root
 and cleanup checks passed. These are process-level observations, not universal
 allocation bounds or release-throughput measurements.
 
+### Current scope: stabilize migrated modules
+
+The current user-approved scope is correctness and stabilization of modules
+already substantially migrated to Lean. Do not start or continue migrations of
+new domains. Cloud ingestion, partial/network ingestion and the other unfinished
+operations described in this document are deferred, not prerequisites for this
+stabilization checkpoint. Their existing Rust implementations remain in place.
+
+The review inventory is the existing production Lean surface: scope/authorization,
+walk validation and scheduling decisions, completeness certificates, CAS
+settlement and lifecycle operations, local reads/repair and complete local
+ingestion, trie lookup/codec, and history retention. Include their native
+transport, runtime lifetime management and raw host adapters. A partially
+migrated subsystem does not authorize migrating its remaining Rust operations.
+
+Review the production Lean entrypoints, their same-source proof coverage and
+explicit host assumptions, FFI/resource ownership, failure and concurrency
+behavior, compatibility and supported-platform CI. Fix defects and misleading
+claims in the migrated paths; do not expand their scope to remove every remaining
+Rust domain algorithm. Performance measurements remain explicit limitations,
+not correctness or throughput-parity claims.
+
+The uncommitted cloud-command experiment was withdrawn before native integration.
+No cloud operation was switched, and no cloud-only raw host capability was added
+to the production interface.
+
 ### Bounded development validation
 
 Native compilation and the repository's Lean packages limit each Lean compiler
