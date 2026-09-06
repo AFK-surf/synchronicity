@@ -8,7 +8,7 @@ open VerifiedCore VerifiedCore.Host VerifiedCore.Cas.Read SimulatedHost
 
 /-- Raw rows selected by the read operation's actual snapshot statement. -/
 def observation (state : State) (root : ByteArray) : List Row :=
-  ((rows state.db "blobs").filter (selects ⟨"blobs", [("root", .blob root)], []⟩)).map
+  ((rows state.db "blobs").filter (selects ⟨"blobs", [("root", .blob root)], [], []⟩)).map
     (project ["root", "size", "complete", "bitmap", "inline", "last_access", "durable"])
 
 /-- The database decodes to this metadata and the selected backing storage

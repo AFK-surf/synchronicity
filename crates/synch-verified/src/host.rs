@@ -52,6 +52,8 @@ pub struct Selection {
     pub relation: String,
     pub equals: Fields,
     pub like_any: Vec<(String, String)>,
+    /// Rows whose stored cell `IS NOT` the value are selected; NULL is a value.
+    pub not_equals: Fields,
 }
 
 /// An explicit value or a raw source-column projection for INSERT SELECT.

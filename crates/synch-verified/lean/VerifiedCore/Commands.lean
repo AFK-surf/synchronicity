@@ -6,6 +6,7 @@ import VerifiedCore.Origin
 import VerifiedCore.Trie.Program
 import VerifiedCore.Trie.Verify
 import VerifiedCore.Trie.Mutate
+import VerifiedCore.Cas.Durable
 
 /-! The shapes that cross the command boundary: what a caller asks for and
 what a finished command reports. `hostgen` derives the codecs of every type
@@ -53,6 +54,18 @@ inductive Command where
   | trieRemove (root : ByteArray) (keySize : UInt64)
   /-- Retire head history of an origin recorded before `before`. -/
   | pruneHistory (origin : String) (before : Int64)
+  /-- Record that the backend holds the complete object; only after its
+  acknowledgement, which is the caller's obligation. -/
+  | casMarkDurable (root : ByteArray)
+  /-- Reconstruct a cold durable row once the backend confirmed the final pair. -/
+  | casAdoptDurable (root : ByteArray) (size : UInt64) (now : Int64)
+  /-- The backend answered that the object is not there: withdraw the durable
+  claim and turn machine roles into repair intents. -/
+  | casHealMissing (root : ByteArray)
+  /-- Reconcile cache claims with an ephemeral scratch generation marker. -/
+  | casReconcileScratch (marker : String)
+  /-- Drop reconstructible local bytes while keeping a remote durable claim. -/
+  | casClearCache (root : ByteArray)
 
 /-- Malformed metadata or a column of the wrong storage class, as pin
 acquisition and deletion report it. -/
@@ -78,6 +91,14 @@ inductive ReadDomainError where
   | malformed
   | columnType (index : Nat) (column : String) (actual : Cas.Codec.CellType)
   | column (column : String) (reason : String)
+  deriving BEq, DecidableEq
+
+/-- How a durability transition refuses: a malformed row, or a row whose
+recorded size disagrees with the size the backend confirmed. -/
+inductive DurableDomainError where
+  | malformed
+  | columnType (index : Nat) (column : String) (actual : Cas.Codec.CellType)
+  | sizeMismatch (root : ByteArray) (recorded offered : UInt64)
   deriving BEq, DecidableEq
 
 inductive HistoryDomainError where

@@ -333,6 +333,7 @@ fn columns_for(relation: &str) -> Result<&'static [&'static str]> {
             "recorded_at",
         ]),
         "trie_nodes" | "trie_values" => Ok(&["hash", "data"]),
+        "config" => Ok(&["key", "value"]),
         _ => Err(StoreError::invalid("unsupported storage relation")),
     }
 }
@@ -408,6 +409,10 @@ fn selection_sql(selection: &Selection) -> Result<(String, Vec<Cell>)> {
             bindings.push(Cell::Text(pattern.clone()));
         }
         terms.push(format!("({})", alternatives.join(" OR ")));
+    }
+    for (name, value) in &selection.not_equals {
+        terms.push(format!("{} IS NOT ?", column(&selection.relation, name)?));
+        bindings.push(value.clone());
     }
     Ok((
         format!(
@@ -916,6 +921,7 @@ mod tests {
             relation: relation.into(),
             equals: vec![],
             like_any: vec![],
+            not_equals: vec![],
         }
     }
 
@@ -935,6 +941,7 @@ mod tests {
                 ("holder".into(), "source:%".into()),
                 ("holder".into(), "replica:%".into()),
             ],
+            not_equals: vec![],
         };
         let mut storage = SqliteStorage::new(&conn);
         assert_eq!(
@@ -1004,6 +1011,7 @@ mod tests {
             relation: "pins".into(),
             equals: vec![],
             like_any: vec![("holder".into(), "absent:%".into())],
+            not_equals: vec![],
         };
         assert_eq!(
             storage
@@ -1078,6 +1086,7 @@ mod tests {
             relation: "pins".into(),
             equals: vec![],
             like_any: vec![("holder OR 1".into(), "%".into())],
+            not_equals: vec![],
         };
         assert!(storage.snapshot(&invalid, &names(&["root"])).is_err());
         let tx = storage.begin().unwrap();

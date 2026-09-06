@@ -367,6 +367,24 @@ Integration review has identified specific gates, not waived limitations:
   every profile: `deep_write_path` measures 8.9 s (Rust) against 17.5 s
   (Lean commands) in a debug test run, and 505 s before the explicit stack
   and the optimized C.
+- The CAS durability transitions are now the whole commands `casMarkDurable`,
+  `casAdoptDurable`, `casHealMissing`, `casReconcileScratch` and
+  `casClearCache` (`Cas/Durable.lean`) over raw selections, updates, copies
+  and deletes; `Selection.notEquals` (SQL `IS NOT ?`) expresses "a durable
+  claim stands" without a Rust statement, and the `config` relation joined
+  the store's schema capability for the scratch-generation marker.
+  `clearCache` reads the writer count through `Resources`, changes the rows,
+  and removes both files only after the commit, tolerating their absence;
+  Rust keeps the CAS ordering guard around the command so the count it reads
+  is meaningful. `CasDurableProofs` derives each transition's exact database
+  on the simulated host: marking never inserts; healing withdraws only a
+  standing claim and only then moves the machine roles' pins to repair
+  intents, keeping the operator's pin, existing intents and other roots'
+  rows, and conserving the repair obligation proved for the read path; a
+  generation change drops exactly the staged rows and clears exactly the
+  durable out-of-line rows' cached groups. The simulated host's literal
+  predicates now have SQL `IS` semantics (NULL selects NULL), matching the
+  adapter. The five Rust SQL bodies in `cas.rs` are deleted.
 - Native tests now cover acquisition transport, every effect-failure position,
   repeated polling, malformed replies and terminal resume. Generic SQLite tests
   cover UPSERT identity/time preservation, raw cells, failed commit, abandoned

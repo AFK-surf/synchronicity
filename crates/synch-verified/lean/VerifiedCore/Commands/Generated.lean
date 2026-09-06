@@ -217,6 +217,20 @@ instance : Decode Commands.HistoryDomainError where
     | 4 => return .origin (← Decode.decode)
     | _ => throw ()
 
+instance : Encode Commands.DurableDomainError where
+  encode out value := match value with
+    | .malformed => out.push 0
+    | .columnType a0 a1 a2 => out.push 1 |>.put a0 |>.put a1 |>.put a2
+    | .sizeMismatch a0 a1 a2 => out.push 2 |>.put a0 |>.put a1 |>.put a2
+
+instance : Decode Commands.DurableDomainError where
+  decode := do
+    match ← readByte with
+    | 0 => return .malformed
+    | 1 => return .columnType (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 2 => return .sizeMismatch (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | _ => throw ()
+
 instance : Encode Commands.Ingested where
   encode out value := match value with
     | .mk a0 a1 => out |>.put a0 |>.put a1
@@ -253,6 +267,11 @@ instance : Encode Commands.Command where
     | .trieInsert a0 a1 a2 => out.push 11 |>.put a0 |>.put a1 |>.put a2
     | .trieRemove a0 a1 => out.push 12 |>.put a0 |>.put a1
     | .pruneHistory a0 a1 => out.push 13 |>.put a0 |>.put a1
+    | .casMarkDurable a0 => out.push 14 |>.put a0
+    | .casAdoptDurable a0 a1 a2 => out.push 15 |>.put a0 |>.put a1 |>.put a2
+    | .casHealMissing a0 => out.push 16 |>.put a0
+    | .casReconcileScratch a0 => out.push 17 |>.put a0
+    | .casClearCache a0 => out.push 18 |>.put a0
 
 instance : Decode Commands.Command where
   decode := do
@@ -271,6 +290,11 @@ instance : Decode Commands.Command where
     | 11 => return .trieInsert (← Decode.decode) (← Decode.decode) (← Decode.decode)
     | 12 => return .trieRemove (← Decode.decode) (← Decode.decode)
     | 13 => return .pruneHistory (← Decode.decode) (← Decode.decode)
+    | 14 => return .casMarkDurable (← Decode.decode)
+    | 15 => return .casAdoptDurable (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 16 => return .casHealMissing (← Decode.decode)
+    | 17 => return .casReconcileScratch (← Decode.decode)
+    | 18 => return .casClearCache (← Decode.decode)
     | _ => throw ()
 
 end VerifiedCore

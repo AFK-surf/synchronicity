@@ -138,6 +138,7 @@ impl<'a> Reader<'a> {
             relation: self.string()?,
             equals: self.fields()?,
             like_any: self.list(|r| Ok((r.string()?, r.string()?)))?,
+            not_equals: self.fields()?,
         })
     }
     pub(crate) fn order(&mut self) -> Result<Order, ()> {
@@ -796,6 +797,7 @@ mod tests {
             relation: "table".into(),
             equals: vec![],
             like_any: vec![],
+            not_equals: vec![],
         };
         for frame in [
             Frame::Begin,
@@ -1254,6 +1256,9 @@ mod tests {
         word(out, 1);
         bytes(out, b"name");
         bytes(out, b"prefix/%");
+        word(out, 1);
+        bytes(out, b"durable");
+        cell(out, &Cell::Integer(0));
     }
 
     #[test]
@@ -1268,6 +1273,7 @@ mod tests {
                 assert_eq!(selection.relation, "raw_table");
                 assert_eq!(selection.equals, [("id".into(), Cell::Blob(vec![0, 255]))]);
                 assert_eq!(selection.like_any, [("name".into(), "prefix/%".into())]);
+                assert_eq!(selection.not_equals, [("durable".into(), Cell::Integer(0))]);
                 assert_eq!(columns, ["value"]);
             }
             _ => panic!("unexpected snapshot frame"),

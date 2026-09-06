@@ -7,6 +7,7 @@ import VerifiedCore.Cas.Input
 import VerifiedCore.Trie.Program
 import VerifiedCore.Trie.Verify
 import VerifiedCore.Trie.Mutate
+import VerifiedCore.Cas.Durable
 import VerifiedCore.Replication.History
 
 /-! The one native entry point. A command arrives as a packet, decoded with
@@ -91,6 +92,15 @@ def mutation : Except Trie.Error ByteArray → Host.Reply ByteArray
   | .error (.host hostFailure) => .error hostFailure
   | .error (.domain error) => terminalOf (Except.error error : Except _ ByteArray)
 
+def durable [Encode A] : Except Cas.Durable.Error A → Host.Reply ByteArray
+  | .ok value => terminalOf (Except.ok value : Except DurableDomainError A)
+  | .error (.host hostFailure) => .error hostFailure
+  | .error .malformed => terminalOf (Except.error DurableDomainError.malformed : Except _ A)
+  | .error (.columnType index column actual) =>
+    terminalOf (Except.error (DurableDomainError.columnType index column actual) : Except _ A)
+  | .error (.sizeMismatch root recorded offered) =>
+    terminalOf (Except.error (DurableDomainError.sizeMismatch root recorded offered) : Except _ A)
+
 def malformedRoot : Native := .pure (.error ⟨2, 0⟩)
 def protocol : Native := .pure (.error protocolFailure)
 
@@ -130,6 +140,15 @@ def dispatch : Command → Native
   | .trieRemove root keySize =>
     if root.size != 32 then malformedRoot else command (Trie.removeInput root keySize) mutation
   | .pruneHistory origin before => command (Replication.History.prune origin before) retention
+  | .casMarkDurable root =>
+    if root.size != 32 then protocol else command (Cas.Durable.markDurable root) durable
+  | .casAdoptDurable root size now =>
+    if root.size != 32 then protocol else command (Cas.Durable.adoptDurable root size now) durable
+  | .casHealMissing root =>
+    if root.size != 32 then protocol else command (Cas.Durable.healMissing root) durable
+  | .casReconcileScratch marker => command (Cas.Durable.reconcileScratch marker) durable
+  | .casClearCache root =>
+    if root.size != 32 then protocol else command (Cas.Durable.clearCache root) durable
 
 /-- Every command starts here: an undecodable packet is a protocol failure
 before any effect is requested. -/

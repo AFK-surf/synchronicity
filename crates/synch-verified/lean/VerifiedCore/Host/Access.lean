@@ -5,11 +5,14 @@ No callback parses domain metadata or decides recovery policy. -/
 namespace VerifiedCore.Host
 
 /-- A raw selection. Equality terms are conjunctive; a nonempty `likeAny`
-adds one disjunction of SQL LIKE terms, with the backend's existing semantics. -/
+adds one disjunction of SQL LIKE terms, with the backend's existing semantics;
+`notEquals` terms exclude rows whose stored cell is the value (`IS NOT`), so
+NULL is a value like any other. -/
 structure Selection where
   relation : String
   equals : Fields
   likeAny : List (String × String) := []
+  notEquals : Fields := []
   deriving BEq
 
 /-- Literal values or columns of the selected source row, never SQL text. -/

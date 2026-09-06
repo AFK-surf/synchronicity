@@ -723,156 +723,51 @@ impl Store {
 
     /// Records that the configured backend has promoted a complete object to
     /// stable storage. Call only after the backend's durability promise.
+    ///
+    /// The transition is the Lean command `Cas.Durable.markDurable`; it never
+    /// creates a row.
     pub(crate) fn mark_blob_durable(&self, root: &Hash) -> Result<bool> {
-        let changed = self.conn().execute(
-            "UPDATE blobs SET durable = 1 WHERE root = ?1",
-            params![root.as_bytes().to_vec()],
-        )?;
-        Ok(changed > 0)
+        crate::lean_durable::mark_durable(self, root)
     }
 
     /// Reconstructs a cold durable row after metadata restore, once the remote
     /// backend has confirmed that the final payload/outboard pair exists.
+    ///
+    /// `Cas.AdoptRemote` is this row creation from a remote pair the backend
+    /// has just confirmed; it only ever adds availability. The row decision
+    /// (agreeing size marked, missing row created, disagreeing size refused)
+    /// is the Lean command `Cas.Durable.adoptDurable`.
     pub(crate) fn adopt_durable_blob(&self, root: &Hash, size: u64, now: i64) -> Result<()> {
-        // `Cas.AdoptRemote` is this row creation from a remote pair
-        // the backend has just confirmed; it only ever adds availability.
-        self.with_immediate_tx(|tx| {
-            let existing: Option<i64> = tx
-                .query_row(
-                    "SELECT size FROM blobs WHERE root = ?1",
-                    params![root.as_bytes().to_vec()],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            if let Some(existing) = existing {
-                if existing as u64 != size {
-                    return Err(StoreError::invalid(format!(
-                        "size mismatch for {root}: have {existing}, offered {size}"
-                    )));
-                }
-                tx.execute(
-                    "UPDATE blobs SET durable = 1 WHERE root = ?1",
-                    params![root.as_bytes().to_vec()],
-                )?;
-            } else {
-                tx.execute(
-                    "INSERT INTO blobs
-                       (root, size, complete, bitmap, inline, last_access, durable)
-                     VALUES (?1, ?2, 0, NULL, NULL, ?3, 1)",
-                    params![root.as_bytes().to_vec(), size as i64, now],
-                )?;
-            }
-            Ok(())
-        })
+        crate::lean_durable::adopt_durable(self, root, size, now)
     }
 
     /// Applies the authoritative S3 `NoSuchKey` heal rule.
     ///
     /// The durable claim is withdrawn. A row with no verified cache bytes is
     /// removed altogether; otherwise it remains a partial peer-fetched cache.
+    ///
+    /// `FaultTolerant.HealRemote` is this transaction, the Lean command
+    /// `Cas.Durable.healMissing`: the durable claim is withdrawn, role pins
+    /// become wants, the operator's pin is left alone. The backend losing the
+    /// object is the environment step before it. A replica's claim must not
+    /// outlive the bytes it was a promise about (`docs/REPLICATION.md` §8):
+    /// this is the one place where absence of bytes *is* evidence, because the
+    /// backend answered `NotFound` about a content address. The repair is
+    /// gated on the *withdrawal*, not on the row disappearing: a cloud
+    /// replica reaches `durable=1, complete=0, bitmap NOT NULL` in the
+    /// ordinary course of things, and for such a row nothing is deleted.
+    /// `CasDurableProofs.lean` proves the gating and what moves.
     pub(crate) fn heal_missing_durable_blob(&self, root: &Hash) -> Result<bool> {
-        // `FaultTolerant.HealRemote` is this transaction: the durable claim is
-        // withdrawn, role pins become wants, the operator's pin is left alone.
-        // The backend losing the object is the environment step before it.
-        self.with_immediate_tx(|tx| {
-            let key = root.as_bytes().to_vec();
-            // Read before anything is written: this row is the most
-            // authoritative record of the object's size, and it is about to be
-            // withdrawn or deleted.
-            let size: Option<i64> = tx
-                .query_row(
-                    "SELECT size FROM blobs WHERE root = ?1",
-                    params![key.clone()],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            let changed = tx.execute(
-                "UPDATE blobs SET durable = 0 WHERE root = ?1 AND durable != 0",
-                params![key.clone()],
-            )?;
-            tx.execute(
-                "DELETE FROM blobs
-                   WHERE root = ?1 AND complete = 0 AND bitmap IS NULL AND inline IS NULL",
-                params![key.clone()],
-            )?;
-            // A replica's claim must not outlive the bytes it was a promise
-            // about (`docs/REPLICATION.md` §8). This is the one place where
-            // absence of bytes *is* evidence: the backend answered `NotFound`
-            // about a content address, which is a statement — unlike `entries`
-            // merely not naming a root.
-            //
-            // Gated on the *withdrawal*, not on the row disappearing. A cloud
-            // replica reaches `durable=1, complete=0, bitmap NOT NULL` in the
-            // ordinary course of things — the cache LRU clears a durable row
-            // and any later ranged read writes a partial bitmap back — and for
-            // such a row the delete above matches nothing. Gating on it left
-            // the pin standing over bytes that are neither complete nor
-            // durable, which is the same permanent hole this exists to close:
-            // both staging paths skip a root the holder already pins, so no
-            // sweep could ever re-want it.
-            if changed > 0 {
-                // `blobs.size` is `NOT NULL` and `changed > 0` means the row
-                // was there to withdraw, so the size is always in hand — which
-                // is the point: a root no entry names is still re-fetchable
-                // from any provider that has it, and `blob_providers` survives
-                // independently of `entries`. Dropping such a claim silently
-                // would lose exactly the objects a `forever` replica is bought
-                // to keep, since nothing else names a superseded version.
-                tx.execute(
-                    "INSERT INTO content_want (root, holder, size, prev, first_wanted)
-                     SELECT p.root, p.holder, ?2, NULL, ?3
-                       FROM pins p
-                      WHERE p.root = ?1
-                        AND (p.holder LIKE 'source:%' OR p.holder LIKE 'replica:%')
-                     ON CONFLICT(root, holder) DO NOTHING",
-                    params![key.clone(), size.unwrap_or(0), synch_core::now_ns()],
-                )?;
-                // The claim goes either way: it was a promise about bytes this
-                // node no longer holds. The operator's own pins are left alone
-                // — those are a person's promise, not this node's bookkeeping,
-                // and a vanished object is something they should be told about
-                // rather than have quietly rewritten.
-                tx.execute(
-                    "DELETE FROM pins WHERE root = ?1
-                       AND (holder LIKE 'source:%' OR holder LIKE 'replica:%')",
-                    params![key],
-                )?;
-            }
-            Ok(changed > 0)
-        })
+        crate::lean_durable::heal_missing(self, root)
     }
 
     /// Reconciles database cache claims with an ephemeral scratch generation.
     ///
     /// A changed marker drops staged-only rows and clears cached groups on
     /// durable rows in one transaction. A matching marker is an O(1) no-op.
+    /// The transaction is the Lean command `Cas.Durable.reconcileScratch`.
     pub fn reconcile_scratch_generation(&self, marker: &str) -> Result<bool> {
-        const KEY: &str = "cas.cloud.scratch_generation";
-        self.with_immediate_tx(|tx| {
-            let previous: Option<String> = tx
-                .query_row(
-                    "SELECT value FROM config WHERE key = ?1",
-                    params![KEY],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            if previous.as_deref() == Some(marker) {
-                return Ok(false);
-            }
-            tx.execute(
-                "DELETE FROM blobs
-                   WHERE durable = 0 AND inline IS NULL",
-                [],
-            )?;
-            tx.execute(
-                "UPDATE blobs
-                    SET complete = 0, bitmap = NULL
-                  WHERE durable != 0 AND inline IS NULL",
-                [],
-            )?;
-            crate::db::set_config_in(tx, KEY, marker)?;
-            Ok(true)
-        })
+        crate::lean_durable::reconcile_scratch(self, marker)
     }
 
     /// Whether both files behind a complete out-of-line cache claim exist.
@@ -897,31 +792,21 @@ impl Store {
     pub(crate) fn clear_blob_cache(&self, root: &Hash) -> Result<bool> {
         // `Cas.CacheEvict` retains remote durability when local cache
         // bytes disappear; callers select durable cache rows.
+        //
+        // `Cas.DropStaged` is the row removal of a non-durable cache claim
+        // inside it, and the same transition behind
+        // `reconcile_scratch_generation` and the `commit_cas_migration`
+        // discard. None of the three consults `pins`:
+        // `SystemSafety.staged_row_drop_is_unpinned` is why they need not
+        // (`Cas.NoLoss`: a pin is only ever granted over available content),
+        // and `Store::pin`'s `durable` predicate is what makes that theorem
+        // true of the store. The Lean command `Cas.Durable.clearCache` reads
+        // the writer count first, changes the rows, and removes the files
+        // after the commit; Rust holds the ordering guard that makes the
+        // count it reads meaningful.
         let conn = self.conn();
         let _ordered_against_writers = self.cas_order();
-        if self.is_being_written(root) {
-            return Ok(false);
-        }
-        // `Cas.DropStaged` is this row removal of a non-durable cache
-        // claim, and the same transition behind `reconcile_scratch_generation`
-        // and the `commit_cas_migration` discard. None of the three consults
-        // `pins`: `SystemSafety.staged_row_drop_is_unpinned` is why they
-        // need not (`Cas.NoLoss`: a pin is only ever granted over available
-        // content), and `Store::pin`'s `durable` predicate is what makes
-        // that theorem true of the store.
-        conn.execute(
-            "DELETE FROM blobs WHERE root = ?1 AND durable = 0 AND inline IS NULL",
-            params![root.as_bytes().to_vec()],
-        )?;
-        conn.execute(
-            "UPDATE blobs SET complete = 0, bitmap = NULL
-               WHERE root = ?1 AND durable != 0 AND inline IS NULL",
-            params![root.as_bytes().to_vec()],
-        )?;
-        let _ = std::fs::remove_file(self.blob_path(root));
-        let _ = std::fs::remove_file(self.outboard_path(root));
-        drop(conn);
-        Ok(true)
+        crate::lean_durable::clear_cache(self, &conn, root)
     }
 
     /// Atomically commits a verified backend migration and drops leftover

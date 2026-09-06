@@ -271,14 +271,33 @@ executed receive, not only the planner. Cutover: `write_slice`, `write_proof`,
 `promote`, `trim_to_size`. No per-group round trips: the throughput of the
 Rust decoder is kept by construction.
 
-**C3. Durability transitions** (`Cas/Durable.lean`). `adopt`, `markDurable`,
-`healMissing`, `reconcileScratchGeneration`, `clearCache` are relational
-transactions already; they move as whole commands over `Storage`, `Access`
-and `Upsert`. Proofs: `markDurable` never inserts; `healMissing` withdraws a
-claim only on `notFound`, moves every `source:`/`replica:` pin to a want,
-leaves the operator pin, and preserves every other row; a scratch-generation
-change clears exactly the non-durable, out-of-line rows. Cutover: the
-`backend.rs` call sites.
+**C3. Durability transitions** (`Cas/Durable.lean`). Done. `markDurable`,
+`adoptDurable`, `healMissing`, `reconcileScratch` and `clearCache` run as
+the whole commands `casMarkDurable`, `casAdoptDurable`, `casHealMissing`,
+`casReconcileScratch` and `casClearCache` over `Storage`, `Access` and
+`Clock`, with `Resources` for the writer count and the post-commit file
+removals of `clearCache`. `Selection` gained `notEquals` (rendered
+`IS NOT ?`) so "durable ≠ 0" is a raw predicate rather than a Rust
+statement, and the store's schema capability gained the `config` relation.
+The simulated host now renders every literal predicate as SQL `IS`, as the
+adapter does, so NULL selects NULL (`isCell`); conflicts and joins keep `=`.
+Proved (`CasDurableProofs`), each as the exact database the executed
+program leaves on the shared host: marking never inserts and returns every
+other relation and every other root's row verbatim; healing withdraws a
+claim only where one stands, and only then copies every `source:`/`replica:`
+pin to a repair intent (existing intents keeping their record), removes
+exactly the role pins, leaves every other pin (the operator's among them)
+and every other root's row, and conserves the read-path obligation theorem
+(`heal_preserves_responsibility` reuses `CasHealingPromises`); a generation
+change drops exactly the staged rows, clears the cached groups of every
+durable out-of-line row and records the marker, while a matching marker
+changes nothing; concrete fixtures cover adoption (create, mark, refuse a
+size mismatch untouched), the cold-row sweep, the writer refusal of
+`clearCache`, the commit-before-unlink order with unlink failures tolerated,
+and rollback at every failing effect of every transition. Cutover: the five
+`Store` methods in `cas.rs` delegate to `lean_durable.rs`; their SQL bodies
+are deleted, and `clear_blob_cache` keeps the Rust ordering guard around
+the command. `backend.rs` call sites are unchanged.
 
 **C4. Cloud composition** (`Cas/Cloud.lean`, `Cas/Hydrate.lean`, requires
 F2). `hydrateRanges` holds the lease, fetches the outboard on first touch,

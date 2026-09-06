@@ -39,6 +39,7 @@ fn main() {
         "Cas/IngestCommit",
         "Cas/Ingest",
         "Cas/Input",
+        "Cas/Durable",
         "Host/Wire",
         "Trie/Codec",
         "Trie/Program",
@@ -147,6 +148,8 @@ fn main() {
         // Compile-time checks of the object layout native.rs copies from lean.h.
         .file(root.join("src/layout.c"))
         .flag_if_supported("-Wno-unused-parameter")
+        // Lean emits closed terms it never references at the C level.
+        .flag_if_supported("-Wno-unused-variable")
         // The generated C is the compiled core, not code anyone steps through
         // in a debugger: build it optimized in every profile, as the Lean
         // toolchain's own libraries are, so a debug test run pays for the

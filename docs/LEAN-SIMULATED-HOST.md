@@ -66,6 +66,10 @@ Relational comparisons cover the typed CAS/history schemas. The model does not
 implement SQLite affinity, arbitrary collations, numeric mixed-type ordering, or
 its full malformed-text behavior. General repair key theorems require canonical
 blob roots and text holders. LIKE supports ASCII case folding, `%`, and `_`.
+Literal predicates (`equals`, `notEquals`, delete bounds) have SQL `IS`
+semantics, as the store adapter renders them: NULL selects NULL and `IS NOT`
+NULL excludes it. Conflict detection and join correlation keep SQL `=`, where
+NULL equals nothing, matching unique indexes and joins.
 
 Files opened here have stable bytes. Mutable-file capture, concurrent mutations,
 crash persistence, and allocator exhaustion are separate obligations. Fixtures

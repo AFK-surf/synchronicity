@@ -5,8 +5,8 @@
 //! starts it, and hands its terminal back as a typed result.
 
 pub use crate::generated::{
-    CellType, Committed, IngestDomainError, IngestInput, Ingested, LifecycleDomainError, Outcome,
-    PinHolder, ReadDomainError,
+    CellType, Committed, DurableDomainError, IngestDomainError, IngestInput, Ingested,
+    LifecycleDomainError, Outcome, PinHolder, ReadDomainError,
 };
 pub use crate::host::IngestResources;
 pub use crate::operation::OperationError;
@@ -45,6 +45,13 @@ pub enum ReadError<E> {
 pub enum LifecycleError<E> {
     Operation(OperationError<E>),
     Domain(LifecycleDomainError),
+}
+
+/// Completed durability-transition failure, preserving original host errors.
+#[derive(Debug)]
+pub enum DurableError<E> {
+    Operation(OperationError<E>),
+    Domain(DurableDomainError),
 }
 
 /// Decode a run's terminal, or carry its host or protocol failure through.
@@ -272,6 +279,82 @@ pub fn acquire<S: Storage>(
         finish(run(storage, Capabilities::default(), &[], &command))
             .map_err(LifecycleError::Operation)?;
     outcome.map_err(LifecycleError::Domain)
+}
+
+/// Decode a durability transition's terminal into its typed outcome.
+fn finish_durable<T: Decode, E>(
+    result: Result<Vec<u8>, OperationError<E>>,
+) -> Result<T, DurableError<E>> {
+    let outcome: Result<T, DurableDomainError> = finish(result).map_err(DurableError::Operation)?;
+    outcome.map_err(DurableError::Domain)
+}
+
+/// Record that the backend holds the complete object, after its own
+/// acknowledgement. Never creates a row; answers whether one was marked.
+pub fn mark_durable<S: Storage>(
+    storage: &mut S,
+    root: &[u8; 32],
+) -> Result<bool, DurableError<S::Error>> {
+    let command = Command::CasMarkDurable(root.to_vec());
+    finish_durable(run(storage, Capabilities::default(), &[], &command))
+}
+
+/// Reconstruct a cold durable row once the backend confirmed the final pair:
+/// a row agreeing on size is marked, a missing row is created without local
+/// bytes, and a row disagreeing on size is refused untouched.
+pub fn adopt_durable<S: Storage>(
+    storage: &mut S,
+    root: &[u8; 32],
+    size: u64,
+    now: i64,
+) -> Result<(), DurableError<S::Error>> {
+    let command = Command::CasAdoptDurable {
+        root: root.to_vec(),
+        size,
+        now,
+    };
+    finish_durable(run(storage, Capabilities::default(), &[], &command))
+}
+
+/// The backend answered that the object is not there: withdraw the durable
+/// claim, drop a row without local bytes, and turn every machine role's pin
+/// into a repair intent. Answers whether a claim was withdrawn.
+pub fn heal_missing<S: Storage>(
+    storage: &mut S,
+    clock: &mut dyn Clock<Error = S::Error>,
+    root: &[u8; 32],
+) -> Result<bool, DurableError<S::Error>> {
+    let command = Command::CasHealMissing(root.to_vec());
+    let capabilities = Capabilities {
+        clock: Some(clock),
+        ..Capabilities::default()
+    };
+    finish_durable(run(storage, capabilities, &[], &command))
+}
+
+/// Reconcile cache claims with an ephemeral scratch generation marker.
+/// Answers whether the marker changed and the cache rows were reset.
+pub fn reconcile_scratch<S: Storage>(
+    storage: &mut S,
+    marker: &str,
+) -> Result<bool, DurableError<S::Error>> {
+    let command = Command::CasReconcileScratch(marker.to_owned());
+    finish_durable(run(storage, Capabilities::default(), &[], &command))
+}
+
+/// Drop reconstructible local bytes while keeping a remote durable claim;
+/// refused while a writer holds the object. Answers whether it cleared.
+pub fn clear_cache<S: Storage>(
+    storage: &mut S,
+    resources: &mut dyn Resources<Error = S::Error>,
+    root: &[u8; 32],
+) -> Result<bool, DurableError<S::Error>> {
+    let command = Command::CasClearCache(root.to_vec());
+    let capabilities = Capabilities {
+        resources: Some(resources),
+        ..Capabilities::default()
+    };
+    finish_durable(run(storage, capabilities, &[], &command))
 }
 
 #[cfg(test)]

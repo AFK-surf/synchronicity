@@ -11,7 +11,7 @@ set_option Elab.async false
 decoded row, bitmap or coverage snapshot to the operation. -/
 theorem read_observes_metadata (key : ByteArray) (request : Request) :
     ∃ resume, (read key request).run = .request
-      (.right (.left (.snapshot ⟨"blobs", [("root", .blob key)], []⟩
+      (.right (.left (.snapshot ⟨"blobs", [("root", .blob key)], [], []⟩
         ["root", "size", "complete", "bitmap", "inline", "last_access", "durable"]))) resume := by
   exact ⟨_, rfl⟩
 

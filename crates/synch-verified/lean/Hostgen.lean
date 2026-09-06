@@ -78,6 +78,7 @@ def messages : List Name := [
   ``VerifiedCore.Trie.Refusal, ``VerifiedCore.Trie.Verdict, ``VerifiedCore.Trie.MutationError,
   ``VerifiedCore.Commands.LifecycleDomainError, ``VerifiedCore.Commands.IngestDomainError,
   ``VerifiedCore.Commands.ReadDomainError, ``VerifiedCore.Commands.HistoryDomainError,
+  ``VerifiedCore.Commands.DurableDomainError,
   ``VerifiedCore.Commands.Ingested, ``VerifiedCore.Commands.Committed,
   ``VerifiedCore.Commands.Command]
 

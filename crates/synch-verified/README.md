@@ -29,7 +29,12 @@ Rust `hash_of_encoded`, `hashes_to` and `check_invariants` algorithms are
 deleted and `synch-mpt` only names the refusal. The trie write path
 (`Trie/Mutate.lean`: insert and remove, canonical form, the order of writes)
 is likewise a pair of whole commands over raw reads, `ByteWrites.putBytes`
-and the digest; `synch-mpt`'s write helpers are deleted. History retention now runs as a
+and the digest; `synch-mpt`'s write helpers are deleted. The CAS durability
+transitions (`Cas/Durable.lean`: mark, adopt, heal a backend `NotFound`,
+reconcile a scratch generation, clear the local cache) are whole commands
+over raw selections with `IS NOT` predicates, a clock and the resource
+counter/unlink services; `synch-store`'s five SQL bodies are deleted and
+`lean_durable.rs` only binds services and names diagnostics. History retention now runs as a
 complete Lean operation over raw scans and a separate Ed25519 primitive; the
 Rust retention loop and receipt/fork helpers are removed. Raw scans retain
 rows before a trailing host failure so Lean owns first-error selection.

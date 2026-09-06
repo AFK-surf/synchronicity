@@ -68,8 +68,28 @@ def equalCell : Cell → Cell → Bool
   change (bytes == bytes) = true
   exact beq_self_eq_true _
 
+/-- SQL `IS`, which the host renders every literal predicate with: equality
+except that NULL is itself. Conflict detection and joins keep SQL `=`. -/
+def isCell : Cell → Cell → Bool
+  | .null, .null => true
+  | a, b => equalCell a b
+
+@[simp] theorem isCell_null_null : isCell .null .null = true := rfl
+
+@[simp] theorem isCell_blob (left : ByteArray) (right : Cell) :
+    isCell (.blob left) right = equalCell (.blob left) right := by
+  cases right <;> rfl
+
+@[simp] theorem isCell_integer (left : Int64) (right : Cell) :
+    isCell (.integer left) right = equalCell (.integer left) right := by
+  cases right <;> rfl
+
+@[simp] theorem isCell_text (left : String) (right : Cell) :
+    isCell (.text left) right = equalCell (.text left) right := by
+  cases right <;> rfl
+
 def equals (row : Fields) (fields : Fields) : Bool :=
-  fields.all fun (column, value) => equalCell (cell row column) value
+  fields.all fun (column, value) => isCell (cell row column) value
 
 /-- SQL LIKE with ASCII case folding, percent and underscore wildcards.
 The recursion consumes either pattern or input, so it needs no external fuel. -/
@@ -92,7 +112,8 @@ def like (value : Cell) (pattern : String) : Bool :=
 
 def selects (selection : Selection) (row : Fields) : Bool :=
   equals row selection.equals && (selection.likeAny.isEmpty ||
-    selection.likeAny.any (fun (column, pattern) => like (cell row column) pattern))
+    selection.likeAny.any (fun (column, pattern) => like (cell row column) pattern)) &&
+    selection.notEquals.all (fun (column, value) => !isCell (cell row column) value)
 
 def project (columns : List String) (row : Fields) : Row := columns.map (cell row)
 
