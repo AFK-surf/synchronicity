@@ -5831,7 +5831,7 @@ dependencies = [
 
 [[package]]
 name = "synch-cc"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "cc",
  "synch-core",
@@ -5841,7 +5841,7 @@ dependencies = [
 
 [[package]]
 name = "synch-cli"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "anyhow",
  "base64 0.22.1",
@@ -5878,7 +5878,7 @@ dependencies = [
 
 [[package]]
 name = "synch-core"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "blake3",
  "hex",
@@ -5897,7 +5897,7 @@ dependencies = [
 
 [[package]]
 name = "synch-dp"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "axum",
  "blake3",
@@ -5925,7 +5925,7 @@ dependencies = [
 
 [[package]]
 name = "synch-engine"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "async-trait",
  "aws-lc-rs",
@@ -5957,7 +5957,7 @@ dependencies = [
 
 [[package]]
 name = "synch-monitor"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "base64 0.22.1",
  "clap",
@@ -5978,7 +5978,7 @@ dependencies = [
 
 [[package]]
 name = "synch-mpt"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "blake3",
  "postcard",
@@ -5991,7 +5991,7 @@ dependencies = [
 
 [[package]]
 name = "synch-net"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "async-trait",
  "aws-lc-rs",
@@ -6026,7 +6026,7 @@ dependencies = [
 
 [[package]]
 name = "synch-s3"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "anyhow",
  "axum",
@@ -6052,7 +6052,7 @@ dependencies = [
 
 [[package]]
 name = "synch-sock"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "async-ebpf",
  "async-trait",
@@ -6076,7 +6076,7 @@ dependencies = [
 
 [[package]]
 name = "synch-store"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "async-trait",
  "bao-tree",
@@ -6104,7 +6104,7 @@ dependencies = [
 
 [[package]]
 name = "synch-verified"
-version = "0.1.8"
+version = "0.1.9"
 dependencies = [
  "blake3",
  "cc",
