@@ -726,4 +726,248 @@ theorem split_leaf_new_prefix (digestWidth : Width d) (shaped : Shaped before)
         · refine Or.inr ⟨tail, oldKey.trans oldSpelling.symm, (leafEntries tail result).mpr ?_⟩
           simpa [NodeEntries, nibblesOf, TrieWalkProofs.toList_eq] using oldMeaning
 
+private theorem branch_two_entries {leftPosition rightPosition : UInt8}
+    (leftBound : leftPosition.toNat < 16) (rightBound : rightPosition.toNat < 16)
+    (different : leftPosition ≠ rightPosition) :
+    NodeEntries store (.branch
+      (setChild (setChild emptyChildren leftPosition (some left)) rightPosition (some right)) none) key bytes ↔
+      (∃ tail, key = leftPosition :: tail ∧ GraphValue store left tail bytes) ∨
+        ∃ tail, key = rightPosition :: tail ∧ GraphValue store right tail bytes := by
+  cases key with
+  | nil => simp [NodeEntries]
+  | cons nibble tail =>
+    by_cases isRight : nibble = rightPosition
+    · subst nibble
+      simp only [NodeEntries, setChild,
+        List.getElem?_set_self (show rightPosition.toNat < (emptyChildren.set leftPosition.toNat (some left)).length by
+          rw [List.length_set]; exact rightBound), Option.some.injEq]
+      simp [Ne.symm different]
+    · simp only [NodeEntries, setChild_getElem_ne _ (Ne.symm isRight)]
+      by_cases isLeft : nibble = leftPosition
+      · subst nibble
+        simp only [setChild,
+          List.getElem?_set_self (show leftPosition.toNat < emptyChildren.length from leftBound),
+          Option.some.injEq]
+        simp [different]
+      · simp only [setChild_getElem_ne _ (Ne.symm isLeft)]
+        have empty : ∀ root, emptyChildren[nibble.toNat]? ≠ some (some root) := by
+          intro root selected
+          have member := List.mem_of_getElem? selected
+          simp only [emptyChildren, List.mem_replicate] at member
+          cases member.2
+        simp [empty, isLeft, isRight]
+
+private theorem branch_two_ready {leftPosition rightPosition : UInt8}
+    (leftBound : leftPosition.toNat < 16) (rightBound : rightPosition.toNat < 16)
+    (different : leftPosition ≠ rightPosition)
+    (leftWidth : left.size = 32) (rightWidth : right.size = 32)
+    (leftClosed : Closed store left) (rightClosed : Closed store right) :
+    let node := Node.branch
+      (setChild (setChild emptyChildren leftPosition (some left)) rightPosition (some right)) none
+    node.wf ∧ checkInvariants node = .ok () ∧ NodeClosed store node := by
+  have valid := branchOk_setChild (branchOk_setChild branchOk_empty leftPosition leftWidth)
+    rightPosition rightWidth
+  have rightSlot : (setChild emptyChildren leftPosition (some left))[rightPosition.toNat]? = some none := by
+    rw [setChild_getElem_ne _ different]
+    exact emptyChildren_none rightBound
+  have occupied : 2 ≤ occupants
+      (setChild (setChild emptyChildren leftPosition (some left)) rightPosition (some right)) none := by
+    rw [occupants_setChild_of_none rightSlot, occupants_setChild_of_none (emptyChildren_none leftBound),
+      occupants_empty_none]
+    decide
+  have emptyClosed : ∀ (index : Nat) child, emptyChildren[index]? = some (some child) → Closed store child := by
+    intro index child selected
+    have member := List.mem_of_getElem? selected
+    simp only [emptyChildren, List.mem_replicate] at member
+    cases member.2
+  have childrenClosed := set_child_closed
+    (set_child_closed emptyClosed rfl leftBound leftClosed)
+    (by simp only [length_setChild]; rfl) rightBound rightClosed
+  refine ⟨wf_branch valid, checkInvariants_branch valid occupied, ?_⟩
+  exact ⟨(fun _ impossible => nomatch impossible), childrenClosed⟩
+
+private theorem put_wrap_exact (digestWidth : Width d) (shaped : Shaped before)
+    (wellFormed : node.wf) (canonical : checkInvariants node = .ok ())
+    (closed : NodeClosed before.read node)
+    (nibbles : Nibbles segment) (small : segment.length < 2 ^ 64)
+    (safe : SafeWrites d before (do let child ← put node; wrapInExtension segment child).run)
+    (ran : execute d before (do let child ← put node; wrapInExtension segment child).run =
+      some (.ok root, after)) :
+    RecordsIncluded before.read after.read ∧ Shaped after ∧ root.size = 32 ∧ Closed after.read root ∧
+      ∀ key bytes, GraphValue after.read root key bytes ↔
+        ∃ tail, key = segment ++ tail ∧ NodeEntries before.read node tail bytes := by
+  simp only [run_bind] at safe
+  have firstSafe := safe_bind_left _ safe
+  rw [execute_run_bind] at ran
+  cases first : execute d before (put node).run with
+  | none => simp [first] at ran
+  | some reply =>
+    obtain ⟨reply, middle⟩ := reply
+    cases reply with
+    | error error => simp [first] at ran
+    | ok child =>
+      have restSafe := safe_bind_right _ safe first
+      simp only [bindCont_ok] at restSafe
+      simp only [first] at ran
+      obtain ⟨included, middleShape, childWidth, childClosed, childEntries⟩ :=
+        put_exact digestWidth shaped wellFormed canonical closed firstSafe first
+      obtain ⟨laterIncluded, finalShape, rootWidth, rootClosed, entries⟩ :=
+        wrap_exact digestWidth middleShape nibbles small childWidth childClosed restSafe ran
+      refine ⟨fun space key bytes admitted held => laterIncluded space key bytes admitted
+        (included space key bytes admitted held), finalShape, rootWidth, rootClosed, ?_⟩
+      intro key bytes
+      exact (entries key bytes).trans (exists_congr fun tail => and_congr Iff.rfl (childEntries tail bytes))
+
+/-- Diverging keys use separate child edges in the actual split. The result
+contains exactly the old entry and the newly requested entry. -/
+theorem split_leaf_divergent (digestWidth : Width d) (shaped : Shaped before)
+    (suffixNibbles : Nibbles suffix) (keyNibbles : Nibbles key)
+    (suffixSmall : suffix.length < 2 ^ 64) (keySmall : key.length < 2 ^ 64)
+    (different : suffix ≠ key)
+    (oldValid : ValueOk old) (oldClosed : ∃ bytes, ValueDenotes before.read old bytes)
+    (valueValid : ValueOk value) (valueMeaning : ValueDenotes before.read value bytes)
+    {leftPosition rightPosition : UInt8}
+    (oldContinues : suffix.drop (commonPrefix suffix key) = leftPosition :: leftTail)
+    (newContinues : key.drop (commonPrefix suffix key) = rightPosition :: rightTail)
+    (safe : SafeWrites d before (splitLeaf suffix old key value).run)
+    (ran : execute d before (splitLeaf suffix old key value).run = some (.ok root, after)) :
+    RecordsIncluded before.read after.read ∧ Shaped after ∧ root.size = 32 ∧ Closed after.read root ∧
+      ∀ probe result, GraphValue after.read root probe result ↔
+        Overwrite (NodeEntries before.read (.leaf (nibblesOf suffix) old)) key bytes probe result := by
+  have beqDifferent : (suffix == key) = false := beq_eq_false_iff_ne.mpr different
+  simp only [splitLeaf, beqDifferent, Bool.false_eq_true, ↓reduceIte, oldContinues, newContinues] at safe ran
+  have leftNibbles := nibbles_tail (oldContinues ▸ nibbles_drop suffixNibbles _)
+  have rightNibbles := nibbles_tail (newContinues ▸ nibbles_drop keyNibbles _)
+  have leftSmall : leftTail.length < 2 ^ 64 := by
+    have length := congrArg List.length oldContinues
+    simp only [List.length_drop, List.length_cons] at length
+    omega
+  have rightSmall : rightTail.length < 2 ^ 64 := by
+    have length := congrArg List.length newContinues
+    simp only [List.length_drop, List.length_cons] at length
+    omega
+  have leftBound : leftPosition.toNat < 16 := by
+    have := nibbles_head (oldContinues ▸ nibbles_drop suffixNibbles _)
+    omega
+  have rightBound : rightPosition.toNat < 16 := by
+    have := nibbles_head (newContinues ▸ nibbles_drop keyNibbles _)
+    omega
+  have distinctEdges := commonPrefix_heads_differ suffix key oldContinues newContinues
+  have leftWf : (Node.leaf (nibblesOf leftTail) old).wf :=
+    ⟨nibblesOf_wf leftNibbles leftSmall, oldValid.1⟩
+  have rightWf : (Node.leaf (nibblesOf rightTail) value).wf :=
+    ⟨nibblesOf_wf rightNibbles rightSmall, valueValid.1⟩
+  simp only [run_bind] at safe
+  have firstSafe := safe_bind_left _ safe
+  rw [execute_run_bind] at ran
+  cases first : execute d before (put (.leaf (nibblesOf leftTail) old)).run with
+  | none => simp [first] at ran
+  | some reply =>
+    obtain ⟨reply, middle⟩ := reply
+    cases reply with
+    | error error => simp [first] at ran
+    | ok left =>
+      have restSafe := safe_bind_right _ safe first
+      simp only [bindCont_ok, run_bind] at restSafe
+      simp only [first] at ran
+      obtain ⟨included, middleShape, leftWidth, leftClosed, leftEntries⟩ :=
+        put_exact digestWidth shaped leftWf (by simpa [checkInvariants] using oldValid.2)
+          oldClosed firstSafe first
+      have valueAfter : ValueDenotes middle.read value bytes := by
+        have unchanged := node_entries_unchanged (node := .leaf ByteArray.empty value)
+          (key := []) (bytes := bytes) ⟨bytes, valueMeaning⟩ included
+        have beforeEntry : NodeEntries before.read (.leaf ByteArray.empty value) [] bytes :=
+          ⟨by simp [TrieWalkProofs.toList_eq], valueMeaning⟩
+        exact (unchanged.mpr beforeEntry).2
+      have secondSafe := safe_bind_left _ restSafe
+      rw [execute_run_bind] at ran
+      cases second : execute d middle (put (.leaf (nibblesOf rightTail) value)).run with
+      | none => simp [second] at ran
+      | some reply =>
+        obtain ⟨reply, childrenStore⟩ := reply
+        cases reply with
+        | error error => simp [second] at ran
+        | ok right =>
+          have lastSafe := safe_bind_right _ restSafe second
+          simp only [bindCont_ok] at lastSafe
+          simp only [second] at ran
+          obtain ⟨nextIncluded, childrenShape, rightWidth, rightClosed, _⟩ :=
+            put_exact digestWidth middleShape rightWf (by simpa [checkInvariants] using valueValid.2)
+              ⟨bytes, valueAfter⟩ secondSafe second
+          obtain ⟨branchWf, branchCanonical, branchClosed⟩ :=
+            branch_two_ready leftBound rightBound distinctEdges leftWidth rightWidth
+              (closed_preserved leftClosed nextIncluded) rightClosed
+          have prefixSmall : (key.take (commonPrefix suffix key)).length < 2 ^ 64 := by
+            simp only [List.length_take]
+            omega
+          obtain ⟨lastIncluded, finalShape, rootWidth, rootClosed, entries⟩ :=
+            put_wrap_exact digestWidth childrenShape branchWf branchCanonical branchClosed
+              (nibbles_take keyNibbles _) prefixSmall lastSafe ran
+          have oldSpelling : key.take (commonPrefix suffix key) ++ leftPosition :: leftTail = suffix := by
+            rw [← oldContinues]
+            exact commonPrefix_reconstruct suffix key
+          have newSpelling : key.take (commonPrefix suffix key) ++ rightPosition :: rightTail = key := by
+            rw [← newContinues]
+            exact List.take_append_drop _ _
+          refine ⟨fun space address data admitted held => lastIncluded space address data admitted
+            (nextIncluded space address data admitted (included space address data admitted held)),
+            finalShape, rootWidth, rootClosed, ?_⟩
+          intro probe result
+          have oldMeaning : NodeEntries before.read (.leaf (nibblesOf suffix) old) =
+              (fun probe result => probe = suffix ∧ ValueDenotes before.read old result) := by
+            funext probe result
+            simp [NodeEntries, nibblesOf, TrieWalkProofs.toList_eq]
+          have oldLeaf : ∀ query, GraphValue childrenStore.read left query result ↔
+              query = leftTail ∧ ValueDenotes before.read old result := by
+            intro query
+            have same : GraphValue childrenStore.read left query result ↔ GraphValue middle.read left query result :=
+              ⟨closed_snapshot_no_new_entries leftClosed nextIncluded, graph_value_preserved nextIncluded⟩
+            exact same.trans (by simpa [NodeEntries, nibblesOf, TrieWalkProofs.toList_eq] using leftEntries query result)
+          have newLeaf : ∀ query, GraphValue childrenStore.read right query result ↔ query = rightTail ∧ result = bytes := by
+            intro query
+            simpa [nibblesOf, TrieWalkProofs.toList_eq] using
+              (put_leaf_exact (key := query) (result := result) rightWf valueAfter second)
+          rw [entries, oldMeaning, distinct_leaf_update different]
+          simp only [branch_two_entries leftBound rightBound distinctEdges, oldLeaf, newLeaf]
+          constructor
+          · rintro ⟨tail, spelling, ⟨below, rfl, rfl, prior⟩ | ⟨below, rfl, rfl, fresh⟩⟩
+            · exact Or.inr ⟨spelling.trans oldSpelling, prior⟩
+            · exact Or.inl ⟨spelling.trans newSpelling, fresh⟩
+          · rintro (⟨newKey, fresh⟩ | ⟨oldKey, prior⟩)
+            · exact ⟨rightPosition :: rightTail, newKey.trans newSpelling.symm,
+                Or.inr ⟨rightTail, rfl, rfl, fresh⟩⟩
+            · exact ⟨leftPosition :: leftTail, oldKey.trans oldSpelling.symm,
+                Or.inl ⟨leftTail, rfl, rfl, prior⟩⟩
+
+/-- Every actual leaf split, including equal keys, both prefix directions,
+and diverging keys, replaces exactly the requested entry. -/
+theorem split_leaf_exact (digestWidth : Width d) (shaped : Shaped before)
+    (suffixNibbles : Nibbles suffix) (keyNibbles : Nibbles key)
+    (suffixSmall : suffix.length < 2 ^ 64) (keySmall : key.length < 2 ^ 64)
+    (oldValid : ValueOk old) (oldClosed : ∃ bytes, ValueDenotes before.read old bytes)
+    (valueValid : ValueOk value) (valueMeaning : ValueDenotes before.read value bytes)
+    (safe : SafeWrites d before (splitLeaf suffix old key value).run)
+    (ran : execute d before (splitLeaf suffix old key value).run = some (.ok root, after)) :
+    RecordsIncluded before.read after.read ∧ Shaped after ∧ root.size = 32 ∧ Closed after.read root ∧
+      ∀ probe result, GraphValue after.read root probe result ↔
+        Overwrite (NodeEntries before.read (.leaf (nibblesOf suffix) old)) key bytes probe result := by
+  by_cases same : suffix = key
+  · subst key
+    exact replace_leaf_exact digestWidth shaped suffixNibbles suffixSmall valueValid valueMeaning safe ran
+  · cases oldRest : suffix.drop (commonPrefix suffix key) with
+    | nil =>
+      cases newRest : key.drop (commonPrefix suffix key) with
+      | nil => exact False.elim (same (commonPrefix_exhausted suffix key oldRest newRest))
+      | cons position tail =>
+        exact split_leaf_old_prefix digestWidth shaped keyNibbles keySmall same
+          oldValid oldClosed valueValid valueMeaning oldRest newRest safe ran
+    | cons leftPosition leftTail =>
+      cases newRest : key.drop (commonPrefix suffix key) with
+      | nil =>
+        exact split_leaf_new_prefix digestWidth shaped suffixNibbles suffixSmall same
+          oldValid oldClosed valueValid valueMeaning newRest oldRest safe ran
+      | cons rightPosition rightTail =>
+        exact split_leaf_divergent digestWidth shaped suffixNibbles keyNibbles suffixSmall keySmall same
+          oldValid oldClosed valueValid valueMeaning oldRest newRest safe ran
+
 end Synchronicity.TrieInsertSemantics
