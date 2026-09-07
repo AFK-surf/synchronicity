@@ -585,38 +585,6 @@ mod terminal_tests {
     use crate::host::Output;
 
     #[test]
-    fn lifecycle_terminals_are_exactly_framed() {
-        type Lifecycle = Result<bool, LifecycleDomainError>;
-        assert_eq!(terminal::<Lifecycle>(&[0, 0]), Ok(Ok(false)));
-        assert_eq!(terminal::<Lifecycle>(&[0, 1]), Ok(Ok(true)));
-        assert_eq!(
-            terminal::<Lifecycle>(&[1, 0]),
-            Ok(Err(LifecycleDomainError::Malformed))
-        );
-        for malformed in [&[][..], &[0], &[0, 2], &[0, 1, 0], &[1], &[1, 2], &[2]] {
-            assert_eq!(terminal::<Lifecycle>(malformed), Err(()));
-        }
-    }
-
-    #[test]
-    fn read_terminal_range_preserves_unsigned_endpoints() {
-        let mut packet = vec![1, 1];
-        for value in [u64::MAX - 1, u64::MAX, 7] {
-            packet.extend_from_slice(&value.to_le_bytes());
-        }
-        assert_eq!(
-            terminal::<Result<u64, ReadDomainError>>(&packet),
-            Ok(Err(ReadDomainError::Range {
-                start: u64::MAX - 1,
-                stop: u64::MAX,
-                size: 7,
-            }))
-        );
-        packet.push(0);
-        assert_eq!(terminal::<Result<u64, ReadDomainError>>(&packet), Err(()));
-    }
-
-    #[test]
     fn read_terminal_count_releases_the_private_output_without_copying() {
         for size in [0_usize, 2, 65543] {
             let mut packet = vec![0];

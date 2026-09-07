@@ -33,7 +33,7 @@ pub fn prune<S: Storage>(
 mod tests {
     use super::*;
     use crate::host::{Cell, Fields, Join, Order, Row};
-    use crate::operation::{terminal, OperationError};
+    use crate::operation::OperationError;
     use std::{cell::RefCell, rc::Rc};
 
     type Trace = Rc<RefCell<Vec<&'static str>>>;
@@ -229,17 +229,6 @@ mod tests {
         assert!(crypto.keys.is_empty());
         assert_eq!(*trace.borrow(), ["begin", "heads", "rollback"]);
     }
-    #[test]
-    fn terminal_decoder_rejects_unknown_tags_and_trailing_data() {
-        for bytes in [&[9][..], &[1, 0, 0][..], &[1, 4, 9][..], &[0, 0][..]] {
-            assert!(terminal::<Result<u64, DomainError>>(bytes).is_err());
-        }
-        assert_eq!(
-            terminal::<Result<u64, DomainError>>(&[1, 4, 2]),
-            Ok(Err(DomainError::Origin(OriginError::KeyDecode)))
-        );
-    }
-
     #[test]
     fn earlier_row_error_wins_over_trailing_scan_failure() {
         for width in [0, 32] {

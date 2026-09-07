@@ -104,73 +104,30 @@ mod tests {
     }
 
     #[test]
-    fn native_order_agrees_with_sequence_and_all_hash_bytes() {
-        let mut versions = vec![
-            (0, [0; 32]),
-            (0, [255; 32]),
-            (1, [0; 32]),
-            (i64::MAX as u64, [255; 32]),
-            (1 << 63, [0; 32]),
-            (u64::MAX, [255; 32]),
-        ];
-        for byte in 0..32 {
-            let mut root = [0; 32];
-            root[byte] = 1;
-            versions.push((1, root));
-        }
-        for &(seq, root) in &versions {
-            for &(peer_seq, peer_root) in &versions {
-                let ours = head("origin", seq, root);
-                let theirs = head("origin", peer_seq, peer_root);
-                let plan = plan_exchange(vec![ours.clone()], vec![theirs], vec![ours]).unwrap();
-                assert_eq!(!plan.want.is_empty(), (peer_seq, peer_root) > (seq, root));
-                assert_eq!(!plan.push.is_empty(), (seq, root) > (peer_seq, peer_root));
-            }
-        }
-        let zero = head("origin", 0, [0; 32]);
-        assert_eq!(
-            plan_exchange(vec![], vec![zero.clone()], vec![])
-                .unwrap()
-                .want,
-            ["origin"]
-        );
-        assert_eq!(plan_exchange(vec![], vec![], vec![zero]).unwrap().push, [0]);
-    }
-
-    #[test]
-    fn duplicates_and_slot_order_cannot_hide_newer_versions() {
-        let low = head("origin", 2, [0; 32]);
-        let high = head("origin", 2, [255; 32]);
-        let ours = vec![low.clone()];
-        for theirs in [
-            vec![low.clone(), high.clone()],
-            vec![high.clone(), low.clone()],
-            vec![low.clone(), low.clone(), high.clone(), high.clone()],
+    fn native_exchange_preserves_unsigned_versions_and_servable_positions() {
+        // ExchangeProofs and ExchangeVersionProofs cover the ordering laws.
+        // These vectors exercise the native integer and byte-array boundary.
+        let mut last_byte = [0; 32];
+        last_byte[31] = 255;
+        let mut first_byte = [0; 32];
+        first_byte[0] = 1;
+        for (low, high) in [
+            ((i64::MAX as u64, [255; 32]), (1 << 63, [0; 32])),
+            ((u64::MAX, [0; 32]), (u64::MAX, last_byte)),
+            ((1, last_byte), (1, first_byte)),
         ] {
-            assert_eq!(
-                plan_exchange(ours.clone(), theirs, vec![]).unwrap().want,
-                ["origin"]
-            );
+            let low = head("origin", low.0, low.1);
+            let high = head("origin", high.0, high.1);
+            let plan = plan_exchange(vec![low.clone()], vec![high.clone()], vec![]).unwrap();
+            assert_eq!(plan.want, ["origin"]);
+            assert!(plan.push.is_empty());
+            // A pending higher head is not a servable entry. Check the
+            // actual returned index after a lower, ineligible entry.
+            let pending = head("origin", high.seq, [255; 32]);
+            let plan = plan_exchange(vec![pending], vec![low.clone()], vec![low, high]).unwrap();
+            assert_eq!(plan.push, [1]);
+            assert!(plan.want.is_empty());
         }
-        assert!(plan_exchange(
-            vec![high.clone(), low.clone(), high.clone()],
-            vec![low, high],
-            vec![]
-        )
-        .unwrap()
-        .want
-        .is_empty());
-    }
-
-    #[test]
-    fn only_supplied_servable_heads_are_pushed() {
-        let pending = head("origin", 3, [3; 32]);
-        let complete = head("origin", 1, [1; 32]);
-        let peer = head("origin", 2, [2; 32]);
-        let plan =
-            plan_exchange(vec![pending, complete.clone()], vec![peer], vec![complete]).unwrap();
-        assert!(plan.push.is_empty());
-        assert!(plan.want.is_empty());
     }
 
     #[test]

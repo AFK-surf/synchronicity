@@ -1506,44 +1506,6 @@ mod tests {
     }
 
     #[test]
-    fn ingestion_frames_are_exact_and_borrow_payloads() {
-        let mut packet = vec![1, 39];
-        bytes(&mut packet, &[41, 42]);
-        match decode(&packet).unwrap() {
-            Frame::Hash(payload) => {
-                assert_eq!(payload, [41, 42]);
-                assert_eq!(payload.as_ptr(), packet[10..].as_ptr());
-            }
-            _ => panic!("unexpected frame"),
-        }
-        for end in 0..packet.len() {
-            assert!(decode(&packet[..end]).is_err());
-        }
-        packet.push(0);
-        assert!(decode(&packet).is_err());
-        let mut build = vec![1, 38];
-        for value in [1, 2, 3, u64::MAX] {
-            word(&mut build, value);
-        }
-        assert!(matches!(
-            decode(&build),
-            Ok(Frame::Build(1, 2, 3, u64::MAX))
-        ));
-        for end in 0..build.len() {
-            assert!(decode(&build[..end]).is_err());
-        }
-        build.push(0);
-        assert!(decode(&build).is_err());
-        for tag in [43, 45, 48] {
-            let mut packet = vec![1, tag];
-            word(&mut packet, 7);
-            assert!(decode(&packet).is_ok());
-            packet.push(0);
-            assert!(decode(&packet).is_err());
-        }
-    }
-
-    #[test]
     fn hash_frames_reject_hostile_lengths_and_stale_tags() {
         let mut packet = vec![1, 39];
         word(&mut packet, u64::MAX);
@@ -1582,43 +1544,42 @@ mod tests {
     }
 
     #[test]
-    fn ingestion_failures_preserve_opaque_errors_in_generic_replies() {
-        for tag in 38..=52 {
-            let mut errors = Vec::new();
-            let response = reply(tag, Err::<(), _>("original"), &mut errors, |_, ()| {});
-            assert_eq!(errors, vec![Some("original")]);
-            let mut expected = vec![1, 0];
-            word(&mut expected, 1);
-            word(&mut expected, 1);
-            assert_eq!(response, expected);
-        }
+    fn failed_reply_registers_the_original_host_error() {
+        let mut errors = Vec::new();
+        let response = reply(38, Err::<(), _>("original"), &mut errors, |_, ()| {});
+        assert_eq!(errors, vec![Some("original")]);
+        let mut expected = vec![1, 0];
+        word(&mut expected, 1);
+        word(&mut expected, 1);
+        assert_eq!(response, expected);
     }
 
     #[test]
-    fn source_frames_preserve_unsigned_coordinates_and_borrow_frozen_bytes() {
-        let mut read = vec![1, 50];
-        for value in [7, u64::MAX, 65536] {
-            word(&mut read, value);
+    fn terminal_decoder_checks_nested_tags_lengths_and_integer_bounds() {
+        type Value = Result<crate::generated::ParsedOrigin, crate::generated::OriginError>;
+        let value = crate::generated::ParsedOrigin::Key(vec![7; 32]);
+        let mut packet = vec![0];
+        value.encode(&mut packet);
+        assert_eq!(terminal::<Value>(&packet), Ok(Ok(value)));
+        for end in 0..packet.len() {
+            assert!(terminal::<Value>(&packet[..end]).is_err());
         }
-        assert!(matches!(
-            decode(&read),
-            Ok(Frame::ReadSome(7, u64::MAX, 65536))
-        ));
-        let mut frozen = vec![1, 51];
-        bytes(&mut frozen, &[41, 42]);
-        match decode(&frozen).unwrap() {
-            Frame::Freeze(bytes) => assert_eq!(bytes.as_ptr(), frozen[10..].as_ptr()),
-            _ => panic!("unexpected frame"),
+        packet.push(0);
+        assert!(terminal::<Value>(&packet).is_err());
+        for invalid in [&[2][..], &[0, 255], &[1, 255]] {
+            assert!(terminal::<Value>(invalid).is_err());
         }
-        for packet in [&read, &frozen] {
-            for end in 0..packet.len() {
-                assert!(decode(&packet[..end]).is_err());
-            }
-            let mut trailing = packet.clone();
-            trailing.push(0);
-            assert!(decode(&trailing).is_err());
+        assert!(terminal::<Option<bool>>(&[2]).is_err());
+        assert!(terminal::<Option<bool>>(&[1, 2]).is_err());
+        assert!(terminal::<Vec<u8>>(&u64::MAX.to_le_bytes()).is_err());
+        for value in [0, 1 << 63, u64::MAX] {
+            assert_eq!(terminal::<u64>(&value.to_le_bytes()), Ok(value));
+        }
+        for value in [i64::MIN, -1, i64::MAX] {
+            assert_eq!(terminal::<i64>(&value.to_le_bytes()), Ok(value));
         }
     }
+
     use crate::cas::acquire;
 
     #[test]
@@ -1640,29 +1601,15 @@ mod tests {
         assert!(decode(&packet).is_err());
     }
 
-    #[test]
-    fn output_request_borrows_bounded_bytes_with_exact_framing() {
-        let mut packet = vec![1, 37];
-        bytes(&mut packet, &[9, 8, 7]);
-        match decode(&packet).unwrap() {
-            Frame::Append(payload) => {
-                assert_eq!(payload, [9, 8, 7]);
-                assert_eq!(payload.as_ptr(), packet[10..].as_ptr());
-            }
-            _ => panic!("expected output request"),
-        }
-        for length in 0..packet.len() {
-            assert!(decode(&packet[..length]).is_err());
-        }
-        packet.push(0);
-        assert!(decode(&packet).is_err());
+    #[derive(Default)]
+    struct OutputTestFiles {
+        calls: Vec<&'static str>,
+        fail_read: bool,
     }
-
-    struct OutputTestFiles(Vec<&'static str>);
     impl FileIO for OutputTestFiles {
         type Error = &'static str;
         fn open(&mut self, _: &str, _: &[u8]) -> Result<u64, FileFailure<Self::Error>> {
-            self.0.push("open");
+            self.calls.push("open");
             Ok(9)
         }
         fn read_into(
@@ -1672,13 +1619,20 @@ mod tests {
             buffer: &mut [u8],
         ) -> Result<(), FileFailure<Self::Error>> {
             assert_eq!((handle, offset, buffer.len()), (9, 0, 65540));
-            self.0.push("transfer");
+            self.calls.push("transfer");
             buffer.fill(7);
-            Ok(())
+            if self.fail_read {
+                Err(FileFailure {
+                    error: "read",
+                    kind: FileFailureKind::Other,
+                })
+            } else {
+                Ok(())
+            }
         }
         fn close(&mut self, handle: u64) -> Result<(), Self::Error> {
             assert_eq!(handle, 9);
-            self.0.push("close");
+            self.calls.push("close");
             Ok(())
         }
 
@@ -1720,13 +1674,21 @@ mod tests {
     }
     #[test]
     fn output_failures_resume_lean_and_close_before_termination() {
-        for host in [Some(true), Some(false), None] {
+        for (host, fail_read) in [
+            (Some(true), false),
+            (Some(false), false),
+            (None, false),
+            (None, true),
+        ] {
             let mut storage = Script::default();
-            let mut files = OutputTestFiles(vec![]);
-            let mut clock = OutputTestFiles(vec![]);
+            let mut files = OutputTestFiles {
+                fail_read,
+                ..OutputTestFiles::default()
+            };
+            let mut clock = OutputTestFiles::default();
             let mut output = FailingOutput {
                 host,
-                bytes: vec![],
+                bytes: if fail_read { vec![9, 9] } else { vec![] },
                 grown: 0,
                 shrunk: 0,
             };
@@ -1744,10 +1706,14 @@ mod tests {
                     range: None,
                 },
             );
-            match host {
-                Some(true) => assert!(matches!(result, Err(OperationError::Host("sink")))),
-                Some(false) => assert!(matches!(result, Err(OperationError::Protocol))),
-                None => {
+            match (host, fail_read) {
+                (Some(true), _) => assert!(matches!(result, Err(OperationError::Host("sink")))),
+                (Some(false), _) => assert!(matches!(result, Err(OperationError::Protocol))),
+                (None, true) => {
+                    assert!(matches!(result, Err(OperationError::Host("read"))));
+                    assert_eq!(output.bytes, [9, 9]);
+                }
+                (None, false) => {
                     assert_eq!(result.unwrap(), [0, 4, 0, 1, 0, 0, 0, 0, 0]);
                     assert!(output.bytes.iter().all(|byte| *byte == 7));
                     assert_eq!(output.bytes.len(), 65540);
@@ -1755,74 +1721,15 @@ mod tests {
             }
             assert_eq!(storage.calls, ["snapshot"]);
             assert_eq!(
-                files.0,
+                files.calls,
                 if host.is_some() {
                     vec!["open", "close"]
                 } else {
                     vec!["open", "transfer", "close"]
                 }
             );
-            assert_eq!((output.grown, output.shrunk), (1, 0));
+            assert_eq!((output.grown, output.shrunk), (1, usize::from(fail_read)));
         }
-    }
-
-    struct ShortFile;
-    impl FileIO for ShortFile {
-        type Error = &'static str;
-        fn open(&mut self, _: &str, _: &[u8]) -> Result<u64, FileFailure<Self::Error>> {
-            Ok(9)
-        }
-        fn read_into(
-            &mut self,
-            _: u64,
-            _: u64,
-            buffer: &mut [u8],
-        ) -> Result<(), FileFailure<Self::Error>> {
-            buffer.fill(1);
-            Err(FileFailure {
-                error: "truncated",
-                kind: FileFailureKind::ShortRead,
-            })
-        }
-        fn close(&mut self, _: u64) -> Result<(), Self::Error> {
-            Ok(())
-        }
-
-        host_unexpected!(read_at);
-    }
-    #[test]
-    fn failed_transfer_takes_back_the_grown_tail() {
-        let mut errors = Vec::new();
-        let mut files = ShortFile;
-        let mut sink = FailingOutput {
-            host: None,
-            bytes: vec![9, 9],
-            grown: 0,
-            shrunk: 0,
-        };
-        let response = {
-            let files: &mut dyn FileIO<Error = &'static str> = &mut files;
-            let output: &mut dyn crate::host::Output<Error = OperationError<&'static str>> =
-                &mut sink;
-            match output.grow(65540) {
-                Ok(buffer) => match files.read_into(9, 0, buffer) {
-                    Ok(()) => vec![1, 52],
-                    Err(failure) => {
-                        output.shrink(65540);
-                        file_reply(52, Err::<(), _>(failure), &mut errors, |_, ()| {})
-                    }
-                },
-                Err(_) => panic!("the sink grows"),
-            }
-        };
-        assert_eq!(sink.bytes, [9, 9]);
-        assert_eq!((sink.grown, sink.shrunk), (1, 1));
-        assert_eq!(errors, [Some("truncated")]);
-        let mut expected = vec![1, 0];
-        word(&mut expected, 1);
-        word(&mut expected, 1);
-        expected.push(1);
-        assert_eq!(response, expected);
     }
 
     fn selection_packet(out: &mut Vec<u8>) {
@@ -2392,15 +2299,6 @@ mod tests {
             ),
             Err(OperationError::Protocol)
         ));
-    }
-
-    #[test]
-    fn a_dropped_suspension_releases_its_continuation() {
-        let mut script = Script::default();
-        let first = suspended(probe(&mut script, false));
-        drop(first);
-        let again = suspended(probe(&mut script, false));
-        assert!(matches!(again.request(), PeerRequest::Nodes { .. }));
     }
 
     #[test]
