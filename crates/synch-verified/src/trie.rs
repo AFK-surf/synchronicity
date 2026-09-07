@@ -982,6 +982,30 @@ pub fn scan<S: ByteStorage>(
     walked(storage, resources, &command)
 }
 
+/// Check a publisher's entire unresolved scope boundary in Lean. Missing
+/// nodes and exhausted work bounds fail instead of certifying authorization.
+pub fn first_outside<S: ByteStorage>(
+    storage: &mut S,
+    redaction: &mut dyn crate::host::Redaction<Error = S::Error>,
+    root: &[u8; 32],
+    prefixes: Option<&[Vec<u8>]>,
+    exact: &[Vec<u8>],
+) -> Result<Option<Vec<u8>>, WalkError<S::Error>> {
+    walked(
+        storage,
+        WalkResources {
+            redaction,
+            digest: None,
+            apply: None,
+        },
+        &Command::TrieFirstOutside {
+            root: root.to_vec(),
+            prefixes: prefixes.map(<[Vec<u8>]>::to_vec),
+            exact: exact.to_vec(),
+        },
+    )
+}
+
 /// Every differing key between two roots, in key order, each with its old
 /// and new value references. A value is compared as a value: inline bytes
 /// and the address of the same bytes out of line are one value.

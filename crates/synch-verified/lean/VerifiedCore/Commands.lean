@@ -15,6 +15,7 @@ import VerifiedCore.Cas.Project
 import VerifiedCore.Trie.Serve
 import VerifiedCore.Trie.Collect
 import VerifiedCore.Trie.Walk
+import VerifiedCore.Trie.ScopeCheck
 import VerifiedCore.Trie.Diff
 import VerifiedCore.Trie.Proof
 import VerifiedCore.Trie.Complete
@@ -174,6 +175,9 @@ inductive Command where
   | casBlobIn (tx : UInt64) (root : ByteArray)
   /-- Select the next bounded batch of eligible peers in cyclic order. -/
   | planContact (peers : List ByteArray) (cursor : Option ByteArray) (maximum : UInt64)
+
+  /-- Check that a confined publisher introduces no entries outside its grant. -/
+  | trieFirstOutside (root : ByteArray) (prefixes : Option (List ByteArray)) (exact : List ByteArray)
 
 /-- Malformed metadata or a column of the wrong storage class, as pin
 acquisition and deletion report it. -/

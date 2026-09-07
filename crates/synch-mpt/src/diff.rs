@@ -31,17 +31,6 @@ pub struct Change {
     pub new: Option<ValueRef>,
 }
 
-impl Change {
-    /// Classifies the change.
-    pub fn kind(&self) -> ChangeKind {
-        match (&self.old, &self.new) {
-            (None, Some(_)) => ChangeKind::Added,
-            (Some(_), None) => ChangeKind::Deleted,
-            _ => ChangeKind::Changed,
-        }
-    }
-}
-
 impl<S: NodeStore + ?Sized> Trie<'_, S> {
     /// Diffs two roots, returning one [`Change`] per differing key in
     /// lexicographic key order.
@@ -73,34 +62,12 @@ impl<S: NodeStore + ?Sized> Trie<'_, S> {
         .collect()
     }
 
-    /// Diffs two roots and resolves every value to bytes.
-    ///
-    /// Materializes the whole set, which is what makes it the wrong shape for
-    /// applying a promotion: see [`Trie::for_each_resolved_change_scoped`].
-    pub fn diff_resolved(
-        &self,
-        old_root: Hash,
-        new_root: Hash,
-    ) -> Result<Vec<ResolvedChange>, MptError> {
-        self.diff(old_root, new_root)?
-            .into_iter()
-            .map(|c| {
-                Ok(ResolvedChange {
-                    old: c.old.as_ref().map(|v| self.resolve(v)).transpose()?,
-                    new: c.new.as_ref().map(|v| self.resolve(v)).transpose()?,
-                    key: c.key,
-                })
-            })
-            .collect()
-    }
-
     /// Streams the diff, resolving one value at a time, and reports how many
     /// changes were handed over.
     ///
-    /// This is what a head promotion applies, and the difference from
-    /// [`Trie::diff_resolved`] is a bound rather than a style: the walk ceiling
-    /// bounds positions, not the bytes hanging off them — six canonical nodes
-    /// describe 65 536 positions — so collecting `Vec<ResolvedChange>` meant
+    /// This is what a head promotion applies. The walk ceiling bounds
+    /// positions, not the bytes hanging off them — six canonical nodes
+    /// describe 65 536 positions — so collecting fully resolved changes meant
     /// resolving one large payload once per position, into memory, inside the
     /// transaction the flip runs in. An allocation failure there aborts rather
     /// than returning `Err`, so §12's per-origin containment never runs, and
@@ -168,28 +135,6 @@ pub struct ChangeView<'a> {
     pub kind: ChangeKind,
     /// The value under the new root, absent for a deletion.
     pub new: Option<&'a [u8]>,
-}
-
-/// A [`Change`] with both sides resolved to bytes.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub struct ResolvedChange {
-    /// The key.
-    pub key: Vec<u8>,
-    /// The value under the old root, if any.
-    pub old: Option<Vec<u8>>,
-    /// The value under the new root, if any.
-    pub new: Option<Vec<u8>>,
-}
-
-impl ResolvedChange {
-    /// Classifies the change.
-    pub fn kind(&self) -> ChangeKind {
-        match (&self.old, &self.new) {
-            (None, Some(_)) => ChangeKind::Added,
-            (Some(_), None) => ChangeKind::Deleted,
-            _ => ChangeKind::Changed,
-        }
-    }
 }
 
 #[cfg(test)]

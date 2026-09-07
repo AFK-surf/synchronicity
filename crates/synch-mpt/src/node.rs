@@ -25,16 +25,6 @@ pub enum ValueRef {
     Hash(Hash),
 }
 
-impl ValueRef {
-    /// The out-of-line value hash, if this reference is not inline.
-    pub(crate) fn out_of_line(&self) -> Option<Hash> {
-        match self {
-            ValueRef::Inline(_) => None,
-            ValueRef::Hash(h) => Some(*h),
-        }
-    }
-}
-
 /// A node of the radix-16 Merkle-Patricia Trie.
 // A branch carries 16 optional hashes and is therefore much larger than a leaf
 // or an extension. Boxing it would add an allocation to every node load and
@@ -52,8 +42,8 @@ pub enum TrieNode {
     /// A path-compression node: a shared nibble prefix above a branch.
     ///
     /// Invariant: `prefix` is non-empty and `child` is always a
-    /// [`TrieNode::Branch`]; an extension above anything else would have been
-    /// merged during canonicalization.
+    /// [`TrieNode::Branch`] or [`TrieNode::Route`]; other adjacent compressed
+    /// nodes are merged during canonicalization.
     Ext {
         /// The shared nibble prefix.
         prefix: Nibbles,
@@ -155,20 +145,6 @@ impl TrieNode {
                 crate::lean_storage::refusal_error(refusal),
             )),
             NodeVerdict::PeerFault => Ok(Verdict::PeerFault),
-        }
-    }
-
-    /// The hashes of any out-of-line values this node references.
-    pub fn value_hashes(&self) -> Vec<Hash> {
-        match self {
-            TrieNode::Route { value, .. } => value.iter().copied().collect(),
-            TrieNode::Leaf { value, .. } => value.out_of_line().into_iter().collect(),
-            TrieNode::Ext { .. } => Vec::new(),
-            TrieNode::Branch { value, .. } => value
-                .as_ref()
-                .and_then(ValueRef::out_of_line)
-                .into_iter()
-                .collect(),
         }
     }
 

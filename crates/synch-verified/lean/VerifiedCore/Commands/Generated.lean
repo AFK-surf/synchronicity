@@ -655,6 +655,7 @@ instance : Encode Commands.Command where
     | .trieNormalize a0 => out.push 47 |>.put a0
     | .casBlobIn a0 a1 => out.push 48 |>.put a0 |>.put a1
     | .planContact a0 a1 a2 => out.push 49 |>.put a0 |>.put a1 |>.put a2
+    | .trieFirstOutside a0 a1 a2 => out.push 50 |>.put a0 |>.put a1 |>.put a2
 
 instance : Decode Commands.Command where
   decode := do
@@ -709,6 +710,7 @@ instance : Decode Commands.Command where
     | 47 => return .trieNormalize (← Decode.decode)
     | 48 => return .casBlobIn (← Decode.decode) (← Decode.decode)
     | 49 => return .planContact (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 50 => return .trieFirstOutside (← Decode.decode) (← Decode.decode) (← Decode.decode)
     | _ => throw ()
 
 end VerifiedCore

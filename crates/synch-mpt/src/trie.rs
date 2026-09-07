@@ -2,12 +2,7 @@
 
 use synch_core::{Hash, OriginId, MAX_KEY_LEN};
 
-use crate::{
-    error::MptError,
-    node::{TrieNode, ValueRef},
-    scope::Scope,
-    store::NodeStore,
-};
+use crate::{error::MptError, scope::Scope, store::NodeStore};
 
 /// How deep, in nibbles, any walk over trie structure descends.
 ///
@@ -41,15 +36,6 @@ pub const MAX_DEPTH_NIBBLES: usize = MAX_KEY_LEN * 2;
 /// refusal names.
 pub(crate) const WALK_POSITION_CEILING: usize = 8_000_000;
 
-/// Maps the empty-trie sentinel onto `None`.
-pub(crate) fn root_opt(root: Hash) -> Option<Hash> {
-    if root.is_empty_sentinel() {
-        None
-    } else {
-        Some(root)
-    }
-}
-
 /// A key/value pair as yielded by iteration and range scans.
 pub type Entry = (Vec<u8>, Vec<u8>);
 
@@ -71,26 +57,6 @@ impl<'a, S: NodeStore + ?Sized> Trie<'a, S> {
     /// The underlying store.
     pub fn store(&self) -> &'a S {
         self.store
-    }
-
-    fn wrap<T>(r: Result<T, S::Error>) -> Result<T, MptError> {
-        r.map_err(MptError::store)
-    }
-
-    /// Reads a node's bytes without requiring it to be present, for the walks
-    /// whose whole purpose is finding out whether it is.
-    pub(crate) fn load_raw(&self, hash: &Hash) -> Result<Option<Vec<u8>>, MptError> {
-        Self::wrap(self.store.get_node(hash))
-    }
-
-    /// Resolves a value reference into bytes, fetching out-of-line payloads.
-    pub fn resolve(&self, value: &ValueRef) -> Result<Vec<u8>, MptError> {
-        match value {
-            ValueRef::Inline(bytes) => Ok(bytes.clone()),
-            ValueRef::Hash(h) => {
-                Self::wrap(self.store.get_value(h))?.ok_or(MptError::MissingValue(*h))
-            }
-        }
     }
 
     // ---- reads ------------------------------------------------------------
@@ -287,7 +253,7 @@ impl<'a, S: NodeStore + ?Sized> Trie<'a, S> {
         crate::lean_storage::complete(self.store, owner, root, scope)
     }
 
-    /// The first key under `root` that `scope` does not admit, if there is one.
+    /// An occupied position outside the publisher's scope, if there is one.
     ///
     /// The publish-scope question (§3.5): a delegated origin's trie must hold
     /// nothing outside its granted spaces, and a head whose trie does is
@@ -298,86 +264,123 @@ impl<'a, S: NodeStore + ?Sized> Trie<'a, S> {
     /// prefix cannot lead out of it, so its subtree is skipped — and visits on
     /// the order of trie depth times the number of granted prefixes.
     ///
-    /// An absent node stops that branch rather than raising. The caller
-    /// relies on its completeness check; this is not an independent check
-    /// that every shared entry is present.
+    /// Lean owns the bounded walk and scope decisions. A missing unresolved
+    /// node fails the check. Granted subtrees are skipped, so this does not
+    /// independently establish completeness or provenance.
     pub fn first_key_outside(
         &self,
         root: Hash,
         scope: &Scope,
     ) -> Result<Option<Vec<u8>>, MptError> {
-        if scope.is_full() {
-            return Ok(None);
-        }
-        let mut stack = match root_opt(root) {
-            None => return Ok(None),
-            Some(hash) => vec![(hash, Vec::<u8>::new())],
-        };
-        while let Some((hash, path)) = stack.pop() {
-            if scope.contains_subtree(&path) {
-                continue;
-            }
-            let Some(data) = self.load_raw(&hash)? else {
-                continue;
-            };
-            match TrieNode::decode(&data)? {
-                TrieNode::Leaf { key_rest, .. } => {
-                    let mut key = path;
-                    key.extend_from_slice(key_rest.as_slice());
-                    if !scope.admits_key_path(&key) {
-                        return Ok(Some(key));
-                    }
-                }
-                TrieNode::Ext { prefix, child } => {
-                    let mut child_path = path;
-                    child_path.extend_from_slice(prefix.as_slice());
-                    if !scope.admits_path(&child_path) {
-                        return Ok(Some(child_path));
-                    }
-                    stack.push((child, child_path));
-                }
-                TrieNode::Branch { children, value } => {
-                    // A branch may itself carry a value, and that value's key
-                    // is the branch's own position.
-                    if value.is_some() && !scope.admits_key_path(&path) {
-                        return Ok(Some(path.clone()));
-                    }
-                    for (slot, child) in children.iter().enumerate() {
-                        let Some(child) = child else { continue };
-                        let mut child_path = path.clone();
-                        child_path.push(slot as u8);
-                        if !scope.admits_path(&child_path) {
-                            return Ok(Some(child_path));
-                        }
-                        stack.push((*child, child_path));
-                    }
-                }
-                TrieNode::Route { children, value } => {
-                    // A branch may itself carry a value, and that value's key
-                    // is the branch's own position.
-                    if value.is_some() && !scope.admits_key_path(&path) {
-                        return Ok(Some(path.clone()));
-                    }
-                    for (slot, child) in children.iter().enumerate() {
-                        let Some(child) = child else { continue };
-                        let mut child_path = path.clone();
-                        child_path.push(slot as u8);
-                        if !scope.admits_path(&child_path) {
-                            return Ok(Some(child_path));
-                        }
-                        stack.push((*child, child_path));
-                    }
-                }
-            }
-        }
-        Ok(None)
+        synch_verified::trie::first_outside(
+            &mut crate::lean_storage::Bytes(self.store),
+            &mut crate::lean_storage::Redactions(self.store),
+            root.as_bytes(),
+            scope.prefixes(),
+            scope.exact(),
+        )
+        .map_err(crate::lean_storage::walk_error)
     }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::store::MemStore;
+    use crate::{store::MemStore, ValueRef};
+
+    #[test]
+    fn publication_scope_exact_keys_do_not_authorize_longer_or_shorter_keys() {
+        let store = MemStore::new();
+        let trie = Trie::new(&store);
+        let scope = Scope::of(&synch_core::ScopeKeys {
+            prefixes: vec![],
+            exact: vec![b"m:space/photos".to_vec(), b"m:self".to_vec()],
+        });
+        let root = trie
+            .insert(Hash::EMPTY, b"m:space/photos", b"allowed")
+            .unwrap();
+        let root = trie.insert(root, b"m:self", b"allowed too").unwrap();
+        for routed in [false, true] {
+            let root = if routed {
+                trie.normalize_publication(root).unwrap()
+            } else {
+                root
+            };
+            assert_eq!(trie.first_key_outside(root, &scope).unwrap(), None);
+            for key in [b"m:space/photos-raw".as_slice(), b"m:selfie", b"m:", b""] {
+                let wider = trie.insert(root, key, b"private").unwrap();
+                assert!(
+                    trie.first_key_outside(wider, &scope).unwrap().is_some(),
+                    "unauthorized key {key:?} was accepted (routed={routed})"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn publication_scope_missing_boundary_is_not_a_certificate() {
+        let store = MemStore::new();
+        let trie = Trie::new(&store);
+        let scope = Scope::of(&synch_core::ScopeKeys {
+            prefixes: vec![b"f:photos/".to_vec()],
+            exact: vec![],
+        });
+        let missing = Hash::new(b"missing boundary");
+        assert!(matches!(
+            trie.first_key_outside(missing, &scope),
+            Err(MptError::MissingNode(_))
+        ));
+        assert_eq!(trie.first_key_outside(Hash::EMPTY, &scope).unwrap(), None);
+        assert_eq!(
+            trie.first_key_outside(missing, &Scope::full()).unwrap(),
+            None
+        );
+
+        // Once the entire subtree is granted its bytes are irrelevant to this
+        // authorization check; completeness is checked separately.
+        let node = crate::TrieNode::Ext {
+            prefix: crate::Nibbles::from_bytes(b"f:photos/"),
+            child: missing,
+        };
+        store.put_node(&node.hash(), &node.encode()).unwrap();
+        assert_eq!(trie.first_key_outside(node.hash(), &scope).unwrap(), None);
+    }
+
+    #[test]
+    fn publication_scope_empty_grant_rejects_nonempty_publication() {
+        let store = MemStore::new();
+        let trie = Trie::new(&store);
+        let scope = Scope::of(&synch_core::ScopeKeys::default());
+        assert_eq!(trie.first_key_outside(Hash::EMPTY, &scope).unwrap(), None);
+        for key in [b"".as_slice(), b"f:photos/a.jpg"] {
+            let root = trie.insert(Hash::EMPTY, key, b"value").unwrap();
+            assert!(trie.first_key_outside(root, &scope).unwrap().is_some());
+        }
+    }
+
+    #[test]
+    fn publication_scope_does_not_certify_a_branch_beyond_the_key_limit() {
+        let store = MemStore::new();
+        let trie = Trie::new(&store);
+        let leaf = crate::TrieNode::Leaf {
+            key_rest: crate::Nibbles::from_nibbles(&[0, 0]),
+            value: ValueRef::Inline(b"too deep".to_vec()),
+        };
+        store.put_node(&leaf.hash(), &leaf.encode()).unwrap();
+        let root = crate::TrieNode::Ext {
+            prefix: crate::Nibbles::from_bytes(&vec![0; MAX_KEY_LEN]),
+            child: leaf.hash(),
+        };
+        store.put_node(&root.hash(), &root.encode()).unwrap();
+        let scope = Scope::of(&synch_core::ScopeKeys {
+            prefixes: vec![],
+            exact: vec![vec![0; MAX_KEY_LEN + 1]],
+        });
+        assert!(matches!(
+            trie.first_key_outside(root.hash(), &scope),
+            Err(MptError::NonCanonical(_))
+        ));
+    }
 
     /// A delegated origin publishing outside its spaces is caught, by walking
     /// the spine rather than the trie (§3.5).
@@ -399,7 +402,6 @@ mod tests {
         let root = trie.insert(root, b"f:finance/q3.pdf", b"x").unwrap();
         let offending = trie.first_key_outside(root, &scope).unwrap();
         assert!(offending.is_some(), "an out-of-scope key went unnoticed");
-        assert!(!scope.admits_path(&offending.unwrap()));
 
         // A full scope has nothing to find, however the trie is shaped.
         assert_eq!(trie.first_key_outside(root, &Scope::full()).unwrap(), None);

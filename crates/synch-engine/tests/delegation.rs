@@ -359,10 +359,10 @@ async fn a_withheld_node_cannot_be_reached_by_claiming_a_position_for_it() {
     );
     let root = issuer.root();
 
-    let scope = Scope::of(&synch_core::scope_prefixes(&["photos".to_string()]));
+    let finance = synch_mpt::Nibbles::from_bytes(b"f:finance/");
     let withheld: Vec<Hash> = walk_all(issuer.store.as_ref(), root)
         .into_iter()
-        .filter(|(path, _)| !scope.admits_path(path))
+        .filter(|(path, _)| path.starts_with(finance.as_slice()))
         .map(|(_, hash)| hash)
         .collect();
     assert!(
@@ -374,10 +374,6 @@ async fn a_withheld_node_cannot_be_reached_by_claiming_a_position_for_it() {
     let bogus = synch_mpt::Nibbles::from_bytes(b"f:photos/\xde\xad\xbe\xef")
         .as_slice()
         .to_vec();
-    assert!(
-        scope.admits_path(&bogus),
-        "the position must pass the scope test"
-    );
 
     let client = connect(&delegate, &issuer).await;
     for hash in &withheld {
@@ -428,10 +424,10 @@ async fn a_delegate_cannot_authorize_with_its_own_root_or_name() {
 
     // A node of the issuer's trie the delegate is not entitled to — a hash it
     // knows honestly, from a branch the signed root recomputes through.
-    let scope = Scope::of(&synch_core::scope_prefixes(&["photos".to_string()]));
+    let finance = synch_mpt::Nibbles::from_bytes(b"f:finance/");
     let withheld_node = walk_all(issuer.store.as_ref(), issuer.root())
         .into_iter()
-        .find(|(path, _)| !scope.admits_path(path))
+        .find(|(path, _)| path.starts_with(finance.as_slice()))
         .map(|(_, hash)| hash)
         .expect("the issuer withholds something; test is vacuous");
 
@@ -622,22 +618,29 @@ async fn a_value_is_refused_by_the_coverage_of_the_node_that_holds_it() {
     // The node that carries the withheld payload, at a position the delegate's
     // scope admits: the spine. That pairing is the whole attack — an admitted
     // position holding a node whose coverage is not admitted.
-    let scope = Scope::of(&synch_core::scope_prefixes(&["photos".to_string()]));
     let withheld = Hash::new(&record);
     let (path, _) = walk_all(issuer.store.as_ref(), root)
         .into_iter()
-        .find(|(path, hash)| {
-            scope.admits_path(path)
-                && synch_mpt::NodeStore::get_node(issuer.store.as_ref(), hash)
-                    .unwrap()
-                    .map(|bytes| {
-                        synch_mpt::TrieNode::decode(&bytes)
-                            .map(|n| n.value_hashes().contains(&withheld))
-                            .unwrap_or(false)
-                    })
-                    .unwrap_or(false)
+        .find(|(_, hash)| {
+            synch_mpt::NodeStore::get_node(issuer.store.as_ref(), hash)
+                .unwrap()
+                .map(|bytes| {
+                    synch_mpt::TrieNode::decode(&bytes)
+                        .map(|n| {
+                            matches!(n, synch_mpt::TrieNode::Leaf {
+                            value: synch_mpt::ValueRef::Hash(hash), ..
+                        } if hash == withheld)
+                        })
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false)
         })
-        .expect("the withheld value sits at no admitted position; test is vacuous");
+        .expect("the withheld value has no carrying node; test is vacuous");
+    assert_eq!(
+        path,
+        synch_mpt::Nibbles::from_bytes(b"m").as_slice(),
+        "the private manifest must sit on the shared m: spine"
+    );
 
     let client = connect(&delegate, &issuer).await;
     let answer = client

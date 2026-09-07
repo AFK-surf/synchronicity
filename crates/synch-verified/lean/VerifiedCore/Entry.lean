@@ -316,6 +316,9 @@ def dispatch : Command → Native
   | .trieMemoKey root prefixes exact owner =>
     if root.size != 32 then protocol
     else command (Trie.Memo.keyFor (E := Host.Digest) id ⟨prefixes, exact⟩ root owner) hostOnly
+  | .trieFirstOutside root prefixes exact =>
+    if root.size != 32 then protocol
+    else command (Trie.ScopeCheck.firstOutside root ⟨prefixes, exact⟩) walking
   | .trieScan root keyPrefix startAfter limit =>
     if root.size != 32 then protocol
     else command (Trie.Walk.scan (E := Trie.Walk.Effects) root keyPrefix startAfter limit) walking

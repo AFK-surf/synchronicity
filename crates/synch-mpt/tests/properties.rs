@@ -110,26 +110,31 @@ proptest! {
             root_b = trie.remove(root_b, k).unwrap();
         }
 
-        let changes = trie.diff_resolved(root_a, root_b).unwrap();
+        let mut changes = Vec::new();
+        trie.for_each_resolved_change_scoped::<synch_mpt::MptError, _>(
+            root_a, root_b, &synch_mpt::Scope::full(), |change| {
+                changes.push((change.key.to_vec(), change.kind, change.new.map(<[u8]>::to_vec)));
+                Ok(())
+            },
+        ).unwrap();
 
         // Applying the diff to `a` must yield exactly `b`.
         let mut replayed = root_a;
-        for change in &changes {
-            replayed = match &change.new {
-                Some(v) => trie.insert(replayed, &change.key, v).unwrap(),
-                None => trie.remove(replayed, &change.key).unwrap(),
+        for (key, _, new) in &changes {
+            replayed = match new {
+                Some(v) => trie.insert(replayed, key, v).unwrap(),
+                None => trie.remove(replayed, key).unwrap(),
             };
         }
         prop_assert_eq!(replayed, root_b);
 
         // And the diff must be minimal: every reported key really differs.
-        for change in &changes {
-            let before = trie.get(root_a, &change.key).unwrap();
-            let after = trie.get(root_b, &change.key).unwrap();
+        for (key, kind, new) in &changes {
+            let before = trie.get(root_a, key).unwrap();
+            let after = trie.get(root_b, key).unwrap();
             prop_assert_ne!(&before, &after);
-            prop_assert_eq!(&before, &change.old);
-            prop_assert_eq!(&after, &change.new);
-            match change.kind() {
+            prop_assert_eq!(&after, new);
+            match kind {
                 ChangeKind::Added => prop_assert!(before.is_none() && after.is_some()),
                 ChangeKind::Deleted => prop_assert!(before.is_some() && after.is_none()),
                 ChangeKind::Changed => prop_assert!(before.is_some() && after.is_some()),
@@ -137,7 +142,7 @@ proptest! {
         }
 
         // Nothing outside the diff may have changed.
-        let keys_in_diff: std::collections::BTreeSet<&Vec<u8>> = changes.iter().map(|c| &c.key).collect();
+        let keys_in_diff: std::collections::BTreeSet<&Vec<u8>> = changes.iter().map(|(key, _, _)| key).collect();
         for (k, v) in trie.iter(root_a).unwrap() {
             if !keys_in_diff.contains(&k) {
                 prop_assert_eq!(trie.get(root_b, &k).unwrap(), Some(v));

@@ -60,6 +60,7 @@ fn main() {
         "Trie/Memo",
         "Trie/Collect",
         "Trie/Walk",
+        "Trie/ScopeCheck",
         "Trie/Diff",
         "Trie/Proof",
         "Trie/Missing",

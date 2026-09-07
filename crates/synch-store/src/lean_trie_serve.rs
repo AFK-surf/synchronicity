@@ -441,19 +441,18 @@ mod tests {
             }
         );
 
-        // A position the grant does not admit is refused whatever hash is
-        // claimed there, and an admitted position that holds nothing cannot
-        // be talked into holding the withheld hash.
+        // Nodes withheld from the actual scoped fetch remain unavailable
+        // when requested directly or under a fabricated granted position.
         let withheld: Vec<&(Vec<u8>, Hash)> = unscoped
             .iter()
-            .filter(|(path, _)| !scope.admits_path(path))
+            .filter(|(_, hash)| copy.get_node(hash).unwrap().is_none())
             .collect();
         assert!(!withheld.is_empty());
         for (path, hash) in &withheld {
             let (nodes, missing, _) = store
                 .serve_trie_nodes(&delegate, &root, &[(path.clone(), *hash)])
                 .unwrap();
-            assert!(nodes.is_empty(), "an out-of-scope position was served");
+            assert!(nodes.is_empty(), "a withheld fixture node was served");
             assert_eq!(missing, vec![*hash]);
             let inside = Nibbles::from_bytes(b"f:photos/nothing-here")
                 .as_slice()

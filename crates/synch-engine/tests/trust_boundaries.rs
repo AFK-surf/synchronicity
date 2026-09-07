@@ -3,7 +3,7 @@
 
 use synch_core::{delegation_key, file_key, now_ns, Delegation, Hash, NodeId, SignedHead};
 use synch_engine::{reconcile::HeadOutcome, FetchOutcome, Syncer};
-use synch_mpt::{NodeStore, Scope, Trie, TrieNode};
+use synch_mpt::{NodeStore, Trie, TrieNode};
 use synch_store::Slot;
 
 mod common;
@@ -115,7 +115,6 @@ async fn a_delegate_cannot_launder_a_withheld_subtree_through_its_own_trie() {
         ],
     );
     let issuer_root = issuer.root();
-    let scope = Scope::of(&synch_core::scope_prefixes(&["photos".to_string()]));
 
     // The withheld Branch under `f:finance`, and where it sits: the grafter
     // learns the hash honestly from the spine, never its contents.
@@ -125,8 +124,7 @@ async fn a_delegate_cannot_launder_a_withheld_subtree_through_its_own_trie() {
     let (withheld_path, withheld_branch) = walk_all(&issuer.store, issuer_root)
         .into_iter()
         .find(|(path, hash)| {
-            !scope.admits_path(path)
-                && path.starts_with(&finance)
+            path.starts_with(&finance)
                 && matches!(
                     TrieNode::decode(&issuer.store.get_node(hash).unwrap().unwrap()).unwrap(),
                     TrieNode::Branch { .. }

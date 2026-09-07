@@ -4,8 +4,8 @@
 //! is: a hash cannot carry it — the hash of a redacted subtree sits inside the
 //! branch node that makes the root verify, and position cannot be recovered
 //! from a hash because structural sharing lets one node sit under several
-//! prefixes — so both sides of a fetch work in nibble paths, and this is the
-//! predicate they share.
+//! prefixes — so both sides of a fetch work in nibble paths, and Lean owns the
+//! predicates and complete operations that enforce this scope.
 //!
 //! Redaction itself is free: a branch node already carries all sixteen child
 //! hashes, so withholding a subtree means declining to send its nodes, and the
@@ -73,65 +73,6 @@ impl Scope {
         &self.exact
     }
 
-    /// True if a node sitting at nibble `path` may be served.
-    ///
-    /// A node at `path` commits to every key beginning with `path`, so it is
-    /// in scope as an ancestor of an allowed prefix or inside one. Both
-    /// directions matter: the ancestors are the spine that makes the signed
-    /// root recompute.
-    // The executable Lean predicate is `Trie.Serve.Scope.admitsPath`;
-    // `TrieServeProofs.admitsPath_of_append` proves its spine property.
-    pub fn admits_path(&self, path: &[u8]) -> bool {
-        match &self.prefixes {
-            None => true,
-            Some(prefixes) => {
-                prefixes
-                    .iter()
-                    .any(|p| p.starts_with(path) || path.starts_with(p.as_slice()))
-                    // An exact key admits the spine down to it and the key
-                    // itself — never a position *below* it, which would be a
-                    // longer key the scope does not cover.
-                    || self.exact.iter().any(|k| k.starts_with(path))
-            }
-        }
-    }
-
-    /// True if everything below `path` is inside this scope.
-    ///
-    /// Once a position sits inside a granted prefix, no descent below it can
-    /// leave — which lets a scope check stop at the boundary. Exact keys are
-    /// deliberately absent: a subtree at an exact key may hold longer keys
-    /// extending it, and those are outside.
-    // The executable Lean predicate is `Trie.Serve.Scope.containsSubtree`;
-    // `TrieServeProofs.containsSubtree_append` is the stop-at-the-
-    // boundary property.
-    pub fn contains_subtree(&self, path: &[u8]) -> bool {
-        match &self.prefixes {
-            None => true,
-            Some(prefixes) => prefixes.iter().any(|p| path.starts_with(p.as_slice())),
-        }
-    }
-
-    /// True if a key, given as a full nibble path, lies inside this scope.
-    pub(crate) fn admits_key_path(&self, key: &[u8]) -> bool {
-        self.contains_subtree(key) || self.exact.iter().any(|k| k == key)
-    }
-
-    /// True if a whole byte key lies inside this scope.
-    ///
-    /// Stricter than [`Scope::admits_path`]: a key is a leaf position, so
-    /// being an ancestor of an allowed prefix is not enough — `f:` is on the
-    /// spine of every space, and is nobody's key. Production admission works
-    /// in nibbles (`admits_key_path`); this byte-key form is what the tests
-    /// below state the rules through.
-    #[cfg(test)]
-    pub(crate) fn admits_key(&self, key: &[u8]) -> bool {
-        match self.prefixes {
-            None => true,
-            Some(_) => self.admits_key_path(Nibbles::from_bytes(key).as_slice()),
-        }
-    }
-
     /// The key a completeness answer for `root` may be memoized under.
     ///
     /// "Do I hold all of this?" is a question about a root *and* a scope: a
@@ -173,74 +114,6 @@ mod tests {
 
     fn path(bytes: &[u8]) -> Vec<u8> {
         Nibbles::from_bytes(bytes).as_slice().to_vec()
-    }
-
-    #[test]
-    fn scope_extremes_admit_or_grant_nothing() {
-        let scope = Scope::full();
-        assert!(scope.is_full());
-        assert!(scope.admits_path(&path(b"anything")));
-        assert!(scope.admits_key(b"f:finance/q3.pdf"));
-
-        let scope = Scope::of(&synch_core::ScopeKeys::default());
-        assert!(!scope.is_full());
-        assert!(!scope.admits_path(&[]));
-        assert!(!scope.admits_key(b"f:photos/a.jpg"));
-    }
-
-    #[test]
-    fn the_spine_is_admitted_and_the_sibling_is_not() {
-        let scope = Scope::of(&synch_core::ScopeKeys {
-            prefixes: vec![b"f:photos/".to_vec()],
-            exact: Vec::new(),
-        });
-        // The root and everything above the granted subtree: the spine a
-        // scoped peer needs to recompute the signed root.
-        assert!(scope.admits_path(&[]));
-        assert!(scope.admits_path(&path(b"f")));
-        assert!(scope.admits_path(&path(b"f:pho")));
-        // Inside the grant.
-        assert!(scope.admits_path(&path(b"f:photos/2024/")));
-        // The sibling subtree, which is the whole point.
-        assert!(!scope.admits_path(&path(b"f:finance/")));
-        assert!(!scope.admits_key(b"f:finance/q3.pdf"));
-        assert!(scope.admits_key(b"f:photos/a.jpg"));
-    }
-
-    #[test]
-    fn a_spine_position_is_not_a_key() {
-        // `f:` is on the path to every space and is nobody's key: admitting it
-        // as a *path* is what lets the root verify, admitting it as a *key*
-        // would hand over a value the peer was never granted.
-        let scope = Scope::of(&synch_core::ScopeKeys {
-            prefixes: vec![b"f:photos/".to_vec()],
-            exact: Vec::new(),
-        });
-        assert!(scope.admits_path(&path(b"f:")));
-        assert!(!scope.admits_key(b"f:"));
-    }
-
-    /// One space id being a prefix of another must not carry it along.
-    ///
-    /// `f:<space>/` bounds itself with a separator no id may contain, but a
-    /// space's own `m:space/<id>` record does not — as a prefix it would hand
-    /// a delegate of `photos` the record of `photos-raw`, with its entry count
-    /// and absolute local path.
-    #[test]
-    fn an_exact_key_does_not_carry_its_extensions() {
-        let scope = Scope::of(&synch_core::scope_prefixes(&["photos".to_string()]));
-        assert!(scope.admits_key(b"m:space/photos"));
-        assert!(!scope.admits_key(b"m:space/photos-raw"));
-        assert!(!scope.admits_key(b"m:space/photography"));
-        // `m:self` the same way: nothing under it comes with it.
-        assert!(scope.admits_key(b"m:self"));
-        assert!(!scope.admits_key(b"m:selfie"));
-        // The spine down to an exact key is still admitted, or the root would
-        // not recompute.
-        assert!(scope.admits_path(&path(b"m:")));
-        // And `f:` keeps working the way it always did.
-        assert!(scope.admits_key(b"f:photos/a.jpg"));
-        assert!(!scope.admits_key(b"f:photos-raw/a.jpg"));
     }
 
     /// The serving side reads a scope back as exactly what it was built from.
