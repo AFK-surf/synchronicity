@@ -634,4 +634,96 @@ theorem split_leaf_old_prefix (digestWidth : Width d) (shaped : Shaped before)
         · exact Or.inr ⟨tail, newKey.trans newSpelling.symm, rfl, newMeaning⟩
         · exact Or.inl ⟨ownKey.trans oldSpelling.symm, ownMeaning⟩
 
+/-- When the inserted key is a proper prefix of the old key, the actual split
+adds the new ancestor payload and retains the complete old descendant. -/
+theorem split_leaf_new_prefix (digestWidth : Width d) (shaped : Shaped before)
+    (suffixNibbles : Nibbles suffix) (small : suffix.length < 2 ^ 64)
+    (different : suffix ≠ key)
+    (oldValid : ValueOk old) (oldClosed : ∃ bytes, ValueDenotes before.read old bytes)
+    (valueValid : ValueOk value) (valueMeaning : ValueDenotes before.read value bytes)
+    (newEnds : key.drop (commonPrefix suffix key) = [])
+    {position : UInt8} (oldContinues : suffix.drop (commonPrefix suffix key) = position :: tail)
+    (safe : SafeWrites d before (splitLeaf suffix old key value).run)
+    (ran : execute d before (splitLeaf suffix old key value).run = some (.ok root, after)) :
+    RecordsIncluded before.read after.read ∧ Shaped after ∧ root.size = 32 ∧ Closed after.read root ∧
+      ∀ probe result, GraphValue after.read root probe result ↔
+        Overwrite (NodeEntries before.read (.leaf (nibblesOf suffix) old)) key bytes probe result := by
+  have beqDifferent : (suffix == key) = false := beq_eq_false_iff_ne.mpr different
+  simp only [splitLeaf, beqDifferent, Bool.false_eq_true, ↓reduceIte, oldContinues, newEnds] at safe ran
+  have tailNibbles : Nibbles tail := nibbles_tail (oldContinues ▸ nibbles_drop suffixNibbles _)
+  have tailSmall : tail.length < 2 ^ 64 := by
+    have length := congrArg List.length oldContinues
+    simp only [List.length_drop, List.length_cons] at length
+    omega
+  have bound : position.toNat < 16 := by
+    have := nibbles_head (oldContinues ▸ nibbles_drop suffixNibbles _)
+    omega
+  have leafWf : (Node.leaf (nibblesOf tail) old).wf :=
+    ⟨nibblesOf_wf tailNibbles tailSmall, oldValid.1⟩
+  simp only [run_bind] at safe
+  have firstSafe := safe_bind_left _ safe
+  rw [execute_run_bind] at ran
+  cases first : execute d before (put (.leaf (nibblesOf tail) old)).run with
+  | none => simp [first] at ran
+  | some reply =>
+    obtain ⟨reply, middle⟩ := reply
+    cases reply with
+    | error error => simp [first] at ran
+    | ok child =>
+      have restSafe := safe_bind_right _ safe first
+      simp only [bindCont_ok] at restSafe
+      simp only [first] at ran
+      obtain ⟨included, middleShape, childWidth, childClosed, leafEntries⟩ :=
+        put_exact digestWidth shaped leafWf (by simpa [checkInvariants] using oldValid.2)
+          oldClosed firstSafe first
+      have valueAfter : ∃ result, ValueDenotes middle.read value result :=
+        node_closed_preserved (node := .leaf ByteArray.empty value) ⟨bytes, valueMeaning⟩ included
+      have valueSame : ∀ result, ValueDenotes middle.read value result ↔ result = bytes := by
+        intro result
+        have unchanged : ValueDenotes middle.read value result ↔ ValueDenotes before.read value result := by
+          simpa [NodeEntries] using (node_entries_unchanged (node := .leaf ByteArray.empty value)
+            (key := []) (bytes := result) ⟨bytes, valueMeaning⟩ included)
+        rw [unchanged]
+        constructor
+        · intro found
+          cases valueMeaning <;> cases found <;> simp_all
+        · rintro rfl
+          exact valueMeaning
+      have prefixNibbles : Nibbles (key.take (commonPrefix suffix key)) := by
+        rw [← commonPrefix_shared]
+        exact nibbles_take suffixNibbles _
+      have prefixSmall : (key.take (commonPrefix suffix key)).length < 2 ^ 64 := by
+        have := commonPrefix_le_left suffix key
+        simp only [List.length_take]
+        omega
+      obtain ⟨laterIncluded, finalShape, rootWidth, rootClosed, entries⟩ :=
+        branch_one_wrap digestWidth middleShape bound prefixNibbles prefixSmall
+          childWidth childClosed valueValid valueAfter restSafe ran
+      have newSpelling : key.take (commonPrefix suffix key) = key := by
+        have spelling := List.take_append_drop (commonPrefix suffix key) key
+        simpa only [newEnds, List.append_nil] using spelling
+      have oldSpelling : key.take (commonPrefix suffix key) ++ position :: tail = suffix := by
+        rw [← oldContinues]
+        exact commonPrefix_reconstruct suffix key
+      refine ⟨fun space address data admitted held => laterIncluded space address data admitted
+        (included space address data admitted held), finalShape, rootWidth, rootClosed, ?_⟩
+      intro probe result
+      have oldMeaning : NodeEntries before.read (.leaf (nibblesOf suffix) old) =
+          (fun probe result => probe = suffix ∧ ValueDenotes before.read old result) := by
+        funext probe result
+        simp [NodeEntries, nibblesOf, TrieWalkProofs.toList_eq]
+      rw [entries, oldMeaning, distinct_leaf_update different]
+      simp only [valueSame]
+      constructor
+      · rintro (⟨ownKey, ownMeaning⟩ | ⟨below, oldKey, childMeaning⟩)
+        · exact Or.inl ⟨ownKey.trans newSpelling, ownMeaning⟩
+        · have meaning := (leafEntries below result).mp childMeaning
+          simp only [NodeEntries, nibblesOf, TrieWalkProofs.toList_eq] at meaning
+          obtain ⟨rfl, prior⟩ := meaning
+          exact Or.inr ⟨oldKey.trans oldSpelling, prior⟩
+      · rintro (⟨newKey, newMeaning⟩ | ⟨oldKey, oldMeaning⟩)
+        · exact Or.inl ⟨newKey.trans newSpelling.symm, newMeaning⟩
+        · refine Or.inr ⟨tail, oldKey.trans oldSpelling.symm, (leafEntries tail result).mpr ?_⟩
+          simpa [NodeEntries, nibblesOf, TrieWalkProofs.toList_eq] using oldMeaning
+
 end Synchronicity.TrieInsertSemantics
