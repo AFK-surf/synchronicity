@@ -970,4 +970,126 @@ theorem split_leaf_exact (digestWidth : Width d) (shaped : Shaped before)
         exact split_leaf_divergent digestWidth shaped suffixNibbles keyNibbles suffixSmall keySmall same
           oldValid oldClosed valueValid valueMeaning oldRest newRest safe ran
 
+private theorem commonPrefix_appended (segment rest : List UInt8) :
+    commonPrefix segment (segment ++ rest) = segment.length := by
+  induction segment with
+  | nil => simp [commonPrefix]
+  | cons nibble segment ih => simp [commonPrefix, ih]
+
+private theorem overwrite_absent (absent : ∀ result, ¬ inside key result) :
+    Overwrite inside key bytes probe result ↔
+      (probe = key ∧ result = bytes) ∨ inside probe result := by
+  constructor
+  · rintro (fresh | ⟨_, prior⟩)
+    · exact Or.inl fresh
+    · exact Or.inr prior
+  · rintro (fresh | prior)
+    · exact Or.inl fresh
+    · exact Or.inr ⟨fun same => absent result (same ▸ prior), prior⟩
+
+private theorem extension_overwrite (diverges : commonPrefix segment key < segment.length) :
+    Overwrite (NodeEntries store (.extension (nibblesOf segment) child)) key bytes probe result ↔
+      (probe = key ∧ result = bytes) ∨
+        ∃ tail, probe = segment ++ tail ∧ GraphValue store child tail result := by
+  have nonempty : segment ≠ [] := by
+    intro eq
+    subst segment
+    simp at diverges
+  have meaning : NodeEntries store (.extension (nibblesOf segment) child) =
+      (fun probe result => ∃ tail, probe = segment ++ tail ∧ GraphValue store child tail result) := by
+    funext probe result
+    simp [NodeEntries, nibblesOf, TrieWalkProofs.toList_eq, nonempty]
+  rw [meaning]
+  apply overwrite_absent
+  rintro result ⟨tail, spelling, _⟩
+  rw [spelling, commonPrefix_appended] at diverges
+  exact Nat.lt_irrefl _ diverges
+
+private theorem complete_value_exact (included : RecordsIncluded before after)
+    (known : ValueDenotes before value bytes) :
+    ValueDenotes after value result ↔ result = bytes := by
+  have unchanged : ValueDenotes after value result ↔ ValueDenotes before value result := by
+    simpa [NodeEntries] using (node_entries_unchanged (node := .leaf ByteArray.empty value)
+      (key := []) (bytes := result) ⟨bytes, known⟩ included)
+  rw [unchanged]
+  constructor
+  · intro found
+    cases known <;> cases found <;> simp_all
+  · rintro rfl
+    exact known
+
+/-- Splitting a compressed path above its former child adds the requested
+ancestor key and retains every entry beneath the original path. -/
+theorem split_extension_prefix (digestWidth : Width d) (shaped : Shaped before)
+    (segmentNibbles : Nibbles segment) (segmentSmall : segment.length < 2 ^ 64)
+    (childWidth : child.size = 32) (childClosed : Closed before.read child)
+    (valueValid : ValueOk value) (valueMeaning : ValueDenotes before.read value bytes)
+    {position : UInt8} (oldContinues : segment.drop (commonPrefix segment key) = position :: below)
+    (newEnds : key.drop (commonPrefix segment key) = [])
+    (safe : SafeWrites d before (splitExtension segment child key value).run)
+    (ran : execute d before (splitExtension segment child key value).run = some (.ok root, after)) :
+    RecordsIncluded before.read after.read ∧ Shaped after ∧ root.size = 32 ∧ Closed after.read root ∧
+      ∀ probe result, GraphValue after.read root probe result ↔
+        Overwrite (NodeEntries before.read (.extension (nibblesOf segment) child)) key bytes probe result := by
+  have operation : splitExtension segment child key value = (do
+      let down ← wrapInExtension below child
+      let branch ← put (.branch (setChild emptyChildren position (some down)) (some value))
+      wrapInExtension (key.take (commonPrefix segment key)) branch) := by
+    simp only [splitExtension, oldContinues, newEnds, wrapInExtension]
+    split <;> rfl
+  rw [operation] at safe ran
+  have belowNibbles := nibbles_tail (oldContinues ▸ nibbles_drop segmentNibbles _)
+  have length := congrArg List.length oldContinues
+  simp only [List.length_drop, List.length_cons] at length
+  have belowSmall : below.length < 2 ^ 64 := by omega
+  have diverges : commonPrefix segment key < segment.length := by omega
+  have bound : position.toNat < 16 := by
+    have := nibbles_head (oldContinues ▸ nibbles_drop segmentNibbles _)
+    omega
+  simp only [run_bind] at safe
+  have firstSafe := safe_bind_left _ safe
+  rw [execute_run_bind] at ran
+  cases first : execute d before (wrapInExtension below child).run with
+  | none => simp [first] at ran
+  | some reply =>
+    obtain ⟨reply, middle⟩ := reply
+    cases reply with
+    | error error => simp [first] at ran
+    | ok down =>
+      have restSafe := safe_bind_right _ safe first
+      simp only [bindCont_ok] at restSafe
+      simp only [first] at ran
+      obtain ⟨included, middleShape, downWidth, downClosed, downEntries⟩ :=
+        wrap_exact digestWidth shaped belowNibbles belowSmall childWidth childClosed firstSafe first
+      have ownMeaning : ValueDenotes middle.read value bytes := (complete_value_exact included valueMeaning).mpr rfl
+      have prefixNibbles : Nibbles (key.take (commonPrefix segment key)) := by
+        rw [← commonPrefix_shared]
+        exact nibbles_take segmentNibbles _
+      have prefixSmall : (key.take (commonPrefix segment key)).length < 2 ^ 64 := by
+        simp only [List.length_take]
+        omega
+      obtain ⟨laterIncluded, finalShape, rootWidth, rootClosed, entries⟩ :=
+        branch_one_wrap digestWidth middleShape bound prefixNibbles prefixSmall
+          downWidth downClosed valueValid ⟨bytes, ownMeaning⟩ restSafe ran
+      have newSpelling : key.take (commonPrefix segment key) = key := by
+        have spelling := List.take_append_drop (commonPrefix segment key) key
+        simpa only [newEnds, List.append_nil] using spelling
+      have oldSpelling : key.take (commonPrefix segment key) ++ position :: below = segment := by
+        rw [← oldContinues]
+        exact commonPrefix_reconstruct segment key
+      refine ⟨fun space address data admitted held => laterIncluded space address data admitted
+        (included space address data admitted held), finalShape, rootWidth, rootClosed, ?_⟩
+      intro probe result
+      rw [entries, extension_overwrite diverges]
+      simp only [complete_value_exact included valueMeaning, downEntries]
+      constructor
+      · rintro (⟨ownKey, fresh⟩ | ⟨tail, oldKey, remaining, rfl, prior⟩)
+        · exact Or.inl ⟨ownKey.trans newSpelling, fresh⟩
+        · refine Or.inr ⟨remaining, ?_, prior⟩
+          simpa only [← List.cons_append, ← List.append_assoc, oldSpelling] using oldKey
+      · rintro (⟨ownKey, fresh⟩ | ⟨remaining, oldKey, prior⟩)
+        · exact Or.inl ⟨ownKey.trans newSpelling.symm, fresh⟩
+        · refine Or.inr ⟨below ++ remaining, ?_, remaining, rfl, prior⟩
+          simpa only [← List.cons_append, ← List.append_assoc, oldSpelling] using oldKey
+
 end Synchronicity.TrieInsertSemantics
