@@ -15,46 +15,85 @@ fn publish(node: &WireNode, seq: u64, files: &[(&str, &[u8])]) -> SignedHead {
     node.publish(seq, &files, &[])
 }
 
-/// A one-file update to a 60-file trie pulls only the touched path — a diff
-/// regression would silently sync whole tries.
+/// A one-file update stores only its changed paths, independently of the
+/// corpus size. Actual requesting-operation traffic is counted in fetch_progress.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn incremental_updates_transfer_only_the_change() {
+    use std::collections::HashSet;
+    use synch_mpt::{NodeStore, TrieNode};
     let _blocking = synch_core::BlockingScope::enter();
-    let publisher = WireNode::spawn(Some("nas")).await;
-    let follower = WireNode::spawn(Some("laptop")).await;
-    trust_all(&[&publisher, &follower]);
+    for corpus in [60, 600] {
+        let publisher = WireNode::spawn(Some("nas")).await;
+        let follower = WireNode::spawn(Some("laptop")).await;
+        trust_all(&[&publisher, &follower]);
+        let files: Vec<(String, Vec<u8>)> = (0..corpus)
+            .map(|i| (format!("f{i:03}.bin"), vec![i as u8; 32]))
+            .collect();
+        let borrowed: Vec<_> = files
+            .iter()
+            .map(|(p, c)| (p.as_str(), c.as_slice()))
+            .collect();
+        let head1 = publish(&publisher, 1, &borrowed);
+        let client = connect(&follower, &publisher).await;
+        let syncer = Syncer::new(follower.store.clone());
+        syncer.sync_with(&client).await.unwrap();
+        let unchanged_key = file_key("media", "f059.bin").unwrap();
+        let unchanged = Trie::new(follower.store.as_ref())
+            .get(head1.root, &unchanged_key)
+            .unwrap();
+        assert!(unchanged.is_some());
+        let nodes_before = count_nodes(&follower.store);
 
-    let files: Vec<(String, Vec<u8>)> = (0..60)
-        .map(|i| (format!("f{i:03}.bin"), vec![i as u8; 32]))
-        .collect();
-    let borrowed: Vec<(&str, &[u8])> = files
-        .iter()
-        .map(|(p, c)| (p.as_str(), c.as_slice()))
-        .collect();
-    publish(&publisher, 1, &borrowed);
-
-    let client = connect(&follower, &publisher).await;
-    let syncer = Syncer::new(follower.store.clone());
-    syncer.sync_with(&client).await.unwrap();
-
-    let nodes_before = count_nodes(&follower.store);
-
-    // One file changes; the second exchange must pull only the touched path.
-    let head2 = publish(&publisher, 2, &[("f000.bin", b"changed")]);
-    let report = syncer.sync_with(&client).await.unwrap();
-    assert_eq!(report.tries_completed, 1, "{report:?}");
-    assert_eq!(
-        follower.store.complete_head(&publisher.origin).unwrap(),
-        Some(head2)
-    );
-
-    let pulled = count_nodes(&follower.store) - nodes_before;
-    assert!(
-        pulled < 20,
-        "structural sharing should bound a one-file update to a handful of nodes, pulled {pulled}"
-    );
-
-    shutdown_all(&[&publisher, &follower]).await;
+        // Publishing changes the file record and adds its new blob advertisement.
+        let head2 = publish(&publisher, 2, &[("f000.bin", b"changed")]);
+        let changed_keys = [
+            file_key("media", "f000.bin").unwrap(),
+            synch_core::blob_key(&Hash::new(b"changed")),
+        ];
+        let source = Trie::new(publisher.store.as_ref());
+        let changes = source.diff(head1.root, head2.root).unwrap();
+        assert_eq!(changes.len(), 2);
+        assert!(changes
+            .iter()
+            .all(|change| changed_keys.contains(&change.key)));
+        let mut expected_new = HashSet::new();
+        for key in &changed_keys {
+            let proof = source.prove(head2.root, key).unwrap();
+            // Every branch/routing step consumes one nibble; one terminal
+            // holder may follow. This bound depends on keys, never entry count.
+            assert!(proof.nodes.len() <= 2 * key.len() + 1);
+            for bytes in proof.nodes {
+                let hash = TrieNode::hash_of_encoded(&bytes).unwrap();
+                if !follower.store.has_node(&hash).unwrap() {
+                    expected_new.insert(hash);
+                }
+            }
+        }
+        let report = syncer.sync_with(&client).await.unwrap();
+        assert_eq!(report.tries_completed, 1, "{report:?}");
+        assert_eq!(
+            follower.store.complete_head(&publisher.origin).unwrap(),
+            Some(head2.clone())
+        );
+        let stored = count_nodes(&follower.store) - nodes_before;
+        // Adding the new advertisement may split one existing compressed
+        // segment, creating one neighboring node outside the new key's path.
+        assert!(
+            (expected_new.len()..=expected_new.len() + 1).contains(&stored),
+            "{corpus} files: {stored} new nodes exceed {} changed-path nodes plus one split neighbor",
+            expected_new.len(),
+        );
+        assert!(expected_new
+            .iter()
+            .all(|hash| follower.store.has_node(hash).unwrap()));
+        let view = Trie::new(follower.store.as_ref());
+        assert_eq!(
+            view.get(head2.root, &changed_keys[0]).unwrap(),
+            source.get(head2.root, &changed_keys[0]).unwrap()
+        );
+        assert_eq!(view.get(head2.root, &unchanged_key).unwrap(), unchanged);
+        shutdown_all(&[&publisher, &follower]).await;
+    }
 }
 
 /// §3.2: connections from device keys with no live binding are refused.

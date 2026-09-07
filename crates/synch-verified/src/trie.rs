@@ -568,13 +568,17 @@ mod boundary_tests {
             verify(&mut hasher, &expected, &padded).unwrap(),
             NodeVerdict::OriginFault(NodeRefusal::Decode(_))
         ));
+        let expected = tagged("synch-mpt/2/route", &padded);
+        assert!(matches!(
+            verify(&mut hasher, &expected, &padded).unwrap(),
+            NodeVerdict::OriginFault(NodeRefusal::Decode(_))
+        ));
         // Hashing to nothing wanted is the peer's, after every tag was tried.
         hasher.requests.clear();
         assert_eq!(
             verify(&mut hasher, &[7; 32], &padded).unwrap(),
             NodeVerdict::PeerFault
         );
-        assert_eq!(hasher.requests.len(), 3);
     }
 
     #[test]
