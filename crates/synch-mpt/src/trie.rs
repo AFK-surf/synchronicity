@@ -226,7 +226,7 @@ impl<'a, S: NodeStore + ?Sized> Trie<'a, S> {
     /// Whether the scoped requesting walk and its generation check accept
     /// `root`. Refused nodes remain missing. Authenticated scoped omission
     /// and the full exact-view proof remain open obligations in
-    /// `docs/RUST-LEAN-PROOFS.md`.
+    /// `docs/LEAN.md`.
     ///
     /// Completeness is a property of a root *and* a scope: a trie held whole
     /// within one grant is not held whole within a wider one. The memo is keyed

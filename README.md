@@ -13,7 +13,7 @@ Install Rust and the pinned Lean 4.33.1 toolchain through elan. The executable
 Lean core owns the migrated Trie and CAS operations and is statically linked
 into every build; no feature flag or Rust fallback exists. Remaining Rust
 orchestration and the scoped proof claims are documented in the
-[Rust/Lean architecture and proof contract](docs/RUST-LEAN-PROOFS.md).
+[Rust/Lean architecture and proof contract](docs/LEAN.md).
 Supported platforms are Linux GNU and macOS (x86-64/arm64), and Windows
 x86-64 using the GNU/LLVM toolchain. OpenBSD and Linux musl are unsupported.
 See [Lean core build instructions](crates/synch-verified/README.md) for Windows

@@ -1,7 +1,7 @@
 # Building the executable Lean core
 
 This crate compiles and links the Lean operations used by production Rust APIs.
-The single [Rust/Lean architecture and proof contract](../../docs/RUST-LEAN-PROOFS.md)
+The single [Rust/Lean architecture and proof contract](../../docs/LEAN.md)
 contains operation ownership, user-facing proof goals, checked evidence, trusted
 host contracts, remaining migrations and validation limits. Keep those accounts
 there; this README covers build and boundary-generation commands.

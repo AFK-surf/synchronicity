@@ -1,8 +1,8 @@
 # Proof package
 
 This package imports the executable Lean core that Cargo compiles and links
-into `synch`. The canonical [Rust/Lean architecture and proof contract](../../docs/RUST-LEAN-PROOFS.md)
-contains the user-facing goals, current theorem scopes, module audit, host
+into `synch`. The canonical [Rust/Lean architecture and proof contract](../../docs/LEAN.md)
+contains the user-facing goals, checked scopes, host
 assumptions and remaining migration/proof plan. Keep those descriptions there.
 
 The package depends only on the core and the pinned toolchain; no Mathlib.
@@ -12,8 +12,8 @@ cd specs/lean
 lake build --wfail
 ```
 
-Run the [bounded standalone kernel check](../../docs/RUST-LEAN-PROOFS.md#validation-and-completion-gates)
-after building; the prefix-wide checker starts modules concurrently.
+Run the [standalone kernel checks in CI](../../.github/workflows/ci.yml) after
+building; in memory-constrained environments, check modules serially.
 
 CI also audits axioms and rejects `sorryAx` or unapproved assumptions. Native
 interpreter/platform tests are separate evidence; the proof build does not verify

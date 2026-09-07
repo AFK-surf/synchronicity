@@ -1,6 +1,6 @@
 # Formal checks
 
-The canonical [Rust/Lean architecture and proof contract](../docs/RUST-LEAN-PROOFS.md)
+The canonical [Rust/Lean architecture and proof contract](../docs/LEAN.md)
 contains the user-facing goals, evidence scopes, recovery-model limitations and
 migration/proof plan. Lean checks executable core properties; TLC checks bounded
 recovery schedules; native tests check host integration.
@@ -13,7 +13,7 @@ lake build --wfail
 ```
 
 See the [proof package README](lean/README.md) for prerequisites and the
-[bounded standalone kernel check](../docs/RUST-LEAN-PROOFS.md#validation-and-completion-gates).
+[kernel and axiom checks in CI](../.github/workflows/ci.yml).
 
 ## Recovery model
 
