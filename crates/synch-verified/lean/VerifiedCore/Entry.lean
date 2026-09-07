@@ -311,7 +311,8 @@ def dispatch : Command → Native
     else command (Trie.Complete.isComplete (Std.HashSet Trie.Missing.Visit) (Std.HashSet ByteArray)
       ⟨⟨prefixes, exact⟩, owner⟩ root) completing
   | .planExchange ours theirs servable =>
-    if !(ours ++ theirs ++ servable).all (·.root.size == 32) then protocol
+    if servable.length > UInt64.size ||
+        !(ours ++ theirs ++ servable).all (·.root.size == 32) then protocol
     else pure (terminalOf (Replication.Exchange.plan ours theirs servable))
 
 /-- Every command starts here: an undecodable packet is a protocol failure

@@ -52,23 +52,36 @@ theorem requests_exactly_newer_versions (ours theirs servable : List Advertised)
     origin ∈ (plan ours theirs servable).want ↔ best origin ours < best origin theirs := by
   simp only [plan, requested_iff, index_get]
 
-private theorem best_perm (origin : String) {a b : List Advertised} (h : a.Perm b) :
-    best origin a = best origin b := by
-  induction h with
-  | nil => rfl
-  | cons head h ih => simp only [best, ih]
-  | swap a b rest => simp only [best]; omega
-  | trans h₁ h₂ ih₁ ih₂ => exact ih₁.trans ih₂
+private theorem best_le (origin : String) (heads : List Advertised) (bound : Nat) :
+    best origin heads ≤ bound ↔
+      ∀ head ∈ heads, head.origin = origin → version head ≤ bound := by
+  induction heads with
+  | nil => simp [best]
+  | cons head rest ih =>
+    simp only [best, Nat.max_le, ih, List.mem_cons, forall_eq_or_imp]
+    by_cases same : head.origin = origin <;> simp [same]
 
-/-- Reordering either device's advertisements cannot change which origins
-are requested, including two slots at the same sequence and duplicate rows. -/
-theorem advertisement_order_does_not_hide_updates {ours ours' theirs theirs' : List Advertised}
-    (localOrder : ours.Perm ours') (remoteOrder : theirs.Perm theirs')
+/-- Reordering, repeating, or removing duplicate advertisements cannot affect
+requests: only which versions are known matters, even when both slots advertise
+one version. The premise compares sets, not multisets or arrival sequences. -/
+theorem advertisement_order_and_duplicates_do_not_hide_updates {ours ours' theirs theirs' : List Advertised}
+    (localVersions : ∀ head, head ∈ ours ↔ head ∈ ours')
+    (remoteVersions : ∀ head, head ∈ theirs ↔ head ∈ theirs')
     (servable : List Advertised) (origin : String) :
     origin ∈ (plan ours theirs servable).want ↔
       origin ∈ (plan ours' theirs' servable).want := by
-  simp only [requests_exactly_newer_versions, best_perm origin localOrder,
-    best_perm origin remoteOrder]
+  have sameBest : ∀ (a b : List Advertised), (∀ head, head ∈ a ↔ head ∈ b) →
+      best origin a = best origin b := by
+    intro a b members
+    apply Nat.le_antisymm
+    · apply (best_le origin a _).mpr
+      intro head member same
+      exact (best_le origin b _).mp (Nat.le_refl _) head ((members head).mp member) same
+    · apply (best_le origin b _).mpr
+      intro head member same
+      exact (best_le origin a _).mp (Nat.le_refl _) head ((members head).mpr member) same
+  simp only [requests_exactly_newer_versions, sameBest ours ours' localVersions,
+    sameBest theirs theirs' remoteVersions]
 
 /-- A push always selects one of the heads supplied as servable, and that
 head beats every version the peer advertises for its origin. -/
@@ -79,5 +92,20 @@ theorem pushes_only_servable_updates (ours theirs servable : List Advertised) (p
   simp only [plan, List.mem_map, List.mem_filter, decide_eq_true_eq, index_get] at selected
   obtain ⟨⟨head, index⟩, ⟨member, newer⟩, same⟩ := selected
   exact ⟨head, index, member, same, newer⟩
+
+/-- Under the native command's input bound, each returned position denotes
+an actual supplied servable head; machine-integer encoding cannot change it. -/
+theorem selected_positions_refer_to_servable_heads (ours theirs servable : List Advertised)
+    (bounded : servable.length ≤ UInt64.size) (position : UInt64)
+    (selected : position ∈ (plan ours theirs servable).push) :
+    ∃ head, servable[position.toNat]? = some head ∧
+      best head.origin theirs < version head := by
+  obtain ⟨head, index, member, same, newer⟩ := pushes_only_servable_updates ours theirs servable position selected
+  have lookup := List.mk_mem_zipIdx_iff_getElem?.mp member
+  have lt : index < servable.length := (List.getElem?_eq_some_iff.mp lookup).1
+  have converted : index.toUInt64.toNat = index := by
+    exact UInt64.toNat_ofNat_of_lt' (Nat.lt_of_lt_of_le lt bounded)
+  refine ⟨head, ?_, newer⟩
+  simpa [← same, converted] using lookup
 
 end Synchronicity.ExchangeProofs
