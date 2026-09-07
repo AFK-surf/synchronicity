@@ -796,6 +796,92 @@ private theorem addressValue_shape {value : Value} (digestWidth : Width d) (shap
     obtain ⟨rfl, rfl⟩ := ran
     exact ⟨shaped_write_value shaped _ _, digestWidth _⟩
 
+private theorem addressed_branch_valid (digestWidth : Width d) (shaped : Shaped before)
+    (valid : CursorValid before.read (.node (.branch children value)))
+    (safe : SafeWrites d before (Normalize.addressOptional value).run)
+    (ran : execute d before (Normalize.addressOptional value).run = some (.ok address, after)) :
+    Shaped after ∧ CursorValid after.read (.node (.route children address)) := by
+  cases value with
+  | none =>
+    simp only [Normalize.addressOptional, run_pure, TrieMutateProofs.execute_pure,
+      Option.some.injEq, Prod.mk.injEq, Except.ok.injEq] at ran
+    obtain ⟨rfl, rfl⟩ := ran
+    obtain ⟨_, occupied⟩ := branchOk_of_loaded valid.2.1 valid.2.2
+    refine ⟨shaped, ⟨by simpa [NodeClosed] using valid.1, ?_, ?_⟩⟩
+    · exact ⟨valid.2.1.1, valid.2.1.2.1, by simp⟩
+    · apply checkInvariants_route
+      simpa using (show 1 ≤ occupants children none by omega)
+  | some value =>
+    have firstSafe : SafeWrites d before (addressValue value).run := by
+      simp only [Normalize.addressOptional, run_bind] at safe
+      exact safe_bind_left _ safe
+    simp only [Normalize.addressOptional] at ran
+    rw [execute_run_bind] at ran
+    cases first : execute d before (addressValue value).run with
+    | none => simp [first] at ran
+    | some reply =>
+      obtain ⟨reply, middle⟩ := reply
+      cases reply with
+      | error error => simp [first] at ran
+      | ok addressed =>
+        simp only [first, run_pure, TrieMutateProofs.execute_pure,
+          Option.some.injEq, Prod.mk.injEq, Except.ok.injEq] at ran
+        obtain ⟨rfl, rfl⟩ := ran
+        obtain ⟨middleShaped, addressWidth⟩ := addressValue_shape digestWidth shaped
+          (valid.2.1.2.2 value rfl) first
+        obtain ⟨included, exactBytes⟩ := addressValue_exact firstSafe first
+        obtain ⟨bytes, original⟩ := valid.1.1 value rfl
+        refine ⟨middleShaped, ⟨?_, ?_, ?_⟩⟩
+        · exact ⟨fun hash same => by
+            cases same
+            exact ⟨bytes, (exactBytes bytes).mpr original⟩,
+            fun index root edge => closed_preserved (valid.1.2 index root edge) included⟩
+        · exact ⟨valid.2.1.1, valid.2.1.2.1,
+            fun hash same => by cases same; exact addressWidth⟩
+        · apply checkInvariants_route
+          simp [occupants]
+
+/-- An ordinary branch keeps exactly the same entries when publication moves
+its own value out of line and schedules its children for normalization. -/
+theorem branch_step_preserves (digestWidth : Width d) (shaped : Shaped before)
+    (meaning : StateMeaning before.read ⟨.visit path (.node (.branch children value)) :: work, results⟩ target)
+    (within : path.length ≤ maxKeyBytes * 2) (spine : Normalize.belowBoundary path = false)
+    (safe : SafeWrites d before
+      (Normalize.step ⟨.visit path (.node (.branch children value)) :: work, results⟩).run)
+    (ran : execute d before
+      (Normalize.step ⟨.visit path (.node (.branch children value)) :: work, results⟩).run =
+      some (.ok (.inl next), after)) : Shaped after ∧ StateMeaning after.read next target := by
+  have valid : CursorValid before.read (.node (.branch children value)) := by
+    obtain ⟨_, pending, _⟩ := meaning
+    cases pending with
+    | visit valid _ _ => exact valid
+  simp only [Normalize.step, Nat.not_lt.mpr within, ↓reduceIte, spine,
+    Bool.false_eq_true, run_bind, run_pure, program_bind_pure, bindCont_ok] at safe ran
+  have firstSafe := safe_bind_left _ safe
+  rw [execute_bind] at ran
+  cases first : execute d before (Normalize.addressOptional value).run with
+  | none => simp [first] at ran
+  | some reply =>
+    obtain ⟨reply, middle⟩ := reply
+    cases reply with
+    | error error => simp [first] at ran
+    | ok addressed =>
+      simp only [first, bindCont_ok, run_pure, TrieMutateProofs.execute_pure,
+        Option.some.injEq, Prod.mk.injEq, Except.ok.injEq, Sum.inl.injEq] at ran
+      obtain ⟨rfl, rfl⟩ := ran
+      obtain ⟨middleShaped, routeValid⟩ := addressed_branch_valid digestWidth shaped valid firstSafe first
+      have included := (addressOptional_exact firstSafe first).1
+      have routeMeaning := replace_cursor_meaning (state_meaning_preserved meaning included) routeValid
+        (fun key bytes => (cursor_entries_unchanged (cursor := .node (.branch children value)) valid.1 included).trans
+          (addressed_branch_entries_exact valid.1 firstSafe first).symm)
+      have routeRan : execute d middle
+          (Normalize.step ⟨.visit path (.node (.route children addressed)) :: work, results⟩).run =
+          some (.ok (.inl (Normalize.schedule path children addressed ⟨work, results⟩)), middle) := by
+        simp only [Normalize.step, Nat.not_lt.mpr within, ↓reduceIte, spine,
+          Bool.false_eq_true, run_bind, run_pure, program_bind_pure, bindCont_ok,
+          TrieMutateProofs.execute_pure]
+      exact ⟨middleShaped, (route_step_preserves routeMeaning within spine routeRan).2⟩
+
 /-- The actual terminal-leaf visit moves its value behind an address and
 stores a routing node with exactly the same key and contents. -/
 theorem terminal_leaf_step_preserves (digestWidth : Width d) (shaped : Shaped before)
@@ -942,6 +1028,61 @@ theorem assembly_step_preserves (digestWidth : Width d) (shaped : Shaped before)
         (completed_preserved rightMeaning included)⟩⟩
     intro key bytes
     exact (put_node_exact closed wf collision putRan).trans (exactEntries key bytes)
+
+private theorem node_step_preserves (digestWidth : Width d) (shaped : Shaped before)
+    (meaning : StateMeaning before.read ⟨.visit path (.node node) :: work, results⟩ target)
+    (within : path.length ≤ maxKeyBytes * 2) (spine : Normalize.belowBoundary path = false)
+    (safe : SafeWrites d before
+      (Normalize.step ⟨.visit path (.node node) :: work, results⟩).run)
+    (ran : execute d before (Normalize.step ⟨.visit path (.node node) :: work, results⟩).run =
+      some (.ok (.inl next), after)) : Shaped after ∧ StateMeaning after.read next target := by
+  cases node with
+  | leaf suffix value =>
+    cases spelling : suffix.toList with
+    | nil => exact terminal_leaf_step_preserves digestWidth shaped meaning within spine spelling safe ran
+    | cons nibble rest =>
+      obtain ⟨rfl, preserved⟩ := leaf_edge_step_preserves meaning within spine spelling ran
+      exact ⟨shaped, preserved⟩
+  | extension segment child =>
+    cases spelling : segment.toList with
+    | nil => simp [Normalize.step, Nat.not_lt.mpr within, spine, spelling] at ran
+    | cons nibble rest =>
+      obtain ⟨rfl, preserved⟩ := extension_edge_step_preserves meaning within spine spelling ran
+      exact ⟨shaped, preserved⟩
+  | branch children value => exact branch_step_preserves digestWidth shaped meaning within spine safe ran
+  | route children value =>
+    obtain ⟨rfl, preserved⟩ := route_step_preserves meaning within spine ran
+    exact ⟨shaped, preserved⟩
+
+/-- Loading a previously stored node and taking its real normalization step
+preserves the version's entries just as a constructed-node visit does. -/
+theorem stored_step_preserves (digestWidth : Width d) (shaped : Shaped before)
+    (meaning : StateMeaning before.read ⟨.visit path (.stored root) :: work, results⟩ target)
+    (within : path.length ≤ maxKeyBytes * 2) (spine : Normalize.belowBoundary path = false)
+    (safe : SafeWrites d before
+      (Normalize.step ⟨.visit path (.stored root) :: work, results⟩).run)
+    (ran : execute d before (Normalize.step ⟨.visit path (.stored root) :: work, results⟩).run =
+      some (.ok (.inl next), after)) : Shaped after ∧ StateMeaning after.read next target := by
+  have valid : CursorValid before.read (.stored root) := by
+    obtain ⟨_, pending, _⟩ := meaning
+    cases pending with
+    | visit valid _ _ => exact valid
+  rw [stored_step_as_node within spine] at safe ran
+  simp only [run_bind] at safe
+  rw [execute_run_bind] at ran
+  cases first : execute d before (load root).run with
+  | none => simp [first] at ran
+  | some reply =>
+    obtain ⟨reply, middle⟩ := reply
+    cases reply with
+    | error error => simp [first] at ran
+    | ok node =>
+      have restSafe := safe_bind_right _ safe first
+      simp only [bindCont_ok] at restSafe
+      simp only [first] at ran
+      obtain ⟨rfl, nodeValid, exactEntries⟩ := load_cursor_meaning shaped valid first
+      exact node_step_preserves digestWidth shaped
+        (replace_cursor_meaning meaning nodeValid exactEntries) within spine restSafe ran
 
 /-- The initial machine state represents exactly the input version. -/
 theorem initial_state_meaning (width : root.size = 32) (closed : Closed store root) :
