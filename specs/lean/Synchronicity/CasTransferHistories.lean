@@ -233,25 +233,83 @@ theorem first_transfer_and_history_save_content (state : State) (root content : 
   rw [finalCoverage, coverage]
   simp only [List.any_cons, verifiedGroups, decision, verifies, Bool.true_and]
 
-/-- Once successful transfers have covered the object, a whole-object read
-returns exactly its named content, even if the history also contained failed,
-overlapping or repeated transfers. The object started absent. -/
-theorem receiving_all_content_makes_the_whole_readable (state : State) (root content : ByteArray)
-    (size : UInt64) (first : Transfer) (rest : List Transfer) (ready : Ready state)
+/-- Initial interruptions do not require restarting from a clean file. As
+soon as any transfer verifies content, the same actual history establishes a
+saved version and exactly the union of its successful transfers. -/
+theorem absent_history_saves_verified_content (state : State) (root content : ByteArray)
+    (size : UInt64) (transfers : List Transfer) (ready : Ready state)
     (absent : (rows state.db "blobs").filter (fun row => equals row [("root", .blob root)]) = [])
     (width : root.size = 32) (identity : state.hash content = root)
     (sameSize : size.toNat = content.size) (large : ¬ size ≤ Cas.Receive.inlineMax)
     (correct : DecoderCorrect state root content size)
-    (nonempty : Cas.Receive.window size first.served ≠ [])
-    (verifies : state.decodeSlice root size (Cas.Serve.pairsOf (Cas.Receive.window size first.served)) first.input = true)
+    (someVerified : ∃ g, transfers.any (fun transfer => verifiedGroups state root size transfer g) = true) :
+    ∃ final : StoredFile (receiveAll root size transfers state) root content,
+      final.size = size ∧ Ready (receiveAll root size transfers state) ∧
+      ∀ g, spansContain (Cas.Serve.held final.metadata) g =
+        transfers.any (fun transfer => verifiedGroups state root size transfer g) := by
+  induction transfers generalizing state with
+  | nil => simp at someVerified
+  | cons first rest ih =>
+    by_cases successful : Cas.Receive.window size first.served ≠ [] ∧
+        state.decodeSlice root size (Cas.Serve.pairsOf (Cas.Receive.window size first.served)) first.input = true
+    · exact first_transfer_and_history_save_content state root content size first rest ready absent width identity
+        sameSize large correct successful.1 successful.2
+    · have unverified : Cas.Receive.window size first.served = [] ∨
+          state.decodeSlice root size (Cas.Serve.pairsOf (Cas.Receive.window size first.served)) first.input = false := by
+        by_cases empty : Cas.Receive.window size first.served = []
+        · exact Or.inl empty
+        · exact Or.inr (Bool.eq_false_iff.mpr (fun verified => successful ⟨empty, verified⟩))
+      have noneVerified (g : Nat) : verifiedGroups state root size first g = false := by
+        rcases unverified with empty | interrupted
+        · simp [verifiedGroups, empty, spansContain]
+        · simp [verifiedGroups, interrupted]
+      obtain ⟨db, quiet, idle, hash, decision, bytes, clean⟩ :=
+        CasReceiveStateProofs.unverified_fresh_receive state root size first.served first.input first.now first.tier
+          ready.quiet ready.idle ready.clean absent large unverified
+      have nextReady : Ready (receive root size first state).2 := ⟨quiet, idle, clean.trans ready.clean⟩
+      have nextAbsent : (rows (receive root size first state).2.db "blobs").filter
+          (fun row => equals row [("root", .blob root)]) = [] := by rw [db]; exact absent
+      have nextIdentity : (receive root size first state).2.hash content = root := by rw [hash]; exact identity
+      have nextCorrect := decoder_preserved _ _ root content size correct decision bytes
+      have tailVerified : ∃ g, rest.any (fun transfer => verifiedGroups (receive root size first state).2 root size transfer g) = true := by
+        obtain ⟨g, verified⟩ := someVerified
+        refine ⟨g, ?_⟩
+        simp only [List.any_cons, noneVerified, Bool.false_or] at verified
+        simpa only [verifiedGroups, decision] using verified
+      obtain ⟨final, finalSize, finalReady, coverage⟩ := ih _ nextReady nextAbsent nextIdentity nextCorrect tailVerified
+      simp only [receiveAll]
+      refine ⟨final, finalSize, finalReady, ?_⟩
+      intro g
+      rw [coverage]
+      simp only [List.any_cons, noneVerified, Bool.false_or]
+      simp only [verifiedGroups, decision]
+
+/-- Once successful transfers have covered the object, a whole-object read
+returns exactly its named content, even if the history also contained failed,
+overlapping or repeated transfers, including interrupted attempts before the
+first successful slice. The object started absent. -/
+theorem receiving_all_content_makes_the_whole_readable (state : State) (root content : ByteArray)
+    (size : UInt64) (transfers : List Transfer) (ready : Ready state)
+    (absent : (rows state.db "blobs").filter (fun row => equals row [("root", .blob root)]) = [])
+    (width : root.size = 32) (identity : state.hash content = root)
+    (sameSize : size.toNat = content.size) (large : ¬ size ≤ Cas.Receive.inlineMax)
+    (correct : DecoderCorrect state root content size)
     (allReceived : ∀ g, g < (groupCount size).toNat →
-      (first :: rest).any (fun transfer => verifiedGroups state root size transfer g) = true) :
-    CasReadPromises.readResult (receiveAll root size (first :: rest) state) root .all = .ok content.data.toList := by
-  obtain ⟨final, finalSize, finalReady, coverage⟩ := first_transfer_and_history_save_content
-    state root content size first rest ready absent width identity sameSize large correct nonempty verifies
+      transfers.any (fun transfer => verifiedGroups state root size transfer g) = true) :
+    CasReadPromises.readResult (receiveAll root size transfers state) root .all = .ok content.data.toList := by
+  have someVerified : ∃ g, transfers.any (fun transfer => verifiedGroups state root size transfer g) = true := by
+    refine ⟨0, allReceived 0 ?_⟩
+    rw [CasPlanProofs.groupCount_spec]
+    split
+    · rename_i zero
+      subst size
+      simp [Cas.Receive.inlineMax] at large
+    · omega
+  obtain ⟨final, finalSize, finalReady, coverage⟩ := absent_history_saves_verified_content
+    state root content size transfers ready absent width identity sameSize large correct someVerified
   obtain ⟨raw, observed, decoded⟩ := final.observed
   unfold CasReadPromises.readResult SimulatedHost.run
-  rw [CasReadPromises.full_read_is_range { (receiveAll root size (first :: rest) state) with output := [] }
+  rw [CasReadPromises.full_read_is_range { (receiveAll root size transfers state) with output := [] }
     root final.metadata raw [] finalReady.quiet observed decoded]
   change CasReadPromises.readResult _ root (.range 0 final.size) = _
   have available : Cas.Read.covered final.metadata 0 final.size = true := by

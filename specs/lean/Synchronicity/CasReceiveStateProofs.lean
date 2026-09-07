@@ -173,4 +173,36 @@ theorem interrupted_decoder_keeps_committed_metadata (state : State) (root : Byt
       lookupFile, writeFile, Except.mapError, Except.map,
       bind, pure, Program.bind, ExceptT.bind, ExceptT.bindCont, ExceptT.pure, ExceptT.run, ExceptT.mk]
 
+/-- An unsuccessful attempt before the first committed slice may leave
+physical decoder writes, but leaves the object absent and permits a retry on
+that same raw state. Empty requests have the same metadata behavior. -/
+theorem unverified_fresh_receive (state : State) (root : ByteArray) (size : UInt64)
+    (served : List (UInt64 × UInt64)) (input : UInt64) (now : Int64)
+    (tier : Cas.IngestCommit.Tier)
+    (quiet : state.faults = []) (idle : state.pending = none) (clean : state.scanFault = none)
+    (absent : (rows state.db "blobs").filter (fun row => equals row [("root", .blob root)]) = [])
+    (large : ¬ size ≤ inlineMax)
+    (unverified : window size served = [] ∨
+      state.decodeSlice root size (Cas.Serve.pairsOf (window size served)) input = false) :
+    let result := SimulatedHost.run (writeSlice root size served input now tier) state
+    result.2.db = state.db ∧ result.2.faults = [] ∧ result.2.pending = none ∧
+    result.2.hash = state.hash ∧ result.2.decodeSlice = state.decodeSlice ∧
+    result.2.decodedPayload = state.decodedPayload ∧ result.2.scanFault = state.scanFault := by
+  by_cases empty : window size served = []
+  · simp [SimulatedHost.run, writeSlice, empty, execute, pure, ExceptT.pure, ExceptT.run, ExceptT.mk, quiet, idle]
+  · have interrupted := unverified.resolve_left empty
+    have selected (table : String) (fields : Fields) :
+        selects ⟨table, fields, [], []⟩ = fun row => equals row fields := by
+      funext row
+      simp [selects]
+    simp [SimulatedHost.run, writeSlice, leased, admit, metadata?,
+      VerifiedCore.Cas.Receive.access, VerifiedCore.Cas.Receive.lease, VerifiedCore.Cas.Receive.bao,
+      Cas.IngestCommit.admit, Cas.IngestCommit.decodeClaim,
+      within, ensure, raise, performOver, Inject.inject, Program.mapEffects,
+      execute, Interpreter.handle, SimulatedHost.access, SimulatedHost.lease,
+      SimulatedHost.bao, reply, fault, record, quiet, idle, clean,
+      scanFailure, absent, CasReceiveProofs.fresh_accepted,
+      selected, large, empty, interrupted, counter, setCounter, Except.mapError, Except.map,
+      bind, pure, Program.bind, ExceptT.bind, ExceptT.bindCont, ExceptT.pure, ExceptT.run, ExceptT.mk]
+
 end Synchronicity.CasReceiveStateProofs
