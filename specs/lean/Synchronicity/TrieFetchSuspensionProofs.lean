@@ -1,5 +1,6 @@
 import VerifiedCore.Trie.Fetch
 import Synchronicity.SuspensionProofs
+import Synchronicity.TriePreflightTransactions
 
 /-! The executable requesting operation may inspect and admit data inside a
 transaction, but a network wait must occur after that transaction has closed.
@@ -93,7 +94,7 @@ private theorem key_without_waits (scope : Serve.Scope) (root : ByteArray) (owne
 /-- Every inspection finishes its transaction before the requester can wait
 for a peer, including generation resets, full walks and certification. This
 uses the actual missing-data walk, for arbitrary frontier implementations. -/
-theorem inspection_closes_before_the_next_wait [Missing.WorkSet Missing.Visit V]
+private theorem inspection_closes_before_the_next_wait [Missing.WorkSet Missing.Visit V]
     [Missing.WorkSet ByteArray H] (target : Fetch.Target) (state : Fetch.State V H) (maximum : Nat) :
     Suspending guard (Fetch.inspect target state maximum) := by
   unfold Fetch.inspect
@@ -151,7 +152,7 @@ private theorem NoWait.within [Inject E Fetch.Effects] (operation : OperationOve
 /-- An entire reply, of any length, is processed without a network wait
 inside its transaction. Success commits before fetching another reply;
 a validation or host failure terminates the admission. -/
-theorem admission_closes_before_the_next_wait [Missing.WorkSet ByteArray H]
+private theorem admission_closes_before_the_next_wait [Missing.WorkSet ByteArray H]
     (target : Fetch.Target) (values : Bool)
     (requested served : List (ByteArray × ByteArray)) (routeValues : List ByteArray) :
     Suspending guard (Fetch.admit (H := H) target values requested served routeValues) := by
@@ -201,7 +202,7 @@ private theorem abandon_closes (target : Fetch.Target) : Suspending guard (Fetch
 /-- A complete requesting round waits for peers only between transactions,
 for every possible reply and whether it makes progress, retries or retires
 its pending version. -/
-theorem round_waits_only_between_transactions [Missing.WorkSet Missing.Visit V]
+private theorem round_waits_only_between_transactions [Missing.WorkSet Missing.Visit V]
     [Missing.WorkSet ByteArray H] (target : Fetch.Target) (maximum retryLimit : Nat)
     (state : Fetch.State V H) : Suspending guard (Fetch.step target maximum retryLimit state) := by
   unfold Fetch.step
@@ -245,21 +246,46 @@ private theorem iterate_balanced (g : Guard F)
       | request outside replies =>
         exact .request outside fun reply => ih (resume reply) _ (replies reply)
 
-/-- Starting without a reference snapshot, the whole requesting loop holds
-no transaction across any peer wait, however many rounds it executes and
-whatever the host or peer answers. -/
-theorem cold_fetch_waits_only_between_transactions (V H : Type)
+private theorem reference_check_closes (V H : Type) [Missing.WorkSet Missing.Visit V]
+    [Missing.WorkSet ByteArray H] (context : Missing.Context) (root : ByteArray) :
+    Suspending guard (within Fetch.Error.walk (Complete.isComplete V H context root)) := by
+  have closed : TriePreflightTransactions.Closed guard
+      (within (F := Fetch.Effects) Fetch.Error.walk (Complete.isComplete V H context root)).run := by
+    apply TriePreflightTransactions.Closed.bind
+    · apply TriePreflightTransactions.Closed.mapEffects
+        (TriePreflightTransactions.reference_check_keeps_transaction_closed _ _ _ _) Inject.inject
+      intro B effect reply
+      cases effect with
+      | left missing =>
+        cases missing with
+        | left _ => rfl
+        | right effect => cases effect <;> rfl
+      | right effect => cases effect <;> rfl
+    · intro result
+      exact TriePreflightTransactions.Closed.pure _
+  exact closed.balanced.weaken fun _ _ wasClosed _ _ => wasClosed
+
+/-- The whole requester holds no transaction across any network wait, for
+any reference snapshot, any reply batches and any sequence of host replies.
+Inspection, admission, retries and abandonment all obey the same discipline. -/
+theorem fetch_waits_only_between_transactions (V H : Type)
     [Missing.WorkSet Missing.Visit V] [Missing.WorkSet ByteArray H]
-    (target : Fetch.Target) (maximum retryLimit : Nat) :
-    Suspending guard (Fetch.fetch V H target none maximum retryLimit) := by
+    (target : Fetch.Target) (reference : Option ByteArray) (maximum retryLimit : Nat) :
+    Suspending guard (Fetch.fetch V H target reference maximum retryLimit) := by
   unfold Fetch.fetch
   refine Suspending.seq (Suspending.ofRaise _ _ rfl rfl) fun generation => ?_
-  change Suspending guard (OperationOver.iterate
-    (Fetch.step (V := V) (H := H) target maximum retryLimit) .exhausted Missing.batchFuel
-    ⟨Missing.initial target.context none target.root, generation, 0, 0⟩)
-  apply iterate_balanced
-  · intro state
-    exact round_waits_only_between_transactions _ _ _ _
-  · exact round_waits_only_between_transactions _ _ _ _
+  have loop (checkedReference : Option ByteArray) :
+      Suspending guard (OperationOver.iterate
+        (Fetch.step (V := V) (H := H) target maximum retryLimit) .exhausted Missing.batchFuel
+        ⟨Missing.initial target.context checkedReference target.root, generation, 0, 0⟩) := by
+    apply iterate_balanced
+    · intro state
+      exact round_waits_only_between_transactions _ _ _ _
+    · exact round_waits_only_between_transactions _ _ _ _
+  cases reference with
+  | none => exact loop none
+  | some root =>
+    refine Suspending.seq (reference_check_closes _ _ _ _) fun complete => ?_
+    split <;> exact loop _
 
 end Synchronicity.TrieFetchSuspensionProofs
