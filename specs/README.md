@@ -10,10 +10,10 @@ recovery schedules; native tests check host integration.
 ```sh
 cd specs/lean
 lake build --wfail
-lake env leanchecker Synchronicity
 ```
 
-See the [proof package README](lean/README.md) for package prerequisites.
+See the [proof package README](lean/README.md) for prerequisites and the
+[bounded standalone kernel check](../docs/RUST-LEAN-PROOFS.md#validation-and-completion-gates).
 
 ## Recovery model
 

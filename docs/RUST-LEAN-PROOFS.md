@@ -819,7 +819,12 @@ For a changed proof or migration slice:
 # Proof package (imports the production Lean core)
 cd specs/lean
 lake build --wfail
-lake env leanchecker Synchronicity
+# The prefix-wide checker starts modules concurrently. Check them serially
+# inside the bounded scope to stay within the 4 GiB local memory budget.
+rg --files Synchronicity -g '*.lean' | sort | while IFS= read -r source; do
+    module=$(printf '%s' "${source%.lean}" | tr / .)
+    lake env leanchecker "$module" || exit 1
+done
 ```
 
 ```sh

@@ -10,8 +10,10 @@ The package depends only on the core and the pinned toolchain; no Mathlib.
 ```sh
 cd specs/lean
 lake build --wfail
-lake env leanchecker Synchronicity
 ```
+
+Run the [bounded standalone kernel check](../../docs/RUST-LEAN-PROOFS.md#validation-and-completion-gates)
+after building; the prefix-wide checker starts modules concurrently.
 
 CI also audits axioms and rejects `sorryAx` or unapproved assumptions. Native
 interpreter/platform tests are separate evidence; the proof build does not verify
