@@ -391,16 +391,28 @@ instance : WireEffect Sweep := ⟨Sweep.request, Sweep.reply⟩
 
 def Memo.tag : Memo A → UInt8
   | .forgetExcept _ => 69
+  | .isKnown _ => 74
+  | .generation => 75
+  | .certify _ _ => 76
 
 def Memo.name : Memo A → String
   | .forgetExcept _ => "forgetExcept"
+  | .isKnown _ => "isKnown"
+  | .generation => "generation"
+  | .certify _ _ => "certify"
 
 def Memo.request : Memo A → ByteArray
   | .forgetExcept a0 => header 69 |>.put a0
+  | .isKnown a0 => header 74 |>.put a0
+  | .generation => header 75
+  | .certify a0 a1 => header 76 |>.put a0 |>.put a1
 
 def Memo.reply (effect : Memo A) (input : ByteArray) : A :=
   match effect with
   | .forgetExcept _ => decodeReply 69 Decode.decode input
+  | .isKnown _ => decodeReply 74 Decode.decode input
+  | .generation => decodeReply 75 Decode.decode input
+  | .certify _ _ => decodeReply 76 Decode.decode input
 
 instance : WireEffect Memo := ⟨Memo.request, Memo.reply⟩
 

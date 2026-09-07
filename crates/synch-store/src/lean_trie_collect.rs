@@ -93,6 +93,22 @@ impl host::Memo for Memo<'_> {
         }
         Ok(())
     }
+
+    fn is_known(&mut self, key: &[u8]) -> Result<bool> {
+        let key =
+            Hash::from_slice(key).map_err(|_| StoreError::invalid("a memo key is not 32 bytes"))?;
+        synch_mpt::NodeStore::is_known_complete(self.store, &key)
+    }
+
+    fn generation(&mut self) -> Result<u64> {
+        synch_mpt::NodeStore::completeness_generation(self.store)
+    }
+
+    fn certify(&mut self, key: &[u8], generation: u64) -> Result<bool> {
+        let key =
+            Hash::from_slice(key).map_err(|_| StoreError::invalid("a memo key is not 32 bytes"))?;
+        synch_mpt::NodeStore::note_complete_at(self.store, &key, generation)
+    }
 }
 
 /// One mark-and-sweep pass over `trie_nodes`, `trie_node_origins` and

@@ -95,6 +95,7 @@ def messages : List Name := [
   ``VerifiedCore.Commands.ReceiveDomainError, ``VerifiedCore.Commands.CollectDomainError,
   ``VerifiedCore.Commands.ProjectDomainError, ``VerifiedCore.Commands.TrieServeDomainError,
   ``VerifiedCore.Commands.TrieCollectDomainError, ``VerifiedCore.Commands.TrieWalkDomainError,
+  ``VerifiedCore.Commands.TrieMissingDomainError,
   ``VerifiedCore.Commands.Ingested, ``VerifiedCore.Commands.Committed, ``VerifiedCore.Commands.Served,
   ``VerifiedCore.Commands.Evicted, ``VerifiedCore.Commands.Collected, ``VerifiedCore.Commands.Command]
 
@@ -142,7 +143,8 @@ def tags : List (String × Nat) := [
   ("Sweep.fileBytes", 65), ("Sweep.fileModified", 66), ("Sweep.listObjects", 67),
   ("Storage.deleteExcept", 68), ("Memo.forgetExcept", 69),
   ("Redaction.isRedacted", 70), ("Apply.applyChange", 71),
-  ("Peer.fetchNodes", 72), ("Peer.fetchValues", 73)]
+  ("Peer.fetchNodes", 72), ("Peer.fetchValues", 73),
+  ("Memo.isKnown", 74), ("Memo.generation", 75), ("Memo.certify", 76)]
 
 /-- Which Rust service answers an algebra by default. -/
 def defaultRoute : String → Route
@@ -466,6 +468,15 @@ def rustTraits (all : Array Algebra) : String := Id.run do
     for (_, ctor) in members do
       out := out ++ rustMethod ctor
     out := out ++ traitExtras trait ++ "}\n\n"
+  -- A narrowed view of the existing snapshot effect, for byte-backed
+  -- callers that cannot open transactions or mutate relational storage.
+  -- Its signature still comes from the algebra, never a second schema.
+  out := out ++ "/// Raw row snapshots without transaction or mutation capabilities. The\n/// supplied view may already be inside a caller-owned transaction.\npub trait Snapshots {\n    type Error;\n"
+  for algebra in all do
+    for ctor in algebra.ctors do
+      if algebra.short == "Access" && ctor.short == "snapshot" then
+        out := out ++ rustMethod ctor
+  out := out ++ "}\n\n"
   return out
 
 def rustUnexpected (all : Array Algebra) : String := Id.run do

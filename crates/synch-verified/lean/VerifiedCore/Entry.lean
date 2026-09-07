@@ -18,6 +18,7 @@ import VerifiedCore.Trie.Collect
 import VerifiedCore.Trie.Walk
 import VerifiedCore.Trie.Diff
 import VerifiedCore.Trie.Proof
+import VerifiedCore.Trie.Complete
 import VerifiedCore.Replication.History
 
 /-! The one native entry point. A command arrives as a packet, decoded with
@@ -188,6 +189,19 @@ def collecting [Encode A] : Except Cas.Collect.Error A → Host.Reply ByteArray
     terminalOf (Except.error (CollectDomainError.sizeMismatch root recorded offered) : Except _ A)
 
 def malformedRoot : Native := .pure (.error ⟨2, 0⟩)
+
+def completing [Encode A] : Except Trie.Missing.Error A → Host.Reply ByteArray
+  | .ok value => terminalOf (Except.ok value : Except TrieMissingDomainError A)
+  | .error (.host hostFailure) => .error hostFailure
+  | .error (.decode message) => terminalOf (Except.error (TrieMissingDomainError.decode message) : Except _ A)
+  | .error (.canonical (.nodeDepth depth)) =>
+    terminalOf (Except.error (TrieMissingDomainError.nodeDepth depth) : Except _ A)
+  | .error (.canonical (.valueDepth depth)) =>
+    terminalOf (Except.error (TrieMissingDomainError.valueDepth depth) : Except _ A)
+  | .error (.canonical (.expectedBranch hash)) =>
+    terminalOf (Except.error (TrieMissingDomainError.expectedBranch hash) : Except _ A)
+  | .error .exhausted => terminalOf (Except.error TrieMissingDomainError.exhausted : Except _ A)
+
 def protocol : Native := .pure (.error protocolFailure)
 
 def dispatch : Command → Native
@@ -292,6 +306,10 @@ def dispatch : Command → Native
     if root.size != 32 then protocol
     else command (Trie.Proof.verify (E := Host.Digest) root key nodes value) hostOnly
   | .peerProbe root wants inTransaction => command (Host.Peer.probe root wants inTransaction) hostOnly
+  | .trieComplete root prefixes exact owner =>
+    if root.size != 32 then protocol
+    else command (Trie.Complete.isComplete (Std.HashSet Trie.Missing.Visit) (Std.HashSet ByteArray)
+      ⟨⟨prefixes, exact⟩, owner⟩ root) completing
 
 /-- Every command starts here: an undecodable packet is a protocol failure
 before any effect is requested. -/

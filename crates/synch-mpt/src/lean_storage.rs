@@ -16,6 +16,121 @@ impl<S: NodeStore + ?Sized> synch_verified::host::ByteStorage for Bytes<'_, S> {
     }
 }
 
+/// Literal presence projections over the two raw relations a requesting
+/// walk consults. The operation supplies the predicates; no scope or trie
+/// shape is interpreted here, and value payloads are never materialized.
+impl<S: NodeStore + ?Sized> synch_verified::host::Snapshots for Bytes<'_, S> {
+    type Error = MptError;
+
+    fn snapshot(
+        &mut self,
+        selection: &synch_verified::host::Selection,
+        columns: &[String],
+    ) -> Result<synch_verified::host::Scan<MptError>, MptError> {
+        use synch_verified::host::{Cell, Scan};
+        if !selection.like_any.is_empty() || !selection.not_equals.is_empty() || columns != ["hash"]
+        {
+            return Err(protocol_error());
+        }
+        let (key, present) = match (selection.relation.as_str(), selection.equals.as_slice()) {
+            ("trie_values", [(column, Cell::Blob(key))]) if column == "hash" => {
+                let hash = Hash::from_slice(key).map_err(MptError::store)?;
+                (key, self.0.has_value(&hash).map_err(MptError::store)?)
+            }
+            (
+                "trie_node_origins",
+                [(origin_column, Cell::Text(origin)), (hash_column, Cell::Blob(key))],
+            ) if origin_column == "origin_id" && hash_column == "hash" => {
+                let origin = origin.parse().map_err(MptError::store)?;
+                let hash = Hash::from_slice(key).map_err(MptError::store)?;
+                (
+                    key,
+                    self.0.owns_node(&origin, &hash).map_err(MptError::store)?,
+                )
+            }
+            _ => return Err(protocol_error()),
+        };
+        Ok(Scan {
+            rows: if present {
+                vec![vec![Cell::Blob(key.clone())]]
+            } else {
+                Vec::new()
+            },
+            failure: None,
+        })
+    }
+}
+
+impl<S: NodeStore + ?Sized> synch_verified::host::Memo for Bytes<'_, S> {
+    type Error = MptError;
+
+    fn forget_except(&mut self, _keep: &[&[u8]]) -> Result<(), MptError> {
+        // The read-only runner refuses this effect before reaching the service.
+        Err(protocol_error())
+    }
+
+    fn is_known(&mut self, key: &[u8]) -> Result<bool, MptError> {
+        let hash = Hash::from_slice(key).map_err(MptError::store)?;
+        self.0.is_known_complete(&hash).map_err(MptError::store)
+    }
+
+    fn generation(&mut self) -> Result<u64, MptError> {
+        self.0.completeness_generation().map_err(MptError::store)
+    }
+
+    fn certify(&mut self, key: &[u8], generation: u64) -> Result<bool, MptError> {
+        let hash = Hash::from_slice(key).map_err(MptError::store)?;
+        self.0
+            .note_complete_at(&hash, generation)
+            .map_err(MptError::store)
+    }
+}
+
+pub(crate) fn complete<S: NodeStore + ?Sized>(
+    store: &S,
+    owner: Option<&synch_core::OriginId>,
+    root: Hash,
+    scope: &crate::Scope,
+) -> Result<bool, MptError> {
+    use synch_verified::trie::{self, CompleteError, TrieMissingDomainError as Domain};
+    trie::is_complete(
+        &mut Bytes(store),
+        trie::CompleteResources {
+            snapshots: &mut Bytes(store),
+            digest: &mut Blake3,
+            memo: &mut Bytes(store),
+            redaction: &mut Redactions(store),
+        },
+        root.as_bytes(),
+        trie::ServeScope {
+            prefixes: scope.prefixes().map(<[Vec<u8>]>::to_vec),
+            exact: scope.exact().to_vec(),
+        },
+        owner.map(synch_core::OriginId::canonical),
+    )
+    .map_err(|error| match error {
+        CompleteError::Operation(error) => operation_error(error),
+        CompleteError::Domain(Domain::Decode(message)) => MptError::Decode(message),
+        CompleteError::Domain(Domain::NodeDepth(depth)) => MptError::NonCanonical(format!(
+            "a trie node sits at nibble depth {depth}, past the {} any valid key reaches",
+            crate::trie::MAX_DEPTH_NIBBLES,
+        )),
+        CompleteError::Domain(Domain::ValueDepth(depth)) => MptError::NonCanonical(format!(
+            "a trie value sits at nibble depth {depth}, past the {} any valid key reaches",
+            crate::trie::MAX_DEPTH_NIBBLES,
+        )),
+        CompleteError::Domain(Domain::ExpectedBranch(hash)) => match Hash::from_slice(&hash) {
+            Ok(hash) => MptError::NonCanonical(format!(
+                "node {hash} sits under an extension but is not a branch"
+            )),
+            Err(_) => protocol_error(),
+        },
+        CompleteError::Domain(Domain::Exhausted) => {
+            MptError::NonCanonical("the completeness walk outran its work budget".into())
+        }
+    })
+}
+
 pub(crate) fn protocol_error() -> MptError {
     MptError::store(std::io::Error::new(
         std::io::ErrorKind::InvalidData,

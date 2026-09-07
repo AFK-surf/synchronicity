@@ -461,9 +461,39 @@ Integration review has identified specific gates, not waived limitations:
   nothing inside a grant is redacted, that a descent and the merged descent
   answer only hashes the stored graph places at the position asked about,
   the early admission decisions, the budget invariant, and fixtures with a
-  failure injected at every effect. The Rust serving arms, vouching, answer
+  failure injected at every effect. `TrieServePrivacyProofs` proves scope
+  privacy across both whole serving loops: every node payload decodes to a
+  node admitted at a requested, scope-admitted position, and every value
+  payload has a requested, scope-admitted holder whose decoded node names
+  the value and grants its key. The theorems cover arbitrary batches and
+  host failures, including deduplication and early budget exits. A shared
+  payload needs one authorized position even if another position refuses
+  it; fixtures check both orders and entirely refused batches. They do not
+  establish loop-level provenance or native-host refinement.
+  The Rust serving arms, vouching, answer
   assembly and `Scope::admits_node` are deleted; the requesting walk's own
   scope predicates stay in Rust until the walk migrates.
+- The requesting walk's Lean implementation is in progress
+  (`Trie/Missing.lean`), used in production by completeness. Its
+  frontier stays in Lean, with hash sets for visits and deferred branch
+  checks and a trampoline for batches. `TrieMissingProofs` checks scope
+  admission across whole batches, retryable interrupted reads, deferred
+  values, resumption and terminal faults, plus shared-state histories.
+  Exhaustion implying coverage, fetch composition, generation handling and
+  fetch regression/cost validation remain open. The Rust `MissingWalk`
+  and reconcile fetch loop remain the fetch paths until that cutover.
+- Completeness is the whole `trieComplete` command (`Trie/Complete.lean`):
+  key computation, known-certificate lookup, generation, requesting walk
+  and certification. `Trie::is_complete_scoped_for` is now a facade, with
+  raw byte/presence reads and memo services bound by `lean_storage.rs`.
+  `TrieCompleteProofs` proves the answer after a walk is exactly the memo's
+  verdict when exhausted, false otherwise, and that new certification uses
+  the ticket read before the walk under the computed scope/owner key.
+  Native tests cover invalidation during reads, host failures, fast paths,
+  incomplete values, transaction-only validation and isolation of memo keys.
+  A transactional view still never caches its own uncommitted rows. The
+  generation guard's concurrency contract stays trusted and tested, and
+  the walk's exhaustion-implies-coverage theorem remains open.
 - Collecting the trie is now the whole command `trieCollect`
   (`Trie/Collect.lean`), one immediate transaction over the head rows, raw
   node reads, `Storage.deleteExcept` (one set-wise statement per relation

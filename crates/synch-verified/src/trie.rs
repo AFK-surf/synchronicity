@@ -6,11 +6,62 @@ use crate::{
 
 pub use crate::generated::{
     Collected, LookupDomainError, MutationDomainError, NodeAnswer, NodeRefusal, NodeVerdict,
-    ProofVerifyError, TrieChange, TrieCollectDomainError, TrieProof, TrieServeDomainError,
-    TrieValue, TrieWalkDomainError, ValueAnswer,
+    ProofVerifyError, TrieChange, TrieCollectDomainError, TrieMissingDomainError, TrieProof,
+    TrieServeDomainError, TrieValue, TrieWalkDomainError, ValueAnswer,
 };
 pub use crate::operation::OperationError;
 use crate::{host::Storage, operation::Decode};
+
+/// Original host/transport failure or the requesting walk's shape refusal.
+#[derive(Debug)]
+pub enum CompleteError<E> {
+    Operation(OperationError<E>),
+    Domain(TrieMissingDomainError),
+}
+
+/// The raw services completeness reads besides the node bytes.
+pub struct CompleteResources<'a, E> {
+    pub snapshots: &'a mut dyn crate::host::Snapshots<Error = E>,
+    pub digest: &'a mut dyn Digest<Error = E>,
+    pub memo: &'a mut dyn crate::host::Memo<Error = E>,
+    pub redaction: &'a mut dyn crate::host::Redaction<Error = E>,
+}
+
+impl<E> std::fmt::Debug for CompleteResources<'_, E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CompleteResources").finish_non_exhaustive()
+    }
+}
+
+/// Completeness under a scope and optional provenance. Lean owns the memo
+/// key, fast path, walk and generation-checked certification. The caller's
+/// services may be a raw store or a view inside an existing transaction.
+pub fn is_complete<S: ByteStorage>(
+    storage: &mut S,
+    resources: CompleteResources<'_, S::Error>,
+    root: &[u8; 32],
+    scope: ServeScope,
+    owner: Option<String>,
+) -> Result<bool, CompleteError<S::Error>> {
+    let command = Command::TrieComplete {
+        root: root.to_vec(),
+        prefixes: scope.prefixes,
+        exact: scope.exact,
+        owner,
+    };
+    let capabilities = operation::Capabilities {
+        snapshots: Some(resources.snapshots),
+        digest: Some(resources.digest),
+        memo: Some(resources.memo),
+        redaction: Some(resources.redaction),
+        ..operation::Capabilities::default()
+    };
+    let result = operation::run_walk(storage, capabilities, &[], &command)
+        .map_err(CompleteError::Operation)?;
+    let outcome: Result<bool, TrieMissingDomainError> =
+        terminal(&result).map_err(|()| CompleteError::Operation(OperationError::Protocol))?;
+    outcome.map_err(CompleteError::Domain)
+}
 
 /// Completed serving failure, preserving original host errors.
 #[derive(Debug)]

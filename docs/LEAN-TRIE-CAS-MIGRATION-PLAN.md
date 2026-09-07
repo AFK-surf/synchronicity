@@ -222,7 +222,7 @@ the evidence for those. Cutover: `node.rs` publish path; the Rust
 of a 4 KiB key) 8.9 s in the Rust write path, 17.5 s through the Lean
 commands in a debug test run with the core's C compiled at `-O2`.
 
-**T3. Walk and fetch** (`Trie/Walk.lean`, requires F2). The reconcile fetch
+**T3. Walk and fetch** (`Trie/Missing.lean`, requires F2). The reconcile fetch
 loop becomes one suspended program: walk a batch (reads inside a transaction
 the program opens and closes), suspend on `Peer.fetchNodes`, verify each
 reply through T1, write nodes and provenance rows, resume. The walk's
@@ -237,14 +237,61 @@ walk is exhausted, every node and value reachable from the root through
 scope-admitted positions is present or redacted at a non-contained position.
 Cutover: `reconcile.rs:889-962` and `verify_node`; `MissingWalk` is deleted.
 
-**T4. Completeness and its memo** (`Trie/Complete.lean`). `isComplete owner
-root scope` reads `Memo.isKnown`, snapshots `Memo.generation`, runs the T3
-walk for one batch, and certifies. Proof: the result equals exhaustion of
-the T3 walk; a certificate is written only under the generation it was
-computed at. The host contract (generation advances on both edges of every
-destructive mutation) is stated, and the existing `db.rs:275-330` tests
-remain its evidence. Cutover: the four `reconcile.rs` sites, `aae.rs`,
-`membership.rs`.
+**In progress; completeness uses the Lean walk, fetch still uses Rust.** `Trie/Missing.lean` implements
+the requesting walk with its frontier, deferred positions, depth-aware
+visits, reference pairing and pending extension-child checks retained in
+Lean. It runs over a `WorkSet` interface with hash-set and list instances;
+the batch uses `Program.iterate` so pure pruning does not grow the native
+stack. Each position is inspected before its state transition commits.
+Raw byte reads, presence snapshots and redaction lookups use existing
+algebras; the same reads can run inside a fetch transaction or under a
+completeness generation guard. No frontier crosses a command boundary.
+`TrieMissingProofs` proves both set instances lawful, deferred visits
+eligible again after resumption, missing holders non-exhausted, failed
+reads retryable, canonicality faults terminal, and every reported want and
+retained position scope-admitted (`nextBatch_admitted`). Kernel histories
+cover repeated and shared missing values, held and absent redaction
+boundaries, provenance, reference pruning and pairing, delayed extension
+children, batch limits, scan failures and retry after every fixture read.
+The module is compiled into the native core and used by T4's completeness
+command. The Rust `MissingWalk` remains the fetch's production path.
+Still required for T3: the suspended fetch command
+and engine driver, generation resets and certification, response admission
+and writes, the absence and exhaustion/coverage theorems, native regression
+and cost gates, and deletion of the Rust algorithms at the cutover.
+
+**T4. Completeness and its memo** (`Trie/Complete.lean`). Production cutover
+implemented; exhaustion/coverage still depends on T3. `Trie::is_complete`,
+`is_complete_scoped` and `is_complete_scoped_for` now call the whole
+`trieComplete` command, so all reconciliation, AAE and membership callers
+use it. Lean computes the scope/owner memo key, checks `Memo.isKnown`,
+reads `Memo.generation`, runs the requesting walk for one missing item and,
+only if exhausted, asks `Memo.certify` under the original ticket. The Rust
+memo/walk/certification algorithm is deleted. The adapter supplies raw node
+bytes and presence snapshots (without loading value payloads), BLAKE3,
+redactions and the existing memo methods; the narrowed runner admits those
+reads but no transaction or relational mutation effects. A caller already
+inside a transaction can validate its generation without caching an answer
+about uncommitted rows, exactly as before.
+`TrieCompleteProofs.recheck_after_walk` proves the answer is the memo's
+verdict if exhausted and false otherwise; `recheck_true_has_original_ticket`
+proves a new success uses the ticket read before the walk;
+`complete_true_uses_its_key` ties both paths to the computed scope/owner key.
+Histories cover known and new certificates, a missing value, a blocked or
+terminal memo, a transactional answer with no cache write, stale tickets,
+and every failed effect of the full-view operation. Native tests exercise
+the fast path, generation changes during reads, every failing host call,
+missing values, transactional validation, scope/provenance key isolation
+and agreement with the Rust requesting walk on complete and partial tries.
+The 120,000-entry native cost check made 160,533 node reads in each
+implementation: 0.668 s Rust and 0.733 s Lean in one local debug run
+(`complete_operation::completeness_at_the_documented_corpus_size`, ignored
+by default). Timing is evidence, not an asserted portability threshold.
+The host contract still requires generations to advance at both edges of
+invalidating mutations and never wrap; the existing `db.rs` generation,
+boundary-invalidation and transaction tests remain its evidence. Neither
+the new theorems nor the cutover prove concurrent host refinement or T3's
+exhaustion-implies-coverage theorem.
 
 **T5. Serve-side admission** (`Trie/Serve.lean`). Done. The `GetNodes` and
 `GetValues` answers run as the whole commands `trieServeNodes` and
@@ -274,7 +321,20 @@ be claimed into existence); an unscoped peer and an unvouched root are
 decided before any node is read (`admit_full`, `admit_unvouched`); the
 budget invariant of `Answer.push`; and on a five-node trie the served,
 missing and redacted lists for a scoped, an unscoped and a confined view,
-value serving by coverage, and a failure injected at every effect. Cutover:
+value serving by coverage, and a failure injected at every effect.
+`TrieServePrivacyProofs` closes the loop-level scope-privacy gap:
+`serveNodes_private` proves that every node payload in a successful scoped
+answer decodes to a node the scope admits at a requested, admitted position;
+`serveValues_private` proves that every value payload has a requested,
+admitted holder position whose decoded node references that value and
+admits its key. The invariants follow the executable answer loops through
+deduplication and both budget exits, for arbitrary batches, stored bytes
+and injected failures. They require no distinct-hash or canonical-store
+premise. A payload needs one authorized position: the same hash can also
+be refused at another position. Shared-leaf fixtures check both request
+orders and an entirely refused batch, for nodes and values. These are
+scope-authorization theorems, not a refinement proof of the native host
+or a loop-level provenance theorem. Cutover:
 the two `mpt.rs` arms delegate to `Store::serve_trie_nodes` and
 `serve_trie_values`; the Rust `admit`, `Vouch`, `Answer`, `Distinct` and
 `Scope::admits_node` are deleted, and `Trie::resolve_paths` is kept only as
@@ -637,8 +697,9 @@ Publication migration ── C6
 F1 and C1/T1 can start together. T3 and C4 wait for F2. Relative size: F2
 and T3 are the large items; T1, C3 and C7 are small; the rest are medium.
 C2 shrank when the Bao tree was fixed on the Rust side. F2 is done, so
-what remains is T3, T4 and C4 (C4 still needs the `Provider` algebra), and
-C6 with Publication.
+what remains is T3, T4's dependency on the exhaustion/coverage proof and
+cross-platform validation, C4 (which still needs the `Provider` algebra),
+and C6 with Publication, along with the denotational gaps recorded above.
 
 ## 9. What the end state claims, and what it does not
 

@@ -18,6 +18,8 @@ import VerifiedCore.Trie.Collect
 import VerifiedCore.Trie.Walk
 import VerifiedCore.Trie.Diff
 import VerifiedCore.Trie.Proof
+import VerifiedCore.Trie.Missing
+import VerifiedCore.Trie.Complete
 import VerifiedCore.Replication.History
 
 /-!

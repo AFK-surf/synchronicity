@@ -508,9 +508,10 @@ pub(crate) fn terminal<T: Decode>(bytes: &[u8]) -> Result<T, ()> {
     Ok(value)
 }
 
-// Byte-only commands do not need a pretend relational store or a second
-// layer of host errors: only the raw byte read and the digest primitive are
-// served, each only when the caller supplied it.
+// Narrow commands do not need a pretend transactional store or a second
+// layer of host errors. Byte reads and the explicitly supplied services
+// (including raw snapshots and memo reads/certification) are served here;
+// transaction and relational mutation frames remain protocol failures.
 fn dispatch_readonly<S: ByteStorage>(
     storage: Option<&mut S>,
     capabilities: &mut Capabilities<'_, S::Error>,
@@ -570,6 +571,43 @@ fn dispatch_readonly<S: ByteStorage>(
                 EncodeReply::encode,
             ))
         }
+        Frame::Snapshot(selection, columns) => {
+            let snapshots = capabilities
+                .snapshots
+                .as_deref_mut()
+                .ok_or(OperationError::Protocol)?;
+            Ok(scan_reply(
+                29,
+                snapshots.snapshot(&selection, &columns),
+                errors,
+            ))
+        }
+        Frame::IsKnown(key) => {
+            let memo = capabilities
+                .memo
+                .as_deref_mut()
+                .ok_or(OperationError::Protocol)?;
+            Ok(reply(74, memo.is_known(key), errors, EncodeReply::encode))
+        }
+        Frame::Generation => {
+            let memo = capabilities
+                .memo
+                .as_deref_mut()
+                .ok_or(OperationError::Protocol)?;
+            Ok(reply(75, memo.generation(), errors, EncodeReply::encode))
+        }
+        Frame::Certify(key, generation) => {
+            let memo = capabilities
+                .memo
+                .as_deref_mut()
+                .ok_or(OperationError::Protocol)?;
+            Ok(reply(
+                76,
+                memo.certify(key, generation),
+                errors,
+                EncodeReply::encode,
+            ))
+        }
         _ => Err(OperationError::Protocol),
     }
 }
@@ -612,6 +650,7 @@ pub(crate) struct Capabilities<'a, E> {
     pub(crate) memo: Option<&'a mut dyn crate::host::Memo<Error = E>>,
     pub(crate) redaction: Option<&'a mut dyn crate::host::Redaction<Error = E>>,
     pub(crate) apply: Option<&'a mut dyn crate::host::Apply<Error = E>>,
+    pub(crate) snapshots: Option<&'a mut dyn crate::host::Snapshots<Error = E>>,
 }
 
 impl<E> Default for Capabilities<'_, E> {
@@ -633,6 +672,7 @@ impl<E> Default for Capabilities<'_, E> {
             memo: None,
             redaction: None,
             apply: None,
+            snapshots: None,
         }
     }
 }
@@ -1206,8 +1246,8 @@ pub(crate) fn run_bytes<S: ByteStorage>(
 }
 
 /// Same ownership contract as `run`, narrowed to byte reads and the walk
-/// services the caller supplies (the refusals, the digest, the materializer):
-/// what a structural walk over the trie needs and nothing relational.
+/// services the caller supplies (refusals, digest, materializer, raw snapshots
+/// and memo): no transaction or relational mutation capability is exposed.
 pub(crate) fn run_walk<S: ByteStorage>(
     storage: &mut S,
     capabilities: Capabilities<'_, S::Error>,

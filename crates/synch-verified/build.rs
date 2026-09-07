@@ -60,6 +60,8 @@ fn main() {
         "Trie/Walk",
         "Trie/Diff",
         "Trie/Proof",
+        "Trie/Missing",
+        "Trie/Complete",
         "Replication/History",
         "Commands",
         "Commands/Generated",

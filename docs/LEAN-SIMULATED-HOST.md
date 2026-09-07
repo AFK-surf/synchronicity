@@ -59,7 +59,16 @@ nor out of the set, so the row stays). It touches rows only: the payloads a
 content-addressed relation serves through `readBytes` live in the file
 namespace of the same name, which a fixture keeps consistent with the rows.
 `Memo.forgetExcept` filters `certified` down to the kept keys and advances
-`memoGeneration`; `Digest.blake3` answers with the same `hash` parameter
+`memoGeneration`. `Memo.isKnown` hides certificates while `memoBlocked`
+is true; `Memo.generation` reads the ticket; `Memo.certify` compares that
+ticket with the current generation and, for a writable memo, refuses both
+an invalidating mutation and the terminal epoch. With `memoWritable = false`
+it only validates the generation and never caches an answer, modeling a
+transaction that can read its own uncommitted rows. Mutation-edge
+observations are explicit fixture inputs here, not a concurrent refinement
+proof; the native memo's invalidation, saturation and capacity behavior are
+covered by its Rust tests.
+`Digest.blake3` answers with the same `hash` parameter
 construction hashes with. `Redaction.isRedacted` answers whether `redacted`
 records the hash, at the given position or at any; `Apply.applyChange`
 appends the change to `applied`, in the order it was handed over.

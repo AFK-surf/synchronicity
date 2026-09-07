@@ -35,6 +35,9 @@ import Synchronicity.CasReceiveProofs
 import Synchronicity.CasCollectProofs
 import Synchronicity.CasProjectProofs
 import Synchronicity.TrieServeProofs
+import Synchronicity.TrieServePrivacyProofs
+import Synchronicity.TrieMissingProofs
+import Synchronicity.TrieCompleteProofs
 import Synchronicity.TrieCollectProofs
 import Synchronicity.TrieWalkProofs
 import Synchronicity.TrieMerkleProofs

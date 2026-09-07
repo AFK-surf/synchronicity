@@ -6,9 +6,9 @@ asking Lean for a scalar settlement, bitmap plan, scope predicate, walk step or
 completeness-cache transition.
 
 Local complete ingestion, local reads/repair, CAS acquisition/deletion/unpin/
-expiry, trie lookup and history retention remain mandatory whole Lean commands.
-Partial/cloud CAS orchestration, scope/walk and completeness coordination stay
-in Rust. Their fine-grained native exports and adapters have been removed.
+expiry, trie lookup, completeness and history retention are mandatory whole Lean commands.
+Remaining cloud CAS orchestration and the requesting fetch stay in Rust
+until their whole-command cutovers. Fine-grained domain exports and adapters have been removed.
 No further domain migration is authorized by this boundary cleanup.
 
 `VerifiedCore/Host.lean` supplies a typed executable effect monad and transaction
@@ -75,7 +75,18 @@ loops are deleted. Merkle proofs (`Trie/Proof.lean`: the lookup with its
 node trace, and the lookup again over the proof's nodes as a raw snapshot
 addressed by their digests) are two whole commands, the second over the
 `Digest` algebra alone; the Rust descent and in-memory verification store
-of the `proofs` feature are deleted. A program may wait on a peer
+of the `proofs` feature are deleted. Completeness (`Trie/Complete.lean`)
+is the whole `trieComplete` command: the scope/owner memo key, known-answer
+lookup, generation, one requesting-walk batch and certification. The walk
+(`Trie/Missing.lean`) retains its frontier and hash sets in Lean, uses raw
+byte and presence reads, and defers holders of missing values. Rust binds
+the existing memo generation guard and supplies snapshots without loading
+value payloads; the completeness algorithm is deleted from `synch-mpt`.
+The same raw view may be inside a caller-owned transaction, which validates
+its ticket without caching an answer about uncommitted rows. The fetch
+continues to use Rust's `MissingWalk` until its suspended-command cutover;
+exhaustion implying coverage remains an open proof obligation.
+A program may wait on a peer
 (`Host/Peer.lean`: the node and value round trips a fetch makes): the
 `suspend` module runs such a command to its first request and hands the
 continuation back as a `Suspension`, resumed with the reply and storage
@@ -246,8 +257,8 @@ explicit; they do not prove arbitrary filesystem/database behavior, native
 cryptographic primitives, the Rust interpreters, the runtime bindings or the
 compiler.
 
-Nothing in `specs/lean` models Rust. Scoped walks, completeness certificates,
-cloud and network ingestion and every other Rust path are covered by
+Nothing in `specs/lean` models Rust. The remaining requesting fetch, native
+memo guard, cloud orchestration and every other Rust path are covered by
 regression tests, not by Lean theorems, and no anchor pairs a Lean definition
 with a Rust site.
 

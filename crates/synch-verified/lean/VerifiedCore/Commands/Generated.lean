@@ -479,6 +479,24 @@ instance : Decode Commands.TrieWalkDomainError where
     | 4 => return .ceiling
     | _ => throw ()
 
+instance : Encode Commands.TrieMissingDomainError where
+  encode out value := match value with
+    | .decode a0 => out.push 0 |>.put a0
+    | .nodeDepth a0 => out.push 1 |>.put a0
+    | .valueDepth a0 => out.push 2 |>.put a0
+    | .expectedBranch a0 => out.push 3 |>.put a0
+    | .exhausted => out.push 4
+
+instance : Decode Commands.TrieMissingDomainError where
+  decode := do
+    match ← readByte with
+    | 0 => return .decode (← Decode.decode)
+    | 1 => return .nodeDepth (← Decode.decode)
+    | 2 => return .valueDepth (← Decode.decode)
+    | 3 => return .expectedBranch (← Decode.decode)
+    | 4 => return .exhausted
+    | _ => throw ()
+
 instance : Encode Commands.Ingested where
   encode out value := match value with
     | .mk a0 a1 => out |>.put a0 |>.put a1
@@ -576,6 +594,7 @@ instance : Encode Commands.Command where
     | .trieProve a0 a1 => out.push 41 |>.put a0 |>.put a1
     | .trieVerifyProof a0 a1 a2 a3 => out.push 42 |>.put a0 |>.put a1 |>.put a2 |>.put a3
     | .peerProbe a0 a1 a2 => out.push 43 |>.put a0 |>.put a1 |>.put a2
+    | .trieComplete a0 a1 a2 a3 => out.push 44 |>.put a0 |>.put a1 |>.put a2 |>.put a3
 
 instance : Decode Commands.Command where
   decode := do
@@ -624,6 +643,7 @@ instance : Decode Commands.Command where
     | 41 => return .trieProve (← Decode.decode) (← Decode.decode)
     | 42 => return .trieVerifyProof (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode)
     | 43 => return .peerProbe (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 44 => return .trieComplete (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode)
     | _ => throw ()
 
 end VerifiedCore

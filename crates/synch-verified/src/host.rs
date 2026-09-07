@@ -4,7 +4,7 @@
 
 pub use crate::generated::{
     Apply, Bao, ByteWrites, Clock, Construct, Crypto, Digest, FileIO, Lease, Memo, Output,
-    Redaction, Resources, SourceIO, Storage, Sweep, TemporaryFiles,
+    Redaction, Resources, Snapshots, SourceIO, Storage, Sweep, TemporaryFiles,
 };
 
 /// The raw services an ingestion directs besides its relational storage. The

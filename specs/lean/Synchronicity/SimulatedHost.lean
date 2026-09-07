@@ -48,6 +48,13 @@ structure State where
   have forgotten some of them. -/
   certified : List ByteArray := []
   memoGeneration : UInt64 := 0
+  /-- An invalidating host mutation currently hides certificates. The host
+  advances the generation at both edges; concurrent refinement is a trust
+  boundary, so fixtures supply those observations explicitly. -/
+  memoBlocked : Bool := false
+  /-- A transaction may validate its own snapshot without caching an answer
+  about data it can still roll back. -/
+  memoWritable : Bool := true
   /-- The refusals a peer recorded, as (hash, position), and the changes a
   materialization was handed, in walk order. -/
   redacted : List (ByteArray × ByteArray) := []
@@ -394,6 +401,17 @@ def memo : Memo A → State → Result A
   | .forgetExcept keep, state => reply state "memo:forget" fun state =>
       let certified := state.certified.filter fun key => keep.contains key
       (.ok (), { state with certified, memoGeneration := state.memoGeneration + 1 })
+  | .isKnown key, state => reply state "memo:known" fun state =>
+      (.ok (!state.memoBlocked && state.certified.contains key), state)
+  | .generation, state => reply state "memo:generation" fun state =>
+      (.ok state.memoGeneration, state)
+  | .certify key generation, state => reply state "memo:certify" fun state =>
+      let allowed := generation == state.memoGeneration &&
+        (!state.memoWritable || (!state.memoBlocked && generation != 18446744073709551615))
+      let certified := if allowed && state.memoWritable then
+        if state.certified.contains key then state.certified else key :: state.certified
+        else state.certified
+      (.ok allowed, { state with certified })
 
 /-- A refusal is looked up by hash at a position, or at any. -/
 def redaction : Redaction A → State → Result A

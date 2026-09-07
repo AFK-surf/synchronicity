@@ -16,6 +16,7 @@ import VerifiedCore.Trie.Collect
 import VerifiedCore.Trie.Walk
 import VerifiedCore.Trie.Diff
 import VerifiedCore.Trie.Proof
+import VerifiedCore.Trie.Complete
 import VerifiedCore.Host.Peer
 
 /-! The shapes that cross the command boundary: what a caller asks for and
@@ -152,6 +153,10 @@ inductive Command where
   /-- The suspending runner's self-test: two peer round trips, inside a
   transaction when told to. -/
   | peerProbe (root : ByteArray) (wants : List (ByteArray × ByteArray)) (inTransaction : Bool)
+  /-- Whether every scope-admitted position and value is held, with the
+  requested provenance, guarded by the completeness memo's generation. -/
+  | trieComplete (root : ByteArray) (prefixes : Option (List ByteArray)) (exact : List ByteArray)
+      (owner : Option String)
 
 /-- Malformed metadata or a column of the wrong storage class, as pin
 acquisition and deletion report it. -/
@@ -224,6 +229,16 @@ inductive TrieCollectDomainError where
   | columnType (index : Nat) (column : String) (actual : Cas.Codec.CellType)
   | column (column : String) (reason : String)
   | origin (error : Origin.Error)
+  | exhausted
+  deriving BEq, DecidableEq
+
+/-- The requesting walk's stored-shape refusals. Host failures retain their
+original token rather than being translated into one of these verdicts. -/
+inductive TrieMissingDomainError where
+  | decode (message : String)
+  | nodeDepth (depth : Nat)
+  | valueDepth (depth : Nat)
+  | expectedBranch (hash : ByteArray)
   | exhausted
   deriving BEq, DecidableEq
 

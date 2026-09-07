@@ -719,20 +719,7 @@ impl<'a, S: NodeStore + ?Sized> Trie<'a, S> {
         root: Hash,
         scope: &Scope,
     ) -> Result<bool, MptError> {
-        let memo = scope.memo_key_for(owner, root)?;
-        if Self::wrap(self.store.is_known_complete(&memo))? {
-            return Ok(true);
-        }
-        let generation = Self::wrap(self.store.completeness_generation())?;
-        let complete = MissingWalk::for_origin(owner.cloned(), None, root, scope.clone())
-            .next_batch(self, 1)?
-            .is_empty();
-        if complete {
-            // A concurrent write may have dissolved a boundary while this walk
-            // ran. In that case the caller must retry on a fresh snapshot.
-            return Self::wrap(self.store.note_complete_at(&memo, generation));
-        }
-        Ok(complete)
+        crate::lean_storage::complete(self.store, owner, root, scope)
     }
 
     /// Resolves claimed positions against `root`, returning what actually
