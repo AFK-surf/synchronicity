@@ -57,12 +57,12 @@ proptest! {
         prop_assert_eq!(iterated, expected);
     }
 
-    /// The root hash is a function of the key/value map alone: inserting the
-    /// same pairs in any order yields the same root.
+    /// Building a fresh compressed trie from the same pairs in any order
+    /// yields the same root. This does not compare routing representations.
     #[test]
     fn root_is_order_independent(items in map_strategy()) {
         // `forward` is the deduplicated map in sorted order; equal roots across
-        // the two orders mean the root depends on the map alone.
+        // the two orders checks insertion order for this compressed form.
         let map: BTreeMap<Vec<u8>, Vec<u8>> = items.iter().cloned().collect();
         let forward: Vec<(Vec<u8>, Vec<u8>)> = map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
 
@@ -73,7 +73,7 @@ proptest! {
         prop_assert_eq!(root_a, root_b);
     }
 
-    /// Deleting keys leaves exactly the canonical trie of the remaining map.
+    /// Deleting keys from a compressed trie matches a fresh compressed build.
     #[test]
     fn canonical_after_delete(items in map_strategy(), to_delete in prop::collection::vec(key_strategy(), 0..12)) {
         let map: BTreeMap<Vec<u8>, Vec<u8>> = items.into_iter().collect();

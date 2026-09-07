@@ -186,12 +186,11 @@ impl<'a, S: NodeStore + ?Sized> Trie<'a, S> {
 
     /// Removes a key, returning the new root.
     ///
-    /// Removing an absent key returns the root unchanged, so the trie stays in
-    /// canonical form: any two tries holding the same key/value map have the
-    /// same root regardless of the operation history that produced them. The
-    /// whole removal is the Lean operation `Trie.remove`, including the §12
-    /// key bound `insert` applies and the collapse and merge rules that keep
-    /// an extension above a branch only.
+    /// Removing an absent key returns the root unchanged. The whole removal
+    /// is the Lean operation `Trie.remove`, including the §12 key bound and
+    /// the collapse and merge rules that preserve valid compressed or routing
+    /// nodes. Different supported representations can have different roots
+    /// for the same entries.
     pub fn remove(&self, root: Hash, key: &[u8]) -> Result<Hash, MptError> {
         let mut bytes = crate::lean_storage::Bytes(self.store);
         let mut writes = crate::lean_storage::Bytes(self.store);
