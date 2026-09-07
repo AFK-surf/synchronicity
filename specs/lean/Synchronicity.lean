@@ -47,3 +47,6 @@ import Synchronicity.ExchangeVersionProofs
 import Synchronicity.TrieSnapshotProofs
 import Synchronicity.TrieRemoveSemantics
 import Synchronicity.CasReceivePromises
+import Synchronicity.TrieWriteSemantics
+import Synchronicity.CasContentProofs
+import Synchronicity.CasReceiveStateProofs
