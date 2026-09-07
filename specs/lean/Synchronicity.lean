@@ -44,3 +44,6 @@ import Synchronicity.TrieMerkleProofs
 import Synchronicity.SuspensionProofs
 import Synchronicity.ExchangeProofs
 import Synchronicity.ExchangeVersionProofs
+import Synchronicity.TrieSnapshotProofs
+import Synchronicity.TrieRemoveSemantics
+import Synchronicity.CasReceivePromises

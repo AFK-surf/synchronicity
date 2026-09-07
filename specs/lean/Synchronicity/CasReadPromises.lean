@@ -55,10 +55,17 @@ theorem empty_range_execution (state : State) (root : ByteArray) (row : Metadata
     ExceptT.run, ExceptT.mk, Except.mapError, UInt64.ofNat_toNat,
     beq_iff_eq, if_false, if_pos empty]
 
-/-- A nonempty available range appends exactly the selected stored bytes. -/
-theorem range_execution (state : State) (root : ByteArray) (row : Metadata)
+/-- A range needs backing only through its endpoint. Other parts may still be
+missing: partial receives do not need a fictitious intact whole file. -/
+theorem range_execution_from_backing (state : State) (root : ByteArray) (row : Metadata)
     (bytes : ByteArray) (offset length : UInt64)
-    (quiet : state.faults = []) (represents : Represents state root row bytes)
+    (raw : Row) (rest : List Row)
+    (quiet : state.faults = []) (observed : observation state root = raw :: rest)
+    (decoded : decodeRow raw = .ok row)
+    (representation : match row.inline with
+      | some inline => inline = bytes
+      | none => lookupFile state.files ("cas_payload", root) = some bytes)
+    (intact : min (offset.toNat + length.toNat) row.size.toNat ≤ bytes.size)
     (valid : offset.toNat ≤ row.size.toNat)
     (nonempty : offset.toNat ≠ min (offset.toNat + length.toNat) row.size.toNat)
     (available : covered row offset (min (offset.toNat + length.toNat) row.size.toNat).toUInt64 = true) :
@@ -66,9 +73,7 @@ theorem range_execution (state : State) (root : ByteArray) (row : Metadata)
     (result.1, result.2.output) =
       (.ok (min (offset.toNat + length.toNat) row.size.toNat - offset.toNat).toUInt64,
        state.output ++ (bytes.extract offset.toNat (min (offset.toNat + length.toNat) row.size.toNat)).data.toList) := by
-  obtain ⟨⟨raw, rest, observed, decoded⟩, size, representation⟩ := represents
   unfold observation at observed
-  have intact : min (offset.toNat + length.toNat) row.size.toNat ≤ bytes.size := by omega
   have bound : min (offset.toNat + length.toNat) row.size.toNat - offset.toNat < UInt64.size :=
     Nat.lt_of_le_of_lt (Nat.le_trans (Nat.sub_le ..) (Nat.min_le_right ..)) row.size.toNat_lt
   have stop : offset.toNat + (min (offset.toNat + length.toNat) row.size.toNat - offset.toNat) =
@@ -90,6 +95,21 @@ theorem range_execution (state : State) (root : ByteArray) (row : Metadata)
       Nat.not_lt.mpr valid, nonempty, available, UInt64.toNat_ofNat_of_lt' bound, stop, intact,
       bind, pure, Program.bind, ExceptT.bind, ExceptT.bindCont, ExceptT.pure,
       ExceptT.run, ExceptT.mk, Except.mapError]
+
+/-- A nonempty available range appends exactly the selected stored bytes. -/
+theorem range_execution (state : State) (root : ByteArray) (row : Metadata)
+    (bytes : ByteArray) (offset length : UInt64)
+    (quiet : state.faults = []) (represents : Represents state root row bytes)
+    (valid : offset.toNat ≤ row.size.toNat)
+    (nonempty : offset.toNat ≠ min (offset.toNat + length.toNat) row.size.toNat)
+    (available : covered row offset (min (offset.toNat + length.toNat) row.size.toNat).toUInt64 = true) :
+    let result := execute (read root (.range offset length)).run state
+    (result.1, result.2.output) =
+      (.ok (min (offset.toNat + length.toNat) row.size.toNat - offset.toNat).toUInt64,
+       state.output ++ (bytes.extract offset.toNat (min (offset.toNat + length.toNat) row.size.toNat)).data.toList) := by
+  obtain ⟨⟨raw, rest, observed, decoded⟩, size, representation⟩ := represents
+  exact range_execution_from_backing state root row bytes offset length raw rest
+    quiet observed decoded representation (by omega) valid nonempty available
 
 /-- Reading a part returns exactly that part, with no host/state conversion. -/
 theorem reading_a_part_returns_that_part (state : State) (root : ByteArray)
@@ -125,6 +145,38 @@ theorem reading_a_part_returns_that_part (state : State) (root : ByteArray)
       rw [UInt64.toNat_ofNat_of_lt' bound, ByteArray.size_extract]
       omega
     rw [if_pos count, size]
+
+/-- A received part is readable without assuming the rest of the object has
+arrived. Only the requested range must have verified coverage and backing. -/
+theorem reading_received_part (state : State) (root : ByteArray)
+    (row : Metadata) (bytes : ByteArray) (offset length : UInt64)
+    (raw : Row) (rest : List Row)
+    (quiet : state.faults = []) (observed : observation state root = raw :: rest)
+    (decoded : decodeRow raw = .ok row)
+    (representation : match row.inline with
+      | some inline => inline = bytes
+      | none => lookupFile state.files ("cas_payload", root) = some bytes)
+    (intact : min (offset.toNat + length.toNat) row.size.toNat ≤ bytes.size)
+    (valid : offset.toNat ≤ row.size.toNat)
+    (nonempty : offset.toNat ≠ min (offset.toNat + length.toNat) row.size.toNat)
+    (available : covered row offset (min (offset.toNat + length.toNat) row.size.toNat).toUInt64 = true) :
+    readResult state root (.range offset length) = .ok
+      (bytes.extract offset.toNat (min (offset.toNat + length.toNat) row.size.toNat)).data.toList := by
+  have bound : min (offset.toNat + length.toNat) row.size.toNat - offset.toNat < UInt64.size :=
+    Nat.lt_of_le_of_lt (Nat.le_trans (Nat.sub_le ..) (Nat.min_le_right ..)) row.size.toNat_lt
+  have result := range_execution_from_backing { state with output := [] } root row bytes
+    offset length raw rest quiet observed decoded representation intact valid nonempty available
+  have value := congrArg Prod.fst result
+  have output := congrArg Prod.snd result
+  simp only [List.nil_append] at value output
+  simp only [readResult, SimulatedHost.run, value, publish, output]
+  have count : (min (offset.toNat + length.toNat) row.size.toNat - offset.toNat).toUInt64.toNat =
+      (bytes.extract offset.toNat (min (offset.toNat + length.toNat) row.size.toNat)).data.toList.length := by
+    change (min (offset.toNat + length.toNat) row.size.toNat - offset.toNat).toUInt64.toNat =
+      (bytes.extract offset.toNat (min (offset.toNat + length.toNat) row.size.toNat)).size
+    rw [UInt64.toNat_ofNat_of_lt' bound, ByteArray.size_extract]
+    omega
+  rw [if_pos count]
 
 /-- A complete local claim covers all ranges inside the object. -/
 theorem complete_covers (row : Metadata) (start stop : UInt64)

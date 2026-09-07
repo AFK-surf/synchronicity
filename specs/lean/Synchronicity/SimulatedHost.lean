@@ -91,6 +91,12 @@ structure State where
   decodeInline : ByteArray → UInt64 → Option ByteArray → List (UInt64 × UInt64) → UInt64 →
     Option ByteArray := fun _ _ inline _ _ => some (inline.getD ByteArray.empty)
   decodeSlice : ByteArray → UInt64 → List (UInt64 × UInt64) → UInt64 → Bool := fun _ _ _ _ => true
+  /-- The trusted Bao decoder's physical result, using the existing payload.
+  Content composition must require that this transformation writes the verified
+  bytes and preserves previously verified bytes. A successful verification bit
+  alone does not establish either fact. -/
+  decodedPayload : ByteArray → UInt64 → List (UInt64 × UInt64) → UInt64 → ByteArray →
+    ByteArray := fun _ _ _ _ previous => previous
   proven : ByteArray → UInt64 → List (UInt64 × UInt64) → UInt64 → UInt64 →
     Option (Bool × List (UInt64 × UInt64 × ByteArray × Bool)) := fun _ _ _ _ _ => some (false, [])
   agrees : ByteArray → ByteArray → UInt64 → UInt64 → UInt64 → ByteArray → Bool :=
@@ -364,7 +370,9 @@ def bao : Bao A → State → Result A
       | some buffer => (.ok buffer, state)
   | .decodeSlice root size spans input, state => reply state "bao:decodeSlice" fun state =>
       if state.decodeSlice root size spans input then
-        (.ok (), { state with files := writeFile state.files ("cas_payload", root) ByteArray.empty })
+        let previous := (lookupFile state.files ("cas_payload", root)).getD ByteArray.empty
+        let bytes := state.decodedPayload root size spans input previous
+        (.ok (), { state with files := writeFile state.files ("cas_payload", root) bytes })
       else (.error invalid, state)
   | .flushObject root, state => reply state "bao:flush" fun state =>
       (.ok (), { state with synced := ("cas_payload", root) :: state.synced })
