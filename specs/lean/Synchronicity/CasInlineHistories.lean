@@ -137,4 +137,87 @@ theorem received_inline_content_remains_readable (state : State) (root content :
   rw [kept.1]
   exact observed
 
+/-- The inline decoder's success means exact bytes for this named object.
+This contract concerns only the primitive's returned buffer, not a later
+metadata flag or a later read. Small objects have one complete group. -/
+def InlineDecoderCorrect (state : State) (root content : ByteArray) (size : UInt64) : Prop :=
+  ∀ (input : UInt64) (buffer : ByteArray),
+    state.decodeInline root size none (Cas.Serve.pairsOf (Cas.IngestCommit.fullSpan size)) input = some buffer →
+      buffer = content
+
+private theorem unverified_inline_receive (state : State) (root : ByteArray) (size : UInt64)
+    (transfer : Transfer) (ready : Ready state)
+    (absent : (rows state.db "blobs").filter (fun row => equals row [("root", .blob root)]) = [])
+    (small : size ≤ Cas.Receive.inlineMax)
+    (unverified : Cas.Receive.window size transfer.served = [] ∨
+      state.decodeInline root size none (Cas.Serve.pairsOf (Cas.Receive.window size transfer.served)) transfer.input = none) :
+    let result := receive root size transfer state
+    result.2.db = state.db ∧ Ready result.2 ∧ result.2.decodeInline = state.decodeInline := by
+  rcases ready with ⟨quiet, idle, clean⟩
+  by_cases empty : Cas.Receive.window size transfer.served = []
+  · simp [receive, SimulatedHost.run, Cas.Receive.writeSlice, empty, execute, pure,
+      ExceptT.pure, ExceptT.run, ExceptT.mk]
+    exact ⟨quiet, idle, clean⟩
+  · have interrupted := unverified.resolve_left empty
+    have selected (table : String) (fields : Fields) :
+        selects ⟨table, fields, [], []⟩ = fun row => equals row fields := by
+      funext row
+      simp [selects]
+    simp [receive, SimulatedHost.run, Cas.Receive.writeSlice, Cas.Receive.leased, Cas.Receive.admit,
+      Cas.Receive.metadata?, Cas.Receive.access, Cas.Receive.lease, Cas.Receive.bao,
+      Cas.IngestCommit.admit, Cas.IngestCommit.decodeClaim, within, ensure, raise, performOver,
+      Inject.inject, Program.mapEffects, execute, Interpreter.handle, SimulatedHost.access,
+      SimulatedHost.lease, SimulatedHost.bao, reply, fault, record, quiet, idle, clean,
+      scanFailure, absent, CasReceiveProofs.fresh_accepted, selected, small, empty, interrupted,
+      counter, setCounter, Except.mapError, Except.map, bind, pure, Program.bind, ExceptT.bind,
+      ExceptT.bindCont, ExceptT.pure, ExceptT.run, ExceptT.mk]
+    exact ⟨rfl, rfl, rfl⟩
+
+/-- An arbitrary inline receive history eventually makes the exact object
+readable when at least one nonempty transfer verifies. Earlier interruptions,
+empty requests, and later duplicates require no reset or clean-file adapter. -/
+theorem verified_inline_history_makes_the_whole_readable (state : State) (root content : ByteArray)
+    (size : UInt64) (transfers : List Transfer) (ready : Ready state)
+    (absent : (rows state.db "blobs").filter (fun row => equals row [("root", .blob root)]) = [])
+    (width : root.size = 32) (sameSize : size.toNat = content.size)
+    (small : size ≤ Cas.Receive.inlineMax) (correct : InlineDecoderCorrect state root content size)
+    (eventuallyVerified : ∃ transfer ∈ transfers, Cas.Receive.window size transfer.served ≠ [] ∧
+      (state.decodeInline root size none (Cas.Serve.pairsOf (Cas.Receive.window size transfer.served)) transfer.input).isSome = true) :
+    CasReadPromises.readResult (receiveAll root size transfers state) root .all = .ok content.data.toList := by
+  induction transfers generalizing state with
+  | nil => simp at eventuallyVerified
+  | cons first rest ih =>
+    have continueAfterFailure (unverified : Cas.Receive.window size first.served = [] ∨
+        state.decodeInline root size none (Cas.Serve.pairsOf (Cas.Receive.window size first.served)) first.input = none) :
+        CasReadPromises.readResult (receiveAll root size (first :: rest) state) root .all = .ok content.data.toList := by
+      obtain ⟨db, nextReady, decoder⟩ := unverified_inline_receive state root size first ready absent small unverified
+      have nextAbsent : (rows (receive root size first state).2.db "blobs").filter
+          (fun row => equals row [("root", .blob root)]) = [] := by rw [db]; exact absent
+      have nextCorrect : InlineDecoderCorrect (receive root size first state).2 root content size := by
+        unfold InlineDecoderCorrect at *
+        rw [decoder]
+        exact correct
+      apply ih _ nextReady nextAbsent nextCorrect
+      obtain ⟨transfer, member, nonempty, verified⟩ := eventuallyVerified
+      have inRest : transfer ∈ rest := by
+        rcases List.mem_cons.mp member with same | member
+        · subst transfer
+          rcases unverified with empty | failure
+          · exact False.elim (nonempty empty)
+          · simp [failure] at verified
+        · exact member
+      exact ⟨transfer, inRest, nonempty, by simpa only [decoder] using verified⟩
+    by_cases empty : Cas.Receive.window size first.served = []
+    · exact continueAfterFailure (Or.inl empty)
+    · cases decoded : state.decodeInline root size none
+          (Cas.Serve.pairsOf (Cas.Receive.window size first.served)) first.input with
+      | none => exact continueAfterFailure (Or.inr decoded)
+      | some buffer =>
+        have correctBuffer : buffer = content := by
+          apply correct first.input buffer
+          rw [small_window size first.served small empty] at decoded
+          exact decoded
+        subst buffer
+        exact received_inline_content_remains_readable state root content size first rest ready absent width sameSize small empty decoded
+
 end Synchronicity.CasInlineHistories
