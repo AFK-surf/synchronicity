@@ -557,6 +557,113 @@ private theorem load_cursor_meaning (shaped : Shaped before)
     exact ⟨rfl, ⟨loaded_node_closed valid.2 held decoded, wf, inv⟩,
       fun _ _ => graph_node_entries held decoded⟩
 
+private theorem stored_step_as_node
+    (within : path.length ≤ maxKeyBytes * 2) (spine : Normalize.belowBoundary path = false) :
+    (Normalize.step ⟨.visit path (.stored root) :: work, results⟩).run =
+      (do let node ← load root
+          Normalize.step ⟨.visit path (.node node) :: work, results⟩).run := by
+  simp only [Normalize.step, Nat.not_lt.mpr within, ↓reduceIte, spine,
+    Bool.false_eq_true, run_bind]
+  congr 1
+
+private theorem replace_cursor_meaning
+    (meaning : StateMeaning store ⟨.visit path cursor :: work, results⟩ target)
+    (valid : CursorValid store replacement)
+    (same : ∀ key bytes, CursorEntries store cursor key bytes ↔ CursorEntries store replacement key bytes) :
+    StateMeaning store ⟨.visit path replacement :: work, results⟩ target := by
+  obtain ⟨entries, pending, completed⟩ := meaning
+  cases pending with
+  | visit original originalEntries below =>
+    exact ⟨entries, .visit valid
+      (fun key bytes => (same key bytes).symm.trans (originalEntries key bytes)) below, completed⟩
+
+private theorem addressValue_shape {value : Value} (digestWidth : Width d) (shaped : Shaped before)
+    (wf : value.wf)
+    (ran : execute d before (addressValue value).run = some (.ok address, after)) :
+    Shaped after ∧ address.size = 32 := by
+  cases value with
+  | hash existing =>
+    simp only [addressValue, run_pure, TrieMutateProofs.execute_pure,
+      Option.some.injEq, Prod.mk.injEq, Except.ok.injEq] at ran
+    obtain ⟨rfl, rfl⟩ := ran
+    exact ⟨shaped, wf⟩
+  | inline bytes =>
+    simp only [addressValue, run_bind, digest_run, program_bind_request,
+      program_bind_pure, execute_digest, mapError_ok, bindCont_ok, write_run,
+      execute_write, run_pure, TrieMutateProofs.execute_pure, Option.some.injEq,
+      Prod.mk.injEq, Except.ok.injEq] at ran
+    obtain ⟨rfl, rfl⟩ := ran
+    exact ⟨shaped_write_value shaped _ _, digestWidth _⟩
+
+/-- The actual terminal-leaf visit moves its value behind an address and
+stores a routing node with exactly the same key and contents. -/
+theorem terminal_leaf_step_preserves (digestWidth : Width d) (shaped : Shaped before)
+    (meaning : StateMeaning before.read ⟨.visit path (.node (.leaf suffix value)) :: work, results⟩ target)
+    (within : path.length ≤ maxKeyBytes * 2) (spine : Normalize.belowBoundary path = false)
+    (spelling : suffix.toList = [])
+    (safe : SafeWrites d before
+      (Normalize.step ⟨.visit path (.node (.leaf suffix value)) :: work, results⟩).run)
+    (ran : execute d before
+      (Normalize.step ⟨.visit path (.node (.leaf suffix value)) :: work, results⟩).run =
+      some (.ok (.inl next), after)) : Shaped after ∧ StateMeaning after.read next target := by
+  obtain ⟨entries, pending, completed⟩ := meaning
+  cases pending with
+  | visit valid originalEntries below =>
+    obtain ⟨closed, wf, inv⟩ := valid
+    obtain ⟨original, denotes⟩ := closed
+    simp only [Normalize.step, Nat.not_lt.mpr within, ↓reduceIte, spine,
+      Bool.false_eq_true, run_bind, run_pure, program_bind_pure, bindCont_ok, spelling] at safe ran
+    have firstSafe := safe_bind_left _ safe
+    rw [execute_bind] at ran
+    cases first : execute d before (addressValue value).run with
+    | none => simp [first] at ran
+    | some reply =>
+      obtain ⟨reply, middle⟩ := reply
+      cases reply with
+      | error error => simp [first] at ran
+      | ok addressed =>
+        have restSafe := safe_bind_right _ safe first
+        simp only [first, bindCont_ok] at ran
+        obtain ⟨middleShaped, addressWidth⟩ := addressValue_shape digestWidth shaped wf.2 first
+        obtain ⟨firstIncluded, payloadExact⟩ := addressValue_exact firstSafe first
+        have routeWf : (Node.route emptyChildren (some addressed)).wf :=
+          ⟨rfl, branchOk_empty.2.1, fun hash same => by cases same; exact addressWidth⟩
+        have routeInv : checkInvariants (.route emptyChildren (some addressed)) = .ok () :=
+          checkInvariants_route (by simp [occupants])
+        have routeClosed : NodeClosed middle.read (.route emptyChildren (some addressed)) :=
+          ⟨fun hash same => by cases same; exact ⟨original, (payloadExact original).mpr denotes⟩,
+            empty_children_meaning.closed⟩
+        have routeEntries : ∀ key bytes, NodeEntries middle.read (.route emptyChildren (some addressed)) key bytes ↔
+            CursorEntries before.read (.node (.leaf suffix value)) key bytes := by
+          intro key bytes
+          cases key with
+          | nil => simpa [NodeEntries, CursorEntries, spelling] using payloadExact bytes
+          | cons nibble tail =>
+            simp only [NodeEntries, CursorEntries, spelling, List.cons_ne_nil, false_and,
+              emptyChildren, List.getElem?_replicate]
+            split <;> simp
+        simp only [bindCont_ok, run_bind] at restSafe
+        have safePut := safe_bind_left _ restSafe
+        have collision : CompatibleWrite middle nodeSpace
+            (d (tagOf (.route emptyChildren (some addressed)) ++ encode (.route emptyChildren (some addressed))))
+            (encode (.route emptyChildren (some addressed))) := by
+          simpa only [put_requests_tagged_digest, SafeWrites, and_true] using safePut
+        rw [execute_run_bind, execute_put] at ran
+        simp only [run_pure, TrieMutateProofs.execute_pure, Option.some.injEq,
+          Prod.mk.injEq, Except.ok.injEq, Sum.inl.injEq] at ran
+        obtain ⟨rfl, rfl⟩ := ran
+        have putRan := execute_put d middle (.route emptyChildren (some addressed))
+        have lastIncluded := (put_stores_node_and_preserves collision putRan).1
+        have included : RecordsIncluded before.read _ := fun space key bytes relevant held =>
+          lastIncluded space key bytes relevant (firstIncluded space key bytes relevant held)
+        refine ⟨shaped_write_node middleShaped (canonical_encode routeWf routeInv),
+          ⟨_, pending_preserved below included, .cons ⟨digestWidth _,
+            put_node_closed routeClosed routeWf collision putRan, ?_⟩
+            (completed_preserved completed included)⟩⟩
+        intro key bytes
+        exact (put_node_exact routeClosed routeWf collision putRan).trans
+          ((routeEntries key bytes).trans (originalEntries key bytes))
+
 /-- Inside a complete sharing prefix, the actual visit keeps the entire
 subtree compressed without changing any of its entries. -/
 theorem boundary_visit_preserves (digestWidth : Width d) (shaped : Shaped before)
