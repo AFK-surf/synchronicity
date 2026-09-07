@@ -436,13 +436,13 @@ completed cutover from being mistaken for a completed user guarantee.
 | --- | --- | --- |
 | Foundation F1/F2 | Lean carrier, raw capabilities, native runtime and peer suspension integrated | Shared host, wire, cleanup and suspension lemmas/tests exist. Provider suspension still needs C4 integration; verify discipline for each real suspending program. |
 | Trie T1/T2: ingress and mutation | Production Lean (`Codec`, `Verify`, `Mutate`) | Canonical encoding/address preservation proved. Exact update/remove map meaning and whole-path depth remain open (P2). |
-| Trie T3: requesting fetch | Lean `Missing` used by completeness; production fetch still Rust | Scope, deferral, interruption and batch results exist. Suspended fetch, response admission/write, generation resets and native cutover remain; exhaustion does not yet establish P3. |
+| Trie T3: requesting fetch | Production Lean `Fetch`, with a pinned Rust worker interpreting peer waits | Inspection, verified response admission, provenance writes, bounded retries and pending-target updates moved into the whole suspended operation. Four real-store tests cover admission, atomic rejection, cancellation and released database access across waits. Remove the remaining exported Rust test oracle and prove the actual operation against faithful shared byte storage; exhaustion still does not establish P3. |
 | Trie T4: completeness | Production Lean `Complete` and scope/owner memo key | Ticket/key discipline and native regressions checked. Justified omission and exact-view coverage are open, including the root-refusal issue above. |
 | Trie T5: serving | Production Lean `Serve`; authorization inputs still composed in Rust | Actual-position resolution and whole-response scope predicates proved. Connect grants, publisher authority, provenance and transmitted bytes for P4/M5. |
 | Trie T6: scan/diff | Production Lean `Walk`/`Diff`, streaming host application | Prefix/cursor/limit constraints and fixtures exist. Exact listings/differences and atomic faithful materialization remain open (P2/P3/M4). |
 | Trie T7/T8: collection and optional Merkle proofs | Production Lean `Collect`/`Proof` | Reachable retained nodes/values survive collection; proof verification/lookup and construction round trip checked. Retention through actual pending/publication transitions remains a composition obligation. |
 | CAS local ingest/read/heal/lifecycle | Production Lean | Named scoped P1/P5/P6 results below; extend fresh-store/intact-content assumptions to relevant histories. |
-| CAS C1/C2: serve/verified receive/delta promotion | Production Lean with trusted Bao service | Window/eligibility and commit-order support exists. Persistent verified receive-to-read composition remains open. |
+| CAS C1/C2: serve/verified receive/delta promotion | Production Lean with trusted Bao service | Fresh full receive-to-read and exact reads of backed verified ranges are checked; successful existing-row receive persists actual planner/decoder output over arbitrary raw databases. Connect repeated receives to the backing/coverage invariant, including decoder failures and partial physical writes. |
 | CAS C3/C5/C7: durability, collection, projections | Production Lean | Repair responsibility, collection protection and projection support exist. Clock/LRU/diagnostics are regression details; cloud/publication retention composition remains open. |
 | CAS C4: cloud composition | Rust `backend.rs` | Migrate complete provider adoption/hydration/finalize/read/serve commands, including trusted-range ingestion and complete-proof path. |
 | CAS C6: source holds and publication advertisement | Rust inside publication transaction | Migrate with the entry/head/reference publication command, never as independently committing calls. |
@@ -482,6 +482,42 @@ library suite passed 284 tests with four ignored. These tests support the Rust
 composition change, not a formal atomic-promotion or eventual-consistency claim.
 The new exchange proofs passed their individual Lean checks; aggregate proof,
 axiom, native and platform gates remain required for the final checkpoint.
+
+The requesting fetch now executes in `VerifiedCore.Trie.Fetch`. Its continuation
+retains traversal state across peer waits; admission verifies requested addresses
+and commits each answer atomically. The host drops its database session before
+calling the peer and resumes on the same worker. Pending refresh/deletion matches
+the target origin, sequence and root, so a stale attempt does not target a newer
+pending version. These are implementation facts and native regression coverage;
+whole-operation transaction, interruption and convergence theorems remain open.
+
+The integration checkpoint passed four real-store fetch tests, seven native
+completeness tests (one stress test ignored), and 179 engine unit tests. The engine
+integration run stopped at `a_compressed_node_spanning_out_of_scope_is_a_boundary_not_an_absence`:
+a delegate granted `photos` must finish an empty permitted view when the publisher
+only has a private `finance/q3.pdf`, without learning that private name. Preserve
+this expectation. The current refusal correction alone cannot satisfy it.
+
+### Newly checked snapshot and content composition
+
+`TrieWriteSemantics.mutation_preserves_saved_read` connects actual mutation effects
+to preservation of an existing successful read, assuming only compatibility of
+encountered stored images at their addresses. `insert_into_empty_exact` gives the
+exact single-entry meaning of inserting into the empty snapshot. General insertion,
+present-key deletion, complete listings and exact differences remain required;
+preserving an existing positive read alone does not exclude new entries appearing
+in a previously incomplete old snapshot.
+
+`CasReceivePromises.fully_received_content_reads_exactly` connects a successful
+fresh full receive to actual subsequent reads. `CasContentProofs.verified_parts_read_as_content`
+extends the read result to arbitrary available nonempty ranges: every returned
+byte equals the corresponding intended content byte, although other groups may
+be absent. `CasReceiveStateProofs.existing_receive_execution` establishes actual
+row and decoder-output persistence without the previous single-row/empty-lease
+restriction. It is a composition lemma, not yet the user theorem that any sequence
+of valid partial receives preserves all readable content. In particular, the
+trusted decoder must preserve previously verified bytes even if it writes part
+of an answer and then fails; a successful-verification flag alone is insufficient.
 
 ## Path to all proof goals
 
@@ -567,9 +603,10 @@ resources, and output publication. The [host document](#shared-host-semantics-an
 describes its supported semantics and limitations. Hashing remains a primitive;
 no cryptographic assumption is disguised as a metadata invariant.
 
-The coverage theorems are about the Lean planner. Verified receive now runs
-in Lean, but its composition with persistent reads is still open; cloud
-orchestration remains Rust. Planner laws alone verify neither composition.
+The coverage laws concern the Lean planner. The receive/read composition above
+now connects selected successful executions to persistent bytes and rows, while
+repeated partial-receive histories and failure preservation remain open. Cloud
+orchestration remains Rust; planner laws alone do not establish its guarantees.
 
 ### Remaining content composition
 
