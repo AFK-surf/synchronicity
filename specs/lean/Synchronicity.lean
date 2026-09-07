@@ -51,3 +51,4 @@ import Synchronicity.TrieWriteSemantics
 import Synchronicity.CasContentProofs
 import Synchronicity.CasReceiveStateProofs
 import Synchronicity.CasBitmapProofs
+import Synchronicity.TrieSnapshotClosure
