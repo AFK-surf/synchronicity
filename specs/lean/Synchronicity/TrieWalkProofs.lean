@@ -7,7 +7,7 @@ back, how a value is compared as a value, what every descent maintains (no
 walk charges past the ceiling, every frame sits under the walk's base), what
 every entry a range scan lists satisfies (the prefix, the resume cursor, the
 limit), and on a concrete trie the scan's listing under prefix, cursor and
-limit, a refused position reading as empty, the diff of two roots with
+limit, a refusal never concealing missing data, the diff of two roots with
 structural sharing pruned and representations reconciled, the streamed
 materialization in walk order, and a failure injected at every effect. -/
 namespace Synchronicity.TrieWalkProofs
@@ -561,13 +561,13 @@ theorem nothing_is_listed_under_the_empty_root :
     (result.1, result.2.trace) == (.ok [], []) := by
   decide +kernel
 
-/-- A position the peer refused reads as empty, so the scan lists what this
-node was sent; the same absence without a refusal is a missing node. -/
-theorem a_refused_position_is_empty_and_an_unexplained_one_is_missing :
+/-- A refusal cannot turn a partial file list into successful output. Both
+refused and unexplained missing nodes leave the scan incomplete. -/
+theorem a_refusal_cannot_hide_a_missing_part_of_the_snapshot :
     (let result := SimulatedHost.run (scan (E := Walk.Effects) rootHash (bytes []) none none) refused
-     (result.1, result.2.trace) == (.ok [(keyA, valueA)], reads 5 ++ ["redacted"])) ∧
+     (result.1, result.2.trace) == (.error (.missingNode leafBHash), reads 5)) ∧
     (let result := SimulatedHost.run (scan (E := Walk.Effects) rootHash (bytes []) none none) missing
-     (result.1, result.2.trace) == (.error (.missingNode leafBHash), reads 5 ++ ["redacted"])) := by
+     (result.1, result.2.trace) == (.error (.missingNode leafBHash), reads 5)) := by
   decide +kernel
 
 /-- A root against itself reads nothing; against the empty root, every

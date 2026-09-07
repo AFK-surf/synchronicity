@@ -94,11 +94,12 @@ there. No automatic conflict-merging guarantee is implied.
 ## An important unresolved meaning of completion
 
 The current `TrieCompleteProofs` establish the completion check's execution
-and generation discipline. They do not establish P3. A checked probe of
-the current command demonstrates that a destination with no node bytes and
-a recorded refusal at the root can return `true` under a restricted scope.
-`TrieMissingProofs.refusals_only_satisfy_absent_spine_positions` already
-records the walk behavior behind that result.
+and generation discipline. They do not establish P3. The earlier command
+accepted a root refusal as a complete empty view without the root's bytes.
+The requesting walk now keeps that node outstanding; scans fail on missing
+referenced nodes even when refused. `a_refused_root_does_not_certify_an_empty_view`
+and `refusals_cannot_satisfy_missing_positions`, plus a native regression with
+an actually published shared entry, check this correction.
 
 A refusal to provide something is not, by itself, evidence that no shared
 entry lies behind it. Before proving P3, establish what authentic evidence
@@ -107,7 +108,14 @@ cannot provide that evidence, change the behavior or the completion status.
 Do not assume "all refusals are safe" merely to make the desired theorem
 provable. Also examine whether valid metadata layouts can place private
 data above shared descendants: privacy and complete disclosure must be
-compatible for the snapshots the product accepts.
+compatible for the snapshots the product accepts. This is a real schema issue:
+valid keys such as `r:photos` and `r:photos-raw` can put a private inline branch
+value above an authorized descendant. The current whole-node hash prevents
+revealing only the safe part of that branch with an ordinary hash check.
+Refusing false completion is an intermediate safety correction, not the final
+scoped-sync behavior or closure of eventual consistency. Legitimate private
+omissions still need authenticated proof or a representation/protocol change;
+do not weaken the existing successful-sharing requirements to hide this gap.
 
 Likewise, `TrieServePrivacyProofs` checks the implemented per-position scope
 rules across an answer. That is useful support for P4, but is not a complete
@@ -300,8 +308,10 @@ materialization, pending-head races, provenance grafting, timeouts and
 anti-entropy behavior. The recovery TLA+ model is valuable for P7 but does
 not model this complete mptsync pipeline or establish M1.
 
-The first blocking semantic issue is M4/P3: a root refusal currently permits
-a successful completeness check with no root data. Resolve what makes an
+The first blocking semantic issue is M4/P3: authenticated omission. The
+requesting walk now keeps refused nodes outstanding, and scans report missing
+nodes instead of silently hiding them. This corrects false success but does
+not yet allow legitimate private omissions to complete. Resolve what makes an
 omission justified before proving convergence to the resulting view. Then
 connect M2/M3/M5 to the executed offer/fetch/promote chain, and prove progress
 through the real scheduler. Preserve the existing fault and concurrency

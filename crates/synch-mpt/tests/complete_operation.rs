@@ -19,6 +19,7 @@ struct Observed {
     fail_at: Cell<Option<usize>>,
     invalidate_on_read: Cell<bool>,
     validate_only: Cell<bool>,
+    refuse: Cell<bool>,
 }
 
 impl Observed {
@@ -100,8 +101,29 @@ impl NodeStore for Observed {
 
     fn is_redacted(&self, _: &Hash, _: Option<&[u8]>) -> io::Result<bool> {
         self.step("redaction")?;
-        Ok(false)
+        Ok(self.refuse.get())
     }
+}
+
+#[test]
+fn a_refusal_cannot_turn_missing_shared_entries_into_a_complete_empty_view() {
+    let publisher = MemStore::default();
+    let root = Trie::new(&publisher)
+        .insert(Hash::EMPTY, b"shared/file", b"published value")
+        .unwrap();
+    let destination = Observed::default();
+    destination.refuse.set(true);
+    let scope = Scope::of(&ScopeKeys {
+        prefixes: vec![b"shared/".to_vec()],
+        exact: vec![],
+    });
+    let trie = Trie::new(&destination);
+    assert!(!trie.is_complete_scoped(root, &scope).unwrap());
+    assert!(destination.known.borrow().is_empty());
+    assert!(trie.scan(root, b"shared/", None, None).is_err());
+    let mut walk = MissingWalk::scoped(None, root, scope);
+    assert!(!walk.next_batch(&trie, 64).unwrap().is_empty());
+    assert!(!walk.is_exhausted());
 }
 
 #[test]

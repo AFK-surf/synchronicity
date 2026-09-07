@@ -74,10 +74,9 @@ def Cursor.value : Cursor → Option Value
   | .at (.extension _ _) => none
   | .at (.branch _ value) => value
 
-/-- The node at an address. A refused position holds nothing this node may
-see, so to a walk over what it *does* hold it is empty rather than absent;
-asked of the hash at any position, since a node missing here and refused
-somewhere was refused at every spine position the scoped fetch walked. -/
+/-- The node at an address. A missing referenced node is an incomplete
+snapshot, even if a peer refused it. A refusal is not authenticated evidence
+that the subtree contains no permitted entries. -/
 def cursorAt [Inject Storage E] [Inject Redaction E] : Option ByteArray → OperationOver E Error Cursor
   | none => pure .empty
   | some hash => do
@@ -86,8 +85,7 @@ def cursorAt [Inject Storage E] [Inject Redaction E] : Option ByteArray → Oper
       match decode raw with
       | .error message => throw (.decode message)
       | .ok node => pure (.at node)
-    | none =>
-      if ← redaction (.isRedacted hash none) then pure .empty else throw (.missingNode hash)
+    | none => throw (.missingNode hash)
 
 /-- One nibble down from a cursor. -/
 def cursorChild [Inject Storage E] [Inject Redaction E] (cursor : Cursor) (nibble : UInt8) :

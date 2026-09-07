@@ -154,9 +154,8 @@ impl MissingWalk {
     /// report a trie complete that it cannot serve.
     ///
     /// The reference must describe this same scope. Sound pruning also
-    /// requires omitted boundaries to contain no authorized entries; the
-    /// link from recorded refusals to that property remains an open proof
-    /// obligation in `docs/RUST-LEAN-PROOFS.md`.
+    /// requires every admitted path to have been checked. A recorded refusal
+    /// does not establish that a subtree contains no authorized entries.
     // The root and each child are queued only at admitted positions.
     pub fn scoped(known_complete: Option<Hash>, root: Hash, scope: Scope) -> MissingWalk {
         MissingWalk::for_origin(None, known_complete, root, scope)
@@ -264,35 +263,9 @@ impl MissingWalk {
                 continue;
             }
             let Some(data) = trie.load_owned_raw(self.owner.as_ref(), &hash)? else {
-                // The current walk treats a recorded refusal as a satisfied
-                // boundary rather than missing (§5.5). Only
-                // above the grant: inside it nothing could rightly be refused,
-                // and calling such a trie complete would vouch for what is not
-                // held. It cannot be tightened to `admits_path`: the child
-                // filter below drops every unadmitted position, so the memo
-                // would never fire. The refusal is looked up for *this*
-                // position: an honest one (`Ext`/`Leaf` running out of scope)
-                // is about where the node sits, and the same node at another
-                // spine position may lead back into the grant. The distinction
-                // lives where the node is: Lean's `Trie.Serve.Scope.admitsNode`,
-                // which does not refuse a branch it can serve.
-                //
-                // And only for an *absent* node. A node this store holds —
-                // served at another position it shares by structure, whatever
-                // a peer refused here — is expanded wherever the walk meets it.
-                // A held boundary would stop the walk above an in-grant
-                // subtree it never fetched, and `paired_children`, which
-                // follows held reference nodes, would prune against that
-                // subtree under the next root.
-                // This filter alone does not prove that a refusal hides no
-                // authorized entries; see `docs/RUST-LEAN-PROOFS.md`.
-                if !self.scope.contains_subtree(&path)
-                    && trie.is_redacted_raw(&hash, Some(&path))?
-                {
-                    self.frontier.pop();
-                    self.seen.insert(visit(&self.scope, hash, &path));
-                    continue;
-                }
+                // A peer refusal does not authenticate absence beneath an
+                // admitted spine. Keep the node outstanding: otherwise a
+                // partial view could replace a complete published file list.
                 self.frontier.pop();
                 self.seen.insert(visit(&self.scope, hash, &path));
                 missing.nodes.push((path.clone(), hash));
@@ -499,8 +472,6 @@ impl<'a, S: NodeStore + ?Sized> Trie<'a, S> {
         Self::wrap(self.store.get_node(hash))
     }
 
-    /// Whether a peer has refused to show this node at `path`, or at any
-    /// position for `None` (§5.5).
     /// [`Trie::load_raw`], with provenance when the walk carries an owner: a
     /// node this store holds but was never served as `owner`'s reads as
     /// absent, so the walk asks for it ([`MissingWalk::for_origin`]).
@@ -515,14 +486,6 @@ impl<'a, S: NodeStore + ?Sized> Trie<'a, S> {
             }
         }
         self.load_raw(hash)
-    }
-
-    pub(crate) fn is_redacted_raw(
-        &self,
-        hash: &Hash,
-        path: Option<&[u8]>,
-    ) -> Result<bool, MptError> {
-        Self::wrap(self.store.is_redacted(hash, path))
     }
 
     pub(crate) fn has_value_raw(&self, hash: &Hash) -> Result<bool, MptError> {
@@ -654,8 +617,8 @@ impl<'a, S: NodeStore + ?Sized> Trie<'a, S> {
     /// `Trie.Walk.scan`: the cursor through stored and compressed nodes, the
     /// hostile-shape defences (a depth past which no valid key can begin, the
     /// absolute ceiling on positions visited), the resume cursor's pruning
-    /// and the key order. Rust supplies raw node reads and the refusals a
-    /// peer recorded, which read as empty positions (§5.5).
+    /// and the key order. A missing referenced node makes the scan fail;
+    /// a peer refusal cannot turn it into an empty subtree.
     pub fn scan(
         &self,
         root: Hash,
@@ -688,9 +651,9 @@ impl<'a, S: NodeStore + ?Sized> Trie<'a, S> {
     }
 
     /// Whether the scoped requesting walk and its generation check accept
-    /// `root`. Recorded refusals can satisfy absent boundary positions;
-    /// connecting that behavior to an exact shared view remains an open
-    /// obligation in `docs/RUST-LEAN-PROOFS.md`.
+    /// `root`. Refused nodes remain missing. Authenticated scoped omission
+    /// and the full exact-view proof remain open obligations in
+    /// `docs/RUST-LEAN-PROOFS.md`.
     ///
     /// Completeness is a property of a root *and* a scope: a trie held whole
     /// within one grant is not held whole within a wider one. The memo is keyed
@@ -701,7 +664,7 @@ impl<'a, S: NodeStore + ?Sized> Trie<'a, S> {
 
     /// [`Trie::is_complete_scoped`] with provenance: for `Some(owner)`,
     /// node presence is checked as `owner`'s ([`NodeStore::owns_node`]),
-    /// while retaining the same refusal-boundary handling.
+    /// while retaining the same requirement for every admitted path.
     ///
     /// This is the question a member asks of a confined origin's head before
     /// it vouches for it (§5.5): a trie assembled out of nodes the origin was

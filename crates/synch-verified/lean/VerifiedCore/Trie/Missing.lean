@@ -158,8 +158,9 @@ def inspect [WorkSet Visit V] [WorkSet ByteArray H] (context : Context)
   if WorkSet.contains frontier.seen (visit context.scope position.hash position.path) then return .skip
   match ← loadOwned context.owner position.hash with
   | none =>
-    if !context.scope.containsSubtree position.path.toList then
-      if ← redaction (.isRedacted position.hash (some position.path)) then return .boundary
+    -- A peer's refusal does not authenticate the absence of permitted entries.
+    -- Keep this position outstanding until its bytes or authenticated omission
+    -- evidence arrive; scope alone cannot justify dropping an admitted spine.
     return .absent
   | some raw =>
     let node ← decodeNode raw

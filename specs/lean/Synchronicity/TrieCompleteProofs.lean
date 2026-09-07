@@ -99,6 +99,13 @@ theorem a_missing_value_prevents_certification :
     result.1 == .ok false && result.2.certified == [] && !result.2.trace.contains "memo:certify" := by
   decide +kernel
 
+/-- Even a refusal at the root cannot certify an unfetched shared view. -/
+theorem a_refused_root_does_not_certify_an_empty_view :
+    let result := SimulatedHost.run (complete ⟨onLeafA, none⟩ rootHash)
+      { redacted := [(rootHash, bytes [])] }
+    result.1 == .ok false && result.2.certified == [] := by
+  decide +kernel
+
 theorem a_transactional_answer_does_not_cache_uncommitted_rows :
     let result := SimulatedHost.run (complete full rootHash) { withValue with memoWritable := false }
     result.1 == .ok true && result.2.certified == [] := by

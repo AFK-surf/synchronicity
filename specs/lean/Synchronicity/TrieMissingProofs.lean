@@ -355,14 +355,14 @@ theorem shared_value_defers_every_holder :
     summary first.1 == .ok (.ok ⟨[], [(bytes [2], valueHash)]⟩, false, [], [leafAHash, leafBHash]) := by
   decide +kernel
 
-/-- A refused absent spine position is a boundary, but a refusal inside a
-grant is not consulted and cannot stand in for a missing node. -/
-theorem refusals_only_satisfy_absent_spine_positions :
+/-- A refused node remains missing on a grant's spine as well as inside it.
+An unsupported refusal never makes the requesting walk complete. -/
+theorem refusals_cannot_satisfy_missing_positions :
     (let context : Context := ⟨onLeafA, none⟩
      let state : State := { redacted := [(rootHash, bytes [])] }
      let result := batchRun context (initial context none rootHash) 64 state
-     summary result.1 == .ok (.ok {}, true, [], []) &&
-       result.2.trace == ["bytes:" ++ nodeSpace, "redacted"]) ∧
+     summary result.1 == .ok (.ok ⟨[(bytes [], rootHash)], []⟩, false, [], [rootHash]) &&
+       result.2.trace == ["bytes:" ++ nodeSpace]) ∧
     (let state : State := { redacted := [(rootHash, bytes [])] }
      let result := batchRun full initialFull 64 state
      summary result.1 == .ok (.ok ⟨[(bytes [], rootHash)], []⟩, false, [], [rootHash]) &&
