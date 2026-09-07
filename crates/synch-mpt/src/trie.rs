@@ -153,12 +153,11 @@ impl MissingWalk {
     /// wrong reference would have the walk skip subtrees it does not hold, and
     /// report a trie complete that it cannot serve.
     ///
-    /// Pruning against the reference root survives the confinement: a hash
-    /// matching one in a trie held whole *within this scope* is a subtree held
-    /// whole within this scope, since every boundary the walk stops at is a
-    /// scope edge.
-    // `ScopedSync.Reach`: the root is on the frontier when its position is
-    // admitted, and (in `next_batch`) a child is pushed when its position is.
+    /// The reference must describe this same scope. Sound pruning also
+    /// requires omitted boundaries to contain no authorized entries; the
+    /// link from recorded refusals to that property remains an open proof
+    /// obligation in `docs/RUST-LEAN-PROOFS.md`.
+    // The root and each child are queued only at admitted positions.
     pub fn scoped(known_complete: Option<Hash>, root: Hash, scope: Scope) -> MissingWalk {
         MissingWalk::for_origin(None, known_complete, root, scope)
     }
@@ -168,8 +167,7 @@ impl MissingWalk {
     /// The reference root, when given, must be complete *with the same
     /// provenance*: pruning a shared subtree stands in for having fetched it
     /// as `owner`'s, which a reference merely held whole cannot vouch for.
-    // `Provenance.view`: the store a walk with an owner sees is the shared
-    // store cut down to what was served as that origin's.
+    // The owner restricts presence to nodes served as that origin's.
     pub fn for_origin(
         owner: Option<OriginId>,
         known_complete: Option<Hash>,
@@ -255,8 +253,8 @@ impl MissingWalk {
             }
             // The same hash in a trie held whole: this subtree is already here,
             // values and all.
-            // `ScopedSync.ReachRef`; `prune_sound` is why the memo written
-            // after a pruned walk is true, given `mpt-walk-paired-children`.
+            // This relies on the caller's reference-completeness contract;
+            // it is not an independent check of the shared subtree.
             if reference == Some(hash) {
                 self.frontier.pop();
                 continue;
@@ -266,8 +264,8 @@ impl MissingWalk {
                 continue;
             }
             let Some(data) = trie.load_owned_raw(self.owner.as_ref(), &hash)? else {
-                // A position a peer has refused holds nothing this node may
-                // see, so it is satisfied rather than missing (§5.5). Only
+                // The current walk treats a recorded refusal as a satisfied
+                // boundary rather than missing (§5.5). Only
                 // above the grant: inside it nothing could rightly be refused,
                 // and calling such a trie complete would vouch for what is not
                 // held. It cannot be tightened to `admits_path`: the child
@@ -286,8 +284,8 @@ impl MissingWalk {
                 // subtree it never fetched, and `paired_children`, which
                 // follows held reference nodes, would prune against that
                 // subtree under the next root.
-                // `ScopedSync.Boundary`: an absent hash refused at this
-                // position is satisfied, not missing, only above the grant.
+                // This filter alone does not prove that a refusal hides no
+                // authorized entries; see `docs/RUST-LEAN-PROOFS.md`.
                 if !self.scope.contains_subtree(&path)
                     && trie.is_redacted_raw(&hash, Some(&path))?
                 {
@@ -406,9 +404,8 @@ impl MissingWalk {
 }
 
 /// The deduplication key for a node at a position ([`Visit`]).
-// `ScopedSync.children_inside_grant_admitted`: inside the grant expansion is
-// position-independent. Depth is still retained for canonicality validation.
-// `Reach` is stated per position.
+// Inside a grant expansion is position-independent. Depth is still
+// retained for canonicality validation.
 fn visit(scope: &Scope, hash: Hash, path: &[u8]) -> Visit {
     match scope.contains_subtree(path) {
         true => (path.len(), hash, None),
@@ -425,9 +422,8 @@ fn visit(scope: &Scope, hash: Hash, path: &[u8]) -> Visit {
 /// to it (one for a branch slot, the whole prefix for an extension), the
 /// position a scoped fetch is authorized on (§5.5), which costs the walk
 /// nothing to keep.
-// `ScopedSync.Paired`: the reference descended through held nodes along the
-// same steps. `paired_reaches` shows those are positions the reference root's
-// own scoped walk reached, because a held node is never a boundary.
+// Pairing follows the same steps through held reference nodes. A held
+// node must be expanded even when a refusal was recorded at its position.
 fn paired_children(
     reference: Option<&TrieNode>,
     node: &TrieNode,
@@ -691,28 +687,27 @@ impl<'a, S: NodeStore + ?Sized> Trie<'a, S> {
         self.is_complete_scoped(root, &Scope::full())
     }
 
-    /// True if everything under `root` *that `scope` admits* is present.
+    /// Whether the scoped requesting walk and its generation check accept
+    /// `root`. Recorded refusals can satisfy absent boundary positions;
+    /// connecting that behavior to an exact shared view remains an open
+    /// obligation in `docs/RUST-LEAN-PROOFS.md`.
     ///
     /// Completeness is a property of a root *and* a scope: a trie held whole
     /// within one grant is not held whole within a wider one. The memo is keyed
     /// by both, so widening a scope re-derives rather than inheriting.
-    // `ScopedSync.CompleteWithin`: every position the scoped walk reaches is
-    // held or a boundary, and every expanded node has its value.
     pub fn is_complete_scoped(&self, root: Hash, scope: &Scope) -> Result<bool, MptError> {
         self.is_complete_scoped_for(None, root, scope)
     }
 
-    /// [`Trie::is_complete_scoped`] with provenance: for `Some(owner)`, every
-    /// admitted node under `root` must have been served as `owner`'s
-    /// ([`NodeStore::owns_node`]), not merely be present.
+    /// [`Trie::is_complete_scoped`] with provenance: for `Some(owner)`,
+    /// node presence is checked as `owner`'s ([`NodeStore::owns_node`]),
+    /// while retaining the same refusal-boundary handling.
     ///
     /// This is the question a member asks of a confined origin's head before
     /// it vouches for it (§5.5): a trie assembled out of nodes the origin was
     /// never shown is not complete however many of them this store holds.
     /// Memoized under a key of its own, since it is a stricter question than
     /// either of the other two.
-    // `Provenance.withheld_root_incomplete`: a confined origin's root that
-    // reaches a node the origin could not legitimately hold never completes.
     pub fn is_complete_scoped_for(
         &self,
         owner: Option<&OriginId>,
@@ -727,16 +722,13 @@ impl<'a, S: NodeStore + ?Sized> Trie<'a, S> {
     ///
     /// The responder's half of a scoped fetch (§5.5): the caller says where it
     /// believes a node sits; this descends from a root the responder itself
-    /// holds and reports what is really there, so a position cannot be claimed
-    /// into existence — a fabricated root fails at the first step, because the
-    /// descent reads this store and nothing else.
+    /// holds and reports what is really there. Establishing that the root
+    /// belongs to an authorized signed version is the serving admission's
+    /// responsibility, not this traversal's.
     ///
     /// One merged descent over the sorted paths shares every prefix two wants
     /// have in common: a batch is the frontier of a single walk, so the cost is
     /// close to trie depth plus batch size, not their product.
-    // `ScopedSync.At`; `At.unique` is why a position names one hash, given
-    // the ingress boundary's non-empty extension prefix.
-    //
     // Production resolution is Lean's `Trie.Serve.resolvePaths`
     // (`Store::resolve_trie_paths`); this is the walk tests' oracle over an
     // in-memory store.
@@ -822,10 +814,9 @@ impl<'a, S: NodeStore + ?Sized> Trie<'a, S> {
     /// prefix cannot lead out of it, so its subtree is skipped — and visits on
     /// the order of trie depth times the number of granted prefixes.
     ///
-    /// An absent node stops that branch rather than raising: this is asked of
-    /// a trie about to be promoted, where absence was already settled by fetch.
-    // `ScopedSync.keys_below_grant_admitted`: skipping a position inside a
-    // granted prefix loses no key outside the grant.
+    /// An absent node stops that branch rather than raising. The caller
+    /// relies on its completeness check; this is not an independent check
+    /// that every shared entry is present.
     pub fn first_key_outside(
         &self,
         root: Hash,
@@ -1314,7 +1305,7 @@ mod tests {
     /// node as a boundary would let the walk stop above an absent in-grant
     /// subtree and call the trie complete — and would let Lean's edge pairing
     /// follow, as a reference, a node whose subtree the reference root's own
-    /// walk never fetched (`ScopedSync.paired_reaches`).
+    /// walk never fetched.
     #[test]
     fn a_held_node_is_never_a_boundary() {
         let source = MemStore::new();

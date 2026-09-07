@@ -88,7 +88,7 @@ impl Txn<'_> {
         )?;
         // Held is not wanted. A source want exists only as a repair intent
         // left by a heal, and the durable row just verified is that repair;
-        // `Cas.SourcePublish` retires the want in the same step.
+        // retire the repair request in the same transaction.
         self.conn().execute(
             "DELETE FROM content_want WHERE root = ?1 AND holder = ?2",
             params![root.as_bytes().to_vec(), holder],
@@ -677,8 +677,8 @@ impl Store {
     /// Reconstructs a cold durable row after metadata restore, once the remote
     /// backend has confirmed that the final payload/outboard pair exists.
     ///
-    /// `Cas.AdoptRemote` is this row creation from a remote pair the backend
-    /// has just confirmed; it only ever adds availability. The row decision
+    /// The backend confirms the remote pair before this row is created.
+    /// The row decision
     /// (agreeing size marked, missing row created, disagreeing size refused)
     /// is the Lean command `Cas.Durable.adoptDurable`.
     pub(crate) fn adopt_durable_blob(&self, root: &Hash, size: u64, now: i64) -> Result<()> {
@@ -690,8 +690,8 @@ impl Store {
     /// The durable claim is withdrawn. A row with no verified cache bytes is
     /// removed altogether; otherwise it remains a partial peer-fetched cache.
     ///
-    /// `FaultTolerant.HealRemote` is this transaction, the Lean command
-    /// `Cas.Durable.healMissing`: the durable claim is withdrawn, role pins
+    /// The Lean command `Cas.Durable.healMissing` withdraws the durable
+    /// claim: role pins
     /// become wants, the operator's pin is left alone. The backend losing the
     /// object is the environment step before it. A replica's claim must not
     /// outlive the bytes it was a promise about (`docs/REPLICATION.md` §8):
@@ -734,17 +734,12 @@ impl Store {
     /// claim. The row changes first, so a crash can leave only harmless orphan
     /// files, never a warm-cache claim with missing bytes.
     pub(crate) fn clear_blob_cache(&self, root: &Hash) -> Result<bool> {
-        // `Cas.CacheEvict` retains remote durability when local cache
-        // bytes disappear; callers select durable cache rows.
-        //
-        // `Cas.DropStaged` is the row removal of a non-durable cache claim
-        // inside it, and the same transition behind
-        // `reconcile_scratch_generation` and the `commit_cas_migration`
-        // discard. None of the three consults `pins`:
-        // `SystemSafety.staged_row_drop_is_unpinned` is why they need not
-        // (`Cas.NoLoss`: a pin is only ever granted over available content),
-        // and `Store::pin`'s `durable` predicate is what makes that theorem
-        // true of the store. The Lean command `Cas.Durable.clearCache` reads
+        // Cache eviction retains the remote claim; callers select durable
+        // cache rows. Non-durable staged rows can instead be removed, as in
+        // `reconcile_scratch_generation` and `commit_cas_migration` discard.
+        // These paths rely on pin acquisition requiring durable content;
+        // the native retention tests exercise that contract.
+        // The Lean command `Cas.Durable.clearCache` reads
         // the writer count first, changes the rows, and removes the files
         // after the commit; Rust holds the ordering guard that makes the
         // count it reads meaningful.
@@ -1620,8 +1615,8 @@ mod tests {
 
     /// A pin is a promise about the durable tier. A complete scratch copy on a
     /// cloud backend is not one, and the store says so at both entry points —
-    /// which is what lets the staged-row drops skip the pin check
-    /// (`SystemSafety.staged_row_drop_is_unpinned`).
+    /// which is the contract staged-row drops rely on when skipping the
+    /// pin check.
     #[test]
     fn a_staged_cloud_row_cannot_be_pinned_or_possessed() {
         let (_d, store) = store();
@@ -1654,7 +1649,7 @@ mod tests {
 
     /// A role's pin is what its live leaf stands on, so the role cannot let
     /// go while an entry in its space still names the root
-    /// (`Cas.Unpin`). The operator's claim has no leaf behind it.
+    /// during unpin. The operator's claim has no leaf behind it.
     #[test]
     fn a_role_holder_cannot_unpin_content_its_space_still_names() {
         let (_d, store) = store();

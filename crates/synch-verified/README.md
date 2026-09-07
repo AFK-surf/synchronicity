@@ -280,7 +280,8 @@ and original host errors are preserved, and read output stays private until a
 successful terminal result.
 
 The `decisions` example is now a static-link smoke check of a complete lookup,
-not a scalar predicate benchmark. The architecture document retains historical
-measurements and the unresolved local-ingestion throughput/captured-input-memory
-limitations. See [architecture](../../docs/LEAN-CORE-ARCHITECTURE.md) for operation
-contracts and the serial 4-GiB validation policy.
+not a scalar predicate benchmark. See the canonical
+[Rust/Lean architecture and proof contract](../../docs/RUST-LEAN-PROOFS.md)
+for operation ownership, current evidence and open goals, host assumptions,
+cost gates and the serial 4-GiB validation policy. Successful correctness checks
+do not establish throughput or memory parity with the former Rust paths.

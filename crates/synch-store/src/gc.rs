@@ -85,8 +85,8 @@ impl Store {
     /// transaction, under the CAS ordering section, and that is what decides
     /// (`specs/lean/Synchronicity/CasCollectProofs.lean`).
     pub fn gc_content(&self, before: i64) -> Result<GcStats> {
-        // `Cas.Age` abstracts crossing this `before` horizon; it grants no
-        // permission by itself, only removes the freshness guard.
+        // Crossing this age horizon only removes the freshness guard;
+        // the retention and reference checks still apply.
         Ok(GcStats {
             blobs: crate::lean_collect::gc_content(self, before)?,
             ..GcStats::default()

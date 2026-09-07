@@ -358,8 +358,8 @@ pub(crate) struct WriteLease<'a> {
 
 impl Drop for WriteLease<'_> {
     fn drop(&mut self) {
-        // `Cas.WriteAbort` also covers the successful lease end: the
-        // protection disappears only after the writer has stopped touching bytes.
+        // On success or failure, protection disappears only after the
+        // writer has stopped touching bytes.
         let mut writing = self.store.writing();
         if let Some(count) = writing.get_mut(&self.root) {
             *count -= 1;
@@ -1305,8 +1305,8 @@ impl Store {
     /// a payload into place before that unlink, even when writer and sweep use
     /// independently opened Store values.
     pub(crate) fn lease_write(&self, root: &Hash) -> WriteLease<'_> {
-        // `Cas.BeginWrite` models this ordered guard acquisition plus the
-        // insertion into `writing`; neither half may move past the other.
+        // Keep guard acquisition ordered with insertion into `writing`;
+        // neither half may move past the other.
         let _ordered_against_the_sweeps = self.conn();
         let _ordered_across_store_instances = self.cas_order();
         *self.writing().entry(*root).or_insert(0) += 1;

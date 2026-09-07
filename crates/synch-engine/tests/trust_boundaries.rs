@@ -59,7 +59,7 @@ fn walk_all(store: &synch_store::Store, root: Hash) -> Vec<(Vec<u8>, Hash)> {
 /// out in the origin itself — and the grafter never held the subtree. The
 /// member's fetch asks the grafter for it, is told `missing`, and abandons the
 /// head; the responder serves nothing under a confined root it does not own
-/// for that origin. `Provenance.lean` is the model of both halves.
+/// for that origin. This test exercises both sides of that boundary.
 #[tokio::test]
 async fn a_delegate_cannot_launder_a_withheld_subtree_through_its_own_trie() {
     let issuer = WireNode::spawn(Some("nas")).await;

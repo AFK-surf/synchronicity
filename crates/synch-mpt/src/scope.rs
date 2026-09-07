@@ -79,7 +79,8 @@ impl Scope {
     /// in scope as an ancestor of an allowed prefix or inside one. Both
     /// directions matter: the ancestors are the spine that makes the signed
     /// root recompute.
-    // `Scope.AdmitsPath`; `admitsPath_of_append` is the spine property.
+    // The executable Lean predicate is `Trie.Serve.Scope.admitsPath`;
+    // `TrieServeProofs.admitsPath_of_append` proves its spine property.
     pub fn admits_path(&self, path: &[u8]) -> bool {
         match &self.prefixes {
             None => true,
@@ -101,7 +102,8 @@ impl Scope {
     /// leave — which lets a scope check stop at the boundary. Exact keys are
     /// deliberately absent: a subtree at an exact key may hold longer keys
     /// extending it, and those are outside.
-    // `Scope.ContainsSubtree`; `containsSubtree_append` is the stop-at-the-
+    // The executable Lean predicate is `Trie.Serve.Scope.containsSubtree`;
+    // `TrieServeProofs.containsSubtree_append` is the stop-at-the-
     // boundary property.
     pub fn contains_subtree(&self, path: &[u8]) -> bool {
         match &self.prefixes {

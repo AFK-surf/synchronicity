@@ -669,8 +669,8 @@ impl Store {
             txn.conn()
                 .execute("DELETE FROM sources WHERE space = ?1", params![space])?;
             let holder = crate::PinHolder::Source(space.to_string()).render();
-            // `Cas.RemoveRole` is this pair of deletes under `Unpin`'s and
-            // `DropWant`'s own guard: a hold or a repair intent behind an
+            // Both deletes retain their live-entry guards: a hold or a
+            // repair intent behind an
             // entry the tree still names survives the role. The engine
             // publishes the space's tombstones before it gets here
             // (`Node::source_removal`), so ordinarily nothing survives; the
@@ -766,15 +766,15 @@ impl Store {
                 return Ok(false);
             }
             if pin_held {
-                // Each of these is `Cas.Pin` by the operator: a replica's pin
-                // stands on a durable claim, which is all `Store::pin` asks.
+                // Preserve an operator pin over the replica's durable claim,
+                // which satisfies `Store::pin`'s requirement.
                 txn.conn().execute(
                     "INSERT OR IGNORE INTO pins (root, holder, created_at, release_after)
                      SELECT root, 'operator', ?2, NULL FROM pins WHERE holder = ?1",
                     params![holder.clone(), now],
                 )?;
             }
-            // `Cas.RetireRole` is this transaction: the holder ceases, so the
+            // This transaction retires the holder, so the
             // leaves it stood behind are no longer any role's and its pins
             // and wants go whatever the tree still names. Unlike
             // `remove_source` this is unguarded by design — `pin_held` is the
@@ -1154,10 +1154,9 @@ impl Txn<'_> {
         old_root: Hash,
         new_root: Hash,
     ) -> Result<usize> {
-        // `SystemSafety` models each changed leaf by its add/remove and entry
-        // transitions (the `mpt-materialize-*` anchors in `apply_change`, and
-        // `cas-remote-promotion`/`cas-ordinary-promotion` in `try_promote`).
-        // Rust commits the entire collection with the head flip.
+        // The entry changes and retention decisions commit together with
+        // the head flip. This Rust composition is covered by integration
+        // tests; it has no separate publication-safety theorem.
         // Scoped exactly as the fetch that filled this trie was: a node
         // reading under a scope holds only that part, and materializing what
         // it does not hold is not a thing it could do (§5.5). For this node's
@@ -1368,7 +1367,7 @@ fn content_wants(
     // Held is not wanted. A want staged while the root was still on its way
     // — an earlier promotion of the same bytes, say — is retired by the pin
     // that supersedes it, in the same transaction, so a replica is never held
-    // and wanted at once (`Cas.ReplicaPromote`). The sweep's
+    // and wanted at once. The sweep's
     // `stage_space_wants` does the same for anything that got here before this
     // line existed.
     tx.execute(
@@ -2286,7 +2285,7 @@ mod tests {
 
     /// A replica leaf whose content is already durable takes a pin and
     /// retires any want staged for it in the same transaction, so held and
-    /// wanted never coexist (`Cas.ReplicaPromote`).
+    /// wanted never coexist.
     #[test]
     fn a_replica_pin_retires_the_want_it_supersedes() {
         let (_d, store) = store();

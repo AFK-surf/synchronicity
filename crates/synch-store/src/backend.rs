@@ -851,8 +851,8 @@ impl CasBackend for Cloud {
         };
         let store = self.store.clone();
         blocking(move || {
-            // `Cas.FinalizeRemote` begins only after the remote pair write
-            // above succeeded; a GC winner makes this row update return false.
+            // Mark durable only after the remote pair write above succeeds;
+            // a GC winner makes this row update return false.
             if store.mark_blob_durable(&root)? {
                 Ok(())
             } else {

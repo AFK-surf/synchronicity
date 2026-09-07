@@ -1593,11 +1593,10 @@ impl Node {
 
         let head = self
             .store()
-            // `Bridge.PublishTxn` composes every source/view micro-step with the
-            // trie transition below: durable check, pins, entries, removals and
-            // the head flip share one commit.
-            // `MptGc.OwnPublish` models the trie/head/materialized side of this
-            // same transaction; it is complete because this node built it.
+            // The durable check, pins, entries, removals and head flip
+            // share one commit with the trie this node just built.
+            // This Rust composition is covered by integration tests; it is
+            // not established by a separate publication theorem.
             .transaction(|txn| -> Result<Option<SignedHead>> {
                 // Read the head we are about to displace inside the transaction:
                 // the root we build on and the seq we build past have to come from
@@ -1643,10 +1642,9 @@ impl Node {
                 // Publication owns the invariant: callers cannot accidentally
                 // publish an own live file without also advertising the
                 // complete durable content that the source hold just proved.
-                // `Publication.publication_contract` is what this transaction
-                // promises along every execution: for as long as the tree
-                // names the content, its holder pins it, it is available, and
-                // its size is the file-entry/BlobAd size recorded here.
+                // The intended invariant is that while the tree names the
+                // content, its holder retains it and the entry and ad agree
+                // with its size. Cross-operation proof remains open.
                 // Materialize before deriving ads so they read the final
                 // file-entry view. Source entries determine their ads without
                 // asking the scanner to stage a second record for the same
