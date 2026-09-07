@@ -488,6 +488,114 @@ theorem leaf_edge_step_preserves
   obtain ⟨rfl, rfl⟩ := ran
   exact ⟨rfl, expand_unary_meaning meaning childValid bound same⟩
 
+/-- Expanding an extension edge preserves the entire descendant view,
+whether the remaining label is empty or still compressed. -/
+theorem extension_edge_step_preserves
+    (meaning : StateMeaning before.read ⟨.visit path (.node (.extension segment child)) :: work, results⟩ target)
+    (within : path.length ≤ maxKeyBytes * 2) (spine : Normalize.belowBoundary path = false)
+    (spelling : segment.toList = nibble :: rest)
+    (ran : execute d before
+      (Normalize.step ⟨.visit path (.node (.extension segment child)) :: work, results⟩).run =
+      some (.ok (.inl next), after)) : after = before ∧ StateMeaning after.read next target := by
+  have valid : CursorValid before.read (.node (.extension segment child)) := by
+    obtain ⟨entries, pending, _⟩ := meaning
+    cases pending with
+    | visit valid _ _ => exact valid
+  obtain ⟨closed, wf, inv⟩ := valid
+  have nibbles : Nibbles (nibble :: rest) := by
+    simpa only [← TrieWalkProofs.toList_eq, spelling] using nibbles_of_nibblesWf wf.1
+  have bound : nibble.toNat < 16 := by
+    have := nibbles nibble (List.mem_cons_self ..)
+    omega
+  have small : rest.length < 2 ^ 64 := by
+    have size := wf.1.1
+    have length : segment.toList.length = segment.size := by
+      rw [TrieWalkProofs.toList_eq]
+      exact Array.length_toList
+    rw [spelling] at length
+    simp only [List.length_cons] at length
+    omega
+  let cursor := if rest.isEmpty then Normalize.Cursor.stored child
+    else .node (.extension (nibblesOf rest) child)
+  have tailSpelling : (nibblesOf rest).toList = rest := by
+    simp [TrieWalkProofs.toList_eq, nibblesOf]
+  have childValid : CursorValid before.read cursor := by
+    cases rest with
+    | nil => exact ⟨wf.2, closed.2⟩
+    | cons head tail =>
+      refine ⟨⟨by simp [tailSpelling], closed.2⟩,
+        ⟨nibblesOf_wf (nibbles_tail nibbles) small, wf.2⟩, ?_⟩
+      simp [checkInvariants, nibblesOf, ByteArray.size]
+  have same : ∀ key bytes, CursorEntries before.read (.node (.extension segment child)) key bytes ↔
+      RoutedEntries none [(nibble, CursorEntries before.read cursor)] key bytes := by
+    intro key bytes
+    cases rest <;> cases key <;>
+      simp [cursor, CursorEntries, NodeEntries, RoutedEntries, spelling, tailSpelling,
+        List.mem_cons, Prod.mk.injEq, and_assoc, exists_and_left]
+  simp only [Normalize.step, Nat.not_lt.mpr within, ↓reduceIte, spine,
+    Bool.false_eq_true, run_bind, run_pure, program_bind_pure, bindCont_ok, spelling,
+    TrieMutateProofs.execute_pure, Option.some.injEq, Prod.mk.injEq, Except.ok.injEq,
+    Sum.inl.injEq] at ran
+  obtain ⟨rfl, rfl⟩ := ran
+  exact ⟨rfl, expand_unary_meaning meaning childValid bound same⟩
+
+private theorem load_cursor_meaning (shaped : Shaped before)
+    (valid : CursorValid before.read (.stored root))
+    (ran : execute d before (load root).run = some (.ok node, after)) :
+    after = before ∧ CursorValid after.read (.node node) ∧
+      ∀ key bytes, CursorEntries before.read (.stored root) key bytes ↔
+        CursorEntries after.read (.node node) key bytes := by
+  simp only [load, run_bind, read_run, program_bind_request, program_bind_pure,
+    mapError_ok, bindCont_ok, execute_read] at ran
+  cases held : before.read nodeSpace root with
+  | none => simp [held] at ran
+  | some raw =>
+    obtain ⟨stored, decoded, _, wf, inv⟩ := shaped root raw held
+    simp only [held, decoded, run_pure, TrieMutateProofs.execute_pure,
+      Option.some.injEq, Prod.mk.injEq, Except.ok.injEq] at ran
+    obtain ⟨rfl, rfl⟩ := ran
+    exact ⟨rfl, ⟨loaded_node_closed valid.2 held decoded, wf, inv⟩,
+      fun _ _ => graph_node_entries held decoded⟩
+
+/-- Inside a complete sharing prefix, the actual visit keeps the entire
+subtree compressed without changing any of its entries. -/
+theorem boundary_visit_preserves (digestWidth : Width d) (shaped : Shaped before)
+    (meaning : StateMeaning before.read ⟨.visit path cursor :: work, results⟩ target)
+    (within : path.length ≤ maxKeyBytes * 2) (inside : Normalize.belowBoundary path = true)
+    (safe : SafeWrites d before (Normalize.step ⟨.visit path cursor :: work, results⟩).run)
+    (ran : execute d before (Normalize.step ⟨.visit path cursor :: work, results⟩).run =
+      some (.ok (.inl next), after)) : Shaped after ∧ StateMeaning after.read next target := by
+  obtain ⟨entries, pending, completed⟩ := meaning
+  cases pending with
+  | visit valid originalEntries below =>
+    cases cursor with
+    | stored root =>
+      simp only [Normalize.step, Nat.not_lt.mpr within, ↓reduceIte, inside,
+        run_bind, run_pure, program_bind_pure, bindCont_ok,
+        TrieMutateProofs.execute_pure, Option.some.injEq, Prod.mk.injEq,
+        Except.ok.injEq, Sum.inl.injEq] at ran
+      obtain ⟨rfl, rfl⟩ := ran
+      exact ⟨shaped, ⟨_, below, .cons ⟨valid.1, valid.2, originalEntries⟩ completed⟩⟩
+    | node node =>
+      obtain ⟨closed, wf, inv⟩ := valid
+      simp only [Normalize.step, Nat.not_lt.mpr within, ↓reduceIte, inside, run_bind] at safe
+      have safePut := safe_bind_left _ safe
+      have collision : CompatibleWrite before nodeSpace (d (tagOf node ++ encode node)) (encode node) := by
+        simpa only [put_requests_tagged_digest, SafeWrites, and_true] using safePut
+      simp only [Normalize.step, Nat.not_lt.mpr within, ↓reduceIte, inside] at ran
+      rw [execute_run_bind, execute_put] at ran
+      simp only [run_pure, TrieMutateProofs.execute_pure, Option.some.injEq,
+        Prod.mk.injEq, Except.ok.injEq, Sum.inl.injEq] at ran
+      obtain ⟨rfl, rfl⟩ := ran
+      have putRan := execute_put d before node
+      have included := (put_stores_node_and_preserves collision putRan).1
+      refine ⟨shaped_write_node shaped (canonical_encode wf inv),
+        ⟨_, pending_preserved below included, .cons ⟨digestWidth _,
+          put_node_closed closed wf collision putRan, ?_⟩
+          (completed_preserved completed included)⟩⟩
+      intro key bytes
+      exact (put_node_exact closed wf collision putRan).trans (originalEntries key bytes)
+
 /-- The actual assembly step stores a valid parent with exactly the child
 entries already normalized, preserving both queued work and sibling results. -/
 theorem assembly_step_preserves (digestWidth : Width d) (shaped : Shaped before)
@@ -561,5 +669,59 @@ theorem finish_step_returns_exact
         Option.some.injEq, Prod.mk.injEq, Except.ok.injEq, Sum.inr.injEq] at ran
       obtain ⟨rfl, rfl⟩ := ran
       exact ⟨rfl, state_meaning_finished meaning⟩
+
+/-- Lift a state invariant through the actual effect-counted loop. Unlike a
+value-only loop invariant, this tracks the store after each iteration and
+requires compatibility only for writes actually encountered. -/
+theorem iterate_store_invariant
+    (body : S → Program MutateEffects (Except ε (S ⊕ R))) (exhausted : ε)
+    (invariant : Store → S → Prop) (finished : Store → R → Prop)
+    (step : ∀ start before reply after, invariant before start →
+      SafeWrites d before (body start) → execute d before (body start) = some (.ok reply, after) →
+      match reply with | .inl next => invariant after next | .inr result => finished after result)
+    (fuel : Nat) : ∀ (program : Program MutateEffects (Except ε (S ⊕ R))) before,
+    (∀ reply after, SafeWrites d before program → execute d before program = some (.ok reply, after) →
+      match reply with | .inl next => invariant after next | .inr result => finished after result) →
+    ∀ result after, SafeWrites d before (Program.iterate body exhausted fuel program) →
+      execute d before (Program.iterate body exhausted fuel program) = some (.ok result, after) →
+      finished after result := by
+  induction fuel with
+  | zero => intro program before post result after safe ran; cases ran
+  | succ fuel ih =>
+    intro program before post result after safe ran
+    cases program with
+    | pure reply =>
+      cases reply with
+      | error error => cases ran
+      | ok reply =>
+        cases reply with
+        | inr answer =>
+          simp only [Program.iterate, TrieMutateProofs.execute_pure,
+            Option.some.injEq, Prod.mk.injEq, Except.ok.injEq] at ran
+          obtain ⟨rfl, rfl⟩ := ran
+          exact post (.inr answer) before trivial rfl
+        | inl next =>
+          exact ih (body next) before
+            (fun reply after => step next before reply after (post (.inl next) before trivial rfl))
+            result after safe ran
+    | request effect resume =>
+      cases effect with
+      | left storage =>
+        cases storage <;> first
+          | contradiction
+          | exact ih (resume (.ok (before.read _ _))) before
+              (fun reply after tailSafe tailRan => post reply after tailSafe tailRan)
+              result after safe ran
+      | right effect =>
+        cases effect with
+        | left digest =>
+          cases digest
+          exact ih (resume (.ok (d _))) before
+            (fun reply after tailSafe tailRan => post reply after tailSafe tailRan)
+            result after safe ran
+        | right write =>
+          cases write
+          exact ih _ _ (fun reply after tailSafe tailRan => post reply after ⟨safe.1, tailSafe⟩ tailRan)
+            result after safe.2 ran
 
 end Synchronicity.TrieNormalizeProofs
