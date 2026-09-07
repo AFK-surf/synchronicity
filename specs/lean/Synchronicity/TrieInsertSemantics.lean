@@ -275,4 +275,133 @@ theorem rebuild_exact (digestWidth : Width d) (stack : List InsertFrame)
           ((context_entries_unchanged stack tailReady included).trans
             (context_entries_congr stack parentEntries))
 
+/-- The remaining key at a child becomes this key at its remembered parent. -/
+def FrameKey : InsertFrame → List UInt8 → List UInt8
+  | .extension segment, key => segment.toList ++ key
+  | .branch _ _ nibble, key => nibble :: key
+  | .route _ _ nibble, key => nibble :: key
+
+def ContextKey : List InsertFrame → List UInt8 → List UInt8
+  | [], key => key
+  | frame :: stack, key => ContextKey stack (FrameKey frame key)
+
+private theorem prefixed_overwrite (pathPrefix : List UInt8) :
+    (∃ tail, probe = pathPrefix ++ tail ∧ Overwrite inside key bytes tail result) ↔
+    Overwrite (fun query value => ∃ tail, query = pathPrefix ++ tail ∧ inside tail value)
+      (pathPrefix ++ key) bytes probe result := by
+  constructor
+  · rintro ⟨tail, rfl, changed | unchanged⟩
+    · exact Or.inl ⟨congrArg (pathPrefix ++ ·) changed.1, changed.2⟩
+    · exact Or.inr ⟨fun eq => unchanged.1 (List.append_cancel_left eq),
+        ⟨tail, rfl, unchanged.2⟩⟩
+  · rintro (⟨rfl, rfl⟩ | ⟨different, tail, rfl, prior⟩)
+    · exact ⟨key, rfl, Or.inl ⟨rfl, rfl⟩⟩
+    · exact ⟨tail, rfl, Or.inr ⟨fun eq => different (congrArg (pathPrefix ++ ·) eq), prior⟩⟩
+
+/-- Replacing one key inside a child replaces exactly the corresponding
+whole key, including when another key terminates at the ancestor itself. -/
+theorem frame_overwrite (ready : FrameReady store frame) :
+    FrameEntries store frame (Overwrite inside key bytes) probe result ↔
+      Overwrite (FrameEntries store frame inside) (FrameKey frame key) bytes probe result := by
+  cases frame with
+  | extension segment =>
+    have nonempty : segment.toList ≠ [] := ready.2.1
+    simpa [FrameEntries, FrameKey, Overwrite, nonempty] using
+      (prefixed_overwrite (inside := inside) (key := key) (bytes := bytes)
+        (probe := probe) (result := result) segment.toList)
+  | branch children value position =>
+    cases probe with
+    | nil => simp [FrameEntries, FrameKey, Overwrite]
+    | cons nibble tail =>
+      by_cases same : nibble = position
+      · subst nibble
+        simp [FrameEntries, FrameKey, Overwrite]
+      · simp [FrameEntries, FrameKey, Overwrite, same]
+  | route children value position =>
+    cases probe with
+    | nil => simp [FrameEntries, FrameKey, Overwrite]
+    | cons nibble tail =>
+      by_cases same : nibble = position
+      · subst nibble
+        simp [FrameEntries, FrameKey, Overwrite]
+      · simp [FrameEntries, FrameKey, Overwrite, same]
+
+/-- A local replacement travels through the actual ancestor order to exactly
+one whole key. No unrelated entry or ancestor payload is changed. -/
+theorem context_overwrite (stack : List InsertFrame) (ready : ContextReady store stack) :
+    ContextEntries store stack (Overwrite inside key bytes) probe result ↔
+      Overwrite (ContextEntries store stack inside) (ContextKey stack key) bytes probe result := by
+  induction stack generalizing inside key with
+  | nil => exact Iff.rfl
+  | cons frame stack ih =>
+    exact (context_entries_congr stack (fun _ _ => frame_overwrite (ready frame (by simp)))).trans
+      (ih (fun ancestor member => ready ancestor (List.mem_cons_of_mem _ member)))
+
+/-- The actual compressed-path wrapper prefixes exactly its child's entries;
+it also retains the child's saved snapshot and every existing stored record. -/
+theorem wrap_exact (digestWidth : Width d) (shaped : Shaped before)
+    (nibbles : Nibbles segment) (small : segment.length < 2 ^ 64)
+    (width : child.size = 32) (closed : Closed before.read child)
+    (safe : SafeWrites d before (wrapInExtension segment child).run)
+    (ran : execute d before (wrapInExtension segment child).run = some (.ok root, after)) :
+    RecordsIncluded before.read after.read ∧ Shaped after ∧ root.size = 32 ∧ Closed after.read root ∧
+      ∀ key bytes, GraphValue after.read root key bytes ↔
+        ∃ tail, key = segment ++ tail ∧ GraphValue before.read child tail bytes := by
+  cases segment with
+  | nil =>
+    simp only [wrapInExtension, List.isEmpty_nil, ↓reduceIte, run_pure,
+      TrieMutateProofs.execute_pure, Option.some.injEq, Prod.mk.injEq, Except.ok.injEq] at ran
+    obtain ⟨rfl, rfl⟩ := ran
+    refine ⟨fun _ _ _ _ held => held, shaped, width, closed, ?_⟩
+    intro key bytes
+    simp
+  | cons nibble tail =>
+    have ready : FrameReady before.read (.extension (nibblesOf (nibble :: tail))) := by
+      refine ⟨nibblesOf_wf nibbles small, ?_, ?_⟩ <;> simp [nibblesOf, ByteArray.size, TrieWalkProofs.toList_eq]
+    simp only [wrapInExtension, List.isEmpty_cons, Bool.false_eq_true, ↓reduceIte] at safe ran
+    obtain ⟨included, finalShape, rootWidth, rootClosed, exactEntries⟩ :=
+      put_frame_exact digestWidth shaped ready width closed safe ran
+    refine ⟨included, finalShape, rootWidth, rootClosed, ?_⟩
+    intro key bytes
+    simpa [FrameEntries, nibblesOf, TrieWalkProofs.toList_eq] using exactEntries key bytes
+
+private theorem put_exact (digestWidth : Width d) (shaped : Shaped before)
+    (wellFormed : node.wf) (canonical : checkInvariants node = .ok ())
+    (closed : NodeClosed before.read node)
+    (safe : SafeWrites d before (put node).run)
+    (ran : execute d before (put node).run = some (.ok root, after)) :
+    RecordsIncluded before.read after.read ∧ Shaped after ∧ root.size = 32 ∧ Closed after.read root ∧
+      ∀ key bytes, GraphValue after.read root key bytes ↔ NodeEntries before.read node key bytes := by
+  have compatible : CompatibleWrite before nodeSpace (d (tagOf node ++ encode node)) (encode node) := by
+    simpa only [put_requests_tagged_digest, SafeWrites, and_true] using safe
+  have included := (put_stores_node_and_preserves compatible ran).1
+  have finalClosed := put_node_closed closed wellFormed compatible ran
+  have entries := fun key bytes => put_node_exact (key := key) (bytes := bytes)
+    closed wellFormed compatible ran
+  rw [execute_put] at ran
+  cases ran
+  exact ⟨included, shaped_write_node shaped (canonical_encode wellFormed canonical),
+    digestWidth _, finalClosed, entries⟩
+
+/-- Insertion at an existing leaf's exact key replaces its contents, while
+retaining all previously stored records for saved roots. -/
+theorem replace_leaf_exact (digestWidth : Width d) (shaped : Shaped before)
+    (nibbles : Nibbles suffix) (small : suffix.length < 2 ^ 64)
+    (validValue : ValueOk value) (denotes : ValueDenotes before.read value bytes)
+    (safe : SafeWrites d before (splitLeaf suffix old suffix value).run)
+    (ran : execute d before (splitLeaf suffix old suffix value).run = some (.ok root, after)) :
+    RecordsIncluded before.read after.read ∧ Shaped after ∧ root.size = 32 ∧ Closed after.read root ∧
+      ∀ probe result, GraphValue after.read root probe result ↔
+        Overwrite (NodeEntries before.read (.leaf (nibblesOf suffix) old)) suffix bytes probe result := by
+  simp only [splitLeaf, beq_self_eq_true, ↓reduceIte] at safe ran
+  have wf : (Node.leaf (nibblesOf suffix) value).wf := ⟨nibblesOf_wf nibbles small, validValue.1⟩
+  obtain ⟨included, finalShape, rootWidth, rootClosed, _⟩ :=
+    put_exact digestWidth shaped wf (by simpa [checkInvariants] using validValue.2)
+      ⟨bytes, denotes⟩ safe ran
+  refine ⟨included, finalShape, rootWidth, rootClosed, ?_⟩
+  intro probe result
+  have entries := put_leaf_exact (key := probe) (result := result) wf denotes ran
+  by_cases same : probe = suffix <;>
+    simpa [Overwrite, NodeEntries, nibblesOf, TrieWalkProofs.toList_eq, same] using entries
+
 end Synchronicity.TrieInsertSemantics
