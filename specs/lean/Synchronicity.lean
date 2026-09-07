@@ -59,3 +59,4 @@ import Synchronicity.TrieNormalizeProofs
 import Synchronicity.CasTransferHistories
 import Synchronicity.TrieFetchProofs
 import Synchronicity.ContactProofs
+import Synchronicity.TrieFetchSuspensionProofs
