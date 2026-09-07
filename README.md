@@ -96,15 +96,16 @@ docker exec -d synch-node synch-s3 serve --listen 0.0.0.0:9000
   long-running servers; the image is built against the runtime's own glibc
   2.36, which is the configuration the test suite runs on.
 
-Nothing is published until that exact image has run a node:
+Every published image is then run as a node:
 [`ops/image-smoke.sh`](ops/image-smoke.sh) does what this section describes —
 `init`, `daemon run`, a source scanned and published, `synch cat` reading it
 back, and `synch-s3` serving the same object over HTTP — and checks what only
 running it can check: all three binaries present and built for this
 architecture, `synch-dp` reaching its configuration check, a data directory the
 uid-10001 service can write, the gateway finding the control socket, and a
-clean shutdown on `synch daemon stop`. The publish job depends on it, so a
-green image is one that ran.
+clean shutdown on `synch daemon stop`. It runs *after* the push, against the
+image the registry now serves, so an image is available as soon as it builds
+and the workflow says whether that image runs.
 
 To build and test it locally, from the repository root:
 
