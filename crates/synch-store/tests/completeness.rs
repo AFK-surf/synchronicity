@@ -1,5 +1,5 @@
 use synch_core::{Hash, OriginId, ScopeKeys};
-use synch_mpt::{MissingWalk, Nibbles, NodeStore, Scope, Trie, TrieNode, ValueRef};
+use synch_mpt::{Nibbles, NodeStore, Scope, Trie, TrieNode, ValueRef};
 use synch_store::{Store, StoreError};
 
 fn boundary() -> (Scope, Hash, Vec<u8>) {
@@ -25,7 +25,7 @@ fn boundary() -> (Scope, Hash, Vec<u8>) {
 }
 
 #[test]
-fn ownership_invalidates_an_already_stored_boundary_across_handles() {
+fn refused_bytes_require_origin_provenance_across_handles() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path()).unwrap();
     let other = Store::open(dir.path()).unwrap();
@@ -33,26 +33,27 @@ fn ownership_invalidates_an_already_stored_boundary_across_handles() {
     let (scope, root, bytes) = boundary();
     store.put_node(&root, &bytes).unwrap();
     store.note_redacted(&root, &[]).unwrap();
-    assert!(Trie::new(&store)
+    assert!(!Trie::new(&store)
         .is_complete_scoped_for(Some(&owner), root, &scope)
         .unwrap());
+    let generation = store.completeness_generation().unwrap();
     other.note_owned(&owner, &root).unwrap();
+    assert_ne!(store.completeness_generation().unwrap(), generation);
     assert!(!Trie::new(&store)
         .is_complete_scoped_for(Some(&owner), root, &scope)
         .unwrap());
 }
 
 #[test]
-fn an_old_walk_cannot_recertify_a_dissolved_boundary() {
+fn receiving_refused_bytes_invalidates_older_certification_tickets() {
     let dir = tempfile::tempdir().unwrap();
     let store = Store::open(dir.path()).unwrap();
     let other = Store::open(dir.path()).unwrap();
     let (scope, root, bytes) = boundary();
     store.note_redacted(&root, &[]).unwrap();
     let generation = store.completeness_generation().unwrap();
-    let mut walk = MissingWalk::scoped(None, root, scope.clone());
-    assert!(walk.next_batch(&Trie::new(&store), 256).unwrap().is_empty());
-    assert!(walk.is_exhausted());
+    // Refusal cannot make the absent root complete, even before admission.
+    assert!(!Trie::new(&store).is_complete_scoped(root, &scope).unwrap());
     other.put_node(&root, &bytes).unwrap();
     assert!(!store
         .note_complete_at(&scope.memo_key(root).unwrap(), generation)
@@ -70,8 +71,8 @@ fn a_walk_started_during_an_invalidating_transaction_cannot_certify_after_commit
     let generation = writer
         .transaction(|txn| -> Result<_, StoreError> {
             txn.put_node(&root, &bytes)?;
-            // A separate WAL reader sees the old, refused boundary. It must not
-            // cache that snapshot while this writer is uncommitted.
+            // A separate WAL reader cannot certify any observation while
+            // this invalidating writer is uncommitted.
             let generation = reader.completeness_generation()?;
             assert!(!reader.note_complete_at(&scope.memo_key(root).unwrap(), generation)?);
             Ok(generation)
@@ -89,6 +90,12 @@ fn rollback_releases_invalidation_but_does_not_reuse_its_generation() {
     let store = Store::open(dir.path()).unwrap();
     let (scope, root, bytes) = boundary();
     store.note_redacted(&root, &[]).unwrap();
+    let complete = Trie::new(&store)
+        .insert(Hash::EMPTY, b"ab", b"held")
+        .unwrap();
+    assert!(Trie::new(&store)
+        .is_complete_scoped(complete, &scope)
+        .unwrap());
     let before = store.completeness_generation().unwrap();
     let error = store.transaction(|txn| -> Result<(), StoreError> {
         txn.put_node(&root, &bytes)?;
@@ -98,5 +105,13 @@ fn rollback_releases_invalidation_but_does_not_reuse_its_generation() {
     assert!(!store
         .note_complete_at(&scope.memo_key(root).unwrap(), before)
         .unwrap());
-    assert!(Trie::new(&store).is_complete_scoped(root, &scope).unwrap());
+    assert!(!Trie::new(&store).is_complete_scoped(root, &scope).unwrap());
+    // Rollback releases the mutation guard: an authentic complete snapshot
+    // can be checked and cached again under a fresh generation.
+    assert!(Trie::new(&store)
+        .is_complete_scoped(complete, &scope)
+        .unwrap());
+    assert!(store
+        .is_known_complete(&scope.memo_key(complete).unwrap())
+        .unwrap());
 }
