@@ -55,3 +55,4 @@ import Synchronicity.TrieSnapshotClosure
 import Synchronicity.CasPersistenceProofs
 import Synchronicity.CasReceiveHistoryProofs
 import Synchronicity.CasAdvertisementProofs
+import Synchronicity.TrieNormalizeProofs

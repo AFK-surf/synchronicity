@@ -139,6 +139,10 @@ idempotence, route edits, empty roots and the deepest supported exact key. The
 previously failing empty permitted-view integration fixture now passes with
 routing publications and unchanged privacy/progress assertions. These tests do
 not replace the required normalization, serving/completion and promotion proofs.
+`TrieNormalizeProofs` now proves exact entry preservation for the actual
+assembly, compressed leaf-edge and finishing steps. The remaining visit cases
+and iteration composition are still required before claiming that the whole
+normalization operation preserves a published snapshot.
 
 Protocol version **4** requires peers to understand the new node form. Upgrade
 communicating peers together; the Hello version check rejects an older peer
