@@ -302,12 +302,6 @@ impl Cloud {
             return Ok(size);
         }
         let store = self.store.clone();
-        if let Some(size) =
-            blocking(move || store.blob(&root).map(|row| row.map(|row| row.size))).await?
-        {
-            return Ok(size);
-        }
-        let store = self.store.clone();
         let size = blocking(move || {
             let Some(ours) = store.self_origin()? else {
                 return Ok(None);
