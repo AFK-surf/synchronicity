@@ -75,11 +75,12 @@ an otherwise empty database. -/
 theorem receive_upsert_selects_new_record (table : List Fields)
     (root : ByteArray) (size : UInt64) (complete : Bool) (bitmap : Option ByteArray)
     (now : Int64) (tier : Cas.IngestCommit.Tier)
-    (absent : table.filter (fun row => equals row [("root", .blob root)]) = []) :
-    let incoming := Cas.IngestCommit.values root size complete bitmap none now tier
+    (absent : table.filter (fun row => equals row [("root", .blob root)]) = [])
+    (inline : Option ByteArray := none) :
+    let incoming := Cas.IngestCommit.values root size complete bitmap inline now tier
     (upsertRows table incoming ["root"] Cas.IngestCommit.assignments).filter
       (fun row => equals row [("root", .blob root)]) = [incoming] := by
-  let incoming := Cas.IngestCommit.values root size complete bitmap none now tier
+  let incoming := Cas.IngestCommit.values root size complete bitmap inline now tier
   have named : cell incoming "root" = .blob root := by simp [incoming, Cas.IngestCommit.values, cell]
   have same := root_conflict root incoming named
   have empty : table.any (conflict ["root"] incoming) = false := by
