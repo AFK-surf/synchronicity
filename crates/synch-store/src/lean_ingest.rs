@@ -543,7 +543,7 @@ mod tests {
     }
 
     #[test]
-    fn native_ingestion_matches_standard_roots_payloads_and_bao_layouts() {
+    fn native_ingestion_produces_content_peers_can_verify() {
         let (dir, store) = crate::testutil::store();
         for size in [0, 1, 63, 1024, 1025, 16384, 16385, 32768, 49152, 100_003] {
             let bytes = data(size);
@@ -566,10 +566,14 @@ mod tests {
                     size <= synch_core::INLINE_BLOB_MAX as usize
                 );
                 if size > synch_core::INLINE_BLOB_MAX as usize {
-                    let tree = Store::tree(size as u64);
-                    let mut expected = vec![0; tree.outboard_size() as usize];
-                    crate::cas::compute_outboard(&bytes[..], tree, &mut expected).unwrap();
-                    assert_eq!(std::fs::read(store.outboard_path(&root)).unwrap(), expected);
+                    let (_peer_dir, peer) = crate::testutil::store();
+                    let wanted =
+                        synch_core::ChunkRanges::single(0, synch_core::group_count(size as u64));
+                    let (encoded, served) = store.encode_slice(&root, &wanted).unwrap();
+                    assert_eq!(served, wanted);
+                    peer.write_slice(&root, length, &served, &encoded, 17)
+                        .unwrap();
+                    assert_eq!(peer.read_all(&root).unwrap(), bytes);
                 }
                 assert!(!store.is_being_written(&root));
                 assert_eq!(

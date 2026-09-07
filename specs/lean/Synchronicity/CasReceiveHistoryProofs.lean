@@ -73,17 +73,6 @@ def StoredFile.metadata (saved : StoredFile state root content) : Cas.Read.Metad
 def StoredFile.claim (saved : StoredFile state root content) : Cas.IngestCommit.Claim :=
   ⟨saved.size, saved.complete, saved.durable != 0, saved.bitmap⟩
 
-private theorem unordered_query (db : Database) (table : String) (columns : List String)
-    (fields : Fields) :
-    query db table columns fields [] [] =
-      ((rows db table).filter (fun row => equals row fields)).map (project columns) := by
-  have sorted (rs : List Fields) : sortRows (ordered []) rs = rs := by
-    induction rs with
-    | nil => rfl
-    | cons row rest ih =>
-      rw [sortRows, ih]
-      cases rest <;> rfl
-  simp [query, sorted]
 
 private theorem record_read (row : Fields) (root : ByteArray) (size : UInt64)
     (complete : Bool) (bitmap : Option ByteArray) (durable accessed : Int64)
@@ -143,6 +132,18 @@ private theorem read_groups (size : UInt64) (complete : Bool) (bitmap : Option B
       apply Bool.eq_iff_iff.mpr
       rw [CasPlanProofs.normalize_spans_membership]
       simp [inside]
+
+private theorem read_group_bound (row : Cas.Read.Metadata) (group : Nat)
+    (available : spansContain (Cas.Serve.held row) group = true) :
+    group < (groupCount row.size).toNat := by
+  unfold Cas.Serve.held at available
+  split at available
+  · simpa [spansContain] using available
+  · cases bitmap : row.bitmap with
+    | none => simp [bitmap, spansContain] at available
+    | some bytes =>
+      simp only [bitmap, Cas.Read.decodeBitmap, Cas.Read.decodeRawBitmap] at available
+      exact ((CasPlanProofs.normalize_spans_membership _ _ _).1 available).2
 
 private theorem byte_group_inside (size : UInt64) (i : Nat) (inside : i < size.toNat) :
     i / 16384 < (groupCount size).toNat := by
@@ -213,6 +214,107 @@ def DecoderCorrect (state : State) (root content : ByteArray) (size : UInt64) : 
     (state.decodeSlice root size (Cas.Serve.pairsOf spans) input = true →
       AgreesOn decoded content spans)
 
+/-- A successful transfer saves the union of old and newly verified content
+in the actual row and file. The resulting invariant can be used directly by
+the next transfer or by any read, without rebuilding a simulated adapter. -/
+theorem successful_transfer_saves_verified_content
+    (saved : StoredFile state root content)
+    (decoder : DecoderCorrect state root content saved.size)
+    (served : List (UInt64 × UInt64)) (input : UInt64) (now : Int64)
+    (tier : Cas.IngestCommit.Tier)
+    (quiet : state.faults = []) (idle : state.pending = none) (clean : state.scanFault = none)
+    (incomplete : saved.complete = false)
+    (nonempty : Cas.Receive.window saved.size served ≠ [])
+    (verifies : state.decodeSlice root saved.size
+      (Cas.Serve.pairsOf (Cas.Receive.window saved.size served)) input = true) :
+    let received := SimulatedHost.run
+      (Cas.Receive.writeSlice root saved.size served input now tier) state
+    let planned := Cas.IngestCommit.plan (some saved.claim) saved.size (Cas.Receive.window saved.size served)
+    received.1 = .ok (Cas.Serve.pairsOf (Cas.Receive.window saved.size served)) ∧
+    ∃ next : StoredFile received.2 root content,
+      next.metadata = CasBitmapProofs.metadata saved.size planned ∧
+      ∀ (offset length : UInt64), offset.toNat ≤ saved.size.toNat →
+        Cas.Read.covered saved.metadata offset
+          (min (offset.toNat + length.toNat) saved.size.toNat).toUInt64 = true →
+        CasReadPromises.readResult received.2 root (.range offset length) = .ok
+          (content.extract offset.toNat (min (offset.toNat + length.toNat) content.size)).data.toList := by
+  let incoming := Cas.Receive.window saved.size served
+  let planned := Cas.IngestCommit.plan (some saved.claim) saved.size incoming
+  let bitmap := (CasBitmapProofs.metadata saved.size planned).bitmap
+  have accepted (groups : List GroupSpan) :
+      (Cas.IngestCommit.plan (some saved.claim) saved.size groups).accepted = true := by
+    simp [Cas.IngestCommit.plan, StoredFile.claim, planCasCommit, settleSize]
+  obtain ⟨raw, observed, decoded⟩ := saved.observed
+  have execution := CasReceiveStateProofs.existing_receive_execution state root saved.size
+    served input now tier saved.claim saved.metadata raw [] quiet idle clean saved.claimed
+    observed decoded incomplete (accepted []) (accepted incoming) saved.large nonempty verifies
+  dsimp only at execution ⊢
+  obtain ⟨success, stored, physical, quietAfter, idleAfter, hashAfter, decodeAfter, payloadAfter, failureAfter⟩ := execution
+  refine ⟨success, ?_⟩
+  let received := SimulatedHost.run
+    (Cas.Receive.writeSlice root saved.size served input now tier) state
+  let values := Cas.IngestCommit.values root saved.size planned.complete bitmap none now tier
+  let updated := assign saved.row (Cas.IngestCommit.assignments.map fun (column, value) =>
+    (column, conflictValue saved.row values value))
+  have membership (g : Nat) : spansContain planned.spans g = true ↔
+      (spansContain (held saved.size saved.complete saved.bitmap) g = true ∨
+        spansContain incoming g = true) ∧ g < (groupCount saved.size).toNat := by
+    have law := CasPlanProofs.cas_plan_membership true saved.claim.durable saved.complete
+      saved.size saved.size (Cas.IngestCommit.oldSpans saved.claim) incoming g
+    simp [planned, Cas.IngestCommit.plan, StoredFile.claim, settleSize, incomplete,
+      held, Cas.IngestCommit.oldSpans, spansContain, List.any_append] at law ⊢
+    exact law
+
+  have bytes := decoder incoming input (payload state root)
+    (CasPlanProofs.normalize_spans_bounds _ _)
+  have sound : AgreesOn (payload received.2 root) content (held saved.size planned.complete bitmap) := by
+    intro i inside available
+    have groupInside : i / 16384 < (groupCount saved.size).toNat :=
+      byte_group_inside saved.size i (by rw [saved.sameSize]; exact inside)
+    rw [← read_groups saved.size planned.complete bitmap (i / 16384) groupInside] at available
+    have coverage := CasBitmapProofs.persisted_plan_has_exact_coverage true saved.claim.durable
+      saved.claim.complete saved.size saved.size (Cas.IngestCommit.oldSpans saved.claim) incoming (i / 16384)
+    change spansContain (Cas.Serve.held (CasBitmapProofs.metadata saved.size planned)) (i / 16384) =
+      spansContain planned.spans (i / 16384) at coverage
+    change spansContain (Cas.Serve.held (CasBitmapProofs.metadata saved.size planned)) (i / 16384) = true at available
+    rw [coverage] at available
+    have agrees := (membership _).1 available
+    have physicalBytes : payload received.2 root = state.decodedPayload root saved.size
+        (Cas.Serve.pairsOf incoming) input (payload state root) := by
+      change lookupFile received.2.files ("cas_payload", root) = _ at physical
+      simp only [payload, physical, Option.getD_some, incoming]
+    rw [physicalBytes]
+    rcases agrees.1 with old | new
+    · exact bytes.1 _ saved.sound i inside old
+    · exact bytes.2 verifies i inside new
+  let next : StoredFile received.2 root content :=
+    { size := saved.size, complete := planned.complete, bitmap := bitmap,
+      durable := max saved.durable (if planned.complete && tier == .local then 1 else 0),
+      accessed := now, row := updated,
+      recorded := saved.recorded.updated saved.size planned.complete bitmap now tier,
+      selected := by
+        change rows received.2.db "blobs" = _ at stored
+        rw [stored]
+        exact CasPersistenceProofs.receive_upsert_selects_record _ saved.row root saved.size
+          planned.complete bitmap now tier saved.selected
+      width := saved.width, identity := by rw [hashAfter]; exact saved.identity,
+      sameSize := saved.sameSize, large := saved.large, sound := sound }
+  refine ⟨next, rfl, ?_⟩
+  intro offset length valid available
+  apply next.reads offset length quietAfter valid
+  apply CasRangeProofs.additional_groups_preserve_readable_ranges saved.metadata next.metadata _ _ _ available
+  intro g old
+  have bound := read_group_bound saved.metadata g old
+  have original : spansContain (held saved.size saved.complete saved.bitmap) g = true := by
+    rw [← read_groups saved.size saved.complete saved.bitmap g bound]
+    exact old
+  have plannedGroup := (membership g).2 ⟨Or.inl original, bound⟩
+  have coverage := CasBitmapProofs.persisted_plan_has_exact_coverage true saved.claim.durable
+    saved.claim.complete saved.size saved.size (Cas.IngestCommit.oldSpans saved.claim) incoming g
+  change spansContain (Cas.Serve.held next.metadata) g = spansContain planned.spans g at coverage
+  rw [coverage]
+  exact plannedGroup
+
 /-- A failed transfer can write a verified prefix, but content already saved
 remains readable byte for byte. This runs the real receive and then the real
 read against its resulting files and database. -/
@@ -258,5 +360,54 @@ theorem interrupted_transfer_preserves_readable_content
         rw [physical]
         exact preserved }
   exact next.reads offset length quietAfter valid available
+
+/-- Receiving another transfer preserves every byte range you could already
+read, whether the transfer succeeds, repeats saved data, requests nothing, or
+fails after writing a verified prefix. -/
+theorem further_transfer_preserves_readable_content
+    (saved : StoredFile state root content)
+    (decoder : DecoderCorrect state root content saved.size)
+    (served : List (UInt64 × UInt64)) (input : UInt64) (now : Int64)
+    (tier : Cas.IngestCommit.Tier) (offset length : UInt64)
+    (quiet : state.faults = []) (idle : state.pending = none) (clean : state.scanFault = none)
+    (valid : offset.toNat ≤ saved.size.toNat)
+    (available : Cas.Read.covered saved.metadata offset
+      (min (offset.toNat + length.toNat) saved.size.toNat).toUInt64 = true) :
+    let received := SimulatedHost.run
+      (Cas.Receive.writeSlice root saved.size served input now tier) state
+    CasReadPromises.readResult received.2 root (.range offset length) = .ok
+      (content.extract offset.toNat (min (offset.toNat + length.toNat) content.size)).data.toList := by
+  by_cases empty : Cas.Receive.window saved.size served = []
+  · have result := saved.reads offset length quiet valid available
+    simpa [SimulatedHost.run, Cas.Receive.writeSlice, empty, execute,
+      pure, ExceptT.pure, ExceptT.run, ExceptT.mk, CasReadPromises.readResult] using result
+  · by_cases complete : saved.complete = true
+    · obtain ⟨raw, observed, decoded⟩ := saved.observed
+      have admitted : (Cas.IngestCommit.plan (some saved.claim) saved.size []).accepted = true := by
+        simp [Cas.IngestCommit.plan, StoredFile.claim, planCasCommit, settleSize]
+      have execution := CasReceiveStateProofs.complete_receive_execution state root saved.size
+        served input now tier saved.claim saved.metadata raw [] quiet idle saved.claimed
+        observed decoded complete admitted
+      dsimp only at execution ⊢
+      obtain ⟨_, db, files, quietAfter, _, hashAfter, _⟩ := execution
+      let received := SimulatedHost.run
+        (Cas.Receive.writeSlice root saved.size served input now tier) state
+      let next : StoredFile received.2 root content :=
+        { saved with
+          selected := by rw [db]; exact saved.selected
+          identity := by rw [hashAfter]; exact saved.identity
+          sound := by
+            change received.2.files = state.files at files
+            change AgreesOn (payload received.2 root) _ _
+            simpa only [payload, files] using saved.sound }
+      exact next.reads offset length quietAfter valid available
+    · have incomplete := Bool.eq_false_iff.mpr complete
+      by_cases verifies : state.decodeSlice root saved.size
+          (Cas.Serve.pairsOf (Cas.Receive.window saved.size served)) input = true
+      · obtain ⟨_, next, _, reads⟩ := successful_transfer_saves_verified_content saved decoder
+          served input now tier quiet idle clean incomplete empty verifies
+        exact reads offset length valid available
+      · exact (interrupted_transfer_preserves_readable_content saved decoder served input now tier
+          offset length quiet idle clean incomplete empty (Bool.eq_false_iff.mpr verifies) valid available).2
 
 end Synchronicity.CasReceiveHistoryProofs

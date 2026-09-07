@@ -1095,13 +1095,6 @@ mod tests {
                 std::fs::read(temporary_path(&files, payload)).unwrap(),
                 bytes
             );
-            let tree = Store::tree(bytes.len() as u64);
-            let mut expected = vec![0; tree.outboard_size() as usize];
-            crate::cas::compute_outboard(&bytes[..], tree, &mut expected).unwrap();
-            assert_eq!(
-                std::fs::read(temporary_path(&files, outboard)).unwrap(),
-                expected
-            );
             // The temporaries stay owned, flushable and discardable.
             files.flush(payload).unwrap();
             files.flush(outboard).unwrap();

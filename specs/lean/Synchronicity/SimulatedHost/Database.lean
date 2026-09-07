@@ -247,4 +247,18 @@ def query (db : Database) (relation : String) (columns : List String) (fields : 
   let candidates := if joins.isEmpty then rows db relation else joinedRows db relation joins
   (sortRows (ordered order) (candidates.filter (fun row => equals row fields))).map (project columns)
 
+/-- An unordered raw projection preserves the selected records exactly. -/
+theorem unordered_query (db : Database) (table : String) (columns : List String)
+    (fields : Fields) :
+    query db table columns fields [] [] =
+      ((rows db table).filter (fun row => equals row fields)).map (project columns) := by
+  have sorted (rs : List Fields) : sortRows (ordered []) rs = rs := by
+    induction rs with
+    | nil => rfl
+    | cons row rest ih =>
+      rw [sortRows, ih]
+      cases rest <;> rfl
+  simp [query, sorted]
+
+
 end Synchronicity.SimulatedHost

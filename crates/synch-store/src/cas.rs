@@ -1417,8 +1417,9 @@ impl Read for TeeReader {
     }
 }
 
-/// Legacy cloud-ingestion builder and independent test oracle. Local
-/// ingestion constructs its hash tree and outboard entirely in Lean.
+/// Trusted Bao tree construction shared by local and cloud ingestion. Lean
+/// controls local source admission, resource ownership and metadata commit;
+/// the Bao implementation hashes the bytes and writes the outboard layout.
 pub(crate) fn compute_outboard(
     data: impl Read,
     tree: BaoTree,
