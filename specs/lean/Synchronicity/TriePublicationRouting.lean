@@ -8,7 +8,7 @@ actual serving decision. Compression remains valid inside complete grants. -/
 namespace Synchronicity.TriePublicationRouting
 open VerifiedCore VerifiedCore.Host VerifiedCore.Trie
 open TrieProgramProofs TrieSnapshotProofs TrieSnapshotClosure TrieNormalizeProofs
-open TrieServeProofs
+open TrieServeProofs TrieMutateProofs TrieWriteSemantics
 
 /-- Every position outside a complete compression boundary is an addressed
 routing node. This describes stored bytes, not a traversal completion flag. -/
@@ -177,5 +177,135 @@ theorem assemble_children_routed (positions : List UInt8)
         (fun nibble member => bounds nibble (by simp [member]))
         (set_child_routed childrenRouted (by rw [width]; exact bounds position (by simp)) head)
         tail ran
+
+private theorem head_closed
+    (meaning : StateMeaning store ⟨work, root :: roots⟩ target) : Closed store root := by
+  obtain ⟨views, pending, completed⟩ := meaning
+  cases completed with
+  | cons head tail => exact head.2.1
+
+private theorem push_routed_result
+    (routing : RoutingState before ⟨.visit path cursor :: work, roots⟩ target)
+    (included : RecordsIncluded before after) (routed : RoutedAt after path root) :
+    RoutingState after ⟨work, root :: roots⟩ target := by
+  obtain ⟨paths, pending, ready⟩ := routing
+  cases pending with
+  | visit below => exact ⟨_, below, .cons routed (routed_results_preserved ready included)⟩
+
+private theorem unary_routing_state
+    (routing : RoutingState store ⟨.visit path cursor :: work, roots⟩ target) :
+    RoutingState store
+      ⟨.visit (path ++ [nibble]) child :: .assemble [nibble] none :: work, roots⟩ target := by
+  obtain ⟨paths, pending, ready⟩ := routing
+  cases pending with
+  | visit below =>
+    refine ⟨paths, .visit ?_, ready⟩
+    simpa using PendingPaths.assemble (value := none) [nibble] below
+
+private theorem scheduled_routing_state
+    (routing : RoutingState before ⟨.visit path cursor :: work, roots⟩ target)
+    (included : RecordsIncluded before after) :
+    RoutingState after (Normalize.schedule path children value ⟨work, roots⟩) target := by
+  obtain ⟨paths, pending, ready⟩ := routing
+  cases pending with
+  | visit below => exact ⟨paths, schedule_paths below, routed_results_preserved ready included⟩
+
+/-- Keeping a whole compressed subtree is permitted exactly at a schema
+boundary; its stored form is carried into the actual result stack. -/
+theorem boundary_step_routed
+    (routing : RoutingState before.read ⟨.visit path cursor :: work, roots⟩ target)
+    (meaningAfter : StateMeaning after.read next entries)
+    (within : path.length ≤ maxKeyBytes * 2) (boundary : Normalize.belowBoundary path = true)
+    (safe : SafeWrites d before (Normalize.step ⟨.visit path cursor :: work, roots⟩).run)
+    (ran : execute d before (Normalize.step ⟨.visit path cursor :: work, roots⟩).run =
+      some (.ok (.inl next), after)) : RoutingState after.read next target := by
+  have included := execution_preserves_records _ safe ran
+  cases cursor with
+  | stored root =>
+    simp only [Normalize.step, Nat.not_lt.mpr within, ↓reduceIte, boundary, run_bind,
+      run_pure, program_bind_pure, bindCont_ok, TrieMutateProofs.execute_pure,
+      Option.some.injEq, Prod.mk.injEq, Except.ok.injEq, Sum.inl.injEq] at ran
+    obtain ⟨rfl, rfl⟩ := ran
+    exact push_routed_result routing included (.inside boundary (head_closed meaningAfter))
+  | node node =>
+    simp only [Normalize.step, Nat.not_lt.mpr within, ↓reduceIte, boundary] at ran
+    rw [execute_run_bind, execute_put] at ran
+    simp only [run_pure, TrieMutateProofs.execute_pure, Option.some.injEq, Prod.mk.injEq,
+      Except.ok.injEq, Sum.inl.injEq] at ran
+    obtain ⟨rfl, rfl⟩ := ran
+    exact push_routed_result routing included (.inside boundary (head_closed meaningAfter))
+
+/-- Splitting an exact leaf into routing edges retains the original path at
+which its eventual addressed payload must be assembled. -/
+theorem leaf_edge_step_routed
+    (routing : RoutingState before.read ⟨.visit path (.node (.leaf suffix value)) :: work, roots⟩ target)
+    (within : path.length ≤ maxKeyBytes * 2) (spine : Normalize.belowBoundary path = false)
+    (spelling : suffix.toList = nibble :: rest)
+    (ran : execute d before
+      (Normalize.step ⟨.visit path (.node (.leaf suffix value)) :: work, roots⟩).run =
+      some (.ok (.inl next), after)) : RoutingState after.read next target := by
+  simp only [Normalize.step, Nat.not_lt.mpr within, ↓reduceIte, spine, Bool.false_eq_true,
+    spelling, run_bind, run_pure, program_bind_pure, bindCont_ok,
+    TrieMutateProofs.execute_pure, Option.some.injEq, Prod.mk.injEq,
+    Except.ok.injEq, Sum.inl.injEq] at ran
+  obtain ⟨rfl, rfl⟩ := ran
+  exact unary_routing_state routing
+
+/-- An extension is split at the same path positions as a leaf, whether its
+last edge leads to another stored node or to a remaining constructed run. -/
+theorem extension_edge_step_routed
+    (routing : RoutingState before.read
+      ⟨.visit path (.node (.extension segment child)) :: work, roots⟩ target)
+    (within : path.length ≤ maxKeyBytes * 2) (spine : Normalize.belowBoundary path = false)
+    (spelling : segment.toList = nibble :: rest)
+    (ran : execute d before
+      (Normalize.step ⟨.visit path (.node (.extension segment child)) :: work, roots⟩).run =
+      some (.ok (.inl next), after)) : RoutingState after.read next target := by
+  simp only [Normalize.step, Nat.not_lt.mpr within, ↓reduceIte, spine, Bool.false_eq_true,
+    spelling, run_bind, run_pure, program_bind_pure, bindCont_ok,
+    TrieMutateProofs.execute_pure, Option.some.injEq, Prod.mk.injEq,
+    Except.ok.injEq, Sum.inl.injEq] at ran
+  obtain ⟨rfl, rfl⟩ := ran
+  exact unary_routing_state routing
+
+/-- Existing route nodes schedule all children at their original paths. -/
+theorem route_step_routed
+    (routing : RoutingState before.read ⟨.visit path (.node (.route children value)) :: work, roots⟩ target)
+    (within : path.length ≤ maxKeyBytes * 2) (spine : Normalize.belowBoundary path = false)
+    (ran : execute d before
+      (Normalize.step ⟨.visit path (.node (.route children value)) :: work, roots⟩).run =
+      some (.ok (.inl next), after)) : RoutingState after.read next target := by
+  simp only [Normalize.step, Nat.not_lt.mpr within, ↓reduceIte, spine, Bool.false_eq_true,
+    run_bind, run_pure, program_bind_pure, bindCont_ok,
+    TrieMutateProofs.execute_pure, Option.some.injEq, Prod.mk.injEq,
+    Except.ok.injEq, Sum.inl.injEq] at ran
+  obtain ⟨rfl, rfl⟩ := ran
+  exact scheduled_routing_state routing (fun _ _ _ _ held => held)
+
+/-- Addressing a branch payload preserves completed siblings and queues its
+children at the same paths used by the actual routing assembler. -/
+theorem branch_step_routed
+    (routing : RoutingState before.read ⟨.visit path (.node (.branch children value)) :: work, roots⟩ target)
+    (within : path.length ≤ maxKeyBytes * 2) (spine : Normalize.belowBoundary path = false)
+    (safe : SafeWrites d before
+      (Normalize.step ⟨.visit path (.node (.branch children value)) :: work, roots⟩).run)
+    (ran : execute d before
+      (Normalize.step ⟨.visit path (.node (.branch children value)) :: work, roots⟩).run =
+      some (.ok (.inl next), after)) : RoutingState after.read next target := by
+  have included := execution_preserves_records _ safe ran
+  simp only [Normalize.step, Nat.not_lt.mpr within, ↓reduceIte, spine, Bool.false_eq_true,
+    run_bind, run_pure, program_bind_pure, bindCont_ok] at ran
+  rw [TrieMutateProofs.execute_bind] at ran
+  cases first : execute d before (Normalize.addressOptional value).run with
+  | none => simp [first] at ran
+  | some reply =>
+    obtain ⟨reply, middle⟩ := reply
+    cases reply with
+    | error error => simp [first] at ran
+    | ok addressed =>
+      simp only [first, bindCont_ok, run_pure, TrieMutateProofs.execute_pure,
+        Option.some.injEq, Prod.mk.injEq, Except.ok.injEq, Sum.inl.injEq] at ran
+      obtain ⟨rfl, rfl⟩ := ran
+      exact scheduled_routing_state routing included
 
 end Synchronicity.TriePublicationRouting

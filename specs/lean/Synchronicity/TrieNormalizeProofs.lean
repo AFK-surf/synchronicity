@@ -353,7 +353,7 @@ private theorem selected_children_occupied
     rw [empty] at selected
     exact List.not_mem_nil selected
 
-private theorem empty_children_meaning : ChildrenMeaning store emptyChildren [] := by
+theorem empty_children_meaning : ChildrenMeaning store emptyChildren [] := by
   refine ⟨branchOk_empty, ?_, ?_, ?_⟩
   · intro index child edge
     simp only [emptyChildren, List.getElem?_replicate] at edge
@@ -468,7 +468,7 @@ private theorem completed_preserved (completed : Completed before roots views)
     exact (Iff.intro (closed_snapshot_no_new_entries closed included)
       (graph_value_preserved included)).trans (exactEntries key bytes)
 
-private theorem completed_split (first : List Entries)
+theorem completed_split (first : List Entries)
     (completed : Completed store roots (first ++ rest)) :
     ∃ left right, roots = left ++ right ∧ Completed store left first ∧ Completed store right rest := by
   induction first generalizing roots with
@@ -740,7 +740,7 @@ theorem extension_edge_step_preserves
   obtain ⟨rfl, rfl⟩ := ran
   exact ⟨rfl, expand_unary_meaning meaning childValid bound same⟩
 
-private theorem load_cursor_meaning (shaped : Shaped before)
+theorem load_cursor_meaning (shaped : Shaped before)
     (valid : CursorValid before.read (.stored root))
     (ran : execute d before (load root).run = some (.ok node, after)) :
     after = before ∧ CursorValid after.read (.node node) ∧
@@ -758,7 +758,7 @@ private theorem load_cursor_meaning (shaped : Shaped before)
     exact ⟨rfl, ⟨loaded_node_closed valid.2 held decoded, wf, inv⟩,
       fun _ _ => graph_node_entries held decoded⟩
 
-private theorem stored_step_as_node
+theorem stored_step_as_node
     (within : path.length ≤ maxKeyBytes * 2) (spine : Normalize.belowBoundary path = false) :
     (Normalize.step ⟨.visit path (.stored root) :: work, results⟩).run =
       (do let node ← load root
@@ -767,7 +767,7 @@ private theorem stored_step_as_node
     Bool.false_eq_true, run_bind]
   congr 1
 
-private theorem replace_cursor_meaning
+theorem replace_cursor_meaning
     (meaning : StateMeaning store ⟨.visit path cursor :: work, results⟩ target)
     (valid : CursorValid store replacement)
     (same : ∀ key bytes, CursorEntries store cursor key bytes ↔ CursorEntries store replacement key bytes) :
@@ -778,7 +778,7 @@ private theorem replace_cursor_meaning
     exact ⟨entries, .visit valid
       (fun key bytes => (same key bytes).symm.trans (originalEntries key bytes)) below, completed⟩
 
-private theorem addressValue_shape {value : Value} (digestWidth : Width d) (shaped : Shaped before)
+theorem addressValue_shape {value : Value} (digestWidth : Width d) (shaped : Shaped before)
     (wf : value.wf)
     (ran : execute d before (addressValue value).run = some (.ok address, after)) :
     Shaped after ∧ address.size = 32 := by
@@ -1110,7 +1110,7 @@ private theorem node_step_not_finished
           TrieMutateProofs.execute_pure] at ran
   | route children value => simp [Normalize.step, Nat.not_lt.mpr within, spine] at ran
 
-private theorem finished_step_has_no_work
+theorem finished_step_has_no_work
     (ran : execute d before (Normalize.step state).run = some (.ok (.inr root), after)) :
     state.work = [] := by
   obtain ⟨work, results⟩ := state
