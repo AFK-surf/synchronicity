@@ -37,6 +37,11 @@ structure State where
   pending : Option (Transaction × Database) := none
   nextTx : UInt64 := 1
   files : FileStore := []
+  /-- Raw byte namespaces backed by SQL `(hash, data)` relations. Reads use
+  the active transaction's rows, exactly as the native storage session does.
+  Other namespaces use the file service. This is backend configuration,
+  shared by every operation, rather than an operation-specific interpreter. -/
+  byteRelations : List String := []
   /-- When each file was last written, for the sweeps; a file without a
   time is one whose time cannot be read. -/
   modified : List (ObjectKey × Int64) := []
@@ -109,6 +114,28 @@ abbrev Result (A : Type) := A × State
 def invalid : Failure := ⟨3, 0⟩
 def absent : Failure := ⟨1, 2⟩
 def truncated : Failure := ⟨1, 3⟩
+
+/-- A missing row and an ill-typed payload have different raw replies. -/
+def relationBytes (db : Database) (relation : String) (key : ByteArray) : Reply (Option ByteArray) :=
+  match (rows db relation).find? (fun row => cell row "hash" == .blob key) with
+  | none => .ok none
+  | some row => match cell row "data" with
+    | .blob bytes => .ok (some bytes)
+    | _ => .error invalid
+
+/-- The actual byte accessor behind Storage, including writes made by an
+open transaction. A later rollback therefore also rolls back its byte view. -/
+def readByteObject (state : State) (space : String) (key : ByteArray) : Reply (Option ByteArray) :=
+  if state.byteRelations.contains space then
+    relationBytes ((state.pending.map Prod.snd).getD state.db) space key
+  else .ok (lookupFile state.files (space, key))
+
+/-- Successful raw bytes, for graph interpretations. A failed read cannot
+establish a graph edge; executable readers still return its original error. -/
+def readableBytes (state : State) (space : String) (key : ByteArray) : Option ByteArray :=
+  match readByteObject state space key with
+  | .ok bytes => bytes
+  | .error _ => none
 
 def fault (state : State) : Option Failure :=
   (state.faults.find? fun entry => entry.1 == state.trace.length).map Prod.snd
@@ -184,9 +211,8 @@ def storage : Storage A → State → Result A
       reply state ("sweep:" ++ relation) fun state => transaction state tx fun db =>
         let table := rows db relation
         -- SQL `NOT IN`: a NULL key is neither in nor out of the set, so the
-        -- row stays; any other key not in the set goes. Rows only: a
-        -- content-addressed relation's payloads (`readBytes`) are the
-        -- fixture's mirror of its rows, outside the transaction.
+        -- row stays; any other key not in the set goes. Configured raw byte
+        -- relations expose this same pending database through `readBytes`.
         let remaining := table.filter fun row => match cell row column with
           | .blob key => keys.contains key
           | .null => true
@@ -195,7 +221,7 @@ def storage : Storage A → State → Result A
   | .readCounter space key, state => reply state ("counter:" ++ space) fun state =>
       (.ok (counter state (space, key)), state)
   | .readBytes space key, state => reply state ("bytes:" ++ space) fun state =>
-      (.ok (lookupFile state.files (space, key)), state)
+      (readByteObject state space key, state)
   | .readInput handle offset count, state => reply state "readInput" fun state =>
       match (state.handles.find? fun entry => entry.1 == handle).map Prod.snd with
       | none => (.error invalid, state)

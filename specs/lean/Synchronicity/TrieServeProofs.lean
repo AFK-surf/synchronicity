@@ -150,7 +150,7 @@ extension's label concatenates, a branch contributes one nibble. -/
 
 /-- The nodes a host state holds, by address. -/
 def nodesOf (state : State) (hash : ByteArray) : Option ByteArray :=
-  lookupFile state.files (nodeSpace, hash)
+  readableBytes state nodeSpace hash
 
 /-- The stored graph places `found` at `path` below `hash`. -/
 inductive Reaches (lookup : ByteArray → Option ByteArray) : ByteArray → Path → ByteArray → Prop where
@@ -242,59 +242,64 @@ theorem descend_sound (fuel : Nat) : ∀ (consumed : Nat) (current : Option Byte
           ExceptT.bindCont, ExceptT.mk, Program.bind, execute, Interpreter.handle,
           SimulatedHost.storage, reply, fault, quiet, List.find?_nil, Option.map_none, record,
           Except.mapError] at ran
-        cases held : lookupFile state.files (nodeSpace, hash) with
-        | none => simp [held, execute, ExceptT.mk, pure, ExceptT.pure] at ran
-        | some raw =>
-          simp only [held] at ran
-          cases decoded : decode raw with
-          | error message => simp [decoded, throw, throwThe, MonadExcept.throw, execute] at ran
-          | ok node =>
-            simp only [decoded] at ran
-            cases node with
-            | leaf _ _ => simp [execute, ExceptT.mk, pure, ExceptT.pure] at ran
-            | extension segment child =>
-              simp only at ran
-              split at ran
-              · simp [execute, ExceptT.mk, pure, ExceptT.pure] at ran
-              · rename_i spelled
-                simp only [Bool.or_eq_true, Bool.not_eq_true', not_or] at spelled
-                obtain ⟨nonempty, prefixed⟩ := spelled
-                obtain ⟨start, same, reached⟩ :=
-                  ih _ _ _ _ { record state ("bytes:" ++ nodeSpace) with faults := [] } _ _ rfl ran
-                cases same
-                have shape := drop_of_isPrefixOf (segment := segment.toList) (rest := nibble :: below)
-                  (by simpa using prefixed)
-                rw [← shape]
-                exact .extension hash raw segment child found _ held decoded
-                  (by simpa using nonempty) reached
-            | branch children value =>
-              simp only at ran
-              split at ran
-              · simp [execute, ExceptT.mk, pure, ExceptT.pure] at ran
-              · rename_i inRange
-                cases edge : (children[nibble.toNat]?).getD none with
-                | none => simp [edge, execute, ExceptT.mk, pure, ExceptT.pure] at ran
-                | some child =>
-                  simp only [edge] at ran
+        cases read : readByteObject state nodeSpace hash with
+        | error failure =>
+          simp [read, execute, pure] at ran
+        | ok bytes =>
+          cases bytes with
+          | none => simp [read, execute, ExceptT.mk, pure, ExceptT.pure] at ran
+          | some raw =>
+            have held : nodesOf state hash = some raw := by simp [nodesOf, readableBytes, read]
+            simp only [read] at ran
+            cases decoded : decode raw with
+            | error message => simp [decoded, throw, throwThe, MonadExcept.throw, execute] at ran
+            | ok node =>
+              simp only [decoded] at ran
+              cases node with
+              | leaf _ _ => simp [execute, ExceptT.mk, pure, ExceptT.pure] at ran
+              | extension segment child =>
+                simp only at ran
+                split at ran
+                · simp [execute, ExceptT.mk, pure, ExceptT.pure] at ran
+                · rename_i spelled
+                  simp only [Bool.or_eq_true, Bool.not_eq_true', not_or] at spelled
+                  obtain ⟨nonempty, prefixed⟩ := spelled
                   obtain ⟨start, same, reached⟩ :=
                     ih _ _ _ _ { record state ("bytes:" ++ nodeSpace) with faults := [] } _ _ rfl ran
                   cases same
-                  exact .branch hash raw child found children value nibble below held decoded
-                    (getD_none_eq_some edge) reached
-            | route children value =>
-              simp only at ran
-              split at ran
-              · simp [execute, ExceptT.mk, pure, ExceptT.pure] at ran
-              · rename_i inRange
-                cases edge : (children[nibble.toNat]?).getD none with
-                | none => simp [edge, execute, ExceptT.mk, pure, ExceptT.pure] at ran
-                | some child =>
-                  simp only [edge] at ran
-                  obtain ⟨start, same, reached⟩ :=
-                    ih _ _ _ _ { record state ("bytes:" ++ nodeSpace) with faults := [] } _ _ rfl ran
-                  cases same
-                  exact .route hash raw child found children value nibble below held decoded
-                    (getD_none_eq_some edge) reached
+                  have shape := drop_of_isPrefixOf (segment := segment.toList) (rest := nibble :: below)
+                    (by simpa using prefixed)
+                  rw [← shape]
+                  exact .extension hash raw segment child found _ held decoded
+                    (by simpa using nonempty) reached
+              | branch children value =>
+                simp only at ran
+                split at ran
+                · simp [execute, ExceptT.mk, pure, ExceptT.pure] at ran
+                · rename_i inRange
+                  cases edge : (children[nibble.toNat]?).getD none with
+                  | none => simp [edge, execute, ExceptT.mk, pure, ExceptT.pure] at ran
+                  | some child =>
+                    simp only [edge] at ran
+                    obtain ⟨start, same, reached⟩ :=
+                      ih _ _ _ _ { record state ("bytes:" ++ nodeSpace) with faults := [] } _ _ rfl ran
+                    cases same
+                    exact .branch hash raw child found children value nibble below held decoded
+                      (getD_none_eq_some edge) reached
+              | route children value =>
+                simp only at ran
+                split at ran
+                · simp [execute, ExceptT.mk, pure, ExceptT.pure] at ran
+                · rename_i inRange
+                  cases edge : (children[nibble.toNat]?).getD none with
+                  | none => simp [edge, execute, ExceptT.mk, pure, ExceptT.pure] at ran
+                  | some child =>
+                    simp only [edge] at ran
+                    obtain ⟨start, same, reached⟩ :=
+                      ih _ _ _ _ { record state ("bytes:" ++ nodeSpace) with faults := [] } _ _ rfl ran
+                    cases same
+                    exact .route hash raw child found children value nibble below held decoded
+                      (getD_none_eq_some edge) reached
 
 /-! ## The trail
 
@@ -314,7 +319,7 @@ theorem prefix_shape {segment rest : Path} (h : segment.isPrefixOf rest = true) 
 trail only what it was handed and positions it reached from its start. -/
 theorem descend_trail (fuel : Nat) : ∀ (consumed : Nat) (current : Option ByteArray) (rest : Path)
     (trail : List (Nat × ByteArray)) (state : State), state.faults = [] →
-    (execute (descend fuel consumed current rest trail) state).2.files = state.files ∧
+    nodesOf (execute (descend fuel consumed current rest trail) state).2 = nodesOf state ∧
     (execute (descend fuel consumed current rest trail) state).2.faults = [] ∧
     ∀ found trail', (execute (descend fuel consumed current rest trail) state).1 = .ok (found, trail') →
       ∀ step ∈ trail', step ∈ trail ∨ ∃ start, current = some start ∧ consumed ≤ step.1 ∧
@@ -351,145 +356,151 @@ theorem descend_trail (fuel : Nat) : ∀ (consumed : Nat) (current : Option Byte
           ExceptT.bindCont, ExceptT.mk, Program.bind, execute, Interpreter.handle,
           SimulatedHost.storage, reply, fault, quiet, List.find?_nil, Option.map_none, record,
           Except.mapError]
-        cases held : lookupFile state.files (nodeSpace, hash) with
-        | none =>
-          simp only [execute, ExceptT.mk, pure, ExceptT.pure]
-          refine ⟨by trivial, by trivial, ?_⟩
-          intro found trail' same step mem
-          cases same
-          exact .inl mem
-        | some raw =>
-          cases decoded : decode raw with
-          | error message =>
-            simp only [decoded, throw, throwThe, MonadExcept.throw, execute_throw]
+        cases read : readByteObject state nodeSpace hash with
+        | error failure =>
+          simp only [execute, pure]
+          exact ⟨rfl, by trivial, by intros; contradiction⟩
+        | ok bytes =>
+          cases bytes with
+          | none =>
+            simp only [execute, ExceptT.mk, pure, ExceptT.pure]
             refine ⟨by trivial, by trivial, ?_⟩
-            intro found trail' same
+            intro found trail' same step mem
             cases same
-          | ok node =>
-            simp only [decoded]
-            cases node with
-            | leaf _ _ =>
-              simp only [execute, ExceptT.mk, pure, ExceptT.pure]
+            exact .inl mem
+          | some raw =>
+            have held : nodesOf state hash = some raw := by simp [nodesOf, readableBytes, read]
+            cases decoded : decode raw with
+            | error message =>
+              simp only [decoded, throw, throwThe, MonadExcept.throw, execute_throw]
               refine ⟨by trivial, by trivial, ?_⟩
-              intro found trail' same step mem
+              intro found trail' same
               cases same
-              exact .inl mem
-            | extension segment child =>
-              simp only
-              split
-              · simp only [execute, ExceptT.mk, pure, ExceptT.pure]
+            | ok node =>
+              simp only [decoded]
+              cases node with
+              | leaf _ _ =>
+                simp only [execute, ExceptT.mk, pure, ExceptT.pure]
                 refine ⟨by trivial, by trivial, ?_⟩
                 intro found trail' same step mem
                 cases same
                 exact .inl mem
-              · rename_i spelled
-                simp only [Bool.or_eq_true, Bool.not_eq_true', not_or] at spelled
-                obtain ⟨nonempty, prefixed⟩ := spelled
-                obtain ⟨tail, shape⟩ := prefix_shape (segment := segment.toList) (rest := nibble :: below)
-                  (by simpa using prefixed)
-                obtain ⟨files, faults, steps⟩ := ih (consumed + segment.toList.length) (some child)
-                  (List.drop segment.toList.length (nibble :: below))
-                  (trail ++ [(consumed + segment.toList.length, child)])
-                  { record state ("bytes:" ++ nodeSpace) with faults := [] } rfl
-                refine ⟨files, faults, ?_⟩
-                intro found trail' ran step mem
-                rcases steps found trail' ran step mem with old | ⟨start, same, lower, upper, reached⟩
-                · rcases List.mem_append.mp old with old | new
-                  · exact .inl old
-                  · simp only [List.mem_singleton] at new
-                    subst new
-                    refine .inr ⟨hash, rfl, by omega, ?_, ?_⟩
-                    · simp only [Nat.add_sub_cancel_left, shape, List.length_append]
+              | extension segment child =>
+                simp only
+                split
+                · simp only [execute, ExceptT.mk, pure, ExceptT.pure]
+                  refine ⟨by trivial, by trivial, ?_⟩
+                  intro found trail' same step mem
+                  cases same
+                  exact .inl mem
+                · rename_i spelled
+                  simp only [Bool.or_eq_true, Bool.not_eq_true', not_or] at spelled
+                  obtain ⟨nonempty, prefixed⟩ := spelled
+                  obtain ⟨tail, shape⟩ := prefix_shape (segment := segment.toList) (rest := nibble :: below)
+                    (by simpa using prefixed)
+                  obtain ⟨files, faults, steps⟩ := ih (consumed + segment.toList.length) (some child)
+                    (List.drop segment.toList.length (nibble :: below))
+                    (trail ++ [(consumed + segment.toList.length, child)])
+                    { record state ("bytes:" ++ nodeSpace) with faults := [] } rfl
+                  refine ⟨files, faults, ?_⟩
+                  intro found trail' ran step mem
+                  rcases steps found trail' ran step mem with old | ⟨start, same, lower, upper, reached⟩
+                  · rcases List.mem_append.mp old with old | new
+                    · exact .inl old
+                    · simp only [List.mem_singleton] at new
+                      subst new
+                      refine .inr ⟨hash, rfl, by omega, ?_, ?_⟩
+                      · simp only [Nat.add_sub_cancel_left, shape, List.length_append]
+                        omega
+                      · simp only [Nat.add_sub_cancel_left, shape, List.take_left]
+                        simpa using Reaches.extension hash raw segment child child [] held decoded
+                          (by simpa using nonempty) (.here child)
+                  · cases same
+                    have bound : segment.toList.length ≤ (nibble :: below).length := by
+                      rw [shape, List.length_append]
                       omega
-                    · simp only [Nat.add_sub_cancel_left, shape, List.take_left]
-                      simpa using Reaches.extension hash raw segment child child [] held decoded
-                        (by simpa using nonempty) (.here child)
-                · cases same
-                  have bound : segment.toList.length ≤ (nibble :: below).length := by
-                    rw [shape, List.length_append]
-                    omega
-                  refine .inr ⟨hash, rfl, by omega, ?_, ?_⟩
-                  · simp only [List.length_drop] at upper
-                    omega
-                  · have split : step.1 - consumed =
-                      segment.toList.length + (step.1 - (consumed + segment.toList.length)) := by omega
-                    rw [split, List.take_add, shape, List.take_left]
-                    refine Reaches.extension hash raw segment child step.2 _ held decoded
-                      (by simpa using nonempty) ?_
-                    have reached' : Reaches (nodesOf state) child
-                        (List.take (step.1 - (consumed + segment.toList.length))
-                          (List.drop segment.toList.length (nibble :: below))) step.2 := reached
-                    simpa [shape] using reached'
-            | branch children value =>
-              simp only
-              split
-              · simp only [execute, ExceptT.mk, pure, ExceptT.pure]
-                refine ⟨by trivial, by trivial, ?_⟩
-                intro found trail' same step mem
-                cases same
-                exact .inl mem
-              · cases edge : (children[nibble.toNat]?).getD none with
-                | none =>
-                  simp only [execute, ExceptT.mk, pure, ExceptT.pure]
+                    refine .inr ⟨hash, rfl, by omega, ?_, ?_⟩
+                    · simp only [List.length_drop] at upper
+                      omega
+                    · have split : step.1 - consumed =
+                        segment.toList.length + (step.1 - (consumed + segment.toList.length)) := by omega
+                      rw [split, List.take_add, shape, List.take_left]
+                      refine Reaches.extension hash raw segment child step.2 _ held decoded
+                        (by simpa using nonempty) ?_
+                      have reached' : Reaches (nodesOf state) child
+                          (List.take (step.1 - (consumed + segment.toList.length))
+                            (List.drop segment.toList.length (nibble :: below))) step.2 := reached
+                      simpa [shape] using reached'
+              | branch children value =>
+                simp only
+                split
+                · simp only [execute, ExceptT.mk, pure, ExceptT.pure]
                   refine ⟨by trivial, by trivial, ?_⟩
                   intro found trail' same step mem
                   cases same
                   exact .inl mem
-                | some child =>
-                  obtain ⟨files, faults, steps⟩ := ih (consumed + 1) (some child) below
-                    (trail ++ [(consumed + 1, child)]) { record state ("bytes:" ++ nodeSpace) with faults := [] } rfl
-                  refine ⟨files, faults, ?_⟩
-                  intro found trail' ran step mem
-                  rcases steps found trail' ran step mem with old | ⟨start, same, lower, upper, reached⟩
-                  · rcases List.mem_append.mp old with old | new
-                    · exact .inl old
-                    · simp only [List.mem_singleton] at new
-                      subst new
-                      refine .inr ⟨hash, rfl, by omega, by simp, ?_⟩
-                      simp only [Nat.add_sub_cancel_left, List.take_succ_cons, List.take_zero]
-                      exact Reaches.branch hash raw child child children value nibble [] held decoded
-                        (getD_none_eq_some edge) (.here child)
-                  · cases same
-                    refine .inr ⟨hash, rfl, by omega, by simp; omega, ?_⟩
-                    have split : step.1 - consumed = (step.1 - (consumed + 1)) + 1 := by omega
-                    rw [split, List.take_succ_cons]
-                    exact Reaches.branch hash raw child step.2 children value nibble _ held decoded
-                      (getD_none_eq_some edge) reached
-            | route children value =>
-              simp only
-              split
-              · simp only [execute, ExceptT.mk, pure, ExceptT.pure]
-                refine ⟨by trivial, by trivial, ?_⟩
-                intro found trail' same step mem
-                cases same
-                exact .inl mem
-              · cases edge : (children[nibble.toNat]?).getD none with
-                | none =>
-                  simp only [execute, ExceptT.mk, pure, ExceptT.pure]
+                · cases edge : (children[nibble.toNat]?).getD none with
+                  | none =>
+                    simp only [execute, ExceptT.mk, pure, ExceptT.pure]
+                    refine ⟨by trivial, by trivial, ?_⟩
+                    intro found trail' same step mem
+                    cases same
+                    exact .inl mem
+                  | some child =>
+                    obtain ⟨files, faults, steps⟩ := ih (consumed + 1) (some child) below
+                      (trail ++ [(consumed + 1, child)]) { record state ("bytes:" ++ nodeSpace) with faults := [] } rfl
+                    refine ⟨files, faults, ?_⟩
+                    intro found trail' ran step mem
+                    rcases steps found trail' ran step mem with old | ⟨start, same, lower, upper, reached⟩
+                    · rcases List.mem_append.mp old with old | new
+                      · exact .inl old
+                      · simp only [List.mem_singleton] at new
+                        subst new
+                        refine .inr ⟨hash, rfl, by omega, by simp, ?_⟩
+                        simp only [Nat.add_sub_cancel_left, List.take_succ_cons, List.take_zero]
+                        exact Reaches.branch hash raw child child children value nibble [] held decoded
+                          (getD_none_eq_some edge) (.here child)
+                    · cases same
+                      refine .inr ⟨hash, rfl, by omega, by simp; omega, ?_⟩
+                      have split : step.1 - consumed = (step.1 - (consumed + 1)) + 1 := by omega
+                      rw [split, List.take_succ_cons]
+                      exact Reaches.branch hash raw child step.2 children value nibble _ held decoded
+                        (getD_none_eq_some edge) reached
+              | route children value =>
+                simp only
+                split
+                · simp only [execute, ExceptT.mk, pure, ExceptT.pure]
                   refine ⟨by trivial, by trivial, ?_⟩
                   intro found trail' same step mem
                   cases same
                   exact .inl mem
-                | some child =>
-                  obtain ⟨files, faults, steps⟩ := ih (consumed + 1) (some child) below
-                    (trail ++ [(consumed + 1, child)]) { record state ("bytes:" ++ nodeSpace) with faults := [] } rfl
-                  refine ⟨files, faults, ?_⟩
-                  intro found trail' ran step mem
-                  rcases steps found trail' ran step mem with old | ⟨start, same, lower, upper, reached⟩
-                  · rcases List.mem_append.mp old with old | new
-                    · exact .inl old
-                    · simp only [List.mem_singleton] at new
-                      subst new
-                      refine .inr ⟨hash, rfl, by omega, by simp, ?_⟩
-                      simp only [Nat.add_sub_cancel_left, List.take_succ_cons, List.take_zero]
-                      exact Reaches.route hash raw child child children value nibble [] held decoded
-                        (getD_none_eq_some edge) (.here child)
-                  · cases same
-                    refine .inr ⟨hash, rfl, by omega, by simp; omega, ?_⟩
-                    have split : step.1 - consumed = (step.1 - (consumed + 1)) + 1 := by omega
-                    rw [split, List.take_succ_cons]
-                    exact Reaches.route hash raw child step.2 children value nibble _ held decoded
-                      (getD_none_eq_some edge) reached
+                · cases edge : (children[nibble.toNat]?).getD none with
+                  | none =>
+                    simp only [execute, ExceptT.mk, pure, ExceptT.pure]
+                    refine ⟨by trivial, by trivial, ?_⟩
+                    intro found trail' same step mem
+                    cases same
+                    exact .inl mem
+                  | some child =>
+                    obtain ⟨files, faults, steps⟩ := ih (consumed + 1) (some child) below
+                      (trail ++ [(consumed + 1, child)]) { record state ("bytes:" ++ nodeSpace) with faults := [] } rfl
+                    refine ⟨files, faults, ?_⟩
+                    intro found trail' ran step mem
+                    rcases steps found trail' ran step mem with old | ⟨start, same, lower, upper, reached⟩
+                    · rcases List.mem_append.mp old with old | new
+                      · exact .inl old
+                      · simp only [List.mem_singleton] at new
+                        subst new
+                        refine .inr ⟨hash, rfl, by omega, by simp, ?_⟩
+                        simp only [Nat.add_sub_cancel_left, List.take_succ_cons, List.take_zero]
+                        exact Reaches.route hash raw child child children value nibble [] held decoded
+                          (getD_none_eq_some edge) (.here child)
+                    · cases same
+                      refine .inr ⟨hash, rfl, by omega, by simp; omega, ?_⟩
+                      have split : step.1 - consumed = (step.1 - (consumed + 1)) + 1 := by omega
+                      rw [split, List.take_succ_cons]
+                      exact Reaches.route hash raw child step.2 children value nibble _ held decoded
+                        (getD_none_eq_some edge) reached
 
 /-- Executing a bound program runs the first, then the continuation on the
 state it leaves. -/
@@ -630,9 +641,7 @@ theorem resolveSorted_sound (sorted : List (Nat × Path)) :
             obtain ⟨start, same, reached⟩ := sound found trail' quiet rfl
             obtain ⟨origin, same', above⟩ := origins start same
             exact ⟨origin, same', by simpa [List.take_append_drop] using above.trans reached⟩
-          · have nodes : nodesOf next = nodesOf state := by
-              funext hash
-              simp only [nodesOf, files]
+          · have nodes : nodesOf next = nodesOf state := files
             have trailOk : TrailOk (nodesOf next) root path trail' := by
               intro step mem
               rw [nodes]

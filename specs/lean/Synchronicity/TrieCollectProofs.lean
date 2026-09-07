@@ -86,7 +86,7 @@ decode them. No fuel, no set, no interpreter. -/
 
 /-- The nodes a host state holds, by address. -/
 def nodesOf (state : State) (hash : ByteArray) : Option ByteArray :=
-  lookupFile state.files (nodeSpace, hash)
+  readableBytes state nodeSpace hash
 
 /-- `target` is below `hash` in the stored graph. -/
 inductive ReachesNode (lookup : ByteArray → Option ByteArray) : ByteArray → ByteArray → Prop where
@@ -135,7 +135,7 @@ once the frontier is drained, and carries every marked node's values. -/
 
 theorem mark_run [MarkSet S] [LawfulMarkSet S] (fuel : Nat) :
     ∀ (frontier : List ByteArray) (marks : Marks S) (state : State), state.faults = [] →
-    (execute (mark fuel frontier marks) state).2.files = state.files ∧
+    nodesOf (execute (mark fuel frontier marks) state).2 = nodesOf state ∧
     (execute (mark fuel frontier marks) state).2.faults = [] ∧
     ∀ marks', (execute (mark fuel frontier marks) state).1 = .ok marks' →
       (∀ hash, MarkSet.contains marks.nodes hash = true → MarkSet.contains marks'.nodes hash = true) ∧
@@ -194,50 +194,14 @@ theorem mark_run [MarkSet S] [LawfulMarkSet S] (fuel : Nat) :
           Inject.inject, bind, ExceptT.bind, ExceptT.bindCont, ExceptT.mk, Program.bind, execute,
           Interpreter.handle, SimulatedHost.storage, reply, fault, quiet, List.find?_nil,
           Option.map_none, record, Except.mapError]
-        cases read : lookupFile state.files (nodeSpace, hash) with
-        | none =>
-          obtain ⟨files, faults, steps⟩ := ih rest { marks with nodes := MarkSet.insert marks.nodes hash }
-            { record state ("bytes:" ++ nodeSpace) with faults := [] } rfl
-          refine ⟨files, faults, ?_⟩
-          intro marks' ran
-          obtain ⟨grew, visited, closed, values⟩ := steps marks' ran
-          refine ⟨fun probe prior => grew probe (contains_of_contains_insert _ _ _ prior), ?_, ?_, ?_⟩
-          · intro probe mem
-            rcases List.mem_cons.mp mem with rfl | later
-            · exact grew probe (contains_insert_self _ _)
-            · exact visited probe later
-          · intro inv
-            refine closed ?_
-            intro node marked raw decodedNode found decoded child edge
-            simp only [LawfulMarkSet.contains_insert, Bool.or_eq_true] at marked
-            rcases marked with same | marked
-            · rw [← eq_of_beq same] at found
-              simp only [nodesOf, record, read] at found
-              cases found
-            · rcases inv node marked raw decodedNode found decoded child edge with marked | mem
-              · exact .inl (contains_of_contains_insert _ _ _ marked)
-              · rcases List.mem_cons.mp mem with rfl | later
-                · exact .inl (contains_insert_self _ _)
-                · exact .inr later
-          · intro inv
-            refine values ?_
-            intro node marked raw decodedNode found decoded value named
-            simp only [LawfulMarkSet.contains_insert, Bool.or_eq_true] at marked
-            rcases marked with same | marked
-            · rw [← eq_of_beq same] at found
-              simp only [nodesOf, record, read] at found
-              cases found
-            · exact inv node marked raw decodedNode found decoded value named
-        | some raw =>
-          cases decoded : decode raw with
-          | error message =>
-            simp only [decoded, throw, throwThe, MonadExcept.throw, throw_eq, execute]
-            exact ⟨by trivial, by trivial, fun _ same => nomatch same⟩
-          | ok node =>
-            simp only [decoded]
-            obtain ⟨files, faults, steps⟩ := ih (node.childHashes ++ rest)
-              { nodes := MarkSet.insert marks.nodes hash,
-                values := node.valueHashes.foldl MarkSet.insert marks.values }
+        cases read : readByteObject state nodeSpace hash with
+        | error failure =>
+          simp only [execute, pure]
+          exact ⟨rfl, by trivial, by intros; contradiction⟩
+        | ok bytes =>
+          cases bytes with
+          | none =>
+            obtain ⟨files, faults, steps⟩ := ih rest { marks with nodes := MarkSet.insert marks.nodes hash }
               { record state ("bytes:" ++ nodeSpace) with faults := [] } rfl
             refine ⟨files, faults, ?_⟩
             intro marks' ran
@@ -246,36 +210,81 @@ theorem mark_run [MarkSet S] [LawfulMarkSet S] (fuel : Nat) :
             · intro probe mem
               rcases List.mem_cons.mp mem with rfl | later
               · exact grew probe (contains_insert_self _ _)
-              · exact visited probe (List.mem_append_right _ later)
+              · exact visited probe later
             · intro inv
               refine closed ?_
-              intro probe marked raw' node' found decoded' child edge
+              intro node marked raw decodedNode found decoded child edge
               simp only [LawfulMarkSet.contains_insert, Bool.or_eq_true] at marked
               rcases marked with same | marked
               · rw [← eq_of_beq same] at found
-                simp only [nodesOf, record, read, Option.some.injEq] at found
-                subst found
-                rw [decoded] at decoded'
-                cases decoded'
-                exact .inr (List.mem_append_left _ edge)
-              · rcases inv probe marked raw' node' found decoded' child edge with marked | mem
+                change readableBytes state nodeSpace hash = some raw at found
+                simp only [readableBytes, read] at found
+                cases found
+              · rcases inv node marked raw decodedNode found decoded child edge with marked | mem
                 · exact .inl (contains_of_contains_insert _ _ _ marked)
                 · rcases List.mem_cons.mp mem with rfl | later
                   · exact .inl (contains_insert_self _ _)
-                  · exact .inr (List.mem_append_right _ later)
+                  · exact .inr later
             · intro inv
               refine values ?_
-              intro probe marked raw' node' found decoded' value named
+              intro node marked raw decodedNode found decoded value named
               simp only [LawfulMarkSet.contains_insert, Bool.or_eq_true] at marked
               rcases marked with same | marked
               · rw [← eq_of_beq same] at found
-                simp only [nodesOf, record, read, Option.some.injEq] at found
-                subst found
-                rw [decoded] at decoded'
-                cases decoded'
-                exact contains_foldl_of_mem value _ _ named
-              · exact contains_foldl_of_contains value _ _
-                  (inv probe marked raw' node' found decoded' value named)
+                change readableBytes state nodeSpace hash = some raw at found
+                simp only [readableBytes, read] at found
+                cases found
+              · exact inv node marked raw decodedNode found decoded value named
+          | some raw =>
+            cases decoded : decode raw with
+            | error message =>
+              simp only [decoded, throw, throwThe, MonadExcept.throw, throw_eq, execute]
+              exact ⟨by trivial, by trivial, fun _ same => nomatch same⟩
+            | ok node =>
+              simp only [decoded]
+              obtain ⟨files, faults, steps⟩ := ih (node.childHashes ++ rest)
+                { nodes := MarkSet.insert marks.nodes hash,
+                  values := node.valueHashes.foldl MarkSet.insert marks.values }
+                { record state ("bytes:" ++ nodeSpace) with faults := [] } rfl
+              refine ⟨files, faults, ?_⟩
+              intro marks' ran
+              obtain ⟨grew, visited, closed, values⟩ := steps marks' ran
+              refine ⟨fun probe prior => grew probe (contains_of_contains_insert _ _ _ prior), ?_, ?_, ?_⟩
+              · intro probe mem
+                rcases List.mem_cons.mp mem with rfl | later
+                · exact grew probe (contains_insert_self _ _)
+                · exact visited probe (List.mem_append_right _ later)
+              · intro inv
+                refine closed ?_
+                intro probe marked raw' node' found decoded' child edge
+                simp only [LawfulMarkSet.contains_insert, Bool.or_eq_true] at marked
+                rcases marked with same | marked
+                · rw [← eq_of_beq same] at found
+                  change readableBytes state nodeSpace hash = some raw' at found
+                  simp only [readableBytes, read, Option.some.injEq] at found
+                  subst found
+                  rw [decoded] at decoded'
+                  cases decoded'
+                  exact .inr (List.mem_append_left _ edge)
+                · rcases inv probe marked raw' node' found decoded' child edge with marked | mem
+                  · exact .inl (contains_of_contains_insert _ _ _ marked)
+                  · rcases List.mem_cons.mp mem with rfl | later
+                    · exact .inl (contains_insert_self _ _)
+                    · exact .inr (List.mem_append_right _ later)
+              · intro inv
+                refine values ?_
+                intro probe marked raw' node' found decoded' value named
+                simp only [LawfulMarkSet.contains_insert, Bool.or_eq_true] at marked
+                rcases marked with same | marked
+                · rw [← eq_of_beq same] at found
+                  change readableBytes state nodeSpace hash = some raw' at found
+                  simp only [readableBytes, read, Option.some.injEq] at found
+                  subst found
+                  rw [decoded] at decoded'
+                  cases decoded'
+                  exact contains_foldl_of_mem value _ _ named
+                · exact contains_foldl_of_contains value _ _
+                    (inv probe marked raw' node' found decoded' value named)
 
 /-- Every stored node reachable from a root the walk started from is marked:
 the graph-level obligation of the sweep. -/
