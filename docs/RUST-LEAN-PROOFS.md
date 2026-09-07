@@ -461,6 +461,14 @@ versioned frames, checked lengths, buffer ownership and opaque error-token ident
 Payloads use bounded buffers/handles; preserve batched processing and avoid copying
 whole objects or large traversal frontiers across each suspension.
 
+The ABI has one command entry, `synch_lean_start`, plus packet/resume transport;
+there is no C policy shim. `native.rs` owns invocation-local handles and packets,
+initializes the runtime once and calling threads through TLS, and transfers
+continuation ownership on resume. `layout.c` checks object layout against the
+pinned Lean header; the build rejects another runtime version or target ABI.
+Strict framing and original host errors are preserved, and output stays private
+until a successful terminal result. These are tested native host contracts.
+
 ### Suspension and cancellation
 
 The native `run_suspending`/`Step`/`Suspension` path retains the Lean continuation
@@ -504,7 +512,7 @@ completed cutover from being mistaken for a completed user guarantee.
 | --- | --- | --- |
 | Foundation F1/F2 | Lean carrier, raw capabilities, native runtime and peer suspension integrated | Shared host, wire, cleanup and suspension lemmas/tests exist. Provider suspension still needs C4 integration; verify discipline for each real suspending program. |
 | Trie T1/T2: ingress and mutation | Production Lean (`Codec`, `Verify`, `Mutate`) | Canonical encoding/address preservation proved. Exact update/remove map meaning and whole-path depth remain open (P2). |
-| Trie T3: requesting fetch | Production Lean `Fetch`, with a pinned Rust worker interpreting peer waits | Inspection, verified response admission, provenance writes, bounded retries and pending-target updates moved into the whole suspended operation. Six store unit tests and seven transfer integration tests cover verified progress, invalidation, atomic rejection, cancellation, released database access and transfer cost. The duplicate Rust requesting, resolution, reachability and admission test algorithms are deleted. Rust scope predicates and the publication scope-check traversal still require cutover; this is not yet a claim that all duplicates are gone. Prove the actual operation against faithful shared byte storage; exhaustion still does not establish P3. |
+| Trie T3: requesting fetch | Production Lean `Fetch`, with a pinned Rust worker interpreting peer waits | Inspection, verified response admission, provenance writes, bounded retries and pending-target updates moved into the whole suspended operation. Six store unit tests and seven transfer integration tests cover verified progress, invalidation, atomic rejection, cancellation, released database access and transfer cost. The duplicate Rust requesting, resolution, reachability and admission test algorithms are deleted. Publication scope validation now uses the whole Lean `ScopeCheck.firstOutside` command and the shared serving predicates/bounded walk. Rust scope predicates, their test oracles, the old scope traversal, value-reference traversal and the test-only resolved-diff path are deleted; meaningful diff tests exercise native materialization. The successful scope-check authorization theorem remains required. Prove the actual operation against faithful shared byte storage; exhaustion still does not establish P3. |
 | Trie T4: completeness | Production Lean `Complete` and scope/owner memo key | Ticket/key discipline and native regressions checked. Justified omission and exact-view coverage are open, including the root-refusal issue above. |
 | Trie T5: serving | Production Lean `Serve`; authorization inputs still composed in Rust | Actual-position resolution and whole-response scope predicates proved. Connect grants, publisher authority, provenance and transmitted bytes for P4/M5. |
 | Trie T6: scan/diff | Production Lean `Walk`/`Diff`, streaming host application | Prefix/cursor/limit constraints and fixtures exist. Exact listings/differences and atomic faithful materialization remain open (P2/P3/M4). |
@@ -517,6 +525,7 @@ completed cutover from being mistaken for a completed user guarantee.
 | History pruning | Production Lean `Replication/History` | Retention/fork witness support proved. Adoption, reconciliation and scheduling still require implementation-connected M1–M8 proofs. |
 | Peer contact selection | Production Lean `Replication/Contact`, called by serialized periodic rounds | Native bounded-turn and duplicate/order cases checked. Bounded service through the actual native index, returned cursor and selected peer positions is proved for fixed eligible input. Actual eligibility and completed engine attempts still require composition for M1/M6. |
 | Head exchange selection | Production Lean `Replication/Exchange`, called by engine reconciliation | Selects request origins and push indices from advertised/servable heads. Exact newer-version requests, duplicate/order invariance and push selection support M2. Signature/admission/availability inputs and subsequent adoption remain separate obligations. |
+| Origin parsing | Lean inside retained-history validation; duplicate Rust parser still serves public `synch-core` APIs | Cut over complete origin parsing and normalization APIs to the existing Lean implementation, retaining only primitive public-key point validation in Rust. This newly identified duplicate must be removed before closure. |
 | Promotion authority snapshot | Rust `try_promote`, with permissions/authority read in its publication transaction | Snapshot-consistent permission checks and full own-view readiness have native regressions. This is a safety fix, not a Lean promotion theorem or closure of P3/M4/M8. |
 
 The operator-only CAS migration tool, staging-directory layout sweep and provider
@@ -524,6 +533,15 @@ SDK remain Rust. They are not alternate implementations of migrated domain polic
 Historical performance evidence includes the 120,000-entry completeness corpus:
 the Lean command and the now-deleted Rust walk each read 160,533 nodes; one local debug run measured 0.668 s Rust and 0.733 s Lean.
 These are measurements, not a portability theorem or substitute for CI.
+
+Publication-scope cutover validation: warning-free native core build (56 jobs),
+checked generated host codecs, MPT suite (43 passed; four existing stress tests
+ignored), store serving tests (3), and engine delegation/trust-boundary tests
+(8 + 2) passed. All-target/all-feature Clippy for MPT, store and engine passed
+with warnings denied. The scope command rejects missing unresolved boundaries and
+unresolved paths beyond the key bound, while skipping fully granted subtrees.
+These checks establish the migration regression baseline, not its still-open
+entry-authorization theorem or full promotion composition.
 
 ### Latest mptsync checkpoint
 
@@ -558,7 +576,11 @@ and commits each answer atomically. The host drops its database session before
 calling the peer and resumes on the same worker. Pending refresh/deletion matches
 the target origin, sequence and root, so a stale attempt does not target a newer
 pending version. These are implementation facts and native regression coverage;
-whole-operation transaction, interruption and convergence theorems remain open.
+`TrieFetchSuspensionProofs.fetch_waits_only_between_transactions` now proves
+that every actual peer wait occurs outside a storage transaction, including
+reference preflight, all host replies and fuel interruption. This proves that
+waiting for a peer does not hold the database transaction open; exact completion,
+interruption preservation and convergence composition remain open.
 
 Routing validation passed the three native publication tests, the automatic
 legacy-republication regression, and all eight delegation integration tests.
@@ -615,8 +637,11 @@ successful transfers cover every group. This currently covers large file-backed
 objects through arbitrary initial failed or empty attempts, followed by enough
 verified coverage. `CasInlineHistories` separately proves that an actual verified
 small-object receive, including empty content, saves the exact decoder buffer and
-remains wholly readable after arbitrary later transfers. Initial inline failure
-histories and other injected host-failure paths remain open.
+remains wholly readable after arbitrary later transfers.
+`verified_inline_history_makes_the_whole_readable` extends this to initial failed
+or empty attempts, under the primitive contract that any successful inline
+verification returns the exact named bytes. Broader injected host-failure paths
+and cloud/source-hold composition remain open.
 
 ## Path to all proof goals
 
