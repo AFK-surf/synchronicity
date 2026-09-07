@@ -1203,7 +1203,9 @@ pub(crate) fn run<S: Storage>(
 }
 
 /// Execute a pure command. Any requested host capability is a protocol error.
-pub(crate) fn run_pure(command: &Command) -> Result<Vec<u8>, OperationError<std::convert::Infallible>> {
+pub(crate) fn run_pure(
+    command: &Command,
+) -> Result<Vec<u8>, OperationError<std::convert::Infallible>> {
     execute(
         start(command),
         |_, _, _| Err(OperationError::Protocol),
