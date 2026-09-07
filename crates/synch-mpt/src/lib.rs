@@ -1,9 +1,9 @@
 //! The synchronicity Merkle-Patricia Trie (§4.3).
 //!
-//! A radix-16 (nibble) trie with three node kinds — leaf, extension, branch —
-//! hashed with BLAKE3 under a per-kind domain-separation tag. Values of at most
-//! 128 bytes are inlined in their node; larger ones are stored out-of-line and
-//! addressed by hash.
+//! A radix-16 (nibble) trie with leaf, extension, branch and routing nodes,
+//! hashed with BLAKE3 under a per-kind domain-separation tag. Compressed nodes
+//! inline values of at most 128 bytes. Routing nodes address every payload
+//! separately so their public paths can be shared without exposing a value.
 //!
 //! The trie is stateless: every operation takes a root hash and returns a new
 //! one, and nodes are content-addressed, so successive roots share every
@@ -11,9 +11,9 @@
 //! cheap, diffing cheap, and anti-entropy bandwidth proportional to the change
 //! rather than to the tree.
 //!
-//! Canonical form is maintained on every mutation: any two tries holding the
-//! same key/value map have the same root hash, regardless of the order of
-//! operations that produced them.
+//! Mutations preserve canonical node encoding and structural invariants.
+//! Legacy compressed and routing representations may have different roots
+//! for the same entries; a signed version commits to its particular root.
 #![deny(missing_docs)]
 
 pub mod diff;
@@ -27,7 +27,7 @@ pub mod node;
 /// replicates whole tries rather than proving single keys — and DESIGN.md §13
 /// is explicit that the capability is deliberately ahead of its use. Shipping
 /// it in the default surface would make it a public, tested, maintained API
-/// with no caller anywhere in the workspace; behind a flag it stays available
+/// with no production caller; behind a flag it stays available
 /// to the partial-replication work §13 describes without being something every
 /// build has to keep correct.
 #[cfg(feature = "proofs")]
