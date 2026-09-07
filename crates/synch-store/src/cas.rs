@@ -504,7 +504,7 @@ impl Store {
     /// Every locally held object, as the columns a sweep or a report reads.
     ///
     /// [`Store::blobs`] returns whole rows, which means `inline` — up to
-    /// [`INLINE_BLOB_MAX`] per row — and `bitmap`. Neither GC nor `synch
+    /// [`INLINE_BLOB_MAX`](synch_core::INLINE_BLOB_MAX) per row — and `bitmap`. Neither GC nor `synch
     /// doctor` looks at either: they read the root, the completeness flag, the
     /// pin state and `last_access`. Pulling the payloads anyway made a pass
     /// over a store of many small objects allocate the inlined half of the CAS,
