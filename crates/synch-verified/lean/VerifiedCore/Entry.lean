@@ -98,6 +98,17 @@ def retention : Replication.History.Result Nat → Host.Reply ByteArray
       | .origin error => .origin error
       | .host _ => .malformed) : Except _ Nat)
 
+def authorizing [Encode A] : Except Authorization.Error A → Host.Reply ByteArray
+  | .ok value => terminalOf (Except.ok value : Except AuthorizationDomainError A)
+  | .error (.host hostFailure) => .error hostFailure
+  | .error error => terminalOf (Except.error (match error with
+      | .malformed => AuthorizationDomainError.malformed
+      | .columnType index column actual => .columnType index column actual
+      | .invalidText bytes => .invalidText ⟨bytes.toArray⟩
+      | .column column reason => .column column reason
+      | .origin column error => .origin column error
+      | .host _ => .malformed) : Except _ A)
+
 def mutation : Except Trie.Error ByteArray → Host.Reply ByteArray
   | .ok root => terminalOf (Except.ok root : Except Trie.MutationError ByteArray)
   | .error (.host hostFailure) => .error hostFailure
@@ -344,6 +355,29 @@ def dispatch : Command → Native
   | .originNamed id domain => pure (terminalOf (Origin.named id domain))
   | .originNormalizeLabel text => pure (terminalOf (Origin.normalizeLabel text))
   | .originNormalizeDomain text => pure (terminalOf (Origin.normalizeDomain text))
+  | .originCanonical value => pure (terminalOf (Origin.canonical value))
+  | .authBindings selection live reading => command (Authorization.bindings selection live reading) authorizing
+  | .authBindingStatuses reading => command (Authorization.bindingStatuses reading) authorizing
+  | .authTrustedKeys reading => command (Authorization.trustedKeys reading) authorizing
+  | .authTrustedOrigins reading => command (Authorization.trustedOrigins reading) authorizing
+  | .authTrustedKey key reading => command (Authorization.trustedKey key reading) authorizing
+  | .authBound origin key reading => command (Authorization.bound origin key reading) authorizing
+  | .authPeerAuthority key reading => command (Authorization.peerAuthority key reading) authorizing
+  | .authOriginPublication origin reading => command (Authorization.originPublication origin reading) authorizing
+  | .authOriginAuthority origin reading => command (Authorization.originAuthority origin reading) authorizing
+  | .authOriginAuthorityIn tx origin reading => command (Authorization.originAuthorityIn tx origin reading) authorizing
+  | .authLocalAuthority reading => command (Authorization.localAuthority reading) authorizing
+  | .authLocalSpaces => command Authorization.localSpaces authorizing
+  | .authLocalScope => command Authorization.localScope authorizing
+  | .authLocalScopeIn tx => command (Authorization.localScopeIn tx) authorizing
+  | .authMaterializationScope origin => command (Authorization.materializationScope origin) authorizing
+  | .authMaterializationScopeIn tx origin => command (Authorization.materializationScopeIn tx origin) authorizing
+  | .authMetadataPeer key reading => command (Authorization.metadataPeer key reading) authorizing
+  | .authSocketAuthority key reading => command (Authorization.socketAuthority key reading) authorizing
+  | .authSoleDnsHintSource key domain reading => command (Authorization.soleDnsHintSource key domain reading) authorizing
+  | .authHasDelegations => command Authorization.hasDelegations authorizing
+  | .authExpireDns reading => command (Authorization.expireDns reading) authorizing
+
   | .planContact peers cursor maximum =>
     if peers.length > UInt64.size || !(peers.all (·.size == 32)) ||
         cursor.any (·.size != 32) || maximum == 0 || maximum > 256 then protocol

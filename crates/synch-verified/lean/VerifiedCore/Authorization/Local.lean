@@ -7,20 +7,20 @@ namespace VerifiedCore.Authorization
 open Host
 
 structure LocalAuthority where
-  ownOrigin : Option String
-  issuers : List String
+  ownOrigin : Option Origin.Parsed
+  issuers : List Origin.Parsed
   grant : Option (List String)
   rootedElsewhere : Bool
   deriving BEq, DecidableEq
 
-def ownOrigin (tx : Transaction) : Action (Option String) := do
+def ownOrigin (tx : Transaction) : Action (Option Origin.Parsed) := do
   (← config tx "self_origin_id").mapM (originField "config.self_origin_id")
 
 /-- Only public ownership columns cross this boundary. Ordering remains active
 keys first and newest first; canonical own-origin key comes before these rows,
 as before. The same key can occur twice and those occurrences stay observable. -/
-def ownKeys (tx : Transaction) (own : Option String) : Action (List ByteArray) := do
-  let first := match own.bind (fun text => (Origin.parseSyntax text).toOption) with
+def ownKeys (tx : Transaction) (own : Option Origin.Parsed) : Action (List ByteArray) := do
+  let first := match own with
     | some (.key bytes) => [(⟨bytes.toArray⟩ : ByteArray)]
     | _ => []
   let scan ← storage (.scanRows tx "device_keys" ["node_id", "state", "created_at"] []
@@ -63,20 +63,22 @@ def localAuthorityIn (tx : Transaction) (reading : Int64) : Action LocalAuthorit
 
 def localAuthority (reading : Int64) : Action LocalAuthority := transaction fun tx => localAuthorityIn tx reading
 
-def materializationScopeIn (tx : Transaction) (origin : String) : Action Trie.Serve.Scope := do
+def materializationScopeIn (tx : Transaction) (origin : Origin.Parsed) : Action Trie.Serve.Scope := do
   let own ← ownOrigin tx
   if own == some origin then return fullScope
   return (← localSpacesIn tx).map readScope |>.getD fullScope
 
-def materializationScope (origin : String) : Action Trie.Serve.Scope :=
+def materializationScope (origin : Origin.Parsed) : Action Trie.Serve.Scope :=
   transaction fun tx => materializationScopeIn tx origin
 
-def localScope : Action Trie.Serve.Scope := transaction fun tx => do
+def localScopeIn (tx : Transaction) : Action Trie.Serve.Scope := do
   return (← localSpacesIn tx).map readScope |>.getD fullScope
 
-def originDomain (origin : String) : Option String :=
-  match Origin.parseSyntax origin with
-  | .ok (.named value) => some value.domain
+def localScope : Action Trie.Serve.Scope := transaction localScopeIn
+
+def originDomain (origin : Origin.Parsed) : Option String :=
+  match origin with
+  | .named value => some value.domain
   | _ => none
 
 inductive MetadataRefusal where

@@ -101,12 +101,23 @@ def messages : List Name := [
   ``VerifiedCore.Commands.TrieCollectDomainError, ``VerifiedCore.Commands.TrieWalkDomainError,
   ``VerifiedCore.Commands.TrieMissingDomainError,
   ``VerifiedCore.Commands.TrieFetchDomainError,
+  ``VerifiedCore.Trie.Serve.Scope,
+  ``VerifiedCore.Authorization.Source, ``VerifiedCore.Authorization.Binding,
+  ``VerifiedCore.Authorization.PublishScope, ``VerifiedCore.Authorization.PeerAuthority,
+  ``VerifiedCore.Authorization.OriginAuthority, ``VerifiedCore.Authorization.BindingSelection,
+  ``VerifiedCore.Authorization.BindingStatus, ``VerifiedCore.Authorization.SocketAuthority,
+  ``VerifiedCore.Authorization.LocalAuthority, ``VerifiedCore.Authorization.MetadataRefusal,
+  ``VerifiedCore.Commands.AuthorizationDomainError,
   ``VerifiedCore.Commands.Ingested, ``VerifiedCore.Commands.Committed, ``VerifiedCore.Commands.Served,
   ``VerifiedCore.Commands.Evicted, ``VerifiedCore.Commands.Collected, ``VerifiedCore.Commands.Command]
 
 /-- Rust spellings that differ from the Lean short name. -/
 def rustName (name : Name) : String :=
   match name with
+  | ``VerifiedCore.Trie.Serve.Scope => "AuthorizationTrieScope"
+  | ``VerifiedCore.Authorization.Source => "AuthorizationSource"
+  | ``VerifiedCore.Authorization.Binding => "AuthorizationBinding"
+  | ``VerifiedCore.Authorization.PublishScope => "AuthorizationPublishScope"
   | ``VerifiedCore.Cas.Input.Kind => "IngestInput"
   | ``VerifiedCore.Origin.Error => "OriginError"
   | ``VerifiedCore.Origin.Named => "NamedOrigin"

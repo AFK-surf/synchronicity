@@ -574,6 +574,163 @@ instance : Decode Commands.TrieFetchDomainError where
     | 5 => return .exhausted
     | _ => throw ()
 
+instance : Encode Trie.Serve.Scope where
+  encode out value := match value with
+    | .mk a0 a1 => out |>.put a0 |>.put a1
+
+instance : Decode Trie.Serve.Scope where
+  decode := do
+    let a0 ← Decode.decode
+    let a1 ← Decode.decode
+    return .mk a0 a1
+
+instance : Encode Authorization.Source where
+  encode out value := match value with
+    | .static => out.push 0
+    | .dns => out.push 1
+    | .delegated => out.push 2
+
+instance : Decode Authorization.Source where
+  decode := do
+    match ← readByte with
+    | 0 => return .static
+    | 1 => return .dns
+    | 2 => return .delegated
+    | _ => throw ()
+
+instance : Encode Authorization.Binding where
+  encode out value := match value with
+    | .mk a0 a1 a2 a3 a4 a5 a6 a7 a8 => out |>.put a0 |>.put a1 |>.put a2 |>.put a3 |>.put a4 |>.put a5 |>.put a6 |>.put a7 |>.put a8
+
+instance : Decode Authorization.Binding where
+  decode := do
+    let a0 ← Decode.decode
+    let a1 ← Decode.decode
+    let a2 ← Decode.decode
+    let a3 ← Decode.decode
+    let a4 ← Decode.decode
+    let a5 ← Decode.decode
+    let a6 ← Decode.decode
+    let a7 ← Decode.decode
+    let a8 ← Decode.decode
+    return .mk a0 a1 a2 a3 a4 a5 a6 a7 a8
+
+instance : Encode Authorization.PublishScope where
+  encode out value := match value with
+    | .untrusted => out.push 0
+    | .unrestricted => out.push 1
+    | .confined a0 => out.push 2 |>.put a0
+
+instance : Decode Authorization.PublishScope where
+  decode := do
+    match ← readByte with
+    | 0 => return .untrusted
+    | 1 => return .unrestricted
+    | 2 => return .confined (← Decode.decode)
+    | _ => throw ()
+
+instance : Encode Authorization.PeerAuthority where
+  encode out value := match value with
+    | .mk a0 a1 a2 a3 => out |>.put a0 |>.put a1 |>.put a2 |>.put a3
+
+instance : Decode Authorization.PeerAuthority where
+  decode := do
+    let a0 ← Decode.decode
+    let a1 ← Decode.decode
+    let a2 ← Decode.decode
+    let a3 ← Decode.decode
+    return .mk a0 a1 a2 a3
+
+instance : Encode Authorization.OriginAuthority where
+  encode out value := match value with
+    | .mk a0 a1 a2 => out |>.put a0 |>.put a1 |>.put a2
+
+instance : Decode Authorization.OriginAuthority where
+  decode := do
+    let a0 ← Decode.decode
+    let a1 ← Decode.decode
+    let a2 ← Decode.decode
+    return .mk a0 a1 a2
+
+instance : Encode Authorization.BindingSelection where
+  encode out value := match value with
+    | .all => out.push 0
+    | .key a0 => out.push 1 |>.put a0
+    | .origin a0 => out.push 2 |>.put a0
+    | .delegated => out.push 3
+
+instance : Decode Authorization.BindingSelection where
+  decode := do
+    match ← readByte with
+    | 0 => return .all
+    | 1 => return .key (← Decode.decode)
+    | 2 => return .origin (← Decode.decode)
+    | 3 => return .delegated
+    | _ => throw ()
+
+instance : Encode Authorization.BindingStatus where
+  encode out value := match value with
+    | .mk a0 a1 a2 => out |>.put a0 |>.put a1 |>.put a2
+
+instance : Decode Authorization.BindingStatus where
+  decode := do
+    let a0 ← Decode.decode
+    let a1 ← Decode.decode
+    let a2 ← Decode.decode
+    return .mk a0 a1 a2
+
+instance : Encode Authorization.SocketAuthority where
+  encode out value := match value with
+    | .mk a0 a1 => out |>.put a0 |>.put a1
+
+instance : Decode Authorization.SocketAuthority where
+  decode := do
+    let a0 ← Decode.decode
+    let a1 ← Decode.decode
+    return .mk a0 a1
+
+instance : Encode Authorization.LocalAuthority where
+  encode out value := match value with
+    | .mk a0 a1 a2 a3 => out |>.put a0 |>.put a1 |>.put a2 |>.put a3
+
+instance : Decode Authorization.LocalAuthority where
+  decode := do
+    let a0 ← Decode.decode
+    let a1 ← Decode.decode
+    let a2 ← Decode.decode
+    let a3 ← Decode.decode
+    return .mk a0 a1 a2 a3
+
+instance : Encode Authorization.MetadataRefusal where
+  encode out value := match value with
+    | .notFullMember => out.push 0
+    | .differentCluster => out.push 1
+
+instance : Decode Authorization.MetadataRefusal where
+  decode := do
+    match ← readByte with
+    | 0 => return .notFullMember
+    | 1 => return .differentCluster
+    | _ => throw ()
+
+instance : Encode Commands.AuthorizationDomainError where
+  encode out value := match value with
+    | .malformed => out.push 0
+    | .columnType a0 a1 a2 => out.push 1 |>.put a0 |>.put a1 |>.put a2
+    | .invalidText a0 => out.push 2 |>.put a0
+    | .column a0 a1 => out.push 3 |>.put a0 |>.put a1
+    | .origin a0 a1 => out.push 4 |>.put a0 |>.put a1
+
+instance : Decode Commands.AuthorizationDomainError where
+  decode := do
+    match ← readByte with
+    | 0 => return .malformed
+    | 1 => return .columnType (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 2 => return .invalidText (← Decode.decode)
+    | 3 => return .column (← Decode.decode) (← Decode.decode)
+    | 4 => return .origin (← Decode.decode) (← Decode.decode)
+    | _ => throw ()
+
 instance : Encode Commands.Ingested where
   encode out value := match value with
     | .mk a0 a1 => out |>.put a0 |>.put a1
@@ -682,6 +839,28 @@ instance : Encode Commands.Command where
     | .originNamed a0 a1 => out.push 52 |>.put a0 |>.put a1
     | .originNormalizeLabel a0 => out.push 53 |>.put a0
     | .originNormalizeDomain a0 => out.push 54 |>.put a0
+    | .originCanonical a0 => out.push 55 |>.put a0
+    | .authBindings a0 a1 a2 => out.push 56 |>.put a0 |>.put a1 |>.put a2
+    | .authBindingStatuses a0 => out.push 57 |>.put a0
+    | .authTrustedKeys a0 => out.push 58 |>.put a0
+    | .authTrustedOrigins a0 => out.push 59 |>.put a0
+    | .authTrustedKey a0 a1 => out.push 60 |>.put a0 |>.put a1
+    | .authBound a0 a1 a2 => out.push 61 |>.put a0 |>.put a1 |>.put a2
+    | .authPeerAuthority a0 a1 => out.push 62 |>.put a0 |>.put a1
+    | .authOriginPublication a0 a1 => out.push 63 |>.put a0 |>.put a1
+    | .authOriginAuthority a0 a1 => out.push 64 |>.put a0 |>.put a1
+    | .authOriginAuthorityIn a0 a1 a2 => out.push 65 |>.put a0 |>.put a1 |>.put a2
+    | .authLocalAuthority a0 => out.push 66 |>.put a0
+    | .authLocalSpaces => out.push 67
+    | .authLocalScope => out.push 68
+    | .authLocalScopeIn a0 => out.push 69 |>.put a0
+    | .authMaterializationScope a0 => out.push 70 |>.put a0
+    | .authMaterializationScopeIn a0 a1 => out.push 71 |>.put a0 |>.put a1
+    | .authMetadataPeer a0 a1 => out.push 72 |>.put a0 |>.put a1
+    | .authSocketAuthority a0 a1 => out.push 73 |>.put a0 |>.put a1
+    | .authSoleDnsHintSource a0 a1 a2 => out.push 74 |>.put a0 |>.put a1 |>.put a2
+    | .authHasDelegations => out.push 75
+    | .authExpireDns a0 => out.push 76 |>.put a0
 
 instance : Decode Commands.Command where
   decode := do
@@ -741,6 +920,28 @@ instance : Decode Commands.Command where
     | 52 => return .originNamed (← Decode.decode) (← Decode.decode)
     | 53 => return .originNormalizeLabel (← Decode.decode)
     | 54 => return .originNormalizeDomain (← Decode.decode)
+    | 55 => return .originCanonical (← Decode.decode)
+    | 56 => return .authBindings (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 57 => return .authBindingStatuses (← Decode.decode)
+    | 58 => return .authTrustedKeys (← Decode.decode)
+    | 59 => return .authTrustedOrigins (← Decode.decode)
+    | 60 => return .authTrustedKey (← Decode.decode) (← Decode.decode)
+    | 61 => return .authBound (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 62 => return .authPeerAuthority (← Decode.decode) (← Decode.decode)
+    | 63 => return .authOriginPublication (← Decode.decode) (← Decode.decode)
+    | 64 => return .authOriginAuthority (← Decode.decode) (← Decode.decode)
+    | 65 => return .authOriginAuthorityIn (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 66 => return .authLocalAuthority (← Decode.decode)
+    | 67 => return .authLocalSpaces
+    | 68 => return .authLocalScope
+    | 69 => return .authLocalScopeIn (← Decode.decode)
+    | 70 => return .authMaterializationScope (← Decode.decode)
+    | 71 => return .authMaterializationScopeIn (← Decode.decode) (← Decode.decode)
+    | 72 => return .authMetadataPeer (← Decode.decode) (← Decode.decode)
+    | 73 => return .authSocketAuthority (← Decode.decode) (← Decode.decode)
+    | 74 => return .authSoleDnsHintSource (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 75 => return .authHasDelegations
+    | 76 => return .authExpireDns (← Decode.decode)
     | _ => throw ()
 
 end VerifiedCore

@@ -1,3 +1,4 @@
+import VerifiedCore.Authorization.Operations
 import VerifiedCore.Cas
 import VerifiedCore.Cas.Codec
 import VerifiedCore.Cas.Program
@@ -185,6 +186,37 @@ inductive Command where
   | originNamed (id domain : String)
   | originNormalizeLabel (text : String)
   | originNormalizeDomain (text : String)
+  | originCanonical (value : Origin.Parsed)
+  | authBindings (selection : Authorization.BindingSelection) (onlyLive : Bool) (reading : Int64)
+  | authBindingStatuses (reading : Int64)
+  | authTrustedKeys (reading : Int64)
+  | authTrustedOrigins (reading : Int64)
+  | authTrustedKey (key : ByteArray) (reading : Int64)
+  | authBound (origin : Origin.Parsed) (key : ByteArray) (reading : Int64)
+  | authPeerAuthority (key : ByteArray) (reading : Int64)
+  | authOriginPublication (origin : Origin.Parsed) (reading : Int64)
+  | authOriginAuthority (origin : Origin.Parsed) (reading : Int64)
+  | authOriginAuthorityIn (tx : UInt64) (origin : Origin.Parsed) (reading : Int64)
+  | authLocalAuthority (reading : Int64)
+  | authLocalSpaces
+  | authLocalScope
+  | authLocalScopeIn (tx : UInt64)
+  | authMaterializationScope (origin : Origin.Parsed)
+  | authMaterializationScopeIn (tx : UInt64) (origin : Origin.Parsed)
+  | authMetadataPeer (key : ByteArray) (reading : Int64)
+  | authSocketAuthority (key : ByteArray) (reading : Int64)
+  | authSoleDnsHintSource (key : ByteArray) (domain : String) (reading : Int64)
+  | authHasDelegations
+  | authExpireDns (reading : Int64)
+
+
+inductive AuthorizationDomainError where
+  | malformed
+  | columnType (index : Nat) (column : String) (actual : Cas.Codec.CellType)
+  | invalidText (bytes : ByteArray)
+  | column (column : String) (reason : String)
+  | origin (column : String) (error : Origin.Error)
+  deriving BEq, DecidableEq
 
 /-- Malformed metadata or a column of the wrong storage class, as pin
 acquisition and deletion report it. -/

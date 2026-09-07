@@ -44,7 +44,8 @@ def liveAmong (tx : Transaction) (rows : List Binding) (now : Int64) : Action (L
   for binding in rows do
     if !binding.datedLive now then continue
     if binding.source == .delegated then
-      let some issuer := binding.issuer | continue
+      let some issuerOrigin := binding.issuer | continue
+      let issuer := Origin.canonical issuerOrigin
       let rooted ← match issuers[issuer]? with
         | some value => pure value
         | none => do
@@ -56,14 +57,20 @@ def liveAmong (tx : Transaction) (rows : List Binding) (now : Int64) : Action (L
     live := binding :: live
   return live.reverse
 
+def rootedOrigins (rows : List Binding) (now : Int64) : Std.TreeSet String :=
+  rows.foldl (fun set binding =>
+    if binding.source.rooted && binding.datedLive now then set.insert (Origin.canonical binding.origin)
+    else set) {}
+
+def supportedBy (rooted : Std.TreeSet String) (now : Int64) (binding : Binding) : Bool :=
+  binding.datedLive now && (binding.source != .delegated ||
+    binding.issuer.any (fun issuer => rooted.contains (Origin.canonical issuer)))
+
 /-- The full projection already has the issuer records, so its cascade uses
 one set construction, not one SQL lookup for every row. -/
 def allLive (tx : Transaction) (now : Int64) : Action (List Binding) := do
   let all ← readBindings tx []
-  let rooted := all.foldl (fun (set : Std.TreeSet String) binding =>
-    if binding.source.rooted && binding.datedLive now then set.insert binding.origin else set) {}
-  return all.filter fun binding => binding.datedLive now &&
-    (binding.source != .delegated || binding.issuer.any rooted.contains)
+  return all.filter (supportedBy (rootedOrigins all now) now)
 
 def liveForKey (tx : Transaction) (key : ByteArray) (now : Int64) : Action (List Binding) := do
   liveAmong tx (← readBindings tx [("node_id", .blob key)]) now
@@ -89,7 +96,7 @@ def peerPublishScope (live : List Binding) : PublishScope :=
 structure PeerAuthority where
   serving : Trie.Serve.Scope
   publication : PublishScope
-  origins : List String
+  origins : List Origin.Parsed
   rooted : Bool
   deriving BEq, DecidableEq
 
@@ -105,15 +112,15 @@ def peerAuthorityIn (tx : Transaction) (key : ByteArray) (reading : Int64) : Act
 structure OriginAuthority where
   publication : PublishScope
   publicationKeys : Trie.Serve.Scope
-  provenance : Option String
+  provenance : Option Origin.Parsed
   deriving BEq, DecidableEq
 
 /-- Promotion calls this with the caller-owned transaction token, so clock
 floor, issuer revocation, publication authority and provenance come from the
 same snapshot as the head flip. No transaction effect occurs in this body. -/
-def originAuthorityIn (tx : Transaction) (origin : String) (reading : Int64) : Action OriginAuthority := do
+def originAuthorityIn (tx : Transaction) (origin : Origin.Parsed) (reading : Int64) : Action OriginAuthority := do
   let now ← trustInstant tx reading
-  let live ← liveForOrigin tx origin now
+  let live ← liveForOrigin tx (Origin.canonical origin) now
   let scope := originScope live
   let own ← (← config tx "self_origin_id").mapM (originField "config.self_origin_id")
   let owner := if own == some origin || scope == .unrestricted then none else some origin
@@ -126,7 +133,7 @@ def originAuthorityIn (tx : Transaction) (origin : String) (reading : Int64) : A
 def peerAuthority (key : ByteArray) (reading : Int64) : Action PeerAuthority :=
   transaction (fun tx => peerAuthorityIn tx key reading)
 
-def originAuthority (origin : String) (reading : Int64) : Action OriginAuthority :=
+def originAuthority (origin : Origin.Parsed) (reading : Int64) : Action OriginAuthority :=
   transaction (fun tx => originAuthorityIn tx origin reading)
 
 end VerifiedCore.Authorization

@@ -47,11 +47,11 @@ def parseSource (text : String) : Except Error Source :=
   | other => .error (.column "bindings.source" other)
 
 structure Binding where
-  origin : String
+  origin : Origin.Parsed
   nodeId : ByteArray
   source : Source
   domain : Option String
-  issuer : Option String
+  issuer : Option Origin.Parsed
   spaces : List String
   note : Option String
   addedAt : Int64
@@ -132,9 +132,9 @@ def optionalInteger (index : Nat) (column : String) : Cell → Except Error (Opt
   | .null => .ok none
   | value => (integerField index column value).map some
 
-def originField (column text : String) : Action String := do
+def originField (column text : String) : Action Origin.Parsed := do
   match ← Origin.parse validateKey text with
-  | .ok value => return Origin.canonical value
+  | .ok value => return value
   | .error error => throw (.origin column error)
 
 def keyField (column : String) (bytes : ByteArray) : Action ByteArray := do

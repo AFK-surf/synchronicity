@@ -37,12 +37,20 @@ def liveColumn (tx : Transaction) (column : String) (now : Int64) : Action (List
   return (rows.filter fun row => liveAt row.expiresAt now &&
     (row.source != .delegated || (!row.issuer.isEmpty && rooted.contains row.issuer))).map (·.selected)
 
-def trustedOrigins (reading : Int64) : Action (List String) := transaction fun tx => do
+/-- The public OriginId ordering: keys before names; names by domain then
+member id. Canonical text ordering is deliberately not substituted. -/
+def originLe : Origin.Parsed → Origin.Parsed → Bool
+  | .key a, .key b => a ≤ b
+  | .key _, .named _ => true
+  | .named _, .key _ => false
+  | .named a, .named b => a.domain < b.domain || (a.domain == b.domain && a.id ≤ b.id)
+
+def trustedOrigins (reading : Int64) : Action (List Origin.Parsed) := transaction fun tx => do
   let now ← trustInstant tx reading
   let cells ← liveColumn tx "origin_id" now
   let origins ← cells.mapM fun cell => do
     originField "bindings.origin_id" (← checked (textField 0 "origin_id" cell))
-  return canonicalSpaces origins
+  return (origins.mergeSort originLe).eraseReps
 
 def trustedKeys (reading : Int64) : Action (List ByteArray) := transaction fun tx => do
   let now ← trustInstant tx reading
@@ -55,14 +63,14 @@ def trustedKeys (reading : Int64) : Action (List ByteArray) := transaction fun t
 inductive BindingSelection where
   | all
   | key (key : ByteArray)
-  | origin (origin : String)
+  | origin (origin : Origin.Parsed)
   | delegated
   deriving BEq, DecidableEq
 
 def BindingSelection.fields : BindingSelection → Fields
   | .all => []
   | .key value => [("node_id", .blob value)]
-  | .origin value => [("origin_id", .text value)]
+  | .origin value => [("origin_id", .text (Origin.canonical value))]
   | .delegated => [("source", .text "delegated")]
 
 /-- Raw reporting and live authorization share one decoder. Expiry and issuer
@@ -78,13 +86,17 @@ def bindings (selection : BindingSelection) (onlyLive : Bool) (reading : Int64) 
 structure BindingStatus where
   binding : Binding
   datedLive : Bool
+  live : Bool
   deriving BEq, DecidableEq
 
-/-- Reporting explicitly asks for dated rows. Rendering never reimplements
-clock/expiry policy, and this status does not pretend to certify the cascade. -/
+/-- Reporting receives both the dated observation and effective live trust.
+The cascade is evaluated per complete binding identity, so one live issuer
+cannot conceal another issuer's expired delegation in the diagnostic. -/
 def bindingStatuses (reading : Int64) : Action (List BindingStatus) := transaction fun tx => do
   let now ← trustInstant tx reading
-  return (← readBindings tx []).map fun binding => ⟨binding, binding.datedLive now⟩
+  let rows ← readBindings tx []
+  let rooted := rootedOrigins rows now
+  return rows.map fun binding => ⟨binding, binding.datedLive now, supportedBy rooted now binding⟩
 
 /-- DNS hint attribution intentionally asks the dated rule, without the
 issuer cascade: a hint's sole source and a delegation's authority are distinct. -/
@@ -96,7 +108,7 @@ def soleDnsHintSource (key : ByteArray) (domain : String) (reading : Int64) : Ac
     return !live.isEmpty && live.all (fun binding => binding.source == .dns && binding.domain == some domain)
 
 structure SocketAuthority where
-  origin : String
+  origin : Origin.Parsed
   spaces : Option (List String)
   deriving BEq, DecidableEq
 
