@@ -308,4 +308,265 @@ theorem branch_step_routed
       obtain ⟨rfl, rfl⟩ := ran
       exact scheduled_routing_state routing included
 
+private theorem empty_children_routed : RoutedChildren store path emptyChildren := by
+  intro nibble child edge
+  simp only [emptyChildren, List.getElem?_replicate] at edge
+  split at edge <;> cases edge
+
+/-- A terminal key receives its own addressed routing node, so admitting its
+spine does not require revealing the key's payload. -/
+theorem terminal_leaf_step_routed (digestWidth : Width d) (shaped : Shaped before)
+    (meaningBefore : StateMeaning before.read
+      ⟨.visit path (.node (.leaf suffix value)) :: work, roots⟩ entries)
+    (meaningAfter : StateMeaning after.read next entries)
+    (routing : RoutingState before.read
+      ⟨.visit path (.node (.leaf suffix value)) :: work, roots⟩ target)
+    (within : path.length ≤ maxKeyBytes * 2) (spine : Normalize.belowBoundary path = false)
+    (spelling : suffix.toList = [])
+    (safe : SafeWrites d before
+      (Normalize.step ⟨.visit path (.node (.leaf suffix value)) :: work, roots⟩).run)
+    (ran : execute d before
+      (Normalize.step ⟨.visit path (.node (.leaf suffix value)) :: work, roots⟩).run =
+      some (.ok (.inl next), after)) : RoutingState after.read next target := by
+  have included := execution_preserves_records _ safe ran
+  have valid : CursorValid before.read (.node (.leaf suffix value)) := by
+    obtain ⟨views, pending, ready⟩ := meaningBefore
+    cases pending with
+    | visit valid _ _ => exact valid
+  simp only [Normalize.step, Nat.not_lt.mpr within, ↓reduceIte, spine,
+    Bool.false_eq_true, run_bind, run_pure, program_bind_pure, bindCont_ok, spelling] at ran
+  rw [TrieMutateProofs.execute_bind] at ran
+  cases first : execute d before (addressValue value).run with
+  | none => simp [first] at ran
+  | some reply =>
+    obtain ⟨reply, middle⟩ := reply
+    cases reply with
+    | error error => simp [first] at ran
+    | ok addressed =>
+      have addressWidth := (addressValue_shape digestWidth shaped valid.2.1.2 first).2
+      simp only [first, bindCont_ok] at ran
+      rw [execute_run_bind, execute_put] at ran
+      simp only [run_pure, TrieMutateProofs.execute_pure, Option.some.injEq,
+        Prod.mk.injEq, Except.ok.injEq, Sum.inl.injEq] at ran
+      obtain ⟨rfl, rfl⟩ := ran
+      have routeWf : (Node.route emptyChildren (some addressed)).wf :=
+        ⟨rfl, branchOk_empty.2.1, fun hash same => by cases same; exact addressWidth⟩
+      refine push_routed_result routing included
+        (.route (by simp [read_write_node]) (TrieCodecProofs.decode_encode routeWf)
+          (head_closed meaningAfter) ?_)
+      exact empty_children_routed
+
+/-- Assembling normalized children stores an actual routing parent at their
+original path, preserving the form of completed siblings. -/
+theorem assembly_step_routed {address : Option ByteArray}
+    (meaningBefore : StateMeaning before.read ⟨.assemble positions address :: work, roots⟩ entries)
+    (meaningAfter : StateMeaning after.read next entries)
+    (routing : RoutingState before.read ⟨.assemble positions address :: work, roots⟩ target)
+    (safe : SafeWrites d before (Normalize.step ⟨.assemble positions address :: work, roots⟩).run)
+    (ran : execute d before (Normalize.step ⟨.assemble positions address :: work, roots⟩).run =
+      some (.ok (.inl next), after)) : RoutingState after.read next target := by
+  have included := execution_preserves_records _ safe ran
+  obtain ⟨views, pending, completed⟩ := meaningBefore
+  cases pending with
+  | assemble children distinct nibbles occupied payload below =>
+    obtain ⟨left, right, rfl, leftMeaning, rightMeaning⟩ := completed_split _ completed
+    have ready : Completed before.read left ((children.reverse).map Prod.snd) := by
+      simpa only [List.map_reverse] using leftMeaning
+    obtain ⟨built, assembled, childMeaning⟩ := assemble_children_exact children.reverse ready
+      empty_children_meaning (by simpa using distinct.perm (List.reverse_perm _).symm)
+      (fun position member => nibbles position (by simpa using member)) right
+    simp only [List.map_reverse, List.reverse_reverse, List.append_nil] at assembled childMeaning
+    have routeWf := (assembled_node_meaning childMeaning payload occupied).1
+    obtain ⟨paths, pendingPaths, routedResults⟩ := routing
+    cases pendingPaths with
+    | assemble positions belowPaths =>
+      have readyPaths := routedResults
+      rw [← List.map_reverse] at readyPaths
+      obtain ⟨childrenRouted, remainingRouted⟩ := assemble_children_routed
+        (children.map Prod.fst).reverse rfl
+        (fun position member => nibbles position (by simpa using member))
+        empty_children_routed readyPaths assembled
+      simp only [Normalize.step, assembled] at ran
+      rw [execute_run_bind, execute_put] at ran
+      simp only [run_pure, TrieMutateProofs.execute_pure, Option.some.injEq,
+        Prod.mk.injEq, Except.ok.injEq, Sum.inl.injEq] at ran
+      obtain ⟨rfl, rfl⟩ := ran
+      refine ⟨_, belowPaths, .cons
+        (.route (by simp [read_write_node]) (TrieCodecProofs.decode_encode routeWf)
+          (head_closed meaningAfter) ?_) (routed_results_preserved remainingRouted included)⟩
+      intro nibble child edge
+      exact routed_preserved (childrenRouted nibble child edge) included
+
+private theorem replace_cursor_routing
+    (routing : RoutingState store ⟨.visit path cursor :: work, roots⟩ target) :
+    RoutingState store ⟨.visit path replacement :: work, roots⟩ target := by
+  obtain ⟨paths, pending, ready⟩ := routing
+  cases pending with
+  | visit below => exact ⟨paths, .visit below, ready⟩
+
+private theorem node_step_routed (digestWidth : Width d) (shaped : Shaped before)
+    (meaningBefore : StateMeaning before.read ⟨.visit path (.node node) :: work, roots⟩ entries)
+    (meaningAfter : StateMeaning after.read next entries)
+    (routing : RoutingState before.read ⟨.visit path (.node node) :: work, roots⟩ target)
+    (within : path.length ≤ maxKeyBytes * 2) (spine : Normalize.belowBoundary path = false)
+    (safe : SafeWrites d before (Normalize.step ⟨.visit path (.node node) :: work, roots⟩).run)
+    (ran : execute d before (Normalize.step ⟨.visit path (.node node) :: work, roots⟩).run =
+      some (.ok (.inl next), after)) : RoutingState after.read next target := by
+  cases node with
+  | leaf suffix value =>
+    cases spelling : suffix.toList with
+    | nil =>
+      exact terminal_leaf_step_routed digestWidth shaped meaningBefore meaningAfter
+        routing within spine spelling safe ran
+    | cons nibble rest => exact leaf_edge_step_routed routing within spine spelling ran
+  | extension segment child =>
+    cases spelling : segment.toList with
+    | nil => simp [Normalize.step, Nat.not_lt.mpr within, spine, spelling] at ran
+    | cons nibble rest => exact extension_edge_step_routed routing within spine spelling ran
+  | branch children value => exact branch_step_routed routing within spine safe ran
+  | route children value => exact route_step_routed routing within spine ran
+
+private theorem stored_step_routed (digestWidth : Width d) (shaped : Shaped before)
+    (meaningBefore : StateMeaning before.read ⟨.visit path (.stored root) :: work, roots⟩ entries)
+    (meaningAfter : StateMeaning after.read next entries)
+    (routing : RoutingState before.read ⟨.visit path (.stored root) :: work, roots⟩ target)
+    (within : path.length ≤ maxKeyBytes * 2) (spine : Normalize.belowBoundary path = false)
+    (safe : SafeWrites d before (Normalize.step ⟨.visit path (.stored root) :: work, roots⟩).run)
+    (ran : execute d before (Normalize.step ⟨.visit path (.stored root) :: work, roots⟩).run =
+      some (.ok (.inl next), after)) : RoutingState after.read next target := by
+  have valid : CursorValid before.read (.stored root) := by
+    obtain ⟨_, pending, _⟩ := meaningBefore
+    cases pending with
+    | visit valid _ _ => exact valid
+  rw [stored_step_as_node within spine] at safe ran
+  simp only [run_bind] at safe
+  rw [execute_run_bind] at ran
+  cases first : execute d before (load root).run with
+  | none => simp [first] at ran
+  | some reply =>
+    obtain ⟨reply, middle⟩ := reply
+    cases reply with
+    | error error => simp [first] at ran
+    | ok node =>
+      have restSafe := safe_bind_right _ safe first
+      simp only [bindCont_ok] at restSafe
+      simp only [first] at ran
+      obtain ⟨rfl, nodeValid, exactEntries⟩ := load_cursor_meaning shaped valid first
+      exact node_step_routed digestWidth shaped
+        (replace_cursor_meaning meaningBefore nodeValid exactEntries) meaningAfter
+        (replace_cursor_routing routing) within spine restSafe ran
+
+/-- Every successful normalization continuation preserves the routing form
+of completed results and their positions in the actual work stack. -/
+theorem step_routed (digestWidth : Width d) (shaped : Shaped before)
+    (meaning : StateMeaning before.read state entries)
+    (routing : RoutingState before.read state target)
+    (safe : SafeWrites d before (Normalize.step state).run)
+    (ran : execute d before (Normalize.step state).run = some (.ok (.inl next), after)) :
+    RoutingState after.read next target := by
+  have meaningAfter := (step_preserves_entries digestWidth shaped meaning safe ran).2
+  obtain ⟨work, roots⟩ := state
+  cases work with
+  | nil =>
+    cases roots with
+    | nil => simp [Normalize.step] at ran
+    | cons root rest => cases rest <;> simp [Normalize.step] at ran
+  | cons task work =>
+    cases task with
+    | assemble positions address => exact assembly_step_routed meaning meaningAfter routing safe ran
+    | visit path cursor =>
+      by_cases over : path.length > maxKeyBytes * 2
+      · simp [Normalize.step, over] at ran
+      · have within : path.length ≤ maxKeyBytes * 2 := Nat.le_of_not_gt over
+        cases spine : Normalize.belowBoundary path with
+        | true => exact boundary_step_routed routing meaningAfter within spine safe ran
+        | false =>
+          cases cursor with
+          | stored root => exact stored_step_routed digestWidth shaped meaning meaningAfter routing within spine safe ran
+          | node node => exact node_step_routed digestWidth shaped meaning meaningAfter routing within spine safe ran
+
+private theorem initial_routing :
+    RoutingState store ⟨[.visit [] (.stored root)], []⟩ [] :=
+  ⟨[], .visit (.done []), .nil⟩
+
+private theorem finish_routing
+    (routing : RoutingState before.read ⟨[], roots⟩ target)
+    (ran : execute d before (Normalize.step ⟨[], roots⟩).run = some (.ok (.inr root), after)) :
+    RoutedAt after.read target root := by
+  cases roots with
+  | nil => simp [Normalize.step] at ran
+  | cons result rest =>
+    cases rest with
+    | cons next rest => simp [Normalize.step] at ran
+    | nil =>
+      simp only [Normalize.step, run_pure, TrieMutateProofs.execute_pure,
+        Option.some.injEq, Prod.mk.injEq, Except.ok.injEq, Sum.inr.injEq] at ran
+      obtain ⟨rfl, rfl⟩ := ran
+      obtain ⟨paths, pending, ready⟩ := routing
+      cases pending with
+      | done path =>
+        cases ready with
+        | cons head tail => exact head
+
+/-- Successful normalization produces the stored routing form needed to
+share metadata paths without exposing private ancestor payloads. The input
+may use any valid stored representation; it need not already be routed. -/
+theorem publication_routed (digestWidth : Width d) (shaped : Shaped before)
+    (width : root.size = 32) (closed : Closed before.read root)
+    (nonempty : isEmptyRoot root = false)
+    (safe : SafeWrites d before (Normalize.publication root).run)
+    (ran : execute d before (Normalize.publication root).run = some (.ok normalized, after)) :
+    RoutedAt after.read [] normalized := by
+  let invariant := fun (store : Store) state => Shaped store ∧
+    StateMeaning store.read state (GraphValue before.read root) ∧ RoutingState store.read state []
+  let finished := fun (store : Store) result => RoutedAt store.read [] result
+  have preservation : ∀ state store reply finalStore, invariant store state →
+      SafeWrites d store (Normalize.step state).run →
+      execute d store (Normalize.step state).run = some (.ok reply, finalStore) →
+      match reply with | .inl next => invariant finalStore next | .inr result => finished finalStore result := by
+    intro state store reply finalStore current safeStep ranStep
+    cases reply with
+    | inl next =>
+      have semantic := step_preserves_entries digestWidth current.1 current.2.1 safeStep ranStep
+      exact ⟨semantic.1, semantic.2,
+        step_routed digestWidth current.1 current.2.1 current.2.2 safeStep ranStep⟩
+    | inr result =>
+      have empty := finished_step_has_no_work ranStep
+      obtain ⟨work, roots⟩ := state
+      simp only at empty
+      subst work
+      exact finish_routing current.2.2 ranStep
+  have initial : invariant before ⟨[.visit [] (.stored root)], []⟩ :=
+    ⟨shaped, initial_state_meaning width closed, initial_routing⟩
+  simp only [Normalize.publication, nonempty, Bool.false_eq_true, ↓reduceIte,
+    OperationOver.iterate] at safe ran
+  exact iterate_store_invariant (d := d) (S := Normalize.State) (R := ByteArray)
+    (fun state => (Normalize.step state).run) (.domain .depthExceeded) invariant finished
+    (fun state store reply finalStore current safeStep ranStep => by
+      cases reply with
+      | inl next => exact preservation state store (.inl next) finalStore current safeStep ranStep
+      | inr result => exact preservation state store (.inr result) finalStore current safeStep ranStep)
+    Normalize.workFuel (Normalize.step ⟨[.visit [] (.stored root)], []⟩).run before
+    (fun reply finalStore initialSafe initialRan => by
+      cases reply with
+      | inl next => exact preservation _ before (.inl next) finalStore initial initialSafe initialRan
+      | inr result => exact preservation _ before (.inr result) finalStore initial initialSafe initialRan)
+    normalized after safe ran
+
+/-- A successfully normalized version permits every stored node needed on
+a granted path. The grant may select a private exact key or a complete shared
+subtree; it need not grant any private ancestor's payload. -/
+theorem normalized_nodes_are_admitted (digestWidth : Width d) (shaped : Shaped before)
+    (width : root.size = 32) (closed : Closed before.read root)
+    (nonempty : isEmptyRoot root = false)
+    (safe : SafeWrites d before (Normalize.publication root).run)
+    (ran : execute d before (Normalize.publication root).run = some (.ok normalized, after))
+    (compatible : BoundaryCompatible scope)
+    (reaches : Reaches (after.read nodeSpace) normalized path found)
+    (admitted : scope.admitsPath path = true)
+    (held : after.read nodeSpace found = some raw) (decoded : decode raw = .ok node) :
+    scope.admitsNode path node = true := by
+  exact routed_nodes_are_admitted compatible
+    (publication_routed digestWidth shaped width closed nonempty safe ran) reaches admitted held decoded
+
 end Synchronicity.TriePublicationRouting
