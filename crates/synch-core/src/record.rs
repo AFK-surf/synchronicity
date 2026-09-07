@@ -200,7 +200,7 @@ pub struct AdState {
 /// it — decodes the lot; §12's per-message cap cannot apply after the decode,
 /// which is after the allocation it is meant to bound. Generous next to
 /// anything honest: spans are 16 MiB-granular runs, a fetch walks windows in
-/// order, and `coalesce_spans` merges what touches, so a real partial holder
+/// order, and native advertisement construction merges what touches, so a real partial holder
 /// publishes a handful. What is over the cap is dropped rather than merged
 /// across gaps, because merging would claim bytes the holder does not have:
 /// over-reporting sends a fetcher to a provider that cannot serve it, while
@@ -298,17 +298,6 @@ impl BlobAd {
         }
     }
 
-    /// Builds a partial advertisement, coalescing spans to 16 MiB granularity.
-    pub fn partial(size: u64, spans: impl IntoIterator<Item = (u64, u64)>) -> Self {
-        BlobAd {
-            v: RECORD_VERSION,
-            size,
-            state: AdState {
-                spans: coalesce_spans(spans, size),
-            },
-        }
-    }
-
     /// True if the ad covers the whole object. Derived, not stored: one span
     /// reaching from nothing to the object's end.
     pub fn is_complete(&self) -> bool {
@@ -319,52 +308,6 @@ impl BlobAd {
     pub fn intersects(&self, start: u64, end: u64) -> bool {
         self.state.spans.iter().any(|&(s, e)| s < end && start < e)
     }
-}
-
-/// Rounds spans *inward* to [`AD_SPAN_GRANULARITY`] boundaries and merges what
-/// touches.
-///
-/// Ads are hints, not promises (§6.3) — the fetcher learns exact availability
-/// from `SliceEnd` — but the direction of the error is not a free choice:
-/// over-reporting sends a fetcher to a provider that cannot serve it, while
-/// under-reporting costs at most a re-fetch.
-///
-/// Each run contributes the largest granule-aligned span inside it. The object's
-/// boundaries stay exact (0 is a granule boundary anyway, and the final partial
-/// granule is real bytes), so a whole-object holder still advertises the whole
-/// object.
-pub fn coalesce_spans(spans: impl IntoIterator<Item = (u64, u64)>, size: u64) -> Vec<(u64, u64)> {
-    let mut v: Vec<(u64, u64)> = spans
-        .into_iter()
-        .filter(|(s, e)| s < e)
-        .map(|(s, e)| {
-            // Clamped to the object first, so nothing downstream has to reason
-            // about a span past the end — and the tail granule at the object's
-            // end survives as real bytes, not a rounding artifact.
-            let (s, e) = (s.min(size), e.min(size));
-            let start = s
-                .div_ceil(AD_SPAN_GRANULARITY)
-                .saturating_mul(AD_SPAN_GRANULARITY);
-            let end = match e == size {
-                true => e,
-                false => (e / AD_SPAN_GRANULARITY) * AD_SPAN_GRANULARITY,
-            };
-            (start.min(size), end.min(size))
-        })
-        .filter(|(s, e)| s < e)
-        .collect();
-    v.sort_unstable();
-    let mut out: Vec<(u64, u64)> = Vec::with_capacity(v.len());
-    for (s, e) in v {
-        match out.last_mut() {
-            Some(last) if s <= last.1 => last.1 = last.1.max(e),
-            _ => out.push((s, e)),
-        }
-    }
-    // The same cap the decode applies, so what this node publishes is what a
-    // peer will keep of it; dropped from the tail, never merged across gaps.
-    out.truncate(MAX_AD_SPANS);
-    out
 }
 
 /// What an origin advertises about one space, published under
@@ -880,7 +823,13 @@ mod tests {
     #[test]
     fn record_round_trips_via_postcard() {
         round_trips(FileEntry::file(1234, 42, Hash::new(b"x"), 7));
-        round_trips(BlobAd::partial(100 * 1024 * 1024, [(0, 20 * 1024 * 1024)]));
+        round_trips(BlobAd {
+            v: RECORD_VERSION,
+            size: 100 * 1024 * 1024,
+            state: AdState {
+                spans: vec![(0, AD_SPAN_GRANULARITY)],
+            },
+        });
         round_trips(NodeManifest {
             v: RECORD_VERSION,
             name: "nas".into(),
@@ -930,63 +879,20 @@ mod tests {
         // than was published rather than more.
         assert_eq!(decoded.state.spans, spans[..MAX_AD_SPANS]);
         assert!(!decoded.is_complete());
-
-        // The same cap on the way out, so what this node publishes survives a
-        // peer's decode unchanged.
-        let ours = BlobAd::partial(u64::MAX, spans);
-        assert_eq!(ours.state.spans.len(), MAX_AD_SPANS);
     }
 
-    /// Coalescing under-reports rather than over-reports: rounding a run out to
-    /// granule boundaries claims up to 16 MiB of unheld bytes at each end.
     #[test]
-    fn spans_coalesce_at_16mib() {
+    fn advertisements_intersect_only_their_stated_ranges() {
         let g = AD_SPAN_GRANULARITY;
-        let size = 10 * g;
-
-        // Byte-sized runs round to nothing; a run covering whole granules
-        // keeps only them, losing the partial granule at each end; runs that
-        // meet at a boundary merge.
-        assert_eq!(coalesce_spans([(1, 2), (g + 5, g + 6)], size), vec![]);
-        assert_eq!(coalesce_spans([(0, 1), (5 * g, 5 * g + 1)], size), vec![]);
-        assert_eq!(coalesce_spans([(g - 1, 3 * g + 1)], size), vec![(g, 3 * g)]);
-        assert_eq!(
-            coalesce_spans([(0, 2 * g), (2 * g, 4 * g)], size),
-            vec![(0, 4 * g)]
-        );
-
-        // The object's own end is exact: a claim past it clamps, and a run
-        // inside the last partial granule rounds away entirely.
-        let size = g / 2;
-        assert_eq!(coalesce_spans([(0, size)], size), vec![(0, size)]);
-        assert_eq!(coalesce_spans([(0, size * 4)], size), vec![(0, size)]);
-        assert_eq!(coalesce_spans([(0, 10)], size), vec![]);
-
-        // Intersection answers against the same span shape.
-        let ad = BlobAd::partial(10 * g, [(0, g)]);
+        let ad = BlobAd {
+            v: RECORD_VERSION,
+            size: 10 * g,
+            state: AdState {
+                spans: vec![(0, g)],
+            },
+        };
         assert!(ad.intersects(0, 10));
         assert!(!ad.intersects(2 * g, 3 * g));
         assert!(BlobAd::complete(10).intersects(0, 10));
-    }
-
-    /// A holder of part of an object never advertises the whole of it.
-    #[test]
-    fn a_partial_holder_never_reports_complete() {
-        let g = AD_SPAN_GRANULARITY;
-        // The first slice window of a 10 MiB object — under one granule, so the
-        // node advertises nothing rather than everything.
-        let small = 10 * 1024 * 1024;
-        let ad = BlobAd::partial(small, [(0, 8 * 1024 * 1024)]);
-        assert!(!ad.is_complete(), "{:?}", ad.state.spans);
-
-        // And the first two granules of a larger one is two granules, not all.
-        let ad = BlobAd::partial(10 * g, [(0, 2 * g + 7)]);
-        assert_eq!(ad.state.spans, vec![(0, 2 * g)]);
-        assert!(!ad.is_complete());
-
-        // A holder of the whole object still says so, tail granule included.
-        let ad = BlobAd::partial(small, [(0, small)]);
-        assert_eq!(ad.state.spans, vec![(0, small)]);
-        assert!(ad.is_complete());
     }
 }

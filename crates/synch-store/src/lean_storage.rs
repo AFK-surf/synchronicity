@@ -54,6 +54,7 @@ impl synch_verified::host::Resources for Resources<'_> {
 pub(crate) struct SqliteStorage<'a> {
     conn: ConnectionSource<'a>,
     active: Option<u64>,
+    borrowed_transaction: bool,
     next: u64,
 }
 
@@ -94,8 +95,27 @@ impl<'a> SqliteStorage<'a> {
         Self {
             conn: ConnectionSource::Borrowed(conn),
             active: None,
+            borrowed_transaction: false,
             next: 1,
         }
+    }
+
+    /// Bind the already-open transaction without taking ownership of its end.
+    /// Native commands using this handle may not commit or abort it, and drop
+    /// cannot roll back the surrounding publication transaction.
+    pub(crate) fn borrow_transaction(conn: &'a Connection) -> Result<(Self, u64)> {
+        if conn.is_autocommit() {
+            return Err(StoreError::invalid("no transaction to borrow"));
+        }
+        Ok((
+            Self {
+                conn: ConnectionSource::Borrowed(conn),
+                active: Some(1),
+                borrowed_transaction: true,
+                next: 2,
+            },
+            1,
+        ))
     }
 
     fn require_transaction(&self, tx: u64) -> Result<()> {
@@ -159,6 +179,7 @@ impl<'a> Session<'a> {
         Ok(SqliteStorage {
             conn,
             active: None,
+            borrowed_transaction: false,
             next: self.next,
         })
     }
@@ -314,7 +335,7 @@ impl Storage for Session<'_> {
 
 impl Drop for SqliteStorage<'_> {
     fn drop(&mut self) {
-        if self.active.is_some() && !self.conn.is_autocommit() {
+        if !self.borrowed_transaction && self.active.is_some() && !self.conn.is_autocommit() {
             // Cancellation releases an uncommitted host resource. Normal
             // recovery and error selection are requested by the Lean program.
             let _ = self.conn.execute_batch("ROLLBACK");
@@ -606,6 +627,9 @@ impl Storage for SqliteStorage<'_> {
     }
 
     fn commit(&mut self, tx: u64) -> Result<()> {
+        if self.borrowed_transaction {
+            return Err(StoreError::invalid("cannot commit a borrowed transaction"));
+        }
         self.require_transaction(tx)?;
         self.conn.execute_batch("COMMIT")?;
         self.active = None;
@@ -613,6 +637,9 @@ impl Storage for SqliteStorage<'_> {
     }
 
     fn rollback(&mut self, tx: u64) -> Result<()> {
+        if self.borrowed_transaction {
+            return Err(StoreError::invalid("cannot abort a borrowed transaction"));
+        }
         self.require_transaction(tx)?;
         // SQLite can itself roll back a transaction after certain I/O errors.
         // Already rolled back is a released resource, not a successful commit.

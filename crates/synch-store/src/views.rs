@@ -1884,7 +1884,13 @@ mod tests {
             .put_provider(
                 &root,
                 &origin_named("laptop"),
-                &BlobAd::partial(10 * g, [(0, g)]),
+                &BlobAd {
+                    v: synch_core::record::RECORD_VERSION,
+                    size: 10 * g,
+                    state: synch_core::record::AdState {
+                        spans: vec![(0, g)],
+                    },
+                },
             )
             .unwrap();
 

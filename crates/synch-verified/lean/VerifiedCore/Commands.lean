@@ -169,6 +169,8 @@ inductive Command where
 
   /-- Prepare routing spines for a private scoped publication. -/
   | trieNormalize (root : ByteArray)
+  /-- Read one complete CAS projection within a transaction owned by the caller. -/
+  | casBlobIn (tx : UInt64) (root : ByteArray)
 
 /-- Malformed metadata or a column of the wrong storage class, as pin
 acquisition and deletion report it. -/

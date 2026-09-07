@@ -109,6 +109,22 @@ pub fn blob<S: Storage>(
     project(storage, &Command::CasBlob(root.to_vec()))
 }
 
+/// A complete object projection using an existing transaction. The command
+/// neither commits nor aborts the caller's transaction.
+pub fn blob_in<S: Storage>(
+    storage: &mut S,
+    transaction: u64,
+    root: &[u8; 32],
+) -> Result<Option<ProjectedBlob>, ProjectError<S::Error>> {
+    project(
+        storage,
+        &Command::CasBlobIn {
+            tx: transaction,
+            root: root.to_vec(),
+        },
+    )
+}
+
 /// Every index row, most recently accessed first, each with its pin state
 /// read as one join and merged in one pass.
 pub fn blobs<S: Storage>(storage: &mut S) -> Result<Vec<ProjectedBlob>, ProjectError<S::Error>> {

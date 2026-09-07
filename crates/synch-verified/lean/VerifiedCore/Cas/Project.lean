@@ -1,4 +1,5 @@
 import VerifiedCore.Cas.ReadCodec
+import VerifiedCore.Cas.Serve
 import VerifiedCore.Cas.Program
 
 /-! The projections of the content store: one object's row, every row, the
@@ -35,6 +36,8 @@ structure Blob where
   inline : Option ByteArray
   pinned : Bool
   lastAccess : Int64
+  verifiedGroups : List (UInt64 × UInt64)
+  advertisedSpans : List (UInt64 × UInt64)
   deriving BEq, DecidableEq
 
 /-- A row without its payload: what a sweep or a report reads. -/
@@ -74,6 +77,30 @@ def rootField (index : Nat) (column : String) (cell : Cell) : Except Error ByteA
 def blobColumns : List String :=
   ["root", "size", "complete", "bitmap", "inline", "last_access", "durable"]
 
+/-- A partial advertisement rounds inward to 16 MiB boundaries, keeping the
+object's true end, and drops excess runs. Natural-number arithmetic avoids
+wrapping the endpoint of the last group of a maximum-size object. -/
+def advertised (size : UInt64) (complete durable : Bool) (groups : List GroupSpan) : List (UInt64 × UInt64) :=
+  if complete || durable then
+    if size == 0 then [] else [(0, size)]
+  else
+    let granule := 16777216
+    let rounded := groups.map fun span =>
+      let first := min (span.start * 16384) size.toNat
+      let last := min (span.stop * 16384) size.toNat
+      let start := min (((first + granule - 1) / granule) * granule) size.toNat
+      let stop := if last == size.toNat then last else last / granule * granule
+      (⟨start, stop⟩ : GroupSpan)
+    Serve.pairsOf ((normalizeSpans size.toNat rounded).take 1024)
+
+/-- One decoded observation supplies both exact cache availability and the
+canonical advertisement. Callers need not reinterpret bitmap or tier flags. -/
+def projected (root : ByteArray) (size : UInt64) (complete durable : Bool)
+    (bitmap inline : Option ByteArray) (lastAccess : Int64) : Blob :=
+  let groups := Serve.held ⟨size, complete, bitmap, inline⟩
+  ⟨root, size, complete, durable, bitmap, inline, false, lastAccess,
+    Serve.pairsOf groups, advertised size complete durable groups⟩
+
 /-- The read path's row, kept whole; `pinned` is merged in afterwards. -/
 def decodeBlob : Row → Except Error Blob
   | [root, size, complete, bitmap, inline, lastAccess, durable] => do
@@ -85,7 +112,7 @@ def decodeBlob : Row → Except Error Blob
     let lastAccess ← integerField 5 "last_access" lastAccess
     let durable ← integerField 6 "durable" durable
     if root.size != 32 then throw (.column "blobs.root" (toString root.size ++ " bytes, not 32"))
-    return ⟨root, size.toUInt64, complete != 0, durable != 0, bitmap, inline, false, lastAccess⟩
+    return projected root size.toUInt64 (complete != 0) (durable != 0) bitmap inline lastAccess
   | _ => .error .malformed
 
 def summaryColumns : List String := ["root", "size", "complete", "durable", "last_access"]
@@ -131,14 +158,18 @@ def read (tx : Transaction) (relation : String) (columns : List String) (equals 
 def pinnedRoots (tx : Transaction) : Action (List ByteArray) :=
   read tx "blobs" ["root"] [] byAccess pinJoin decodeRoot
 
-/-- One object's row, with whether any claim stands on it. -/
-def blob (root : ByteArray) : Action (Option Blob) := transaction fun tx => do
+/-- One object's complete projection in the caller's existing transaction.
+This command borrows the transaction; it never commits or aborts it. -/
+def blobIn (tx : Transaction) (root : ByteArray) : Action (Option Blob) := do
   match ← read tx "blobs" blobColumns [("root", .blob root)] [] [] decodeBlob with
   | [] => return none
   | [row] =>
     let pinned ← storage (.existsRows tx "pins" [("root", .blob root)])
     return some { row with pinned }
   | _ => throw .malformed
+
+/-- One object's row, with whether any claim stands on it. -/
+def blob (root : ByteArray) : Action (Option Blob) := transaction fun tx => blobIn tx root
 
 /-- Every row, most recently accessed first. -/
 def blobs : Action (List Blob) := transaction fun tx => do

@@ -2010,7 +2010,7 @@ mod tests {
     #[tokio::test]
     async fn complementary_holders_are_asked_for_what_they_hold() {
         let (_d, node) = node().await;
-        // Four ad spans, so each half is a whole number, surviving `coalesce_spans`' rounding.
+        // Four ad spans, so each half is a whole number, surviving advertisement rounding.
         let size = 4 * synch_core::AD_SPAN_GRANULARITY;
         let payload: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
         let half = size / 2;
@@ -2080,7 +2080,17 @@ mod tests {
         let root = Hash::new(b"object");
         let (origin, _) = trust(&node, "partial");
         node.store()
-            .put_provider(&root, &origin, &BlobAd::partial(4 * g, [(0, g)]))
+            .put_provider(
+                &root,
+                &origin,
+                &BlobAd {
+                    v: synch_core::record::RECORD_VERSION,
+                    size: 4 * g,
+                    state: synch_core::record::AdState {
+                        spans: vec![(0, g)],
+                    },
+                },
+            )
             .unwrap();
         // Self-ads and unbound origins are filtered out of the provider pool.
         node.store()

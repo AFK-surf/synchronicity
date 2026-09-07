@@ -34,15 +34,7 @@ use crate::{
 impl Txn<'_> {
     /// Reads the local CAS row from this transaction's snapshot.
     pub fn blob(&self, root: &Hash) -> Result<Option<BlobRow>> {
-        let row = self
-            .conn()
-            .query_row(
-                &format!("SELECT {BLOB_COLUMNS} FROM blobs WHERE root = ?1"),
-                params![root.as_bytes().to_vec()],
-                raw_blob_row,
-            )
-            .optional()?;
-        row.map(blob_row_from).transpose()
+        crate::lean_project::blob_in(self.conn(), root)
     }
 
     /// Verifies durable possession and installs the source hold used by the
@@ -295,56 +287,8 @@ pub struct BlobSummary {
     pub last_access: i64,
 }
 
-/// The column list `blob` and `blobs` share, in the order [`raw_blob_row`]
-/// destructures. One spelling, because hand-aligned tuple destructurings of
-/// the same columns is how a reordered schema change compiles cleanly and
-/// decodes the wrong column. (`blob_candidates` still hand-decodes its own
-/// narrower row below.)
-const BLOB_COLUMNS: &str = "root, size, complete, bitmap, inline,
-        EXISTS(SELECT 1 FROM pins WHERE pins.root = blobs.root),
-        last_access, durable";
-
-/// A [`BLOB_COLUMNS`] row as SQLite hands it over, before hash decoding —
-/// which reports through [`StoreError`], so it happens outside the closure.
-type RawBlobRow = (
-    Vec<u8>,
-    i64,
-    i64,
-    Option<Vec<u8>>,
-    Option<Vec<u8>>,
-    i64,
-    i64,
-    i64,
-);
-
-fn raw_blob_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawBlobRow> {
-    Ok((
-        row.get(0)?,
-        row.get(1)?,
-        row.get(2)?,
-        row.get(3)?,
-        row.get(4)?,
-        row.get(5)?,
-        row.get(6)?,
-        row.get(7)?,
-    ))
-}
-
-fn blob_row_from(raw: RawBlobRow) -> Result<BlobRow> {
-    let (root, size, complete, bitmap, inline, pinned, last_access, durable) = raw;
-    Ok(BlobRow {
-        root: hash_column(root, "blobs.root")?,
-        size: size as u64,
-        complete: complete != 0,
-        durable: durable != 0,
-        bitmap,
-        inline,
-        pinned: pinned != 0,
-        last_access,
-    })
-}
-
-/// A row of the local blob index.
+/// A snapshot of one local blob index row and its native projections.
+/// Editing public row fields does not recompute availability or advertisements.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlobRow {
     /// The object root.
@@ -363,40 +307,27 @@ pub struct BlobRow {
     pub pinned: bool,
     /// When the blob was last read, in unix nanoseconds.
     pub last_access: i64,
+    /// Exact availability computed by the native projection of this snapshot.
+    pub(crate) verified_groups: ChunkRanges,
+    /// Canonical advertisement computed by the same native projection.
+    pub(crate) advertised_spans: Vec<(u64, u64)>,
 }
 
 impl BlobRow {
-    /// The groups this holder has verified.
+    /// The verified groups in the original projected snapshot.
     pub fn verified_groups(&self) -> ChunkRanges {
-        // This is cache availability, not the durable-tier promise. A cold
-        // cloud row advertises complete through `to_ad`, while the fetch/read
-        // planner still sees which groups are actually local.
-        if self.complete {
-            return ChunkRanges::single(0, group_count(self.size));
-        }
-        match &self.bitmap {
-            None => ChunkRanges::empty(),
-            Some(bytes) => blob_to_ranges(bytes, group_count(self.size)),
-        }
+        self.verified_groups.clone()
     }
 
-    /// The advertisement this holder should publish for the object (§6.3).
+    /// The advertisement computed for the original projected snapshot (§6.3).
     pub fn to_ad(&self) -> BlobAd {
-        if self.complete || self.durable {
-            return BlobAd::complete(self.size);
+        BlobAd {
+            v: synch_core::record::RECORD_VERSION,
+            size: self.size,
+            state: synch_core::record::AdState {
+                spans: self.advertised_spans.clone(),
+            },
         }
-        let spans: Vec<(u64, u64)> = self
-            .verified_groups()
-            .ranges
-            .iter()
-            .map(|r| {
-                (
-                    r.start * CHUNK_GROUP_SIZE,
-                    (r.end * CHUNK_GROUP_SIZE).min(self.size),
-                )
-            })
-            .collect();
-        BlobAd::partial(self.size, spans)
     }
 }
 
@@ -442,21 +373,6 @@ pub(crate) fn grow_to(file: &File, len: u64) -> Result<()> {
 pub(crate) fn ranges_to_blob(ranges: &ChunkRanges) -> Vec<u8> {
     let pairs: Vec<(u64, u64)> = ranges.ranges.iter().map(|r| (r.start, r.end)).collect();
     postcard::to_stdvec(&pairs).expect("range encoding is infallible")
-}
-
-/// Decodes the `blobs.bitmap` column, clamped to the object's group count.
-pub(crate) fn blob_to_ranges(bytes: &[u8], groups: u64) -> ChunkRanges {
-    let pairs: Vec<(u64, u64)> = match postcard::from_bytes(bytes) {
-        Ok(pairs) => pairs,
-        // A row this build cannot read is treated as holding nothing, which
-        // costs a re-fetch and never a wrong claim of availability.
-        Err(_) => return ChunkRanges::empty(),
-    };
-    ChunkRanges::from_ranges(
-        pairs
-            .into_iter()
-            .map(|(start, end)| GroupRange::new(start, end.min(groups))),
-    )
 }
 
 /// Decodes the pre-v10 bit-per-group encoding.
@@ -1977,7 +1893,7 @@ mod tests {
 
         // An ad span is 16 MiB and a slice window 8, so the first window
         // advertises nothing: spans round inward rather than claiming a
-        // granule the holder is halfway through (`coalesce_spans`).
+        // granule the holder is halfway through.
         let groups_per_span = g / CHUNK_GROUP_SIZE;
         let mut want = ChunkRanges::single(0, groups_per_span);
         let mut windows = 0;

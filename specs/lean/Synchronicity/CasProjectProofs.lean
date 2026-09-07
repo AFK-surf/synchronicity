@@ -11,17 +11,6 @@ open VerifiedCore.Host VerifiedCore.Cas VerifiedCore.Cas.Project SimulatedHost C
 
 /-! ## Row decoding -/
 
-/-- A well-typed row decodes to its cells, unpinned until the join says otherwise. -/
-theorem decodeBlob_of_typed (root : ByteArray) (size complete lastAccess durable : Int64)
-    (bitmap inline : Option ByteArray) (width : root.size = 32) :
-    decodeBlob [.blob root, .integer size, .integer complete, bitmap.elim .null .blob,
-      inline.elim .null .blob, .integer lastAccess, .integer durable] =
-      .ok ⟨root, size.toUInt64, complete != 0, durable != 0, bitmap, inline, false, lastAccess⟩ := by
-  cases bitmap <;> cases inline <;>
-    simp [decodeBlob, blobField, integerField, optionalBlobField, VerifiedCore.Cas.Codec.blobField,
-      VerifiedCore.Cas.Codec.integerField, VerifiedCore.Cas.Codec.optionalBlobField, width, bind, pure,
-      Except.bind, Except.pure]
-
 /-- A column of the wrong class is refused by its position and name, before
 the root's width is looked at. -/
 theorem decodeBlob_refuses_a_text_size (root : ByteArray) (size : String) (a b c d e : Cell) :
@@ -134,7 +123,7 @@ theorem blob_absent (state : State) (root : ByteArray)
     let result := SimulatedHost.run (VerifiedCore.Cas.Project.blob root) state
     result.1 = .ok none ∧ result.2.db = state.db ∧
       result.2.trace = state.trace ++ ["begin", "read:blobs", "commit"] := by
-  simp [SimulatedHost.run, VerifiedCore.Cas.Project.blob, VerifiedCore.Cas.Project.read,
+  simp [SimulatedHost.run, VerifiedCore.Cas.Project.blob, VerifiedCore.Cas.Project.blobIn, VerifiedCore.Cas.Project.read,
     VerifiedCore.Cas.Project.transaction, transactionWith, transactionOver,
     VerifiedCore.Cas.Project.storage, performWith, execute, Interpreter.handle, SimulatedHost.storage,
     reply, fault, record, SimulatedHost.transaction, quiet, idle, absent,
@@ -151,7 +140,7 @@ theorem blob_present (state : State) (root : ByteArray) (row : Row) (decoded : B
     result.1 = .ok (some { decoded with
       pinned := (rows state.db "pins").any (fun pin => equals pin [("root", .blob root)]) }) ∧
       result.2.db = state.db := by
-  simp [SimulatedHost.run, VerifiedCore.Cas.Project.blob, VerifiedCore.Cas.Project.read,
+  simp [SimulatedHost.run, VerifiedCore.Cas.Project.blob, VerifiedCore.Cas.Project.blobIn, VerifiedCore.Cas.Project.read,
     VerifiedCore.Cas.Project.transaction, transactionWith, transactionOver,
     VerifiedCore.Cas.Project.storage, performWith, execute, Interpreter.handle, SimulatedHost.storage,
     reply, fault, record, SimulatedHost.transaction, quiet, idle, observed, typed,
@@ -167,7 +156,7 @@ private def row (key : ByteArray) (accessed : Int64) (inline : Cell := .null) : 
    ("inline", inline), ("last_access", .integer accessed), ("durable", .integer 0)]
 
 private def projected (key : ByteArray) (accessed : Int64) (pinned : Bool) (inline : Option ByteArray := none) : Blob :=
-  ⟨key, 4, true, false, none, inline, pinned, accessed⟩
+  { VerifiedCore.Cas.Project.projected key 4 true false none inline accessed with pinned }
 
 /-- Three objects, the middle one pinned twice, the last inline. -/
 private def stocked : State :=

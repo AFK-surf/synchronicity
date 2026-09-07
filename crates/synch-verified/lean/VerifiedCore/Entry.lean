@@ -295,6 +295,7 @@ def dispatch : Command → Native
   | .casGcContent before => command (Cas.Collect.gcContent before) collecting
   | .casGcOrphans before => command (Cas.Collect.gcOrphans before) collecting
   | .casBlob root => if root.size != 32 then protocol else command (Cas.Project.blob root) projecting
+  | .casBlobIn tx root => if root.size != 32 then protocol else command (Cas.Project.blobIn tx root) projecting
   | .casBlobs => command Cas.Project.blobs projecting
   | .casBlobCandidates => command Cas.Project.candidates projecting
   | .casPins root =>

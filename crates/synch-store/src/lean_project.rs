@@ -52,6 +52,14 @@ fn row_of(blob: cas::ProjectedBlob) -> Result<BlobRow> {
         inline: blob.inline,
         pinned: blob.pinned,
         last_access: blob.last_access,
+        verified_groups: synch_core::ChunkRanges {
+            ranges: blob
+                .verified_groups
+                .into_iter()
+                .map(|(start, end)| synch_core::GroupRange::new(start, end))
+                .collect(),
+        },
+        advertised_spans: blob.advertised_spans,
     })
 }
 
@@ -83,6 +91,14 @@ fn pin_of(pin: cas::ProjectedPin) -> Result<PinRow> {
 pub(crate) fn blob(store: &Store, root: &Hash) -> Result<Option<BlobRow>> {
     let mut storage = crate::lean_storage::Session::new(store);
     cas::blob(&mut storage, root.as_bytes())
+        .map_err(error)?
+        .map(row_of)
+        .transpose()
+}
+
+pub(crate) fn blob_in(conn: &rusqlite::Connection, root: &Hash) -> Result<Option<BlobRow>> {
+    let (mut storage, transaction) = crate::lean_storage::SqliteStorage::borrow_transaction(conn)?;
+    cas::blob_in(&mut storage, transaction, root.as_bytes())
         .map_err(error)?
         .map(row_of)
         .transpose()
@@ -130,6 +146,103 @@ mod tests {
     use crate::testutil::{data, store};
     use rusqlite::params;
 
+    #[test]
+    fn native_advertisements_never_round_out_into_missing_content() {
+        let (_dir, store) = store();
+        let root = Hash::new(b"projected availability");
+        let g = synch_core::AD_SPAN_GRANULARITY;
+        let chunk = synch_core::CHUNK_GROUP_SIZE;
+        let cases = [
+            (
+                10 * g,
+                vec![(0, 1), (5 * g / chunk, 5 * g / chunk + 1)],
+                vec![],
+            ),
+            (
+                10 * g,
+                vec![(g / chunk - 1, 3 * g / chunk + 1)],
+                vec![(g, 3 * g)],
+            ),
+            (
+                10 * g,
+                vec![(0, 2 * g / chunk), (2 * g / chunk, 4 * g / chunk)],
+                vec![(0, 4 * g)],
+            ),
+            (g / 2, vec![(0, 4 * g / chunk)], vec![(0, g / 2)]),
+            (g / 2, vec![(0, 1)], vec![]),
+            (10 * 1024 * 1024, vec![(0, 8 * 1024 * 1024 / chunk)], vec![]),
+            (
+                u64::MAX,
+                vec![(0, synch_core::group_count(u64::MAX))],
+                vec![(0, u64::MAX)],
+            ),
+        ];
+        for (size, groups, expected) in cases {
+            let bitmap = postcard::to_stdvec(&groups).unwrap();
+            store.conn().execute(
+                "INSERT OR REPLACE INTO blobs (root,size,complete,bitmap,inline,last_access,durable) VALUES (?1,?2,0,?3,NULL,0,0)",
+                params![root.as_bytes().as_slice(), size as i64, bitmap],
+            ).unwrap();
+            let row = store.blob(&root).unwrap().unwrap();
+            assert_eq!(
+                row.to_ad().state.spans,
+                expected,
+                "size={size}, groups={groups:?}"
+            );
+        }
+        let runs: Vec<(u64, u64)> = (0..1100)
+            .map(|i| (2 * i * g / chunk, (2 * i + 1) * g / chunk))
+            .collect();
+        store
+            .conn()
+            .execute(
+                "UPDATE blobs SET bitmap=?1",
+                params![postcard::to_stdvec(&runs).unwrap()],
+            )
+            .unwrap();
+        let ad = store.blob(&root).unwrap().unwrap().to_ad();
+        assert_eq!(ad.state.spans.len(), synch_core::record::MAX_AD_SPANS);
+        assert_eq!(ad.state.spans.last(), Some(&(2046 * g, 2047 * g)));
+        let decoded: synch_core::BlobAd =
+            postcard::from_bytes(&postcard::to_stdvec(&ad).unwrap()).unwrap();
+        assert_eq!(decoded, ad);
+        store
+            .conn()
+            .execute("UPDATE blobs SET bitmap=X'FF', durable=1", [])
+            .unwrap();
+        let row = store.blob(&root).unwrap().unwrap();
+        assert!(row.verified_groups().is_empty());
+        assert_eq!(row.to_ad().state.spans, vec![(0, u64::MAX)]);
+    }
+
+    #[test]
+    fn native_transaction_projection_neither_commits_nor_aborts_publication() {
+        use synch_verified::host::Storage;
+        let (_dir, store) = store();
+        let root = store.ingest_bytes(b"existing", 1).unwrap();
+        let result: Result<()> = store.transaction(|txn| {
+            txn.conn().execute(
+                "UPDATE blobs SET durable=0, last_access=77 WHERE root=?1",
+                params![root.as_bytes().as_slice()],
+            )?;
+            let row = txn.blob(&root)?.unwrap();
+            assert_eq!(row.last_access, 77);
+            assert!(!row.durable);
+            assert_eq!(row.verified_groups(), synch_core::ChunkRanges::single(0, 1));
+            assert_eq!(row.to_ad(), synch_core::BlobAd::complete(8));
+            let (mut borrowed, token) =
+                crate::lean_storage::SqliteStorage::borrow_transaction(txn.conn())?;
+            assert!(borrowed.commit(token).is_err());
+            assert!(borrowed.rollback(token).is_err());
+            drop(borrowed);
+            assert!(!txn.conn().is_autocommit());
+            Err(StoreError::invalid("abort outer publication"))
+        });
+        assert!(result.is_err());
+        let row = store.blob(&root).unwrap().unwrap();
+        assert_eq!(row.last_access, 1);
+        assert!(row.durable);
+    }
     #[test]
     fn rows_are_listed_most_recent_first_with_their_pin_state() {
         let (_dir, store) = store();
