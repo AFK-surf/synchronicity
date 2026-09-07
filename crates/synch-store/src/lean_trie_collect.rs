@@ -40,18 +40,7 @@ fn error(error: CollectError<StoreError>) -> StoreError {
             _ => StoreError::invalid("unknown native trie-collection error column"),
         },
         CollectError::Domain(Domain::Origin(error)) => {
-            use synch_verified::history::OriginError;
-            let error = match error {
-                OriginError::Label(text) => OriginParseError::Label(text),
-                OriginError::Domain(text) => OriginParseError::Domain(text),
-                OriginError::Shape(text) => OriginParseError::Shape(text),
-                OriginError::KeyDecode => {
-                    OriginParseError::Key("failed to decode base32 string".into())
-                }
-                OriginError::KeyData => {
-                    OriginParseError::Key("data is not a valid public key".into())
-                }
-            };
+            let error = OriginParseError::from(error);
             StoreError::column("head_history.origin_id", error.to_string())
         }
         // Nothing was swept: the transaction rolled back with the walk.

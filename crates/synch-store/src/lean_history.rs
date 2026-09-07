@@ -3,7 +3,7 @@ use crate::{lean_storage::SqliteStorage, Result, Store, StoreError};
 use synch_core::{origin::OriginParseError, NodeId, OriginId};
 use synch_verified::{
     cas::OperationError,
-    history::{CellType, DomainError, Error, OriginError},
+    history::{CellType, DomainError, Error},
 };
 
 struct Crypto;
@@ -51,17 +51,7 @@ fn error(error: Error<StoreError>) -> StoreError {
             StoreError::column(column, reason)
         }
         Error::Domain(DomainError::Origin(error)) => {
-            let error = match error {
-                OriginError::Label(text) => OriginParseError::Label(text),
-                OriginError::Domain(text) => OriginParseError::Domain(text),
-                OriginError::Shape(text) => OriginParseError::Shape(text),
-                OriginError::KeyDecode => {
-                    OriginParseError::Key("failed to decode base32 string".into())
-                }
-                OriginError::KeyData => {
-                    OriginParseError::Key("data is not a valid public key".into())
-                }
-            };
+            let error = OriginParseError::from(error);
             StoreError::column("heads.origin_id", error.to_string())
         }
     }

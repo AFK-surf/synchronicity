@@ -179,6 +179,13 @@ inductive Command where
   /-- Check that a confined publisher introduces no entries outside its grant. -/
   | trieFirstOutside (root : ByteArray) (prefixes : Option (List ByteArray)) (exact : List ByteArray)
 
+  /-- Complete origin parsing, including primitive key-point validation. -/
+  | originParse (text : String)
+  /-- Validate and normalize both named-origin components in one operation. -/
+  | originNamed (id domain : String)
+  | originNormalizeLabel (text : String)
+  | originNormalizeDomain (text : String)
+
 /-- Malformed metadata or a column of the wrong storage class, as pin
 acquisition and deletion report it. -/
 inductive LifecycleDomainError where

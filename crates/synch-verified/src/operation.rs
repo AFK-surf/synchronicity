@@ -528,6 +528,18 @@ fn dispatch_readonly<S: ByteStorage>(
                 EncodeReply::encode,
             ))
         }
+        Frame::ValidateEd25519(bytes) => {
+            let crypto = capabilities
+                .crypto
+                .as_deref_mut()
+                .ok_or(OperationError::Protocol)?;
+            Ok(reply(
+                27,
+                crypto.validate_ed25519(bytes),
+                errors,
+                EncodeReply::encode,
+            ))
+        }
         Frame::Blake3(bytes) => {
             let digest = capabilities
                 .digest
@@ -1296,6 +1308,25 @@ pub(crate) fn run_digest<D: crate::host::Digest>(
         },
         inputs,
         capabilities,
+    )
+}
+
+/// Execute a command with only primitive point validation. No storage or
+/// domain parsing capability is supplied by the host.
+pub(crate) fn run_crypto<C: crate::host::Crypto>(
+    crypto: &mut C,
+    command: &Command,
+) -> Result<Vec<u8>, OperationError<C::Error>> {
+    execute(
+        start(command),
+        |frame, capabilities, errors| {
+            dispatch_readonly::<NoBytes<C::Error>>(None, capabilities, frame, errors)
+        },
+        &[],
+        Capabilities {
+            crypto: Some(crypto),
+            ..Capabilities::default()
+        },
     )
 }
 

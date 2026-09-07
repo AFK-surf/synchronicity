@@ -85,7 +85,8 @@ def messages : List Name := [
   ``VerifiedCore.Replication.Exchange.ExchangePlan,
   ``VerifiedCore.Replication.Contact.ContactPlan,
   ``VerifiedCore.Cas.Codec.CellType, ``VerifiedCore.Cas.PinHolder, ``VerifiedCore.Cas.Input.Kind,
-  ``VerifiedCore.Cas.Outcome, ``VerifiedCore.Origin.Error, ``VerifiedCore.Trie.LookupError,
+  ``VerifiedCore.Cas.Outcome, ``VerifiedCore.Origin.Error,
+  ``VerifiedCore.Origin.Named, ``VerifiedCore.Origin.Parsed, ``VerifiedCore.Trie.LookupError,
   ``VerifiedCore.Trie.Value, ``VerifiedCore.Trie.Diff.Change, ``VerifiedCore.Trie.Proof.Proof,
   ``VerifiedCore.Trie.Refusal, ``VerifiedCore.Trie.Verdict, ``VerifiedCore.Trie.MutationError,
   ``VerifiedCore.Trie.Proof.VerifyError,
@@ -108,6 +109,8 @@ def rustName (name : Name) : String :=
   match name with
   | ``VerifiedCore.Cas.Input.Kind => "IngestInput"
   | ``VerifiedCore.Origin.Error => "OriginError"
+  | ``VerifiedCore.Origin.Named => "NamedOrigin"
+  | ``VerifiedCore.Origin.Parsed => "ParsedOrigin"
   | ``VerifiedCore.Trie.LookupError => "LookupDomainError"
   | ``VerifiedCore.Trie.Refusal => "NodeRefusal"
   | ``VerifiedCore.Trie.Verdict => "NodeVerdict"

@@ -338,6 +338,12 @@ def dispatch : Command → Native
     if root.size != 32 then protocol
     else command (Trie.Complete.isComplete (Std.HashSet Trie.Missing.Visit) (Std.HashSet ByteArray)
       ⟨⟨prefixes, exact⟩, owner⟩ root) completing
+  | .originParse text =>
+    command (Origin.parse (m := Host.OperationOver Host.Crypto Host.Failure)
+      (fun bytes => Host.raise id (Host.Crypto.validateEd25519 bytes)) text) hostOnly
+  | .originNamed id domain => pure (terminalOf (Origin.named id domain))
+  | .originNormalizeLabel text => pure (terminalOf (Origin.normalizeLabel text))
+  | .originNormalizeDomain text => pure (terminalOf (Origin.normalizeDomain text))
   | .planContact peers cursor maximum =>
     if peers.length > UInt64.size || !(peers.all (·.size == 32)) ||
         cursor.any (·.size != 32) || maximum == 0 || maximum > 256 then protocol

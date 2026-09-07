@@ -126,6 +126,28 @@ instance : Decode Origin.Error where
     | 4 => return .shape (← Decode.decode)
     | _ => throw ()
 
+instance : Encode Origin.Named where
+  encode out value := match value with
+    | .mk a0 a1 => out |>.put a0 |>.put a1
+
+instance : Decode Origin.Named where
+  decode := do
+    let a0 ← Decode.decode
+    let a1 ← Decode.decode
+    return .mk a0 a1
+
+instance : Encode Origin.Parsed where
+  encode out value := match value with
+    | .named a0 => out.push 0 |>.put a0
+    | .key a0 => out.push 1 |>.put a0
+
+instance : Decode Origin.Parsed where
+  decode := do
+    match ← readByte with
+    | 0 => return .named (← Decode.decode)
+    | 1 => return .key (← Decode.decode)
+    | _ => throw ()
+
 instance : Encode Trie.LookupError where
   encode out value := match value with
     | .keyTooLong a0 => out.push 0 |>.put a0
@@ -656,6 +678,10 @@ instance : Encode Commands.Command where
     | .casBlobIn a0 a1 => out.push 48 |>.put a0 |>.put a1
     | .planContact a0 a1 a2 => out.push 49 |>.put a0 |>.put a1 |>.put a2
     | .trieFirstOutside a0 a1 a2 => out.push 50 |>.put a0 |>.put a1 |>.put a2
+    | .originParse a0 => out.push 51 |>.put a0
+    | .originNamed a0 a1 => out.push 52 |>.put a0 |>.put a1
+    | .originNormalizeLabel a0 => out.push 53 |>.put a0
+    | .originNormalizeDomain a0 => out.push 54 |>.put a0
 
 instance : Decode Commands.Command where
   decode := do
@@ -711,6 +737,10 @@ instance : Decode Commands.Command where
     | 48 => return .casBlobIn (← Decode.decode) (← Decode.decode)
     | 49 => return .planContact (← Decode.decode) (← Decode.decode) (← Decode.decode)
     | 50 => return .trieFirstOutside (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 51 => return .originParse (← Decode.decode)
+    | 52 => return .originNamed (← Decode.decode) (← Decode.decode)
+    | 53 => return .originNormalizeLabel (← Decode.decode)
+    | 54 => return .originNormalizeDomain (← Decode.decode)
     | _ => throw ()
 
 end VerifiedCore

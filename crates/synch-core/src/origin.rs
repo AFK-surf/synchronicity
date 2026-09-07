@@ -1,6 +1,8 @@
 //! [`OriginId`] — the stable identity that owns a trie (§3.1).
 
-use std::{fmt, str::FromStr};
+use std::{convert::Infallible, fmt, str::FromStr};
+
+use synch_verified::origin::{self as verified, DomainError, OperationError};
 
 use iroh_base::PublicKey;
 use serde::{Deserialize, Serialize};
@@ -28,9 +30,11 @@ pub enum OriginId {
 impl OriginId {
     /// Builds a named origin, validating and normalizing both parts.
     pub fn named(id: &str, domain: &str) -> Result<Self, OriginParseError> {
-        let id = normalize_label(id)?;
-        let domain = normalize_domain(domain)?;
-        Ok(OriginId::Named { domain, id })
+        let value = verified::named(id, domain).map_err(operation_error)?;
+        Ok(OriginId::Named {
+            domain: value.domain,
+            id: value.id,
+        })
     }
 
     /// The canonical text rendering, as stored in the `origin_id` SQL columns (§10).
@@ -120,61 +124,70 @@ pub enum OriginParseError {
     /// The string was neither `key:<...>` nor `<id>@<domain>`.
     #[error("origin must be '<id>@<domain>' or 'key:<z-base-32>', got {0:?}")]
     Shape(String),
+    /// The native operation failed; this is not rejection of an origin's syntax.
+    #[error("origin validation operation failed: {0}")]
+    Operation(#[source] OperationError<Infallible>),
+}
+
+impl From<DomainError> for OriginParseError {
+    fn from(error: DomainError) -> Self {
+        match error {
+            DomainError::Label(text) => Self::Label(text),
+            DomainError::Domain(text) => Self::Domain(text),
+            DomainError::Shape(text) => Self::Shape(text),
+            DomainError::KeyDecode => Self::Key("failed to decode base32 string".into()),
+            DomainError::KeyData => Self::Key("data is not a valid public key".into()),
+        }
+    }
+}
+
+fn operation_error(error: verified::Error<Infallible>) -> OriginParseError {
+    match error {
+        verified::Error::Operation(error) => OriginParseError::Operation(error),
+        verified::Error::Domain(error) => error.into(),
+    }
 }
 
 /// Normalizes and validates a member label (`id=` in the TXT record, §3.2).
 pub fn normalize_label(id: &str) -> Result<String, OriginParseError> {
-    let lower = id.to_ascii_lowercase();
-    let ok = !lower.is_empty()
-        && lower.len() <= 63
-        && lower
-            .bytes()
-            .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-');
-    if ok {
-        Ok(lower)
-    } else {
-        Err(OriginParseError::Label(id.to_string()))
-    }
+    verified::normalize_label(id).map_err(operation_error)
 }
 
 /// Normalizes and validates a DNS membership domain.
 pub fn normalize_domain(domain: &str) -> Result<String, OriginParseError> {
-    let lower = domain.trim_end_matches('.').to_ascii_lowercase();
-    let ok = !lower.is_empty()
-        && lower.len() <= 253
-        && lower.split('.').all(|label| {
-            !label.is_empty()
-                && label.len() <= 63
-                && label
-                    .bytes()
-                    .all(|b| b.is_ascii_lowercase() || b.is_ascii_digit() || b == b'-')
-                && !label.starts_with('-')
-                && !label.ends_with('-')
-        });
-    if ok {
-        Ok(lower)
-    } else {
-        Err(OriginParseError::Domain(domain.to_string()))
-    }
+    verified::normalize_domain(domain).map_err(operation_error)
 }
 
 impl FromStr for OriginId {
     type Err = OriginParseError;
 
     fn from_str(s: &str) -> Result<Self, Self::Err> {
-        if let Some(rest) = s.strip_prefix("key:") {
-            let key =
-                PublicKey::from_z32(rest).map_err(|e| OriginParseError::Key(e.to_string()))?;
-            return Ok(OriginId::Key(key));
+        let mut crypto = PointValidator(None);
+        match verified::parse(&mut crypto, s).map_err(operation_error)? {
+            verified::Parsed::Named(value) => Ok(Self::Named {
+                domain: value.domain,
+                id: value.id,
+            }),
+            verified::Parsed::Key(bytes) => crypto
+                .0
+                .filter(|key| key.as_bytes().as_slice() == bytes.as_slice())
+                .map(Self::Key)
+                .ok_or(OriginParseError::Operation(OperationError::Protocol)),
         }
-        if let Some((id, domain)) = s.split_once('@') {
-            return OriginId::named(id, domain);
-        }
-        // A bare z-base-32 key is also accepted for CLI convenience.
-        if let Ok(key) = PublicKey::from_z32(s) {
-            return Ok(OriginId::Key(key));
-        }
-        Err(OriginParseError::Shape(s.to_string()))
+    }
+}
+
+/// Cache the validated wire key so decoding the command result does not
+/// repeat the cryptographic primitive. Syntax and diagnostic choice stay in Lean.
+struct PointValidator(Option<NodeId>);
+
+impl synch_verified::host::Crypto for PointValidator {
+    type Error = Infallible;
+    fn validate_ed25519(&mut self, bytes: &[u8]) -> Result<bool, Self::Error> {
+        self.0 = <&[u8; 32]>::try_from(bytes)
+            .ok()
+            .and_then(|key| PublicKey::from_bytes(key).ok());
+        Ok(self.0.is_some())
     }
 }
 

@@ -15,6 +15,7 @@ pub mod history;
 pub mod host;
 mod native;
 mod operation;
+pub mod origin;
 pub mod replication;
 pub mod suspend;
 pub mod trie;
