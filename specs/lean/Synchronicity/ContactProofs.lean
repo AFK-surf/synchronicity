@@ -1,5 +1,6 @@
 import VerifiedCore.Replication.Contact
 import Synchronicity.ExchangeVersionProofs
+import Synchronicity.SimulatedHost.Database
 import Std.Data.TreeMap.Lemmas
 import Init.Data.List.Nat.TakeDrop
 
@@ -219,5 +220,132 @@ theorem every_peer_has_a_bounded_turn [BEq α] [LawfulBEq α]
   rw [cycle_length entries ordered] at bounded
   have reached := positions rounds (Nat.le_refl _)
   omega
+
+private def PointsTo (peers : List ByteArray) (table : Index) : Prop :=
+  ∀ rank value, table[rank]? = some value →
+    key value.2 = rank ∧ peers[value.1]? = some value.2
+
+private theorem fold_points_to (peers : List ByteArray) (input : List (ByteArray × Nat))
+    (valid : ∀ item ∈ input, peers[item.2]? = some item.1)
+    (table : Index) (points : PointsTo peers table) :
+    PointsTo peers (input.foldl (fun result (peer, position) =>
+      result.insert (key peer) (position, peer)) table) := by
+  induction input generalizing table with
+  | nil => exact points
+  | cons item rest ih =>
+    apply ih (fun item member => valid item (List.mem_cons_of_mem _ member))
+    intro rank value found
+    rw [Std.TreeMap.getElem?_insert] at found
+    split at found
+    · rename_i same
+      have named : key item.1 = rank := by simpa using same
+      cases Option.some.inj found
+      exact ⟨named, valid item (by simp)⟩
+    · exact points rank value found
+
+/-- Every entry retained by the native contact index names exactly the peer
+at its input position. Duplicate inputs cannot create an unrelated identity. -/
+theorem indexed_peers_come_from_input (peers : List ByteArray)
+    (entry : Nat × (Nat × ByteArray)) (member : entry ∈ (index peers).toList) :
+    key entry.2.2 = entry.1 ∧ peers[entry.2.1]? = some entry.2.2 := by
+  have valid := fold_points_to peers peers.zipIdx
+    (fun item member => List.mem_zipIdx_iff_getElem?.mp member) ({} : Index)
+    (by intro rank value found; simp at found)
+  exact valid entry.1 entry.2 (Std.TreeMap.mem_toList_iff_getElem?_eq_some.mp member)
+
+/-- A selected native position resolves back to its selected eligible peer;
+the checked boundary size prevents integer conversion from changing it. -/
+theorem selected_positions_name_the_selected_peers (peers : List ByteArray)
+    (within : peers.length ≤ UInt64.size) (cursor : Option ByteArray) (maximum : Nat)
+    (entry : Nat × (Nat × ByteArray))
+    (selected : entry ∈ (cycle (index peers) cursor).take maximum) :
+    entry.2.1.toUInt64 ∈ (plan peers cursor maximum).positions ∧
+      peers[entry.2.1.toUInt64.toNat]? = some entry.2.2 := by
+  have belongs := (cycle_membership (index peers).toList entry _).mp
+    (List.mem_of_mem_take selected)
+  obtain ⟨_, source⟩ := indexed_peers_come_from_input peers entry belongs
+  have bound : entry.2.1 < peers.length := List.getElem?_eq_some_iff.mp source |>.choose
+  have fits : entry.2.1 < UInt64.size := Nat.lt_of_lt_of_le bound within
+  refine ⟨List.mem_map.mpr ⟨entry, selected, rfl⟩, ?_⟩
+  simpa only [UInt64.toNat_ofNat_of_lt' fits] using source
+
+private theorem fold_membership (input : List (ByteArray × Nat)) (table : Index) (rank : Nat) :
+    rank ∈ input.foldl (fun result (peer, position) => result.insert (key peer) (position, peer)) table ↔
+      rank ∈ table ∨ ∃ item ∈ input, key item.1 = rank := by
+  induction input generalizing table with
+  | nil => simp
+  | cons item rest ih =>
+    simp [List.foldl_cons, ih, Std.TreeMap.mem_insert, or_assoc, or_comm]
+
+/-- No eligible peer disappears during native indexing, even when the input
+contains duplicates. Fixed-width identity ordering excludes key collisions. -/
+theorem every_input_peer_is_indexed (peers : List ByteArray)
+    (width : ∀ peer ∈ peers, peer.size = 32) (member : peer ∈ peers) :
+    ∃ entry ∈ (index peers).toList, entry.2.2 = peer := by
+  obtain ⟨position, source⟩ := List.mem_iff_getElem?.mp member
+  have present : key peer ∈ index peers :=
+    (fold_membership peers.zipIdx {} (key peer)).mpr
+      (.inr ⟨(peer, position), List.mk_mem_zipIdx_iff_getElem?.mpr source, rfl⟩)
+  have existsValue := Std.TreeMap.mem_iff_isSome_getElem?.mp present
+  cases found : (index peers)[key peer]? with
+  | none => simp [found] at existsValue
+  | some value =>
+    have entry : (key peer, value) ∈ (index peers).toList :=
+      Std.TreeMap.mem_toList_iff_getElem?_eq_some.mpr found
+    obtain ⟨named, supplied⟩ := indexed_peers_come_from_input peers (key peer, value) entry
+    exact ⟨(key peer, value), entry,
+      peer_keys_preserve_identity value.2 peer (width value.2 (List.mem_of_getElem? supplied))
+        (width peer member) named⟩
+
+/-- The cursor actually returned by the native plan is the last selected
+peer's ordering key, exactly the transition used by the bounded-turn proof. -/
+theorem native_cursor_finishes_the_selected_batch (peers : List ByteArray)
+    (cursor : Option ByteArray) (maximum : Nat)
+    (nonempty : ((cycle (index peers) cursor).take maximum) ≠ []) :
+    ((plan peers cursor maximum).cursor.map key).getD 0 =
+      (((cycle (index peers) cursor).take maximum).getLast nonempty).1 := by
+  let last := ((cycle (index peers) cursor).take maximum).getLast nonempty
+  have member := (cycle_membership (index peers).toList last _).mp
+    (List.mem_of_mem_take (List.getLast_mem nonempty))
+  have named := (indexed_peers_come_from_input peers last member).1
+  simpa only [plan, List.getLast?_eq_some_getLast nonempty, Option.map_some,
+    Option.getD_some] using named
+
+/-- For a stable eligible input, the actual native plans select every supplied
+peer within enough completed rounds to cover the distinct peers. The result
+names a real returned position resolving to that peer, not an abstract index.
+Runtime completion of every planned attempt is the remaining engine contract. -/
+theorem native_plans_give_every_peer_a_bounded_turn (peers : List ByteArray)
+    (width : ∀ peer ∈ peers, peer.size = 32) (within : peers.length ≤ UInt64.size)
+    (member : peer ∈ peers) (maximum rounds : Nat) (positive : 0 < maximum)
+    (cursors : Nat → Option ByteArray)
+    (enough : (index peers).toList.length ≤ rounds * maximum)
+    (completed : ∀ round < rounds, cursors (round + 1) = (plan peers (cursors round) maximum).cursor) :
+    ∃ round < rounds, ∃ position ∈ (plan peers (cursors round) maximum).positions,
+      peers[position.toNat]? = some peer := by
+  obtain ⟨entry, indexed, named⟩ := every_input_peer_is_indexed peers width member
+  have ordered : (index peers).toList.Pairwise (fun a b => a.1 < b.1) := by
+    simpa only [Nat.compare_eq_lt] using (Std.TreeMap.ordered_keys_toList (t := index peers))
+  have steps : ∀ round < rounds,
+      ∃ nonempty : ((cycleAt (index peers).toList (((cursors round).map key).getD 0)).take maximum) ≠ [],
+        (((cursors (round + 1)).map key).getD 0) =
+          (((cycleAt (index peers).toList (((cursors round).map key).getD 0)).take maximum).getLast nonempty).1 := by
+    intro round before
+    have held := (cycle_membership (index peers).toList entry (((cursors round).map key).getD 0)).mpr indexed
+    have nonempty : ((cycle (index peers) (cursors round)).take maximum) ≠ [] := by
+      intro empty
+      have size := congrArg List.length empty
+      have lower := List.length_pos_of_mem held
+      simp only [List.length_take, List.length_nil] at size
+      unfold cycle at size
+      omega
+    refine ⟨nonempty, ?_⟩
+    rw [completed round before]
+    exact native_cursor_finishes_the_selected_batch peers (cursors round) maximum nonempty
+  obtain ⟨round, before, selected⟩ := every_peer_has_a_bounded_turn (index peers).toList ordered indexed
+    (fun round => ((cursors round).map key).getD 0) maximum rounds enough steps
+  obtain ⟨returned, source⟩ := selected_positions_name_the_selected_peers peers within
+    (cursors round) maximum entry selected
+  exact ⟨round, before, entry.2.1.toUInt64, returned, by simpa only [named] using source⟩
 
 end Synchronicity.ContactProofs
