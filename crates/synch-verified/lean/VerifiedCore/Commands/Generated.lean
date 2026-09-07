@@ -15,6 +15,18 @@ instance : Decode Host.Probed where
     let a1 ← Decode.decode
     return .mk a0 a1
 
+instance : Encode Host.ProviderProbed where
+  encode out value := match value with
+    | .mk a0 a1 a2 a3 => out |>.put a0 |>.put a1 |>.put a2 |>.put a3
+
+instance : Decode Host.ProviderProbed where
+  decode := do
+    let a0 ← Decode.decode
+    let a1 ← Decode.decode
+    let a2 ← Decode.decode
+    let a3 ← Decode.decode
+    return .mk a0 a1 a2 a3
+
 instance : Encode Replication.Exchange.Advertised where
   encode out value := match value with
     | .mk a0 a1 a2 => out |>.put a0 |>.put a1 |>.put a2
@@ -478,6 +490,32 @@ instance : Decode Commands.ProjectDomainError where
     | 2 => return .column (← Decode.decode) (← Decode.decode)
     | _ => throw ()
 
+instance : Encode Commands.CloudDomainError where
+  encode out value := match value with
+    | .malformed => out.push 0
+    | .columnType a0 a1 a2 => out.push 1 |>.put a0 |>.put a1 |>.put a2
+    | .column a0 a1 => out.push 2 |>.put a0 |>.put a1
+    | .missingBlob a0 => out.push 3 |>.put a0
+    | .sizeMismatch a0 a1 a2 => out.push 4 |>.put a0 |>.put a1 |>.put a2
+    | .cacheBusy => out.push 5
+    | .invalidRange a0 a1 a2 => out.push 6 |>.put a0 |>.put a1 |>.put a2
+    | .unalignedRange => out.push 7
+    | .incompleteInline => out.push 8
+
+instance : Decode Commands.CloudDomainError where
+  decode := do
+    match ← readByte with
+    | 0 => return .malformed
+    | 1 => return .columnType (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 2 => return .column (← Decode.decode) (← Decode.decode)
+    | 3 => return .missingBlob (← Decode.decode)
+    | 4 => return .sizeMismatch (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 5 => return .cacheBusy
+    | 6 => return .invalidRange (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 7 => return .unalignedRange
+    | 8 => return .incompleteInline
+    | _ => throw ()
+
 instance : Encode Commands.TrieServeDomainError where
   encode out value := match value with
     | .unvouchedRoot => out.push 0
@@ -828,39 +866,44 @@ instance : Encode Commands.Command where
     | .trieProve a0 a1 => out.push 41 |>.put a0 |>.put a1
     | .trieVerifyProof a0 a1 a2 a3 => out.push 42 |>.put a0 |>.put a1 |>.put a2 |>.put a3
     | .peerProbe a0 a1 a2 => out.push 43 |>.put a0 |>.put a1 |>.put a2
-    | .trieComplete a0 a1 a2 a3 => out.push 44 |>.put a0 |>.put a1 |>.put a2 |>.put a3
-    | .planExchange a0 a1 a2 => out.push 45 |>.put a0 |>.put a1 |>.put a2
-    | .trieFetch a0 a1 a2 a3 a4 a5 a6 a7 a8 => out.push 46 |>.put a0 |>.put a1 |>.put a2 |>.put a3 |>.put a4 |>.put a5 |>.put a6 |>.put a7 |>.put a8
-    | .trieNormalize a0 => out.push 47 |>.put a0
-    | .casBlobIn a0 a1 => out.push 48 |>.put a0 |>.put a1
-    | .planContact a0 a1 a2 => out.push 49 |>.put a0 |>.put a1 |>.put a2
-    | .trieFirstOutside a0 a1 a2 => out.push 50 |>.put a0 |>.put a1 |>.put a2
-    | .originParse a0 => out.push 51 |>.put a0
-    | .originNamed a0 a1 => out.push 52 |>.put a0 |>.put a1
-    | .originNormalizeLabel a0 => out.push 53 |>.put a0
-    | .originNormalizeDomain a0 => out.push 54 |>.put a0
-    | .originCanonical a0 => out.push 55 |>.put a0
-    | .authBindings a0 a1 a2 => out.push 56 |>.put a0 |>.put a1 |>.put a2
-    | .authBindingStatuses a0 => out.push 57 |>.put a0
-    | .authTrustedKeys a0 => out.push 58 |>.put a0
-    | .authTrustedOrigins a0 => out.push 59 |>.put a0
-    | .authTrustedKey a0 a1 => out.push 60 |>.put a0 |>.put a1
-    | .authBound a0 a1 a2 => out.push 61 |>.put a0 |>.put a1 |>.put a2
-    | .authPeerAuthority a0 a1 => out.push 62 |>.put a0 |>.put a1
-    | .authOriginPublication a0 a1 => out.push 63 |>.put a0 |>.put a1
-    | .authOriginAuthority a0 a1 => out.push 64 |>.put a0 |>.put a1
-    | .authOriginAuthorityIn a0 a1 a2 => out.push 65 |>.put a0 |>.put a1 |>.put a2
-    | .authLocalAuthority a0 => out.push 66 |>.put a0
-    | .authLocalSpaces => out.push 67
-    | .authLocalScope => out.push 68
-    | .authLocalScopeIn a0 => out.push 69 |>.put a0
-    | .authMaterializationScope a0 => out.push 70 |>.put a0
-    | .authMaterializationScopeIn a0 a1 => out.push 71 |>.put a0 |>.put a1
-    | .authMetadataPeer a0 a1 => out.push 72 |>.put a0 |>.put a1
-    | .authSocketAuthority a0 a1 => out.push 73 |>.put a0 |>.put a1
-    | .authSoleDnsHintSource a0 a1 a2 => out.push 74 |>.put a0 |>.put a1 |>.put a2
-    | .authHasDelegations => out.push 75
-    | .authExpireDns a0 => out.push 76 |>.put a0
+    | .providerProbe a0 a1 => out.push 44 |>.put a0 |>.put a1
+    | .cloudEnsureCached a0 a1 => out.push 45 |>.put a0 |>.put a1
+    | .cloudEnsureRanges a0 a1 a2 => out.push 46 |>.put a0 |>.put a1 |>.put a2
+    | .cloudHydrate a0 a1 a2 => out.push 47 |>.put a0 |>.put a1 |>.put a2
+    | .cloudOutboard a0 a1 => out.push 48 |>.put a0 |>.put a1
+    | .trieComplete a0 a1 a2 a3 => out.push 49 |>.put a0 |>.put a1 |>.put a2 |>.put a3
+    | .planExchange a0 a1 a2 => out.push 50 |>.put a0 |>.put a1 |>.put a2
+    | .trieFetch a0 a1 a2 a3 a4 a5 a6 a7 a8 => out.push 51 |>.put a0 |>.put a1 |>.put a2 |>.put a3 |>.put a4 |>.put a5 |>.put a6 |>.put a7 |>.put a8
+    | .trieNormalize a0 => out.push 52 |>.put a0
+    | .casBlobIn a0 a1 => out.push 53 |>.put a0 |>.put a1
+    | .planContact a0 a1 a2 => out.push 54 |>.put a0 |>.put a1 |>.put a2
+    | .trieFirstOutside a0 a1 a2 => out.push 55 |>.put a0 |>.put a1 |>.put a2
+    | .originParse a0 => out.push 56 |>.put a0
+    | .originNamed a0 a1 => out.push 57 |>.put a0 |>.put a1
+    | .originNormalizeLabel a0 => out.push 58 |>.put a0
+    | .originNormalizeDomain a0 => out.push 59 |>.put a0
+    | .originCanonical a0 => out.push 60 |>.put a0
+    | .authBindings a0 a1 a2 => out.push 61 |>.put a0 |>.put a1 |>.put a2
+    | .authBindingStatuses a0 => out.push 62 |>.put a0
+    | .authTrustedKeys a0 => out.push 63 |>.put a0
+    | .authTrustedOrigins a0 => out.push 64 |>.put a0
+    | .authTrustedKey a0 a1 => out.push 65 |>.put a0 |>.put a1
+    | .authBound a0 a1 a2 => out.push 66 |>.put a0 |>.put a1 |>.put a2
+    | .authPeerAuthority a0 a1 => out.push 67 |>.put a0 |>.put a1
+    | .authOriginPublication a0 a1 => out.push 68 |>.put a0 |>.put a1
+    | .authOriginAuthority a0 a1 => out.push 69 |>.put a0 |>.put a1
+    | .authOriginAuthorityIn a0 a1 a2 => out.push 70 |>.put a0 |>.put a1 |>.put a2
+    | .authLocalAuthority a0 => out.push 71 |>.put a0
+    | .authLocalSpaces => out.push 72
+    | .authLocalScope => out.push 73
+    | .authLocalScopeIn a0 => out.push 74 |>.put a0
+    | .authMaterializationScope a0 => out.push 75 |>.put a0
+    | .authMaterializationScopeIn a0 a1 => out.push 76 |>.put a0 |>.put a1
+    | .authMetadataPeer a0 a1 => out.push 77 |>.put a0 |>.put a1
+    | .authSocketAuthority a0 a1 => out.push 78 |>.put a0 |>.put a1
+    | .authSoleDnsHintSource a0 a1 a2 => out.push 79 |>.put a0 |>.put a1 |>.put a2
+    | .authHasDelegations => out.push 80
+    | .authExpireDns a0 => out.push 81 |>.put a0
 
 instance : Decode Commands.Command where
   decode := do
@@ -909,39 +952,44 @@ instance : Decode Commands.Command where
     | 41 => return .trieProve (← Decode.decode) (← Decode.decode)
     | 42 => return .trieVerifyProof (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode)
     | 43 => return .peerProbe (← Decode.decode) (← Decode.decode) (← Decode.decode)
-    | 44 => return .trieComplete (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode)
-    | 45 => return .planExchange (← Decode.decode) (← Decode.decode) (← Decode.decode)
-    | 46 => return .trieFetch (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode)
-    | 47 => return .trieNormalize (← Decode.decode)
-    | 48 => return .casBlobIn (← Decode.decode) (← Decode.decode)
-    | 49 => return .planContact (← Decode.decode) (← Decode.decode) (← Decode.decode)
-    | 50 => return .trieFirstOutside (← Decode.decode) (← Decode.decode) (← Decode.decode)
-    | 51 => return .originParse (← Decode.decode)
-    | 52 => return .originNamed (← Decode.decode) (← Decode.decode)
-    | 53 => return .originNormalizeLabel (← Decode.decode)
-    | 54 => return .originNormalizeDomain (← Decode.decode)
-    | 55 => return .originCanonical (← Decode.decode)
-    | 56 => return .authBindings (← Decode.decode) (← Decode.decode) (← Decode.decode)
-    | 57 => return .authBindingStatuses (← Decode.decode)
-    | 58 => return .authTrustedKeys (← Decode.decode)
-    | 59 => return .authTrustedOrigins (← Decode.decode)
-    | 60 => return .authTrustedKey (← Decode.decode) (← Decode.decode)
-    | 61 => return .authBound (← Decode.decode) (← Decode.decode) (← Decode.decode)
-    | 62 => return .authPeerAuthority (← Decode.decode) (← Decode.decode)
-    | 63 => return .authOriginPublication (← Decode.decode) (← Decode.decode)
-    | 64 => return .authOriginAuthority (← Decode.decode) (← Decode.decode)
-    | 65 => return .authOriginAuthorityIn (← Decode.decode) (← Decode.decode) (← Decode.decode)
-    | 66 => return .authLocalAuthority (← Decode.decode)
-    | 67 => return .authLocalSpaces
-    | 68 => return .authLocalScope
-    | 69 => return .authLocalScopeIn (← Decode.decode)
-    | 70 => return .authMaterializationScope (← Decode.decode)
-    | 71 => return .authMaterializationScopeIn (← Decode.decode) (← Decode.decode)
-    | 72 => return .authMetadataPeer (← Decode.decode) (← Decode.decode)
-    | 73 => return .authSocketAuthority (← Decode.decode) (← Decode.decode)
-    | 74 => return .authSoleDnsHintSource (← Decode.decode) (← Decode.decode) (← Decode.decode)
-    | 75 => return .authHasDelegations
-    | 76 => return .authExpireDns (← Decode.decode)
+    | 44 => return .providerProbe (← Decode.decode) (← Decode.decode)
+    | 45 => return .cloudEnsureCached (← Decode.decode) (← Decode.decode)
+    | 46 => return .cloudEnsureRanges (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 47 => return .cloudHydrate (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 48 => return .cloudOutboard (← Decode.decode) (← Decode.decode)
+    | 49 => return .trieComplete (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 50 => return .planExchange (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 51 => return .trieFetch (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 52 => return .trieNormalize (← Decode.decode)
+    | 53 => return .casBlobIn (← Decode.decode) (← Decode.decode)
+    | 54 => return .planContact (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 55 => return .trieFirstOutside (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 56 => return .originParse (← Decode.decode)
+    | 57 => return .originNamed (← Decode.decode) (← Decode.decode)
+    | 58 => return .originNormalizeLabel (← Decode.decode)
+    | 59 => return .originNormalizeDomain (← Decode.decode)
+    | 60 => return .originCanonical (← Decode.decode)
+    | 61 => return .authBindings (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 62 => return .authBindingStatuses (← Decode.decode)
+    | 63 => return .authTrustedKeys (← Decode.decode)
+    | 64 => return .authTrustedOrigins (← Decode.decode)
+    | 65 => return .authTrustedKey (← Decode.decode) (← Decode.decode)
+    | 66 => return .authBound (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 67 => return .authPeerAuthority (← Decode.decode) (← Decode.decode)
+    | 68 => return .authOriginPublication (← Decode.decode) (← Decode.decode)
+    | 69 => return .authOriginAuthority (← Decode.decode) (← Decode.decode)
+    | 70 => return .authOriginAuthorityIn (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 71 => return .authLocalAuthority (← Decode.decode)
+    | 72 => return .authLocalSpaces
+    | 73 => return .authLocalScope
+    | 74 => return .authLocalScopeIn (← Decode.decode)
+    | 75 => return .authMaterializationScope (← Decode.decode)
+    | 76 => return .authMaterializationScopeIn (← Decode.decode) (← Decode.decode)
+    | 77 => return .authMetadataPeer (← Decode.decode) (← Decode.decode)
+    | 78 => return .authSocketAuthority (← Decode.decode) (← Decode.decode)
+    | 79 => return .authSoleDnsHintSource (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 80 => return .authHasDelegations
+    | 81 => return .authExpireDns (← Decode.decode)
     | _ => throw ()
 
 end VerifiedCore

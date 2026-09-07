@@ -3,7 +3,7 @@
 //! types they exchange are defined here.
 
 pub use crate::generated::{
-    Apply, Bao, ByteWrites, Clock, Construct, Crypto, Digest, FileIO, Lease, Memo, Output,
+    Apply, Bao, ByteWrites, CacheIO, Clock, Construct, Crypto, Digest, FileIO, Lease, Memo, Output,
     Redaction, Resources, Snapshots, SourceIO, Storage, Sweep, TemporaryFiles,
 };
 

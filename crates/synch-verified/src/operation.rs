@@ -434,7 +434,12 @@ macro_rules! encode_list {
         })+
     };
 }
-encode_list!(Vec<u8>, String, (Vec<u8>, Vec<u8>));
+encode_list!(
+    Vec<u8>,
+    String,
+    (Vec<u8>, Vec<u8>),
+    crate::generated::ParsedOrigin
+);
 
 /// How a terminal value is read back once a run has finished.
 pub(crate) trait Decode: Sized {
@@ -653,6 +658,7 @@ pub(crate) struct Capabilities<'a, E> {
     pub(crate) output: Option<&'a mut dyn crate::host::Output<Error = OperationError<E>>>,
     pub(crate) construct: Option<&'a mut dyn crate::host::Construct<Error = E>>,
     pub(crate) temporary: Option<&'a mut dyn crate::host::TemporaryFiles<Error = E>>,
+    pub(crate) cache: Option<&'a mut dyn crate::host::CacheIO<Error = E>>,
     pub(crate) leases: Option<&'a mut dyn crate::host::Lease<Error = E>>,
     pub(crate) source: Option<&'a mut dyn crate::host::SourceIO<Error = E>>,
     pub(crate) digest: Option<&'a mut dyn crate::host::Digest<Error = E>>,
@@ -675,6 +681,7 @@ impl<E> Default for Capabilities<'_, E> {
             output: None,
             construct: None,
             temporary: None,
+            cache: None,
             leases: None,
             source: None,
             digest: None,
@@ -762,6 +769,37 @@ pub enum PeerReply<E> {
     Failed(E),
 }
 
+/// Literal immutable-object IO requested by a suspended cloud operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderRequest {
+    Stat {
+        space: String,
+        key: Vec<u8>,
+    },
+    ReadAll {
+        space: String,
+        key: Vec<u8>,
+    },
+    ReadRange {
+        space: String,
+        key: Vec<u8>,
+        offset: u64,
+        count: u64,
+    },
+}
+
+/// Raw provider results. Only the provider's actual not-found error is
+/// classified as missing; all errors retain their original host allocation.
+#[derive(Debug)]
+pub enum ProviderReply<E> {
+    Stat(Result<u64, FileFailure<E>>),
+    ReadAll(Result<Vec<u8>, FileFailure<E>>),
+    ReadRange(Result<Vec<u8>, FileFailure<E>>),
+}
+
+pub type ProviderStep<T, E> = Step<T, E, ProviderRequest>;
+pub type ProviderSuspension<T, E> = Suspension<T, E, ProviderRequest>;
+
 /// A completed operation or an owned continuation waiting for external IO.
 /// The request type identifies the external service; peer requests are the
 /// default for existing network callers.
@@ -773,8 +811,9 @@ pub enum Step<T, E, R = PeerRequest> {
 
 /// A program waiting for external IO. It owns the Lean continuation, so it stays
 /// on the thread that started the run and holds no storage: the runner only
-/// suspends while no transaction is open, and the storage handed to `resume`
-/// may be a fresh one. Dropping it drops the continuation unanswered.
+/// suspends while no transaction or remover section is open. The storage
+/// handed to the resuming facade may be fresh. Dropping this value drops the
+/// continuation unanswered; the invocation host owns resource abandonment.
 pub struct Suspension<T, E, R = PeerRequest> {
     state: Handle,
     request: R,
@@ -840,19 +879,55 @@ impl<T, E> Suspension<T, E> {
             }
             _ => protocol_failure(),
         };
+        self.continue_response(response, storage, capabilities, peer_request)
+    }
+}
+
+impl<T, E, R> Suspension<T, E, R> {
+    fn continue_response<S: Storage<Error = E>>(
+        mut self,
+        response: Vec<u8>,
+        storage: &mut S,
+        capabilities: Capabilities<'_, E>,
+        request: RequestDecoder<R>,
+    ) -> Result<Step<T, E, R>, OperationError<E>> {
         self.state.resume(&response);
         drive(
             Run {
                 state: self.state,
                 errors: self.errors,
                 open: 0,
-                request: Some(peer_request),
+                sections: Vec::new(),
+                request: Some(request),
                 finish: self.finish,
             },
             |frame, capabilities, errors| dispatch(storage, capabilities, frame, errors),
             &[],
             capabilities,
         )
+    }
+}
+
+impl<T, E> ProviderSuspension<T, E> {
+    pub(crate) fn continue_provider_with<S: Storage<Error = E>>(
+        mut self,
+        answer: ProviderReply<E>,
+        storage: &mut S,
+        capabilities: Capabilities<'_, E>,
+    ) -> Result<ProviderStep<T, E>, OperationError<E>> {
+        let response = match (&self.request, answer) {
+            (ProviderRequest::Stat { .. }, ProviderReply::Stat(value)) => {
+                file_reply(self.tag, value, &mut self.errors, EncodeReply::encode)
+            }
+            (ProviderRequest::ReadAll { .. }, ProviderReply::ReadAll(value))
+            | (ProviderRequest::ReadRange { .. }, ProviderReply::ReadRange(value)) => {
+                file_reply(self.tag, value, &mut self.errors, EncodeReply::encode)
+            }
+            // Provider effects use the FileReply envelope even on malformed
+            // host replies, so Lean can run its resource cleanup continuation.
+            _ => file_protocol_failure(),
+        };
+        self.continue_response(response, storage, capabilities, provider_request)
     }
 }
 
@@ -897,16 +972,50 @@ fn peer_request(frame: &Frame<'_>) -> Option<(PeerRequest, u8)> {
     }
 }
 
-/// A run in progress: the continuation, the host errors it has registered,
-/// how many storage transactions it holds open (a suspension is refused
-/// while any is), which external requests may suspend, and how its terminal
-/// is read.
+fn provider_request(frame: &Frame<'_>) -> Option<(ProviderRequest, u8)> {
+    match frame {
+        Frame::ProviderStat(space, key) => Some((
+            ProviderRequest::Stat {
+                space: space.clone(),
+                key: key.to_vec(),
+            },
+            77,
+        )),
+        Frame::ProviderReadAll(space, key) => Some((
+            ProviderRequest::ReadAll {
+                space: space.clone(),
+                key: key.to_vec(),
+            },
+            78,
+        )),
+        Frame::ProviderReadRange(space, key, offset, count) => Some((
+            ProviderRequest::ReadRange {
+                space: space.clone(),
+                key: key.to_vec(),
+                offset: *offset,
+                count: *count,
+            },
+            79,
+        )),
+        _ => None,
+    }
+}
+
+fn file_protocol_failure() -> Vec<u8> {
+    let mut response = protocol_failure();
+    response.push(2); // FileFailureKind.other
+    response
+}
+
 type RequestDecoder<R> = fn(&Frame<'_>) -> Option<(R, u8)>;
 
+/// The shared transport state, including connection ownership. External IO
+/// may suspend only after every transaction and remover section is closed.
 struct Run<T, E, R> {
     state: Handle,
     errors: Vec<Option<E>>,
     open: usize,
+    sections: Vec<u64>,
     request: Option<RequestDecoder<R>>,
     finish: fn(&[u8]) -> Result<T, ()>,
 }
@@ -925,6 +1034,7 @@ fn execute<E>(
         state,
         errors: Vec::new(),
         open: 0,
+        sections: Vec::new(),
         request: None,
         finish: |bytes| Ok(bytes.to_vec()),
     };
@@ -934,10 +1044,9 @@ fn execute<E>(
     }
 }
 
-/// Drive a run until it ends or, when allowed, suspends on a peer. A peer
-/// request in a run that may not suspend, or while a transaction is open, is
-/// a protocol failure delivered into the program, so its own cleanup runs
-/// before it terminates.
+/// Drive a run until it ends or suspends on an allowed external service.
+/// A disallowed wait, or a wait while holding a transaction or remover
+/// section, receives a protocol failure so the program can run its cleanup.
 fn drive<T, E, R>(
     mut run: Run<T, E, R>,
     mut host: impl FnMut(
@@ -953,7 +1062,12 @@ fn drive<T, E, R>(
         let frame = decode(packet.as_bytes()).map_err(|()| OperationError::Protocol)?;
         let opens = matches!(frame, Frame::Begin);
         let closes = matches!(frame, Frame::Commit(_) | Frame::Rollback(_));
-        if run.open == 0 {
+        let orders = matches!(frame, Frame::Order(_));
+        let releases = match &frame {
+            Frame::Release(token) => Some(*token),
+            _ => None,
+        };
+        if run.open == 0 && run.sections.is_empty() {
             if let Some((request, tag)) = run.request.and_then(|decode| decode(&frame)) {
                 return Ok(Step::Suspended(Suspension {
                     state: run.state,
@@ -966,6 +1080,9 @@ fn drive<T, E, R>(
         }
         let response = match frame {
             Frame::FetchNodes(..) | Frame::FetchValues(..) => protocol_failure(),
+            Frame::ProviderStat(..) | Frame::ProviderReadAll(..) | Frame::ProviderReadRange(..) => {
+                file_protocol_failure()
+            }
             // The transferred bytes go from the file straight into the tail of
             // the output sink; they are never a reply payload. A sink that
             // cannot grow is a protocol failure delivered as a file failure,
@@ -1191,6 +1308,18 @@ fn drive<T, E, R>(
         if closes && matches!(response.get(1), Some(17 | 18)) {
             run.open = run.open.saturating_sub(1);
         }
+        // A remover section owns a connection even before it begins a SQL
+        // transaction. Writer leases do not, and may survive a network wait.
+        if orders && response.get(1) == Some(&63) {
+            let token = Reader(&response[2..])
+                .word()
+                .map_err(|()| OperationError::Protocol)?;
+            run.sections.push(token);
+        }
+        // Release consumes the token even when the host reports a failure.
+        if let Some(token) = releases {
+            run.sections.retain(|held| *held != token);
+        }
         // No request borrows packet data past this point. Release the packet
         // before constructing the next continuation to limit peak retention.
         drop(packet);
@@ -1351,11 +1480,31 @@ pub(crate) fn run_suspending<T, S: Storage>(
     command: &Command,
     finish: fn(&[u8]) -> Result<T, ()>,
 ) -> Result<Step<T, S::Error>, OperationError<S::Error>> {
+    run_external(storage, capabilities, command, finish, peer_request)
+}
+
+pub(crate) fn run_provider_suspending<T, S: Storage>(
+    storage: &mut S,
+    capabilities: Capabilities<'_, S::Error>,
+    command: &Command,
+    finish: fn(&[u8]) -> Result<T, ()>,
+) -> Result<ProviderStep<T, S::Error>, OperationError<S::Error>> {
+    run_external(storage, capabilities, command, finish, provider_request)
+}
+
+fn run_external<T, S: Storage, R>(
+    storage: &mut S,
+    capabilities: Capabilities<'_, S::Error>,
+    command: &Command,
+    finish: fn(&[u8]) -> Result<T, ()>,
+    request: RequestDecoder<R>,
+) -> Result<Step<T, S::Error, R>, OperationError<S::Error>> {
     let run = Run {
         state: start(command),
         errors: Vec::new(),
         open: 0,
-        request: Some(peer_request),
+        sections: Vec::new(),
+        request: Some(request),
         finish,
     };
     drive(
@@ -2580,5 +2729,226 @@ mod tests {
         ] {
             assert!(decode(packet).is_err());
         }
+    }
+    #[derive(Default)]
+    struct ProbeLeases {
+        held: bool,
+        calls: Vec<&'static str>,
+        fail_release: bool,
+    }
+    impl crate::host::Lease for ProbeLeases {
+        type Error = &'static str;
+        fn acquire(&mut self, space: &str, _: &[u8]) -> Result<u64, Self::Error> {
+            assert_eq!(space, "cas_writers");
+            self.calls.push("acquire");
+            self.held = true;
+            Ok(91)
+        }
+        fn order(&mut self, space: &str) -> Result<u64, Self::Error> {
+            assert_eq!(space, "cas");
+            self.calls.push("order");
+            self.held = true;
+            Ok(91)
+        }
+        fn release(&mut self, token: u64) -> Result<(), Self::Error> {
+            assert_eq!(token, 91);
+            assert!(self.held);
+            self.held = false;
+            self.calls.push("release");
+            if self.fail_release {
+                Err("release")
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn provider_probe(
+        script: &mut Script,
+        leases: &mut ProbeLeases,
+        mode: u64,
+    ) -> Result<
+        ProviderStep<crate::generated::ProviderProbed, &'static str>,
+        OperationError<&'static str>,
+    > {
+        run_provider_suspending(
+            script,
+            Capabilities {
+                leases: Some(leases),
+                ..Capabilities::default()
+            },
+            &Command::ProviderProbe {
+                key: b"object".to_vec(),
+                mode,
+            },
+            terminal,
+        )
+    }
+
+    fn provider_wait(
+        step: Result<
+            ProviderStep<crate::generated::ProviderProbed, &'static str>,
+            OperationError<&'static str>,
+        >,
+    ) -> ProviderSuspension<crate::generated::ProviderProbed, &'static str> {
+        match step.unwrap() {
+            Step::Suspended(wait) => wait,
+            Step::Done(_) => panic!("expected provider request"),
+        }
+    }
+
+    #[test]
+    fn provider_waits_preserve_requests_and_allow_writer_protection() {
+        let mut script = Script::default();
+        let mut leases = ProbeLeases::default();
+        let first = provider_wait(provider_probe(&mut script, &mut leases, 3));
+        assert!(leases.held);
+        assert_eq!(
+            first.request(),
+            &ProviderRequest::Stat {
+                space: "probe".into(),
+                key: b"object".to_vec(),
+            }
+        );
+        let second = provider_wait(first.continue_provider_with(
+            ProviderReply::Stat(Ok(3)),
+            &mut script,
+            Capabilities {
+                leases: Some(&mut leases),
+                ..Capabilities::default()
+            },
+        ));
+        assert!(leases.held);
+        assert_eq!(
+            second.request(),
+            &ProviderRequest::ReadAll {
+                space: "probe".into(),
+                key: b"object".to_vec(),
+            }
+        );
+        let third = provider_wait(second.continue_provider_with(
+            ProviderReply::ReadAll(Ok(b"abc".to_vec())),
+            &mut script,
+            Capabilities {
+                leases: Some(&mut leases),
+                ..Capabilities::default()
+            },
+        ));
+        assert!(leases.held);
+        assert_eq!(
+            third.request(),
+            &ProviderRequest::ReadRange {
+                space: "probe".into(),
+                key: b"object".to_vec(),
+                offset: 1,
+                count: 2,
+            }
+        );
+        let result = third
+            .continue_provider_with(
+                ProviderReply::ReadRange(Ok(b"bc".to_vec())),
+                &mut script,
+                Capabilities {
+                    leases: Some(&mut leases),
+                    ..Capabilities::default()
+                },
+            )
+            .unwrap();
+        let Step::Done(value) = result else {
+            panic!("unexpected wait")
+        };
+        assert_eq!(
+            (value.size, value.whole, value.ranged, value.missing),
+            (3, b"abc".to_vec(), b"bc".to_vec(), false)
+        );
+        assert!(!leases.held);
+        assert_eq!(leases.calls, ["acquire", "release"]);
+        assert!(script.calls.is_empty());
+    }
+
+    #[test]
+    fn provider_refuses_waits_inside_transactions_and_remover_sections() {
+        for mode in [1, 2] {
+            let mut script = Script::default();
+            let mut leases = ProbeLeases::default();
+            assert!(matches!(
+                provider_probe(&mut script, &mut leases, mode),
+                Err(OperationError::Protocol)
+            ));
+            assert!(!leases.held);
+            if mode == 1 {
+                assert_eq!(script.calls, ["begin", "rollback"]);
+                assert!(leases.calls.is_empty());
+            } else {
+                assert!(script.calls.is_empty());
+                assert_eq!(leases.calls, ["order", "release"]);
+            }
+        }
+    }
+
+    #[test]
+    fn provider_failed_release_consumes_section_before_waiting() {
+        let mut script = Script::default();
+        let mut leases = ProbeLeases {
+            fail_release: true,
+            ..ProbeLeases::default()
+        };
+        let waiting = provider_wait(provider_probe(&mut script, &mut leases, 4));
+        assert!(!leases.held);
+        assert_eq!(leases.calls, ["order", "release"]);
+        drop(waiting);
+    }
+
+    #[test]
+    fn provider_missing_and_original_errors_stay_distinct() {
+        for kind in [
+            FileFailureKind::Missing,
+            FileFailureKind::ShortRead,
+            FileFailureKind::Other,
+        ] {
+            let mut script = Script::default();
+            let mut leases = ProbeLeases::default();
+            let waiting = provider_wait(provider_probe(&mut script, &mut leases, 3));
+            let missing = matches!(kind, FileFailureKind::Missing);
+            let result = waiting.continue_provider_with(
+                ProviderReply::Stat(Err(FileFailure {
+                    error: "provider",
+                    kind,
+                })),
+                &mut script,
+                Capabilities {
+                    leases: Some(&mut leases),
+                    ..Capabilities::default()
+                },
+            );
+            if missing {
+                let Step::Done(value) = result.unwrap() else {
+                    panic!("unexpected wait")
+                };
+                assert!(value.missing);
+            } else {
+                assert!(matches!(result, Err(OperationError::Host("provider"))));
+            }
+            assert!(!leases.held);
+            assert_eq!(leases.calls, ["acquire", "release"]);
+        }
+    }
+
+    #[test]
+    fn provider_wrong_reply_kind_runs_cleanup() {
+        let mut script = Script::default();
+        let mut leases = ProbeLeases::default();
+        let waiting = provider_wait(provider_probe(&mut script, &mut leases, 3));
+        let result = waiting.continue_provider_with(
+            ProviderReply::ReadAll(Ok(Vec::new())),
+            &mut script,
+            Capabilities {
+                leases: Some(&mut leases),
+                ..Capabilities::default()
+            },
+        );
+        assert!(matches!(result, Err(OperationError::Protocol)));
+        assert!(!leases.held);
+        assert_eq!(leases.calls, ["acquire", "release"]);
     }
 }

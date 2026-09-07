@@ -30,7 +30,8 @@ distinct typed algebra. Existing storage packets retain their exact bytes. -/
 abbrev WriteEffects := EffectSum Construct
   (EffectSum Upsert (EffectSum Resources (EffectSum Lease (EffectSum SourceIO
     (EffectSum Digest (EffectSum ByteWrites (EffectSum Bao (EffectSum Sweep
-      (EffectSum Memo (EffectSum Redaction (EffectSum Apply Peer)))))))))))
+      (EffectSum Memo (EffectSum Redaction (EffectSum Apply
+        (EffectSum Peer (EffectSum Provider CacheIO)))))))))))))
 abbrev NativeEffects := EffectSum Storage (EffectSum Crypto
   (EffectSum Access (EffectSum FileIO (EffectSum Clock (EffectSum Output WriteEffects)))))
 abbrev NativeState := Program NativeEffects (Reply ByteArray)

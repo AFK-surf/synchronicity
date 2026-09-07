@@ -58,6 +58,12 @@ pub fn normalize_domain(text: &str) -> Result<String, Error<Infallible>> {
     )
 }
 
+/// Serialize a typed origin in its canonical wire spelling.
+pub fn canonical(origin: &Parsed) -> Result<String, OperationError<Infallible>> {
+    let result = operation::run_pure(&Command::OriginCanonical(origin.clone()))?;
+    terminal(&result).map_err(|()| OperationError::Protocol)
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;

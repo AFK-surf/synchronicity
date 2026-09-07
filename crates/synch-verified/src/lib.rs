@@ -10,7 +10,9 @@ mod generated {
     include!(concat!(env!("OUT_DIR"), "/generated.rs"));
 }
 
+pub mod authorization;
 pub mod cas;
+pub mod cloud;
 pub mod history;
 pub mod host;
 mod native;

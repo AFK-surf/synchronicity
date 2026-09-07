@@ -13,6 +13,7 @@ import VerifiedCore.Cas.Serve
 import VerifiedCore.Cas.Receive
 import VerifiedCore.Cas.Collect
 import VerifiedCore.Cas.Project
+import VerifiedCore.Cas.Cloud
 import VerifiedCore.Trie.Serve
 import VerifiedCore.Trie.Collect
 import VerifiedCore.Trie.Walk
@@ -159,6 +160,11 @@ inductive Command where
   /-- The suspending runner's self-test: two peer round trips, inside a
   transaction when told to. -/
   | peerProbe (root : ByteArray) (wants : List (ByteArray × ByteArray)) (inTransaction : Bool)
+  | providerProbe (key : ByteArray) (mode : UInt64)
+  | cloudEnsureCached (root : ByteArray) (size : UInt64)
+  | cloudEnsureRanges (root : ByteArray) (size : UInt64) (ranges : List (UInt64 × UInt64))
+  | cloudHydrate (root : ByteArray) (size : UInt64) (ranges : List (UInt64 × UInt64))
+  | cloudOutboard (root : ByteArray) (force : Bool)
   /-- Whether every scope-admitted position and value is held, with the
   requested provenance, guarded by the completeness memo's generation. -/
   | trieComplete (root : ByteArray) (prefixes : Option (List ByteArray)) (exact : List ByteArray)
@@ -344,6 +350,19 @@ inductive HistoryDomainError where
   | invalidText (bytes : ByteArray)
   | column (column : String) (reason : String)
   | origin (error : Origin.Error)
+  deriving BEq, DecidableEq
+
+/-- Cloud restoration refusals; original host failures use the host terminal. -/
+inductive CloudDomainError where
+  | malformed
+  | columnType (index : Nat) (column : String) (actual : Cas.Codec.CellType)
+  | column (column reason : String)
+  | missingBlob (root : ByteArray)
+  | sizeMismatch (root : ByteArray) (recorded offered : UInt64)
+  | cacheBusy
+  | invalidRange (start stop size : UInt64)
+  | unalignedRange
+  | incompleteInline
   deriving BEq, DecidableEq
 
 /-- A whole ingested object. -/

@@ -99,9 +99,10 @@ def rowOrAdopt (root : ByteArray) (size : UInt64) : Action (Option Project.Blob)
 /-- Outboard publication uses an owned temporary and never claims payload
 coverage. Cache directory-sync unavailability is explicitly tolerated; real
 flush/replace/sync failures still propagate. -/
-def outboard (root : ByteArray) : Action Unit := do
-  let cached ← try raise Error.host (Storage.readBytes "cas_outboard" root) catch _ => pure none
-  if cached.isSome then return ()
+def outboard (root : ByteArray) (force : Bool := false) : Action ByteArray := do
+  if !force then
+    let cached ← try raise Error.host (Storage.readBytes "cas_outboard" root) catch _ => pure none
+    if let some bytes := cached then return bytes
   let bytes ← providerBytes root (.readAll "cas_outboard" root)
   let temporary ← resource (.createTemporary "cas_outboard")
   ensure (do
@@ -110,6 +111,7 @@ def outboard (root : ByteArray) : Action Unit := do
     resource (.replace temporary "cas_outboard" root)
     let _ ← resource (.syncParent "cas_outboard" root)
     pure ()) (resource (.discard temporary))
+  return bytes
 
 /-- A provider range is trusted storage data, not a peer Bao slice. The
 provider's immutable-object contract supplies exact content bytes; this
@@ -147,7 +149,7 @@ def hydrateStep (root : ByteArray) (size : UInt64) (stop offset : Nat) : Action 
 def hydrate (root : ByteArray) (size : UInt64) (groups : List GroupSpan) : Action Unit := do
   if groups.isEmpty then return ()
   leased root do
-    outboard root
+    let _ ← outboard root
     if size == 0 then return ← cacheTrustedRange root size 0 ByteArray.empty
     for span in groups do
       let start := min (span.start * 16384) size.toNat

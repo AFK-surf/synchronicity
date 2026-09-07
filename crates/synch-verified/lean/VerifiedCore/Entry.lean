@@ -181,6 +181,28 @@ def walking [Encode A] : Except Trie.Walk.Error A → Host.Reply ByteArray
       | .ceiling => .ceiling
       | .host _ => .ceiling) : Except _ A)
 
+def cloudError : Cas.Cloud.Error → Except Host.Failure CloudDomainError
+  | .host hostFailure | .project (.host hostFailure) | .durable (.host hostFailure)
+    | .receive (.host hostFailure) => .error hostFailure
+  | .protocol | .receive .protocol => .error protocolFailure
+  | .project .malformed | .durable .malformed | .receive .malformed => .ok .malformed
+  | .project (.columnType index column actual) | .durable (.columnType index column actual)
+    | .receive (.columnType index column actual) => .ok (.columnType index column actual)
+  | .project (.column column reason) | .receive (.column column reason) => .ok (.column column reason)
+  | .sizeMismatch root recorded offered | .durable (.sizeMismatch root recorded offered)
+    | .receive (.sizeMismatch root recorded offered) => .ok (.sizeMismatch root recorded offered)
+  | .missingBlob root => .ok (.missingBlob root)
+  | .cacheBusy => .ok .cacheBusy
+  | .invalidRange start stop size => .ok (.invalidRange start stop size)
+  | .unalignedRange => .ok .unalignedRange
+  | .incompleteInline => .ok .incompleteInline
+
+def restoring [Encode A] : Except Cas.Cloud.Error A → Host.Reply ByteArray
+  | .ok value => terminalOf (Except.ok value : Except CloudDomainError A)
+  | .error error => match cloudError error with
+    | .error hostFailure => .error hostFailure
+    | .ok error => terminalOf (Except.error error : Except CloudDomainError A)
+
 def projecting [Encode A] : Except Cas.Project.Error A → Host.Reply ByteArray
   | .ok value => terminalOf (Except.ok value : Except ProjectDomainError A)
   | .error (.host hostFailure) => .error hostFailure
@@ -345,6 +367,16 @@ def dispatch : Command → Native
     if root.size != 32 then protocol
     else command (Trie.Proof.verify (E := Host.Digest) root key nodes value) hostOnly
   | .peerProbe root wants inTransaction => command (Host.Peer.probe root wants inTransaction) hostOnly
+  | .providerProbe key mode => command (Host.Provider.probe key mode) hostOnly
+  | .cloudEnsureCached root size =>
+    if root.size != 32 then protocol else command (Cas.Cloud.ensureCached root size) restoring
+  | .cloudEnsureRanges root size ranges =>
+    if root.size != 32 then protocol else command (Cas.Cloud.ensureRanges root size ranges) restoring
+  | .cloudHydrate root size ranges =>
+    if root.size != 32 then protocol else command (Cas.Cloud.hydrate root size
+      (normalizeSpans (groupCount size).toNat (Cas.Serve.spansOf ranges))) restoring
+  | .cloudOutboard root force =>
+    if root.size != 32 then protocol else command (Cas.Cloud.leased root (Cas.Cloud.outboard root force)) restoring
   | .trieComplete root prefixes exact owner =>
     if root.size != 32 then protocol
     else command (Trie.Complete.isComplete (Std.HashSet Trie.Missing.Visit) (Std.HashSet ByteArray)
