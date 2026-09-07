@@ -5,6 +5,20 @@ import VerifiedCore.Cas.Program
 import VerifiedCore.Cas.Read
 import VerifiedCore.Cas.Input
 import VerifiedCore.Trie.Program
+import VerifiedCore.Trie.Verify
+import VerifiedCore.Trie.Mutate
+import VerifiedCore.Cas.Durable
+import VerifiedCore.Cas.Serve
+import VerifiedCore.Cas.Receive
+import VerifiedCore.Cas.Collect
+import VerifiedCore.Cas.Project
+import VerifiedCore.Trie.Serve
+import VerifiedCore.Trie.Memo
+import VerifiedCore.Trie.Collect
+import VerifiedCore.Trie.Walk
+import VerifiedCore.Trie.Diff
+import VerifiedCore.Trie.Proof
+import VerifiedCore.Trie.Complete
 import VerifiedCore.Replication.History
 
 /-! The one native entry point. A command arrives as a packet, decoded with
@@ -84,8 +98,166 @@ def retention : Replication.History.Result Nat → Host.Reply ByteArray
       | .origin error => .origin error
       | .host _ => .malformed) : Except _ Nat)
 
+def authorizing [Encode A] : Except Authorization.Error A → Host.Reply ByteArray
+  | .ok value => terminalOf (Except.ok value : Except AuthorizationDomainError A)
+  | .error (.host hostFailure) => .error hostFailure
+  | .error error => terminalOf (Except.error (match error with
+      | .malformed => AuthorizationDomainError.malformed
+      | .columnType index column actual => .columnType index column actual
+      | .invalidText bytes => .invalidText ⟨bytes.toArray⟩
+      | .column column reason => .column column reason
+      | .origin column error => .origin column error
+      | .host _ => .malformed) : Except _ A)
+
+def mutation : Except Trie.Error ByteArray → Host.Reply ByteArray
+  | .ok root => terminalOf (Except.ok root : Except Trie.MutationError ByteArray)
+  | .error (.host hostFailure) => .error hostFailure
+  | .error (.domain error) => terminalOf (Except.error error : Except _ ByteArray)
+
+def durable [Encode A] : Except Cas.Durable.Error A → Host.Reply ByteArray
+  | .ok value => terminalOf (Except.ok value : Except DurableDomainError A)
+  | .error (.host hostFailure) => .error hostFailure
+  | .error .malformed => terminalOf (Except.error DurableDomainError.malformed : Except _ A)
+  | .error (.columnType index column actual) =>
+    terminalOf (Except.error (DurableDomainError.columnType index column actual) : Except _ A)
+  | .error (.sizeMismatch root recorded offered) =>
+    terminalOf (Except.error (DurableDomainError.sizeMismatch root recorded offered) : Except _ A)
+
+def serving : Except Cas.Serve.Error Cas.Serve.Served → Host.Reply ByteArray
+  | .ok served =>
+    terminalOf (Except.ok (Served.mk served.count served.spans) : Except ServeDomainError Served)
+  | .error (.host hostFailure) => .error hostFailure
+  | .error .protocol => .error protocolFailure
+  | .error error => terminalOf (Except.error (match error with
+      | .missingBlob => ServeDomainError.missingBlob
+      | .malformed => .malformed
+      | .columnType index column actual => .columnType index column actual
+      | .column column reason => .column column reason
+      | .overBudget level budget => .overBudget level budget
+      | .host _ | .protocol => .malformed) : Except _ Served)
+
+def receiving [Encode A] : Except Cas.Receive.Error A → Host.Reply ByteArray
+  | .ok value => terminalOf (Except.ok value : Except ReceiveDomainError A)
+  | .error (.host hostFailure) => .error hostFailure
+  | .error .protocol => .error protocolFailure
+  | .error error => terminalOf (Except.error (match error with
+      | .malformed => ReceiveDomainError.malformed
+      | .columnType index column actual => .columnType index column actual
+      | .column column reason => .column column reason
+      | .sizeMismatch root recorded offered => .sizeMismatch root recorded offered
+      | .host _ | .protocol => .malformed) : Except _ A)
+
+def servingTrie [Encode A] : Except Trie.Serve.Error A → Host.Reply ByteArray
+  | .ok value => terminalOf (Except.ok value : Except TrieServeDomainError A)
+  | .error (.host hostFailure) => .error hostFailure
+  | .error error => terminalOf (Except.error (match error with
+      | .unvouchedRoot => TrieServeDomainError.unvouchedRoot
+      | .decode message => .decode message
+      | .malformed => .malformed
+      | .columnType index column actual => .columnType index column actual
+      | .column column reason => .column column reason
+      | .host _ => .malformed) : Except _ A)
+
+def collectingTrie [Encode A] : Except Trie.Collect.Error A → Host.Reply ByteArray
+  | .ok value => terminalOf (Except.ok value : Except TrieCollectDomainError A)
+  | .error (.host hostFailure) => .error hostFailure
+  | .error error => terminalOf (Except.error (match error with
+      | .decode message => TrieCollectDomainError.decode message
+      | .malformed => .malformed
+      | .columnType index column actual => .columnType index column actual
+      | .column column reason => .column column reason
+      | .origin error => .origin error
+      | .exhausted => .exhausted
+      | .host _ => .malformed) : Except _ A)
+
+def walking [Encode A] : Except Trie.Walk.Error A → Host.Reply ByteArray
+  | .ok value => terminalOf (Except.ok value : Except TrieWalkDomainError A)
+  | .error (.host hostFailure) => .error hostFailure
+  | .error error => terminalOf (Except.error (match error with
+      | .missingNode hash => TrieWalkDomainError.missingNode hash
+      | .missingValue hash => .missingValue hash
+      | .decode message => .decode message
+      | .oddDepthValue => .oddDepthValue
+      | .ceiling => .ceiling
+      | .host _ => .ceiling) : Except _ A)
+
+def cloudError : Cas.Cloud.Error → Except Host.Failure CloudDomainError
+  | .host hostFailure | .project (.host hostFailure) | .durable (.host hostFailure)
+    | .receive (.host hostFailure) => .error hostFailure
+  | .protocol | .receive .protocol => .error protocolFailure
+  | .project .malformed | .durable .malformed | .receive .malformed => .ok .malformed
+  | .project (.columnType index column actual) | .durable (.columnType index column actual)
+    | .receive (.columnType index column actual) => .ok (.columnType index column actual)
+  | .project (.column column reason) | .receive (.column column reason) => .ok (.column column reason)
+  | .sizeMismatch root recorded offered | .durable (.sizeMismatch root recorded offered)
+    | .receive (.sizeMismatch root recorded offered) => .ok (.sizeMismatch root recorded offered)
+  | .missingBlob root => .ok (.missingBlob root)
+  | .cacheBusy => .ok .cacheBusy
+  | .invalidRange start stop size => .ok (.invalidRange start stop size)
+  | .unalignedRange => .ok .unalignedRange
+  | .incompleteInline => .ok .incompleteInline
+
+def restoring [Encode A] : Except Cas.Cloud.Error A → Host.Reply ByteArray
+  | .ok value => terminalOf (Except.ok value : Except CloudDomainError A)
+  | .error error => match cloudError error with
+    | .error hostFailure => .error hostFailure
+    | .ok error => terminalOf (Except.error error : Except CloudDomainError A)
+
+def projecting [Encode A] : Except Cas.Project.Error A → Host.Reply ByteArray
+  | .ok value => terminalOf (Except.ok value : Except ProjectDomainError A)
+  | .error (.host hostFailure) => .error hostFailure
+  | .error .malformed => terminalOf (Except.error ProjectDomainError.malformed : Except _ A)
+  | .error (.columnType index column actual) =>
+    terminalOf (Except.error (ProjectDomainError.columnType index column actual) : Except _ A)
+  | .error (.column column reason) =>
+    terminalOf (Except.error (ProjectDomainError.column column reason) : Except _ A)
+
+def collecting [Encode A] : Except Cas.Collect.Error A → Host.Reply ByteArray
+  | .ok value => terminalOf (Except.ok value : Except CollectDomainError A)
+  | .error (.host hostFailure) => .error hostFailure
+  | .error .malformed => terminalOf (Except.error CollectDomainError.malformed : Except _ A)
+  | .error (.columnType index column actual) =>
+    terminalOf (Except.error (CollectDomainError.columnType index column actual) : Except _ A)
+  | .error (.sizeMismatch root recorded offered) =>
+    terminalOf (Except.error (CollectDomainError.sizeMismatch root recorded offered) : Except _ A)
+
 def malformedRoot : Native := .pure (.error ⟨2, 0⟩)
+
+def completing [Encode A] : Except Trie.Missing.Error A → Host.Reply ByteArray
+  | .ok value => terminalOf (Except.ok value : Except TrieMissingDomainError A)
+  | .error (.host hostFailure) => .error hostFailure
+  | .error (.decode message) => terminalOf (Except.error (TrieMissingDomainError.decode message) : Except _ A)
+  | .error (.canonical (.nodeDepth depth)) =>
+    terminalOf (Except.error (TrieMissingDomainError.nodeDepth depth) : Except _ A)
+  | .error (.canonical (.valueDepth depth)) =>
+    terminalOf (Except.error (TrieMissingDomainError.valueDepth depth) : Except _ A)
+  | .error (.canonical (.expectedBranch hash)) =>
+    terminalOf (Except.error (TrieMissingDomainError.expectedBranch hash) : Except _ A)
+  | .error (.canonical (.valueLength hash size routing)) =>
+    terminalOf (Except.error (TrieMissingDomainError.valueLength hash size routing) : Except _ A)
+  | .error .exhausted => terminalOf (Except.error TrieMissingDomainError.exhausted : Except _ A)
+
 def protocol : Native := .pure (.error protocolFailure)
+
+def fetching [Encode A] : Except Trie.Fetch.Error A → Host.Reply ByteArray
+  | .ok value => terminalOf (Except.ok value : Except TrieFetchDomainError A)
+  | .error (.host hostFailure) | .error (.walk (.host hostFailure)) => .error hostFailure
+  | .error (.walk error) =>
+    let error := match error with
+      | .host _ => TrieMissingDomainError.exhausted
+      | .decode message => .decode message
+      | .canonical (.nodeDepth depth) => .nodeDepth depth
+      | .canonical (.valueDepth depth) => .valueDepth depth
+      | .canonical (.expectedBranch hash) => .expectedBranch hash
+      | .canonical (.valueLength hash size routing) => .valueLength hash size routing
+      | .exhausted => .exhausted
+    terminalOf (Except.error (TrieFetchDomainError.walk error) : Except _ A)
+  | .error (.origin refusal) => terminalOf (Except.error (TrieFetchDomainError.origin refusal) : Except _ A)
+  | .error (.nodeHash hash) => terminalOf (Except.error (TrieFetchDomainError.nodeHash hash) : Except _ A)
+  | .error (.valueHash hash) => terminalOf (Except.error (TrieFetchDomainError.valueHash hash) : Except _ A)
+  | .error (.unsolicited value hash) =>
+    terminalOf (Except.error (TrieFetchDomainError.unsolicited value hash) : Except _ A)
+  | .error .exhausted => terminalOf (Except.error TrieFetchDomainError.exhausted : Except _ A)
 
 def dispatch : Command → Native
   | .acquire root holder now possession =>
@@ -114,7 +286,143 @@ def dispatch : Command → Native
     if root.size != 32 then protocol else command (Cas.IngestCommit.admit root size) metadata
   | .trieGet root keySize =>
     if root.size != 32 then malformedRoot else command (Trie.getInput root 0 keySize) hostOnly
+  | .trieAdmit size => command (Trie.admitInput 0 size) hostOnly
+  | .trieVerify expected size =>
+    if expected.size != 32 then protocol else command (Trie.verifyInput expected 0 size) hostOnly
+  | .trieInsert root keySize valueSize =>
+    if root.size != 32 then malformedRoot
+    else command (Trie.insertInput root keySize valueSize) mutation
+  | .trieNormalize root =>
+    if root.size != 32 then malformedRoot else command (Trie.Normalize.publication root) mutation
+  | .trieRemove root keySize =>
+    if root.size != 32 then malformedRoot else command (Trie.removeInput root keySize) mutation
   | .pruneHistory origin before => command (Replication.History.prune origin before) retention
+  | .casMarkDurable root =>
+    if root.size != 32 then protocol else command (Cas.Durable.markDurable root) durable
+  | .casAdoptDurable root size now =>
+    if root.size != 32 then protocol else command (Cas.Durable.adoptDurable root size now) durable
+  | .casHealMissing root =>
+    if root.size != 32 then protocol else command (Cas.Durable.healMissing root) durable
+  | .casReconcileScratch marker => command (Cas.Durable.reconcileScratch marker) durable
+  | .casClearCache root =>
+    if root.size != 32 then protocol else command (Cas.Durable.clearCache root) durable
+  | .casEncodeSlice root requested =>
+    if root.size != 32 then protocol else command (Cas.Serve.encodeSlice root requested) serving
+  | .casEncodeProof root requested level budget =>
+    if root.size != 32 then protocol
+    else command (Cas.Serve.encodeProof root requested level budget) serving
+  | .casWriteSlice root size served now cache =>
+    if root.size != 32 then protocol
+    else command (Cas.Receive.writeSlice root size served 0 now (if cache then .cache else .local)) receiving
+  | .casWriteProof root size served level now cache =>
+    if root.size != 32 then protocol
+    else command (Cas.Receive.writeProof root size served level 0 now (if cache then .cache else .local)) receiving
+  | .casPromote donor root size proven now cache =>
+    if root.size != 32 || donor.size != 32 then protocol
+    else command (Cas.Receive.promote donor root size proven now (if cache then .cache else .local)) receiving
+  | .casTouch root =>
+    if root.size != 32 then protocol else command (Cas.Collect.touch root) collecting
+  | .casEvict limit shortfall =>
+    command (Cas.Collect.evict limit shortfall)
+      (collecting ∘ Except.map fun (entries, freed) => Evicted.mk entries freed)
+  | .casGcContent before => command (Cas.Collect.gcContent before) collecting
+  | .casGcOrphans before => command (Cas.Collect.gcOrphans before) collecting
+  | .casBlob root => if root.size != 32 then protocol else command (Cas.Project.blob root) projecting
+  | .casBlobIn tx root => if root.size != 32 then protocol else command (Cas.Project.blobIn tx root) projecting
+  | .casBlobs => command Cas.Project.blobs projecting
+  | .casBlobCandidates => command Cas.Project.candidates projecting
+  | .casPins root =>
+    if root.any (·.size != 32) then protocol else command (Cas.Project.pins root) projecting
+  | .casPinnedBlobs => command Cas.Project.pinnedBlobs projecting
+  | .trieServeNodes root wants prefixes exact peerOrigins confined =>
+    if root.size != 32 then protocol
+    else command (Trie.Serve.serveNodes root wants ⟨prefixes, exact⟩ peerOrigins confined) servingTrie
+  | .trieServeValues root wants prefixes exact peerOrigins confined =>
+    if root.size != 32 then protocol
+    else command (Trie.Serve.serveValues root wants ⟨prefixes, exact⟩ peerOrigins confined) servingTrie
+  | .trieResolve root paths =>
+    if root.size != 32 then protocol
+    else command (Trie.Serve.resolvePaths root (paths.map (·.toList))) servingTrie
+  | .trieCollect prefixes exact =>
+    command (Trie.Collect.gcTrie (Std.HashSet ByteArray) ⟨prefixes, exact⟩)
+      (collectingTrie ∘ Except.map fun (nodes, values, roots) => Collected.mk nodes values roots)
+  | .trieMemoKey root prefixes exact owner =>
+    if root.size != 32 then protocol
+    else command (Trie.Memo.keyFor (E := Host.Digest) id ⟨prefixes, exact⟩ root owner) hostOnly
+  | .trieFirstOutside root prefixes exact =>
+    if root.size != 32 then protocol
+    else command (Trie.ScopeCheck.firstOutside root ⟨prefixes, exact⟩) walking
+  | .trieScan root keyPrefix startAfter limit =>
+    if root.size != 32 then protocol
+    else command (Trie.Walk.scan (E := Trie.Walk.Effects) root keyPrefix startAfter limit) walking
+  | .trieDiff oldRoot newRoot =>
+    if oldRoot.size != 32 || newRoot.size != 32 then protocol
+    else command (Trie.Diff.diff (E := Trie.Diff.Effects) oldRoot newRoot) walking
+  | .trieMaterialize oldRoot newRoot prefixes exact =>
+    if oldRoot.size != 32 || newRoot.size != 32 then protocol
+    else command (Trie.Diff.materialize (E := Trie.Diff.Effects) ⟨prefixes, exact⟩ oldRoot newRoot) walking
+  | .trieProve root keySize =>
+    if root.size != 32 then malformedRoot else command (Trie.Proof.proveInput root 0 keySize) hostOnly
+  | .trieVerifyProof root key nodes value =>
+    if root.size != 32 then protocol
+    else command (Trie.Proof.verify (E := Host.Digest) root key nodes value) hostOnly
+  | .peerProbe root wants inTransaction => command (Host.Peer.probe root wants inTransaction) hostOnly
+  | .providerProbe key mode => command (Host.Provider.probe key mode) hostOnly
+  | .cloudEnsureCached root size =>
+    if root.size != 32 then protocol else command (Cas.Cloud.ensureCached root size) restoring
+  | .cloudEnsureRanges root size ranges =>
+    if root.size != 32 then protocol else command (Cas.Cloud.ensureRanges root size ranges) restoring
+  | .cloudHydrate root size ranges =>
+    if root.size != 32 then protocol else command (Cas.Cloud.hydrate root size
+      (normalizeSpans (groupCount size).toNat (Cas.Serve.spansOf ranges))) restoring
+  | .cloudOutboard root force =>
+    if root.size != 32 then protocol else command (Cas.Cloud.leased root (Cas.Cloud.outboard root force)) restoring
+  | .trieComplete root prefixes exact owner =>
+    if root.size != 32 then protocol
+    else command (Trie.Complete.isComplete (Std.HashSet Trie.Missing.Visit) (Std.HashSet ByteArray)
+      ⟨⟨prefixes, exact⟩, owner⟩ root) completing
+  | .originParse text =>
+    command (Origin.parse (m := Host.OperationOver Host.Crypto Host.Failure)
+      (fun bytes => Host.raise id (Host.Crypto.validateEd25519 bytes)) text) hostOnly
+  | .originNamed id domain => pure (terminalOf (Origin.named id domain))
+  | .originNormalizeLabel text => pure (terminalOf (Origin.normalizeLabel text))
+  | .originNormalizeDomain text => pure (terminalOf (Origin.normalizeDomain text))
+  | .originCanonical value => pure (terminalOf (Origin.canonical value))
+  | .authBindings selection live reading => command (Authorization.bindings selection live reading) authorizing
+  | .authBindingStatuses reading => command (Authorization.bindingStatuses reading) authorizing
+  | .authTrustedKeys reading => command (Authorization.trustedKeys reading) authorizing
+  | .authTrustedOrigins reading => command (Authorization.trustedOrigins reading) authorizing
+  | .authTrustedKey key reading => command (Authorization.trustedKey key reading) authorizing
+  | .authBound origin key reading => command (Authorization.bound origin key reading) authorizing
+  | .authPeerAuthority key reading => command (Authorization.peerAuthority key reading) authorizing
+  | .authOriginPublication origin reading => command (Authorization.originPublication origin reading) authorizing
+  | .authOriginAuthority origin reading => command (Authorization.originAuthority origin reading) authorizing
+  | .authOriginAuthorityIn tx origin reading => command (Authorization.originAuthorityIn tx origin reading) authorizing
+  | .authLocalAuthority reading => command (Authorization.localAuthority reading) authorizing
+  | .authLocalSpaces => command Authorization.localSpaces authorizing
+  | .authLocalScope => command Authorization.localScope authorizing
+  | .authLocalScopeIn tx => command (Authorization.localScopeIn tx) authorizing
+  | .authMaterializationScope origin => command (Authorization.materializationScope origin) authorizing
+  | .authMaterializationScopeIn tx origin => command (Authorization.materializationScopeIn tx origin) authorizing
+  | .authMetadataPeer key reading => command (Authorization.metadataPeer key reading) authorizing
+  | .authSocketAuthority key reading => command (Authorization.socketAuthority key reading) authorizing
+  | .authSoleDnsHintSource key domain reading => command (Authorization.soleDnsHintSource key domain reading) authorizing
+  | .authHasDelegations => command Authorization.hasDelegations authorizing
+  | .authExpireDns reading => command (Authorization.expireDns reading) authorizing
+
+  | .planContact peers cursor maximum =>
+    if peers.length > UInt64.size || !(peers.all (·.size == 32)) ||
+        cursor.any (·.size != 32) || maximum == 0 || maximum > 256 then protocol
+    else pure (terminalOf (Replication.Contact.plan peers cursor maximum.toNat))
+  | .planExchange ours theirs servable =>
+    if servable.length > UInt64.size ||
+        !(ours ++ theirs ++ servable).all (·.root.size == 32) then protocol
+    else pure (terminalOf (Replication.Exchange.plan ours theirs servable))
+  | .trieFetch root origin seq prefixes exact owner reference maximum retryLimit =>
+    if root.size != 32 || reference.any (·.size != 32) || maximum == 0 || maximum > 256 ||
+        retryLimit == 0 || retryLimit > 3 then protocol
+    else command (Trie.Fetch.fetch (Std.HashSet Trie.Missing.Visit) (Std.HashSet ByteArray)
+      ⟨root, origin, seq, ⟨⟨prefixes, exact⟩, owner⟩⟩ reference maximum.toNat retryLimit.toNat) fetching
 
 /-- Every command starts here: an undecodable packet is a protocol failure
 before any effect is requested. -/

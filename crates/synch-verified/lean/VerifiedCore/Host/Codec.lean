@@ -89,8 +89,8 @@ instance : Encode Exclusion :=
 instance : Encode Join :=
   ⟨fun out item => Encode.encode (Encode.encode out item.relation) item.keys⟩
 instance : Encode Selection :=
-  ⟨fun out selected => Encode.encode (Encode.encode (Encode.encode out selected.relation)
-    selected.equals) selected.likeAny⟩
+  ⟨fun out selected => Encode.encode (Encode.encode (Encode.encode (Encode.encode out
+    selected.relation) selected.equals) selected.likeAny) selected.notEquals⟩
 
 def sourceValue : SourceValue → ByteArray
   | .literal value => octet 0 ++ cell value
@@ -183,6 +183,7 @@ instance : Decode Nat := ⟨do return (← readWord).toNat⟩
 instance : Decode Int64 := ⟨do return (← readWord).toInt64⟩
 instance : Decode Unit := ⟨pure ()⟩
 instance : Decode ByteArray := ⟨readBytes⟩
+instance : Decode (List UInt8) := ⟨do return (← readBytes).data.toList⟩
 instance : Decode Bool := ⟨do
   match ← readByte with
   | 0 => return false

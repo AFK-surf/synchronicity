@@ -144,12 +144,14 @@ mod tests {
         host_unexpected!(
             exists_rows,
             upsert,
+            delete_except,
             read_bytes,
             snapshot,
             update,
             copy_rows,
             delete,
-            write
+            write,
+            snapshot_excluding
         );
     }
     fn setup(origin: &str, result: Result<bool, &'static str>) -> (Rows, Primitive, Trace) {

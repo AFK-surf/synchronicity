@@ -119,6 +119,16 @@ impl<'a> Reader<'a> {
         }
         (0..count).map(|_| read(self)).collect()
     }
+    pub(crate) fn option<T>(
+        &mut self,
+        read: impl FnOnce(&mut Self) -> Result<T, ()>,
+    ) -> Result<Option<T>, ()> {
+        match self.byte()? {
+            0 => Ok(None),
+            1 => read(self).map(Some),
+            _ => Err(()),
+        }
+    }
     pub(crate) fn cell(&mut self) -> Result<Cell, ()> {
         Ok(match self.byte()? {
             0 => Cell::Null,
@@ -138,6 +148,7 @@ impl<'a> Reader<'a> {
             relation: self.string()?,
             equals: self.fields()?,
             like_any: self.list(|r| Ok((r.string()?, r.string()?)))?,
+            not_equals: self.fields()?,
         })
     }
     pub(crate) fn order(&mut self) -> Result<Order, ()> {
@@ -310,6 +321,28 @@ impl EncodeReply for Vec<u8> {
         bytes(out, &value);
     }
 }
+impl EncodeReply for Option<u64> {
+    fn encode(out: &mut Vec<u8>, value: Self) {
+        match value {
+            None => out.push(0),
+            Some(value) => {
+                out.push(1);
+                word(out, value);
+            }
+        }
+    }
+}
+impl EncodeReply for Option<i64> {
+    fn encode(out: &mut Vec<u8>, value: Self) {
+        match value {
+            None => out.push(0),
+            Some(value) => {
+                out.push(1);
+                word(out, value as u64);
+            }
+        }
+    }
+}
 impl EncodeReply for Option<Vec<u8>> {
     fn encode(out: &mut Vec<u8>, value: Self) {
         match value {
@@ -389,6 +422,24 @@ impl Encode for Vec<(u64, u64)> {
         }
     }
 }
+macro_rules! encode_list {
+    ($($item:ty),+ $(,)?) => {
+        $(impl Encode for Vec<$item> {
+            fn encode(&self, out: &mut Vec<u8>) {
+                word(out, self.len() as u64);
+                for item in self {
+                    item.encode(out);
+                }
+            }
+        })+
+    };
+}
+encode_list!(
+    Vec<u8>,
+    String,
+    (Vec<u8>, Vec<u8>),
+    crate::generated::ParsedOrigin
+);
 
 /// How a terminal value is read back once a run has finished.
 pub(crate) trait Decode: Sized {
@@ -462,21 +513,137 @@ pub(crate) fn terminal<T: Decode>(bytes: &[u8]) -> Result<T, ()> {
     Ok(value)
 }
 
-// Byte-only commands do not need a pretend relational store or a second
-// layer of host errors: only the raw byte read is served.
+// Narrow commands do not need a pretend transactional store or a second
+// layer of host errors. Byte reads and the explicitly supplied services
+// (including raw snapshots and memo reads/certification) are served here;
+// transaction and relational mutation frames remain protocol failures.
 fn dispatch_readonly<S: ByteStorage>(
-    storage: &mut S,
+    storage: Option<&mut S>,
+    capabilities: &mut Capabilities<'_, S::Error>,
     frame: Frame<'_>,
     errors: &mut Vec<Option<S::Error>>,
 ) -> Result<Vec<u8>, OperationError<S::Error>> {
     match frame {
-        Frame::ReadBytes(space, key) => Ok(reply(
-            22,
-            storage.read_bytes(&space, key),
-            errors,
-            EncodeReply::encode,
-        )),
+        Frame::ReadBytes(space, key) => {
+            let storage = storage.ok_or(OperationError::Protocol)?;
+            Ok(reply(
+                22,
+                storage.read_bytes(&space, key),
+                errors,
+                EncodeReply::encode,
+            ))
+        }
+        Frame::ValidateEd25519(bytes) => {
+            let crypto = capabilities
+                .crypto
+                .as_deref_mut()
+                .ok_or(OperationError::Protocol)?;
+            Ok(reply(
+                27,
+                crypto.validate_ed25519(bytes),
+                errors,
+                EncodeReply::encode,
+            ))
+        }
+        Frame::Blake3(bytes) => {
+            let digest = capabilities
+                .digest
+                .as_deref_mut()
+                .ok_or(OperationError::Protocol)?;
+            Ok(reply(53, digest.blake3(bytes), errors, EncodeReply::encode))
+        }
+        Frame::PutBytes(space, key, bytes) => {
+            let writes = capabilities
+                .writes
+                .as_deref_mut()
+                .ok_or(OperationError::Protocol)?;
+            Ok(reply(
+                54,
+                writes.put_bytes(&space, key, bytes),
+                errors,
+                EncodeReply::encode,
+            ))
+        }
+        Frame::IsRedacted(hash, path) => {
+            let redaction = capabilities
+                .redaction
+                .as_deref_mut()
+                .ok_or(OperationError::Protocol)?;
+            Ok(reply(
+                70,
+                redaction.is_redacted(hash, path),
+                errors,
+                EncodeReply::encode,
+            ))
+        }
+        Frame::ApplyChange(key, kind, new) => {
+            let apply = capabilities
+                .apply
+                .as_deref_mut()
+                .ok_or(OperationError::Protocol)?;
+            Ok(reply(
+                71,
+                apply.apply_change(key, kind, new),
+                errors,
+                EncodeReply::encode,
+            ))
+        }
+        Frame::Snapshot(selection, columns) => {
+            let snapshots = capabilities
+                .snapshots
+                .as_deref_mut()
+                .ok_or(OperationError::Protocol)?;
+            Ok(scan_reply(
+                29,
+                snapshots.snapshot(&selection, &columns),
+                errors,
+            ))
+        }
+        Frame::IsKnown(key) => {
+            let memo = capabilities
+                .memo
+                .as_deref_mut()
+                .ok_or(OperationError::Protocol)?;
+            Ok(reply(74, memo.is_known(key), errors, EncodeReply::encode))
+        }
+        Frame::Generation => {
+            let memo = capabilities
+                .memo
+                .as_deref_mut()
+                .ok_or(OperationError::Protocol)?;
+            Ok(reply(75, memo.generation(), errors, EncodeReply::encode))
+        }
+        Frame::Certify(key, generation) => {
+            let memo = capabilities
+                .memo
+                .as_deref_mut()
+                .ok_or(OperationError::Protocol)?;
+            Ok(reply(
+                76,
+                memo.certify(key, generation),
+                errors,
+                EncodeReply::encode,
+            ))
+        }
         _ => Err(OperationError::Protocol),
+    }
+}
+
+/// A byte store that is never there: the type a digest-only run names for
+/// the storage it does not supply. A byte read is refused before this is
+/// ever asked, so the impossible method is unreachable by construction, and
+/// the type is uninhabited on purpose.
+#[allow(dead_code)]
+enum NoBytes<E> {
+    Never(std::convert::Infallible, std::marker::PhantomData<E>),
+}
+
+impl<E> ByteStorage for NoBytes<E> {
+    type Error = E;
+    fn read_bytes(&mut self, _: &str, _: &[u8]) -> Result<Option<Vec<u8>>, E> {
+        match *self {
+            NoBytes::Never(never, _) => match never {},
+        }
     }
 }
 
@@ -491,8 +658,17 @@ pub(crate) struct Capabilities<'a, E> {
     pub(crate) output: Option<&'a mut dyn crate::host::Output<Error = OperationError<E>>>,
     pub(crate) construct: Option<&'a mut dyn crate::host::Construct<Error = E>>,
     pub(crate) temporary: Option<&'a mut dyn crate::host::TemporaryFiles<Error = E>>,
+    pub(crate) cache: Option<&'a mut dyn crate::host::CacheIO<Error = E>>,
     pub(crate) leases: Option<&'a mut dyn crate::host::Lease<Error = E>>,
     pub(crate) source: Option<&'a mut dyn crate::host::SourceIO<Error = E>>,
+    pub(crate) digest: Option<&'a mut dyn crate::host::Digest<Error = E>>,
+    pub(crate) writes: Option<&'a mut dyn crate::host::ByteWrites<Error = E>>,
+    pub(crate) bao: Option<&'a mut dyn crate::host::Bao<Error = E>>,
+    pub(crate) sweep: Option<&'a mut dyn crate::host::Sweep<Error = E>>,
+    pub(crate) memo: Option<&'a mut dyn crate::host::Memo<Error = E>>,
+    pub(crate) redaction: Option<&'a mut dyn crate::host::Redaction<Error = E>>,
+    pub(crate) apply: Option<&'a mut dyn crate::host::Apply<Error = E>>,
+    pub(crate) snapshots: Option<&'a mut dyn crate::host::Snapshots<Error = E>>,
 }
 
 impl<E> Default for Capabilities<'_, E> {
@@ -505,14 +681,374 @@ impl<E> Default for Capabilities<'_, E> {
             output: None,
             construct: None,
             temporary: None,
+            cache: None,
             leases: None,
             source: None,
+            digest: None,
+            writes: None,
+            bao: None,
+            sweep: None,
+            memo: None,
+            redaction: None,
+            apply: None,
+            snapshots: None,
         }
     }
 }
 
+/// A protocol failure delivered into the program, so its own cleanup runs.
+fn protocol_failure() -> Vec<u8> {
+    let mut out = vec![1, 0];
+    word(&mut out, 3);
+    word(&mut out, 0);
+    out
+}
+
+/// Append a host encoding to the output sink and reply with the count it
+/// added, shaped by `wrap`. A sink that cannot grow is a protocol failure
+/// delivered into the program, so its own cleanup still runs.
+fn sink_reply<E, A: EncodeReply>(
+    tag: u8,
+    encoded: Vec<u8>,
+    output: &mut dyn crate::host::Output<Error = OperationError<E>>,
+    errors: &mut Vec<Option<E>>,
+    wrap: impl FnOnce(u64) -> Option<A>,
+) -> Vec<u8> {
+    let count = encoded.len() as u64;
+    match output.append(&encoded) {
+        Ok(()) => match wrap(count) {
+            Some(value) => reply(tag, Ok::<A, E>(value), errors, EncodeReply::encode),
+            None => {
+                let mut out = vec![1, 0];
+                word(&mut out, 3);
+                word(&mut out, 0);
+                out
+            }
+        },
+        Err(OperationError::Host(error)) => {
+            reply(tag, Err::<A, _>(error), errors, EncodeReply::encode)
+        }
+        Err(_) => {
+            let mut out = vec![1, 0];
+            word(&mut out, 3);
+            word(&mut out, 0);
+            out
+        }
+    }
+}
+
+/// What a suspended program asked a peer for: the root it is fetching under
+/// and, for each want, the position asked at and the hash expected there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PeerRequest {
+    Nodes {
+        root: Vec<u8>,
+        wants: Vec<(Vec<u8>, Vec<u8>)>,
+    },
+    Values {
+        root: Vec<u8>,
+        wants: Vec<(Vec<u8>, Vec<u8>)>,
+    },
+}
+
+/// What came back for a request: the pairs served, the hashes the peer did
+/// not have and, for nodes, the hashes it holds but may not show; or the
+/// host error that stands for the round trip failing, delivered into the
+/// program the way any host failure is.
+#[derive(Debug)]
+pub enum PeerReply<E> {
+    Nodes {
+        served: Vec<(Vec<u8>, Vec<u8>)>,
+        missing: Vec<Vec<u8>>,
+        redacted: Vec<Vec<u8>>,
+    },
+    Values {
+        served: Vec<(Vec<u8>, Vec<u8>)>,
+        missing: Vec<Vec<u8>>,
+    },
+    Failed(E),
+}
+
+/// Literal immutable-object IO requested by a suspended cloud operation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ProviderRequest {
+    Stat {
+        space: String,
+        key: Vec<u8>,
+    },
+    ReadAll {
+        space: String,
+        key: Vec<u8>,
+    },
+    ReadRange {
+        space: String,
+        key: Vec<u8>,
+        offset: u64,
+        count: u64,
+    },
+}
+
+/// Raw provider results. Only the provider's actual not-found error is
+/// classified as missing; all errors retain their original host allocation.
+#[derive(Debug)]
+pub enum ProviderReply<E> {
+    Stat(Result<u64, FileFailure<E>>),
+    ReadAll(Result<Vec<u8>, FileFailure<E>>),
+    ReadRange(Result<Vec<u8>, FileFailure<E>>),
+}
+
+pub type ProviderStep<T, E> = Step<T, E, ProviderRequest>;
+pub type ProviderSuspension<T, E> = Suspension<T, E, ProviderRequest>;
+
+/// A completed operation or an owned continuation waiting for external IO.
+/// The request type identifies the external service; peer requests are the
+/// default for existing network callers.
+#[derive(Debug)]
+pub enum Step<T, E, R = PeerRequest> {
+    Done(T),
+    Suspended(Suspension<T, E, R>),
+}
+
+/// A program waiting for external IO. It owns the Lean continuation, so it stays
+/// on the thread that started the run and holds no storage: the runner only
+/// suspends while no transaction or remover section is open. The storage
+/// handed to the resuming facade may be fresh. Dropping this value drops the
+/// continuation unanswered; the invocation host owns resource abandonment.
+pub struct Suspension<T, E, R = PeerRequest> {
+    state: Handle,
+    request: R,
+    tag: u8,
+    errors: Vec<Option<E>>,
+    finish: fn(&[u8]) -> Result<T, ()>,
+}
+
+impl<T, E, R: std::fmt::Debug> std::fmt::Debug for Suspension<T, E, R> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Suspension")
+            .field("request", &self.request)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<T, E, R> Suspension<T, E, R> {
+    /// What the program is waiting for.
+    pub fn request(&self) -> &R {
+        &self.request
+    }
+}
+
+impl<T, E> Suspension<T, E> {
+    /// Answer the request and run on until the next suspension or the end. A
+    /// reply of the other kind is a protocol failure delivered into the
+    /// program, so its own cleanup runs.
+    pub(crate) fn continue_with<S: Storage<Error = E>>(
+        mut self,
+        answer: PeerReply<E>,
+        storage: &mut S,
+        capabilities: Capabilities<'_, E>,
+    ) -> Result<Step<T, E>, OperationError<E>> {
+        let response = match (self.tag, answer) {
+            (
+                72,
+                PeerReply::Nodes {
+                    served,
+                    missing,
+                    redacted,
+                },
+            ) => reply(
+                72,
+                Ok::<_, E>((served, missing, redacted)),
+                &mut self.errors,
+                |out, (served, missing, redacted)| {
+                    pairs(out, &served);
+                    hashes(out, &missing);
+                    hashes(out, &redacted);
+                },
+            ),
+            (73, PeerReply::Values { served, missing }) => reply(
+                73,
+                Ok::<_, E>((served, missing)),
+                &mut self.errors,
+                |out, (served, missing)| {
+                    pairs(out, &served);
+                    hashes(out, &missing);
+                },
+            ),
+            (tag, PeerReply::Failed(error)) => {
+                reply(tag, Err::<(), _>(error), &mut self.errors, |_, ()| {})
+            }
+            _ => protocol_failure(),
+        };
+        self.continue_response(response, storage, capabilities, peer_request)
+    }
+}
+
+impl<T, E, R> Suspension<T, E, R> {
+    fn continue_response<S: Storage<Error = E>>(
+        mut self,
+        response: Vec<u8>,
+        storage: &mut S,
+        capabilities: Capabilities<'_, E>,
+        request: RequestDecoder<R>,
+    ) -> Result<Step<T, E, R>, OperationError<E>> {
+        self.state.resume(&response);
+        drive(
+            Run {
+                state: self.state,
+                errors: self.errors,
+                open: 0,
+                sections: Vec::new(),
+                request: Some(request),
+                finish: self.finish,
+            },
+            |frame, capabilities, errors| dispatch(storage, capabilities, frame, errors),
+            &[],
+            capabilities,
+        )
+    }
+}
+
+impl<T, E> ProviderSuspension<T, E> {
+    pub(crate) fn continue_provider_with<S: Storage<Error = E>>(
+        mut self,
+        answer: ProviderReply<E>,
+        storage: &mut S,
+        capabilities: Capabilities<'_, E>,
+    ) -> Result<ProviderStep<T, E>, OperationError<E>> {
+        let response = match (&self.request, answer) {
+            (ProviderRequest::Stat { .. }, ProviderReply::Stat(value)) => {
+                file_reply(self.tag, value, &mut self.errors, EncodeReply::encode)
+            }
+            (ProviderRequest::ReadAll { .. }, ProviderReply::ReadAll(value))
+            | (ProviderRequest::ReadRange { .. }, ProviderReply::ReadRange(value)) => {
+                file_reply(self.tag, value, &mut self.errors, EncodeReply::encode)
+            }
+            // Provider effects use the FileReply envelope even on malformed
+            // host replies, so Lean can run its resource cleanup continuation.
+            _ => file_protocol_failure(),
+        };
+        self.continue_response(response, storage, capabilities, provider_request)
+    }
+}
+
+fn pairs(out: &mut Vec<u8>, values: &[(Vec<u8>, Vec<u8>)]) {
+    word(out, values.len() as u64);
+    for (key, value) in values {
+        bytes(out, key);
+        bytes(out, value);
+    }
+}
+fn hashes(out: &mut Vec<u8>, values: &[Vec<u8>]) {
+    word(out, values.len() as u64);
+    for value in values {
+        bytes(out, value);
+    }
+}
+
+fn owned_pairs(wants: &[(&[u8], &[u8])]) -> Vec<(Vec<u8>, Vec<u8>)> {
+    wants
+        .iter()
+        .map(|(position, hash)| (position.to_vec(), hash.to_vec()))
+        .collect()
+}
+
+fn peer_request(frame: &Frame<'_>) -> Option<(PeerRequest, u8)> {
+    match frame {
+        Frame::FetchNodes(root, wants) => Some((
+            PeerRequest::Nodes {
+                root: root.to_vec(),
+                wants: owned_pairs(wants),
+            },
+            72,
+        )),
+        Frame::FetchValues(root, wants) => Some((
+            PeerRequest::Values {
+                root: root.to_vec(),
+                wants: owned_pairs(wants),
+            },
+            73,
+        )),
+        _ => None,
+    }
+}
+
+fn provider_request(frame: &Frame<'_>) -> Option<(ProviderRequest, u8)> {
+    match frame {
+        Frame::ProviderStat(space, key) => Some((
+            ProviderRequest::Stat {
+                space: space.clone(),
+                key: key.to_vec(),
+            },
+            77,
+        )),
+        Frame::ProviderReadAll(space, key) => Some((
+            ProviderRequest::ReadAll {
+                space: space.clone(),
+                key: key.to_vec(),
+            },
+            78,
+        )),
+        Frame::ProviderReadRange(space, key, offset, count) => Some((
+            ProviderRequest::ReadRange {
+                space: space.clone(),
+                key: key.to_vec(),
+                offset: *offset,
+                count: *count,
+            },
+            79,
+        )),
+        _ => None,
+    }
+}
+
+fn file_protocol_failure() -> Vec<u8> {
+    let mut response = protocol_failure();
+    response.push(2); // FileFailureKind.other
+    response
+}
+
+type RequestDecoder<R> = fn(&Frame<'_>) -> Option<(R, u8)>;
+
+/// The shared transport state, including connection ownership. External IO
+/// may suspend only after every transaction and remover section is closed.
+struct Run<T, E, R> {
+    state: Handle,
+    errors: Vec<Option<E>>,
+    open: usize,
+    sections: Vec<u64>,
+    request: Option<RequestDecoder<R>>,
+    finish: fn(&[u8]) -> Result<T, ()>,
+}
+
 fn execute<E>(
-    mut state: Handle,
+    state: Handle,
+    host: impl FnMut(
+        Frame<'_>,
+        &mut Capabilities<'_, E>,
+        &mut Vec<Option<E>>,
+    ) -> Result<Vec<u8>, OperationError<E>>,
+    inputs: &[&[u8]],
+    capabilities: Capabilities<'_, E>,
+) -> Result<Vec<u8>, OperationError<E>> {
+    let run: Run<_, _, PeerRequest> = Run {
+        state,
+        errors: Vec::new(),
+        open: 0,
+        sections: Vec::new(),
+        request: None,
+        finish: |bytes| Ok(bytes.to_vec()),
+    };
+    match drive(run, host, inputs, capabilities)? {
+        Step::Done(result) => Ok(result),
+        Step::Suspended(_) => Err(OperationError::Protocol),
+    }
+}
+
+/// Drive a run until it ends or suspends on an allowed external service.
+/// A disallowed wait, or a wait while holding a transaction or remover
+/// section, receives a protocol failure so the program can run its cleanup.
+fn drive<T, E, R>(
+    mut run: Run<T, E, R>,
     mut host: impl FnMut(
         Frame<'_>,
         &mut Capabilities<'_, E>,
@@ -520,12 +1056,33 @@ fn execute<E>(
     ) -> Result<Vec<u8>, OperationError<E>>,
     inputs: &[&[u8]],
     mut capabilities: Capabilities<'_, E>,
-) -> Result<Vec<u8>, OperationError<E>> {
-    let mut errors = Vec::new();
+) -> Result<Step<T, E, R>, OperationError<E>> {
     loop {
-        let packet = state.packet();
+        let packet = run.state.packet();
         let frame = decode(packet.as_bytes()).map_err(|()| OperationError::Protocol)?;
+        let opens = matches!(frame, Frame::Begin);
+        let closes = matches!(frame, Frame::Commit(_) | Frame::Rollback(_));
+        let orders = matches!(frame, Frame::Order(_));
+        let releases = match &frame {
+            Frame::Release(token) => Some(*token),
+            _ => None,
+        };
+        if run.open == 0 && run.sections.is_empty() {
+            if let Some((request, tag)) = run.request.and_then(|decode| decode(&frame)) {
+                return Ok(Step::Suspended(Suspension {
+                    state: run.state,
+                    request,
+                    tag,
+                    errors: run.errors,
+                    finish: run.finish,
+                }));
+            }
+        }
         let response = match frame {
+            Frame::FetchNodes(..) | Frame::FetchValues(..) => protocol_failure(),
+            Frame::ProviderStat(..) | Frame::ProviderReadAll(..) | Frame::ProviderReadRange(..) => {
+                file_protocol_failure()
+            }
             // The transferred bytes go from the file straight into the tail of
             // the output sink; they are never a reply payload. A sink that
             // cannot grow is a protocol failure delivered as a file failure,
@@ -544,7 +1101,7 @@ fn execute<E>(
                         Ok(()) => vec![1, 52],
                         Err(failure) => {
                             output.shrink(count);
-                            file_reply(52, Err::<(), _>(failure), &mut errors, |_, ()| {})
+                            file_reply(52, Err::<(), _>(failure), &mut run.errors, |_, ()| {})
                         }
                     },
                     Err(OperationError::Host(error)) => file_reply(
@@ -553,7 +1110,7 @@ fn execute<E>(
                             error,
                             kind: FileFailureKind::Other,
                         }),
-                        &mut errors,
+                        &mut run.errors,
                         |_, ()| {},
                     ),
                     Err(_) => {
@@ -565,11 +1122,128 @@ fn execute<E>(
                     }
                 }
             }
+            // A Bao encoding lands in the output sink the way a transfer does:
+            // the host encodes exactly the groups the program named, and the
+            // program learns only the byte count it appended.
+            Frame::EncodeSlice(root, size, inline, spans) => {
+                let bao = capabilities
+                    .bao
+                    .as_deref_mut()
+                    .ok_or(OperationError::Protocol)?;
+                let output = capabilities
+                    .output
+                    .as_deref_mut()
+                    .ok_or(OperationError::Protocol)?;
+                match bao.encode_slice(root, size, inline, &spans) {
+                    Ok(encoded) => sink_reply(55, encoded, output, &mut run.errors, Some),
+                    Err(error) => reply(
+                        55,
+                        Err::<u64, _>(error),
+                        &mut run.errors,
+                        EncodeReply::encode,
+                    ),
+                }
+            }
+            Frame::EncodeProof(root, size, spans, level, budget) => {
+                let bao = capabilities
+                    .bao
+                    .as_deref_mut()
+                    .ok_or(OperationError::Protocol)?;
+                let output = capabilities
+                    .output
+                    .as_deref_mut()
+                    .ok_or(OperationError::Protocol)?;
+                match bao.encode_proof(root, size, &spans, level, budget) {
+                    Ok(Some(encoded)) => {
+                        sink_reply(56, encoded, output, &mut run.errors, |count| {
+                            Some(Some(count))
+                        })
+                    }
+                    Ok(None) => reply(
+                        56,
+                        Ok::<Option<u64>, _>(None),
+                        &mut run.errors,
+                        EncodeReply::encode,
+                    ),
+                    Err(error) => reply(
+                        56,
+                        Err::<Option<u64>, _>(error),
+                        &mut run.errors,
+                        EncodeReply::encode,
+                    ),
+                }
+            }
+            // Received encodings are decoded out of the run's byte inputs
+            // straight into the object's files or inline buffer; the program
+            // names the input by handle and never holds the encoding.
+            Frame::DecodeInline(root, size, inline, spans, input) => {
+                let bao = capabilities
+                    .bao
+                    .as_deref_mut()
+                    .ok_or(OperationError::Protocol)?;
+                match usize::try_from(input)
+                    .ok()
+                    .and_then(|input| inputs.get(input))
+                {
+                    Some(encoded) => reply(
+                        57,
+                        bao.decode_inline(root, size, inline, &spans, encoded),
+                        &mut run.errors,
+                        EncodeReply::encode,
+                    ),
+                    None => protocol_failure(),
+                }
+            }
+            Frame::DecodeSlice(root, size, spans, input) => {
+                let bao = capabilities
+                    .bao
+                    .as_deref_mut()
+                    .ok_or(OperationError::Protocol)?;
+                match usize::try_from(input)
+                    .ok()
+                    .and_then(|input| inputs.get(input))
+                {
+                    Some(encoded) => reply(
+                        58,
+                        bao.decode_slice(root, size, &spans, encoded),
+                        &mut run.errors,
+                        EncodeReply::encode,
+                    ),
+                    None => protocol_failure(),
+                }
+            }
+            Frame::WriteProof(root, size, spans, level, input) => {
+                let bao = capabilities
+                    .bao
+                    .as_deref_mut()
+                    .ok_or(OperationError::Protocol)?;
+                match usize::try_from(input)
+                    .ok()
+                    .and_then(|input| inputs.get(input))
+                {
+                    Some(encoded) => reply(
+                        61,
+                        bao.write_proof(root, size, &spans, level, encoded),
+                        &mut run.errors,
+                        |out, (wrote, proven)| {
+                            out.push(u8::from(wrote));
+                            word(out, proven.len() as u64);
+                            for (start, groups, cv, whole) in proven {
+                                word(out, start);
+                                word(out, groups);
+                                bytes(out, &cv);
+                                out.push(u8::from(whole));
+                            }
+                        },
+                    ),
+                    None => protocol_failure(),
+                }
+            }
             Frame::Append(bytes) => match capabilities.output.as_deref_mut() {
                 Some(output) => match output.append(bytes) {
                     Ok(()) => vec![1, 37],
                     Err(OperationError::Host(error)) => {
-                        reply(37, Err::<(), _>(error), &mut errors, |_, ()| {})
+                        reply(37, Err::<(), _>(error), &mut run.errors, |_, ()| {})
                     }
                     // An allocation/capacity failure is not an invented backing
                     // store error. Deliver protocol failure into Lean so its
@@ -606,10 +1280,15 @@ fn execute<E>(
                     }
                 }
             }
-            Frame::Done(result) => return Ok(result.to_vec()),
+            Frame::Done(result) => {
+                return (run.finish)(result)
+                    .map(Step::Done)
+                    .map_err(|()| OperationError::Protocol)
+            }
             Frame::Failure(code, token) => {
                 return Err(match (code, token) {
-                    (1, token) if token > 0 => errors
+                    (1, token) if token > 0 => run
+                        .errors
                         .get_mut((token - 1) as usize)
                         .and_then(Option::take)
                         .map(OperationError::Host)
@@ -618,12 +1297,33 @@ fn execute<E>(
                     _ => OperationError::Protocol,
                 })
             }
-            frame => host(frame, &mut capabilities, &mut errors)?,
+            frame => host(frame, &mut capabilities, &mut run.errors)?,
         };
+        // A transaction counts as open from a begin that succeeded until a
+        // commit or rollback that succeeded; a failed close keeps it counted,
+        // so a later suspension is still refused.
+        if opens && response.get(1) == Some(&16) {
+            run.open += 1;
+        }
+        if closes && matches!(response.get(1), Some(17 | 18)) {
+            run.open = run.open.saturating_sub(1);
+        }
+        // A remover section owns a connection even before it begins a SQL
+        // transaction. Writer leases do not, and may survive a network wait.
+        if orders && response.get(1) == Some(&63) {
+            let token = Reader(&response[2..])
+                .word()
+                .map_err(|()| OperationError::Protocol)?;
+            run.sections.push(token);
+        }
+        // Release consumes the token even when the host reports a failure.
+        if let Some(token) = releases {
+            run.sections.retain(|held| *held != token);
+        }
         // No request borrows packet data past this point. Release the packet
         // before constructing the next continuation to limit peak retention.
         drop(packet);
-        state.resume(&response);
+        run.state.resume(&response);
     }
 }
 
@@ -653,6 +1353,18 @@ pub(crate) fn run<S: Storage>(
     )
 }
 
+/// Execute a pure command. Any requested host capability is a protocol error.
+pub(crate) fn run_pure(
+    command: &Command,
+) -> Result<Vec<u8>, OperationError<std::convert::Infallible>> {
+    execute(
+        start(command),
+        |_, _, _| Err(OperationError::Protocol),
+        &[],
+        Capabilities::default(),
+    )
+}
+
 /// Same ownership contract as `run`, narrowed to byte-reading capabilities.
 pub(crate) fn run_readonly<S: ByteStorage>(
     storage: &mut S,
@@ -662,9 +1374,144 @@ pub(crate) fn run_readonly<S: ByteStorage>(
     let state = start(command);
     execute(
         state,
-        |frame, _, errors| dispatch_readonly(storage, frame, errors),
+        |frame, capabilities, errors| {
+            dispatch_readonly(Some(&mut *storage), capabilities, frame, errors)
+        },
         inputs,
         Capabilities::default(),
+    )
+}
+
+/// Same ownership contract as `run`, narrowed to byte reads, content-addressed
+/// byte writes and the digest primitive: what a trie write needs and nothing
+/// relational.
+pub(crate) fn run_bytes<S: ByteStorage>(
+    storage: &mut S,
+    writes: &mut dyn crate::host::ByteWrites<Error = S::Error>,
+    digest: &mut dyn crate::host::Digest<Error = S::Error>,
+    inputs: &[&[u8]],
+    command: &Command,
+) -> Result<Vec<u8>, OperationError<S::Error>> {
+    let state = start(command);
+    let capabilities = Capabilities {
+        digest: Some(digest),
+        writes: Some(writes),
+        ..Capabilities::default()
+    };
+    execute(
+        state,
+        |frame, capabilities, errors| {
+            dispatch_readonly(Some(&mut *storage), capabilities, frame, errors)
+        },
+        inputs,
+        capabilities,
+    )
+}
+
+/// Same ownership contract as `run`, narrowed to byte reads and the walk
+/// services the caller supplies (refusals, digest, materializer, raw snapshots
+/// and memo): no transaction or relational mutation capability is exposed.
+pub(crate) fn run_walk<S: ByteStorage>(
+    storage: &mut S,
+    capabilities: Capabilities<'_, S::Error>,
+    inputs: &[&[u8]],
+    command: &Command,
+) -> Result<Vec<u8>, OperationError<S::Error>> {
+    let state = start(command);
+    execute(
+        state,
+        |frame, capabilities, errors| {
+            dispatch_readonly(Some(&mut *storage), capabilities, frame, errors)
+        },
+        inputs,
+        capabilities,
+    )
+}
+
+/// Same ownership contract as `run`, narrowed to the digest primitive: no
+/// storage of any kind is reachable, so a byte read is a protocol failure.
+pub(crate) fn run_digest<D: crate::host::Digest>(
+    digest: &mut D,
+    inputs: &[&[u8]],
+    command: &Command,
+) -> Result<Vec<u8>, OperationError<D::Error>> {
+    let state = start(command);
+    let capabilities = Capabilities {
+        digest: Some(digest),
+        ..Capabilities::default()
+    };
+    execute(
+        state,
+        |frame, capabilities, errors| {
+            dispatch_readonly::<NoBytes<D::Error>>(None, capabilities, frame, errors)
+        },
+        inputs,
+        capabilities,
+    )
+}
+
+/// Execute a command with only primitive point validation. No storage or
+/// domain parsing capability is supplied by the host.
+pub(crate) fn run_crypto<C: crate::host::Crypto>(
+    crypto: &mut C,
+    command: &Command,
+) -> Result<Vec<u8>, OperationError<C::Error>> {
+    execute(
+        start(command),
+        |frame, capabilities, errors| {
+            dispatch_readonly::<NoBytes<C::Error>>(None, capabilities, frame, errors)
+        },
+        &[],
+        Capabilities {
+            crypto: Some(crypto),
+            ..Capabilities::default()
+        },
+    )
+}
+
+/// Run one command over the relational host and whatever raw services it may
+/// direct, letting it suspend on a peer: the caller gets the continuation
+/// back with each request and answers it through `Suspension::continue_with`,
+/// supplying storage again at that point. Byte inputs are never held across
+/// a suspension, so there are none.
+pub(crate) fn run_suspending<T, S: Storage>(
+    storage: &mut S,
+    capabilities: Capabilities<'_, S::Error>,
+    command: &Command,
+    finish: fn(&[u8]) -> Result<T, ()>,
+) -> Result<Step<T, S::Error>, OperationError<S::Error>> {
+    run_external(storage, capabilities, command, finish, peer_request)
+}
+
+pub(crate) fn run_provider_suspending<T, S: Storage>(
+    storage: &mut S,
+    capabilities: Capabilities<'_, S::Error>,
+    command: &Command,
+    finish: fn(&[u8]) -> Result<T, ()>,
+) -> Result<ProviderStep<T, S::Error>, OperationError<S::Error>> {
+    run_external(storage, capabilities, command, finish, provider_request)
+}
+
+fn run_external<T, S: Storage, R>(
+    storage: &mut S,
+    capabilities: Capabilities<'_, S::Error>,
+    command: &Command,
+    finish: fn(&[u8]) -> Result<T, ()>,
+    request: RequestDecoder<R>,
+) -> Result<Step<T, S::Error, R>, OperationError<S::Error>> {
+    let run = Run {
+        state: start(command),
+        errors: Vec::new(),
+        open: 0,
+        sections: Vec::new(),
+        request: Some(request),
+        finish,
+    };
+    drive(
+        run,
+        |frame, capabilities, errors| dispatch(storage, capabilities, frame, errors),
+        &[],
+        capabilities,
     )
 }
 
@@ -700,6 +1547,7 @@ mod tests {
             relation: "table".into(),
             equals: vec![],
             like_any: vec![],
+            not_equals: vec![],
         };
         for frame in [
             Frame::Begin,
@@ -717,7 +1565,12 @@ mod tests {
             Frame::Delete(1, selection()),
         ] {
             assert!(matches!(
-                dispatch_readonly(&mut host, frame, &mut errors),
+                dispatch_readonly(
+                    Some(&mut host),
+                    &mut Capabilities::default(),
+                    frame,
+                    &mut errors
+                ),
                 Err(OperationError::Protocol)
             ));
         }
@@ -766,13 +1619,14 @@ mod tests {
         let mut errors = Vec::new();
         let key = [1; 32];
         let frame = || Frame::ReadBytes("trie_nodes".into(), &key);
+        let mut none = Capabilities::default();
         assert_eq!(
-            dispatch_readonly(&mut host, frame(), &mut errors).unwrap(),
+            dispatch_readonly(Some(&mut host), &mut none, frame(), &mut errors).unwrap(),
             vec![1, 22, 0]
         );
         host.value = Some(vec![]);
         assert_eq!(
-            dispatch_readonly(&mut host, frame(), &mut errors).unwrap(),
+            dispatch_readonly(Some(&mut host), &mut none, frame(), &mut errors).unwrap(),
             vec![1, 22, 1, 0, 0, 0, 0, 0, 0, 0, 0]
         );
         assert_eq!(host.reads, 2);
@@ -1152,6 +2006,9 @@ mod tests {
         word(out, 1);
         bytes(out, b"name");
         bytes(out, b"prefix/%");
+        word(out, 1);
+        bytes(out, b"durable");
+        cell(out, &Cell::Integer(0));
     }
 
     #[test]
@@ -1166,6 +2023,7 @@ mod tests {
                 assert_eq!(selection.relation, "raw_table");
                 assert_eq!(selection.equals, [("id".into(), Cell::Blob(vec![0, 255]))]);
                 assert_eq!(selection.like_any, [("name".into(), "prefix/%".into())]);
+                assert_eq!(selection.not_equals, [("durable".into(), Cell::Integer(0))]);
                 assert_eq!(columns, ["value"]);
             }
             _ => panic!("unexpected snapshot frame"),
@@ -1546,7 +2404,16 @@ mod tests {
             })
         }
 
-        host_unexpected!(exists_rows, read_bytes, update, copy_rows, delete, write);
+        host_unexpected!(
+            exists_rows,
+            delete_except,
+            read_bytes,
+            update,
+            copy_rows,
+            delete,
+            write,
+            snapshot_excluding
+        );
     }
 
     #[test]
@@ -1582,6 +2449,176 @@ mod tests {
                 assert_eq!(script.calls, expected);
             }
         }
+    }
+
+    fn probe(
+        script: &mut Script,
+        in_transaction: bool,
+    ) -> Result<Step<crate::generated::Probed, &'static str>, OperationError<&'static str>> {
+        crate::suspend::probe(
+            script,
+            &[1; 32],
+            &[(vec![5, 6], vec![2; 32]), (vec![], vec![3; 32])],
+            in_transaction,
+        )
+    }
+
+    fn suspended<T: std::fmt::Debug, E: std::fmt::Debug>(
+        step: Result<Step<T, E>, OperationError<E>>,
+    ) -> Suspension<T, E> {
+        match step {
+            Ok(Step::Suspended(suspension)) => suspension,
+            other => panic!("expected a suspension, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_probe_suspends_on_each_round_trip_and_counts_the_answers() {
+        let mut script = Script::default();
+        let first = suspended(probe(&mut script, false));
+        assert_eq!(
+            *first.request(),
+            PeerRequest::Nodes {
+                root: vec![1; 32],
+                wants: vec![(vec![5, 6], vec![2; 32]), (vec![], vec![3; 32])],
+            }
+        );
+        let second = suspended(first.resume(
+            PeerReply::Nodes {
+                served: vec![(vec![5, 6], vec![9, 9, 9])],
+                missing: vec![vec![3; 32]],
+                redacted: vec![],
+            },
+            &mut script,
+        ));
+        assert_eq!(
+            *second.request(),
+            PeerRequest::Values {
+                root: vec![1; 32],
+                wants: vec![(vec![5, 6], vec![2; 32]), (vec![], vec![3; 32])],
+            }
+        );
+        let done = second.resume(
+            PeerReply::Values {
+                served: vec![(vec![], vec![7]), (vec![5, 6], vec![])],
+                missing: vec![vec![3; 32], vec![4; 32], vec![5; 32]],
+            },
+            &mut script,
+        );
+        match done {
+            Ok(Step::Done(probed)) => assert_eq!(
+                probed,
+                crate::generated::Probed {
+                    served: 3,
+                    missing: 4
+                }
+            ),
+            other => panic!("expected the count, got {other:?}"),
+        }
+        assert!(script.calls.is_empty());
+    }
+
+    #[test]
+    fn a_suspension_inside_a_transaction_is_refused_and_rolled_back() {
+        let mut script = Script::default();
+        assert!(matches!(
+            probe(&mut script, true),
+            Err(OperationError::Protocol)
+        ));
+        assert_eq!(script.calls, ["begin", "rollback"]);
+    }
+
+    #[test]
+    fn a_failed_round_trip_is_the_hosts_error() {
+        let mut script = Script::default();
+        let first = suspended(probe(&mut script, false));
+        assert!(matches!(
+            first.resume(PeerReply::Failed("primary"), &mut script),
+            Err(OperationError::Host("primary"))
+        ));
+        let mut script = Script::default();
+        let second = suspended(suspended(probe(&mut script, false)).resume(
+            PeerReply::Nodes {
+                served: vec![],
+                missing: vec![],
+                redacted: vec![],
+            },
+            &mut script,
+        ));
+        assert!(matches!(
+            second.resume(PeerReply::Failed("primary"), &mut script),
+            Err(OperationError::Host("primary"))
+        ));
+    }
+
+    #[test]
+    fn a_reply_of_the_other_kind_is_a_protocol_failure() {
+        let mut script = Script::default();
+        let first = suspended(probe(&mut script, false));
+        assert!(matches!(
+            first.resume(
+                PeerReply::Values {
+                    served: vec![],
+                    missing: vec![]
+                },
+                &mut script
+            ),
+            Err(OperationError::Protocol)
+        ));
+    }
+
+    #[test]
+    fn a_dropped_suspension_releases_its_continuation() {
+        let mut script = Script::default();
+        let first = suspended(probe(&mut script, false));
+        drop(first);
+        let again = suspended(probe(&mut script, false));
+        assert!(matches!(again.request(), PeerRequest::Nodes { .. }));
+    }
+
+    #[test]
+    fn a_run_that_may_not_suspend_refuses_peer_requests() {
+        let mut script = Script::default();
+        let command = Command::PeerProbe {
+            root: vec![1; 32],
+            wants: vec![],
+            in_transaction: false,
+        };
+        assert!(matches!(
+            run(&mut script, Capabilities::default(), &[], &command),
+            Err(OperationError::Protocol)
+        ));
+        assert!(script.calls.is_empty());
+    }
+
+    #[test]
+    fn peer_replies_are_written_in_the_order_the_program_reads_them() {
+        let mut errors: Vec<Option<&'static str>> = Vec::new();
+        let packet = reply(
+            72,
+            Ok::<_, &'static str>((
+                vec![(vec![1], vec![2, 3])],
+                vec![vec![4]],
+                vec![vec![5], vec![6]],
+            )),
+            &mut errors,
+            |out, (served, missing, redacted)| {
+                pairs(out, &served);
+                hashes(out, &missing);
+                hashes(out, &redacted);
+            },
+        );
+        let mut reader = Reader(&packet);
+        assert_eq!(reader.byte(), Ok(1));
+        assert_eq!(reader.byte(), Ok(72));
+        assert_eq!(
+            reader.list(|r| Ok((r.bytes()?, r.bytes()?))),
+            Ok(vec![(vec![1], vec![2, 3])])
+        );
+        assert_eq!(reader.list(Reader::bytes), Ok(vec![vec![4]]));
+        assert_eq!(reader.list(Reader::bytes), Ok(vec![vec![5], vec![6]]));
+        reader.end().unwrap();
+        assert!(errors.is_empty());
     }
 
     fn state() -> Handle {
@@ -1692,5 +2729,226 @@ mod tests {
         ] {
             assert!(decode(packet).is_err());
         }
+    }
+    #[derive(Default)]
+    struct ProbeLeases {
+        held: bool,
+        calls: Vec<&'static str>,
+        fail_release: bool,
+    }
+    impl crate::host::Lease for ProbeLeases {
+        type Error = &'static str;
+        fn acquire(&mut self, space: &str, _: &[u8]) -> Result<u64, Self::Error> {
+            assert_eq!(space, "cas_writers");
+            self.calls.push("acquire");
+            self.held = true;
+            Ok(91)
+        }
+        fn order(&mut self, space: &str) -> Result<u64, Self::Error> {
+            assert_eq!(space, "cas");
+            self.calls.push("order");
+            self.held = true;
+            Ok(91)
+        }
+        fn release(&mut self, token: u64) -> Result<(), Self::Error> {
+            assert_eq!(token, 91);
+            assert!(self.held);
+            self.held = false;
+            self.calls.push("release");
+            if self.fail_release {
+                Err("release")
+            } else {
+                Ok(())
+            }
+        }
+    }
+
+    fn provider_probe(
+        script: &mut Script,
+        leases: &mut ProbeLeases,
+        mode: u64,
+    ) -> Result<
+        ProviderStep<crate::generated::ProviderProbed, &'static str>,
+        OperationError<&'static str>,
+    > {
+        run_provider_suspending(
+            script,
+            Capabilities {
+                leases: Some(leases),
+                ..Capabilities::default()
+            },
+            &Command::ProviderProbe {
+                key: b"object".to_vec(),
+                mode,
+            },
+            terminal,
+        )
+    }
+
+    fn provider_wait(
+        step: Result<
+            ProviderStep<crate::generated::ProviderProbed, &'static str>,
+            OperationError<&'static str>,
+        >,
+    ) -> ProviderSuspension<crate::generated::ProviderProbed, &'static str> {
+        match step.unwrap() {
+            Step::Suspended(wait) => wait,
+            Step::Done(_) => panic!("expected provider request"),
+        }
+    }
+
+    #[test]
+    fn provider_waits_preserve_requests_and_allow_writer_protection() {
+        let mut script = Script::default();
+        let mut leases = ProbeLeases::default();
+        let first = provider_wait(provider_probe(&mut script, &mut leases, 3));
+        assert!(leases.held);
+        assert_eq!(
+            first.request(),
+            &ProviderRequest::Stat {
+                space: "probe".into(),
+                key: b"object".to_vec(),
+            }
+        );
+        let second = provider_wait(first.continue_provider_with(
+            ProviderReply::Stat(Ok(3)),
+            &mut script,
+            Capabilities {
+                leases: Some(&mut leases),
+                ..Capabilities::default()
+            },
+        ));
+        assert!(leases.held);
+        assert_eq!(
+            second.request(),
+            &ProviderRequest::ReadAll {
+                space: "probe".into(),
+                key: b"object".to_vec(),
+            }
+        );
+        let third = provider_wait(second.continue_provider_with(
+            ProviderReply::ReadAll(Ok(b"abc".to_vec())),
+            &mut script,
+            Capabilities {
+                leases: Some(&mut leases),
+                ..Capabilities::default()
+            },
+        ));
+        assert!(leases.held);
+        assert_eq!(
+            third.request(),
+            &ProviderRequest::ReadRange {
+                space: "probe".into(),
+                key: b"object".to_vec(),
+                offset: 1,
+                count: 2,
+            }
+        );
+        let result = third
+            .continue_provider_with(
+                ProviderReply::ReadRange(Ok(b"bc".to_vec())),
+                &mut script,
+                Capabilities {
+                    leases: Some(&mut leases),
+                    ..Capabilities::default()
+                },
+            )
+            .unwrap();
+        let Step::Done(value) = result else {
+            panic!("unexpected wait")
+        };
+        assert_eq!(
+            (value.size, value.whole, value.ranged, value.missing),
+            (3, b"abc".to_vec(), b"bc".to_vec(), false)
+        );
+        assert!(!leases.held);
+        assert_eq!(leases.calls, ["acquire", "release"]);
+        assert!(script.calls.is_empty());
+    }
+
+    #[test]
+    fn provider_refuses_waits_inside_transactions_and_remover_sections() {
+        for mode in [1, 2] {
+            let mut script = Script::default();
+            let mut leases = ProbeLeases::default();
+            assert!(matches!(
+                provider_probe(&mut script, &mut leases, mode),
+                Err(OperationError::Protocol)
+            ));
+            assert!(!leases.held);
+            if mode == 1 {
+                assert_eq!(script.calls, ["begin", "rollback"]);
+                assert!(leases.calls.is_empty());
+            } else {
+                assert!(script.calls.is_empty());
+                assert_eq!(leases.calls, ["order", "release"]);
+            }
+        }
+    }
+
+    #[test]
+    fn provider_failed_release_consumes_section_before_waiting() {
+        let mut script = Script::default();
+        let mut leases = ProbeLeases {
+            fail_release: true,
+            ..ProbeLeases::default()
+        };
+        let waiting = provider_wait(provider_probe(&mut script, &mut leases, 4));
+        assert!(!leases.held);
+        assert_eq!(leases.calls, ["order", "release"]);
+        drop(waiting);
+    }
+
+    #[test]
+    fn provider_missing_and_original_errors_stay_distinct() {
+        for kind in [
+            FileFailureKind::Missing,
+            FileFailureKind::ShortRead,
+            FileFailureKind::Other,
+        ] {
+            let mut script = Script::default();
+            let mut leases = ProbeLeases::default();
+            let waiting = provider_wait(provider_probe(&mut script, &mut leases, 3));
+            let missing = matches!(kind, FileFailureKind::Missing);
+            let result = waiting.continue_provider_with(
+                ProviderReply::Stat(Err(FileFailure {
+                    error: "provider",
+                    kind,
+                })),
+                &mut script,
+                Capabilities {
+                    leases: Some(&mut leases),
+                    ..Capabilities::default()
+                },
+            );
+            if missing {
+                let Step::Done(value) = result.unwrap() else {
+                    panic!("unexpected wait")
+                };
+                assert!(value.missing);
+            } else {
+                assert!(matches!(result, Err(OperationError::Host("provider"))));
+            }
+            assert!(!leases.held);
+            assert_eq!(leases.calls, ["acquire", "release"]);
+        }
+    }
+
+    #[test]
+    fn provider_wrong_reply_kind_runs_cleanup() {
+        let mut script = Script::default();
+        let mut leases = ProbeLeases::default();
+        let waiting = provider_wait(provider_probe(&mut script, &mut leases, 3));
+        let result = waiting.continue_provider_with(
+            ProviderReply::ReadAll(Ok(Vec::new())),
+            &mut script,
+            Capabilities {
+                leases: Some(&mut leases),
+                ..Capabilities::default()
+            },
+        );
+        assert!(matches!(result, Err(OperationError::Protocol)));
+        assert!(!leases.held);
+        assert_eq!(leases.calls, ["acquire", "release"]);
     }
 }

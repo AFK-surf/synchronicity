@@ -93,6 +93,7 @@ impl Storage for Script {
     // The relational host is one trait; these operations never request the
     // read-repair, copy or expression-upsert statements.
     host_unexpected!(
+        delete_except,
         scan_rows,
         read_rows,
         exists_rows,
@@ -102,7 +103,8 @@ impl Storage for Script {
         update,
         copy_rows,
         delete,
-        write
+        write,
+        snapshot_excluding
     );
 }
 

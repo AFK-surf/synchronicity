@@ -139,7 +139,7 @@ cannot yield to is rejected before a writer decodes bytes against it, so a
 wrong-size outboard is never written over verified groups. The commit
 decides again, transactionally. A row that is not there admits any size. -/
 def admit (root : ByteArray) (size : UInt64) : Action Unit := do
-  let scan ← raise Error.host (Access.snapshot ⟨"blobs", [("root", .blob root)], []⟩ claimColumns)
+  let scan ← raise Error.host (Access.snapshot ⟨"blobs", [("root", .blob root)], [], []⟩ claimColumns)
   let claim ← ExceptT.mk (.pure (decodeClaim scan.rows))
   match claim, scan.failure with
   | none, some failure => throw (.host failure)

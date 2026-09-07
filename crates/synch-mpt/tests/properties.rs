@@ -57,12 +57,12 @@ proptest! {
         prop_assert_eq!(iterated, expected);
     }
 
-    /// The root hash is a function of the key/value map alone: inserting the
-    /// same pairs in any order yields the same root.
+    /// Building a fresh compressed trie from the same pairs in any order
+    /// yields the same root. This does not compare routing representations.
     #[test]
     fn root_is_order_independent(items in map_strategy()) {
         // `forward` is the deduplicated map in sorted order; equal roots across
-        // the two orders mean the root depends on the map alone.
+        // the two orders checks insertion order for this compressed form.
         let map: BTreeMap<Vec<u8>, Vec<u8>> = items.iter().cloned().collect();
         let forward: Vec<(Vec<u8>, Vec<u8>)> = map.iter().map(|(k, v)| (k.clone(), v.clone())).collect();
 
@@ -73,7 +73,7 @@ proptest! {
         prop_assert_eq!(root_a, root_b);
     }
 
-    /// Deleting keys leaves exactly the canonical trie of the remaining map.
+    /// Deleting keys from a compressed trie matches a fresh compressed build.
     #[test]
     fn canonical_after_delete(items in map_strategy(), to_delete in prop::collection::vec(key_strategy(), 0..12)) {
         let map: BTreeMap<Vec<u8>, Vec<u8>> = items.into_iter().collect();
@@ -110,26 +110,31 @@ proptest! {
             root_b = trie.remove(root_b, k).unwrap();
         }
 
-        let changes = trie.diff_resolved(root_a, root_b).unwrap();
+        let mut changes = Vec::new();
+        trie.for_each_resolved_change_scoped::<synch_mpt::MptError, _>(
+            root_a, root_b, &synch_mpt::Scope::full(), |change| {
+                changes.push((change.key.to_vec(), change.kind, change.new.map(<[u8]>::to_vec)));
+                Ok(())
+            },
+        ).unwrap();
 
         // Applying the diff to `a` must yield exactly `b`.
         let mut replayed = root_a;
-        for change in &changes {
-            replayed = match &change.new {
-                Some(v) => trie.insert(replayed, &change.key, v).unwrap(),
-                None => trie.remove(replayed, &change.key).unwrap(),
+        for (key, _, new) in &changes {
+            replayed = match new {
+                Some(v) => trie.insert(replayed, key, v).unwrap(),
+                None => trie.remove(replayed, key).unwrap(),
             };
         }
         prop_assert_eq!(replayed, root_b);
 
         // And the diff must be minimal: every reported key really differs.
-        for change in &changes {
-            let before = trie.get(root_a, &change.key).unwrap();
-            let after = trie.get(root_b, &change.key).unwrap();
+        for (key, kind, new) in &changes {
+            let before = trie.get(root_a, key).unwrap();
+            let after = trie.get(root_b, key).unwrap();
             prop_assert_ne!(&before, &after);
-            prop_assert_eq!(&before, &change.old);
-            prop_assert_eq!(&after, &change.new);
-            match change.kind() {
+            prop_assert_eq!(&after, new);
+            match kind {
                 ChangeKind::Added => prop_assert!(before.is_none() && after.is_some()),
                 ChangeKind::Deleted => prop_assert!(before.is_some() && after.is_none()),
                 ChangeKind::Changed => prop_assert!(before.is_some() && after.is_some()),
@@ -137,7 +142,7 @@ proptest! {
         }
 
         // Nothing outside the diff may have changed.
-        let keys_in_diff: std::collections::BTreeSet<&Vec<u8>> = changes.iter().map(|c| &c.key).collect();
+        let keys_in_diff: std::collections::BTreeSet<&Vec<u8>> = changes.iter().map(|(key, _, _)| key).collect();
         for (k, v) in trie.iter(root_a).unwrap() {
             if !keys_in_diff.contains(&k) {
                 prop_assert_eq!(trie.get(root_b, &k).unwrap(), Some(v));

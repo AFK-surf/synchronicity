@@ -110,7 +110,7 @@ impl Store {
 
     /// Drops one want, whether it was satisfied or has stopped being wanted.
     pub fn drop_want(&self, root: &Hash, holder: &PinHolder) -> Result<bool> {
-        // `Cas.DropWant` requires the replica leaf to have left the
+        // Retiring a repair request requires its replica leaf to have left the
         // materialized active view before its unsatisfied intent is retired;
         // the entry guard makes that requirement local to this DELETE.
         Ok(self.conn().execute(
@@ -821,7 +821,7 @@ mod tests {
 
     /// A hold or a repair intent behind an entry the tree still names
     /// survives the source role's removal: the leaf stands, so what it stands
-    /// on stays (`Cas.RemoveRole`). Holds nothing names go as before.
+    /// on stays. Holds nothing names go as before.
     #[test]
     fn removing_a_source_keeps_the_holds_behind_live_entries() {
         let (_dir, store) = store();

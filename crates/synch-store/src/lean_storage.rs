@@ -11,6 +11,24 @@ use synch_verified::host::{
 
 use crate::{Result, StoreError};
 
+#[cfg(test)]
+thread_local! {
+    static SQL_SCAN_WORK: std::cell::Cell<(usize, i32)> = const { std::cell::Cell::new((0, 0)) };
+    static BYTE_READ_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Counts raw native commands on this test thread, without interpreting trie shape.
+#[cfg(test)]
+pub(crate) fn take_byte_read_calls() -> usize {
+    BYTE_READ_CALLS.with(|calls| calls.replace(0))
+}
+
+/// Actual SQL work on this test thread: projected rows and full-scan steps.
+#[cfg(test)]
+pub(crate) fn take_sql_scan_work() -> (usize, i32) {
+    SQL_SCAN_WORK.with(|work| work.replace((0, 0)))
+}
+
 /// Raw keyed resources; no CAS protection or cleanup policy is interpreted here.
 pub(crate) struct Resources<'a>(pub(crate) &'a crate::Store);
 
@@ -43,6 +61,7 @@ impl synch_verified::host::Resources for Resources<'_> {
 pub(crate) struct SqliteStorage<'a> {
     conn: ConnectionSource<'a>,
     active: Option<u64>,
+    borrowed_transaction: bool,
     next: u64,
 }
 
@@ -50,6 +69,9 @@ pub(crate) struct SqliteStorage<'a> {
 enum ConnectionSource<'a> {
     Borrowed(&'a Connection),
     Owned(crate::db::ConnectionLease<'a>),
+    /// The connection the remover's critical section holds, shared with the
+    /// section's token for as long as either lives.
+    Shared(std::rc::Rc<crate::db::ConnectionLease<'a>>),
 }
 
 impl std::ops::Deref for ConnectionSource<'_> {
@@ -58,17 +80,49 @@ impl std::ops::Deref for ConnectionSource<'_> {
         match self {
             Self::Borrowed(conn) => conn,
             Self::Owned(conn) => conn,
+            Self::Shared(conn) => conn,
         }
     }
 }
+
+/// The connection state one invocation's storage session and its lease
+/// service share: the connection a critical section (`Lease::order`) holds,
+/// which every statement inside the section then runs on, and whether a
+/// transaction is open, which is when a section may not begin.
+#[derive(Debug, Default)]
+pub(crate) struct Shared<'a> {
+    pub(crate) held: Option<std::rc::Rc<crate::db::ConnectionLease<'a>>>,
+    pub(crate) transaction: bool,
+}
+
+pub(crate) type Section<'a> = std::rc::Rc<std::cell::RefCell<Shared<'a>>>;
 
 impl<'a> SqliteStorage<'a> {
     pub(crate) fn new(conn: &'a Connection) -> Self {
         Self {
             conn: ConnectionSource::Borrowed(conn),
             active: None,
+            borrowed_transaction: false,
             next: 1,
         }
+    }
+
+    /// Bind the already-open transaction without taking ownership of its end.
+    /// Native commands using this handle may not commit or abort it, and drop
+    /// cannot roll back the surrounding publication transaction.
+    pub(crate) fn borrow_transaction(conn: &'a Connection) -> Result<(Self, u64)> {
+        if conn.is_autocommit() {
+            return Err(StoreError::invalid("no transaction to borrow"));
+        }
+        Ok((
+            Self {
+                conn: ConnectionSource::Borrowed(conn),
+                active: Some(1),
+                borrowed_transaction: true,
+                next: 2,
+            },
+            1,
+        ))
     }
 
     fn require_transaction(&self, tx: u64) -> Result<()> {
@@ -94,6 +148,7 @@ pub(crate) struct Session<'a> {
     store: &'a crate::Store,
     active: Option<SqliteStorage<'a>>,
     next: u64,
+    section: Section<'a>,
 }
 
 impl<'a> Session<'a> {
@@ -102,7 +157,14 @@ impl<'a> Session<'a> {
             store,
             active: None,
             next: 1,
+            section: Section::default(),
         }
+    }
+
+    /// The connection state a lease service of the same invocation shares,
+    /// so a critical section it opens carries this session's statements.
+    pub(crate) fn section(&self) -> Section<'a> {
+        self.section.clone()
     }
 
     fn transaction(&mut self) -> Result<&mut SqliteStorage<'a>> {
@@ -115,11 +177,23 @@ impl<'a> Session<'a> {
         if self.active.is_some() {
             return Err(StoreError::invalid("snapshot during storage transaction"));
         }
+        // Inside a critical section the connection is already held; taking
+        // it again would wait on the invocation's own guard forever.
+        let conn = match self.section.borrow().held.as_ref() {
+            Some(held) => ConnectionSource::Shared(held.clone()),
+            None => ConnectionSource::Owned(self.store.connection_lease()),
+        };
         Ok(SqliteStorage {
-            conn: ConnectionSource::Owned(self.store.connection_lease()),
+            conn,
             active: None,
+            borrowed_transaction: false,
             next: self.next,
         })
+    }
+
+    fn finish(&mut self) {
+        self.active = None;
+        self.section.borrow_mut().transaction = false;
     }
 }
 
@@ -131,19 +205,30 @@ impl Storage for Session<'_> {
         let tx = storage.begin()?;
         self.next = storage.next;
         self.active = Some(storage);
+        self.section.borrow_mut().transaction = true;
         Ok(tx)
     }
 
     fn commit(&mut self, tx: u64) -> Result<()> {
         self.transaction()?.commit(tx)?;
-        self.active = None;
+        self.finish();
         Ok(())
     }
 
     fn rollback(&mut self, tx: u64) -> Result<()> {
         self.transaction()?.rollback(tx)?;
-        self.active = None;
+        self.finish();
         Ok(())
+    }
+
+    fn snapshot_excluding(
+        &mut self,
+        selection: &Selection,
+        columns: &[String],
+        excluding: &[synch_verified::host::Exclusion],
+    ) -> Result<Scan<StoreError>> {
+        self.snapshot_storage()?
+            .snapshot_excluding(selection, columns, excluding)
     }
 
     fn exists_rows(&mut self, tx: u64, relation: &str, equals: &Fields) -> Result<bool> {
@@ -200,7 +285,28 @@ impl Storage for Session<'_> {
             .delete_rows(tx, relation, equals, unless, at_most)
     }
 
+    fn delete_except(
+        &mut self,
+        tx: u64,
+        relation: &str,
+        column: &str,
+        keys: &[&[u8]],
+    ) -> Result<u64> {
+        self.transaction()?
+            .delete_except(tx, relation, column, keys)
+    }
+
     fn read_bytes(&mut self, space: &str, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        #[cfg(test)]
+        BYTE_READ_CALLS.with(|calls| calls.set(calls.get() + 1));
+        if matches!(space, "cas_payload" | "cas_outboard") {
+            let path = crate::lean_resources::target(self.store, space, key)?;
+            return match std::fs::read(path) {
+                Ok(bytes) => Ok(Some(bytes)),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(error) => Err(error.into()),
+            };
+        }
         if let Some(storage) = self.active.as_mut() {
             storage.read_bytes(space, key)
         } else {
@@ -244,7 +350,7 @@ impl Storage for Session<'_> {
 
 impl Drop for SqliteStorage<'_> {
     fn drop(&mut self) {
-        if self.active.is_some() && !self.conn.is_autocommit() {
+        if !self.borrowed_transaction && self.active.is_some() && !self.conn.is_autocommit() {
             // Cancellation releases an uncommitted host resource. Normal
             // recovery and error selection are requested by the Lean program.
             let _ = self.conn.execute_batch("ROLLBACK");
@@ -333,6 +439,20 @@ fn columns_for(relation: &str) -> Result<&'static [&'static str]> {
             "recorded_at",
         ]),
         "trie_nodes" | "trie_values" => Ok(&["hash", "data"]),
+        "trie_node_origins" => Ok(&["origin_id", "hash"]),
+        "bindings" => Ok(&[
+            "origin_id",
+            "node_id",
+            "source",
+            "domain",
+            "issuer",
+            "spaces",
+            "note",
+            "added_at",
+            "expires_at",
+        ]),
+        "device_keys" => Ok(&["node_id", "state", "created_at"]),
+        "config" => Ok(&["key", "value"]),
         _ => Err(StoreError::invalid("unsupported storage relation")),
     }
 }
@@ -391,6 +511,44 @@ fn predicate(relation: &str, equals: &Fields) -> Result<String> {
     })
 }
 
+/// The correlated `NOT EXISTS` terms of raw exclusions against the base
+/// relation aliased `"target"`, with the literals they bind, in order.
+fn exclusion_terms(
+    relation: &str,
+    exclusions: &[synch_verified::host::Exclusion],
+) -> Result<(Vec<String>, Vec<Cell>)> {
+    let mut terms = Vec::new();
+    let mut bindings = Vec::new();
+    for exclusion in exclusions {
+        columns_for(&exclusion.relation)?;
+        let mut guards = exclusion
+            .equals
+            .iter()
+            .map(|(name, _)| {
+                column(&exclusion.relation, name).map(|name| format!("\"guard\".{name} IS ?"))
+            })
+            .collect::<Result<Vec<_>>>()?;
+        for (base, excluded) in &exclusion.keys {
+            guards.push(format!(
+                "\"target\".{} = \"guard\".{}",
+                column(relation, base)?,
+                column(&exclusion.relation, excluded)?
+            ));
+        }
+        let predicate = if guards.is_empty() {
+            String::new()
+        } else {
+            format!(" WHERE {}", guards.join(" AND "))
+        };
+        terms.push(format!(
+            "NOT EXISTS (SELECT 1 FROM \"{}\" AS \"guard\"{predicate})",
+            exclusion.relation
+        ));
+        bindings.extend(exclusion.equals.iter().map(|(_, cell)| cell.clone()));
+    }
+    Ok((terms, bindings))
+}
+
 /// Build only whitelisted identifiers; every literal remains a bound cell.
 /// WHERE 1 also disambiguates SQLite's INSERT SELECT ... ON CONFLICT grammar.
 fn selection_sql(selection: &Selection) -> Result<(String, Vec<Cell>)> {
@@ -408,6 +566,10 @@ fn selection_sql(selection: &Selection) -> Result<(String, Vec<Cell>)> {
             bindings.push(Cell::Text(pattern.clone()));
         }
         terms.push(format!("({})", alternatives.join(" OR ")));
+    }
+    for (name, value) in &selection.not_equals {
+        terms.push(format!("{} IS NOT ?", column(&selection.relation, name)?));
+        bindings.push(value.clone());
     }
     Ok((
         format!(
@@ -492,6 +654,9 @@ impl Storage for SqliteStorage<'_> {
     }
 
     fn commit(&mut self, tx: u64) -> Result<()> {
+        if self.borrowed_transaction {
+            return Err(StoreError::invalid("cannot commit a borrowed transaction"));
+        }
         self.require_transaction(tx)?;
         self.conn.execute_batch("COMMIT")?;
         self.active = None;
@@ -499,6 +664,9 @@ impl Storage for SqliteStorage<'_> {
     }
 
     fn rollback(&mut self, tx: u64) -> Result<()> {
+        if self.borrowed_transaction {
+            return Err(StoreError::invalid("cannot abort a borrowed transaction"));
+        }
         self.require_transaction(tx)?;
         // SQLite can itself roll back a transaction after certain I/O errors.
         // Already rolled back is a released resource, not a successful commit.
@@ -626,6 +794,14 @@ impl Storage for SqliteStorage<'_> {
                 }
             }
         }
+        #[cfg(test)]
+        SQL_SCAN_WORK.with(|work| {
+            let (rows, steps) = work.get();
+            work.set((
+                rows + scan.rows.len(),
+                steps + statement.get_status(rusqlite::StatementStatus::FullscanStep),
+            ));
+        });
         Ok(scan)
     }
 
@@ -707,33 +883,9 @@ impl Storage for SqliteStorage<'_> {
         );
         let mut bindings = values(equals);
         bindings.extend(values(at_most));
-        for exclusion in unless {
-            columns_for(&exclusion.relation)?;
-            let mut guards = exclusion
-                .equals
-                .iter()
-                .map(|(name, _)| {
-                    column(&exclusion.relation, name).map(|name| format!("\"guard\".{name} IS ?"))
-                })
-                .collect::<Result<Vec<_>>>()?;
-            for (base, excluded) in &exclusion.keys {
-                guards.push(format!(
-                    "\"target\".{} = \"guard\".{}",
-                    column(relation, base)?,
-                    column(&exclusion.relation, excluded)?
-                ));
-            }
-            let predicate = if guards.is_empty() {
-                String::new()
-            } else {
-                format!(" WHERE {}", guards.join(" AND "))
-            };
-            terms.push(format!(
-                "NOT EXISTS (SELECT 1 FROM \"{}\" AS \"guard\"{predicate})",
-                exclusion.relation
-            ));
-            bindings.extend(values(&exclusion.equals));
-        }
+        let (excluded, guards) = exclusion_terms(relation, unless)?;
+        terms.extend(excluded);
+        bindings.extend(guards.iter().map(BoundCell));
         let predicate = if terms.is_empty() {
             String::new()
         } else {
@@ -741,6 +893,37 @@ impl Storage for SqliteStorage<'_> {
         };
         let sql = format!("DELETE FROM \"{relation}\" AS \"target\"{predicate}");
         Ok(self.conn.execute(&sql, params_from_iter(bindings))? as u64)
+    }
+
+    fn delete_except(
+        &mut self,
+        tx: u64,
+        relation: &str,
+        column: &str,
+        keys: &[&[u8]],
+    ) -> Result<u64> {
+        self.require_live_transaction(tx)?;
+        let column = self::column(relation, column)?;
+        // The kept set goes through a temporary table rather than an
+        // `IN (?, ?, …)` list: it is the size of the live trie, far past
+        // SQLite's parameter limit, and one statement sweeps the rest.
+        self.conn.execute_batch(
+            "CREATE TEMP TABLE IF NOT EXISTS lean_kept (key BLOB PRIMARY KEY);
+             DELETE FROM lean_kept;",
+        )?;
+        {
+            let mut insert = self
+                .conn
+                .prepare("INSERT OR IGNORE INTO lean_kept (key) VALUES (?1)")?;
+            for key in keys {
+                insert.execute(rusqlite::params![*key])?;
+            }
+        }
+        let sql =
+            format!("DELETE FROM \"{relation}\" WHERE {column} NOT IN (SELECT key FROM lean_kept)");
+        let swept = self.conn.execute(&sql, [])?;
+        self.conn.execute_batch("DELETE FROM lean_kept;")?;
+        Ok(swept as u64)
     }
 
     fn read_bytes(&mut self, space: &str, key: &[u8]) -> Result<Option<Vec<u8>>> {
@@ -756,15 +939,32 @@ impl Storage for SqliteStorage<'_> {
     }
 
     fn snapshot(&mut self, selection: &Selection, columns: &[String]) -> Result<Scan<StoreError>> {
+        self.snapshot_excluding(selection, columns, &[])
+    }
+
+    fn snapshot_excluding(
+        &mut self,
+        selection: &Selection,
+        columns: &[String],
+        excluding: &[synch_verified::host::Exclusion],
+    ) -> Result<Scan<StoreError>> {
         if self.active.is_some() || !self.conn.is_autocommit() {
             return Err(StoreError::invalid("snapshot during storage transaction"));
         }
         if columns.is_empty() {
             return Err(StoreError::invalid("empty storage projection"));
         }
-        let (predicate, bindings) = selection_sql(selection)?;
+        // The same alias a delete's blockers correlate against, so the
+        // exclusion rendering is shared with `delete_rows`.
+        let (mut predicate, mut bindings) = selection_sql(selection)?;
+        let (excluded, guards) = exclusion_terms(&selection.relation, excluding)?;
+        for term in excluded {
+            predicate.push_str(" AND ");
+            predicate.push_str(&term);
+        }
+        bindings.extend(guards);
         let sql = format!(
-            "SELECT {} FROM \"{}\"{predicate}",
+            "SELECT {} FROM \"{}\" AS \"target\"{predicate}",
             projection(&selection.relation, columns)?,
             selection.relation
         );
@@ -916,6 +1116,7 @@ mod tests {
             relation: relation.into(),
             equals: vec![],
             like_any: vec![],
+            not_equals: vec![],
         }
     }
 
@@ -935,6 +1136,7 @@ mod tests {
                 ("holder".into(), "source:%".into()),
                 ("holder".into(), "replica:%".into()),
             ],
+            not_equals: vec![],
         };
         let mut storage = SqliteStorage::new(&conn);
         assert_eq!(
@@ -1004,6 +1206,7 @@ mod tests {
             relation: "pins".into(),
             equals: vec![],
             like_any: vec![("holder".into(), "absent:%".into())],
+            not_equals: vec![],
         };
         assert_eq!(
             storage
@@ -1078,6 +1281,7 @@ mod tests {
             relation: "pins".into(),
             equals: vec![],
             like_any: vec![("holder OR 1".into(), "%".into())],
+            not_equals: vec![],
         };
         assert!(storage.snapshot(&invalid, &names(&["root"])).is_err());
         let tx = storage.begin().unwrap();

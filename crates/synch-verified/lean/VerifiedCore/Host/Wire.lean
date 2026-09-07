@@ -1,4 +1,5 @@
 import VerifiedCore.Host.Generated
+import VerifiedCore.Host.Peer
 
 /-! Private versioned transport for raw host effects, not domain snapshots.
 Replies must match the pending effect tag and consume the entire input; no
@@ -27,7 +28,10 @@ abbrev State := Program Storage (Reply ByteArray)
 /-- One native continuation transport, with every capability kept as a
 distinct typed algebra. Existing storage packets retain their exact bytes. -/
 abbrev WriteEffects := EffectSum Construct
-  (EffectSum Upsert (EffectSum Resources (EffectSum Lease SourceIO)))
+  (EffectSum Upsert (EffectSum Resources (EffectSum Lease (EffectSum SourceIO
+    (EffectSum Digest (EffectSum ByteWrites (EffectSum Bao (EffectSum Sweep
+      (EffectSum Memo (EffectSum Redaction (EffectSum Apply
+        (EffectSum Peer (EffectSum Provider CacheIO)))))))))))))
 abbrev NativeEffects := EffectSum Storage (EffectSum Crypto
   (EffectSum Access (EffectSum FileIO (EffectSum Clock (EffectSum Output WriteEffects)))))
 abbrev NativeState := Program NativeEffects (Reply ByteArray)

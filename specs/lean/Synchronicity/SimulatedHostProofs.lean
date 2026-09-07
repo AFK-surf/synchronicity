@@ -8,16 +8,16 @@ open VerifiedCore.Host SimulatedHost
 private def failure : Failure := ⟨1, 99⟩
 private def base : State := { db := [("table", [[("id", .integer 1), ("value", .text "old")]])] }
 private def started := storage .begin base
-private def changed := access (.update 1 ⟨"table", [("id", .integer 1)], []⟩ [("value", .text "new")]) started.2
+private def changed := access (.update 1 ⟨"table", [("id", .integer 1)], [], []⟩ [("value", .text "new")]) started.2
 
 theorem transactions_hide_uncommitted_writes :
-    (access (.snapshot ⟨"table", [], []⟩ ["value"]) changed.2).1.map Scan.rows == .ok [[.text "old"]] := by decide +kernel
+    (access (.snapshot ⟨"table", [], [], []⟩ ["value"]) changed.2).1.map Scan.rows == .ok [[.text "old"]] := by decide +kernel
 
 theorem transactions_read_their_own_writes :
     (storage (.readRows 1 "table" ["value"] []) changed.2).1 == .ok [[.text "new"]] := by decide +kernel
 
 theorem commit_publishes_writes :
-    (access (.snapshot ⟨"table", [], []⟩ ["value"]) (storage (.commit 1) changed.2).2).1.map Scan.rows ==
+    (access (.snapshot ⟨"table", [], [], []⟩ ["value"]) (storage (.commit 1) changed.2).2).1.map Scan.rows ==
       .ok [[.text "new"]] := by decide +kernel
 
 theorem rollback_restores_committed_state : (storage (.rollback 1) changed.2).2.db == base.db := by decide +kernel
@@ -26,7 +26,7 @@ theorem failed_commit_does_not_publish :
     (storage (.commit 1) { changed.2 with faults := [(2, failure)] }).2.db == base.db := by decide +kernel
 
 theorem invalid_transaction_token_cannot_mutate :
-    let result := access (.delete 2 ⟨"table", [], []⟩) changed.2
+    let result := access (.delete 2 ⟨"table", [], [], []⟩) changed.2
     result.1 == .error invalid ∧ result.2.pending.map Prod.snd == changed.2.pending.map Prod.snd := by decide +kernel
 
 theorem actual_delete_count_and_correlation :

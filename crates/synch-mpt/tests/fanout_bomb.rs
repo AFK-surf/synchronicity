@@ -1,6 +1,6 @@
 //! A trie DAG fans out exponentially in `diff`, but not in the fetch that
 //! admits it. Nothing canonicalises a peer's node graph, and a branch may
-//! point all sixteen children at the same hash: `MissingWalk` deduplicates on
+//! point all sixteen children at the same hash: the Lean requesting operation deduplicates on
 //! hash, so the structure is `k + 1` nodes on the wire and `is_complete`
 //! answers yes, while `diff_walk` walks *positions* and expands into 16^k
 //! paths — one SQLite read each, one `Change` per leaf visit, inside the
@@ -9,7 +9,7 @@
 //!
 //! The shape is *not* distinguishable from honest data: sixty thousand keys
 //! sharing one value collapse to ~10 distinct nodes, which is why the bound is
-//! on work alone (`FanoutGuard`, `WALK_POSITION_CEILING`) — deduplicating
+//! on work alone (Lean's `Trie.Walk.descend`, `WALK_POSITION_CEILING`) — deduplicating
 //! positions by node hash instead silently drops keys.
 
 use synch_core::Hash;
@@ -52,12 +52,12 @@ fn fanout_bomb(store: &MemStore, k: usize) -> Hash {
 /// Ignored because it is expensive *by construction*, not because it is
 /// flaky: refusal happens at `WALK_POSITION_CEILING`, so asserting it end to
 /// end means walking that many positions — ~8 s in release, ~90 s in debug.
-/// `trie.rs`'s `the_walk_guard_stops_at_the_ceiling` covers the guard's
-/// arithmetic in microseconds; this covers the wiring. Excluded from the
+/// The ceiling's arithmetic is Lean's (`specs/lean`, `TrieWalkProofs`:
+/// `descend_refuses_past_the_ceiling`); this covers the wiring. Excluded from the
 /// default `cargo test` run so local iteration stays fast, but CI runs it
 /// explicitly (`-- --ignored`) once per job, so it still gates every change.
 #[test]
-#[ignore = "walks to WALK_POSITION_CEILING; see the fast guard test in trie.rs"]
+#[ignore = "walks to WALK_POSITION_CEILING; the ceiling itself is proved in specs/lean"]
 fn a_fanout_bomb_is_refused_rather_than_walked() {
     // Unbounded, k = 6 is 16.7M changes and 155 s; at a 64M-position ceiling it
     // slipped under entirely and wrote every one of those rows. The walk stops

@@ -43,15 +43,13 @@ fn shallow_shared_leaf_cannot_hide_invalid_deeper_reuse() {
             value: None,
         },
     );
-    let mut walk = synch_mpt::MissingWalk::new(root);
-    let error = walk.next_batch(&Trie::new(&store), usize::MAX).unwrap_err();
+    let error = Trie::new(&store).is_complete(root).unwrap_err();
     assert!(
         error
             .to_string()
             .contains(&format!("nibble depth {}", limit + 1)),
         "{error}"
     );
-    assert!(!walk.is_exhausted());
 }
 
 /// Stores a node under its own hash, the way a fetch commits a served node.

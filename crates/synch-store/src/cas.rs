@@ -14,17 +14,14 @@ use std::{
 };
 
 use bao_tree::{
-    io::{
-        outboard::PreOrderOutboard,
-        sync::{decode_ranges, encode_ranges, WriteAt},
-    },
+    io::{outboard::PreOrderOutboard, sync::decode_ranges},
     BaoTree, BlockSize, ChunkNum,
 };
 use rusqlite::{params, OptionalExtension};
-use synch_core::{
-    group_count, groups_for_byte_range, BlobAd, ChunkRanges, GroupRange, Hash, CHUNK_GROUP_LOG2,
-    CHUNK_GROUP_SIZE, INLINE_BLOB_MAX,
-};
+use synch_core::{BlobAd, ChunkRanges, GroupRange, Hash, CHUNK_GROUP_LOG2};
+
+#[cfg(test)]
+use synch_core::{group_count, CHUNK_GROUP_SIZE};
 
 use crate::{
     db::{hash_column, Store, Txn},
@@ -34,15 +31,7 @@ use crate::{
 impl Txn<'_> {
     /// Reads the local CAS row from this transaction's snapshot.
     pub fn blob(&self, root: &Hash) -> Result<Option<BlobRow>> {
-        let row = self
-            .conn()
-            .query_row(
-                &format!("SELECT {BLOB_COLUMNS} FROM blobs WHERE root = ?1"),
-                params![root.as_bytes().to_vec()],
-                raw_blob_row,
-            )
-            .optional()?;
-        row.map(blob_row_from).transpose()
+        crate::lean_project::blob_in(self.conn(), root)
     }
 
     /// Verifies durable possession and installs the source hold used by the
@@ -88,7 +77,7 @@ impl Txn<'_> {
         )?;
         // Held is not wanted. A source want exists only as a repair intent
         // left by a heal, and the durable row just verified is that repair;
-        // `Cas.SourcePublish` retires the want in the same step.
+        // retire the repair request in the same transaction.
         self.conn().execute(
             "DELETE FROM content_want WHERE root = ?1 AND holder = ?2",
             params![root.as_bytes().to_vec(), holder],
@@ -157,54 +146,6 @@ pub(crate) fn fsync_file(file: &File) -> Result<()> {
 pub(crate) use synch_core::fs::fsync_parent;
 
 pub(crate) use synch_core::fs::replace_file;
-
-/// Writes a file whole and flushes it (contents and directory entry) to stable
-/// storage before returning.
-///
-/// Staged and renamed, never written in place. `File::create` truncates first,
-/// and the object this replaces may already be held complete: re-ingesting
-/// content the CAS already has is routine, not exotic — a duplicate file
-/// anywhere in a scanned tree, the scanner's racily-clean re-ingest, an
-/// explicit re-`put` — and for a large object the window between the truncate
-/// and the last byte is the length of the whole write. A power loss inside it
-/// left the object with its `complete = 1` row intact and a truncated outboard
-/// behind it: still advertised by `local_ad`, still `has_complete_blob`, but no
-/// longer satisfying the stable-storage promise represented by that row. The
-/// payload beside it already staged and renamed ([`Store::ingest_file`]); this
-/// is the same rule applied to the file that describes it.
-///
-/// The staging file lives in the staging directory, which [`Store::gc_staging`]
-/// sweeps by age, so a crash between the write and the rename leaks nothing
-/// permanently.
-fn write_and_sync(
-    staging_dir: &std::path::Path,
-    path: &std::path::Path,
-    data: &[u8],
-) -> Result<()> {
-    std::fs::create_dir_all(staging_dir)?;
-    let staging = staging_dir.join(format!("{}.tmp", synch_core::fs::unique_suffix()));
-    let write = || -> Result<()> {
-        let mut file = File::create(&staging)?;
-        file.write_all(data)?;
-        fsync_file(&file)?;
-        Ok(())
-    };
-    if let Err(e) = write() {
-        let _ = std::fs::remove_file(&staging);
-        return Err(e);
-    }
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    // `rename` is atomic within a filesystem: a reader sees either the whole
-    // old file or the whole new one, never a truncated prefix of either.
-    if let Err(e) = replace_file(&staging, path) {
-        let _ = std::fs::remove_file(&staging);
-        return Err(e.into());
-    }
-    fsync_parent(path);
-    Ok(())
-}
 
 /// Who holds a pin (`docs/REPLICATION.md` §3.1).
 ///
@@ -295,56 +236,8 @@ pub struct BlobSummary {
     pub last_access: i64,
 }
 
-/// The column list `blob` and `blobs` share, in the order [`raw_blob_row`]
-/// destructures. One spelling, because hand-aligned tuple destructurings of
-/// the same columns is how a reordered schema change compiles cleanly and
-/// decodes the wrong column. (`blob_candidates` still hand-decodes its own
-/// narrower row below.)
-const BLOB_COLUMNS: &str = "root, size, complete, bitmap, inline,
-        EXISTS(SELECT 1 FROM pins WHERE pins.root = blobs.root),
-        last_access, durable";
-
-/// A [`BLOB_COLUMNS`] row as SQLite hands it over, before hash decoding —
-/// which reports through [`StoreError`], so it happens outside the closure.
-type RawBlobRow = (
-    Vec<u8>,
-    i64,
-    i64,
-    Option<Vec<u8>>,
-    Option<Vec<u8>>,
-    i64,
-    i64,
-    i64,
-);
-
-fn raw_blob_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<RawBlobRow> {
-    Ok((
-        row.get(0)?,
-        row.get(1)?,
-        row.get(2)?,
-        row.get(3)?,
-        row.get(4)?,
-        row.get(5)?,
-        row.get(6)?,
-        row.get(7)?,
-    ))
-}
-
-fn blob_row_from(raw: RawBlobRow) -> Result<BlobRow> {
-    let (root, size, complete, bitmap, inline, pinned, last_access, durable) = raw;
-    Ok(BlobRow {
-        root: hash_column(root, "blobs.root")?,
-        size: size as u64,
-        complete: complete != 0,
-        durable: durable != 0,
-        bitmap,
-        inline,
-        pinned: pinned != 0,
-        last_access,
-    })
-}
-
-/// A row of the local blob index.
+/// A snapshot of one local blob index row and its native projections.
+/// Editing public row fields does not recompute availability or advertisements.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlobRow {
     /// The object root.
@@ -363,40 +256,27 @@ pub struct BlobRow {
     pub pinned: bool,
     /// When the blob was last read, in unix nanoseconds.
     pub last_access: i64,
+    /// Exact availability computed by the native projection of this snapshot.
+    pub(crate) verified_groups: ChunkRanges,
+    /// Canonical advertisement computed by the same native projection.
+    pub(crate) advertised_spans: Vec<(u64, u64)>,
 }
 
 impl BlobRow {
-    /// The groups this holder has verified.
+    /// The verified groups in the original projected snapshot.
     pub fn verified_groups(&self) -> ChunkRanges {
-        // This is cache availability, not the durable-tier promise. A cold
-        // cloud row advertises complete through `to_ad`, while the fetch/read
-        // planner still sees which groups are actually local.
-        if self.complete {
-            return ChunkRanges::single(0, group_count(self.size));
-        }
-        match &self.bitmap {
-            None => ChunkRanges::empty(),
-            Some(bytes) => blob_to_ranges(bytes, group_count(self.size)),
-        }
+        self.verified_groups.clone()
     }
 
-    /// The advertisement this holder should publish for the object (§6.3).
+    /// The advertisement computed for the original projected snapshot (§6.3).
     pub fn to_ad(&self) -> BlobAd {
-        if self.complete || self.durable {
-            return BlobAd::complete(self.size);
+        BlobAd {
+            v: synch_core::record::RECORD_VERSION,
+            size: self.size,
+            state: synch_core::record::AdState {
+                spans: self.advertised_spans.clone(),
+            },
         }
-        let spans: Vec<(u64, u64)> = self
-            .verified_groups()
-            .ranges
-            .iter()
-            .map(|r| {
-                (
-                    r.start * CHUNK_GROUP_SIZE,
-                    (r.end * CHUNK_GROUP_SIZE).min(self.size),
-                )
-            })
-            .collect();
-        BlobAd::partial(self.size, spans)
     }
 }
 
@@ -444,21 +324,6 @@ pub(crate) fn ranges_to_blob(ranges: &ChunkRanges) -> Vec<u8> {
     postcard::to_stdvec(&pairs).expect("range encoding is infallible")
 }
 
-/// Decodes the `blobs.bitmap` column, clamped to the object's group count.
-pub(crate) fn blob_to_ranges(bytes: &[u8], groups: u64) -> ChunkRanges {
-    let pairs: Vec<(u64, u64)> = match postcard::from_bytes(bytes) {
-        Ok(pairs) => pairs,
-        // A row this build cannot read is treated as holding nothing, which
-        // costs a re-fetch and never a wrong claim of availability.
-        Err(_) => return ChunkRanges::empty(),
-    };
-    ChunkRanges::from_ranges(
-        pairs
-            .into_iter()
-            .map(|(start, end)| GroupRange::new(start, end.min(groups))),
-    )
-}
-
 /// Decodes the pre-v10 bit-per-group encoding.
 ///
 /// Live only inside the v10 migration, which rewrites every partial row into
@@ -491,7 +356,7 @@ pub(crate) fn bitmap_to_ranges(bits: &[u8], groups: u64) -> ChunkRanges {
 }
 
 /// Converts our group ranges into bao chunk ranges.
-fn to_bao_ranges(ranges: &ChunkRanges) -> bao_tree::ChunkRanges {
+pub(crate) fn to_bao_ranges(ranges: &ChunkRanges) -> bao_tree::ChunkRanges {
     let per_group = 1u64 << CHUNK_GROUP_LOG2;
     let mut out = bao_tree::ChunkRanges::empty();
     for r in &ranges.ranges {
@@ -499,21 +364,6 @@ fn to_bao_ranges(ranges: &ChunkRanges) -> bao_tree::ChunkRanges {
             bao_tree::ChunkRanges::from(ChunkNum(r.start * per_group)..ChunkNum(r.end * per_group));
     }
     out
-}
-
-fn cache_file_bytes(path: &std::path::Path) -> u64 {
-    let Ok(metadata) = std::fs::metadata(path) else {
-        return 0;
-    };
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::MetadataExt;
-        metadata.blocks().saturating_mul(512)
-    }
-    #[cfg(not(unix))]
-    {
-        metadata.len()
-    }
 }
 
 impl Store {
@@ -592,6 +442,7 @@ impl Store {
     /// complete, durable or final-group-holding row can refuse; a changed
     /// tree shape resets an unattested bitmap; and the merged groups are
     /// written as ranges, `NULL` when there are none or all.
+    #[cfg(test)]
     pub(crate) fn commit_groups(
         &self,
         root: &Hash,
@@ -607,6 +458,7 @@ impl Store {
     /// by the same Lean settlement outside a transaction, so a writer never
     /// decodes bytes (and writes an outboard of the wrong shape) against a
     /// claim the commit would refuse anyway.
+    #[cfg(test)]
     pub(crate) fn admit_size(&self, root: &Hash, size: u64) -> Result<()> {
         crate::lean_ingest::admit_size(self, root, size)
     }
@@ -642,72 +494,31 @@ impl Store {
 
     // ---- index reads ------------------------------------------------------
 
-    /// Reads the local index row for an object.
+    /// Reads the local index row for an object, with whether any claim
+    /// stands on it: the Lean projection `Cas.Project.blob`, validated as
+    /// the read path validates a row.
     pub fn blob(&self, root: &Hash) -> Result<Option<BlobRow>> {
-        let conn = self.conn();
-        let row = conn
-            .query_row(
-                &format!("SELECT {BLOB_COLUMNS} FROM blobs WHERE root = ?1"),
-                params![root.as_bytes().to_vec()],
-                raw_blob_row,
-            )
-            .optional()?;
-        row.map(blob_row_from).transpose()
+        crate::lean_project::blob(self, root)
     }
 
     /// Every locally held object, as the columns a sweep or a report reads.
     ///
     /// [`Store::blobs`] returns whole rows, which means `inline` — up to
-    /// [`INLINE_BLOB_MAX`] per row — and `bitmap`. Neither GC nor `synch
+    /// [`INLINE_BLOB_MAX`](synch_core::INLINE_BLOB_MAX) per row — and `bitmap`. Neither GC nor `synch
     /// doctor` looks at either: they read the root, the completeness flag, the
     /// pin state and `last_access`. Pulling the payloads anyway made a pass
     /// over a store of many small objects allocate the inlined half of the CAS,
     /// every five minutes and again on every doctor run, and drop all of it.
+    /// The pin state is read as one join and merged in one pass by the Lean
+    /// projection `Cas.Project.candidates`.
     pub fn blob_candidates(&self) -> Result<Vec<BlobSummary>> {
-        let conn = self.conn();
-        let mut stmt = conn.prepare(
-            "SELECT root, size, complete, durable,
-                    EXISTS(SELECT 1 FROM pins WHERE pins.root = blobs.root),
-                    last_access
-             FROM blobs ORDER BY last_access DESC",
-        )?;
-        let rows = stmt.query_map([], |row| {
-            Ok((
-                row.get::<_, Vec<u8>>(0)?,
-                row.get::<_, i64>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, i64>(3)?,
-                row.get::<_, i64>(4)?,
-                row.get::<_, i64>(5)?,
-            ))
-        })?;
-        let mut out = Vec::new();
-        for row in rows {
-            let (root, size, complete, durable, pinned, last_access) = row?;
-            out.push(BlobSummary {
-                root: hash_column(root, "blobs.root")?,
-                size: size as u64,
-                complete: complete != 0,
-                durable: durable != 0,
-                pinned: pinned != 0,
-                last_access,
-            });
-        }
-        Ok(out)
+        crate::lean_project::blob_candidates(self)
     }
 
-    /// Every locally held object.
+    /// Every locally held object, most recently accessed first: the Lean
+    /// projection `Cas.Project.blobs`.
     pub fn blobs(&self) -> Result<Vec<BlobRow>> {
-        let conn = self.conn();
-        let mut stmt = conn.prepare(&format!(
-            "SELECT {BLOB_COLUMNS} FROM blobs ORDER BY last_access DESC"
-        ))?;
-        let rows = stmt.query_map([], raw_blob_row)?;
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(blob_row_from(row?)?);
-        }
-        Ok(out)
+        crate::lean_project::blobs(self)
     }
 
     /// True if the whole object is present and verified locally.
@@ -723,156 +534,51 @@ impl Store {
 
     /// Records that the configured backend has promoted a complete object to
     /// stable storage. Call only after the backend's durability promise.
+    ///
+    /// The transition is the Lean command `Cas.Durable.markDurable`; it never
+    /// creates a row.
     pub(crate) fn mark_blob_durable(&self, root: &Hash) -> Result<bool> {
-        let changed = self.conn().execute(
-            "UPDATE blobs SET durable = 1 WHERE root = ?1",
-            params![root.as_bytes().to_vec()],
-        )?;
-        Ok(changed > 0)
+        crate::lean_durable::mark_durable(self, root)
     }
 
     /// Reconstructs a cold durable row after metadata restore, once the remote
     /// backend has confirmed that the final payload/outboard pair exists.
+    ///
+    /// The backend confirms the remote pair before this row is created.
+    /// The row decision
+    /// (agreeing size marked, missing row created, disagreeing size refused)
+    /// is the Lean command `Cas.Durable.adoptDurable`.
     pub(crate) fn adopt_durable_blob(&self, root: &Hash, size: u64, now: i64) -> Result<()> {
-        // `Cas.AdoptRemote` is this row creation from a remote pair
-        // the backend has just confirmed; it only ever adds availability.
-        self.with_immediate_tx(|tx| {
-            let existing: Option<i64> = tx
-                .query_row(
-                    "SELECT size FROM blobs WHERE root = ?1",
-                    params![root.as_bytes().to_vec()],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            if let Some(existing) = existing {
-                if existing as u64 != size {
-                    return Err(StoreError::invalid(format!(
-                        "size mismatch for {root}: have {existing}, offered {size}"
-                    )));
-                }
-                tx.execute(
-                    "UPDATE blobs SET durable = 1 WHERE root = ?1",
-                    params![root.as_bytes().to_vec()],
-                )?;
-            } else {
-                tx.execute(
-                    "INSERT INTO blobs
-                       (root, size, complete, bitmap, inline, last_access, durable)
-                     VALUES (?1, ?2, 0, NULL, NULL, ?3, 1)",
-                    params![root.as_bytes().to_vec(), size as i64, now],
-                )?;
-            }
-            Ok(())
-        })
+        crate::lean_durable::adopt_durable(self, root, size, now)
     }
 
     /// Applies the authoritative S3 `NoSuchKey` heal rule.
     ///
     /// The durable claim is withdrawn. A row with no verified cache bytes is
     /// removed altogether; otherwise it remains a partial peer-fetched cache.
+    ///
+    /// The Lean command `Cas.Durable.healMissing` withdraws the durable
+    /// claim: role pins
+    /// become wants, the operator's pin is left alone. The backend losing the
+    /// object is the environment step before it. A replica's claim must not
+    /// outlive the bytes it was a promise about (`docs/REPLICATION.md` §8):
+    /// this is the one place where absence of bytes *is* evidence, because the
+    /// backend answered `NotFound` about a content address. The repair is
+    /// gated on the *withdrawal*, not on the row disappearing: a cloud
+    /// replica reaches `durable=1, complete=0, bitmap NOT NULL` in the
+    /// ordinary course of things, and for such a row nothing is deleted.
+    /// `CasDurableProofs.lean` proves the gating and what moves.
     pub(crate) fn heal_missing_durable_blob(&self, root: &Hash) -> Result<bool> {
-        // `FaultTolerant.HealRemote` is this transaction: the durable claim is
-        // withdrawn, role pins become wants, the operator's pin is left alone.
-        // The backend losing the object is the environment step before it.
-        self.with_immediate_tx(|tx| {
-            let key = root.as_bytes().to_vec();
-            // Read before anything is written: this row is the most
-            // authoritative record of the object's size, and it is about to be
-            // withdrawn or deleted.
-            let size: Option<i64> = tx
-                .query_row(
-                    "SELECT size FROM blobs WHERE root = ?1",
-                    params![key.clone()],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            let changed = tx.execute(
-                "UPDATE blobs SET durable = 0 WHERE root = ?1 AND durable != 0",
-                params![key.clone()],
-            )?;
-            tx.execute(
-                "DELETE FROM blobs
-                   WHERE root = ?1 AND complete = 0 AND bitmap IS NULL AND inline IS NULL",
-                params![key.clone()],
-            )?;
-            // A replica's claim must not outlive the bytes it was a promise
-            // about (`docs/REPLICATION.md` §8). This is the one place where
-            // absence of bytes *is* evidence: the backend answered `NotFound`
-            // about a content address, which is a statement — unlike `entries`
-            // merely not naming a root.
-            //
-            // Gated on the *withdrawal*, not on the row disappearing. A cloud
-            // replica reaches `durable=1, complete=0, bitmap NOT NULL` in the
-            // ordinary course of things — the cache LRU clears a durable row
-            // and any later ranged read writes a partial bitmap back — and for
-            // such a row the delete above matches nothing. Gating on it left
-            // the pin standing over bytes that are neither complete nor
-            // durable, which is the same permanent hole this exists to close:
-            // both staging paths skip a root the holder already pins, so no
-            // sweep could ever re-want it.
-            if changed > 0 {
-                // `blobs.size` is `NOT NULL` and `changed > 0` means the row
-                // was there to withdraw, so the size is always in hand — which
-                // is the point: a root no entry names is still re-fetchable
-                // from any provider that has it, and `blob_providers` survives
-                // independently of `entries`. Dropping such a claim silently
-                // would lose exactly the objects a `forever` replica is bought
-                // to keep, since nothing else names a superseded version.
-                tx.execute(
-                    "INSERT INTO content_want (root, holder, size, prev, first_wanted)
-                     SELECT p.root, p.holder, ?2, NULL, ?3
-                       FROM pins p
-                      WHERE p.root = ?1
-                        AND (p.holder LIKE 'source:%' OR p.holder LIKE 'replica:%')
-                     ON CONFLICT(root, holder) DO NOTHING",
-                    params![key.clone(), size.unwrap_or(0), synch_core::now_ns()],
-                )?;
-                // The claim goes either way: it was a promise about bytes this
-                // node no longer holds. The operator's own pins are left alone
-                // — those are a person's promise, not this node's bookkeeping,
-                // and a vanished object is something they should be told about
-                // rather than have quietly rewritten.
-                tx.execute(
-                    "DELETE FROM pins WHERE root = ?1
-                       AND (holder LIKE 'source:%' OR holder LIKE 'replica:%')",
-                    params![key],
-                )?;
-            }
-            Ok(changed > 0)
-        })
+        crate::lean_durable::heal_missing(self, root)
     }
 
     /// Reconciles database cache claims with an ephemeral scratch generation.
     ///
     /// A changed marker drops staged-only rows and clears cached groups on
     /// durable rows in one transaction. A matching marker is an O(1) no-op.
+    /// The transaction is the Lean command `Cas.Durable.reconcileScratch`.
     pub fn reconcile_scratch_generation(&self, marker: &str) -> Result<bool> {
-        const KEY: &str = "cas.cloud.scratch_generation";
-        self.with_immediate_tx(|tx| {
-            let previous: Option<String> = tx
-                .query_row(
-                    "SELECT value FROM config WHERE key = ?1",
-                    params![KEY],
-                    |row| row.get(0),
-                )
-                .optional()?;
-            if previous.as_deref() == Some(marker) {
-                return Ok(false);
-            }
-            tx.execute(
-                "DELETE FROM blobs
-                   WHERE durable = 0 AND inline IS NULL",
-                [],
-            )?;
-            tx.execute(
-                "UPDATE blobs
-                    SET complete = 0, bitmap = NULL
-                  WHERE durable != 0 AND inline IS NULL",
-                [],
-            )?;
-            crate::db::set_config_in(tx, KEY, marker)?;
-            Ok(true)
-        })
+        crate::lean_durable::reconcile_scratch(self, marker)
     }
 
     /// Whether both files behind a complete out-of-line cache claim exist.
@@ -880,48 +586,23 @@ impl Store {
         self.blob_path(root).is_file() && self.outboard_path(root).is_file()
     }
 
-    /// Reads the whole cached outboard when present.
-    pub(crate) fn cached_outboard(&self, root: &Hash) -> Option<Vec<u8>> {
-        std::fs::read(self.outboard_path(root)).ok()
-    }
-
-    /// Caches a complete remote outboard without claiming any payload groups.
-    pub(crate) fn cache_outboard(&self, root: &Hash, bytes: &[u8]) -> Result<()> {
-        let _lease = self.lease_write(root);
-        write_and_sync(&self.staging_dir(), &self.outboard_path(root), bytes)
-    }
-
     /// Drops only reconstructible local bytes while retaining a remote durable
     /// claim. The row changes first, so a crash can leave only harmless orphan
     /// files, never a warm-cache claim with missing bytes.
+    #[cfg(test)]
     pub(crate) fn clear_blob_cache(&self, root: &Hash) -> Result<bool> {
-        // `Cas.CacheEvict` retains remote durability when local cache
-        // bytes disappear; callers select durable cache rows.
+        // Cache eviction retains the remote claim; callers select durable
+        // cache rows. Non-durable staged rows can instead be removed, as in
+        // `reconcile_scratch_generation` and `commit_cas_migration` discard.
+        // These paths rely on pin acquisition requiring durable content;
+        // the native retention tests exercise that contract.
+        // The Lean command `Cas.Durable.clearCache` reads
+        // the writer count first, changes the rows, and removes the files
+        // after the commit; Rust holds the ordering guard that makes the
+        // count it reads meaningful.
         let conn = self.conn();
         let _ordered_against_writers = self.cas_order();
-        if self.is_being_written(root) {
-            return Ok(false);
-        }
-        // `Cas.DropStaged` is this row removal of a non-durable cache
-        // claim, and the same transition behind `reconcile_scratch_generation`
-        // and the `commit_cas_migration` discard. None of the three consults
-        // `pins`: `SystemSafety.staged_row_drop_is_unpinned` is why they
-        // need not (`Cas.NoLoss`: a pin is only ever granted over available
-        // content), and `Store::pin`'s `durable` predicate is what makes
-        // that theorem true of the store.
-        conn.execute(
-            "DELETE FROM blobs WHERE root = ?1 AND durable = 0 AND inline IS NULL",
-            params![root.as_bytes().to_vec()],
-        )?;
-        conn.execute(
-            "UPDATE blobs SET complete = 0, bitmap = NULL
-               WHERE root = ?1 AND durable != 0 AND inline IS NULL",
-            params![root.as_bytes().to_vec()],
-        )?;
-        let _ = std::fs::remove_file(self.blob_path(root));
-        let _ = std::fs::remove_file(self.outboard_path(root));
-        drop(conn);
-        Ok(true)
+        crate::lean_durable::clear_cache(self, &conn, root)
     }
 
     /// Atomically commits a verified backend migration and drops leftover
@@ -971,69 +652,25 @@ impl Store {
         Ok(discarded.len())
     }
 
-    /// Current out-of-line bytes occupied by reconstructible durable cache
-    /// entries (payload plus outboard).
-    pub(crate) fn durable_cache_bytes(&self) -> Result<u64> {
-        Ok(self
-            .durable_cache_entries()?
-            .into_iter()
-            .map(|(_, _, bytes)| bytes)
-            .sum())
+    /// Evicts least-recently-used durable cache entries until the cache is
+    /// within `limit` bytes and `shortfall` bytes more are free. Pinned rows
+    /// are eligible because their promise lives remotely; staged-only rows
+    /// are never eligible because scratch is their only copy. Which rows, in
+    /// what order, the measure of each and the refusal of one a writer holds
+    /// are the Lean program's; returns the entries evicted and the bytes freed.
+    pub(crate) fn evict_durable_cache(
+        &self,
+        limit: Option<u64>,
+        shortfall: u64,
+    ) -> Result<(usize, u64)> {
+        crate::lean_collect::evict(self, limit, shortfall)
     }
 
-    /// Evicts least-recently-used durable cache entries until `target_bytes`
-    /// is met. Pinned rows are eligible because their promise lives remotely;
-    /// staged-only rows are never eligible because scratch is their only copy.
-    pub(crate) fn evict_durable_cache_to(&self, target_bytes: u64) -> Result<(usize, u64)> {
-        let mut entries = self.durable_cache_entries()?;
-        entries.sort_unstable_by_key(|(_, last_access, _)| *last_access);
-        let mut usage: u64 = entries.iter().map(|(_, _, bytes)| *bytes).sum();
-        let mut evicted = 0usize;
-        let mut freed = 0u64;
-        for (root, _, bytes) in entries {
-            if usage <= target_bytes {
-                break;
-            }
-            if !self.clear_blob_cache(&root)? {
-                continue;
-            }
-            usage = usage.saturating_sub(bytes);
-            freed = freed.saturating_add(bytes);
-            evicted += 1;
-        }
-        Ok((evicted, freed))
-    }
-
-    /// Advances a cache entry's LRU clock after a backend-served read.
-    pub(crate) fn touch_blob(&self, root: &Hash, now: i64) -> Result<()> {
-        self.conn().execute(
-            "UPDATE blobs SET last_access = max(last_access, ?2) WHERE root = ?1",
-            params![root.as_bytes().to_vec(), now],
-        )?;
-        Ok(())
-    }
-
-    fn durable_cache_entries(&self) -> Result<Vec<(Hash, i64, u64)>> {
-        let conn = self.conn();
-        let mut stmt = conn.prepare(
-            "SELECT root, last_access FROM blobs
-              WHERE durable != 0 AND inline IS NULL",
-        )?;
-        let rows = stmt.query_map([], |row| {
-            Ok((row.get::<_, Vec<u8>>(0)?, row.get::<_, i64>(1)?))
-        })?;
-        let mut out = Vec::new();
-        for row in rows {
-            let (encoded, last_access) = row?;
-            let root = hash_column(encoded, "blobs.root")?;
-            let payload = cache_file_bytes(&self.blob_path(&root));
-            let outboard = cache_file_bytes(&self.outboard_path(&root));
-            let bytes = payload.saturating_add(outboard);
-            if bytes > 0 {
-                out.push((root, last_access, bytes));
-            }
-        }
-        Ok(out)
+    /// Advances a cache entry's LRU clock after a backend-served read. The
+    /// Lean program coalesces touches to once a minute against the row's own
+    /// stamp and never moves it backwards; answers whether it moved.
+    pub(crate) fn touch_blob(&self, root: &Hash) -> Result<bool> {
+        crate::lean_collect::touch(self, root)
     }
 
     /// Records one holder's claim on an object against GC (§9.2,
@@ -1170,57 +807,22 @@ impl Store {
         })
     }
 
-    /// Every claim on one object, oldest first.
+    /// Every claim on one object, by holder.
     pub fn pins_for(&self, root: &Hash) -> Result<Vec<PinRow>> {
-        self.query_pins("WHERE root = ?1", params![root.as_bytes().to_vec()])
+        crate::lean_project::pins(self, Some(root))
     }
 
-    /// Every claim this node holds, by object and then by holder.
+    /// Every claim this node holds, by object and then by holder. A holder
+    /// spelling this build does not know is kept as a holder rather than
+    /// dropped: an unreadable claim is still a claim, and forgetting it is
+    /// how bytes go missing after a downgrade (`Cas.Project.PinHolder.parse`).
     pub fn pins(&self) -> Result<Vec<PinRow>> {
-        self.query_pins("", params![])
+        crate::lean_project::pins(self, None)
     }
 
-    fn query_pins(&self, filter: &str, args: &[&dyn rusqlite::ToSql]) -> Result<Vec<PinRow>> {
-        let conn = self.conn();
-        let mut stmt = conn.prepare(&format!(
-            "SELECT root, holder, created_at, release_after FROM pins {filter}
-             ORDER BY root, holder"
-        ))?;
-        let rows = stmt.query_map(args, |row| {
-            Ok((
-                row.get::<_, Vec<u8>>(0)?,
-                row.get::<_, String>(1)?,
-                row.get::<_, i64>(2)?,
-                row.get::<_, Option<i64>>(3)?,
-            ))
-        })?;
-        let mut out = Vec::new();
-        for row in rows {
-            let (root, holder, created_at, release_after) = row?;
-            out.push(PinRow {
-                root: hash_column(root, "pins.root")?,
-                // A holder spelling this build does not know is kept as a
-                // holder rather than dropped: an unreadable claim is still a
-                // claim, and forgetting it is how bytes go missing after a
-                // downgrade.
-                holder: PinHolder::parse(&holder),
-                created_at,
-                release_after,
-            });
-        }
-        Ok(out)
-    }
-
-    /// Every pinned object.
+    /// Every pinned object, in root order.
     pub fn pinned_blobs(&self) -> Result<Vec<Hash>> {
-        let conn = self.conn();
-        let mut stmt = conn.prepare("SELECT DISTINCT root FROM pins ORDER BY root")?;
-        let rows = stmt.query_map([], |r| r.get::<_, Vec<u8>>(0))?;
-        let mut out = Vec::new();
-        for row in rows {
-            out.push(hash_column(row?, "pins.root")?);
-        }
-        Ok(out)
+        crate::lean_project::pinned_blobs(self)
     }
 
     /// Deletes an object, but only if it is still a GC candidate.
@@ -1244,6 +846,7 @@ impl Store {
     /// [`Store::delete_blob`] explains.
     ///
     /// Returns whether the object was deleted.
+    #[cfg(test)]
     pub(crate) fn delete_blob_if_collectable(&self, root: &Hash, before: i64) -> Result<bool> {
         // The connection and shared CAS order guards are held across the
         // unlinks, not just across the transaction, so no row writer or writer
@@ -1383,131 +986,16 @@ impl Store {
     /// an unclamped request would let a peer name an object-sized allocation —
     /// and no honest requester needs one, because `SliceEnd` tells it exactly
     /// how far it got and its next window starts there (§6.4, §12).
+    ///
+    /// The window (what was asked for, that the row holds, within the object,
+    /// clamped) is the Lean command `Cas.Serve.encodeSlice`; this store is
+    /// the Bao service that encodes exactly the groups it names.
     pub fn encode_slice(
         &self,
         root: &Hash,
         requested: &ChunkRanges,
     ) -> Result<(Vec<u8>, ChunkRanges)> {
-        let blob = self.blob(root)?.ok_or(StoreError::MissingBlob(*root))?;
-        let served = requested
-            .intersect(&blob.verified_groups())
-            .intersect(&ChunkRanges::single(0, group_count(blob.size)))
-            .take(synch_core::MAX_SLICE_GROUPS);
-        if served.is_empty() {
-            return Ok((Vec::new(), served));
-        }
-        let encoded = self.encode_slice_inner(&blob, &served)?;
-        Ok((encoded, served))
-    }
-
-    fn encode_slice_inner(&self, blob: &BlobRow, ranges: &ChunkRanges) -> Result<Vec<u8>> {
-        let tree = Self::tree(blob.size);
-        let bao_ranges = to_bao_ranges(ranges);
-        let mut encoded = Vec::new();
-        let root_hash = blake3::Hash::from_bytes(blob.root.0);
-
-        match &blob.inline {
-            Some(data) => {
-                let outboard = PreOrderOutboard {
-                    root: root_hash,
-                    tree,
-                    data: Vec::<u8>::new(),
-                };
-                encode_ranges(data.as_slice(), outboard, &bao_ranges, &mut encoded)
-            }
-            None => {
-                // Both files are read positionally, never slurped. An outboard
-                // is 1/256 of its object, so reading it whole costs 40 MB on a
-                // 10 GB object — and this runs once per served window (§6.4)
-                // and once per chunk of a streaming read, which turns a large
-                // object's transfer into a repeated scan of its own hash tree.
-                // What each call actually touches is the sibling hashes on the
-                // path to the requested groups.
-                let data = File::open(self.blob_path(&blob.root))?;
-                let outboard = PreOrderOutboard {
-                    root: root_hash,
-                    tree,
-                    data: DataFile(File::open(self.outboard_path(&blob.root))?),
-                };
-                encode_ranges(DataFile(data), outboard, &bao_ranges, &mut encoded)
-            }
-        }
-        .map_err(|error| StoreError::invalid(format!("encode slice: {error}")))?;
-        Ok(encoded)
-    }
-
-    /// Caches one group-aligned range returned by the trusted remote backend.
-    ///
-    /// This deliberately does not run the bytes back through bao. OpenDAL's
-    /// successful write/read contract is the storage-integrity boundary; bao
-    /// verification remains for slices received from peers in [`Store::write_slice`].
-    pub(crate) fn cache_trusted_range(
-        &self,
-        root: &Hash,
-        size: u64,
-        offset: u64,
-        bytes: &[u8],
-        now: i64,
-    ) -> Result<ChunkRanges> {
-        let end = offset
-            .checked_add(bytes.len() as u64)
-            .ok_or_else(|| StoreError::invalid("trusted cache range overflowed"))?;
-        if offset > size || end > size {
-            return Err(StoreError::RangeOutOfBounds {
-                start: offset,
-                end,
-                size,
-            });
-        }
-        if !offset.is_multiple_of(CHUNK_GROUP_SIZE)
-            || (end != size && !end.is_multiple_of(CHUNK_GROUP_SIZE))
-        {
-            return Err(StoreError::invalid(
-                "trusted cache writes must cover whole chunk groups",
-            ));
-        }
-        let served = if size == 0 {
-            ChunkRanges::single(0, 1)
-        } else {
-            ChunkRanges::from_ranges([groups_for_byte_range(offset, end)])
-                .intersect(&ChunkRanges::single(0, group_count(size)))
-        };
-        if served.is_empty() {
-            return Ok(served);
-        }
-
-        let _lease = self.lease_write(root);
-        self.admit_size(root, size)?;
-        if self.blob(root)?.is_some_and(|row| row.complete) {
-            return Ok(ChunkRanges::empty());
-        }
-
-        if size <= INLINE_BLOB_MAX {
-            if offset != 0 || end != size {
-                return Err(StoreError::invalid(
-                    "an inline cache fill must contain the whole object",
-                ));
-            }
-            self.commit_groups(root, size, &served, Some(bytes.to_vec()), now)?;
-            return Ok(served);
-        }
-
-        let payload_path = self.blob_path(root);
-        if let Some(parent) = payload_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let mut payload = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&payload_path)?;
-        payload.write_all_at(offset, bytes)?;
-        fsync_file(&payload)?;
-        fsync_parent(&payload_path);
-        let commit = self.commit_groups(root, size, &served, None, now)?;
-        self.trim_to_size(root, commit);
-        Ok(served)
+        crate::lean_serve::encode_slice(self, root, requested)
     }
 
     /// Decodes a received bao slice into the CAS, verifying every group against
@@ -1523,56 +1011,64 @@ impl Store {
         encoded: &[u8],
         now: i64,
     ) -> Result<ChunkRanges> {
-        let groups = group_count(size);
-        let served = served.intersect(&ChunkRanges::single(0, groups));
-        if served.is_empty() {
-            return Ok(ChunkRanges::empty());
-        }
-        // Taken before the row is read and held past the commit: everything
-        // between is file IO with no lock held, and a sweep deciding this object
-        // is collectable in that window would unlink the bytes out from under
-        // the row this is about to write ([`Store::lease_write`]).
-        let _lease = self.lease_write(root);
-        let tree = Self::tree(size);
-        let bao_ranges = to_bao_ranges(&served);
-        let root_hash = blake3::Hash::from_bytes(root.0);
+        crate::lean_receive::write_slice(self, root, size, served, encoded, now)
+    }
 
-        // The cheap refusal; the commit decides again, transactionally. This
-        // one is here so a claim that cannot possibly stand never reaches the
-        // disk at all.
-        self.admit_size(root, size)?;
-        let existing = self.blob(root)?;
-        if existing.as_ref().is_some_and(|row| row.complete) {
-            return Ok(ChunkRanges::empty());
-        }
+    /// The inline half of the Bao slice service: decode `encoded`, a slice of
+    /// exactly `served`, against the root into the object's inline buffer,
+    /// starting from the bytes the row already holds and zero-filled to `size`.
+    pub(crate) fn decode_inline(
+        &self,
+        root: &Hash,
+        size: u64,
+        inline: Option<&[u8]>,
+        served: &ChunkRanges,
+        encoded: &[u8],
+    ) -> Result<Vec<u8>> {
+        let mut buffer = inline
+            .map(<[u8]>::to_vec)
+            .unwrap_or_else(|| vec![0u8; size as usize]);
+        buffer.resize(size as usize, 0);
+        let outboard = PreOrderOutboard {
+            root: blake3::Hash::from_bytes(root.0),
+            tree: Self::tree(size),
+            data: Vec::<u8>::new(),
+        };
+        decode_ranges(
+            std::io::Cursor::new(encoded),
+            &to_bao_ranges(served),
+            buffer.as_mut_slice(),
+            MemOutboard(outboard),
+        )
+        .map_err(|e| StoreError::Verification {
+            root: *root,
+            reason: e.to_string(),
+        })?;
+        Ok(buffer)
+    }
 
-        // Small objects are decoded in memory and inlined; larger ones stream
-        // into the sparse payload and outboard files.
-        if size <= INLINE_BLOB_MAX {
-            let mut buffer = existing
-                .as_ref()
-                .and_then(|r| r.inline.clone())
-                .unwrap_or_else(|| vec![0u8; size as usize]);
-            buffer.resize(size as usize, 0);
-            let outboard = PreOrderOutboard {
-                root: root_hash,
-                tree,
-                data: Vec::<u8>::new(),
-            };
-            decode_ranges(
-                std::io::Cursor::new(encoded),
-                &bao_ranges,
-                buffer.as_mut_slice(),
-                MemOutboard(outboard),
-            )
-            .map_err(|e| StoreError::Verification {
-                root: *root,
-                reason: e.to_string(),
-            })?;
-            self.commit_groups(root, size, &served, Some(buffer), now)?;
-            return Ok(served);
-        }
-
+    /// The file half of the Bao slice service: decode `encoded`, a slice of
+    /// exactly `served`, against the root into the object's sparse payload and
+    /// outboard, created as needed and left unflushed.
+    ///
+    /// Not pre-grown at all, and never shrunk. Never shrunk, because sizing a
+    /// file down on the strength of a claim is how an understated entry
+    /// destroys verified groups: bytes gone, bitmap bits intact, the node
+    /// advertising a group it can no longer serve ([`grow_to`],
+    /// `docs/DELTA-SYNC.md` §6). Not pre-grown, because `size` is a peer's
+    /// assertion off an entry and this runs *before* `decode_ranges` turns any
+    /// of it into fact: an entry claiming 32 TiB for any root would otherwise
+    /// have every node that attempts a fetch create a 32 TiB payload and a
+    /// 128 GiB outboard, fail verification, and leave both behind. The decode
+    /// extends the file as each verified group lands, so the payload never
+    /// gets longer than the bytes proven against the root.
+    pub(crate) fn decode_slice_into_files(
+        &self,
+        root: &Hash,
+        size: u64,
+        served: &ChunkRanges,
+        encoded: &[u8],
+    ) -> Result<()> {
         let payload_path = self.blob_path(root);
         if let Some(parent) = payload_path.parent() {
             std::fs::create_dir_all(parent)?;
@@ -1583,24 +1079,6 @@ impl Store {
             .create(true)
             .truncate(false)
             .open(&payload_path)?;
-        // Not pre-grown at all, and never shrunk.
-        //
-        // Never shrunk, because sizing a file down on the strength of a claim
-        // is how an understated entry destroys verified groups — bytes gone,
-        // bitmap bits intact, the node advertising a group it can no longer
-        // serve ([`grow_to`], `docs/DELTA-SYNC.md` §6).
-        //
-        // Not pre-grown, because `size` is a peer's assertion off an entry and
-        // this runs *before* `decode_ranges` turns any of it into fact. An
-        // entry claiming 32 TiB for any root would otherwise have every node
-        // that attempts a fetch create a 32 TiB payload and a 128 GiB outboard,
-        // fail verification, and leave both behind — `trim_to_size` only runs
-        // on a commit that completed the object, so nothing reclaims them.
-        //
-        // Let the decode extend the file: `write_at` grows it as each verified
-        // group lands, so the
-        // payload never gets longer than the bytes that have been proven
-        // against the root, whatever the window's position.
         let outboard_file = OpenOptions::new()
             .read(true)
             .write(true)
@@ -1608,60 +1086,40 @@ impl Store {
             .truncate(false)
             .open(self.outboard_path(root))?;
         let outboard = PreOrderOutboard {
-            root: root_hash,
-            tree,
+            root: blake3::Hash::from_bytes(root.0),
+            tree: Self::tree(size),
             data: outboard_file,
         };
-        let payload_for_sync = payload.try_clone().ok();
         decode_ranges(
             std::io::Cursor::new(encoded),
-            &bao_ranges,
+            &to_bao_ranges(served),
             DataFile(payload),
             outboard,
         )
         .map_err(|e| StoreError::Verification {
             root: *root,
             reason: e.to_string(),
-        })?;
+        })
+    }
 
-        // Persist the verified groups (payload and outboard) before the bitmap
-        // in the index advances to cover them — otherwise a crash could leave
-        // the index claiming groups the disk never received.
-        // Both flushes are checked. Swallowing them would let an EIO or ENOSPC
-        // on flush advance the bitmap over data that never reached stable
-        // storage — the exact inversion of the ordering this block exists to
-        // enforce. `try_clone` may likewise not fail silently: it fails under
-        // fd exhaustion, which is precisely when the machine is least able to
-        // afford an unflushed commit.
-        let payload = payload_for_sync.ok_or_else(|| StoreError::Verification {
-            root: *root,
-            reason: "could not duplicate the payload handle to flush it".into(),
-        })?;
-        fsync_file(&payload)?;
-        // The directory entries too, not only the contents. Both files are
-        // opened `create(true)`, so the first window of a fetch creates them —
-        // and `fsync` promises the bytes, not that the name they hang from
-        // survives. The mainstream Linux filesystems do persist a new file's
-        // dirent on its own `fsync`, so this is defence in depth rather than a
-        // live hole, but the two other creation sites here (`ingest_file` and
-        // `write_and_sync`) both do it, and unlike the orphan case a lost name
-        // under an advanced bitmap never self-heals: the row goes on claiming
-        // groups whose bytes are unreachable.
-        fsync_parent(&payload_path);
-        // Reopened for *write* to flush it. `File::open` hands back a read-only
-        // handle, and Windows refuses `FlushFileBuffers` on one with
-        // ERROR_ACCESS_DENIED — a hard failure here, since these flushes are
-        // checked rather than discarded. Unix does not care either way.
-        fsync_file(
-            &OpenOptions::new()
-                .write(true)
-                .open(self.outboard_path(root))?,
-        )?;
-        fsync_parent(&self.outboard_path(root));
-
-        let commit = self.commit_groups(root, size, &served, None, now)?;
-        self.trim_to_size(root, commit);
-        Ok(served)
+    /// Flush the object's payload and outboard, contents and directory
+    /// entries, to stable storage; a file that does not exist has nothing to
+    /// flush. Both flushes are checked: swallowing them would let an EIO or
+    /// ENOSPC on flush advance the bitmap over data that never reached stable
+    /// storage. The directory entries too, not only the contents: the first
+    /// window of a fetch creates the files, and `fsync` promises the bytes,
+    /// not that the name they hang from survives; unlike an orphaned file, a
+    /// lost name under an advanced bitmap never self-heals. Reopened for
+    /// *write* to flush, which is what Windows requires of a flush.
+    pub(crate) fn flush_object(&self, root: &Hash) -> Result<()> {
+        for path in [self.blob_path(root), self.outboard_path(root)] {
+            if !path.is_file() {
+                continue;
+            }
+            fsync_file(&OpenOptions::new().write(true).open(&path)?)?;
+            fsync_parent(&path);
+        }
+        Ok(())
     }
 }
 
@@ -1742,8 +1200,9 @@ impl Read for TeeReader {
     }
 }
 
-/// Legacy cloud-ingestion builder and independent test oracle. Local
-/// ingestion constructs its hash tree and outboard entirely in Lean.
+/// Trusted Bao tree construction shared by local and cloud ingestion. Lean
+/// controls local source admission, resource ownership and metadata commit;
+/// the Bao implementation hashes the bytes and writes the outboard layout.
 pub(crate) fn compute_outboard(
     data: impl Read,
     tree: BaoTree,
@@ -1940,8 +1399,8 @@ mod tests {
 
     /// A pin is a promise about the durable tier. A complete scratch copy on a
     /// cloud backend is not one, and the store says so at both entry points —
-    /// which is what lets the staged-row drops skip the pin check
-    /// (`SystemSafety.staged_row_drop_is_unpinned`).
+    /// which is the contract staged-row drops rely on when skipping the
+    /// pin check.
     #[test]
     fn a_staged_cloud_row_cannot_be_pinned_or_possessed() {
         let (_d, store) = store();
@@ -1974,7 +1433,7 @@ mod tests {
 
     /// A role's pin is what its live leaf stands on, so the role cannot let
     /// go while an entry in its space still names the root
-    /// (`Cas.Unpin`). The operator's claim has no leaf behind it.
+    /// during unpin. The operator's claim has no leaf behind it.
     #[test]
     fn a_role_holder_cannot_unpin_content_its_space_still_names() {
         let (_d, store) = store();
@@ -2301,7 +1760,7 @@ mod tests {
 
         // An ad span is 16 MiB and a slice window 8, so the first window
         // advertises nothing: spans round inward rather than claiming a
-        // granule the holder is halfway through (`coalesce_spans`).
+        // granule the holder is halfway through.
         let groups_per_span = g / CHUNK_GROUP_SIZE;
         let mut want = ChunkRanges::single(0, groups_per_span);
         let mut windows = 0;

@@ -170,6 +170,8 @@ struct NodeInner {
     /// The batch between staging and one signed root (§7.1).
     publisher: Publisher,
     ad_clock: std::sync::Mutex<std::collections::HashMap<Hash, i64>>,
+    /// Serializes bounded repair rounds and retains their last completed peer.
+    contact_cursor: tokio::sync::Mutex<Option<Vec<u8>>>,
     /// Content roots that provider discovery has failed to resolve, and when
     /// each may be asked about again (§6.3).
     ///
@@ -898,6 +900,7 @@ impl Node {
                 config,
                 publisher,
                 ad_clock: std::sync::Mutex::new(Default::default()),
+                contact_cursor: tokio::sync::Mutex::new(None),
                 provider_misses: std::sync::Mutex::new(Default::default()),
                 checkout_writes: std::sync::Mutex::new(Default::default()),
                 program_bytes: crate::sockets::ProgramBytesCache::new(),
@@ -1454,6 +1457,10 @@ impl Node {
         Ok(())
     }
 
+    pub(crate) fn contact_cursor(&self) -> &tokio::sync::Mutex<Option<Vec<u8>>> {
+        &self.inner.contact_cursor
+    }
+
     /// Tells the watcher that the set of spaces changed (§7.1).
     pub(crate) fn spaces_changed(&self) {
         self.inner.spaces_changed.notify_waiters();
@@ -1584,6 +1591,17 @@ impl Node {
         if staged.is_empty() {
             return Ok(None);
         }
+        self.publish_changes(staged)
+    }
+
+    /// Republish an older representation without changing its logical entries.
+    /// The ordinary recovery gate, sequence floor and publication transaction
+    /// still apply; relays never rewrite someone else's signed root.
+    pub(crate) fn upgrade_publication(&self) -> Result<Option<SignedHead>> {
+        self.publish_changes(&[])
+    }
+
+    fn publish_changes(&self, staged: &[StagedChange]) -> Result<Option<SignedHead>> {
         self.ensure_publishable()?;
         let secret = self.secret();
         let origin = self.origin().clone();
@@ -1593,11 +1611,10 @@ impl Node {
 
         let head = self
             .store()
-            // `Bridge.PublishTxn` composes every source/view micro-step with the
-            // trie transition below: durable check, pins, entries, removals and
-            // the head flip share one commit.
-            // `MptGc.OwnPublish` models the trie/head/materialized side of this
-            // same transaction; it is complete because this node built it.
+            // The durable check, pins, entries, removals and head flip
+            // share one commit with the trie this node just built.
+            // This Rust composition is covered by integration tests; it is
+            // not established by a separate publication theorem.
             .transaction(|txn| -> Result<Option<SignedHead>> {
                 // Read the head we are about to displace inside the transaction:
                 // the root we build on and the seq we build past have to come from
@@ -1643,10 +1660,9 @@ impl Node {
                 // Publication owns the invariant: callers cannot accidentally
                 // publish an own live file without also advertising the
                 // complete durable content that the source hold just proved.
-                // `Publication.publication_contract` is what this transaction
-                // promises along every execution: for as long as the tree
-                // names the content, its holder pins it, it is available, and
-                // its size is the file-entry/BlobAd size recorded here.
+                // The intended invariant is that while the tree names the
+                // content, its holder retains it and the entry and ad agree
+                // with its size. Cross-operation proof remains open.
                 // Materialize before deriving ads so they read the final
                 // file-entry view. Source entries determine their ads without
                 // asking the scanner to stage a second record for the same
@@ -1681,6 +1697,10 @@ impl Node {
                         None => trie.remove(root, &blob_key(&content))?,
                     };
                 }
+                // Publication, not current grants, establishes the routing
+                // form. Its separately addressed spine values permit peers
+                // to prove an empty shared view without exposing private keys.
+                root = trie.normalize_publication(root)?;
                 if root != proposed_root {
                     txn.materialize_diff(&origin, proposed_root, root)?;
                 }
@@ -2492,6 +2512,42 @@ mod tests {
         assert_eq!(domain, "other.example");
         assert_eq!(**node_id, report.node_id);
         assert!(err.to_string().contains(&report.node_id.to_z32()));
+    }
+
+    #[tokio::test]
+    async fn anti_entropy_republishes_legacy_entries_once_without_new_changes() {
+        let (_directory, node) = node().await;
+        let change = node.manifest_change().unwrap();
+        let StagedChangeKind::Record { key, value } = &change.0 else {
+            unreachable!()
+        };
+        let trie = Trie::new(node.store().as_ref());
+        let old_root = trie
+            .insert(Hash::EMPTY, key, value.as_deref().unwrap())
+            .unwrap();
+        let entries = trie.iter(old_root).unwrap();
+        let legacy = SignedHead::sign(&node.secret(), node.origin().clone(), 7, old_root, now_ns());
+        node.store()
+            .transaction(|txn| -> Result<()> {
+                txn.put_head(Slot::Complete, &legacy, now_ns(), now_ns())?;
+                txn.materialize_diff(node.origin(), Hash::EMPTY, old_root)?;
+                Ok(())
+            })
+            .unwrap();
+
+        // This runs even with no dialable peers or newly staged files. An
+        // upgraded publisher must make an authentic newer version available.
+        node.anti_entropy_round().await.unwrap();
+        let upgraded = node.store().complete_head(node.origin()).unwrap().unwrap();
+        assert!(upgraded.seq > legacy.seq);
+        assert_ne!(upgraded.root, legacy.root);
+        assert_eq!(trie.iter(upgraded.root).unwrap(), entries);
+        assert_eq!(trie.iter(legacy.root).unwrap(), entries);
+        node.anti_entropy_round().await.unwrap();
+        assert_eq!(
+            node.store().complete_head(node.origin()).unwrap().unwrap(),
+            upgraded
+        );
     }
 
     #[tokio::test]

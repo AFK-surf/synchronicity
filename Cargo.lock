@@ -5887,6 +5887,7 @@ dependencies = [
  "proptest",
  "serde",
  "serde_json",
+ "synch-verified",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
@@ -5945,6 +5946,7 @@ dependencies = [
  "synch-net",
  "synch-sock",
  "synch-store",
+ "synch-verified",
  "tempfile",
  "thiserror 2.0.20",
  "tokio",
@@ -6013,6 +6015,7 @@ dependencies = [
  "synch-net",
  "synch-sock",
  "synch-store",
+ "synch-verified",
  "tempfile",
  "thiserror 2.0.20",
  "time",
@@ -6103,6 +6106,7 @@ dependencies = [
 name = "synch-verified"
 version = "0.1.8"
 dependencies = [
+ "blake3",
  "cc",
  "proptest",
 ]

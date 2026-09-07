@@ -1,7 +1,9 @@
 //! Trie nodes, their canonical encoding, and their domain-separated hashing (§4.3).
 
 use serde::{Deserialize, Serialize};
-use synch_core::{Hash, INLINE_VALUE_MAX, MAX_KEY_LEN};
+use synch_core::Hash;
+#[cfg(test)]
+use synch_core::INLINE_VALUE_MAX;
 
 use crate::{error::MptError, nibbles::Nibbles};
 
@@ -11,35 +13,16 @@ pub(crate) const LEAF_TAG: &[u8] = b"synch-mpt/1/leaf";
 pub(crate) const EXT_TAG: &[u8] = b"synch-mpt/1/ext";
 /// Domain-separation tag for [`TrieNode::Branch`] hashing.
 pub(crate) const BRANCH_TAG: &[u8] = b"synch-mpt/1/branch";
+/// Domain-separation tag for private-scope routing nodes.
+pub(crate) const ROUTE_TAG: &[u8] = b"synch-mpt/2/route";
 
 /// How a leaf's value is carried.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ValueRef {
-    /// A value of at most [`INLINE_VALUE_MAX`] bytes, embedded in the node.
+    /// A value of at most [`synch_core::INLINE_VALUE_MAX`] bytes, embedded in the node.
     Inline(Vec<u8>),
     /// A larger value, stored out-of-line and addressed by its BLAKE3 hash.
     Hash(Hash),
-}
-
-impl ValueRef {
-    /// Chooses the representation for `value`, returning the out-of-line
-    /// payload that must be stored alongside it, if any.
-    pub fn for_value(value: &[u8]) -> (ValueRef, Option<(Hash, Vec<u8>)>) {
-        if value.len() <= INLINE_VALUE_MAX {
-            (ValueRef::Inline(value.to_vec()), None)
-        } else {
-            let hash = Hash::new(value);
-            (ValueRef::Hash(hash), Some((hash, value.to_vec())))
-        }
-    }
-
-    /// The out-of-line value hash, if this reference is not inline.
-    pub(crate) fn out_of_line(&self) -> Option<Hash> {
-        match self {
-            ValueRef::Inline(_) => None,
-            ValueRef::Hash(h) => Some(*h),
-        }
-    }
 }
 
 /// A node of the radix-16 Merkle-Patricia Trie.
@@ -59,8 +42,8 @@ pub enum TrieNode {
     /// A path-compression node: a shared nibble prefix above a branch.
     ///
     /// Invariant: `prefix` is non-empty and `child` is always a
-    /// [`TrieNode::Branch`]; an extension above anything else would have been
-    /// merged during canonicalization.
+    /// [`TrieNode::Branch`] or [`TrieNode::Route`]; other adjacent compressed
+    /// nodes are merged during canonicalization.
     Ext {
         /// The shared nibble prefix.
         prefix: Nibbles,
@@ -76,6 +59,17 @@ pub enum TrieNode {
         children: [Option<Hash>; 16],
         /// The value of the key ending exactly at this node, if any.
         value: Option<ValueRef>,
+    },
+    /// A publication routing node. Child choices can be disclosed without
+    /// disclosing any payload or a compressed private key suffix.
+    ///
+    /// Unlike a compressed branch, one occupant is valid, including a sole
+    /// addressed value that proves there are no descendant keys.
+    Route {
+        /// Child hashes by nibble.
+        children: [Option<Hash>; 16],
+        /// Address of the value ending here; even small payloads stay separate.
+        value: Option<Hash>,
     },
 }
 
@@ -96,6 +90,7 @@ impl TrieNode {
             TrieNode::Leaf { .. } => LEAF_TAG,
             TrieNode::Ext { .. } => EXT_TAG,
             TrieNode::Branch { .. } => BRANCH_TAG,
+            TrieNode::Route { .. } => ROUTE_TAG,
         }
     }
 
@@ -104,134 +99,52 @@ impl TrieNode {
         hash_encoded(self.tag(), &self.encode())
     }
 
-    /// Computes the hash of an already-encoded node, re-deriving its tag.
+    /// The hash an already-encoded node is stored under, once the canonical
+    /// ingress boundary admits it (§5.2, §12).
     ///
-    /// The sync path's verification that a received node hashes to the hash it
-    /// was requested by (§5.2).
+    /// The boundary is the Lean operation `Trie.admit`: the bytes must decode,
+    /// re-encode to exactly themselves (so a peer cannot smuggle padding past
+    /// the hash), keep one node's nibble run within twice
+    /// [`MAX_KEY_LEN`](synch_core::MAX_KEY_LEN) (the per-node half of the depth
+    /// bound; Lean `Trie.Missing.nextBatch` bounds the *path*), and satisfy the
+    /// structural invariants the node kinds document: a non-empty extension
+    /// prefix, inline values within [`synch_core::INLINE_VALUE_MAX`], at least two
+    /// occupants of a branch. Two halves need more than one node and are
+    /// checked where the structure is walked and where values arrive: an
+    /// extension above a non-branch (Lean `Trie.Missing.nextBatch`), and
+    /// an out-of-line value small enough to be inline (the fetch's `put`).
+    ///
+    /// Rust supplies the BLAKE3 primitive and names the refusal; the decision
+    /// is Lean's, and the same-source proofs in `specs/lean` are about it.
     pub fn hash_of_encoded(bytes: &[u8]) -> Result<Hash, MptError> {
-        let node = TrieNode::decode(bytes)?;
-        // Re-encode: a node whose encoding is not canonical must not verify,
-        // otherwise a peer could smuggle padding past the hash check.
-        let canonical = node.encode();
-        if canonical != bytes {
-            return Err(MptError::Decode("non-canonical node encoding".into()));
-        }
-        // Bound the node's key portion at the sync trust boundary: a key is
-        // never longer than MAX_KEY_LEN bytes (§12), so a single node's nibble
-        // run can never exceed twice that. Without it a peer could serve a
-        // hash-valid Leaf with megabytes of key nibbles and every reader would
-        // walk it — heap-stacked walks prune at MAX_DEPTH_NIBBLES, so it costs
-        // work proportional to a number the peer chose. This bounds one node;
-        // `MissingWalk::next_batch` bounds the *path*, the half a per-node cap
-        // cannot see.
-        let nibble_len = match &node {
-            TrieNode::Leaf { key_rest, .. } => key_rest.len(),
-            TrieNode::Ext { prefix, .. } => prefix.len(),
-            TrieNode::Branch { .. } => 0,
-        };
-        if nibble_len > MAX_KEY_LEN * 2 {
-            return Err(MptError::KeyTooLong(nibble_len / 2));
-        }
-        node.check_invariants()?;
-        Ok(hash_encoded(node.tag(), bytes))
-    }
-
-    /// True if `bytes` hash to `expected` under any node kind's tag.
-    ///
-    /// The half of [`TrieNode::hash_of_encoded`] that decides *whose* fault a
-    /// refused node is (§12). A node hash covers the raw bytes exactly as
-    /// served, so bytes that hash to the hash they were requested by are the
-    /// origin's own — a relaying peer cannot have altered them — and a shape
-    /// this crate then refuses (non-canonical encoding, an oversized key run,
-    /// a broken invariant) is that origin's fault and nobody else's. Bytes
-    /// that hash to nothing wanted are the peer's.
-    ///
-    /// Tried under every tag rather than the decoded kind's, because the
-    /// bytes may not decode at all and the question is still answerable.
-    pub fn hashes_to(expected: &Hash, bytes: &[u8]) -> bool {
-        [LEAF_TAG, EXT_TAG, BRANCH_TAG]
-            .iter()
-            .any(|tag| &hash_encoded(tag, bytes) == expected)
-    }
-
-    /// Checks the structural invariants the node kinds document (§4.3).
-    ///
-    /// The write path maintains all of these by construction — `collapse`,
-    /// `merge_down` and `wrap_in_ext` exist precisely to — so this is only ever
-    /// about nodes that arrived from a peer. Each one is load-bearing:
-    ///
-    /// - An **empty extension prefix** is what a canonical trie never contains;
-    ///   accepting one gives a single key/value map two roots, exactly what
-    ///   structural sharing and reference pruning rest on not happening.
-    ///   `Trie::get` refuses to follow one too, and `ingest_boundary`'s
-    ///   `get_and_the_structural_walks_agree_even_if_one_slips_through` pins
-    ///   that the two readers answer alike — the reader disagreement is closed
-    ///   at both ends, and this check keeps the shape from being stored.
-    /// - An **oversized inline value** is 128 bytes by construction
-    ///   ([`INLINE_VALUE_MAX`]); decoded it is bounded only by the frame, so a
-    ///   peer could put 16 MiB in one node and have every diff clone it.
-    /// - An **under-occupied branch** and an **extension above a non-branch**
-    ///   read consistently, so they corrupt nothing — but they give one
-    ///   key/value map several distinct roots, which structural sharing and
-    ///   reference pruning rely on not happening.
-    ///
-    /// Two halves need more than one node and are checked where the structure
-    /// is walked and where values arrive, not here: **an extension above a
-    /// non-branch** needs the child node
-    /// ([`crate::MissingWalk::next_batch`]), and **an out-of-line value small
-    /// enough to be inline** needs the payload, which only the fetch that
-    /// carries it has seen.
-    pub fn check_invariants(&self) -> Result<(), MptError> {
-        let non_canonical = |what: &str| Err(MptError::NonCanonical(what.to_string()));
-        let check_value = |value: &ValueRef| match value {
-            ValueRef::Inline(bytes) if bytes.len() > INLINE_VALUE_MAX => {
-                Err(MptError::NonCanonical(format!(
-                    "inline value of {} bytes exceeds the {INLINE_VALUE_MAX}-byte ceiling",
-                    bytes.len()
-                )))
-            }
-            _ => Ok(()),
-        };
-        match self {
-            TrieNode::Leaf { value, .. } => check_value(value),
-            TrieNode::Ext { prefix, .. } => {
-                if prefix.is_empty() {
-                    return non_canonical("an extension prefix is empty");
-                }
-                Ok(())
-            }
-            TrieNode::Branch { children, value } => {
-                if let Some(value) = value {
-                    check_value(value)?;
-                }
-                let occupants = children.iter().flatten().count() + usize::from(value.is_some());
-                if occupants < 2 {
-                    return non_canonical("a branch has fewer than two occupants");
-                }
-                Ok(())
-            }
+        match synch_verified::trie::admit(&mut crate::lean_storage::Blake3, bytes)
+            .map_err(crate::lean_storage::operation_error)?
+        {
+            Ok(hash) => Ok(Hash(hash)),
+            Err(refusal) => Err(crate::lean_storage::refusal_error(refusal)),
         }
     }
 
-    /// The hashes of this node's child nodes.
-    pub(crate) fn child_hashes(&self) -> Vec<Hash> {
-        match self {
-            TrieNode::Leaf { .. } => Vec::new(),
-            TrieNode::Ext { child, .. } => vec![*child],
-            TrieNode::Branch { children, .. } => children.iter().flatten().copied().collect(),
-        }
-    }
-
-    /// The hashes of any out-of-line values this node references.
-    pub fn value_hashes(&self) -> Vec<Hash> {
-        match self {
-            TrieNode::Leaf { value, .. } => value.out_of_line().into_iter().collect(),
-            TrieNode::Ext { .. } => Vec::new(),
-            TrieNode::Branch { value, .. } => value
-                .as_ref()
-                .and_then(ValueRef::out_of_line)
-                .into_iter()
-                .collect(),
+    /// Whether served bytes are the node they were requested as and, when
+    /// they are not, whose fault that is (§12).
+    ///
+    /// A node hash covers the raw bytes exactly as served, so bytes that hash
+    /// to the hash they were requested by under some kind's tag are the
+    /// origin's own (a relaying peer cannot have altered them), and a shape
+    /// this build then refuses is that origin's fault and nobody else's. Bytes
+    /// that hash to nothing wanted are the peer's. The decision is the Lean
+    /// operation `Trie.verify`; the `Err` here is a host or transport failure,
+    /// never a verdict.
+    pub fn verify_served(expected: &Hash, bytes: &[u8]) -> Result<Verdict, MptError> {
+        use synch_verified::trie::NodeVerdict;
+        match synch_verified::trie::verify(&mut crate::lean_storage::Blake3, &expected.0, bytes)
+            .map_err(crate::lean_storage::operation_error)?
+        {
+            NodeVerdict::Accepted => Ok(Verdict::Accepted),
+            NodeVerdict::OriginFault(refusal) => Ok(Verdict::OriginFault(
+                crate::lean_storage::refusal_error(refusal),
+            )),
+            NodeVerdict::PeerFault => Ok(Verdict::PeerFault),
         }
     }
 
@@ -247,6 +160,18 @@ impl TrieNode {
     }
 }
 
+/// What [`TrieNode::verify_served`] decided about served bytes.
+#[derive(Debug)]
+pub enum Verdict {
+    /// The bytes are the requested node, canonical and within bounds.
+    Accepted,
+    /// The requested hash covers the bytes, but this build refuses their
+    /// shape: the origin published them, so the fault is contained to it.
+    OriginFault(MptError),
+    /// The bytes hash to nothing wanted: the serving peer's fault.
+    PeerFault,
+}
+
 /// Hashes an encoded node under an explicit domain-separation tag.
 pub fn hash_encoded(tag: &[u8], encoded: &[u8]) -> Hash {
     let mut hasher = blake3::Hasher::new();
@@ -255,7 +180,9 @@ pub fn hash_encoded(tag: &[u8], encoded: &[u8]) -> Hash {
     Hash(*hasher.finalize().as_bytes())
 }
 
-/// An empty child array, for building branches.
+/// An empty child array, for building branches by hand in tests; the write
+/// path builds its branches in Lean.
+#[cfg(test)]
 pub(crate) const NO_CHILDREN: [Option<Hash>; 16] = [None; 16];
 
 #[cfg(test)]
@@ -263,20 +190,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn value_ref_inlines_small_values() {
-        // Exactly at the boundary stays inline; one byte past it goes out of
-        // line — the split decides node hashing and wire shape.
+    fn insertion_stores_only_values_above_the_inline_boundary_separately() {
+        use crate::{MemStore, NodeStore, Trie};
+        let store = MemStore::default();
+        let trie = Trie::new(&store);
         let edge = vec![7u8; INLINE_VALUE_MAX];
-        let (r, extra) = ValueRef::for_value(&edge);
-        assert!(matches!(r, ValueRef::Inline(_)));
-        assert!(extra.is_none());
+        let small = trie.insert(Hash::EMPTY, b"key", &edge).unwrap();
+        let node = TrieNode::decode(&store.get_node(&small).unwrap().unwrap()).unwrap();
+        assert!(
+            matches!(node, TrieNode::Leaf { value: ValueRef::Inline(bytes), .. } if bytes == edge)
+        );
+        assert!(store.get_value(&Hash::new(&edge)).unwrap().is_none());
 
         let big = vec![7u8; INLINE_VALUE_MAX + 1];
-        let (r, extra) = ValueRef::for_value(&big);
-        let (h, payload) = extra.unwrap();
-        assert_eq!(r, ValueRef::Hash(h));
-        assert_eq!(h, Hash::new(&big));
-        assert_eq!(payload, big);
+        let large = trie.insert(Hash::EMPTY, b"key", &big).unwrap();
+        let node = TrieNode::decode(&store.get_node(&large).unwrap().unwrap()).unwrap();
+        assert!(
+            matches!(node, TrieNode::Leaf { value: ValueRef::Hash(hash), .. } if hash == Hash::new(&big))
+        );
+        assert_eq!(store.get_value(&Hash::new(&big)).unwrap(), Some(big));
     }
 
     #[test]

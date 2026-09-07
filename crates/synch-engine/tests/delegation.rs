@@ -7,7 +7,7 @@ use synch_core::{
     delegation_key, file_key, now_ns, ChunkRanges, Delegation, FileEntry, Hash, NodeId, SignedHead,
 };
 use synch_engine::Syncer;
-use synch_mpt::{Scope, Trie};
+use synch_mpt::Trie;
 use synch_store::{Slot, StoreError};
 
 mod common;
@@ -44,16 +44,14 @@ async fn a_spine_branch_exposes_its_children_but_not_its_own_payload() {
     );
     let root = issuer.root();
     let path = Nibbles::from_bytes(&private_key).as_slice().to_vec();
-    let carrier = Trie::new(issuer.store.as_ref())
-        .resolve_paths(root, std::slice::from_ref(&path))
+    let carrier = issuer
+        .store
+        .resolve_trie_paths(&root, std::slice::from_ref(&path))
         .unwrap()[0]
         .unwrap();
     assert!(matches!(
         TrieNode::decode(&issuer.store.get_node(&carrier).unwrap().unwrap()).unwrap(),
-        TrieNode::Branch {
-            value: Some(synch_mpt::ValueRef::Hash(_)),
-            ..
-        }
+        TrieNode::Route { value: Some(_), .. }
     ));
     let hash = Hash::new(&private);
     let client = connect(&delegate, &issuer).await;
@@ -120,31 +118,58 @@ fn walk_all(
     store: &dyn synch_mpt::NodeStore<Error = StoreError>,
     root: Hash,
 ) -> Vec<(Vec<u8>, Hash)> {
-    let empty = synch_mpt::MemStore::new();
-    let mut walk = synch_mpt::MissingWalk::new(root);
+    use synch_verified::suspend::{PeerReply, PeerRequest};
+    let dir = tempfile::tempdir().unwrap();
+    let destination = synch_store::Store::open(dir.path()).unwrap();
+    let origin = synch_core::OriginId::named("fixture", "example.test").unwrap();
     let mut all = Vec::new();
-    loop {
-        let batch = walk.next_batch(&Trie::new(&empty), 512).unwrap();
-        if batch.is_empty() {
-            break;
-        }
-        for (path, hash) in &batch.nodes {
-            all.push((path.clone(), *hash));
-            let bytes = synch_mpt::NodeStore::get_node(store, hash)
-                .unwrap()
-                .unwrap();
-            synch_mpt::NodeStore::put_node(&empty, hash, &bytes).unwrap();
-        }
-        // Out-of-line values too: a node whose values have not arrived is
-        // deferred again, so the walk would never terminate.
-        for (_, hash) in &batch.values {
-            let bytes = synch_mpt::NodeStore::get_value(store, hash)
-                .unwrap()
-                .unwrap();
-            synch_mpt::NodeStore::put_value(&empty, hash, &bytes).unwrap();
-        }
-        walk.resume();
-    }
+    assert!(destination
+        .fetch_trie(
+            root,
+            &origin,
+            1,
+            &synch_mpt::Scope::full(),
+            None,
+            None,
+            256,
+            3,
+            |request| Some(match request {
+                PeerRequest::Nodes { wants, .. } => PeerReply::Nodes {
+                    served: wants
+                        .iter()
+                        .map(|(path, hash)| {
+                            let hash_key = Hash::from_slice(hash).unwrap();
+                            all.push((path.clone(), hash_key));
+                            (
+                                hash.clone(),
+                                synch_mpt::NodeStore::get_node(store, &hash_key)
+                                    .unwrap()
+                                    .unwrap(),
+                            )
+                        })
+                        .collect(),
+                    missing: vec![],
+                    redacted: vec![],
+                },
+                PeerRequest::Values { wants, .. } => PeerReply::Values {
+                    served: wants
+                        .iter()
+                        .map(|(_, hash)| (
+                            hash.clone(),
+                            synch_mpt::NodeStore::get_value(
+                                store,
+                                &Hash::from_slice(hash).unwrap()
+                            )
+                            .unwrap()
+                            .unwrap()
+                        ))
+                        .collect(),
+                    missing: vec![],
+                },
+            })
+        )
+        .unwrap()
+        .unwrap());
     all
 }
 
@@ -217,7 +242,7 @@ async fn a_delegate_is_admitted_by_replicated_state_and_sees_only_its_spaces() {
         .get(head.root, &file_key("finance", "q3.pdf").unwrap())
         .is_err());
     // The scope check agrees with what actually landed.
-    let scope = Scope::of(&synch_core::scope_prefixes(&["photos".to_string()]));
+    let scope = delegate.store.local_trie_scope().unwrap();
     assert!(trie.is_complete_scoped(head.root, &scope).unwrap());
     assert!(!trie.is_complete(head.root).unwrap());
 
@@ -334,10 +359,10 @@ async fn a_withheld_node_cannot_be_reached_by_claiming_a_position_for_it() {
     );
     let root = issuer.root();
 
-    let scope = Scope::of(&synch_core::scope_prefixes(&["photos".to_string()]));
+    let finance = synch_mpt::Nibbles::from_bytes(b"f:finance/");
     let withheld: Vec<Hash> = walk_all(issuer.store.as_ref(), root)
         .into_iter()
-        .filter(|(path, _)| !scope.admits_path(path))
+        .filter(|(path, _)| path.starts_with(finance.as_slice()))
         .map(|(_, hash)| hash)
         .collect();
     assert!(
@@ -349,10 +374,6 @@ async fn a_withheld_node_cannot_be_reached_by_claiming_a_position_for_it() {
     let bogus = synch_mpt::Nibbles::from_bytes(b"f:photos/\xde\xad\xbe\xef")
         .as_slice()
         .to_vec();
-    assert!(
-        scope.admits_path(&bogus),
-        "the position must pass the scope test"
-    );
 
     let client = connect(&delegate, &issuer).await;
     for hash in &withheld {
@@ -403,10 +424,10 @@ async fn a_delegate_cannot_authorize_with_its_own_root_or_name() {
 
     // A node of the issuer's trie the delegate is not entitled to — a hash it
     // knows honestly, from a branch the signed root recomputes through.
-    let scope = Scope::of(&synch_core::scope_prefixes(&["photos".to_string()]));
+    let finance = synch_mpt::Nibbles::from_bytes(b"f:finance/");
     let withheld_node = walk_all(issuer.store.as_ref(), issuer.root())
         .into_iter()
-        .find(|(path, _)| !scope.admits_path(path))
+        .find(|(path, _)| path.starts_with(finance.as_slice()))
         .map(|(_, hash)| hash)
         .expect("the issuer withholds something; test is vacuous");
 
@@ -560,7 +581,7 @@ async fn revocation_is_deletion_and_cuts_the_delegate_off() {
 
 /// `GetValues` refuses on coverage, not only on position: the two handlers
 /// must draw the same boundary. `GetNodes` applies the position check *and*
-/// `Scope::admits_node`, because a node at an admitted position can still
+/// `Trie.Serve.Scope.admitsNode`, because a node at an admitted position can still
 /// describe a key that runs out of scope — a leaf spells the rest of its key,
 /// and that key's value is the record.
 #[tokio::test]
@@ -581,7 +602,7 @@ async fn a_value_is_refused_by_the_coverage_of_the_node_that_holds_it() {
     // Only the withheld space's manifest is published: with nothing else under
     // `m:` the trie collapses, and the leaf carrying the record sits on the
     // very spine the grant's own `m:` keys run through.
-    issuer.publish(
+    issuer.publish_legacy(
         1,
         &[],
         &[
@@ -597,22 +618,29 @@ async fn a_value_is_refused_by_the_coverage_of_the_node_that_holds_it() {
     // The node that carries the withheld payload, at a position the delegate's
     // scope admits: the spine. That pairing is the whole attack — an admitted
     // position holding a node whose coverage is not admitted.
-    let scope = Scope::of(&synch_core::scope_prefixes(&["photos".to_string()]));
     let withheld = Hash::new(&record);
     let (path, _) = walk_all(issuer.store.as_ref(), root)
         .into_iter()
-        .find(|(path, hash)| {
-            scope.admits_path(path)
-                && synch_mpt::NodeStore::get_node(issuer.store.as_ref(), hash)
-                    .unwrap()
-                    .map(|bytes| {
-                        synch_mpt::TrieNode::decode(&bytes)
-                            .map(|n| n.value_hashes().contains(&withheld))
-                            .unwrap_or(false)
-                    })
-                    .unwrap_or(false)
+        .find(|(_, hash)| {
+            synch_mpt::NodeStore::get_node(issuer.store.as_ref(), hash)
+                .unwrap()
+                .map(|bytes| {
+                    synch_mpt::TrieNode::decode(&bytes)
+                        .map(|n| {
+                            matches!(n, synch_mpt::TrieNode::Leaf {
+                            value: synch_mpt::ValueRef::Hash(hash), ..
+                        } if hash == withheld)
+                        })
+                        .unwrap_or(false)
+                })
+                .unwrap_or(false)
         })
-        .expect("the withheld value sits at no admitted position; test is vacuous");
+        .expect("the withheld value has no carrying node; test is vacuous");
+    assert_eq!(
+        path,
+        synch_mpt::Nibbles::from_bytes(b"m").as_slice(),
+        "the private manifest must sit on the shared m: spine"
+    );
 
     let client = connect(&delegate, &issuer).await;
     let answer = client

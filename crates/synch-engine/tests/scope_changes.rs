@@ -1,7 +1,7 @@
 //! A read scope that moves has to take the trie and the derived views with it
 //! (§5.5).
 //!
-//! The read scope decides three things at once: what `MissingWalk` asks for,
+//! The read scope decides three things at once: what the Lean requesting operation asks for,
 //! what `is_complete_scoped` counts as whole, and what `materialize_diff`
 //! walks. It used to be one node-wide value adopted from whichever peer spoke
 //! last, and nothing re-derived the first two for a head already in the

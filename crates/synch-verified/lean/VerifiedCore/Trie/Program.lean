@@ -11,6 +11,10 @@ def nodeSpace : String := "trie_nodes"
 def valueSpace : String := "trie_values"
 def maxKeyBytes : Nat := 4096
 
+/-- The zero root is the empty trie. -/
+def rootOf (root : ByteArray) : Option ByteArray :=
+  if root.data.all (· == 0) then none else some root
+
 inductive LookupError where
   | keyTooLong (bytes : Nat)
   | missingNode (address : ByteArray)
@@ -55,6 +59,13 @@ def lookup : Nat → Option ByteArray → List UInt8 → Operation LookupResult
           match value with
           | none => return .ok none
           | some value => resolveValue value
+        | nibble :: rest => lookup fuel ((children[nibble.toNat]?).getD none) rest
+      | .ok (.route children value) =>
+        match rest with
+        | [] =>
+          match value with
+          | none => return .ok none
+          | some address => resolveValue (.hash address)
         | nibble :: rest => lookup fuel ((children[nibble.toNat]?).getD none) rest
 
 /-- Lookup the caller's byte key in a root. The zero root is the empty trie,

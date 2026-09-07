@@ -3,7 +3,7 @@
 
 use synch_core::{delegation_key, file_key, now_ns, Delegation, Hash, NodeId, SignedHead};
 use synch_engine::{reconcile::HeadOutcome, FetchOutcome, Syncer};
-use synch_mpt::{NodeStore, Scope, Trie, TrieNode};
+use synch_mpt::{NodeStore, Trie, TrieNode};
 use synch_store::Slot;
 
 mod common;
@@ -24,25 +24,58 @@ fn delegation(subject: &NodeId, spaces: &[&str]) -> (Vec<u8>, Vec<u8>) {
 
 /// Every node of `root`'s trie by position.
 fn walk_all(store: &synch_store::Store, root: Hash) -> Vec<(Vec<u8>, Hash)> {
-    let empty = synch_mpt::MemStore::new();
-    let mut walk = synch_mpt::MissingWalk::new(root);
+    use synch_verified::suspend::{PeerReply, PeerRequest};
+    let dir = tempfile::tempdir().unwrap();
+    let destination = synch_store::Store::open(dir.path()).unwrap();
+    let origin = synch_core::OriginId::named("fixture", "example.test").unwrap();
     let mut all = Vec::new();
-    loop {
-        let batch = walk.next_batch(&Trie::new(&empty), 512).unwrap();
-        if batch.is_empty() {
-            break;
-        }
-        for (path, hash) in &batch.nodes {
-            all.push((path.clone(), *hash));
-            let bytes = store.get_node(hash).unwrap().unwrap();
-            empty.put_node(hash, &bytes).unwrap();
-        }
-        for (_, hash) in &batch.values {
-            let bytes = store.get_value(hash).unwrap().unwrap();
-            empty.put_value(hash, &bytes).unwrap();
-        }
-        walk.resume();
-    }
+    assert!(destination
+        .fetch_trie(
+            root,
+            &origin,
+            1,
+            &synch_mpt::Scope::full(),
+            None,
+            None,
+            256,
+            3,
+            |request| Some(match request {
+                PeerRequest::Nodes { wants, .. } => PeerReply::Nodes {
+                    served: wants
+                        .iter()
+                        .map(|(path, hash)| {
+                            let hash_key = Hash::from_slice(hash).unwrap();
+                            all.push((path.clone(), hash_key));
+                            (
+                                hash.clone(),
+                                synch_mpt::NodeStore::get_node(store, &hash_key)
+                                    .unwrap()
+                                    .unwrap(),
+                            )
+                        })
+                        .collect(),
+                    missing: vec![],
+                    redacted: vec![],
+                },
+                PeerRequest::Values { wants, .. } => PeerReply::Values {
+                    served: wants
+                        .iter()
+                        .map(|(_, hash)| (
+                            hash.clone(),
+                            synch_mpt::NodeStore::get_value(
+                                store,
+                                &Hash::from_slice(hash).unwrap()
+                            )
+                            .unwrap()
+                            .unwrap()
+                        ))
+                        .collect(),
+                    missing: vec![],
+                },
+            })
+        )
+        .unwrap()
+        .unwrap());
     all
 }
 
@@ -59,7 +92,7 @@ fn walk_all(store: &synch_store::Store, root: Hash) -> Vec<(Vec<u8>, Hash)> {
 /// out in the origin itself — and the grafter never held the subtree. The
 /// member's fetch asks the grafter for it, is told `missing`, and abandons the
 /// head; the responder serves nothing under a confined root it does not own
-/// for that origin. `Provenance.lean` is the model of both halves.
+/// for that origin. This test exercises both sides of that boundary.
 #[tokio::test]
 async fn a_delegate_cannot_launder_a_withheld_subtree_through_its_own_trie() {
     let issuer = WireNode::spawn(Some("nas")).await;
@@ -82,7 +115,6 @@ async fn a_delegate_cannot_launder_a_withheld_subtree_through_its_own_trie() {
         ],
     );
     let issuer_root = issuer.root();
-    let scope = Scope::of(&synch_core::scope_prefixes(&["photos".to_string()]));
 
     // The withheld Branch under `f:finance`, and where it sits: the grafter
     // learns the hash honestly from the spine, never its contents.
@@ -92,8 +124,7 @@ async fn a_delegate_cannot_launder_a_withheld_subtree_through_its_own_trie() {
     let (withheld_path, withheld_branch) = walk_all(&issuer.store, issuer_root)
         .into_iter()
         .find(|(path, hash)| {
-            !scope.admits_path(path)
-                && path.starts_with(&finance)
+            path.starts_with(&finance)
                 && matches!(
                     TrieNode::decode(&issuer.store.get_node(hash).unwrap().unwrap()).unwrap(),
                     TrieNode::Branch { .. }
@@ -212,7 +243,7 @@ async fn a_non_canonical_node_fails_its_origin_and_not_the_exchange() {
 
     // `a` publishes a root that hashes fine and decodes fine but is
     // non-canonical: a branch with a single occupant.
-    let (value, _) = synch_mpt::ValueRef::for_value(b"x");
+    let value = synch_mpt::ValueRef::Inline(b"x".to_vec());
     let leaf = TrieNode::Leaf {
         key_rest: synch_mpt::Nibbles::from_nibbles(&[1, 2, 3]),
         value,

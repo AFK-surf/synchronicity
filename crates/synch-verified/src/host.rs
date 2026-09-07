@@ -3,7 +3,8 @@
 //! types they exchange are defined here.
 
 pub use crate::generated::{
-    Clock, Construct, Crypto, FileIO, Lease, Output, Resources, SourceIO, Storage, TemporaryFiles,
+    Apply, Bao, ByteWrites, CacheIO, Clock, Construct, Crypto, Digest, FileIO, Lease, Memo, Output,
+    Redaction, Resources, Snapshots, SourceIO, Storage, Sweep, TemporaryFiles,
 };
 
 /// The raw services an ingestion directs besides its relational storage. The
@@ -51,6 +52,8 @@ pub struct Selection {
     pub relation: String,
     pub equals: Fields,
     pub like_any: Vec<(String, String)>,
+    /// Rows whose stored cell `IS NOT` the value are selected; NULL is a value.
+    pub not_equals: Fields,
 }
 
 /// An explicit value or a raw source-column projection for INSERT SELECT.

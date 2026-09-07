@@ -236,7 +236,7 @@ pub struct DoctorReport {
     /// This node's device keys and their states.
     pub device_keys: Vec<(NodeId, String)>,
     /// Every binding, live or lapsed.
-    pub bindings: Vec<Binding>,
+    pub bindings: Vec<synch_store::BindingStatus>,
     /// Bindings whose expiry has passed.
     pub lapsed: Vec<Binding>,
     /// The complete head of every known origin, with whether we can serve it.
@@ -805,13 +805,7 @@ impl Node {
     /// it false: the key is not this answer's alone to supply dialing data
     /// for.
     fn hint_source_is_sole(&self, key: &NodeId, domain: &str, now: i64) -> Result<bool> {
-        let bindings = self.store().bindings_for_key(key)?;
-        let clock = self.store().trust_instant(now)?;
-        let mut live = bindings.iter().filter(|b| b.is_live(clock)).peekable();
-        if live.peek().is_none() {
-            return Ok(false);
-        }
-        Ok(live.all(|b| b.source == BindingSource::Dns && b.domain.as_deref() == Some(domain)))
+        Ok(self.store().sole_dns_hint_source(key, domain, now)?)
     }
 
     fn note_dns_attempt(&self, domain: &str, now: i64, ttl: Duration) {
@@ -907,39 +901,11 @@ impl Node {
             mismatch.sort_by(|a, b| a.0.cmp(&b.0));
             (ambiguous, mismatch)
         };
-        let bindings = self.store().bindings()?;
-        // Lapsed by the cascade, not by the date alone: a delegated binding
-        // whose issuer's own rooted binding is gone has lapsed too, and
-        // reporting it as live is precisely the invisible half of the hole
-        // §3.5's cascade exists to close.
-        //
-        // This carries the trust floor with it rather than dropping it:
-        // `live_bindings` opens by flooring `now` through `trust_instant`, so
-        // the report still agrees with `is_bound` and `keys_for_origin` on a
-        // clock that stepped backwards — one report contradicting itself is
-        // worse than either answer.
-        let live: std::collections::HashSet<(String, Vec<u8>, &str)> = self
-            .store()
-            .live_bindings(now)?
-            .into_iter()
-            .map(|b| {
-                (
-                    b.origin.canonical(),
-                    b.node_id.as_bytes().to_vec(),
-                    b.source.as_str(),
-                )
-            })
-            .collect();
+        let bindings = self.store().binding_statuses(now)?;
         let lapsed: Vec<Binding> = bindings
             .iter()
-            .filter(|b| {
-                !live.contains(&(
-                    b.origin.canonical(),
-                    b.node_id.as_bytes().to_vec(),
-                    b.source.as_str(),
-                ))
-            })
-            .cloned()
+            .filter(|status| !status.live)
+            .map(|status| status.binding.clone())
             .collect();
 
         let mut heads = Vec::new();

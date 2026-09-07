@@ -25,11 +25,21 @@ fn main() {
         "Host/Upsert",
         "Host/Resources",
         "Host/Source",
+        "Host/Digest",
+        "Host/Writes",
+        "Host/Bao",
+        "Host/Sweep",
+        "Host/Memo",
+        "Host/Walk",
+        "Host/Peer",
+        "Host/Provider",
+        "Host/CacheIO",
         "Crypto",
         "Host/Codec",
         "Host/Generated",
         "Origin",
         "Cas",
+        "Postcard",
         "Cas/Codec",
         "Cas/Program",
         "Cas/ReadCodec",
@@ -37,10 +47,36 @@ fn main() {
         "Cas/IngestCommit",
         "Cas/Ingest",
         "Cas/Input",
+        "Cas/Durable",
+        "Cas/Serve",
+        "Cas/Receive",
+        "Cas/Collect",
+        "Cas/Project",
+        "Cas/Cloud",
         "Host/Wire",
         "Trie/Codec",
         "Trie/Program",
+        "Trie/Verify",
+        "Trie/Mutate",
+        "Trie/Normalize",
+        "Trie/Serve",
+        "Trie/Memo",
+        "Trie/Collect",
+        "Trie/Walk",
+        "Trie/ScopeCheck",
+        "Trie/Diff",
+        "Trie/Proof",
+        "Trie/Missing",
+        "Trie/Complete",
+        "Trie/Fetch",
         "Replication/History",
+        "Replication/Exchange",
+        "Replication/Contact",
+        "Authorization/Model",
+        "Authorization/Read",
+        "Authorization/Projection",
+        "Authorization/Local",
+        "Authorization/Operations",
         "Commands",
         "Commands/Generated",
         "Entry",
@@ -143,6 +179,13 @@ fn main() {
         // Compile-time checks of the object layout native.rs copies from lean.h.
         .file(root.join("src/layout.c"))
         .flag_if_supported("-Wno-unused-parameter")
+        // Lean emits closed terms it never references at the C level.
+        .flag_if_supported("-Wno-unused-variable")
+        // The generated C is the compiled core, not code anyone steps through
+        // in a debugger: build it optimized in every profile, as the Lean
+        // toolchain's own libraries are, so a debug test run pays for the
+        // Rust it is debugging and not for an unoptimized proof-carrying core.
+        .opt_level(2)
         .compile("synch_verified_core");
     println!(
         "cargo:rustc-link-search=native={}",

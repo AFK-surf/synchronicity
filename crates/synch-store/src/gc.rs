@@ -4,7 +4,6 @@ use std::collections::HashSet;
 
 use rusqlite::{params, OptionalExtension};
 use synch_core::Hash;
-use synch_mpt::{Scope, Trie};
 
 use crate::{db::hash_column, db::Store, error::Result};
 
@@ -51,62 +50,12 @@ impl Store {
     /// `fetch_pending` commits one batch per transaction and `reachable`
     /// silently skips missing children.
     pub(crate) fn gc_trie(&self) -> Result<GcStats> {
-        // `MptGc.TrieGc` models this whole immediate transaction, not its
-        // individual reads and deletes; splitting it invalidates the theorem.
-        let mut stats = GcStats::default();
-        let scope = self.local_trie_scope()?;
-        let (swept_nodes, swept_values) = self.transaction(|txn| -> Result<(usize, usize)> {
-            let conn = txn.conn();
-            let roots = retained_roots_in(conn)?;
-            stats.roots_marked = roots.len();
-            // One accumulating mark set across every retained root, not one
-            // walk per root. Successive roots of an origin share all but
-            // the path that changed, so walking each into its own set would
-            // cost a store read per node *per root* — and `head_history`
-            // holds a row per publish for `root_retention`, so that
-            // multiplier is in the thousands for a node that publishes
-            // steadily. All of it inside the immediate transaction below,
-            // which holds the one write connection.
-            // `TrieGraph.GcSweep` states the graph-level obligation: every
-            // stored node reachable from any retained root is in the mark set.
-            let trie = Trie::new(txn);
-            let mut marked = synch_mpt::Reachable::default();
-            for root in &roots {
-                trie.reach_into(*root, &mut marked)?;
-            }
-            let (nodes, values) = (marked.nodes, marked.values);
-            // Keep certificates only for roots marked by this very
-            // snapshot. The generation still advances to reject walks
-            // that started before the sweep, including pruned fetches.
-            let mut keep: HashSet<Hash> = roots.iter().copied().collect();
-            keep.extend(roots.iter().map(|root| scope.memo_key(*root)));
-            let mut stmt = conn.prepare("SELECT DISTINCT origin_id, root FROM head_history")?;
-            let rows = stmt.query_map([], |row| {
-                Ok((row.get::<_, String>(0)?, row.get::<_, Vec<u8>>(1)?))
-            })?;
-            for row in rows {
-                let (origin, root) = row?;
-                let origin = crate::db::origin_column(origin, "head_history.origin_id")?;
-                let root = hash_column(root, "head_history.root")?;
-                keep.insert(scope.memo_key_for(Some(&origin), root));
-                keep.insert(Scope::full().memo_key_for(Some(&origin), root));
-            }
-            txn.invalidate_completeness_preserving(&keep);
-            // Deleted set-wise rather than row by row: pulling every hash
-            // into a `Vec` and issuing one `DELETE ... WHERE hash = ?` per
-            // unreferenced row is, on a large store, millions of statements
-            // under the write lock.
-            let n = sweep_unmarked(conn, "trie_nodes", &nodes)?;
-            // Provenance rows name nodes; a row for a swept node would
-            // vouch, for the next trie to carry that hash, for a node this
-            // store no longer holds as anyone's.
-            sweep_unmarked(conn, "trie_node_origins", &nodes)?;
-            let v = sweep_unmarked(conn, "trie_values", &values)?;
-            Ok((n, v))
-        })?;
-        stats.nodes = swept_nodes;
-        stats.values = swept_values;
-        Ok(stats)
+        // The whole pass is the Lean command `trieCollect`: the retained
+        // roots, the mark walk over one accumulating mark set, the memo
+        // certificates kept, and the set-wise sweeps, inside its one
+        // immediate transaction. Rust binds the storage session, the digest
+        // behind the memo keys and the memo, and names the diagnostics.
+        crate::lean_trie_collect::gc_trie(self)
     }
 
     /// Sweeps content objects that no retained entry references, that are not
@@ -128,31 +77,20 @@ impl Store {
     /// invert the retention semantics — with it a hot object is never
     /// collected, without it it is. Every write path stamps the column, which
     /// is all this needs.
+    ///
+    /// The pass is the Lean program `Cas.Collect.gcContent`: one snapshot of
+    /// the rows no pin and no entry protects, filtered by the horizon, is the
+    /// pre-filter that keeps the pass from opening a transaction per row; the
+    /// deletion of each candidate re-reads every fact inside its own
+    /// transaction, under the CAS ordering section, and that is what decides
+    /// (`specs/lean/Synchronicity/CasCollectProofs.lean`).
     pub fn gc_content(&self, before: i64) -> Result<GcStats> {
-        // `Cas.Age` abstracts crossing this `before` horizon; it grants no
-        // permission by itself, only removes the freshness guard.
-        let referenced = self.referenced_content()?;
-        let pinned: HashSet<Hash> = self.pinned_blobs()?.into_iter().collect();
-        let mut stats = GcStats::default();
-        // The three reads above are a snapshot and the delete is a fourth
-        // statement, so a pin or a resumed fetch landing in between would
-        // otherwise be decided against by a snapshot older than it is. They
-        // stay as a cheap pre-filter — they keep the pass from opening a
-        // transaction per row — and `delete_blob_if_collectable` re-reads the
-        // predicate inside the transaction that does the delete, which is what
-        // actually decides.
-        for candidate in self.blob_candidates()? {
-            if referenced.contains(&candidate.root) || pinned.contains(&candidate.root) {
-                continue;
-            }
-            if candidate.last_access >= before {
-                continue;
-            }
-            if self.delete_blob_if_collectable(&candidate.root, before)? {
-                stats.blobs += 1;
-            }
-        }
-        Ok(stats)
+        // Crossing this age horizon only removes the freshness guard;
+        // the retention and reference checks still apply.
+        Ok(GcStats {
+            blobs: crate::lean_collect::gc_content(self, before)?,
+            ..GcStats::default()
+        })
     }
 
     /// Removes CAS files that no `blobs` row accounts for.
@@ -179,63 +117,18 @@ impl Store {
     /// unlink — a row claiming verified groups whose bytes are gone.
     ///
     /// So the decision and the unlink are one step under one guard, and the
-    /// writer's own mark is part of the decision (`Store::lease_write`).
-    /// Anything in a shard directory that is not named for an object is left
-    /// alone.
+    /// writer's own mark is part of the decision (`Store::lease_write`). The
+    /// Lean program `Cas.Collect.gcOrphans` takes that section around each
+    /// file's reading, decision and unlink; the listing of the store, one
+    /// shard at a time, and the file names are this side's layout. Anything in
+    /// a shard directory that is not named for an object is never listed.
     ///
     /// Half-written ingests go with them, by way of `Store::gc_staging`.
     ///
-    /// Nothing in the CAS root but a directory is descended into. That is not
-    /// defensiveness: `read_dir` on a regular file fails with `NotADirectory`,
-    /// not `NotFound`, so a single stray file in the root — a leaked staging
-    /// file, say — would make this return an error on every pass from then on.
-    /// `maintenance_pass` would report failure forever and no orphan would be
-    /// swept again, including the file causing it.
-    ///
     /// Returns how many files went.
     pub fn gc_orphans(&self, before: i64) -> Result<usize> {
-        let mut swept = self.gc_staging(before)?;
-        let shards = match std::fs::read_dir(self.cas_dir()) {
-            Ok(shards) => shards,
-            Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(swept),
-            Err(e) => return Err(e.into()),
-        };
-        for shard in shards {
-            let shard = shard?.path();
-            if !shard.is_dir() || shard == self.staging_dir() {
-                continue;
-            }
-            let files = match std::fs::read_dir(&shard) {
-                Ok(files) => files,
-                Err(e) if e.kind() == std::io::ErrorKind::NotFound => continue,
-                Err(e) => return Err(e.into()),
-            };
-            for file in files {
-                let path = file?.path();
-                let Some(root) = cas_root_of(&path) else {
-                    continue;
-                };
-                // One guard across the whole decision and the unlink, so
-                // nothing can make the file live in between. The `stat` is
-                // inside it too: it is the reading the verdict rests on.
-                let conn = self.conn();
-                let _ordered_against_writers = self.cas_order();
-                let Ok(meta) = std::fs::metadata(&path) else {
-                    continue;
-                };
-                if !meta.is_file() || mtime_nanos(&meta).is_none_or(|at| at >= before) {
-                    continue;
-                }
-                if blob_row_exists(&conn, &root)? || self.is_being_written(&root) {
-                    continue;
-                }
-                if std::fs::remove_file(&path).is_ok() {
-                    swept += 1;
-                }
-                drop(conn);
-            }
-        }
-        Ok(swept)
+        let swept = self.gc_staging(before)?;
+        Ok(swept + crate::lean_collect::gc_orphans(self, before)?)
     }
 
     /// Removes staging files no ingest is still writing.
@@ -383,7 +276,7 @@ impl Store {
 /// an outboard.
 ///
 /// `None` for anything else in the directory, which is then left alone.
-fn cas_root_of(path: &std::path::Path) -> Option<Hash> {
+pub(crate) fn cas_root_of(path: &std::path::Path) -> Option<Hash> {
     let name = path.file_name()?.to_str()?;
     let stem = name.strip_suffix(".obao").unwrap_or(name);
     let bytes = hex::decode(stem).ok()?;
@@ -432,7 +325,7 @@ fn sweep_stale_files(
 
 /// A file's modification time in unix nanoseconds, if it has one this side of
 /// the epoch.
-fn mtime_nanos(meta: &std::fs::Metadata) -> Option<i64> {
+pub(crate) fn mtime_nanos(meta: &std::fs::Metadata) -> Option<i64> {
     meta.modified()
         .ok()?
         .duration_since(std::time::UNIX_EPOCH)
@@ -449,6 +342,7 @@ fn mtime_nanos(meta: &std::fs::Metadata) -> Option<i64> {
 /// remove a row a slot still names, so every current head's root is here by
 /// construction. The union returned the same set — but stating the mark set
 /// twice, in two places, is how the two come to disagree.
+#[cfg(test)]
 pub(crate) fn retained_roots_in(conn: &rusqlite::Connection) -> Result<Vec<Hash>> {
     let mut stmt = conn.prepare("SELECT DISTINCT root FROM head_history")?;
     let rows = stmt.query_map([], |row| row.get::<_, Vec<u8>>(0))?;
@@ -459,49 +353,11 @@ pub(crate) fn retained_roots_in(conn: &rusqlite::Connection) -> Result<Vec<Hash>
     Ok(out)
 }
 
-/// Whether a `blobs` row accounts for an object, on a connection already held.
-fn blob_row_exists(conn: &rusqlite::Connection, root: &Hash) -> Result<bool> {
-    Ok(conn.query_row(
-        "SELECT EXISTS (SELECT 1 FROM blobs WHERE root = ?1)",
-        params![root.as_bytes().to_vec()],
-        |row| row.get::<_, i64>(0),
-    )? != 0)
-}
-
-/// Deletes every row of `table` whose hash is not in `marked`, in one
-/// statement, and reports how many went.
-///
-/// The marked set goes into a temporary table rather than an `IN (?, ?, …)`
-/// list: the set is the size of the live trie, which is far past SQLite's
-/// parameter limit.
-fn sweep_unmarked(
-    conn: &rusqlite::Connection,
-    table: &str,
-    marked: &HashSet<Hash>,
-) -> Result<usize> {
-    conn.execute_batch(
-        "CREATE TEMP TABLE IF NOT EXISTS gc_marked (hash BLOB PRIMARY KEY);
-         DELETE FROM gc_marked;",
-    )?;
-    {
-        let mut insert = conn.prepare("INSERT OR IGNORE INTO gc_marked (hash) VALUES (?1)")?;
-        for hash in marked {
-            insert.execute(params![hash.as_bytes().to_vec()])?;
-        }
-    }
-    let swept = conn.execute(
-        &format!("DELETE FROM {table} WHERE hash NOT IN (SELECT hash FROM gc_marked)"),
-        [],
-    )?;
-    conn.execute_batch("DELETE FROM gc_marked;")?;
-    Ok(swept)
-}
-
 #[cfg(test)]
 mod tests {
     use iroh_base::SecretKey;
     use synch_core::{file_key, FileEntry, Hash, SignedHead};
-    use synch_mpt::NodeStore;
+    use synch_mpt::{NodeStore, Trie};
 
     use super::*;
     use crate::heads::Slot;
@@ -541,7 +397,7 @@ mod tests {
             )
             .unwrap();
         store.set_read_scope(Some(&["s".to_string()])).unwrap();
-        let scoped = store.local_trie_scope().unwrap().memo_key(root);
+        let scoped = store.local_trie_scope().unwrap().memo_key(root).unwrap();
         assert_ne!(scoped, root, "a scoped memo is keyed by more than the root");
         store.note_complete(&scoped).unwrap();
 

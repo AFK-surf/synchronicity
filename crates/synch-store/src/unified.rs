@@ -412,9 +412,9 @@ impl Store {
     ///
     /// The persisted trust floor only ever rises, so lifting the reading to it
     /// leaves the clamp doing its job against clocks that are ahead while
-    /// keeping a lagging one from reordering honest entries. Taken here rather
-    /// than through `trust_instant`, which returns an untrusted reading
-    /// unchanged so that expiry fails closed — the worst case for selection,
+    /// keeping a lagging one from reordering honest entries. Authorization
+    /// operations instead leave an untrusted clock reading unchanged so that
+    /// expiry fails closed — the worst case for selection,
     /// where a clock reading 1970 ties every path in the cluster at once.
     pub fn read_instant(&self) -> Result<i64> {
         Ok(synch_core::now_ns().max(self.trust_floor()?))

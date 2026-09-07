@@ -7,7 +7,7 @@
 use std::{io::Write, path::PathBuf, sync::Arc};
 
 use async_trait::async_trait;
-use synch_core::{group_count, groups_for_byte_range, ChunkRanges, Hash, CHUNK_GROUP_SIZE};
+use synch_core::{group_count, groups_for_byte_range, ChunkRanges, Hash};
 
 use crate::{
     cloud::{CloudStore, CloudUploadPolicy},
@@ -176,7 +176,6 @@ pub struct Cloud {
     objects: CloudStore,
     upload_policy: CloudUploadPolicy,
     cache_bytes: Option<u64>,
-    accessed: Arc<std::sync::Mutex<std::collections::HashMap<Hash, i64>>>,
 }
 
 impl Cloud {
@@ -214,7 +213,6 @@ impl Cloud {
             objects,
             upload_policy,
             cache_bytes,
-            accessed: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
         }
     }
 
@@ -229,80 +227,10 @@ impl Cloud {
         .await
     }
 
-    /// The blob row for `root`, adopting a cold remote object into one first
-    /// when storage holds the pair (the restored-database path). `None` when
-    /// neither the database nor remote storage knows the root — what that
-    /// means is the caller's question, which is why both callers answered the
-    /// same `match` differently and now answer this `Option` differently.
-    async fn row_or_adopt(&self, root: Hash, size: u64) -> Result<Option<crate::cas::BlobRow>> {
-        let store = self.store.clone();
-        if let Some(row) = blocking(move || store.blob(&root)).await? {
-            return Ok(Some(row));
-        }
-        if !self.adopt_remote_if_present(root, size).await? {
-            return Ok(None);
-        }
-        let store = self.store.clone();
-        Ok(Some(
-            blocking(move || store.blob(&root))
-                .await?
-                .ok_or(StoreError::MissingBlob(root))?,
-        ))
-    }
-
-    async fn adopt_remote_if_present(&self, root: Hash, size: u64) -> Result<bool> {
-        let store = self.store.clone();
-        let mut replace_claim = false;
-        if let Some(row) = blocking(move || store.blob(&root)).await? {
-            if row.size != size {
-                if attests_size(&row) {
-                    return Err(size_mismatch(root, "have", row.size, "offered", size));
-                }
-                replace_claim = true;
-            }
-            if row.durable {
-                return Ok(true);
-            }
-        }
-        match self.objects.require_pair(&root).await {
-            Ok(stored_size) => {
-                if stored_size != size {
-                    return Err(size_mismatch(
-                        root,
-                        "storage has",
-                        stored_size,
-                        "offered",
-                        size,
-                    ));
-                }
-                if replace_claim {
-                    let store = self.store.clone();
-                    if !blocking(move || store.clear_blob_cache(&root)).await? {
-                        return Err(StoreError::invalid(
-                            "stale size claim changed while the object was being written",
-                        ));
-                    }
-                }
-                let store = self.store.clone();
-                blocking(move || store.adopt_durable_blob(&root, size, synch_core::now_ns()))
-                    .await?;
-                Ok(true)
-            }
-            Err(StoreError::CloudNotFound { .. }) => Ok(false),
-            Err(error) => Err(error),
-        }
-    }
-
     /// Finds an object's size from SQLite, or reconstructs a cold row directly
     /// from its content-addressed final keys. Peer-serving requests carry no
     /// size hint, so this is the restored-database path for encode/read calls.
     async fn durable_size_or_adopt(&self, root: Hash) -> Result<u64> {
-        let store = self.store.clone();
-        if let Some(size) =
-            blocking(move || store.blob(&root).map(|row| row.map(|row| row.size))).await?
-        {
-            return Ok(size);
-        }
         let store = self.store.clone();
         if let Some(size) =
             blocking(move || store.blob(&root).map(|row| row.map(|row| row.size))).await?
@@ -338,99 +266,17 @@ impl Cloud {
     }
 
     async fn touch(&self, root: Hash) -> Result<()> {
-        const TOUCH_INTERVAL_NS: i64 = 60 * 1_000_000_000;
-        let now = synch_core::now_ns();
-        let due = {
-            let mut accessed = self
-                .accessed
-                .lock()
-                .unwrap_or_else(std::sync::PoisonError::into_inner);
-            if accessed
-                .get(&root)
-                .is_some_and(|last| now.saturating_sub(*last) < TOUCH_INTERVAL_NS)
-            {
-                false
-            } else {
-                accessed.insert(root, now);
-                true
-            }
-        };
-        if due {
-            let store = self.store.clone();
-            blocking(move || store.touch_blob(&root, now)).await?;
-        }
-        Ok(())
+        let store = self.store.clone();
+        blocking(move || store.touch_blob(&root).map(|_| ())).await
     }
 
     async fn hydrate_ranges(&self, root: Hash, size: u64, ranges: ChunkRanges) -> Result<()> {
-        if ranges.is_empty() {
-            return Ok(());
-        }
-        // Keep maintenance from evicting an earlier window or the cached
-        // outboard while this hydration is still assembling the requested
-        // ranges. The lease holds no SQLite connection across these awaits.
-        let _hydrating = self.store.lease_write(&root);
-        self.outboard_bytes(root).await?;
-        if size == 0 {
-            let store = self.store.clone();
-            blocking(move || {
-                store.cache_trusted_range(&root, size, 0, &[], synch_core::now_ns())?;
-                Ok(())
-            })
-            .await?;
-            return Ok(());
-        }
-        const WINDOW: u64 = 8 * 1024 * 1024;
-        for range in &ranges.ranges {
-            let mut offset = range.start.saturating_mul(CHUNK_GROUP_SIZE);
-            let end = range.end.saturating_mul(CHUNK_GROUP_SIZE).min(size);
-            while offset < end {
-                let window_end = offset.saturating_add(WINDOW).min(end);
-                let bytes = match self.objects.read_range(&root, offset..window_end).await {
-                    Ok(bytes) => bytes,
-                    Err(error @ StoreError::CloudNotFound { .. }) => {
-                        let store = self.store.clone();
-                        blocking(move || store.heal_missing_durable_blob(&root).map(|_| ()))
-                            .await?;
-                        return Err(error);
-                    }
-                    Err(error) => return Err(error),
-                };
-                let store = self.store.clone();
-                let bytes = bytes.to_vec();
-                blocking(move || {
-                    store.cache_trusted_range(&root, size, offset, &bytes, synch_core::now_ns())?;
-                    Ok(())
-                })
-                .await?;
-                offset = window_end;
-            }
-        }
-        Ok(())
+        crate::lean_cloud::hydrate(self.store.clone(), self.objects.clone(), root, size, ranges)
+            .await
     }
 
     async fn outboard_bytes(&self, root: Hash) -> Result<Vec<u8>> {
-        let store = self.store.clone();
-        if let Some(cached) = blocking(move || Ok(store.cached_outboard(&root))).await? {
-            return Ok(cached);
-        }
-        self.remote_outboard_bytes(root).await
-    }
-
-    async fn remote_outboard_bytes(&self, root: Hash) -> Result<Vec<u8>> {
-        let outboard = match self.objects.read_outboard(&root).await {
-            Ok(outboard) => outboard.to_vec(),
-            Err(error @ StoreError::CloudNotFound { .. }) => {
-                let store = self.store.clone();
-                blocking(move || store.heal_missing_durable_blob(&root).map(|_| ())).await?;
-                return Err(error);
-            }
-            Err(error) => return Err(error),
-        };
-        let store = self.store.clone();
-        let cached = outboard.clone();
-        blocking(move || store.cache_outboard(&root, &cached)).await?;
-        Ok(outboard)
+        crate::lean_cloud::outboard(self.store.clone(), self.objects.clone(), root, false).await
     }
 }
 
@@ -604,51 +450,18 @@ impl CasBackend for Cloud {
     }
 
     async fn ensure_cached(&self, root: Hash, size: u64) -> Result<()> {
-        let Some(row) = self.row_or_adopt(root, size).await? else {
-            return Err(StoreError::MissingBlob(root));
-        };
-        check_durable_size(&row, root, size)?;
-        if row.inline.is_some() {
-            return Ok(());
-        }
-        if row.complete {
-            let store = self.store.clone();
-            let present =
-                blocking(move || Ok(store.cached_blob_files_present(&root, size))).await?;
-            if present {
-                return Ok(());
-            }
-            let store = self.store.clone();
-            if !blocking(move || store.clear_blob_cache(&root)).await? {
-                return Err(StoreError::invalid(
-                    "the cloud cache is currently being filled by another operation",
-                ));
-            }
-            if !row.durable {
-                return Err(StoreError::MissingBlob(root));
-            }
-        }
-        if !row.durable {
-            return Ok(());
-        }
-        self.hydrate_ranges(root, size, ChunkRanges::single(0, group_count(size)))
-            .await
+        crate::lean_cloud::ensure_cached(self.store.clone(), self.objects.clone(), root, size).await
     }
 
     async fn ensure_ranges(&self, root: Hash, size: u64, ranges: ChunkRanges) -> Result<()> {
-        let Some(row) = self.row_or_adopt(root, size).await? else {
-            return Ok(());
-        };
-        check_durable_size(&row, root, size)?;
-        if !row.durable && !self.adopt_remote_if_present(root, size).await? {
-            return Ok(());
-        }
-        if row.inline.is_some() {
-            return Ok(());
-        }
-        let wanted = ranges.intersect(&ChunkRanges::single(0, group_count(size)));
-        self.hydrate_ranges(root, size, wanted.difference(&row.verified_groups()))
-            .await
+        crate::lean_cloud::ensure_ranges(
+            self.store.clone(),
+            self.objects.clone(),
+            root,
+            size,
+            ranges,
+        )
+        .await
     }
 
     async fn encode_slice(
@@ -873,8 +686,8 @@ impl CasBackend for Cloud {
         };
         let store = self.store.clone();
         blocking(move || {
-            // `Cas.FinalizeRemote` begins only after the remote pair write
-            // above succeeded; a GC winner makes this row update return false.
+            // Mark durable only after the remote pair write above succeeds;
+            // a GC winner makes this row update return false.
             if store.mark_blob_durable(&root)? {
                 Ok(())
             } else {
@@ -944,24 +757,25 @@ impl CasBackend for Cloud {
     }
 }
 
+/// The filesystem's shortfall of its free floor is this side's reading; how
+/// much the cache holds, which entries go and in what order is Lean's.
 fn enforce_cache_limit(store: &Store, configured: Option<u64>) -> Result<(usize, u64)> {
-    let usage = store.durable_cache_bytes()?;
-    let mut target = configured.unwrap_or(u64::MAX);
     #[cfg(unix)]
-    {
+    let shortfall = {
         let filesystem = rustix::fs::statvfs(store.cas_dir())
             .map_err(|error| std::io::Error::from_raw_os_error(error.raw_os_error()))?;
         let fragment = filesystem.f_frsize.max(filesystem.f_bsize);
         let total = filesystem.f_blocks.saturating_mul(fragment);
         let available = filesystem.f_bavail.saturating_mul(fragment);
         let free_floor = total / 5;
-        let shortfall = free_floor.saturating_sub(available);
-        target = target.min(usage.saturating_sub(shortfall));
-    }
-    if target == u64::MAX || usage <= target {
+        free_floor.saturating_sub(available)
+    };
+    #[cfg(not(unix))]
+    let shortfall = 0u64;
+    if configured.is_none() && shortfall == 0 {
         return Ok((0, 0));
     }
-    store.evict_durable_cache_to(target)
+    store.evict_durable_cache(configured, shortfall)
 }
 
 fn materialize_cached(
@@ -1049,27 +863,6 @@ fn reflink_file(source: &std::fs::File, dest: &std::fs::File) -> std::io::Result
     }
 }
 
-/// Whether this row's size is one the node has *attested* — durable, complete,
-/// or holding the final group verified — and therefore not a claim an offer
-/// may replace. An unattested cache row's size is just what somebody once
-/// said, and `adopt_remote_if_present` replaces it instead of refusing.
-fn attests_size(row: &crate::cas::BlobRow) -> bool {
-    row.durable
-        || row.complete
-        || row
-            .verified_groups()
-            .contains(group_count(row.size).saturating_sub(1))
-}
-
-/// Refuses an offered size that contradicts a durable row: a durable size is
-/// attested, so the offer is describing some other object.
-fn check_durable_size(row: &crate::cas::BlobRow, root: Hash, size: u64) -> Result<()> {
-    if row.durable && row.size != size {
-        return Err(size_mismatch(root, "have", row.size, "offered", size));
-    }
-    Ok(())
-}
-
 /// The one wording of the size-mismatch refusal, whichever pair of claims
 /// disagreed.
 fn size_mismatch(root: Hash, held: &str, have: u64, claim: &str, offered: u64) -> StoreError {
@@ -1091,7 +884,7 @@ async fn blocking<T: Send + 'static>(
 mod tests {
     use super::*;
     use opendal::{services::Memory, Operator};
-    use synch_core::group_count;
+    use synch_core::{group_count, CHUNK_GROUP_SIZE};
 
     async fn contract(
         backend: Arc<dyn CasBackend>,
@@ -1317,6 +1110,89 @@ mod tests {
         let adopted = store.blob(&rowless.root).unwrap().unwrap();
         assert_eq!(adopted.size, rowless.size);
         assert!(adopted.durable);
+    }
+
+    #[tokio::test]
+    async fn cloud_restore_crosses_hydration_windows_and_preserves_the_partial_tail() {
+        const WINDOW: usize = 8 * 1024 * 1024;
+        let bytes: Vec<u8> = (0..WINDOW + CHUNK_GROUP_SIZE as usize + 137)
+            .map(|index| ((index * 17 + index / 251) % 256) as u8)
+            .collect();
+        let directory = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(directory.path()).unwrap());
+        let objects = CloudStore::from_operator(
+            Operator::new(Memory::default()).unwrap(),
+            scratch.path().to_path_buf(),
+        )
+        .unwrap();
+        let ingested = objects.ingest_bytes(&bytes).await.unwrap();
+        let backend = Cloud::new(store.clone(), objects, CloudUploadPolicy::OwnPinned, None);
+        assert!(store.blob(&ingested.root).unwrap().is_none());
+        backend
+            .ensure_cached(ingested.root, ingested.size)
+            .await
+            .unwrap();
+        assert_eq!(store.read_all(&ingested.root).unwrap(), bytes);
+        // This read crosses the window boundary and clamps past the final
+        // partial group, so neither a skipped window nor a padded tail passes.
+        let offset = WINDOW - 23;
+        assert_eq!(
+            store
+                .read_range(
+                    &ingested.root,
+                    offset as u64,
+                    (bytes.len() - offset + 80) as u64
+                )
+                .unwrap(),
+            bytes[offset..]
+        );
+    }
+
+    #[tokio::test]
+    async fn cloud_adoption_restores_groups_removed_with_an_unattested_size_claim() {
+        let donor_dir = tempfile::tempdir().unwrap();
+        let donor = Store::open(donor_dir.path()).unwrap();
+        let bytes: Vec<u8> = (0..20 * CHUNK_GROUP_SIZE)
+            .map(|index| (index % 251) as u8)
+            .collect();
+        let root = donor.ingest_bytes(&bytes, 1).unwrap();
+        let wanted = ChunkRanges::single(0, 16);
+        let (encoded, served) = donor.encode_slice(&root, &wanted).unwrap();
+
+        let dir = tempfile::tempdir().unwrap();
+        let scratch = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path()).unwrap());
+        // Bao's shared left subtree verifies under either size. These groups
+        // are real, but the final group has not attested the offered size.
+        store
+            .write_slice(&root, 24 * CHUNK_GROUP_SIZE, &served, &encoded, 2)
+            .unwrap();
+        assert_eq!(
+            store.blob(&root).unwrap().unwrap().verified_groups(),
+            wanted
+        );
+        let objects = CloudStore::from_operator(
+            Operator::new(Memory::default()).unwrap(),
+            scratch.path().to_path_buf(),
+        )
+        .unwrap();
+        assert_eq!(objects.ingest_bytes(&bytes).await.unwrap().root, root);
+        let backend = Cloud::new(store.clone(), objects, CloudUploadPolicy::OwnPinned, None);
+        backend
+            .ensure_ranges(root, bytes.len() as u64, wanted.clone())
+            .await
+            .unwrap();
+        let adopted = store.blob(&root).unwrap().unwrap();
+        assert!(adopted.durable);
+        assert_eq!(adopted.size, bytes.len() as u64);
+        assert_eq!(adopted.verified_groups(), wanted);
+        // Adoption clears the old cache. Restoration must reconsider coverage
+        // after that clear, including groups the old snapshot used to contain.
+        assert_eq!(
+            store.read_range(&root, 0, 16 * CHUNK_GROUP_SIZE).unwrap(),
+            bytes[..(16 * CHUNK_GROUP_SIZE) as usize]
+        );
     }
 
     #[tokio::test]

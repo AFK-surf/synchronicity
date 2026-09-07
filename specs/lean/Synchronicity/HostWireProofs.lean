@@ -229,11 +229,11 @@ theorem file_close_accepts_acknowledgement :
     FileIO.reply (.close 7) (b [1, 35]) = .ok () := by decide
 
 theorem snapshot_rejects_invalid_trailing_failure_flag :
-    Access.reply (.snapshot ⟨"blobs", [], []⟩ [])
+    Access.reply (.snapshot ⟨"blobs", [], [], []⟩ [])
       (b [1, 29, 0, 0, 0, 0, 0, 0, 0, 0, 2]) = .error protocolFailure := by rfl
 
 theorem update_rejects_copy_reply :
-    Access.reply (.update 7 ⟨"blobs", [], []⟩ [])
+    Access.reply (.update 7 ⟨"blobs", [], [], []⟩ [])
       (b [1, 31, 0, 0, 0, 0, 0, 0, 0, 0]) = .error protocolFailure := by decide
 
 theorem clock_rejects_wrong_reply_kind :

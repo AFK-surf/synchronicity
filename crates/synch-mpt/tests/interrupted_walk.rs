@@ -1,9 +1,9 @@
-//! Storage failures must leave the Rust walk's selected read pending, not complete.
+//! Failed native completeness reads cannot establish a certificate.
 
 use std::{cell::Cell, io};
 
 use synch_core::Hash;
-use synch_mpt::{MemStore, MissingWalk, Nibbles, NodeStore, Trie, TrieNode, ValueRef};
+use synch_mpt::{MemStore, Nibbles, NodeStore, Trie, TrieNode, ValueRef};
 
 struct InterruptingStore {
     inner: MemStore,
@@ -64,13 +64,10 @@ fn failed_reads_and_decodes_cannot_skip_an_unfinished_node() {
         let root = node.hash();
         store.put_node(&root, &node.encode()).unwrap();
         let trie = Trie::new(&store);
-        let mut walk = MissingWalk::new(root);
-        assert!(walk.next_batch(&trie, 1).is_err());
-        assert!(!walk.is_exhausted());
-        walk.resume();
-        let missing = walk.next_batch(&trie, 1).unwrap();
-        assert_eq!(missing.values, vec![(vec![], payload)]);
+        assert!(trie.is_complete(root).is_err());
+        assert!(!trie.is_complete(root).unwrap());
         assert_eq!(store.reads.get(), 2);
-        assert!(!walk.is_exhausted());
+        store.put_value(&payload, &[7; 129]).unwrap();
+        assert!(trie.is_complete(root).unwrap());
     }
 }

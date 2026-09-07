@@ -4,6 +4,10 @@
 
 This is a Rust 2021 workspace (minimum Rust 1.91). Libraries and binaries live in `crates/synch-*`; code belongs in each crate's `src/`, integration tests in `tests/`, and harnesses in `examples/`. `control-plane/` contains a Gleam/Erlang backend, `control-plane/web/` the React/TypeScript SPA, and `control-plane/e2e/` cross-system tests. Formal models live under `specs/`: the TLA+ recovery model, and Lean proofs about the executable Lean core in `crates/synch-verified`. Consult `DESIGN.md` for architecture and `docs/` for subsystem contracts. `vendor/russh/` is patched; change it only with corresponding patch documentation.
 
+## Lean Architecture and Proof Goals
+
+Read [docs/LEAN.md](docs/LEAN.md) before changing the Rust/Lean boundary or proof goals. It is the canonical overview of architecture, migration status, checked guarantees, trust assumptions and remaining work. Design high-level theorems around real system properties that matter to users and can be explained in plain words; prove helpers only when they support those properties. Keep implementation details and precise assumptions beside the code. Keep `docs/LEAN.md` human-readable, under 20KB and about overall system status, without PR-specific scope or history. Update it when ownership or proof coverage changes, and distinguish migrated code from proved guarantees.
+
 ## Build, Test, and Development Commands
 
 - `cargo build --release` builds workspace binaries into `target/release/`.

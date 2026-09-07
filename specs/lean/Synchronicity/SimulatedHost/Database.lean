@@ -68,8 +68,28 @@ def equalCell : Cell → Cell → Bool
   change (bytes == bytes) = true
   exact beq_self_eq_true _
 
+/-- SQL `IS`, which the host renders every literal predicate with: equality
+except that NULL is itself. Conflict detection and joins keep SQL `=`. -/
+def isCell : Cell → Cell → Bool
+  | .null, .null => true
+  | a, b => equalCell a b
+
+@[simp] theorem isCell_null_null : isCell .null .null = true := rfl
+
+@[simp] theorem isCell_blob (left : ByteArray) (right : Cell) :
+    isCell (.blob left) right = equalCell (.blob left) right := by
+  cases right <;> rfl
+
+@[simp] theorem isCell_integer (left : Int64) (right : Cell) :
+    isCell (.integer left) right = equalCell (.integer left) right := by
+  cases right <;> rfl
+
+@[simp] theorem isCell_text (left : String) (right : Cell) :
+    isCell (.text left) right = equalCell (.text left) right := by
+  cases right <;> rfl
+
 def equals (row : Fields) (fields : Fields) : Bool :=
-  fields.all fun (column, value) => equalCell (cell row column) value
+  fields.all fun (column, value) => isCell (cell row column) value
 
 /-- SQL LIKE with ASCII case folding, percent and underscore wildcards.
 The recursion consumes either pattern or input, so it needs no external fuel. -/
@@ -92,7 +112,8 @@ def like (value : Cell) (pattern : String) : Bool :=
 
 def selects (selection : Selection) (row : Fields) : Bool :=
   equals row selection.equals && (selection.likeAny.isEmpty ||
-    selection.likeAny.any (fun (column, pattern) => like (cell row column) pattern))
+    selection.likeAny.any (fun (column, pattern) => like (cell row column) pattern)) &&
+    selection.notEquals.all (fun (column, value) => !isCell (cell row column) value)
 
 def project (columns : List String) (row : Fields) : Row := columns.map (cell row)
 
@@ -206,9 +227,38 @@ def ordered (order : List Order) (left right : Fields) : Bool :=
       | .lt => !next.descending
       | .gt => next.descending
 
+/-- A stable sort by `le`, structurally recursive so a fixture can decide
+an ordered query: an earlier row stays before a later one it ties with. -/
+def insertOrdered (le : Fields → Fields → Bool) (row : Fields) : List Fields → List Fields
+  | [] => [row]
+  | head :: rest => if le row head then row :: head :: rest else head :: insertOrdered le row rest
+
+def sortRows (le : Fields → Fields → Bool) : List Fields → List Fields
+  | [] => []
+  | row :: rest => insertOrdered le row (sortRows le rest)
+
+@[simp] theorem sortRows_nil (le : Fields → Fields → Bool) : sortRows le [] = [] := rfl
+
+@[simp] theorem sortRows_singleton (le : Fields → Fields → Bool) (row : Fields) :
+    sortRows le [row] = [row] := rfl
+
 def query (db : Database) (relation : String) (columns : List String) (fields : Fields)
     (order : List Order) (joins : List Join) : List Row :=
   let candidates := if joins.isEmpty then rows db relation else joinedRows db relation joins
-  ((candidates.filter (fun row => equals row fields)).mergeSort (ordered order)).map (project columns)
+  (sortRows (ordered order) (candidates.filter (fun row => equals row fields))).map (project columns)
+
+/-- An unordered raw projection preserves the selected records exactly. -/
+theorem unordered_query (db : Database) (table : String) (columns : List String)
+    (fields : Fields) :
+    query db table columns fields [] [] =
+      ((rows db table).filter (fun row => equals row fields)).map (project columns) := by
+  have sorted (rs : List Fields) : sortRows (ordered []) rs = rs := by
+    induction rs with
+    | nil => rfl
+    | cons row rest ih =>
+      rw [sortRows, ih]
+      cases rest <;> rfl
+  simp [query, sorted]
+
 
 end Synchronicity.SimulatedHost

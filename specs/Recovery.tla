@@ -40,7 +40,7 @@
 (*   crates/synch-engine/src/recovery.rs  detection, ensure_publishable,   *)
 (*                                        recover()                        *)
 (*   crates/synch-engine/src/node.rs      next_seq, publish                *)
-(*   crates/synch-net/src/reconcile.rs    the §5.2 acceptance rule         *)
+(*   crates/synch-engine/src/reconcile.rs the §5.2 acceptance rule         *)
 (***************************************************************************)
 EXTENDS Naturals, FiniteSets
 

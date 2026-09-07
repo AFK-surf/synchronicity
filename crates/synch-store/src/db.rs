@@ -317,7 +317,7 @@ impl Completeness {
 /// committed or rolled back. Both edges advance the generation: a reader that
 /// starts during a transaction must not certify its pre-commit snapshot later.
 #[derive(Debug)]
-struct MemoMutation(Arc<CasCoord>);
+pub(crate) struct MemoMutation(Arc<CasCoord>);
 
 impl Drop for MemoMutation {
     fn drop(&mut self) {
@@ -358,8 +358,8 @@ pub(crate) struct WriteLease<'a> {
 
 impl Drop for WriteLease<'_> {
     fn drop(&mut self) {
-        // `Cas.WriteAbort` also covers the successful lease end: the
-        // protection disappears only after the writer has stopped touching bytes.
+        // On success or failure, protection disappears only after the
+        // writer has stopped touching bytes.
         let mut writing = self.store.writing();
         if let Some(count) = writing.get_mut(&self.root) {
             *count -= 1;
@@ -850,9 +850,7 @@ impl Txn<'_> {
     ) {
         let mut guard = self.invalidation.borrow_mut();
         if guard.is_none() {
-            let mut memo = self.store.completeness();
-            memo.begin(keep);
-            *guard = Some(MemoMutation(self.store.cas_coord.clone()));
+            *guard = Some(self.store.begin_memo_mutation(keep));
         }
     }
 
@@ -1261,6 +1259,16 @@ impl Store {
             .unwrap_or_else(PoisonError::into_inner)
     }
 
+    /// Begins a memo mutation keeping only the certificates in `keep`; the
+    /// guard ends it, and must outlive the mutating transaction's edge.
+    pub(crate) fn begin_memo_mutation(
+        &self,
+        keep: &std::collections::HashSet<Hash>,
+    ) -> MemoMutation {
+        self.completeness().begin(keep);
+        MemoMutation(self.cas_coord.clone())
+    }
+
     fn completeness(&self) -> MutexGuard<'_, Completeness> {
         self.cas_coord
             .completeness
@@ -1297,8 +1305,8 @@ impl Store {
     /// a payload into place before that unlink, even when writer and sweep use
     /// independently opened Store values.
     pub(crate) fn lease_write(&self, root: &Hash) -> WriteLease<'_> {
-        // `Cas.BeginWrite` models this ordered guard acquisition plus the
-        // insertion into `writing`; neither half may move past the other.
+        // Keep guard acquisition ordered with insertion into `writing`;
+        // neither half may move past the other.
         let _ordered_against_the_sweeps = self.conn();
         let _ordered_across_store_instances = self.cas_order();
         *self.writing().entry(*root).or_insert(0) += 1;
@@ -1308,10 +1316,10 @@ impl Store {
         }
     }
 
-    /// True if a CAS write is in flight for `root`.
-    ///
-    /// Read by both sweeps while they hold the shared CAS order guard, so the
-    /// answer cannot go stale between the decision and the unlink.
+    /// True if a CAS write is in flight for `root`. The sweeps read the count
+    /// through `Storage.readCounter` inside the ordering section; this is
+    /// the tests' view of the same registry.
+    #[cfg(test)]
     pub(crate) fn is_being_written(&self, root: &Hash) -> bool {
         self.writing().contains_key(root)
     }

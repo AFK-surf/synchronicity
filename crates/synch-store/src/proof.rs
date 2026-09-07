@@ -38,7 +38,7 @@ use bao_tree::{
 };
 use synch_core::{
     group_count, join_cvs, join_root, ChunkRanges, Cv, GroupRange, Hash, CHUNK_GROUP_SIZE,
-    INLINE_BLOB_MAX, MAX_PROOF_NODES, PROOF_NODE_LEN,
+    MAX_PROOF_NODES, PROOF_NODE_LEN,
 };
 
 use crate::{
@@ -333,9 +333,9 @@ impl Subtree {
 
 /// What one walk of an object's tree established.
 #[derive(Debug, Default)]
-struct Proof {
+pub(crate) struct Proof {
     /// The interior nodes the walk visited, in pre-order.
-    nodes: Vec<(TreeNode, [u8; PROOF_NODE_LEN])>,
+    pub(crate) nodes: Vec<(TreeNode, [u8; PROOF_NODE_LEN])>,
     /// The subtrees whose chaining values the walk established.
     proven: Vec<ProvenSubtree>,
 }
@@ -446,7 +446,7 @@ where
 ///
 /// Returns what the walk established and, when the node budget ran out, the
 /// first group it could not cover.
-fn walk_proof<L>(
+pub(crate) fn walk_proof<L>(
     root: &Hash,
     size: u64,
     ranges: &ChunkRanges,
@@ -478,7 +478,7 @@ where
 }
 
 /// Reads a node's pair out of a pre-order outboard.
-fn load_from_outboard<R: ReadAt>(
+pub(crate) fn load_from_outboard<R: ReadAt>(
     outboard: &PreOrderOutboard<R>,
     root: &Hash,
     node: &TreeNode,
@@ -562,10 +562,6 @@ struct OpenDonor {
     /// Its tree, which is what makes a donor cheap to ask about: a 16 MiB span
     /// costs two positional reads to compare rather than 16 MiB of hashing.
     outboard: PreOrderOutboard<DataFile>,
-    /// The groups the donor is known to hold, out of its bitmap.
-    held: ChunkRanges,
-    /// How long the donor is, which bounds what can be read out of it.
-    size: u64,
     /// Its group count, which fixes the shape of its tree.
     groups: u64,
 }
@@ -596,6 +592,19 @@ impl Store {
     ///
     /// An over-budget request is refused rather than truncated; see the walk
     /// below for why that is safe once the requester sizes its own windows.
+    ///
+    /// The window (what was asked for, that the row holds, within the
+    /// object), the single-group short-circuit and the refusal of a walk that
+    /// overran the budget are the Lean command `Cas.Serve.encodeProof`; this
+    /// store is the Bao service that walks the tree over the groups it names.
+    /// Refusing *after* walking is not the amplification it reads as: the
+    /// budget is checked before each node is loaded, so an over-budget request
+    /// costs at most `budget` loads, strictly less than a conforming maximal
+    /// request, which does the same loads and then serialises and sends the
+    /// result. Refusing is also what keeps this to a single walk: serving a
+    /// truncated answer would mean making the two sides agree about where it
+    /// stopped, at up to `MAX_PROOF_NODES` random 64-byte outboard reads for
+    /// a ~50-byte request.
     pub fn encode_proof(
         &self,
         root: &Hash,
@@ -603,66 +612,7 @@ impl Store {
         level: u8,
         budget: u64,
     ) -> Result<(Vec<u8>, ChunkRanges)> {
-        let blob = self.blob(root)?.ok_or(StoreError::MissingBlob(*root))?;
-        let groups = group_count(blob.size);
-        let wanted = requested
-            .intersect(&blob.verified_groups())
-            .intersect(&ChunkRanges::single(0, groups));
-        if wanted.is_empty() || groups <= 1 {
-            // A single-group object has no interior nodes at all: its root is
-            // the group, and there is nothing to prove about it that the root
-            // does not already say.
-            return Ok((Vec::new(), wanted));
-        }
-
-        let tree = Self::tree(blob.size);
-        let outboard = PreOrderOutboard {
-            root: blake3::Hash::from_bytes(root.0),
-            tree,
-            data: DataFile(File::open(self.outboard_path(root))?),
-        };
-        let (proof, truncated) =
-            walk_proof(root, blob.size, &wanted, level, budget, false, |node| {
-                load_from_outboard(&outboard, root, node)
-            })?;
-        // A truncated walk is a refused request, not a partial answer.
-        //
-        // The requester sizes its window from `proof_nodes_upper_bound` so that
-        // a provider holding *everything* it asked for still fits the budget,
-        // and this walk covers `requested ∩ what we hold`, which is a subset of
-        // that and so cannot cost more. Overrunning therefore means the request
-        // was not sized by a conforming requester, and the answer is to say so
-        // rather than to serve a prefix.
-        //
-        // Refusing *after* walking is not the amplification it reads as: the
-        // budget is checked before each node is loaded, so an over-budget
-        // request costs at most `budget` loads — strictly less than a
-        // conforming maximal request, which does the same loads and then
-        // serialises and sends the result. The §12 sanity bound on this message
-        // is enforced, and it is enforced by `budget`, not by this check.
-        //
-        // Refusing is also what keeps this to a single walk. Serving a
-        // truncated answer would mean making the two sides agree about where it
-        // stopped — done by discarding the work and walking the whole thing
-        // again over the ranges that fit, at up to `MAX_PROOF_NODES` random
-        // 64-byte outboard reads for a ~50-byte request.
-        if let Some(at) = truncated {
-            return Err(StoreError::Verification {
-                root: *root,
-                reason: format!(
-                    "a proof over these ranges at level {level} exceeds the \
-                     {budget}-node budget (stopped at group {at}); the requester \
-                     must split the request"
-                ),
-            });
-        }
-        let served = wanted;
-
-        let mut encoded = Vec::with_capacity(proof.nodes.len() * PROOF_NODE_LEN);
-        for (_, pair) in &proof.nodes {
-            encoded.extend_from_slice(pair);
-        }
-        Ok((encoded, served))
+        crate::lean_serve::encode_proof(self, root, requested, level, budget)
     }
 
     /// Encodes a proof for a remotely durable complete object from its whole
@@ -727,24 +677,39 @@ impl Store {
         encoded: &[u8],
         now: i64,
     ) -> Result<Proven> {
-        let groups = group_count(size);
-        let served = served.intersect(&ChunkRanges::single(0, groups));
-        // Held past the commit below, for the reason `write_slice` takes one: the
-        // outboard is written with no lock held ([`Store::lease_write`]).
-        let _lease = self.lease_write(root);
-        // The cheap refusal; `commit_groups` makes the same decision again
-        // inside the transaction that records it.
-        self.admit_size(root, size)?;
+        crate::lean_receive::write_proof(self, root, size, served, level, encoded, now)
+    }
+
+    /// The proof half of the Bao service: verify `encoded` over `served` at
+    /// `level` by recomputation up to `root`, and write its interior nodes into
+    /// the object's sparse outboard, unflushed. Answers whether any node was
+    /// written and the subtrees the proof established.
+    ///
+    /// Every pair is checked before anything is written, so a tampered proof
+    /// is rejected whole. What survives is written at the positions bao would
+    /// have put it: the tree of the new version accumulates ahead of its
+    /// bytes, which is what lets promoted groups be *served* rather than
+    /// merely held (§3.4). The outboard only, and only as far as this proof's
+    /// own nodes reach: `size` came off a trie entry and nothing has verified
+    /// it, so growing to `tree.outboard_size()` turned a 32 TiB claim into a
+    /// 128 GiB file that nothing reclaims.
+    pub(crate) fn verify_proof_into_outboard(
+        &self,
+        root: &Hash,
+        size: u64,
+        served: &ChunkRanges,
+        level: u8,
+        encoded: &[u8],
+    ) -> Result<(bool, Vec<ProvenSubtree>)> {
         if !encoded.len().is_multiple_of(PROOF_NODE_LEN) {
             return Err(StoreError::Verification {
                 root: *root,
                 reason: format!("a proof of {} bytes is not whole nodes", encoded.len()),
             });
         }
-
         let mut cursor = 0usize;
         let (proof, truncated) =
-            walk_proof(root, size, &served, level, MAX_PROOF_NODES, true, |_| {
+            walk_proof(root, size, served, level, MAX_PROOF_NODES, true, |_| {
                 let end = cursor + PROOF_NODE_LEN;
                 if end > encoded.len() {
                     return Err(StoreError::Verification {
@@ -776,77 +741,29 @@ impl Store {
                 ),
             });
         }
-
-        if !proof.nodes.is_empty() {
-            let tree = Self::tree(size);
-            // The outboard only. A proof commits no bytes, so it has no
-            // business creating a payload file the size of an object this node
-            // holds nothing of — that file is the business of whatever first
-            // puts a byte in it.
-            //
-            // And only as far as this proof's own nodes reach, not as far as
-            // the claimed length's tree would: `size` came off a trie entry and
-            // nothing has verified it, so growing to `tree.outboard_size()`
-            // turned a 32 TiB claim into a 128 GiB file that nothing reclaims.
-            // The nodes below are the whole of what is about to be written.
-            let reach = proof
-                .nodes
-                .iter()
-                .filter_map(|(node, _)| tree.pre_order_offset(*node))
-                .map(|offset| (offset + 1) * PROOF_NODE_LEN as u64)
-                .max()
-                .unwrap_or(0);
-            let mut outboard = PreOrderOutboard {
-                root: blake3::Hash::from_bytes(root.0),
-                tree,
-                data: DataFile(self.open_sparse_outboard(root, reach)?),
-            };
-            for (node, pair) in &proof.nodes {
-                let left = blake3::Hash::from_bytes(pair[..32].try_into().expect("32 of 64"));
-                let right = blake3::Hash::from_bytes(pair[32..].try_into().expect("32 of 64"));
-                outboard.save(*node, &(left, right))?;
-            }
-            outboard.sync()?;
-            // Checked, like the flushes `write_slice` runs: a swallowed ENOSPC
-            // or EIO here lets the row below record a tree that never reached
-            // stable storage. The handle is open for writing, which is what
-            // Windows requires of a flush.
-            fsync_file(&outboard.data.0)?;
-            crate::cas::fsync_parent(&self.outboard_path(root));
-            // The row is what later passes read the object's size and bitmap
-            // out of. A proof commits no bytes, so an object first met this way
-            // is recorded as held-nothing rather than not held at all.
-            //
-            // This may affect an in-flight fetch: `commit_groups` also settles
-            // the size, and a claim that moves the object's *group count* resets the bitmap
-            // (settlement rule 3), so a proof carrying a wrong size erases
-            // whatever a concurrent fetch had verified. Sixty-four bytes on the
-            // wire, repeatable, and reachable from any origin that publishes a
-            // false `f:` size for a root a peer is fetching.
-            //
-            // That is a documented, accepted cost rather than a defect — the
-            // same erasure is reachable through the ordinary slice path, and
-            // `docs/DELTA-SYNC.md` §6 states the trade: an unattested size
-            // yields to the next writer so that an overstated entry cannot
-            // brick a root forever, and the price is a re-fetch of what was
-            // held. It is written down here because a comment claiming the
-            // opposite is what would keep the next reader from finding it.
-            //
-            // The size in that row is a claim off an entry, not something this
-            // proof established: an object's tree is the same shape for every
-            // size inside its last 16 KiB chunk group, so a peer can overstate a
-            // root by a few bytes and have the proof verify anyway. Nothing
-            // durable may rest on it, which is what the settlement is for — until
-            // the final group is held, the next writer's size wins, and the
-            // decision is made inside the transaction that records it so that
-            // two writers cannot each decide it on a stale snapshot.
-            self.commit_groups(root, size, &ChunkRanges::empty(), None, now)?;
+        if proof.nodes.is_empty() {
+            return Ok((false, proof.proven));
         }
-        Ok(Proven {
-            root: *root,
-            size,
-            subtrees: proof.proven,
-        })
+        let tree = Self::tree(size);
+        let reach = proof
+            .nodes
+            .iter()
+            .filter_map(|(node, _)| tree.pre_order_offset(*node))
+            .map(|offset| (offset + 1) * PROOF_NODE_LEN as u64)
+            .max()
+            .unwrap_or(0);
+        let mut outboard = PreOrderOutboard {
+            root: blake3::Hash::from_bytes(root.0),
+            tree,
+            data: DataFile(self.open_sparse_outboard(root, reach)?),
+        };
+        for (node, pair) in &proof.nodes {
+            let left = blake3::Hash::from_bytes(pair[..32].try_into().expect("32 of 64"));
+            let right = blake3::Hash::from_bytes(pair[32..].try_into().expect("32 of 64"));
+            outboard.save(*node, &(left, right))?;
+        }
+        outboard.sync()?;
+        Ok((true, proof.proven))
     }
 
     /// The chaining values this object's tree holds at the given spans.
@@ -925,176 +842,102 @@ impl Store {
     ///
     /// Returns the groups newly committed.
     pub fn promote(&self, donor: &Donor, proven: &Proven, now: i64) -> Result<ChunkRanges> {
-        // The object and its length come off the proof itself.
-        //
-        // Passing them alongside it and checking for agreement is not the
-        // security property it looks like: `write_proof` builds `Proven` from
-        // its own arguments and `Proven::none` from the caller's locals, so no
-        // peer-supplied value reaches `proven.root` or `proven.size`
-        // independently of what the caller already had. Such a check could
-        // only catch a caller mixing up two objects — which taking the values
-        // from one place makes unrepresentable instead.
-        //
-        // The real protection is elsewhere: `walk_proof` recomputes every
-        // chaining value to the root, so a proof of another object cannot
-        // verify in the first place.
-        let root = &proven.root;
-        let size = proven.size;
-        // Promotion copies donor bytes into this object's payload and its tree
-        // into the outboard, both with no lock held, and commits after — the same
-        // shape as `write_slice`, and the same reason for a lease
-        // ([`Store::lease_write`]).
-        let _lease = self.lease_write(root);
-        let groups = group_count(size);
-        // Inline blobs never delta (§4): one group is smaller than the round
-        // trip that would discover it could be reused.
-        if size <= INLINE_BLOB_MAX || proven.is_empty() {
-            return Ok(ChunkRanges::empty());
-        }
-        // The cheap refusal; `commit_groups` decides again inside the
-        // transaction that records the result.
-        self.admit_size(root, size)?;
-        let existing = self.blob(root)?;
-        let mut held = ChunkRanges::empty();
-        if let Some(row) = &existing {
-            held = row.verified_groups();
-            if row.complete {
-                return Ok(ChunkRanges::empty());
-            }
-        }
-        let Some(donor) = self.open_donor(donor)? else {
-            return Ok(ChunkRanges::empty());
-        };
+        crate::lean_receive::promote(self, donor, proven, now)
+    }
 
+    /// The promotion half of the Bao service: copy the donor's run of
+    /// `groups` groups from `start`, with the interior nodes beneath it, into
+    /// the object's sparse payload and outboard, if and only if the donor's
+    /// own tree holds `cv` at that position. The donor and the object's files
+    /// are opened on the first run that is asked about and kept for the rest
+    /// of the operation; `flush_promotion` closes them.
+    ///
+    /// Everything that decides *whether* to write happens before a byte of the
+    /// run lands in the payload: judging after writing would mean a run that
+    /// turns out not to match has already overwritten whatever was at those
+    /// offsets. A donor whose tree cannot speak to the position, or whose
+    /// files cannot be read, answers false rather than failing: nothing in the
+    /// descent may fail a fetch.
+    #[allow(clippy::too_many_arguments)]
+    pub(crate) fn promote_run(
+        &self,
+        promotion: &mut Promotion,
+        donor_root: &Hash,
+        root: &Hash,
+        size: u64,
+        start: u64,
+        groups: u64,
+        cv: &Cv,
+    ) -> Result<bool> {
+        if promotion.donor.is_none() {
+            promotion.donor = Some(self.open_donor(&Donor(*donor_root))?);
+        }
+        let Some(Some(donor)) = promotion.donor.as_ref() else {
+            return Ok(false);
+        };
         let tree = Self::tree(size);
-        // The payload and the outboard are opened on the first run that matches,
-        // and not before. A donor with nothing to give is the common case — the
-        // descent offers every version of the path in turn and most of them
-        // agree about nothing — and opening up front left each of them a
-        // full-size sparse payload behind: no data, but an inode and a length,
-        // for an object this node may never fetch a byte of.
-        let mut sink: Option<Sink> = None;
-
-        let mut promoted = ChunkRanges::empty();
-        for subtree in &proven.subtrees {
-            let Some(node) = Subtree::locate(&tree, groups, subtree.start, subtree.groups) else {
-                // Not a subtree of this object: a caller mixing up two objects'
-                // proofs, which is a bug rather than an attack, but either way
-                // there is nothing here to promote into.
-                continue;
-            };
-            // A subtree that overlaps groups this node has already verified is
-            // left alone entirely. Copying donor bytes over a verified group
-            // would risk the one thing the bitmap promises, and the groups
-            // around it come back around at the leaf level anyway.
-            if held.overlaps(subtree.start, subtree.end()) {
-                continue;
-            }
-            if node.groups > 1 && !node.is_whole(size) {
-                continue;
-            }
-            let (start_byte, end_byte) = node.byte_range(size);
-            if end_byte > donor.size || !donor.held.covers(subtree.start, subtree.end()) {
-                continue;
-            }
-            // The extent a chaining value attests has to be the extent that is
-            // copied. `size` is the caller's claim, and a claim a few bytes
-            // short of the object leaves the final group's run shorter here than
-            // in the donor while both sides' chaining values still cover the
-            // whole of it — so the run would be copied truncated and the row
-            // committed complete at a length no byte on the disk supports.
-            // Requiring the two extents to agree costs nothing honest: a whole
-            // subtree ends at `node.end() * CHUNK_GROUP_SIZE` in both objects,
-            // an honest short tail is the same length in both, and a donor that
-            // runs further at the final group fails the comparison below anyway.
-            let donor_end = node.end().saturating_mul(CHUNK_GROUP_SIZE).min(donor.size);
-            if end_byte != donor_end {
-                continue;
-            }
-            // The donor's own word for this run, out of the tree it was given
-            // when its bytes were verified into the CAS. `None` means it cannot
-            // speak to the position at all — its tree is shaped differently
-            // there, or the run is the whole of it and so has no chaining value
-            // (§2); a value that differs means the bytes differ.
-            let donor_cv = match cv_at(
-                &donor.root,
-                &donor.outboard,
-                donor.groups,
-                node.start,
-                node.span,
-            ) {
-                Ok(Some(cv)) => cv,
-                Ok(None) => continue,
-                // A donor whose tree cannot be read where it said it could is
-                // not an error in the fetch, just a donor with nothing to give.
-                Err(e) => {
-                    tracing::debug!(donor = %donor.root, error = %e, "donor tree unreadable");
-                    continue;
-                }
-            };
-            if donor_cv != subtree.cv {
-                continue;
-            }
-
-            // Everything from here on writes, and everything that decides
-            // *whether* to write is above: the comparison happens strictly
-            // before a byte of this run lands in the payload. Judging after
-            // writing would mean a run that turns out not to match has already
-            // overwritten whatever was at those offsets, and a group another
-            // writer had just verified into the bitmap becomes a bit that lies
-            // (§6.2).
-
-            // The nodes *under* the run come across as well, or the groups this
-            // pass gains could be held and not served (§3.4, §6.3).
-            let mut nodes = Vec::new();
-            if let Err(e) = copy_subtree_nodes(&donor, node, &mut nodes) {
-                tracing::debug!(donor = %donor.root, error = %e, "donor tree not copied");
-                continue;
-            }
-            let sink = match &mut sink {
-                Some(sink) => sink,
-                slot => slot.insert(self.open_sink(root, tree)?),
-            };
-            // Grown to the end of the run about to land in it, exactly as
-            // `write_slice` grows to the end of the window it is about to
-            // verify — never to the claimed size, which no proof has
-            // established.
-            crate::cas::grow_to(&sink.payload.0, end_byte)?;
-            if let Err(e) = copy_run(&donor.payload, &mut sink.payload, start_byte, end_byte) {
-                tracing::debug!(donor = %donor.root, error = %e, "donor payload not copied");
-                continue;
-            }
-            for (node, pair) in nodes {
-                let left = blake3::Hash::from_bytes(pair[..32].try_into().expect("32 of 64"));
-                let right = blake3::Hash::from_bytes(pair[32..].try_into().expect("32 of 64"));
-                sink.outboard.save(node, &(left, right))?;
-            }
-            promoted = promoted.union(&ChunkRanges::from_ranges([subtree.range()]));
-        }
-
-        let Some(mut sink) = sink.filter(|_| !promoted.is_empty()) else {
-            return Ok(ChunkRanges::empty());
+        let Some(node) = Subtree::locate(&tree, group_count(size), start, groups) else {
+            // Not a subtree of this object: nothing here to promote into.
+            return Ok(false);
         };
-        // Bytes and tree to stable storage first, the claim that they are there
-        // second: a crash between the two costs a re-promotion, the other order
-        // would cost an index that lies (§6.2).
-        sink.payload.flush()?;
-        sink.outboard.sync()?;
-        fsync_file(&sink.payload.0)?;
-        fsync_file(&sink.outboard.data.0)?;
-        // The directory entries too. `open_sink` creates both files with
-        // `create(true)`, so a promotion into a root this node held nothing of
-        // is what puts their names in the shard directory, and `fsync` promises
-        // the bytes rather than the name. `write_slice` states the reason it
-        // does the same: unlike an orphaned file, a lost *name* under an
-        // advanced bitmap never self-heals — the row goes on claiming groups
-        // whose bytes are unreachable.
-        crate::cas::fsync_parent(&self.blob_path(root));
-        crate::cas::fsync_parent(&self.outboard_path(root));
-        let commit = self.commit_groups(root, size, &promoted, None, now)?;
-        drop(sink);
-        self.trim_to_size(root, commit);
-        Ok(promoted)
+        let (start_byte, end_byte) = node.byte_range(size);
+        // The donor's own word for this run, out of the tree it was given
+        // when its bytes were verified into the CAS. `None` means it cannot
+        // speak to the position at all; a value that differs means the bytes
+        // differ.
+        let donor_cv = match cv_at(
+            &donor.root,
+            &donor.outboard,
+            donor.groups,
+            node.start,
+            node.span,
+        ) {
+            Ok(Some(cv)) => cv,
+            Ok(None) => return Ok(false),
+            Err(e) => {
+                tracing::debug!(donor = %donor.root, error = %e, "donor tree unreadable");
+                return Ok(false);
+            }
+        };
+        if donor_cv != *cv {
+            return Ok(false);
+        }
+        // The nodes *under* the run come across as well, or the groups this
+        // pass gains could be held and not served (§3.4, §6.3).
+        let mut nodes = Vec::new();
+        if let Err(e) = copy_subtree_nodes(donor, node, &mut nodes) {
+            tracing::debug!(donor = %donor.root, error = %e, "donor tree not copied");
+            return Ok(false);
+        }
+        let sink = match &mut promotion.sink {
+            Some(sink) => sink,
+            slot => slot.insert(self.open_sink(root, tree)?),
+        };
+        // Grown to the end of the run about to land in it, never to the
+        // claimed size, which no proof has established.
+        crate::cas::grow_to(&sink.payload.0, end_byte)?;
+        if let Err(e) = copy_run(&donor.payload, &mut sink.payload, start_byte, end_byte) {
+            tracing::debug!(donor = %donor.root, error = %e, "donor payload not copied");
+            return Ok(false);
+        }
+        for (node, pair) in nodes {
+            let left = blake3::Hash::from_bytes(pair[..32].try_into().expect("32 of 64"));
+            let right = blake3::Hash::from_bytes(pair[32..].try_into().expect("32 of 64"));
+            sink.outboard.save(node, &(left, right))?;
+        }
+        Ok(true)
+    }
+
+    /// Flush the files a promotion wrote into and close them. Bytes and tree
+    /// reach stable storage before the claim that they are there is recorded.
+    pub(crate) fn flush_promotion(&self, promotion: &mut Promotion) -> Result<()> {
+        if let Some(mut sink) = promotion.sink.take() {
+            sink.payload.flush()?;
+            sink.outboard.sync()?;
+            fsync_file(&sink.payload.0)?;
+            fsync_file(&sink.outboard.data.0)?;
+        }
+        Ok(())
     }
 
     /// Opens a donor for reading, or reports that it has nothing to offer.
@@ -1109,11 +952,10 @@ impl Store {
         let Some(row) = self.blob(&root)? else {
             return Ok(None);
         };
-        let held = row.verified_groups();
+        // Whether the donor has anything to give (verified groups, out of
+        // line, more than one group) is the program's decision; here only the
+        // tree's shape is read off the row.
         let groups = group_count(row.size);
-        if held.is_empty() || row.inline.is_some() || groups <= 1 {
-            return Ok(None);
-        }
         let (payload, outboard) = match (
             File::open(self.blob_path(&root)),
             File::open(self.outboard_path(&root)),
@@ -1131,8 +973,6 @@ impl Store {
                 tree: Self::tree(row.size),
                 data: DataFile(outboard),
             },
-            held,
-            size: row.size,
             groups,
         }))
     }
@@ -1204,6 +1044,15 @@ impl Store {
         crate::cas::grow_to(&outboard, reach)?;
         Ok(outboard)
     }
+}
+
+/// What one promotion keeps between the runs it is asked about: the donor,
+/// opened on the first question (`Some(None)` for a donor with nothing to
+/// give), and the object's files, opened on the first run that matched.
+#[derive(Default)]
+pub(crate) struct Promotion {
+    donor: Option<Option<OpenDonor>>,
+    sink: Option<Sink>,
 }
 
 /// The files a promotion writes into: the object's sparse payload and its

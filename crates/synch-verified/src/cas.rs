@@ -5,13 +5,15 @@
 //! starts it, and hands its terminal back as a typed result.
 
 pub use crate::generated::{
-    CellType, Committed, IngestDomainError, IngestInput, Ingested, LifecycleDomainError, Outcome,
-    PinHolder, ReadDomainError,
+    CellType, CollectDomainError, Committed, DurableDomainError, Evicted, IngestDomainError,
+    IngestInput, Ingested, LifecycleDomainError, Outcome, PinHolder, ProjectDomainError,
+    ProjectedBlob, ProjectedPin, ProjectedSummary, ProvenSubtree, ReadDomainError,
+    ReceiveDomainError, ServeDomainError, Served,
 };
 pub use crate::host::IngestResources;
 pub use crate::operation::OperationError;
 use crate::{
-    host::{Clock, FileIO, Resources, Storage},
+    host::{Bao, Clock, FileIO, Lease, Resources, Storage, Sweep},
     operation::{run, terminal, Capabilities, Command, Decode},
 };
 
@@ -45,6 +47,317 @@ pub enum ReadError<E> {
 pub enum LifecycleError<E> {
     Operation(OperationError<E>),
     Domain(LifecycleDomainError),
+}
+
+/// Completed durability-transition failure, preserving original host errors.
+#[derive(Debug)]
+pub enum DurableError<E> {
+    Operation(OperationError<E>),
+    Domain(DurableDomainError),
+}
+
+/// Completed serving failure, preserving original host errors.
+#[derive(Debug)]
+pub enum ServeError<E> {
+    Operation(OperationError<E>),
+    Domain(ServeDomainError),
+}
+
+/// Completed projection failure, preserving original host errors.
+#[derive(Debug)]
+pub enum ProjectError<E> {
+    Operation(OperationError<E>),
+    Domain(ProjectDomainError),
+}
+
+macro_rules! decode_list {
+    ($($item:ty),+ $(,)?) => {
+        $(impl Decode for Vec<$item> {
+            fn decode(r: &mut crate::operation::Reader<'_>) -> Result<Self, ()> {
+                r.list(Decode::decode)
+            }
+        })+
+    };
+}
+decode_list!(
+    ProjectedBlob,
+    ProjectedSummary,
+    ProjectedPin,
+    Vec<u8>,
+    (Vec<u8>, Vec<u8>),
+    Option<Vec<u8>>,
+    String,
+    crate::generated::TrieChange
+);
+
+fn project<T: Decode, S: Storage>(
+    storage: &mut S,
+    command: &Command,
+) -> Result<T, ProjectError<S::Error>> {
+    let outcome: Result<T, ProjectDomainError> =
+        finish(run(storage, Capabilities::default(), &[], command))
+            .map_err(ProjectError::Operation)?;
+    outcome.map_err(ProjectError::Domain)
+}
+
+/// One object's index row, with whether any claim stands on it; the row is
+/// validated as the read path validates it.
+pub fn blob<S: Storage>(
+    storage: &mut S,
+    root: &[u8; 32],
+) -> Result<Option<ProjectedBlob>, ProjectError<S::Error>> {
+    project(storage, &Command::CasBlob(root.to_vec()))
+}
+
+/// A complete object projection using an existing transaction. The command
+/// neither commits nor aborts the caller's transaction.
+pub fn blob_in<S: Storage>(
+    storage: &mut S,
+    transaction: u64,
+    root: &[u8; 32],
+) -> Result<Option<ProjectedBlob>, ProjectError<S::Error>> {
+    project(
+        storage,
+        &Command::CasBlobIn {
+            tx: transaction,
+            root: root.to_vec(),
+        },
+    )
+}
+
+/// Every index row, most recently accessed first, each with its pin state
+/// read as one join and merged in one pass.
+pub fn blobs<S: Storage>(storage: &mut S) -> Result<Vec<ProjectedBlob>, ProjectError<S::Error>> {
+    project(storage, &Command::CasBlobs)
+}
+
+/// Every row's summary without its payload, most recently accessed first.
+pub fn blob_candidates<S: Storage>(
+    storage: &mut S,
+) -> Result<Vec<ProjectedSummary>, ProjectError<S::Error>> {
+    project(storage, &Command::CasBlobCandidates)
+}
+
+/// Every claim on one object, or on all, by object and then by holder; a
+/// spelling this build does not know is kept as a holder.
+pub fn pins<S: Storage>(
+    storage: &mut S,
+    root: Option<&[u8; 32]>,
+) -> Result<Vec<ProjectedPin>, ProjectError<S::Error>> {
+    project(storage, &Command::CasPins(root.map(|root| root.to_vec())))
+}
+
+/// Every pinned object, in root order.
+pub fn pinned_blobs<S: Storage>(storage: &mut S) -> Result<Vec<Vec<u8>>, ProjectError<S::Error>> {
+    project(storage, &Command::CasPinnedBlobs)
+}
+
+/// Completed sweep failure, preserving original host errors.
+#[derive(Debug)]
+pub enum CollectError<E> {
+    Operation(OperationError<E>),
+    Domain(CollectDomainError),
+}
+
+/// The services a sweep directs besides its relational storage: the writer
+/// counters and unlinks, the clock, the remover's critical section, and the
+/// object store as a directory.
+pub struct CollectResources<'a, E> {
+    pub resources: &'a mut dyn Resources<Error = E>,
+    pub clock: &'a mut dyn Clock<Error = E>,
+    pub leases: &'a mut dyn Lease<Error = E>,
+    pub sweep: &'a mut dyn Sweep<Error = E>,
+}
+impl<E> std::fmt::Debug for CollectResources<'_, E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("CollectResources").finish_non_exhaustive()
+    }
+}
+
+fn collect<T: Decode, S: Storage>(
+    storage: &mut S,
+    resources: CollectResources<'_, S::Error>,
+    command: &Command,
+) -> Result<T, CollectError<S::Error>> {
+    let capabilities = Capabilities {
+        resources: Some(resources.resources),
+        clock: Some(resources.clock),
+        leases: Some(resources.leases),
+        sweep: Some(resources.sweep),
+        ..Capabilities::default()
+    };
+    let outcome: Result<T, CollectDomainError> =
+        finish(run(storage, capabilities, &[], command)).map_err(CollectError::Operation)?;
+    outcome.map_err(CollectError::Domain)
+}
+
+/// Advance an object's access clock to now, coalesced to once a minute;
+/// answers whether it moved.
+pub fn touch<S: Storage>(
+    storage: &mut S,
+    resources: CollectResources<'_, S::Error>,
+    root: &[u8; 32],
+) -> Result<bool, CollectError<S::Error>> {
+    collect(storage, resources, &Command::CasTouch(root.to_vec()))
+}
+
+/// Evict cached durable objects by least recent use until the cache is
+/// within `limit` bytes and `shortfall` bytes more are free. Lean reads the
+/// rows, measures their files, orders them and clears each inside the
+/// remover's section; answers what went.
+pub fn evict<S: Storage>(
+    storage: &mut S,
+    resources: CollectResources<'_, S::Error>,
+    limit: Option<u64>,
+    shortfall: u64,
+) -> Result<Evicted, CollectError<S::Error>> {
+    collect(storage, resources, &Command::CasEvict { limit, shortfall })
+}
+
+/// Collect every unreferenced, unpinned object untouched since `before`,
+/// each decided again in its own transaction; answers how many went.
+pub fn gc_content<S: Storage>(
+    storage: &mut S,
+    resources: CollectResources<'_, S::Error>,
+    before: i64,
+) -> Result<u64, CollectError<S::Error>> {
+    collect(storage, resources, &Command::CasGcContent(before))
+}
+
+/// Remove every object file no row accounts for, once older than `before`
+/// and held by no writer; answers how many went.
+pub fn gc_orphans<S: Storage>(
+    storage: &mut S,
+    resources: CollectResources<'_, S::Error>,
+    before: i64,
+) -> Result<u64, CollectError<S::Error>> {
+    collect(storage, resources, &Command::CasGcOrphans(before))
+}
+
+/// What one exchange served: the encoded bytes and the group spans they cover.
+pub type ServedBytes = (Vec<u8>, Vec<(u64, u64)>);
+
+impl crate::operation::Encode for Vec<ProvenSubtree> {
+    fn encode(&self, out: &mut Vec<u8>) {
+        (self.len() as u64).encode(out);
+        for subtree in self {
+            subtree.encode(out);
+        }
+    }
+}
+impl Decode for Vec<ProvenSubtree> {
+    fn decode(r: &mut crate::operation::Reader<'_>) -> Result<Self, ()> {
+        r.list(Decode::decode)
+    }
+}
+
+/// Completed receive failure, preserving original host errors.
+#[derive(Debug)]
+pub enum ReceiveError<E> {
+    Operation(OperationError<E>),
+    Domain(ReceiveDomainError),
+}
+
+/// The services a receive directs besides its relational storage: the Bao
+/// tree and the object's write lease.
+pub struct ReceiveResources<'a, E> {
+    pub bao: &'a mut dyn Bao<Error = E>,
+    pub leases: &'a mut dyn Lease<Error = E>,
+}
+impl<E> std::fmt::Debug for ReceiveResources<'_, E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("ReceiveResources").finish_non_exhaustive()
+    }
+}
+
+fn receive<T: Decode, S: Storage>(
+    storage: &mut S,
+    resources: ReceiveResources<'_, S::Error>,
+    encoded: &[u8],
+    command: &Command,
+) -> Result<T, ReceiveError<S::Error>> {
+    let capabilities = Capabilities {
+        bao: Some(resources.bao),
+        leases: Some(resources.leases),
+        ..Capabilities::default()
+    };
+    let outcome: Result<T, ReceiveDomainError> =
+        finish(run(storage, capabilities, &[encoded], command)).map_err(ReceiveError::Operation)?;
+    outcome.map_err(ReceiveError::Domain)
+}
+
+/// Decode a received slice of the served groups and commit exactly the
+/// groups it verified. Lean owns the lease, the size refusal, the row read,
+/// the inline-versus-file policy, the flush before the commit and the trim
+/// of a completed object; the Bao service decodes what Lean names.
+#[allow(clippy::too_many_arguments)]
+pub fn write_slice<S: Storage>(
+    storage: &mut S,
+    resources: ReceiveResources<'_, S::Error>,
+    root: &[u8; 32],
+    size: u64,
+    served: &[(u64, u64)],
+    encoded: &[u8],
+    now: i64,
+    tier: IngestTier,
+) -> Result<Vec<(u64, u64)>, ReceiveError<S::Error>> {
+    let command = Command::CasWriteSlice {
+        root: root.to_vec(),
+        size,
+        served: served.to_vec(),
+        now,
+        cache: tier == IngestTier::Cache,
+    };
+    receive(storage, resources, encoded, &command)
+}
+
+/// Verify a received proof over the served groups and record its tree,
+/// answering the subtrees it established.
+#[allow(clippy::too_many_arguments)]
+pub fn write_proof<S: Storage>(
+    storage: &mut S,
+    resources: ReceiveResources<'_, S::Error>,
+    root: &[u8; 32],
+    size: u64,
+    served: &[(u64, u64)],
+    level: u8,
+    encoded: &[u8],
+    now: i64,
+    tier: IngestTier,
+) -> Result<Vec<ProvenSubtree>, ReceiveError<S::Error>> {
+    let command = Command::CasWriteProof {
+        root: root.to_vec(),
+        size,
+        served: served.to_vec(),
+        level: u64::from(level),
+        now,
+        cache: tier == IngestTier::Cache,
+    };
+    receive(storage, resources, encoded, &command)
+}
+
+/// Promote the donor's bytes for every proven subtree its tree agrees with,
+/// answering the groups newly committed.
+#[allow(clippy::too_many_arguments)]
+pub fn promote<S: Storage>(
+    storage: &mut S,
+    resources: ReceiveResources<'_, S::Error>,
+    donor: &[u8; 32],
+    root: &[u8; 32],
+    size: u64,
+    proven: &[ProvenSubtree],
+    now: i64,
+    tier: IngestTier,
+) -> Result<Vec<(u64, u64)>, ReceiveError<S::Error>> {
+    let command = Command::CasPromote {
+        donor: donor.to_vec(),
+        root: root.to_vec(),
+        size,
+        proven: proven.to_vec(),
+        now,
+        cache: tier == IngestTier::Cache,
+    };
+    receive(storage, resources, &[], &command)
 }
 
 /// Decode a run's terminal, or carry its host or protocol failure through.
@@ -209,6 +522,74 @@ pub fn read<S: Storage>(
     finish_read(result, output)
 }
 
+/// The served bytes are released only on a successful terminal whose count is
+/// exactly what the sink holds, with the group spans they cover.
+fn finish_served<E>(
+    result: Result<Vec<u8>, OperationError<E>>,
+    output: ReadOutput<E>,
+) -> Result<ServedBytes, ServeError<E>> {
+    let outcome: Result<Served, ServeDomainError> =
+        finish(result).map_err(ServeError::Operation)?;
+    let served = outcome.map_err(ServeError::Domain)?;
+    if usize::try_from(served.count).ok() != Some(output.bytes.len()) {
+        return Err(ServeError::Operation(OperationError::Protocol));
+    }
+    Ok((output.bytes, served.spans))
+}
+
+fn serve<S: Storage>(
+    storage: &mut S,
+    bao: &mut dyn Bao<Error = S::Error>,
+    command: &Command,
+) -> Result<ServedBytes, ServeError<S::Error>> {
+    let mut output = ReadOutput {
+        bytes: Vec::new(),
+        error: std::marker::PhantomData,
+    };
+    let capabilities = Capabilities {
+        bao: Some(bao),
+        output: Some(&mut output),
+        ..Capabilities::default()
+    };
+    let result = run(storage, capabilities, &[], command);
+    finish_served(result, output)
+}
+
+/// Serve a Bao slice: the requested group spans the row holds, within the
+/// object, clamped to one exchange's window. Lean names the groups; the Bao
+/// service encodes exactly those into the private sink.
+pub fn encode_slice<S: Storage>(
+    storage: &mut S,
+    bao: &mut dyn Bao<Error = S::Error>,
+    root: &[u8; 32],
+    requested: &[(u64, u64)],
+) -> Result<ServedBytes, ServeError<S::Error>> {
+    let command = Command::CasEncodeSlice {
+        root: root.to_vec(),
+        requested: requested.to_vec(),
+    };
+    serve(storage, bao, &command)
+}
+
+/// Serve the interior tree over the requested group spans the row holds, no
+/// deeper than `level`; a proof past `budget` nodes is refused whole.
+pub fn encode_proof<S: Storage>(
+    storage: &mut S,
+    bao: &mut dyn Bao<Error = S::Error>,
+    root: &[u8; 32],
+    requested: &[(u64, u64)],
+    level: u8,
+    budget: u64,
+) -> Result<ServedBytes, ServeError<S::Error>> {
+    let command = Command::CasEncodeProof {
+        root: root.to_vec(),
+        requested: requested.to_vec(),
+        level: u64::from(level),
+        budget,
+    };
+    serve(storage, bao, &command)
+}
+
 /// Expire due claims, optionally for one holder, through Lean's complete
 /// transaction. Storage performs only the requested atomic mutation.
 pub fn expire<S: Storage>(
@@ -272,6 +653,82 @@ pub fn acquire<S: Storage>(
         finish(run(storage, Capabilities::default(), &[], &command))
             .map_err(LifecycleError::Operation)?;
     outcome.map_err(LifecycleError::Domain)
+}
+
+/// Decode a durability transition's terminal into its typed outcome.
+fn finish_durable<T: Decode, E>(
+    result: Result<Vec<u8>, OperationError<E>>,
+) -> Result<T, DurableError<E>> {
+    let outcome: Result<T, DurableDomainError> = finish(result).map_err(DurableError::Operation)?;
+    outcome.map_err(DurableError::Domain)
+}
+
+/// Record that the backend holds the complete object, after its own
+/// acknowledgement. Never creates a row; answers whether one was marked.
+pub fn mark_durable<S: Storage>(
+    storage: &mut S,
+    root: &[u8; 32],
+) -> Result<bool, DurableError<S::Error>> {
+    let command = Command::CasMarkDurable(root.to_vec());
+    finish_durable(run(storage, Capabilities::default(), &[], &command))
+}
+
+/// Reconstruct a cold durable row once the backend confirmed the final pair:
+/// a row agreeing on size is marked, a missing row is created without local
+/// bytes, and a row disagreeing on size is refused untouched.
+pub fn adopt_durable<S: Storage>(
+    storage: &mut S,
+    root: &[u8; 32],
+    size: u64,
+    now: i64,
+) -> Result<(), DurableError<S::Error>> {
+    let command = Command::CasAdoptDurable {
+        root: root.to_vec(),
+        size,
+        now,
+    };
+    finish_durable(run(storage, Capabilities::default(), &[], &command))
+}
+
+/// The backend answered that the object is not there: withdraw the durable
+/// claim, drop a row without local bytes, and turn every machine role's pin
+/// into a repair intent. Answers whether a claim was withdrawn.
+pub fn heal_missing<S: Storage>(
+    storage: &mut S,
+    clock: &mut dyn Clock<Error = S::Error>,
+    root: &[u8; 32],
+) -> Result<bool, DurableError<S::Error>> {
+    let command = Command::CasHealMissing(root.to_vec());
+    let capabilities = Capabilities {
+        clock: Some(clock),
+        ..Capabilities::default()
+    };
+    finish_durable(run(storage, capabilities, &[], &command))
+}
+
+/// Reconcile cache claims with an ephemeral scratch generation marker.
+/// Answers whether the marker changed and the cache rows were reset.
+pub fn reconcile_scratch<S: Storage>(
+    storage: &mut S,
+    marker: &str,
+) -> Result<bool, DurableError<S::Error>> {
+    let command = Command::CasReconcileScratch(marker.to_owned());
+    finish_durable(run(storage, Capabilities::default(), &[], &command))
+}
+
+/// Drop reconstructible local bytes while keeping a remote durable claim;
+/// refused while a writer holds the object. Answers whether it cleared.
+pub fn clear_cache<S: Storage>(
+    storage: &mut S,
+    resources: &mut dyn Resources<Error = S::Error>,
+    root: &[u8; 32],
+) -> Result<bool, DurableError<S::Error>> {
+    let command = Command::CasClearCache(root.to_vec());
+    let capabilities = Capabilities {
+        resources: Some(resources),
+        ..Capabilities::default()
+    };
+    finish_durable(run(storage, capabilities, &[], &command))
 }
 
 #[cfg(test)]

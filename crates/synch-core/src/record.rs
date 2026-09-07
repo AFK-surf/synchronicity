@@ -200,7 +200,7 @@ pub struct AdState {
 /// it — decodes the lot; §12's per-message cap cannot apply after the decode,
 /// which is after the allocation it is meant to bound. Generous next to
 /// anything honest: spans are 16 MiB-granular runs, a fetch walks windows in
-/// order, and `coalesce_spans` merges what touches, so a real partial holder
+/// order, and native advertisement construction merges what touches, so a real partial holder
 /// publishes a handful. What is over the cap is dropped rather than merged
 /// across gaps, because merging would claim bytes the holder does not have:
 /// over-reporting sends a fetcher to a provider that cannot serve it, while
@@ -298,17 +298,6 @@ impl BlobAd {
         }
     }
 
-    /// Builds a partial advertisement, coalescing spans to 16 MiB granularity.
-    pub fn partial(size: u64, spans: impl IntoIterator<Item = (u64, u64)>) -> Self {
-        BlobAd {
-            v: RECORD_VERSION,
-            size,
-            state: AdState {
-                spans: coalesce_spans(spans, size),
-            },
-        }
-    }
-
     /// True if the ad covers the whole object. Derived, not stored: one span
     /// reaching from nothing to the object's end.
     pub fn is_complete(&self) -> bool {
@@ -319,52 +308,6 @@ impl BlobAd {
     pub fn intersects(&self, start: u64, end: u64) -> bool {
         self.state.spans.iter().any(|&(s, e)| s < end && start < e)
     }
-}
-
-/// Rounds spans *inward* to [`AD_SPAN_GRANULARITY`] boundaries and merges what
-/// touches.
-///
-/// Ads are hints, not promises (§6.3) — the fetcher learns exact availability
-/// from `SliceEnd` — but the direction of the error is not a free choice:
-/// over-reporting sends a fetcher to a provider that cannot serve it, while
-/// under-reporting costs at most a re-fetch.
-///
-/// Each run contributes the largest granule-aligned span inside it. The object's
-/// boundaries stay exact (0 is a granule boundary anyway, and the final partial
-/// granule is real bytes), so a whole-object holder still advertises the whole
-/// object.
-pub fn coalesce_spans(spans: impl IntoIterator<Item = (u64, u64)>, size: u64) -> Vec<(u64, u64)> {
-    let mut v: Vec<(u64, u64)> = spans
-        .into_iter()
-        .filter(|(s, e)| s < e)
-        .map(|(s, e)| {
-            // Clamped to the object first, so nothing downstream has to reason
-            // about a span past the end — and the tail granule at the object's
-            // end survives as real bytes, not a rounding artifact.
-            let (s, e) = (s.min(size), e.min(size));
-            let start = s
-                .div_ceil(AD_SPAN_GRANULARITY)
-                .saturating_mul(AD_SPAN_GRANULARITY);
-            let end = match e == size {
-                true => e,
-                false => (e / AD_SPAN_GRANULARITY) * AD_SPAN_GRANULARITY,
-            };
-            (start.min(size), end.min(size))
-        })
-        .filter(|(s, e)| s < e)
-        .collect();
-    v.sort_unstable();
-    let mut out: Vec<(u64, u64)> = Vec::with_capacity(v.len());
-    for (s, e) in v {
-        match out.last_mut() {
-            Some(last) if s <= last.1 => last.1 = last.1.max(e),
-            _ => out.push((s, e)),
-        }
-    }
-    // The same cap the decode applies, so what this node publishes is what a
-    // peer will keep of it; dropped from the tail, never merged across gaps.
-    out.truncate(MAX_AD_SPANS);
-    out
 }
 
 /// What an origin advertises about one space, published under
@@ -470,15 +413,6 @@ impl Delegation {
                 sorted.dedup();
                 sorted.len() == before
             }
-    }
-
-    /// True if this delegation is dated live at `now`.
-    ///
-    /// An instant no trust decision may be dated by ([`crate::clock_is_trusted`])
-    /// dates nothing: a node whose clock cannot place it reads as holding no
-    /// delegated trust rather than all of it, exactly as with DNS bindings.
-    pub fn is_live(&self, now: i64) -> bool {
-        crate::clock_is_trusted(now) && now < self.not_after
     }
 }
 
@@ -614,11 +548,6 @@ pub fn parse_blob_key(key: &[u8]) -> Result<Hash, KeyError> {
     Hash::from_slice(&key[2..]).map_err(|_| KeyError::Malformed)
 }
 
-/// The `b:` prefix used for range scans over all of an origin's ads.
-pub(crate) fn blob_prefix() -> Vec<u8> {
-    vec![PREFIX_BLOB, b':']
-}
-
 /// The trie key `m:self`.
 pub fn manifest_key() -> Vec<u8> {
     let mut key = vec![PREFIX_MANIFEST, b':'];
@@ -673,42 +602,6 @@ pub fn parse_delegation_key(key: &[u8]) -> Result<crate::NodeId, KeyError> {
     crate::NodeId::from_bytes(&bytes).map_err(|_| KeyError::Malformed)
 }
 
-/// The `d:` prefix used for range scans over an origin's delegations.
-pub(crate) fn delegation_prefix() -> Vec<u8> {
-    vec![PREFIX_DELEGATION, b':']
-}
-
-/// The trie key prefixes a peer delegated `spaces` may be *served* (§5.5).
-///
-/// Everything a delegate is entitled to see, expressed as key prefixes — the
-/// only shape the redaction boundary can take: authorization is about *where*
-/// a node sits, and the walk on both sides tests exactly this list.
-///
-/// `b:` is deliberately absent: a delegate learns object availability through
-/// `FindProviders` (§5.1), making the `b:` namespace invisible to it, down to
-/// how many objects an origin holds.
-pub fn scope_prefixes(spaces: &[String]) -> ScopeKeys {
-    let mut out = ScopeKeys {
-        prefixes: vec![delegation_prefix()],
-        exact: vec![manifest_key()],
-    };
-    for space in spaces {
-        if let Ok(prefix) = space_prefix(space) {
-            out.prefixes.push(prefix);
-        }
-        if let Ok(key) = space_info_key(space) {
-            out.exact.push(key);
-        }
-        // A delegate must be able to *read* the coverage claims on its granted
-        // spaces as well as publish its own, or it can say what it holds and
-        // never learn what anyone else does (`docs/REPLICATION.md` §4.1).
-        if let Ok(key) = replica_claim_key(space) {
-            out.exact.push(key);
-        }
-    }
-    out
-}
-
 /// What part of the keyspace a scope covers, as the two shapes it takes.
 ///
 /// The distinction is load-bearing. `f:<space>/` ends in a separator
@@ -726,36 +619,6 @@ pub struct ScopeKeys {
     pub exact: Vec<Vec<u8>>,
 }
 
-/// The trie key prefixes a delegated origin may *publish* under (§3.5).
-///
-/// Not the same set as what it may read. `b:` is here because a delegate that
-/// holds content must be able to advertise it, or the swarm loses a source for
-/// bytes the delegate legitimately has. `d:` is not, because a delegation is
-/// exactly what a delegate may not issue — R1 already means nobody would read
-/// one, and refusing the head keeps the rule visible where it is broken.
-pub fn publish_prefixes(spaces: &[String]) -> ScopeKeys {
-    let mut out = ScopeKeys {
-        prefixes: vec![blob_prefix()],
-        exact: vec![manifest_key()],
-    };
-    for space in spaces {
-        if let Ok(prefix) = space_prefix(space) {
-            out.prefixes.push(prefix);
-        }
-        if let Ok(key) = space_info_key(space) {
-            out.exact.push(key);
-        }
-        // A delegate that replicates a granted space must be able to say so,
-        // for the reason `b:` is in this list: a holder the swarm cannot see is
-        // a holder it loses. Exact rather than a prefix, since `r:photos` must
-        // not admit `r:photos-raw`.
-        if let Ok(key) = replica_claim_key(space) {
-            out.exact.push(key);
-        }
-    }
-    out
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -771,28 +634,7 @@ mod tests {
         assert_eq!(key.len(), 34);
         assert_eq!(parse_delegation_key(&key).unwrap(), subject);
         assert!(parse_delegation_key(b"d:short").is_err());
-        assert!(key.starts_with(&delegation_prefix()));
-    }
-
-    /// The two scopes differ, and each difference is load-bearing (§3.5).
-    #[test]
-    fn read_and_publish_scopes_differ_where_they_must() {
-        let spaces = vec!["photos".to_string()];
-        let read = scope_prefixes(&spaces);
-        let publish = publish_prefixes(&spaces);
-        // A delegate is never served `b:` — ads are keyed by content hash, so
-        // the shape of that subtree would leak an origin's object count.
-        assert!(!read.prefixes.contains(&blob_prefix()));
-        // But it must publish `b:`, or no member could fetch content from it.
-        assert!(publish.prefixes.contains(&blob_prefix()));
-        // It reads `d:`, which is public by design, and never publishes one —
-        // the one-level rule made visible where it is broken.
-        assert!(read.prefixes.contains(&delegation_prefix()));
-        assert!(!publish.prefixes.contains(&delegation_prefix()));
-        // A space's own record is an *exact* key in both, so one id being a
-        // prefix of another cannot carry it along.
-        assert!(read.exact.contains(&space_info_key("photos").unwrap()));
-        assert!(!read.prefixes.contains(&space_info_key("photos").unwrap()));
+        assert!(key.starts_with(b"d:"));
     }
 
     #[test]
@@ -841,7 +683,7 @@ mod tests {
         let key = blob_key(&h);
         assert_eq!(key.len(), 34);
         assert_eq!(parse_blob_key(&key).unwrap(), h);
-        assert!(key.starts_with(&blob_prefix()));
+        assert!(key.starts_with(b"b:"));
 
         assert!(file_key("has/slash", "a").is_err());
         assert!(file_key("", "a").is_err());
@@ -880,7 +722,13 @@ mod tests {
     #[test]
     fn record_round_trips_via_postcard() {
         round_trips(FileEntry::file(1234, 42, Hash::new(b"x"), 7));
-        round_trips(BlobAd::partial(100 * 1024 * 1024, [(0, 20 * 1024 * 1024)]));
+        round_trips(BlobAd {
+            v: RECORD_VERSION,
+            size: 100 * 1024 * 1024,
+            state: AdState {
+                spans: vec![(0, AD_SPAN_GRANULARITY)],
+            },
+        });
         round_trips(NodeManifest {
             v: RECORD_VERSION,
             name: "nas".into(),
@@ -930,63 +778,20 @@ mod tests {
         // than was published rather than more.
         assert_eq!(decoded.state.spans, spans[..MAX_AD_SPANS]);
         assert!(!decoded.is_complete());
-
-        // The same cap on the way out, so what this node publishes survives a
-        // peer's decode unchanged.
-        let ours = BlobAd::partial(u64::MAX, spans);
-        assert_eq!(ours.state.spans.len(), MAX_AD_SPANS);
     }
 
-    /// Coalescing under-reports rather than over-reports: rounding a run out to
-    /// granule boundaries claims up to 16 MiB of unheld bytes at each end.
     #[test]
-    fn spans_coalesce_at_16mib() {
+    fn advertisements_intersect_only_their_stated_ranges() {
         let g = AD_SPAN_GRANULARITY;
-        let size = 10 * g;
-
-        // Byte-sized runs round to nothing; a run covering whole granules
-        // keeps only them, losing the partial granule at each end; runs that
-        // meet at a boundary merge.
-        assert_eq!(coalesce_spans([(1, 2), (g + 5, g + 6)], size), vec![]);
-        assert_eq!(coalesce_spans([(0, 1), (5 * g, 5 * g + 1)], size), vec![]);
-        assert_eq!(coalesce_spans([(g - 1, 3 * g + 1)], size), vec![(g, 3 * g)]);
-        assert_eq!(
-            coalesce_spans([(0, 2 * g), (2 * g, 4 * g)], size),
-            vec![(0, 4 * g)]
-        );
-
-        // The object's own end is exact: a claim past it clamps, and a run
-        // inside the last partial granule rounds away entirely.
-        let size = g / 2;
-        assert_eq!(coalesce_spans([(0, size)], size), vec![(0, size)]);
-        assert_eq!(coalesce_spans([(0, size * 4)], size), vec![(0, size)]);
-        assert_eq!(coalesce_spans([(0, 10)], size), vec![]);
-
-        // Intersection answers against the same span shape.
-        let ad = BlobAd::partial(10 * g, [(0, g)]);
+        let ad = BlobAd {
+            v: RECORD_VERSION,
+            size: 10 * g,
+            state: AdState {
+                spans: vec![(0, g)],
+            },
+        };
         assert!(ad.intersects(0, 10));
         assert!(!ad.intersects(2 * g, 3 * g));
         assert!(BlobAd::complete(10).intersects(0, 10));
-    }
-
-    /// A holder of part of an object never advertises the whole of it.
-    #[test]
-    fn a_partial_holder_never_reports_complete() {
-        let g = AD_SPAN_GRANULARITY;
-        // The first slice window of a 10 MiB object — under one granule, so the
-        // node advertises nothing rather than everything.
-        let small = 10 * 1024 * 1024;
-        let ad = BlobAd::partial(small, [(0, 8 * 1024 * 1024)]);
-        assert!(!ad.is_complete(), "{:?}", ad.state.spans);
-
-        // And the first two granules of a larger one is two granules, not all.
-        let ad = BlobAd::partial(10 * g, [(0, 2 * g + 7)]);
-        assert_eq!(ad.state.spans, vec![(0, 2 * g)]);
-        assert!(!ad.is_complete());
-
-        // A holder of the whole object still says so, tail granule included.
-        let ad = BlobAd::partial(small, [(0, small)]);
-        assert_eq!(ad.state.spans, vec![(0, small)]);
-        assert!(ad.is_complete());
     }
 }

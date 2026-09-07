@@ -17,7 +17,7 @@ def requestOutput (bytes : ByteArray) : Action Unit := raise Error.host (Output.
 /-- The database's existing LIKE semantics deliberately apply to raw holder
 text. Repair does not parse or normalize holders, nor touch operator pins. -/
 def repairPins (root : ByteArray) : Selection :=
-  ⟨"pins", [("root", .blob root)], [("holder", "source:%"), ("holder", "replica:%")]⟩
+  ⟨"pins", [("root", .blob root)], [("holder", "source:%"), ("holder", "replica:%")], []⟩
 
 /-- Clear a stale local-byte claim and transfer standing machine roles to
 repair intents. Existing intents retain their size, predecessor and timestamp:
@@ -29,7 +29,7 @@ def healIn (tx : Transaction) (root : ByteArray) : Action Unit := do
   match size with
   | none => pure ()
   | some size =>
-    let _ ← requestAccess (.update tx ⟨"blobs", [("root", .blob root)], []⟩
+    let _ ← requestAccess (.update tx ⟨"blobs", [("root", .blob root)], [], []⟩
       [("complete", .integer 0), ("durable", .integer 0),
         ("bitmap", .null), ("inline", .null)])
     let now ← requestClock .nowNs
@@ -83,7 +83,7 @@ synthetic pinned EXISTS column is omitted: it cannot fail type conversion and
 does not affect reads. decodeRow retains the original indices for diagnostics.
 As with SQLite query_row, the first row wins over any later stepping failure. -/
 def metadata (root : ByteArray) : Action Metadata := do
-  let scan ← requestAccess (.snapshot ⟨"blobs", [("root", .blob root)], []⟩
+  let scan ← requestAccess (.snapshot ⟨"blobs", [("root", .blob root)], [], []⟩
     ["root", "size", "complete", "bitmap", "inline", "last_access", "durable"])
   match scan.rows with
   | row :: _ => ExceptT.mk (.pure (decodeRow row))

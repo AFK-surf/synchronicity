@@ -13,6 +13,7 @@ links = "synch_verified_lean"
 cc = "1.4.2"
 
 [dev-dependencies]
+blake3.workspace = true
 proptest.workspace = true
 
 [lints]

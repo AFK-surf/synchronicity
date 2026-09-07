@@ -6,6 +6,15 @@ import VerifiedCore.Host.Construct
 import VerifiedCore.Host.Upsert
 import VerifiedCore.Host.Resources
 import VerifiedCore.Host.Source
+import VerifiedCore.Host.Digest
+import VerifiedCore.Host.Bao
+import VerifiedCore.Host.Sweep
+import VerifiedCore.Host.Memo
+import VerifiedCore.Host.Walk
+import VerifiedCore.Host.Peer
+import VerifiedCore.Host.Provider
+import VerifiedCore.Host.CacheIO
+import VerifiedCore.Host.Writes
 import VerifiedCore.Commands
 
 /-! `hostgen` reads the executable core's effect algebras and command types
@@ -64,25 +73,68 @@ def algebras : List Name := [
   ``VerifiedCore.Host.Storage, ``VerifiedCore.Host.Crypto, ``VerifiedCore.Host.Access,
   ``VerifiedCore.Host.FileIO, ``VerifiedCore.Host.Clock, ``VerifiedCore.Host.Output,
   ``VerifiedCore.Host.Construct, ``VerifiedCore.Host.Upsert, ``VerifiedCore.Host.Resources,
-  ``VerifiedCore.Host.Lease, ``VerifiedCore.Host.SourceIO]
+  ``VerifiedCore.Host.Lease, ``VerifiedCore.Host.SourceIO, ``VerifiedCore.Host.Digest,
+  ``VerifiedCore.Host.ByteWrites, ``VerifiedCore.Host.Bao, ``VerifiedCore.Host.Sweep,
+  ``VerifiedCore.Host.Memo, ``VerifiedCore.Host.Redaction, ``VerifiedCore.Host.Apply,
+  ``VerifiedCore.Host.Peer, ``VerifiedCore.Host.Provider, ``VerifiedCore.Host.CacheIO]
 
 /-- The types that cross the command boundary: what a caller asks for and
 what a finished command reports. Each gets Lean `Encode`/`Decode` instances
 and a Rust mirror with the same codecs; order is by dependency. -/
 def messages : List Name := [
+  ``VerifiedCore.Host.Probed, ``VerifiedCore.Host.ProviderProbed,
+  ``VerifiedCore.Replication.Exchange.Advertised,
+  ``VerifiedCore.Replication.Exchange.ExchangePlan,
+  ``VerifiedCore.Replication.Contact.ContactPlan,
   ``VerifiedCore.Cas.Codec.CellType, ``VerifiedCore.Cas.PinHolder, ``VerifiedCore.Cas.Input.Kind,
-  ``VerifiedCore.Cas.Outcome, ``VerifiedCore.Origin.Error, ``VerifiedCore.Trie.LookupError,
+  ``VerifiedCore.Cas.Outcome, ``VerifiedCore.Origin.Error,
+  ``VerifiedCore.Origin.Named, ``VerifiedCore.Origin.Parsed, ``VerifiedCore.Trie.LookupError,
+  ``VerifiedCore.Trie.Value, ``VerifiedCore.Trie.Diff.Change, ``VerifiedCore.Trie.Proof.Proof,
+  ``VerifiedCore.Trie.Refusal, ``VerifiedCore.Trie.Verdict, ``VerifiedCore.Trie.MutationError,
+  ``VerifiedCore.Trie.Proof.VerifyError,
+  ``VerifiedCore.Cas.Receive.ProvenSubtree, ``VerifiedCore.Cas.Project.Blob,
+  ``VerifiedCore.Cas.Project.Summary, ``VerifiedCore.Cas.Project.Pin,
+  ``VerifiedCore.Trie.Serve.NodeAnswer, ``VerifiedCore.Trie.Serve.ValueAnswer,
   ``VerifiedCore.Commands.LifecycleDomainError, ``VerifiedCore.Commands.IngestDomainError,
   ``VerifiedCore.Commands.ReadDomainError, ``VerifiedCore.Commands.HistoryDomainError,
-  ``VerifiedCore.Commands.Ingested, ``VerifiedCore.Commands.Committed,
-  ``VerifiedCore.Commands.Command]
+  ``VerifiedCore.Commands.DurableDomainError, ``VerifiedCore.Commands.ServeDomainError,
+  ``VerifiedCore.Commands.ReceiveDomainError, ``VerifiedCore.Commands.CollectDomainError,
+  ``VerifiedCore.Commands.ProjectDomainError, ``VerifiedCore.Commands.CloudDomainError, ``VerifiedCore.Commands.TrieServeDomainError,
+  ``VerifiedCore.Commands.TrieCollectDomainError, ``VerifiedCore.Commands.TrieWalkDomainError,
+  ``VerifiedCore.Commands.TrieMissingDomainError,
+  ``VerifiedCore.Commands.TrieFetchDomainError,
+  ``VerifiedCore.Trie.Serve.Scope,
+  ``VerifiedCore.Authorization.Source, ``VerifiedCore.Authorization.Binding,
+  ``VerifiedCore.Authorization.PublishScope, ``VerifiedCore.Authorization.PeerAuthority,
+  ``VerifiedCore.Authorization.OriginAuthority, ``VerifiedCore.Authorization.BindingSelection,
+  ``VerifiedCore.Authorization.BindingStatus, ``VerifiedCore.Authorization.SocketAuthority,
+  ``VerifiedCore.Authorization.LocalAuthority, ``VerifiedCore.Authorization.MetadataRefusal,
+  ``VerifiedCore.Commands.AuthorizationDomainError,
+  ``VerifiedCore.Commands.Ingested, ``VerifiedCore.Commands.Committed, ``VerifiedCore.Commands.Served,
+  ``VerifiedCore.Commands.Evicted, ``VerifiedCore.Commands.Collected, ``VerifiedCore.Commands.Command]
 
 /-- Rust spellings that differ from the Lean short name. -/
 def rustName (name : Name) : String :=
   match name with
+  | ``VerifiedCore.Trie.Serve.Scope => "AuthorizationTrieScope"
+  | ``VerifiedCore.Authorization.Source => "AuthorizationSource"
+  | ``VerifiedCore.Authorization.Binding => "AuthorizationBinding"
+  | ``VerifiedCore.Authorization.PublishScope => "AuthorizationPublishScope"
   | ``VerifiedCore.Cas.Input.Kind => "IngestInput"
   | ``VerifiedCore.Origin.Error => "OriginError"
+  | ``VerifiedCore.Origin.Named => "NamedOrigin"
+  | ``VerifiedCore.Origin.Parsed => "ParsedOrigin"
   | ``VerifiedCore.Trie.LookupError => "LookupDomainError"
+  | ``VerifiedCore.Trie.Refusal => "NodeRefusal"
+  | ``VerifiedCore.Trie.Verdict => "NodeVerdict"
+  | ``VerifiedCore.Trie.MutationError => "MutationDomainError"
+  | ``VerifiedCore.Cas.Project.Blob => "ProjectedBlob"
+  | ``VerifiedCore.Cas.Project.Summary => "ProjectedSummary"
+  | ``VerifiedCore.Cas.Project.Pin => "ProjectedPin"
+  | ``VerifiedCore.Trie.Value => "TrieValue"
+  | ``VerifiedCore.Trie.Diff.Change => "TrieChange"
+  | ``VerifiedCore.Trie.Proof.Proof => "TrieProof"
+  | ``VerifiedCore.Trie.Proof.VerifyError => "ProofVerifyError"
   | _ => name.getString!
 
 /-- The private transport's tags. Numbering is historical, so it is a table
@@ -102,7 +154,20 @@ def tags : List (String × Nat) := [
   ("Resources.createTemporary", 42), ("Resources.flush", 43), ("Resources.replace", 44),
   ("Resources.discard", 45), ("Resources.syncParent", 46),
   ("Lease.acquire", 47), ("Lease.release", 48),
-  ("SourceIO.stat", 49), ("SourceIO.readSome", 50), ("SourceIO.freeze", 51)]
+  ("SourceIO.stat", 49), ("SourceIO.readSome", 50), ("SourceIO.freeze", 51),
+  ("Digest.blake3", 53), ("ByteWrites.putBytes", 54),
+  ("Bao.encodeSlice", 55), ("Bao.encodeProof", 56), ("Bao.decodeInline", 57),
+  ("Bao.decodeSlice", 58), ("Bao.flushObject", 59), ("Bao.trimObject", 60),
+  ("Bao.writeProof", 61), ("Bao.promoteRun", 62),
+  ("Lease.order", 63), ("Access.snapshotExcluding", 64),
+  ("Sweep.fileBytes", 65), ("Sweep.fileModified", 66), ("Sweep.listObjects", 67),
+  ("Storage.deleteExcept", 68), ("Memo.forgetExcept", 69),
+  ("Redaction.isRedacted", 70), ("Apply.applyChange", 71),
+  ("Peer.fetchNodes", 72), ("Peer.fetchValues", 73),
+  ("Memo.isKnown", 74), ("Memo.generation", 75), ("Memo.certify", 76),
+  ("Provider.stat", 77), ("Provider.readAll", 78), ("Provider.readRange", 79),
+  ("CacheIO.isFile", 80), ("CacheIO.writeAt", 81), ("CacheIO.flush", 82),
+  ("CacheIO.writeTemporary", 83)]
 
 /-- Which Rust service answers an algebra by default. -/
 def defaultRoute : String → Route
@@ -115,15 +180,26 @@ def defaultRoute : String → Route
   | "Resources" => .capability "temporary" "TemporaryFiles"
   | "Lease" => .capability "leases" "Lease"
   | "SourceIO" => .capability "source" "SourceIO"
+  | "Digest" => .capability "digest" "Digest"
+  | "ByteWrites" => .capability "writes" "ByteWrites"
+  | "Bao" => .capability "bao" "Bao"
+  | "Sweep" => .capability "sweep" "Sweep"
+  | "Memo" => .capability "memo" "Memo"
+  | "Redaction" => .capability "redaction" "Redaction"
+  | "Apply" => .capability "apply" "Apply"
+  | "CacheIO" => .capability "cache" "CacheIO"
   | _ => .special
 
-/-- Which Rust service each effect belongs to. The command inputs and the
-transfer into the output sink are not trait methods at all: the interpreter
-loop serves them from the run's own resources. -/
+/-- Which Rust service each effect belongs to. The command inputs, the
+transfer into the output sink and the Bao encodings that land in it are not
+trait methods derived from the algebra: the interpreter loop serves them from
+the run's own resources (the Bao trait's methods are written by hand below,
+because they hand their bytes to the sink). -/
 def route (algebra ctor : String) : Route :=
   match algebra ++ "." ++ ctor with
   | "Storage.readCounter" | "Storage.removeFile" => .capability "resources" "Resources"
-  | "Storage.readInput" | "FileIO.transfer" => .special
+  | "Storage.readInput" | "FileIO.transfer" | "Bao.encodeSlice" | "Bao.encodeProof"
+  | "Bao.decodeInline" | "Bao.decodeSlice" | "Bao.writeProof" => .special
   | _ => defaultRoute algebra
 
 /-- Effects the interpreter loop dispatches by hand even though their service
@@ -137,22 +213,30 @@ def traitDoc : String → String
   | "FileIO" => "/// Session-local raw file handles. Dropping the host releases outstanding handles."
   | "Output" => "/// Operation-local byte sink. Appended bytes are provisional until the whole\n/// operation succeeds; the caller discards the sink on failure."
   | "TemporaryFiles" => "/// Invocation-owned staging resources. Abandonment releases handles and\n/// removes unpublished temporary names; replacement consumes temporary ownership."
-  | "Lease" => "/// Opaque counted resource leases ordered against competing deletion. Host\n/// abandonment releases outstanding tokens; policy chooses their lifetime."
+  | "Lease" => "/// Opaque counted resource leases ordered against competing deletion, and\n/// the remover's critical section they are ordered against. Host abandonment\n/// releases outstanding tokens; policy chooses their lifetime."
+  | "Sweep" => "/// The object store as a directory: what each object's files cost on disk,\n/// when they were written, and which objects have files at all. The layout is\n/// this host's; what is evicted, collected or unlinked is the operation's."
+  | "Redaction" => "/// The refusals a peer recorded: whether this store may see a node at a\n/// position, or at any. What a walk does with a refused position is the\n/// operation's."
+  | "Apply" => "/// The materializer of a head promotion: takes each change as the walk\n/// finds it, in walk order, inside the transaction the flip runs in. A\n/// refusal is this host's failure and stops the walk."
+  | "Memo" => "/// The completeness memo. Forgetting is bound to the mutating transaction as\n/// a lease is: certification stays disabled until that transaction's edge,\n/// commit or rollback, so a reader that started before the mutation cannot\n/// certify its stale snapshot afterwards."
   | "SourceIO" => "/// Raw input observations. Successful bounded reads may be short at EOF;\n/// freeze retains an immutable copy under an invocation-owned input handle."
   | "Construct" => "/// Bulk object construction over resources the requesting operation owns.\n///\n/// The operation decides what is built, from which opened source and into\n/// which owned temporaries; the host streams the bytes, hashes them into the\n/// BLAKE3 tree and lays out the Bao outboard. Neither call publishes, flushes\n/// or records anything."
   | "Clock" => "/// Wall-clock input; the operation chooses when to observe it."
   | "Crypto" => "/// Primitive cryptography, separate from storage and domain validation."
+  | "Digest" => "/// Primitive hashing of exactly the bytes the operation supplies, domain tag\n/// included. What is hashed and what a digest's equality means are the\n/// operation's decisions."
+  | "ByteWrites" => "/// Raw content-addressed writes: the operation names the namespace, the\n/// address and the bytes, and has proved the address covers them."
+  | "Bao" => "/// The Bao tree as a service: slice and proof encodings of exactly the group\n/// spans the operation names, which it has read from the row's own record.\n/// The tree, its chaining values and both formats are a trust assumption on\n/// `bao-tree`/`blake3`; the interpreter appends what is encoded to the\n/// operation's output sink, so a served window is never a Lean value."
   | _ => ""
 
 /-- Trait methods the interpreter needs beyond the algebra's effects. -/
 def traitExtras : String → String
   | "FileIO" => "    /// Fill `buffer` from `offset`, returning `ShortRead` at EOF. The\n    /// interpreter hands over the tail of the operation's output sink, so a\n    /// transfer costs one read into the bytes the caller receives.\n    fn read_into(\n        &mut self,\n        handle: u64,\n        offset: u64,\n        buffer: &mut [u8],\n    ) -> Result<(), FileFailure<Self::Error>>;\n"
+  | "Bao" => "    /// Encode the Bao slice of exactly these half-open group spans of the\n    /// object, from its inline bytes or its payload and outboard files,\n    /// validating the local copy against the root.\n    fn encode_slice(\n        &mut self,\n        root: &[u8],\n        size: u64,\n        inline: Option<&[u8]>,\n        spans: &[(u64, u64)],\n    ) -> Result<Vec<u8>, Self::Error>;\n    /// Encode the interior tree nodes over these group spans, no deeper than\n    /// `level`, or answer `None` when the walk would exceed `budget` nodes.\n    fn encode_proof(\n        &mut self,\n        root: &[u8],\n        size: u64,\n        spans: &[(u64, u64)],\n        level: u64,\n        budget: u64,\n    ) -> Result<Option<Vec<u8>>, Self::Error>;\n    /// Decode `input`, a slice of exactly these spans, against the root into\n    /// the object's inline buffer: `inline` when the row already holds one,\n    /// otherwise zeroes, filled out to `size`. A slice that does not verify\n    /// is this host's failure.\n    fn decode_inline(\n        &mut self,\n        root: &[u8],\n        size: u64,\n        inline: Option<&[u8]>,\n        spans: &[(u64, u64)],\n        input: &[u8],\n    ) -> Result<Vec<u8>, Self::Error>;\n    /// Decode `input`, a slice of exactly these spans, against the root into\n    /// the object's payload and outboard files, created as needed, grown only\n    /// as verified groups land and never shrunk, left unflushed.\n    fn decode_slice(\n        &mut self,\n        root: &[u8],\n        size: u64,\n        spans: &[(u64, u64)],\n        input: &[u8],\n    ) -> Result<(), Self::Error>;\n    /// Verify the run's byte input `input`, a proof over these spans no deeper\n    /// than `level`, by recomputation up to the root, and write its interior\n    /// nodes into the outboard as far as they reach, unflushed. Answers\n    /// whether any node was written and the subtrees proven: start, groups,\n    /// chaining value, whole.\n    fn write_proof(\n        &mut self,\n        root: &[u8],\n        size: u64,\n        spans: &[(u64, u64)],\n        level: u64,\n        input: &[u8],\n    ) -> Result<(bool, Vec<(u64, u64, Vec<u8>, bool)>), Self::Error>;\n"
   | "Output" => "    /// Extend the sink by `count` bytes and hand them back for an in-place\n    /// fill, so a file transfer lands directly in the result.\n    fn grow(&mut self, count: u64) -> Result<&mut [u8], Self::Error>;\n    /// Take back the last `count` bytes after a fill failed.\n    fn shrink(&mut self, count: u64);\n"
   | _ => ""
 
 def traitOrder : List String :=
-  ["Storage", "Resources", "Crypto", "FileIO", "Clock", "Output", "Construct", "TemporaryFiles",
-    "Lease", "SourceIO"]
+  ["Storage", "Resources", "Crypto", "FileIO", "Clock", "Output", "Construct", "TemporaryFiles", "CacheIO",
+    "Lease", "SourceIO", "Digest", "ByteWrites", "Bao", "Sweep", "Memo", "Redaction", "Apply"]
 
 def baseTy : Name → Option Ty
   | ``UInt64 | ``VerifiedCore.Host.Transaction => some .u64
@@ -279,7 +363,7 @@ def leanAlgebra (algebra : Algebra) : String := Id.run do
   return out
 
 def leanFile (all : Array Algebra) : String := Id.run do
-  let mut out := "import VerifiedCore.Host.Codec\nimport VerifiedCore.Crypto\nimport VerifiedCore.Host.Construct\nimport VerifiedCore.Host.Source\n\n"
+  let mut out := "import VerifiedCore.Host.Codec\nimport VerifiedCore.Crypto\nimport VerifiedCore.Host.Construct\nimport VerifiedCore.Host.Source\nimport VerifiedCore.Host.Digest\nimport VerifiedCore.Host.Writes\nimport VerifiedCore.Host.Bao\nimport VerifiedCore.Host.Sweep\nimport VerifiedCore.Host.Memo\nimport VerifiedCore.Host.Walk\nimport VerifiedCore.Host.Peer\nimport VerifiedCore.Host.Provider\nimport VerifiedCore.Host.CacheIO\n\n"
   out := out ++ "/-! GENERATED by `hostgen` from the effect algebras; do not edit. Each\nalgebra's tags, names, request encoder, reply decoder and `WireEffect`\ninstance follow from its constructors and the tag table. -/\nnamespace VerifiedCore.Host\nopen Wire\n"
   for algebra in all do
     out := out ++ "\n" ++ leanAlgebra algebra
@@ -323,6 +407,8 @@ def rustParamTy : Ty → String
   | .bool => "bool"
   | .string => "&str"
   | .bytes => "&[u8]"
+  | .option .bytes => "Option<&[u8]>"
+  | .list .bytes => "&[&[u8]]"
   | .list (.prod .string .cell) => "&Fields"
   | .list t => s!"&[{rustOwned t}]"
   | .selection => "&Selection"
@@ -339,7 +425,7 @@ def rustResultTy : Ty → String
 
 /-- Passing a frame field to a trait method. -/
 def rustArg (index : Nat) : Ty → String
-  | .u64 | .bool | .bytes => s!"a{index}"
+  | .u64 | .bool | .bytes | .option .bytes => s!"a{index}"
   | _ => s!"&a{index}"
 
 /-- Reading one field out of a request packet. -/
@@ -364,6 +450,11 @@ partial def rustDecoder : Ty → String
       s!"r.list(Reader::{((inner.drop 2).dropEnd 3).toString})?"
     else s!"r.list(|r| Ok({inner}))?"
   | .prod a b => s!"({rustDecoder a}, {rustDecoder b})"
+  | .option t =>
+    let inner := rustDecoder t
+    if inner.startsWith "r." && inner.endsWith "()?" then
+      s!"r.option(Reader::{((inner.drop 2).dropEnd 3).toString})?"
+    else s!"r.option(|r| Ok({inner}))?"
   | t => panic! s!"hostgen: no request decoder for {repr t}"
 
 def rustTypeAll (all : Array Algebra) (route : Algebra → Ctor → Route) : List (String × Array (Algebra × Ctor)) := Id.run do
@@ -396,11 +487,20 @@ def rustMethod (ctor : Ctor) : String := Id.run do
 def rustTraits (all : Array Algebra) : String := Id.run do
   let mut out := ""
   for (trait, members) in rustTypeAll all (fun a c => route a.short c.short) do
-    out := out ++ traitDoc trait ++ "\n" ++ s!"pub trait {trait} \{\n"
+    out := out ++ traitDoc trait ++ "\n#[allow(clippy::too_many_arguments, clippy::type_complexity)]\n" ++ s!"pub trait {trait} \{\n"
     out := out ++ "    /// Original host error, retained without converting it into a policy result.\n    type Error;\n"
     for (_, ctor) in members do
       out := out ++ rustMethod ctor
     out := out ++ traitExtras trait ++ "}\n\n"
+  -- A narrowed view of the existing snapshot effect, for byte-backed
+  -- callers that cannot open transactions or mutate relational storage.
+  -- Its signature still comes from the algebra, never a second schema.
+  out := out ++ "/// Raw row snapshots without transaction or mutation capabilities. The\n/// supplied view may already be inside a caller-owned transaction.\npub trait Snapshots {\n    type Error;\n"
+  for algebra in all do
+    for ctor in algebra.ctors do
+      if algebra.short == "Access" && ctor.short == "snapshot" then
+        out := out ++ rustMethod ctor
+  out := out ++ "}\n\n"
   return out
 
 def rustUnexpected (all : Array Algebra) : String := Id.run do
@@ -427,19 +527,24 @@ def rustUnexpected (all : Array Algebra) : String := Id.run do
     |>.replace "Result<Vec<Row>" "Result<Vec<$crate::host::Row>"
     |>.replace "Result<SyncStatus" "Result<$crate::host::SyncStatus"
 
+/-- Preserve existing frame spellings while distinguishing raw provider/cache methods. -/
+def frameName (algebra : Algebra) (ctor : Ctor) : String :=
+  (if algebra.short == "Provider" then "Provider"
+    else if algebra.short == "CacheIO" then "Cache" else "") ++ pascal ctor.short
+
 def rustFrames (all : Array Algebra) : String := Id.run do
   let mut out := "/// One decoded request packet. Terminal packets carry the operation's\n/// result or failure; every other frame is one effect of one algebra.\n#[derive(Debug)]\npub(crate) enum Frame<'a> {\n    Done(&'a [u8]),\n    Failure(u64, u64),\n"
   for algebra in all do
     for ctor in algebra.ctors do
       let fields := ctor.fields.toList.map fun field => rustFrameTy field.ty
-      out := out ++ s!"    {pascal ctor.short}" ++
+      out := out ++ s!"    {frameName algebra ctor}" ++
         (if fields.isEmpty then "" else s!"({String.intercalate ", " fields})") ++ ",\n"
   out := out ++ "}\n\n"
   out := out ++ "pub(crate) fn decode(packet: &[u8]) -> Result<Frame<'_>, ()> {\n    let mut r = Reader(packet);\n    if r.byte()? != 1 {\n        return Err(());\n    }\n    let frame = match r.byte()? {\n        0 => Frame::Done(r.byte_slice()?),\n        1 => Frame::Failure(r.word()?, r.word()?),\n"
   for algebra in all do
     for ctor in algebra.ctors do
       let fields := ctor.fields.toList.map fun field => rustDecoder field.ty
-      out := out ++ s!"        {ctor.tag} => Frame::{pascal ctor.short}" ++
+      out := out ++ s!"        {ctor.tag} => Frame::{frameName algebra ctor}" ++
         (if fields.isEmpty then "" else s!"({String.intercalate ", " fields})") ++ ",\n"
   out := out ++ "        _ => return Err(()),\n    };\n    r.end()?;\n    Ok(frame)\n}\n\n"
   return out
@@ -449,7 +554,7 @@ def rustDispatch (all : Array Algebra) : String := Id.run do
   for algebra in all do
     for ctor in algebra.ctors do
       let binders := ctor.fields.toList.zipIdx.map fun (_, i) => s!"a{i}"
-      let pattern := s!"Frame::{pascal ctor.short}" ++
+      let pattern := s!"Frame::{frameName algebra ctor}" ++
         (if binders.isEmpty then "" else s!"({String.intercalate ", " binders})")
       let args := String.intercalate ", " (ctor.fields.toList.zipIdx.map fun (field, i) => rustArg i field.ty)
       let (receiver, prelude) := match route algebra.short ctor.short with
@@ -636,7 +741,10 @@ def main (args : List String) : IO UInt32 := do
   initSearchPath (← findSysroot)
   let modules : Array Name := #[`VerifiedCore.Host, `VerifiedCore.Crypto, `VerifiedCore.Host.Access,
     `VerifiedCore.Host.Construct, `VerifiedCore.Host.Upsert, `VerifiedCore.Host.Resources,
-    `VerifiedCore.Host.Source, `VerifiedCore.Commands]
+    `VerifiedCore.Host.Source, `VerifiedCore.Host.Digest, `VerifiedCore.Host.Writes,
+    `VerifiedCore.Host.Bao, `VerifiedCore.Host.Sweep, `VerifiedCore.Host.Memo, `VerifiedCore.Host.Walk,
+    `VerifiedCore.Host.Peer, `VerifiedCore.Host.Provider, `VerifiedCore.Host.CacheIO,
+    `VerifiedCore.Commands]
   let env ← importModules (modules.map fun module => ({ module } : Import)) {} 0
   let (lean, commands, rust) ← Prod.fst <$> (Meta.MetaM.toIO (do
       let all ← algebras.toArray.mapM readAlgebra

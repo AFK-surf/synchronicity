@@ -121,12 +121,10 @@ fn an_under_occupied_branch_is_refused() {
 }
 
 /// An extension above anything but a branch is refused where the structure is
-/// walked (`check_invariants`): it reads correctly but gives one key/value map
-/// several distinct roots, silently disabling `MissingWalk::scoped`'s pruning.
+/// walked (the boundary's invariants): it reads correctly but gives one key/value map
+/// several distinct roots, silently disabling the requesting operation's pruning.
 #[test]
 fn an_extension_above_a_non_branch_is_refused_by_the_walk() {
-    use synch_mpt::MissingWalk;
-
     let store = MemStore::new();
     let child = TrieNode::Leaf {
         key_rest: Nibbles::from_nibbles(&[1, 2]),
@@ -144,9 +142,8 @@ fn an_extension_above_a_non_branch_is_refused_by_the_walk() {
     );
 
     let trie = Trie::new(&store);
-    let mut walk = MissingWalk::new(root);
-    let err = walk
-        .next_batch(&trie, 256)
+    let err = trie
+        .is_complete(root)
         .expect_err("an ext above a leaf must be refused");
     assert!(err.to_string().contains("not a branch"));
 
@@ -232,19 +229,9 @@ fn the_key_depth_ceiling_is_one_thing_to_every_reader() {
         child = branch(&store, ext, ext);
     }
 
-    let mut walk = synch_mpt::MissingWalk::new(child);
-    let err = loop {
-        match walk.next_batch(&trie, 256) {
-            Ok(missing) => {
-                assert!(missing.is_empty());
-                if walk.is_exhausted() {
-                    panic!("the walk accepted a graph past the key-depth ceiling");
-                }
-                walk.resume();
-            }
-            Err(e) => break e,
-        }
-    };
+    let err = trie
+        .is_complete(child)
+        .expect_err("graph past the key-depth ceiling");
     assert!(err.to_string().contains("nibble depth"), "{err}");
     assert!(!trie.is_complete(child).unwrap_or(false));
 }

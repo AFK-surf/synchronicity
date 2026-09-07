@@ -10,7 +10,12 @@ pub mod db;
 pub mod error;
 pub mod gc;
 pub mod heads;
+mod lean_authorization;
+mod lean_bao;
+mod lean_cloud;
+mod lean_collect;
 mod lean_diagnostics;
+mod lean_durable;
 mod lean_history;
 mod lean_ingest;
 #[cfg(test)]
@@ -21,9 +26,16 @@ mod lean_ingest_memory;
 mod lean_ingest_metadata;
 #[cfg(all(test, unix))]
 mod lean_ingest_streams;
+mod lean_project;
 mod lean_read;
+mod lean_receive;
 mod lean_resources;
+mod lean_serve;
 mod lean_storage;
+mod lean_sweep;
+mod lean_trie_collect;
+mod lean_trie_fetch;
+mod lean_trie_serve;
 pub mod proof;
 pub mod recovery;
 pub mod replica;
@@ -35,7 +47,7 @@ pub mod unified;
 pub mod uploads;
 pub mod views;
 
-pub use bindings::{Binding, BindingSource, PublishScope};
+pub use bindings::{Binding, BindingSource, BindingStatus, PromotionAuthority, PublishScope};
 pub use cas::{PinHolder, PinRow};
 pub use clock::ClockStatus;
 pub use db::{

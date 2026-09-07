@@ -120,6 +120,7 @@ fn pin_acquisition_requires_durability_and_orders_possession_effects() {
         // read-repair, copy or expression-upsert statements.
 
         host_unexpected!(
+            delete_except,
             exists_rows,
             rollback,
             read_bytes,
@@ -127,7 +128,8 @@ fn pin_acquisition_requires_durability_and_orders_possession_effects() {
             update,
             copy_rows,
             delete,
-            write
+            write,
+            snapshot_excluding
         );
     }
 
@@ -292,7 +294,17 @@ fn deletion_protocol_checks_every_protection_and_orders_effects() {
         // The relational host is one trait; these operations never request the
         // read-repair, copy or expression-upsert statements.
 
-        host_unexpected!(upsert, read_bytes, snapshot, update, copy_rows, delete, write);
+        host_unexpected!(
+            delete_except,
+            upsert,
+            read_bytes,
+            snapshot,
+            update,
+            copy_rows,
+            delete,
+            write,
+            snapshot_excluding
+        );
     }
     impl Resources for Files {
         type Error = &'static str;

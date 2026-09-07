@@ -5,6 +5,59 @@ import VerifiedCore.Commands
 namespace VerifiedCore
 open Host.Wire
 
+instance : Encode Host.Probed where
+  encode out value := match value with
+    | .mk a0 a1 => out |>.put a0 |>.put a1
+
+instance : Decode Host.Probed where
+  decode := do
+    let a0 ← Decode.decode
+    let a1 ← Decode.decode
+    return .mk a0 a1
+
+instance : Encode Host.ProviderProbed where
+  encode out value := match value with
+    | .mk a0 a1 a2 a3 => out |>.put a0 |>.put a1 |>.put a2 |>.put a3
+
+instance : Decode Host.ProviderProbed where
+  decode := do
+    let a0 ← Decode.decode
+    let a1 ← Decode.decode
+    let a2 ← Decode.decode
+    let a3 ← Decode.decode
+    return .mk a0 a1 a2 a3
+
+instance : Encode Replication.Exchange.Advertised where
+  encode out value := match value with
+    | .mk a0 a1 a2 => out |>.put a0 |>.put a1 |>.put a2
+
+instance : Decode Replication.Exchange.Advertised where
+  decode := do
+    let a0 ← Decode.decode
+    let a1 ← Decode.decode
+    let a2 ← Decode.decode
+    return .mk a0 a1 a2
+
+instance : Encode Replication.Exchange.ExchangePlan where
+  encode out value := match value with
+    | .mk a0 a1 => out |>.put a0 |>.put a1
+
+instance : Decode Replication.Exchange.ExchangePlan where
+  decode := do
+    let a0 ← Decode.decode
+    let a1 ← Decode.decode
+    return .mk a0 a1
+
+instance : Encode Replication.Contact.ContactPlan where
+  encode out value := match value with
+    | .mk a0 a1 => out |>.put a0 |>.put a1
+
+instance : Decode Replication.Contact.ContactPlan where
+  decode := do
+    let a0 ← Decode.decode
+    let a1 ← Decode.decode
+    return .mk a0 a1
+
 instance : Encode Cas.Codec.CellType where
   encode out value := match value with
     | .null => out.push 0
@@ -85,6 +138,28 @@ instance : Decode Origin.Error where
     | 4 => return .shape (← Decode.decode)
     | _ => throw ()
 
+instance : Encode Origin.Named where
+  encode out value := match value with
+    | .mk a0 a1 => out |>.put a0 |>.put a1
+
+instance : Decode Origin.Named where
+  decode := do
+    let a0 ← Decode.decode
+    let a1 ← Decode.decode
+    return .mk a0 a1
+
+instance : Encode Origin.Parsed where
+  encode out value := match value with
+    | .named a0 => out.push 0 |>.put a0
+    | .key a0 => out.push 1 |>.put a0
+
+instance : Decode Origin.Parsed where
+  decode := do
+    match ← readByte with
+    | 0 => return .named (← Decode.decode)
+    | 1 => return .key (← Decode.decode)
+    | _ => throw ()
+
 instance : Encode Trie.LookupError where
   encode out value := match value with
     | .keyTooLong a0 => out.push 0 |>.put a0
@@ -102,6 +177,174 @@ instance : Decode Trie.LookupError where
     | 3 => return .decode (← Decode.decode)
     | 4 => return .depthExceeded
     | _ => throw ()
+
+instance : Encode Trie.Value where
+  encode out value := match value with
+    | .inline a0 => out.push 0 |>.put a0
+    | .hash a0 => out.push 1 |>.put a0
+
+instance : Decode Trie.Value where
+  decode := do
+    match ← readByte with
+    | 0 => return .inline (← Decode.decode)
+    | 1 => return .hash (← Decode.decode)
+    | _ => throw ()
+
+instance : Encode Trie.Diff.Change where
+  encode out value := match value with
+    | .mk a0 a1 a2 => out |>.put a0 |>.put a1 |>.put a2
+
+instance : Decode Trie.Diff.Change where
+  decode := do
+    let a0 ← Decode.decode
+    let a1 ← Decode.decode
+    let a2 ← Decode.decode
+    return .mk a0 a1 a2
+
+instance : Encode Trie.Proof.Proof where
+  encode out value := match value with
+    | .mk a0 a1 => out |>.put a0 |>.put a1
+
+instance : Decode Trie.Proof.Proof where
+  decode := do
+    let a0 ← Decode.decode
+    let a1 ← Decode.decode
+    return .mk a0 a1
+
+instance : Encode Trie.Refusal where
+  encode out value := match value with
+    | .decode a0 => out.push 0 |>.put a0
+    | .nonCanonical a0 => out.push 1 |>.put a0
+    | .keyTooLong a0 => out.push 2 |>.put a0
+
+instance : Decode Trie.Refusal where
+  decode := do
+    match ← readByte with
+    | 0 => return .decode (← Decode.decode)
+    | 1 => return .nonCanonical (← Decode.decode)
+    | 2 => return .keyTooLong (← Decode.decode)
+    | _ => throw ()
+
+instance : Encode Trie.Verdict where
+  encode out value := match value with
+    | .accepted => out.push 0
+    | .originFault a0 => out.push 1 |>.put a0
+    | .peerFault => out.push 2
+
+instance : Decode Trie.Verdict where
+  decode := do
+    match ← readByte with
+    | 0 => return .accepted
+    | 1 => return .originFault (← Decode.decode)
+    | 2 => return .peerFault
+    | _ => throw ()
+
+instance : Encode Trie.MutationError where
+  encode out value := match value with
+    | .keyTooLong a0 => out.push 0 |>.put a0
+    | .valueTooLong a0 => out.push 1 |>.put a0
+    | .missingNode a0 => out.push 2 |>.put a0
+    | .decode a0 => out.push 3 |>.put a0
+    | .depthExceeded => out.push 4
+
+instance : Decode Trie.MutationError where
+  decode := do
+    match ← readByte with
+    | 0 => return .keyTooLong (← Decode.decode)
+    | 1 => return .valueTooLong (← Decode.decode)
+    | 2 => return .missingNode (← Decode.decode)
+    | 3 => return .decode (← Decode.decode)
+    | 4 => return .depthExceeded
+    | _ => throw ()
+
+instance : Encode Trie.Proof.VerifyError where
+  encode out value := match value with
+    | .refused a0 => out.push 0 |>.put a0
+    | .lookup a0 => out.push 1 |>.put a0
+
+instance : Decode Trie.Proof.VerifyError where
+  decode := do
+    match ← readByte with
+    | 0 => return .refused (← Decode.decode)
+    | 1 => return .lookup (← Decode.decode)
+    | _ => throw ()
+
+instance : Encode Cas.Receive.ProvenSubtree where
+  encode out value := match value with
+    | .mk a0 a1 a2 a3 => out |>.put a0 |>.put a1 |>.put a2 |>.put a3
+
+instance : Decode Cas.Receive.ProvenSubtree where
+  decode := do
+    let a0 ← Decode.decode
+    let a1 ← Decode.decode
+    let a2 ← Decode.decode
+    let a3 ← Decode.decode
+    return .mk a0 a1 a2 a3
+
+instance : Encode Cas.Project.Blob where
+  encode out value := match value with
+    | .mk a0 a1 a2 a3 a4 a5 a6 a7 a8 a9 => out |>.put a0 |>.put a1 |>.put a2 |>.put a3 |>.put a4 |>.put a5 |>.put a6 |>.put a7 |>.put a8 |>.put a9
+
+instance : Decode Cas.Project.Blob where
+  decode := do
+    let a0 ← Decode.decode
+    let a1 ← Decode.decode
+    let a2 ← Decode.decode
+    let a3 ← Decode.decode
+    let a4 ← Decode.decode
+    let a5 ← Decode.decode
+    let a6 ← Decode.decode
+    let a7 ← Decode.decode
+    let a8 ← Decode.decode
+    let a9 ← Decode.decode
+    return .mk a0 a1 a2 a3 a4 a5 a6 a7 a8 a9
+
+instance : Encode Cas.Project.Summary where
+  encode out value := match value with
+    | .mk a0 a1 a2 a3 a4 a5 => out |>.put a0 |>.put a1 |>.put a2 |>.put a3 |>.put a4 |>.put a5
+
+instance : Decode Cas.Project.Summary where
+  decode := do
+    let a0 ← Decode.decode
+    let a1 ← Decode.decode
+    let a2 ← Decode.decode
+    let a3 ← Decode.decode
+    let a4 ← Decode.decode
+    let a5 ← Decode.decode
+    return .mk a0 a1 a2 a3 a4 a5
+
+instance : Encode Cas.Project.Pin where
+  encode out value := match value with
+    | .mk a0 a1 a2 a3 => out |>.put a0 |>.put a1 |>.put a2 |>.put a3
+
+instance : Decode Cas.Project.Pin where
+  decode := do
+    let a0 ← Decode.decode
+    let a1 ← Decode.decode
+    let a2 ← Decode.decode
+    let a3 ← Decode.decode
+    return .mk a0 a1 a2 a3
+
+instance : Encode Trie.Serve.NodeAnswer where
+  encode out value := match value with
+    | .mk a0 a1 a2 => out |>.put a0 |>.put a1 |>.put a2
+
+instance : Decode Trie.Serve.NodeAnswer where
+  decode := do
+    let a0 ← Decode.decode
+    let a1 ← Decode.decode
+    let a2 ← Decode.decode
+    return .mk a0 a1 a2
+
+instance : Encode Trie.Serve.ValueAnswer where
+  encode out value := match value with
+    | .mk a0 a1 => out |>.put a0 |>.put a1
+
+instance : Decode Trie.Serve.ValueAnswer where
+  decode := do
+    let a0 ← Decode.decode
+    let a1 ← Decode.decode
+    return .mk a0 a1
 
 instance : Encode Commands.LifecycleDomainError where
   encode out value := match value with
@@ -171,6 +414,361 @@ instance : Decode Commands.HistoryDomainError where
     | 4 => return .origin (← Decode.decode)
     | _ => throw ()
 
+instance : Encode Commands.DurableDomainError where
+  encode out value := match value with
+    | .malformed => out.push 0
+    | .columnType a0 a1 a2 => out.push 1 |>.put a0 |>.put a1 |>.put a2
+    | .sizeMismatch a0 a1 a2 => out.push 2 |>.put a0 |>.put a1 |>.put a2
+
+instance : Decode Commands.DurableDomainError where
+  decode := do
+    match ← readByte with
+    | 0 => return .malformed
+    | 1 => return .columnType (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 2 => return .sizeMismatch (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | _ => throw ()
+
+instance : Encode Commands.ServeDomainError where
+  encode out value := match value with
+    | .missingBlob => out.push 0
+    | .malformed => out.push 1
+    | .columnType a0 a1 a2 => out.push 2 |>.put a0 |>.put a1 |>.put a2
+    | .column a0 a1 => out.push 3 |>.put a0 |>.put a1
+    | .overBudget a0 a1 => out.push 4 |>.put a0 |>.put a1
+
+instance : Decode Commands.ServeDomainError where
+  decode := do
+    match ← readByte with
+    | 0 => return .missingBlob
+    | 1 => return .malformed
+    | 2 => return .columnType (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 3 => return .column (← Decode.decode) (← Decode.decode)
+    | 4 => return .overBudget (← Decode.decode) (← Decode.decode)
+    | _ => throw ()
+
+instance : Encode Commands.ReceiveDomainError where
+  encode out value := match value with
+    | .malformed => out.push 0
+    | .columnType a0 a1 a2 => out.push 1 |>.put a0 |>.put a1 |>.put a2
+    | .column a0 a1 => out.push 2 |>.put a0 |>.put a1
+    | .sizeMismatch a0 a1 a2 => out.push 3 |>.put a0 |>.put a1 |>.put a2
+
+instance : Decode Commands.ReceiveDomainError where
+  decode := do
+    match ← readByte with
+    | 0 => return .malformed
+    | 1 => return .columnType (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 2 => return .column (← Decode.decode) (← Decode.decode)
+    | 3 => return .sizeMismatch (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | _ => throw ()
+
+instance : Encode Commands.CollectDomainError where
+  encode out value := match value with
+    | .malformed => out.push 0
+    | .columnType a0 a1 a2 => out.push 1 |>.put a0 |>.put a1 |>.put a2
+    | .sizeMismatch a0 a1 a2 => out.push 2 |>.put a0 |>.put a1 |>.put a2
+
+instance : Decode Commands.CollectDomainError where
+  decode := do
+    match ← readByte with
+    | 0 => return .malformed
+    | 1 => return .columnType (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 2 => return .sizeMismatch (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | _ => throw ()
+
+instance : Encode Commands.ProjectDomainError where
+  encode out value := match value with
+    | .malformed => out.push 0
+    | .columnType a0 a1 a2 => out.push 1 |>.put a0 |>.put a1 |>.put a2
+    | .column a0 a1 => out.push 2 |>.put a0 |>.put a1
+
+instance : Decode Commands.ProjectDomainError where
+  decode := do
+    match ← readByte with
+    | 0 => return .malformed
+    | 1 => return .columnType (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 2 => return .column (← Decode.decode) (← Decode.decode)
+    | _ => throw ()
+
+instance : Encode Commands.CloudDomainError where
+  encode out value := match value with
+    | .malformed => out.push 0
+    | .columnType a0 a1 a2 => out.push 1 |>.put a0 |>.put a1 |>.put a2
+    | .column a0 a1 => out.push 2 |>.put a0 |>.put a1
+    | .missingBlob a0 => out.push 3 |>.put a0
+    | .sizeMismatch a0 a1 a2 => out.push 4 |>.put a0 |>.put a1 |>.put a2
+    | .cacheBusy => out.push 5
+    | .invalidRange a0 a1 a2 => out.push 6 |>.put a0 |>.put a1 |>.put a2
+    | .unalignedRange => out.push 7
+    | .incompleteInline => out.push 8
+
+instance : Decode Commands.CloudDomainError where
+  decode := do
+    match ← readByte with
+    | 0 => return .malformed
+    | 1 => return .columnType (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 2 => return .column (← Decode.decode) (← Decode.decode)
+    | 3 => return .missingBlob (← Decode.decode)
+    | 4 => return .sizeMismatch (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 5 => return .cacheBusy
+    | 6 => return .invalidRange (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 7 => return .unalignedRange
+    | 8 => return .incompleteInline
+    | _ => throw ()
+
+instance : Encode Commands.TrieServeDomainError where
+  encode out value := match value with
+    | .unvouchedRoot => out.push 0
+    | .decode a0 => out.push 1 |>.put a0
+    | .malformed => out.push 2
+    | .columnType a0 a1 a2 => out.push 3 |>.put a0 |>.put a1 |>.put a2
+    | .column a0 a1 => out.push 4 |>.put a0 |>.put a1
+
+instance : Decode Commands.TrieServeDomainError where
+  decode := do
+    match ← readByte with
+    | 0 => return .unvouchedRoot
+    | 1 => return .decode (← Decode.decode)
+    | 2 => return .malformed
+    | 3 => return .columnType (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 4 => return .column (← Decode.decode) (← Decode.decode)
+    | _ => throw ()
+
+instance : Encode Commands.TrieCollectDomainError where
+  encode out value := match value with
+    | .decode a0 => out.push 0 |>.put a0
+    | .malformed => out.push 1
+    | .columnType a0 a1 a2 => out.push 2 |>.put a0 |>.put a1 |>.put a2
+    | .column a0 a1 => out.push 3 |>.put a0 |>.put a1
+    | .origin a0 => out.push 4 |>.put a0
+    | .exhausted => out.push 5
+
+instance : Decode Commands.TrieCollectDomainError where
+  decode := do
+    match ← readByte with
+    | 0 => return .decode (← Decode.decode)
+    | 1 => return .malformed
+    | 2 => return .columnType (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 3 => return .column (← Decode.decode) (← Decode.decode)
+    | 4 => return .origin (← Decode.decode)
+    | 5 => return .exhausted
+    | _ => throw ()
+
+instance : Encode Commands.TrieWalkDomainError where
+  encode out value := match value with
+    | .missingNode a0 => out.push 0 |>.put a0
+    | .missingValue a0 => out.push 1 |>.put a0
+    | .decode a0 => out.push 2 |>.put a0
+    | .oddDepthValue => out.push 3
+    | .ceiling => out.push 4
+
+instance : Decode Commands.TrieWalkDomainError where
+  decode := do
+    match ← readByte with
+    | 0 => return .missingNode (← Decode.decode)
+    | 1 => return .missingValue (← Decode.decode)
+    | 2 => return .decode (← Decode.decode)
+    | 3 => return .oddDepthValue
+    | 4 => return .ceiling
+    | _ => throw ()
+
+instance : Encode Commands.TrieMissingDomainError where
+  encode out value := match value with
+    | .decode a0 => out.push 0 |>.put a0
+    | .nodeDepth a0 => out.push 1 |>.put a0
+    | .valueDepth a0 => out.push 2 |>.put a0
+    | .expectedBranch a0 => out.push 3 |>.put a0
+    | .exhausted => out.push 4
+    | .valueLength a0 a1 a2 => out.push 5 |>.put a0 |>.put a1 |>.put a2
+
+instance : Decode Commands.TrieMissingDomainError where
+  decode := do
+    match ← readByte with
+    | 0 => return .decode (← Decode.decode)
+    | 1 => return .nodeDepth (← Decode.decode)
+    | 2 => return .valueDepth (← Decode.decode)
+    | 3 => return .expectedBranch (← Decode.decode)
+    | 4 => return .exhausted
+    | 5 => return .valueLength (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | _ => throw ()
+
+instance : Encode Commands.TrieFetchDomainError where
+  encode out value := match value with
+    | .walk a0 => out.push 0 |>.put a0
+    | .origin a0 => out.push 1 |>.put a0
+    | .nodeHash a0 => out.push 2 |>.put a0
+    | .valueHash a0 => out.push 3 |>.put a0
+    | .unsolicited a0 a1 => out.push 4 |>.put a0 |>.put a1
+    | .exhausted => out.push 5
+
+instance : Decode Commands.TrieFetchDomainError where
+  decode := do
+    match ← readByte with
+    | 0 => return .walk (← Decode.decode)
+    | 1 => return .origin (← Decode.decode)
+    | 2 => return .nodeHash (← Decode.decode)
+    | 3 => return .valueHash (← Decode.decode)
+    | 4 => return .unsolicited (← Decode.decode) (← Decode.decode)
+    | 5 => return .exhausted
+    | _ => throw ()
+
+instance : Encode Trie.Serve.Scope where
+  encode out value := match value with
+    | .mk a0 a1 => out |>.put a0 |>.put a1
+
+instance : Decode Trie.Serve.Scope where
+  decode := do
+    let a0 ← Decode.decode
+    let a1 ← Decode.decode
+    return .mk a0 a1
+
+instance : Encode Authorization.Source where
+  encode out value := match value with
+    | .static => out.push 0
+    | .dns => out.push 1
+    | .delegated => out.push 2
+
+instance : Decode Authorization.Source where
+  decode := do
+    match ← readByte with
+    | 0 => return .static
+    | 1 => return .dns
+    | 2 => return .delegated
+    | _ => throw ()
+
+instance : Encode Authorization.Binding where
+  encode out value := match value with
+    | .mk a0 a1 a2 a3 a4 a5 a6 a7 a8 => out |>.put a0 |>.put a1 |>.put a2 |>.put a3 |>.put a4 |>.put a5 |>.put a6 |>.put a7 |>.put a8
+
+instance : Decode Authorization.Binding where
+  decode := do
+    let a0 ← Decode.decode
+    let a1 ← Decode.decode
+    let a2 ← Decode.decode
+    let a3 ← Decode.decode
+    let a4 ← Decode.decode
+    let a5 ← Decode.decode
+    let a6 ← Decode.decode
+    let a7 ← Decode.decode
+    let a8 ← Decode.decode
+    return .mk a0 a1 a2 a3 a4 a5 a6 a7 a8
+
+instance : Encode Authorization.PublishScope where
+  encode out value := match value with
+    | .untrusted => out.push 0
+    | .unrestricted => out.push 1
+    | .confined a0 => out.push 2 |>.put a0
+
+instance : Decode Authorization.PublishScope where
+  decode := do
+    match ← readByte with
+    | 0 => return .untrusted
+    | 1 => return .unrestricted
+    | 2 => return .confined (← Decode.decode)
+    | _ => throw ()
+
+instance : Encode Authorization.PeerAuthority where
+  encode out value := match value with
+    | .mk a0 a1 a2 a3 => out |>.put a0 |>.put a1 |>.put a2 |>.put a3
+
+instance : Decode Authorization.PeerAuthority where
+  decode := do
+    let a0 ← Decode.decode
+    let a1 ← Decode.decode
+    let a2 ← Decode.decode
+    let a3 ← Decode.decode
+    return .mk a0 a1 a2 a3
+
+instance : Encode Authorization.OriginAuthority where
+  encode out value := match value with
+    | .mk a0 a1 a2 => out |>.put a0 |>.put a1 |>.put a2
+
+instance : Decode Authorization.OriginAuthority where
+  decode := do
+    let a0 ← Decode.decode
+    let a1 ← Decode.decode
+    let a2 ← Decode.decode
+    return .mk a0 a1 a2
+
+instance : Encode Authorization.BindingSelection where
+  encode out value := match value with
+    | .all => out.push 0
+    | .key a0 => out.push 1 |>.put a0
+    | .origin a0 => out.push 2 |>.put a0
+    | .delegated => out.push 3
+
+instance : Decode Authorization.BindingSelection where
+  decode := do
+    match ← readByte with
+    | 0 => return .all
+    | 1 => return .key (← Decode.decode)
+    | 2 => return .origin (← Decode.decode)
+    | 3 => return .delegated
+    | _ => throw ()
+
+instance : Encode Authorization.BindingStatus where
+  encode out value := match value with
+    | .mk a0 a1 a2 => out |>.put a0 |>.put a1 |>.put a2
+
+instance : Decode Authorization.BindingStatus where
+  decode := do
+    let a0 ← Decode.decode
+    let a1 ← Decode.decode
+    let a2 ← Decode.decode
+    return .mk a0 a1 a2
+
+instance : Encode Authorization.SocketAuthority where
+  encode out value := match value with
+    | .mk a0 a1 => out |>.put a0 |>.put a1
+
+instance : Decode Authorization.SocketAuthority where
+  decode := do
+    let a0 ← Decode.decode
+    let a1 ← Decode.decode
+    return .mk a0 a1
+
+instance : Encode Authorization.LocalAuthority where
+  encode out value := match value with
+    | .mk a0 a1 a2 a3 => out |>.put a0 |>.put a1 |>.put a2 |>.put a3
+
+instance : Decode Authorization.LocalAuthority where
+  decode := do
+    let a0 ← Decode.decode
+    let a1 ← Decode.decode
+    let a2 ← Decode.decode
+    let a3 ← Decode.decode
+    return .mk a0 a1 a2 a3
+
+instance : Encode Authorization.MetadataRefusal where
+  encode out value := match value with
+    | .notFullMember => out.push 0
+    | .differentCluster => out.push 1
+
+instance : Decode Authorization.MetadataRefusal where
+  decode := do
+    match ← readByte with
+    | 0 => return .notFullMember
+    | 1 => return .differentCluster
+    | _ => throw ()
+
+instance : Encode Commands.AuthorizationDomainError where
+  encode out value := match value with
+    | .malformed => out.push 0
+    | .columnType a0 a1 a2 => out.push 1 |>.put a0 |>.put a1 |>.put a2
+    | .invalidText a0 => out.push 2 |>.put a0
+    | .column a0 a1 => out.push 3 |>.put a0 |>.put a1
+    | .origin a0 a1 => out.push 4 |>.put a0 |>.put a1
+
+instance : Decode Commands.AuthorizationDomainError where
+  decode := do
+    match ← readByte with
+    | 0 => return .malformed
+    | 1 => return .columnType (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 2 => return .invalidText (← Decode.decode)
+    | 3 => return .column (← Decode.decode) (← Decode.decode)
+    | 4 => return .origin (← Decode.decode) (← Decode.decode)
+    | _ => throw ()
+
 instance : Encode Commands.Ingested where
   encode out value := match value with
     | .mk a0 a1 => out |>.put a0 |>.put a1
@@ -191,6 +789,37 @@ instance : Decode Commands.Committed where
     let a1 ← Decode.decode
     return .mk a0 a1
 
+instance : Encode Commands.Served where
+  encode out value := match value with
+    | .mk a0 a1 => out |>.put a0 |>.put a1
+
+instance : Decode Commands.Served where
+  decode := do
+    let a0 ← Decode.decode
+    let a1 ← Decode.decode
+    return .mk a0 a1
+
+instance : Encode Commands.Evicted where
+  encode out value := match value with
+    | .mk a0 a1 => out |>.put a0 |>.put a1
+
+instance : Decode Commands.Evicted where
+  decode := do
+    let a0 ← Decode.decode
+    let a1 ← Decode.decode
+    return .mk a0 a1
+
+instance : Encode Commands.Collected where
+  encode out value := match value with
+    | .mk a0 a1 a2 => out |>.put a0 |>.put a1 |>.put a2
+
+instance : Decode Commands.Collected where
+  decode := do
+    let a0 ← Decode.decode
+    let a1 ← Decode.decode
+    let a2 ← Decode.decode
+    return .mk a0 a1 a2
+
 instance : Encode Commands.Command where
   encode out value := match value with
     | .acquire a0 a1 a2 a3 => out.push 0 |>.put a0 |>.put a1 |>.put a2 |>.put a3
@@ -202,7 +831,79 @@ instance : Encode Commands.Command where
     | .commitGroups a0 a1 a2 a3 a4 a5 => out.push 6 |>.put a0 |>.put a1 |>.put a2 |>.put a3 |>.put a4 |>.put a5
     | .admitSize a0 a1 => out.push 7 |>.put a0 |>.put a1
     | .trieGet a0 a1 => out.push 8 |>.put a0 |>.put a1
-    | .pruneHistory a0 a1 => out.push 9 |>.put a0 |>.put a1
+    | .trieAdmit a0 => out.push 9 |>.put a0
+    | .trieVerify a0 a1 => out.push 10 |>.put a0 |>.put a1
+    | .trieInsert a0 a1 a2 => out.push 11 |>.put a0 |>.put a1 |>.put a2
+    | .trieRemove a0 a1 => out.push 12 |>.put a0 |>.put a1
+    | .pruneHistory a0 a1 => out.push 13 |>.put a0 |>.put a1
+    | .casMarkDurable a0 => out.push 14 |>.put a0
+    | .casAdoptDurable a0 a1 a2 => out.push 15 |>.put a0 |>.put a1 |>.put a2
+    | .casHealMissing a0 => out.push 16 |>.put a0
+    | .casReconcileScratch a0 => out.push 17 |>.put a0
+    | .casClearCache a0 => out.push 18 |>.put a0
+    | .casEncodeSlice a0 a1 => out.push 19 |>.put a0 |>.put a1
+    | .casEncodeProof a0 a1 a2 a3 => out.push 20 |>.put a0 |>.put a1 |>.put a2 |>.put a3
+    | .casWriteSlice a0 a1 a2 a3 a4 => out.push 21 |>.put a0 |>.put a1 |>.put a2 |>.put a3 |>.put a4
+    | .casWriteProof a0 a1 a2 a3 a4 a5 => out.push 22 |>.put a0 |>.put a1 |>.put a2 |>.put a3 |>.put a4 |>.put a5
+    | .casPromote a0 a1 a2 a3 a4 a5 => out.push 23 |>.put a0 |>.put a1 |>.put a2 |>.put a3 |>.put a4 |>.put a5
+    | .casTouch a0 => out.push 24 |>.put a0
+    | .casEvict a0 a1 => out.push 25 |>.put a0 |>.put a1
+    | .casGcContent a0 => out.push 26 |>.put a0
+    | .casGcOrphans a0 => out.push 27 |>.put a0
+    | .casBlob a0 => out.push 28 |>.put a0
+    | .casBlobs => out.push 29
+    | .casBlobCandidates => out.push 30
+    | .casPins a0 => out.push 31 |>.put a0
+    | .casPinnedBlobs => out.push 32
+    | .trieServeNodes a0 a1 a2 a3 a4 a5 => out.push 33 |>.put a0 |>.put a1 |>.put a2 |>.put a3 |>.put a4 |>.put a5
+    | .trieServeValues a0 a1 a2 a3 a4 a5 => out.push 34 |>.put a0 |>.put a1 |>.put a2 |>.put a3 |>.put a4 |>.put a5
+    | .trieResolve a0 a1 => out.push 35 |>.put a0 |>.put a1
+    | .trieCollect a0 a1 => out.push 36 |>.put a0 |>.put a1
+    | .trieMemoKey a0 a1 a2 a3 => out.push 37 |>.put a0 |>.put a1 |>.put a2 |>.put a3
+    | .trieScan a0 a1 a2 a3 => out.push 38 |>.put a0 |>.put a1 |>.put a2 |>.put a3
+    | .trieDiff a0 a1 => out.push 39 |>.put a0 |>.put a1
+    | .trieMaterialize a0 a1 a2 a3 => out.push 40 |>.put a0 |>.put a1 |>.put a2 |>.put a3
+    | .trieProve a0 a1 => out.push 41 |>.put a0 |>.put a1
+    | .trieVerifyProof a0 a1 a2 a3 => out.push 42 |>.put a0 |>.put a1 |>.put a2 |>.put a3
+    | .peerProbe a0 a1 a2 => out.push 43 |>.put a0 |>.put a1 |>.put a2
+    | .providerProbe a0 a1 => out.push 44 |>.put a0 |>.put a1
+    | .cloudEnsureCached a0 a1 => out.push 45 |>.put a0 |>.put a1
+    | .cloudEnsureRanges a0 a1 a2 => out.push 46 |>.put a0 |>.put a1 |>.put a2
+    | .cloudHydrate a0 a1 a2 => out.push 47 |>.put a0 |>.put a1 |>.put a2
+    | .cloudOutboard a0 a1 => out.push 48 |>.put a0 |>.put a1
+    | .trieComplete a0 a1 a2 a3 => out.push 49 |>.put a0 |>.put a1 |>.put a2 |>.put a3
+    | .planExchange a0 a1 a2 => out.push 50 |>.put a0 |>.put a1 |>.put a2
+    | .trieFetch a0 a1 a2 a3 a4 a5 a6 a7 a8 => out.push 51 |>.put a0 |>.put a1 |>.put a2 |>.put a3 |>.put a4 |>.put a5 |>.put a6 |>.put a7 |>.put a8
+    | .trieNormalize a0 => out.push 52 |>.put a0
+    | .casBlobIn a0 a1 => out.push 53 |>.put a0 |>.put a1
+    | .planContact a0 a1 a2 => out.push 54 |>.put a0 |>.put a1 |>.put a2
+    | .trieFirstOutside a0 a1 a2 => out.push 55 |>.put a0 |>.put a1 |>.put a2
+    | .originParse a0 => out.push 56 |>.put a0
+    | .originNamed a0 a1 => out.push 57 |>.put a0 |>.put a1
+    | .originNormalizeLabel a0 => out.push 58 |>.put a0
+    | .originNormalizeDomain a0 => out.push 59 |>.put a0
+    | .originCanonical a0 => out.push 60 |>.put a0
+    | .authBindings a0 a1 a2 => out.push 61 |>.put a0 |>.put a1 |>.put a2
+    | .authBindingStatuses a0 => out.push 62 |>.put a0
+    | .authTrustedKeys a0 => out.push 63 |>.put a0
+    | .authTrustedOrigins a0 => out.push 64 |>.put a0
+    | .authTrustedKey a0 a1 => out.push 65 |>.put a0 |>.put a1
+    | .authBound a0 a1 a2 => out.push 66 |>.put a0 |>.put a1 |>.put a2
+    | .authPeerAuthority a0 a1 => out.push 67 |>.put a0 |>.put a1
+    | .authOriginPublication a0 a1 => out.push 68 |>.put a0 |>.put a1
+    | .authOriginAuthority a0 a1 => out.push 69 |>.put a0 |>.put a1
+    | .authOriginAuthorityIn a0 a1 a2 => out.push 70 |>.put a0 |>.put a1 |>.put a2
+    | .authLocalAuthority a0 => out.push 71 |>.put a0
+    | .authLocalSpaces => out.push 72
+    | .authLocalScope => out.push 73
+    | .authLocalScopeIn a0 => out.push 74 |>.put a0
+    | .authMaterializationScope a0 => out.push 75 |>.put a0
+    | .authMaterializationScopeIn a0 a1 => out.push 76 |>.put a0 |>.put a1
+    | .authMetadataPeer a0 a1 => out.push 77 |>.put a0 |>.put a1
+    | .authSocketAuthority a0 a1 => out.push 78 |>.put a0 |>.put a1
+    | .authSoleDnsHintSource a0 a1 a2 => out.push 79 |>.put a0 |>.put a1 |>.put a2
+    | .authHasDelegations => out.push 80
+    | .authExpireDns a0 => out.push 81 |>.put a0
 
 instance : Decode Commands.Command where
   decode := do
@@ -216,7 +917,79 @@ instance : Decode Commands.Command where
     | 6 => return .commitGroups (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode)
     | 7 => return .admitSize (← Decode.decode) (← Decode.decode)
     | 8 => return .trieGet (← Decode.decode) (← Decode.decode)
-    | 9 => return .pruneHistory (← Decode.decode) (← Decode.decode)
+    | 9 => return .trieAdmit (← Decode.decode)
+    | 10 => return .trieVerify (← Decode.decode) (← Decode.decode)
+    | 11 => return .trieInsert (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 12 => return .trieRemove (← Decode.decode) (← Decode.decode)
+    | 13 => return .pruneHistory (← Decode.decode) (← Decode.decode)
+    | 14 => return .casMarkDurable (← Decode.decode)
+    | 15 => return .casAdoptDurable (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 16 => return .casHealMissing (← Decode.decode)
+    | 17 => return .casReconcileScratch (← Decode.decode)
+    | 18 => return .casClearCache (← Decode.decode)
+    | 19 => return .casEncodeSlice (← Decode.decode) (← Decode.decode)
+    | 20 => return .casEncodeProof (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 21 => return .casWriteSlice (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 22 => return .casWriteProof (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 23 => return .casPromote (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 24 => return .casTouch (← Decode.decode)
+    | 25 => return .casEvict (← Decode.decode) (← Decode.decode)
+    | 26 => return .casGcContent (← Decode.decode)
+    | 27 => return .casGcOrphans (← Decode.decode)
+    | 28 => return .casBlob (← Decode.decode)
+    | 29 => return .casBlobs
+    | 30 => return .casBlobCandidates
+    | 31 => return .casPins (← Decode.decode)
+    | 32 => return .casPinnedBlobs
+    | 33 => return .trieServeNodes (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 34 => return .trieServeValues (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 35 => return .trieResolve (← Decode.decode) (← Decode.decode)
+    | 36 => return .trieCollect (← Decode.decode) (← Decode.decode)
+    | 37 => return .trieMemoKey (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 38 => return .trieScan (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 39 => return .trieDiff (← Decode.decode) (← Decode.decode)
+    | 40 => return .trieMaterialize (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 41 => return .trieProve (← Decode.decode) (← Decode.decode)
+    | 42 => return .trieVerifyProof (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 43 => return .peerProbe (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 44 => return .providerProbe (← Decode.decode) (← Decode.decode)
+    | 45 => return .cloudEnsureCached (← Decode.decode) (← Decode.decode)
+    | 46 => return .cloudEnsureRanges (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 47 => return .cloudHydrate (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 48 => return .cloudOutboard (← Decode.decode) (← Decode.decode)
+    | 49 => return .trieComplete (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 50 => return .planExchange (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 51 => return .trieFetch (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 52 => return .trieNormalize (← Decode.decode)
+    | 53 => return .casBlobIn (← Decode.decode) (← Decode.decode)
+    | 54 => return .planContact (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 55 => return .trieFirstOutside (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 56 => return .originParse (← Decode.decode)
+    | 57 => return .originNamed (← Decode.decode) (← Decode.decode)
+    | 58 => return .originNormalizeLabel (← Decode.decode)
+    | 59 => return .originNormalizeDomain (← Decode.decode)
+    | 60 => return .originCanonical (← Decode.decode)
+    | 61 => return .authBindings (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 62 => return .authBindingStatuses (← Decode.decode)
+    | 63 => return .authTrustedKeys (← Decode.decode)
+    | 64 => return .authTrustedOrigins (← Decode.decode)
+    | 65 => return .authTrustedKey (← Decode.decode) (← Decode.decode)
+    | 66 => return .authBound (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 67 => return .authPeerAuthority (← Decode.decode) (← Decode.decode)
+    | 68 => return .authOriginPublication (← Decode.decode) (← Decode.decode)
+    | 69 => return .authOriginAuthority (← Decode.decode) (← Decode.decode)
+    | 70 => return .authOriginAuthorityIn (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 71 => return .authLocalAuthority (← Decode.decode)
+    | 72 => return .authLocalSpaces
+    | 73 => return .authLocalScope
+    | 74 => return .authLocalScopeIn (← Decode.decode)
+    | 75 => return .authMaterializationScope (← Decode.decode)
+    | 76 => return .authMaterializationScopeIn (← Decode.decode) (← Decode.decode)
+    | 77 => return .authMetadataPeer (← Decode.decode) (← Decode.decode)
+    | 78 => return .authSocketAuthority (← Decode.decode) (← Decode.decode)
+    | 79 => return .authSoleDnsHintSource (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 80 => return .authHasDelegations
+    | 81 => return .authExpireDns (← Decode.decode)
     | _ => throw ()
 
 end VerifiedCore

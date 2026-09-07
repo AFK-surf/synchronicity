@@ -82,6 +82,9 @@ jobs:
       # fanout_bomb's tests are #[ignore]d for fast local `cargo test`; CI
       # still runs them explicitly so they keep gating changes.
       - run: cargo test -p synch-mpt --test fanout_bomb --no-fail-fast -- --ignored
+      # Exercise native Lean completeness at the documented corpus size;
+      # retain read-count bounds and report timing without a Rust walk oracle.
+      - run: cargo test -p synch-mpt --test complete_operation completeness_at_the_documented_corpus_size -- --ignored --exact --nocapture
 
   test-engine:
     name: test synch-engine (${{ matrix.os }})

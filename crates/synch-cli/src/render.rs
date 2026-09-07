@@ -436,18 +436,14 @@ pub fn doctor(node: &Node) -> Lines {
                 .into(),
         );
     }
-    let now = now_ns();
-    for binding in &report.bindings {
+    for status in &report.bindings {
+        let binding = &status.binding;
         out.push(format!(
             "  {:<32} {} {:<7} {}",
             binding.origin.canonical(),
             binding.node_id.to_z32(),
             binding.source.as_str(),
-            if binding.is_live(now) {
-                "live"
-            } else {
-                "LAPSED"
-            },
+            if status.live { "live" } else { "LAPSED" },
         ));
     }
 

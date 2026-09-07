@@ -90,7 +90,7 @@ def invalidation : Fields :=
 expression is derived from the actual operation by healing_state below. -/
 def healedDatabase (db : Database) (root : ByteArray) (size now : Int64) : Database :=
   let invalidated := setRows db "blobs" ((rows db "blobs").map fun row =>
-    if selects ⟨"blobs", [("root", .blob root)], []⟩ row then assign row invalidation else row)
+    if selects ⟨"blobs", [("root", .blob root)], [], []⟩ row then assign row invalidation else row)
   let copied := copyRows invalidated "content_want" (repairPins root) (repairFields size now) ["root", "holder"]
   setRows copied "pins" ((rows copied "pins").filter fun row => !selects (repairPins root) row)
 

@@ -183,12 +183,14 @@ impl Storage for Database {
         Ok(2)
     }
     host_unexpected!(
+        delete_except,
         scan_rows,
         exists_rows,
         upsert,
         delete_rows,
         read_bytes,
-        write
+        write,
+        snapshot_excluding
     );
 }
 struct Files {

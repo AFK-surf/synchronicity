@@ -22,10 +22,10 @@ pub use origin::{NodeId, OriginId};
 pub use path::{normalize_native_path, normalize_path, MAX_KEY_LEN};
 pub use record::{
     blob_key, delegation_key, dir_prefix, file_key, manifest_key, parse_blob_key,
-    parse_delegation_key, parse_file_key, parse_replica_claim_key, publish_prefixes,
-    replica_claim_key, scope_prefixes, space_info_key, space_prefix, validate_space, AdState,
-    BlobAd, Delegation, EntryKind, FileEntry, KeyError, NodeManifest, ReplicaClaim, ScopeKeys,
-    SpaceInfo, AD_SPAN_GRANULARITY, MAX_AD_SPANS, MAX_DELEGATION_SPACES, RECORD_VERSION,
+    parse_delegation_key, parse_file_key, parse_replica_claim_key, replica_claim_key,
+    space_info_key, space_prefix, validate_space, AdState, BlobAd, Delegation, EntryKind,
+    FileEntry, KeyError, NodeManifest, ReplicaClaim, ScopeKeys, SpaceInfo, AD_SPAN_GRANULARITY,
+    MAX_AD_SPANS, MAX_DELEGATION_SPACES, RECORD_VERSION,
 };
 pub use sock::{
     display_text_is_safe, parse_socket_manifest, valid_ebpf_stack_frame_size, Declaration,
@@ -71,7 +71,7 @@ pub const INLINE_VALUE_MAX: usize = 128;
 ///
 /// The key side is bounded three ways — [`MAX_KEY_LEN`] on insert, twice that
 /// in nibbles at decode, and `MAX_DEPTH_NIBBLES` on every walk — but the value
-/// side had none: `check_invariants` bounds `ValueRef::Inline` at
+/// side had none: the ingress boundary bounds `ValueRef::Inline` at
 /// [`INLINE_VALUE_MAX`] and says nothing about `ValueRef::Hash`, so a value was
 /// bounded only by the frame, at 16 MiB each. That is the enabler for two costs
 /// a §12 sanity bound is supposed to cap: a `GetValues` answer is `MAX_BATCH`

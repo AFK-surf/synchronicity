@@ -108,4 +108,28 @@ def parse [Monad m] (validate : List UInt8 → m Bool) (s : String) :
 
 def checkSyntax (s : String) : Except Error Unit := (parseSyntax s).map (fun _ => ())
 
+/-- Canonical unpadded z-base-32 output for a validated key. The residue
+contains fewer than five bits between bytes; no origin policy lives in the
+native renderer or in an indexed storage callback. -/
+def encodeDigits : List UInt8 → Nat → Nat → List Char → List Char
+  | [], bits, pending, output =>
+    if bits == 0 then output.reverse
+    else (alphabet[pending * 2 ^ (5 - bits)]! :: output).reverse
+  | byte :: rest, bits, pending, output =>
+    let pending := pending * 256 + byte.toNat
+    let bits := bits + 8
+    if bits ≥ 10 then
+      let left := bits - 5
+      let right := bits - 10
+      encodeDigits rest right (pending % 2 ^ right)
+        (alphabet[(pending / 2 ^ right) % 32]! :: alphabet[pending / 2 ^ left]! :: output)
+    else
+      let remaining := bits - 5
+      encodeDigits rest remaining (pending % 2 ^ remaining)
+        (alphabet[pending / 2 ^ remaining]! :: output)
+
+def canonical : Parsed → String
+  | .named name => name.id ++ "@" ++ name.domain
+  | .key bytes => "key:" ++ String.ofList (encodeDigits bytes 0 0 [])
+
 end VerifiedCore.Origin

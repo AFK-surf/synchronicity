@@ -56,6 +56,7 @@ fn directory_policy() -> cas::DirectoryPolicy {
 }
 
 /// Records verified groups through the Lean metadata commit.
+#[cfg(test)]
 pub(crate) fn commit_groups(
     store: &Store,
     root: &Hash,
@@ -84,6 +85,7 @@ pub(crate) fn commit_groups(
 
 /// Refuses a size the row's claim cannot yield to, before any bytes are
 /// decoded against it.
+#[cfg(test)]
 pub(crate) fn admit_size(store: &Store, root: &Hash, size: u64) -> Result<()> {
     let mut storage = crate::lean_storage::Session::new(store);
     cas::admit_size(&mut storage, root.as_bytes(), size).map_err(error)
@@ -243,6 +245,10 @@ mod tests {
         fn acquire(&mut self, space: &str, key: &[u8]) -> Result<u64> {
             self.step("acquire")?;
             self.inner.acquire(space, key)
+        }
+        fn order(&mut self, space: &str) -> Result<u64> {
+            self.step("order")?;
+            self.inner.order(space)
         }
         fn release(&mut self, token: u64) -> Result<()> {
             self.inner.release(token)?;
@@ -539,7 +545,7 @@ mod tests {
     }
 
     #[test]
-    fn native_ingestion_matches_standard_roots_payloads_and_bao_layouts() {
+    fn native_ingestion_produces_content_peers_can_verify() {
         let (dir, store) = crate::testutil::store();
         for size in [0, 1, 63, 1024, 1025, 16384, 16385, 32768, 49152, 100_003] {
             let bytes = data(size);
@@ -562,10 +568,14 @@ mod tests {
                     size <= synch_core::INLINE_BLOB_MAX as usize
                 );
                 if size > synch_core::INLINE_BLOB_MAX as usize {
-                    let tree = Store::tree(size as u64);
-                    let mut expected = vec![0; tree.outboard_size() as usize];
-                    crate::cas::compute_outboard(&bytes[..], tree, &mut expected).unwrap();
-                    assert_eq!(std::fs::read(store.outboard_path(&root)).unwrap(), expected);
+                    let (_peer_dir, peer) = crate::testutil::store();
+                    let wanted =
+                        synch_core::ChunkRanges::single(0, synch_core::group_count(size as u64));
+                    let (encoded, served) = store.encode_slice(&root, &wanted).unwrap();
+                    assert_eq!(served, wanted);
+                    peer.write_slice(&root, length, &served, &encoded, 17)
+                        .unwrap();
+                    assert_eq!(peer.read_all(&root).unwrap(), bytes);
                 }
                 assert!(!store.is_being_written(&root));
                 assert_eq!(

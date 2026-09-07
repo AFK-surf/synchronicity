@@ -454,6 +454,46 @@ async fn convergence_survives_a_partition() {
     shutdown(&[&nas.node, &laptop.node]).await;
 }
 
+/// Learning one publisher's changes must not discard the remaining peers'
+/// scheduled turns. All three publishers start with independent new versions.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn anti_entropy_finishes_every_planned_turn_after_progress() {
+    let _blocking = synch_core::BlockingScope::enter();
+    let first = spawn("first").await;
+    let second = spawn("second").await;
+    let third = spawn("third").await;
+    let replica = spawn("replica").await;
+    let sources = [&first, &second, &third];
+    let mut heads = Vec::new();
+    for source in sources {
+        source
+            .node
+            .add_filesystem_source("media", source.space.path())
+            .unwrap();
+        std::fs::write(
+            source.space.path().join("own.txt"),
+            source.node.origin().canonical(),
+        )
+        .unwrap();
+        heads.push(source.node.scan_and_publish().unwrap().1.unwrap());
+        trust(&replica.node, &source.node);
+        trust(&source.node, &replica.node);
+    }
+    let report = replica.node.anti_entropy_round().await.unwrap();
+    assert_eq!(report.unreachable, 0, "{report:?}");
+    for (source, head) in sources.into_iter().zip(heads) {
+        assert_eq!(
+            replica
+                .node
+                .store()
+                .complete_head(source.node.origin())
+                .unwrap(),
+            Some(head)
+        );
+    }
+    shutdown(&[&first.node, &second.node, &third.node, &replica.node]).await;
+}
+
 /// A reachable but stale member must not consume the one anti-entropy peer a
 /// round contacts and leave newer state waiting for a later interval.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
