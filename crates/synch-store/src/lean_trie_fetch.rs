@@ -313,22 +313,16 @@ mod tests {
         let trie = Trie::new(&source);
         let old = trie.insert(Hash::EMPTY, b"a", b"first").unwrap();
         let old = trie.insert(old, b"b", b"second").unwrap();
-        let retained = trie.reachable(old).unwrap();
-        let removed = *retained
-            .nodes
-            .iter()
-            .find(|hash| {
-                matches!(
-                    synch_mpt::TrieNode::decode(&source.get_node(hash).unwrap().unwrap()).unwrap(),
-                    synch_mpt::TrieNode::Leaf { .. }
-                )
-            })
-            .unwrap();
-        for hash in &retained.nodes {
-            destination
-                .put_node(hash, &source.get_node(hash).unwrap().unwrap())
-                .unwrap();
+        let removed = synch_mpt::TrieNode::Leaf {
+            key_rest: synch_mpt::Nibbles::new(),
+            value: synch_mpt::ValueRef::Inline(b"first".to_vec()),
         }
+        .hash();
+        assert!(source.has_node(&removed).unwrap());
+        let copy = Trie::new(&destination);
+        let copied = copy.insert(Hash::EMPTY, b"a", b"first").unwrap();
+        let copied = copy.insert(copied, b"b", b"second").unwrap();
+        assert_eq!(copied, old);
         assert!(Trie::new(&destination).is_complete(old).unwrap());
         let new = trie.insert(old, b"c", b"third").unwrap();
         let mut invalidated = false;
@@ -396,6 +390,81 @@ mod tests {
         assert_eq!(
             Trie::new(&destination).get(new, b"b").unwrap(),
             Some(b"second".to_vec())
+        );
+    }
+
+    #[test]
+    fn actual_fetch_reads_scale_with_the_initial_tree_and_then_the_change() {
+        let source = synch_mpt::MemStore::new();
+        let mut root = Hash::EMPTY;
+        for index in 0..2_000usize {
+            root = Trie::new(&source)
+                .insert(
+                    root,
+                    format!("f:media/dir{:02}/file{index:06}", index % 100).as_bytes(),
+                    &index.to_le_bytes(),
+                )
+                .unwrap();
+        }
+        let (_dir, destination) = store();
+        let pull = |root, reference| {
+            crate::lean_storage::take_byte_read_calls();
+            let mut requests = 0;
+            assert!(destination
+                .fetch_trie(
+                    root,
+                    &origin(),
+                    1,
+                    &Scope::full(),
+                    None,
+                    reference,
+                    64,
+                    3,
+                    |request| Some(match request {
+                        PeerRequest::Nodes { wants, .. } => {
+                            requests += wants.len();
+                            PeerReply::Nodes {
+                                served: wants
+                                    .iter()
+                                    .map(|(_, hash)| {
+                                        (
+                                            hash.clone(),
+                                            source
+                                                .get_node(&Hash::from_slice(hash).unwrap())
+                                                .unwrap()
+                                                .unwrap(),
+                                        )
+                                    })
+                                    .collect(),
+                                missing: vec![],
+                                redacted: vec![],
+                            }
+                        }
+                        PeerRequest::Values { .. } => panic!("fixture values are inline"),
+                    })
+                )
+                .unwrap()
+                .unwrap());
+            (requests, crate::lean_storage::take_byte_read_calls())
+        };
+        let (requests, reads) = pull(root, None);
+        assert!(
+            reads < requests * 4,
+            "{requests} transferred nodes caused {reads} reads"
+        );
+        let changed = Trie::new(&source)
+            .insert(root, b"f:media/dir00/file000000", b"changed")
+            .unwrap();
+        let (requests, reads) = pull(changed, Some(root));
+        assert!(
+            requests < 100 && reads < 100,
+            "one changed key caused {requests} transfers and {reads} local reads"
+        );
+        assert_eq!(
+            Trie::new(&destination)
+                .get(changed, b"f:media/dir00/file000000")
+                .unwrap(),
+            Some(b"changed".to_vec())
         );
     }
 }

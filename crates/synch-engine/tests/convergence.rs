@@ -368,22 +368,57 @@ fn wire_case(seed: u64) {
     }
 }
 
-/// Copies every trie node and value under `root` between stores — `GetNodes`/
-/// `GetValues` without a transport; the walk itself is covered over real
-/// endpoints in `two_nodes.rs`.
+/// Copies a version through the actual requesting operation, with raw source
+/// store replies replacing the network transport.
 fn copy_trie(from: &Node, to: &Node, root: Hash) {
     use synch_mpt::NodeStore;
-    let reachable = synch_mpt::Trie::new(from.store.as_ref())
-        .reachable(root)
-        .expect("the reachable set");
-    for hash in reachable.nodes {
-        if let Some(bytes) = NodeStore::get_node(from.store.as_ref(), &hash).expect("a node") {
-            NodeStore::put_node(to.store.as_ref(), &hash, &bytes).expect("the put");
-        }
-    }
-    for hash in reachable.values {
-        if let Some(bytes) = NodeStore::get_value(from.store.as_ref(), &hash).expect("a value") {
-            NodeStore::put_value(to.store.as_ref(), &hash, &bytes).expect("the put");
-        }
-    }
+    use synch_verified::suspend::{PeerReply, PeerRequest};
+    let origin = synch_core::OriginId::named("fixture", "example.test").unwrap();
+    assert!(to
+        .store
+        .fetch_trie(
+            root,
+            &origin,
+            1,
+            &synch_mpt::Scope::full(),
+            None,
+            None,
+            256,
+            3,
+            |request| Some(match request {
+                PeerRequest::Nodes { wants, .. } => PeerReply::Nodes {
+                    served: wants
+                        .iter()
+                        .map(|(_, hash)| (
+                            hash.clone(),
+                            NodeStore::get_node(
+                                from.store.as_ref(),
+                                &Hash::from_slice(hash).unwrap()
+                            )
+                            .unwrap()
+                            .unwrap()
+                        ))
+                        .collect(),
+                    missing: vec![],
+                    redacted: vec![],
+                },
+                PeerRequest::Values { wants, .. } => PeerReply::Values {
+                    served: wants
+                        .iter()
+                        .map(|(_, hash)| (
+                            hash.clone(),
+                            NodeStore::get_value(
+                                from.store.as_ref(),
+                                &Hash::from_slice(hash).unwrap()
+                            )
+                            .unwrap()
+                            .unwrap()
+                        ))
+                        .collect(),
+                    missing: vec![],
+                },
+            })
+        )
+        .unwrap()
+        .unwrap());
 }

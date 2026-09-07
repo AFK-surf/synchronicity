@@ -11,6 +11,17 @@ use synch_verified::host::{
 
 use crate::{Result, StoreError};
 
+#[cfg(test)]
+thread_local! {
+    static BYTE_READ_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
+}
+
+/// Counts raw native commands on this test thread, without interpreting trie shape.
+#[cfg(test)]
+pub(crate) fn take_byte_read_calls() -> usize {
+    BYTE_READ_CALLS.with(|calls| calls.replace(0))
+}
+
 /// Raw keyed resources; no CAS protection or cleanup policy is interpreted here.
 pub(crate) struct Resources<'a>(pub(crate) &'a crate::Store);
 
@@ -258,6 +269,8 @@ impl Storage for Session<'_> {
     }
 
     fn read_bytes(&mut self, space: &str, key: &[u8]) -> Result<Option<Vec<u8>>> {
+        #[cfg(test)]
+        BYTE_READ_CALLS.with(|calls| calls.set(calls.get() + 1));
         if let Some(storage) = self.active.as_mut() {
             storage.read_bytes(space, key)
         } else {

@@ -158,17 +158,6 @@ impl TrieNode {
         }
     }
 
-    /// The hashes of this node's child nodes.
-    pub(crate) fn child_hashes(&self) -> Vec<Hash> {
-        match self {
-            TrieNode::Leaf { .. } => Vec::new(),
-            TrieNode::Ext { child, .. } => vec![*child],
-            TrieNode::Branch { children, .. } | TrieNode::Route { children, .. } => {
-                children.iter().flatten().copied().collect()
-            }
-        }
-    }
-
     /// The hashes of any out-of-line values this node references.
     pub fn value_hashes(&self) -> Vec<Hash> {
         match self {

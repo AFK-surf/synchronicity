@@ -21,8 +21,6 @@ use std::{
 };
 
 use synch_core::{now_ns, DeclaredScope, Hash, HeadSummary, OriginId, SignedHead, MAX_BATCH};
-#[cfg(test)]
-use synch_mpt::TrieNode;
 use synch_mpt::{Scope, Trie};
 use synch_store::{PublishScope, Slot, Store};
 
@@ -1442,78 +1440,6 @@ fn serves_trie(
     })
 }
 
-/// Verifies one batch of what a peer served and commits it, refusing anything
-/// that was not asked for.
-///
-/// Three things are checked and all three are containment: a payload has to hash
-/// to the hash it was requested by, it has to be one of the hashes this walk
-/// asked for, and it may appear only once. Without the second, a peer answering
-/// every request with `missing` plus one self-consistent pair of its own counts
-/// as progress on every round — the unproductive counter never fires, the fetch
-/// loop never ends, and the junk lands in the trie tables.
-///
-/// The third is what bounds the answer's *size*. A request is capped at
-/// [`MAX_BATCH`] hashes, but the response it draws is capped only by the frame
-/// length: a peer could answer 256 wanted hashes with a 16 MiB frame repeating
-/// one of them, every entry passing both other checks, and each repeat costs an
-/// autocommit `INSERT OR IGNORE` on the store's single write connection — so a
-/// cheap request would buy six figures of serialized statements, blocking every
-/// other database user in the process. Counting repeats as `learned` would also
-/// defeat the [`MAX_UNPRODUCTIVE_ROUNDS`] escape, since a peer serving one real
-/// node and 10^5 copies of it makes progress forever.
-///
-/// Nodes and values differ only in how a payload is verified, where it is
-/// stored and which error names it, so the checks live here rather than in two
-/// loops that have to be kept in step. `verify` says whether a payload is the
-/// one asked for and, when it is not acceptable, *whose* fault that is: a
-/// `NetError` is the peer's and ends the exchange, an origin fault is
-/// contained to the origin ([`is_origin_fault`]).
-///
-/// The third check is now a backstop rather than the bound it was: `Nodes.nodes`
-/// and `Values.values` are capped at [`MAX_BATCH`] *while decoding*, so a
-/// response cannot carry more entries than the request carried hashes. It stays
-/// because the containment set is what enforces it either way, and because a
-/// repeat must not count as progress even if one arrives.
-///
-/// Returns how many were stored.
-#[cfg(test)]
-fn take_served(
-    requested: &[synch_core::Hash],
-    served: &[(synch_core::Hash, Vec<u8>)],
-    what: &str,
-    verify: impl Fn(&synch_core::Hash, &[u8]) -> Result<()>,
-    put: impl Fn(&synch_core::Hash, &[u8]) -> Result<bool>,
-) -> Result<usize> {
-    // A wanted hash can be asked for once and so may be answered once. The set
-    // is built from the request, never from the response, so the peer cannot
-    // grow it.
-    let mut outstanding: std::collections::HashSet<synch_core::Hash> =
-        requested.iter().copied().collect();
-    let mut stored = 0usize;
-    for (hash, bytes) in served {
-        // `remove` is the containment check and the repeat check at once: a
-        // hash that was never asked for is not in the set, and one already
-        // served has been taken out of it.
-        if !outstanding.remove(hash) {
-            return Err(EngineError::Net(NetError::Unexpected(format!(
-                "peer served unrequested or repeated trie {what} {hash}"
-            ))));
-        }
-        // A malicious or corrupt peer can withhold, never inject.
-        verify(hash, bytes)?;
-        // `put` decides whether the payload is one this node will keep: a rule
-        // about what the *origin* published — a value small enough to be inline,
-        // or one past the size ceiling — refuses the payload without failing the
-        // batch. Refused payloads are not progress, so the unproductive counter
-        // still runs and the head is retired by the §5.2 rule rather than by the
-        // TTL sweep half an hour later.
-        if put(hash, bytes)? {
-            stored += 1;
-        }
-    }
-    Ok(stored)
-}
-
 fn fetch_operation_error(
     error: synch_verified::trie::OperationError<synch_store::StoreError>,
 ) -> EngineError {
@@ -1582,47 +1508,6 @@ fn fetch_domain_error(error: synch_verified::trie::TrieFetchDomainError) -> Engi
         }),
         Fetch::Exhausted => EngineError::invalid("the requesting operation outran its work budget"),
     }
-}
-
-/// Whether served node bytes are the node they were requested as, and whose
-/// fault it is when they are not.
-///
-/// Two failures look alike and must not be treated alike. Bytes that hash to
-/// nothing wanted are the *peer's*: a corrupt or hostile relay, which ends the
-/// exchange. Bytes that hash to the requested hash under their own kind's tag
-/// but that this build refuses — a non-canonical encoding, a key run past
-/// `MAX_KEY_LEN`, a broken structural invariant — are the *origin's*: the hash
-/// covers the raw bytes, so no relay could have produced them, and §12 says a
-/// record this node cannot apply fails its own origin and no other. Reporting
-/// the second as the first aborted every exchange with every peer serving
-/// that origin, at whichever origin sorted after it, and left the head pending
-/// for the sweep to retire and the next exchange to re-adopt.
-#[cfg(test)]
-fn verify_node(expected: &synch_core::Hash, bytes: &[u8]) -> Result<()> {
-    // The decision is the Lean operation `Trie.verify`; a host or transport
-    // failure of that operation is this node's own, not a verdict.
-    match TrieNode::verify_served(expected, bytes)? {
-        synch_mpt::Verdict::Accepted => Ok(()),
-        synch_mpt::Verdict::OriginFault(refused) => Err(EngineError::Mpt(refused)),
-        synch_mpt::Verdict::PeerFault => Err(EngineError::Net(NetError::NodeHashMismatch {
-            expected: *expected,
-        })),
-    }
-}
-
-/// Whether served value bytes are the payload they were requested as.
-///
-/// A value has no shape to refuse at this point: the bounds on what an origin
-/// may put in one are applied by the `put` that follows, which refuses the
-/// payload without failing the batch.
-#[cfg(test)]
-fn verify_value(expected: &synch_core::Hash, bytes: &[u8]) -> Result<()> {
-    if &synch_core::Hash::new(bytes) == expected {
-        return Ok(());
-    }
-    Err(EngineError::Net(NetError::ValueHashMismatch {
-        expected: *expected,
-    }))
 }
 
 /// The serve side's view of the reconciler (§5.2).
@@ -1941,105 +1826,6 @@ mod tests {
         // A head at a later seq is the origin moving on, and is taken normally.
         let next = SignedHead::sign(&key, origin, 2, Hash([1u8; 32]), 0);
         assert!(syncer.offer_head(&next, 0).unwrap().accepted());
-    }
-
-    /// §5.2 containment: only requested hashes, each once, hash-verified —
-    /// the injection and amplification bounds on trie fetch.
-    #[test]
-    fn a_peer_may_not_answer_with_what_was_not_asked_for() {
-        let wanted = Hash::new(b"wanted");
-        let junk = b"nobody asked for this".to_vec();
-        let unrequested = Hash::new(&junk);
-        let stored = std::cell::RefCell::new(Vec::new());
-        let take = |requested: &[Hash], served: &[(Hash, Vec<u8>)]| {
-            take_served(requested, served, "value", verify_value, |hash, _| {
-                stored.borrow_mut().push(*hash);
-                Ok(true)
-            })
-        };
-
-        let err = take(&[wanted], &[(unrequested, junk.clone())])
-            .expect_err("an unrequested value is refused");
-        assert!(err.to_string().contains("unrequested"), "{err}");
-        assert!(stored.borrow().is_empty(), "and nothing was written");
-
-        // What was asked for is taken, and a payload that does not hash to the
-        // hash it was requested by is still refused on its own terms.
-        assert_eq!(take(&[unrequested], &[(unrequested, junk)]).unwrap(), 1);
-        assert!(matches!(
-            take(
-                &[unrequested],
-                &[(unrequested, b"different bytes".to_vec())]
-            ),
-            Err(EngineError::Net(NetError::ValueHashMismatch { .. }))
-        ));
-        assert_eq!(*stored.borrow(), vec![unrequested]);
-
-        // One wanted node repeated would pass containment and cost an insert
-        // apiece; the repeat is refused, and counting it as progress would
-        // defeat `MAX_UNPRODUCTIVE_ROUNDS`.
-        stored.borrow_mut().clear();
-        let dup = b"a node that really was asked for".to_vec();
-        let dup_hash = Hash::new(&dup);
-        let err = take(&[dup_hash], &[(dup_hash, dup.clone()), (dup_hash, dup)])
-            .expect_err("a repeat is refused");
-        assert!(err.to_string().contains("repeated"), "{err}");
-        assert_eq!(
-            *stored.borrow(),
-            vec![dup_hash],
-            "taken before the repeat was seen"
-        );
-
-        stored.borrow_mut().clear();
-        let other = b"a second wanted node".to_vec();
-        let other_hash = Hash::new(&other);
-        assert_eq!(
-            take(
-                &[dup_hash, other_hash],
-                &[
-                    (dup_hash, b"a node that really was asked for".to_vec()),
-                    (other_hash, other),
-                ],
-            )
-            .unwrap(),
-            2
-        );
-    }
-
-    /// §12: served bytes that hash to what was asked for but break a
-    /// structural invariant are the origin's fault; bytes that hash to
-    /// nothing wanted are the peer's. The two must classify apart, because one
-    /// is contained to an origin and the other ends the exchange.
-    #[test]
-    fn a_refused_node_shape_is_the_origins_fault_and_wrong_bytes_are_the_peers() {
-        let value = synch_mpt::ValueRef::Inline(b"x".to_vec());
-        let leaf = synch_mpt::TrieNode::Leaf {
-            key_rest: synch_mpt::Nibbles::from_nibbles(&[1, 2, 3]),
-            value,
-        };
-        let mut children = [None; 16];
-        children[6] = Some(leaf.hash());
-        let lonely = synch_mpt::TrieNode::Branch {
-            children,
-            value: None,
-        };
-        let (bytes, hash) = (lonely.encode(), lonely.hash());
-        assert!(synch_mpt::TrieNode::hash_of_encoded(&bytes).is_err());
-
-        let err = verify_node(&hash, &bytes).expect_err("an under-occupied branch is refused");
-        assert!(is_origin_fault(&err), "{err}");
-        let err = verify_node(&Hash::new(b"something else"), &bytes)
-            .expect_err("bytes that hash to nothing wanted are refused");
-        assert!(!is_origin_fault(&err), "{err}");
-        assert!(matches!(
-            err,
-            EngineError::Net(NetError::NodeHashMismatch { .. })
-        ));
-        let good = leaf.encode();
-        verify_node(&leaf.hash(), &good).expect("a canonical node verifies");
-        assert!(!is_origin_fault(
-            &verify_node(&hash, &good).expect_err("the wrong node is the peer's")
-        ));
     }
 
     #[test]

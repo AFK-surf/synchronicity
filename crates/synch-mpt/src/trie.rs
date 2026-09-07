@@ -1,7 +1,5 @@
 //! Trie operations: get, insert, remove, iterate, and completeness walks (§4.3).
 
-use std::collections::HashSet;
-
 use synch_core::{Hash, OriginId, MAX_KEY_LEN};
 
 use crate::{
@@ -54,15 +52,6 @@ pub(crate) fn root_opt(root: Hash) -> Option<Hash> {
 
 /// A key/value pair as yielded by iteration and range scans.
 pub type Entry = (Vec<u8>, Vec<u8>);
-
-/// Everything reachable from a root, for mark-and-sweep GC (§5.4).
-#[derive(Debug, Clone, Default)]
-pub struct Reachable {
-    /// Reachable trie node hashes.
-    pub nodes: HashSet<Hash>,
-    /// Reachable out-of-line value hashes.
-    pub values: HashSet<Hash>,
-}
 
 /// A trie rooted in a content-addressed [`NodeStore`].
 ///
@@ -383,49 +372,6 @@ impl<'a, S: NodeStore + ?Sized> Trie<'a, S> {
             }
         }
         Ok(None)
-    }
-
-    /// Everything reachable from `root`, for mark-and-sweep GC (§5.4).
-    ///
-    /// Missing nodes are skipped rather than raising: GC must be able to mark
-    /// from a partially fetched pending head without failing.
-    pub fn reachable(&self, root: Hash) -> Result<Reachable, MptError> {
-        let mut out = Reachable::default();
-        self.reach_into(root, &mut out)?;
-        Ok(out)
-    }
-
-    /// The same walk, accumulating into a mark set that already holds what
-    /// earlier roots reached.
-    ///
-    /// Successive roots of one origin share all but the path that changed
-    /// (§4.3), so walking each retained root into a fresh set would re-read the
-    /// entire trie once per root: `head_history` keeps a row per publish for
-    /// `root_retention` (7 days), thousands of roots, all inside the single
-    /// `BEGIN IMMEDIATE` that holds the one write connection, every five
-    /// minutes. Sharing the visited set collapses that to one walk of the live
-    /// node set plus each root's own delta — what §5.4's "runs incrementally"
-    /// means.
-    ///
-    /// A hash already in `out.nodes` has had its subtree walked by definition,
-    /// so skipping it is exactly the dedup the single-root walk does.
-    pub fn reach_into(&self, root: Hash, out: &mut Reachable) -> Result<(), MptError> {
-        let mut frontier = match root_opt(root) {
-            None => return Ok(()),
-            Some(h) => vec![h],
-        };
-        while let Some(hash) = frontier.pop() {
-            if !out.nodes.insert(hash) {
-                continue;
-            }
-            let Some(data) = Self::wrap(self.store.get_node(&hash))? else {
-                continue;
-            };
-            let node = TrieNode::decode(&data)?;
-            frontier.extend(node.child_hashes());
-            out.values.extend(node.value_hashes());
-        }
-        Ok(())
     }
 }
 

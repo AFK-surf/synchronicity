@@ -44,4 +44,4 @@ pub use node::{TrieNode, ValueRef, Verdict};
 pub use proof::Proof;
 pub use scope::Scope;
 pub use store::{MemStore, NodeStore};
-pub use trie::{Entry, Reachable, Trie};
+pub use trie::{Entry, Trie};

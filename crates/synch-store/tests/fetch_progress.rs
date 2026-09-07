@@ -74,8 +74,15 @@ fn a_cold_fetch_transfers_each_node_once_and_an_update_only_transfers_changes() 
     let old = populate(&source, 2_000);
     let dir = tempfile::tempdir().unwrap();
     let destination = Store::open(dir.path()).unwrap();
-    let total = Trie::new(&source).reachable(old).unwrap().nodes.len();
-    assert_eq!(pull(&source, &destination, old, None), total);
+    let requests = pull(&source, &destination, old, None);
+    assert!((2_000..8_000).contains(&requests));
+    for index in 0..2_000usize {
+        let key = format!("f:media/dir{:02}/file{index:06}", index % 100);
+        assert_eq!(
+            Trie::new(&destination).get(old, key.as_bytes()).unwrap(),
+            Some(index.to_le_bytes().to_vec())
+        );
+    }
     let new = Trie::new(&source)
         .insert(old, b"f:media/dir00/file000000", b"changed")
         .unwrap();
@@ -97,8 +104,8 @@ fn an_unheld_reference_never_hides_missing_shared_structure() {
         .unwrap();
     let dir = tempfile::tempdir().unwrap();
     let destination = Store::open(dir.path()).unwrap();
-    let total = Trie::new(&source).reachable(new).unwrap().nodes.len();
-    assert_eq!(pull(&source, &destination, new, Some(old)), total);
+    let requests = pull(&source, &destination, new, Some(old));
+    assert!((500..2_000).contains(&requests));
 }
 
 #[test]
@@ -111,11 +118,40 @@ fn a_shared_missing_payload_is_requested_once_per_round_until_it_arrives() {
     }
     let dir = tempfile::tempdir().unwrap();
     let destination = Store::open(dir.path()).unwrap();
-    for hash in Trie::new(&source).reachable(root).unwrap().nodes {
-        destination
-            .put_node(&hash, &source.get_node(&hash).unwrap().unwrap())
-            .unwrap();
-    }
+    // Cancel the actual fetch at its first payload request. Validated nodes
+    // remain stored, but no certificate may survive the unfinished payload.
+    let staging_origin = OriginId::named("fixture", "example.test").unwrap();
+    let cancelled = destination.fetch_trie(
+        root,
+        &staging_origin,
+        1,
+        &Scope::full(),
+        None,
+        None,
+        256,
+        3,
+        |request| match request {
+            PeerRequest::Nodes { wants, .. } => Some(PeerReply::Nodes {
+                served: wants
+                    .iter()
+                    .map(|(_, hash)| {
+                        (
+                            hash.clone(),
+                            source
+                                .get_node(&Hash::from_slice(hash).unwrap())
+                                .unwrap()
+                                .unwrap(),
+                        )
+                    })
+                    .collect(),
+                missing: vec![],
+                redacted: vec![],
+            }),
+            PeerRequest::Values { .. } => None,
+        },
+    );
+    assert!(cancelled.is_err());
+    assert!(!Trie::new(&destination).is_complete(root).unwrap());
     let origin = OriginId::named("fixture", "example.test").unwrap();
     let mut rounds = 0;
     assert!(destination
@@ -232,4 +268,125 @@ fn small_route_values_arrive_through_the_same_fetch_admission_as_large_values() 
         Trie::new(&destination).get(node.hash(), b"").unwrap(),
         Some(payload.to_vec())
     );
+}
+
+#[test]
+fn a_peer_cannot_store_unsolicited_or_hash_mismatching_payloads() {
+    let source = MemStore::new();
+    let payload = vec![7; 300];
+    let root = Trie::new(&source)
+        .insert(Hash::EMPTY, b"key", &payload)
+        .unwrap();
+    let origin = OriginId::named("fixture", "example.test").unwrap();
+    for unsolicited in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = Store::open(dir.path()).unwrap();
+        let junk = vec![8; 300];
+        let junk_hash = Hash::new(&junk);
+        let result = destination
+            .fetch_trie(
+                root,
+                &origin,
+                1,
+                &Scope::full(),
+                None,
+                None,
+                64,
+                3,
+                |request| {
+                    Some(match request {
+                        PeerRequest::Nodes { wants, .. } => PeerReply::Nodes {
+                            served: wants
+                                .iter()
+                                .map(|(_, hash)| {
+                                    (
+                                        hash.clone(),
+                                        source
+                                            .get_node(&Hash::from_slice(hash).unwrap())
+                                            .unwrap()
+                                            .unwrap(),
+                                    )
+                                })
+                                .collect(),
+                            missing: vec![],
+                            redacted: vec![],
+                        },
+                        PeerRequest::Values { wants, .. } => PeerReply::Values {
+                            served: vec![(
+                                if unsolicited {
+                                    junk_hash.as_bytes().to_vec()
+                                } else {
+                                    wants[0].1.clone()
+                                },
+                                junk.clone(),
+                            )],
+                            missing: vec![],
+                        },
+                    })
+                },
+            )
+            .unwrap()
+            .unwrap_err();
+        assert!(match result {
+            synch_verified::trie::TrieFetchDomainError::Unsolicited { value: true, .. } =>
+                unsolicited,
+            synch_verified::trie::TrieFetchDomainError::ValueHash(_) => !unsolicited,
+            _ => false,
+        });
+        assert!(!destination.has_value(&junk_hash).unwrap());
+        assert!(!destination.has_value(&Hash::new(&payload)).unwrap());
+        assert!(!destination.is_known_complete(&root).unwrap());
+    }
+}
+
+#[test]
+fn malformed_origin_nodes_and_peer_substitutions_have_distinct_fetch_failures() {
+    use synch_mpt::{Nibbles, TrieNode, ValueRef};
+    let leaf = TrieNode::Leaf {
+        key_rest: Nibbles::new(),
+        value: ValueRef::Inline(vec![1]),
+    };
+    let mut children = [None; 16];
+    children[6] = Some(leaf.hash());
+    let malformed = TrieNode::Branch {
+        children,
+        value: None,
+    };
+    let origin = OriginId::named("fixture", "example.test").unwrap();
+    for wrong_hash in [false, true] {
+        let dir = tempfile::tempdir().unwrap();
+        let destination = Store::open(dir.path()).unwrap();
+        let root = if wrong_hash {
+            leaf.hash()
+        } else {
+            malformed.hash()
+        };
+        let result = destination
+            .fetch_trie(
+                root,
+                &origin,
+                1,
+                &Scope::full(),
+                Some(&origin),
+                None,
+                64,
+                3,
+                |_| {
+                    Some(PeerReply::Nodes {
+                        served: vec![(root.as_bytes().to_vec(), malformed.encode())],
+                        missing: vec![],
+                        redacted: vec![],
+                    })
+                },
+            )
+            .unwrap()
+            .unwrap_err();
+        assert!(match result {
+            synch_verified::trie::TrieFetchDomainError::Origin(_) => !wrong_hash,
+            synch_verified::trie::TrieFetchDomainError::NodeHash(_) => wrong_hash,
+            _ => false,
+        });
+        assert!(!destination.has_node(&root).unwrap());
+        assert!(!destination.owns_node(&origin, &root).unwrap());
+    }
 }

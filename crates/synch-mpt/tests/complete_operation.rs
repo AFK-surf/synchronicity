@@ -12,6 +12,7 @@ use synch_mpt::{MemStore, NodeStore, Scope, Trie};
 struct Observed {
     bytes: MemStore,
     calls: RefCell<Vec<&'static str>>,
+    payload_bytes_read: Cell<usize>,
     known: RefCell<HashSet<Hash>>,
     epoch: Cell<u64>,
     fail_at: Cell<Option<usize>>,
@@ -58,7 +59,10 @@ impl NodeStore for Observed {
 
     fn get_value(&self, hash: &Hash) -> io::Result<Option<Vec<u8>>> {
         self.step("value_payload")?;
-        Ok(self.bytes.get_value(hash).unwrap())
+        let bytes = self.bytes.get_value(hash).unwrap();
+        self.payload_bytes_read
+            .set(self.payload_bytes_read.get() + bytes.as_ref().map_or(0, Vec::len));
+        Ok(bytes)
     }
 
     fn put_value(&self, hash: &Hash, bytes: &[u8]) -> io::Result<()> {
@@ -299,4 +303,40 @@ fn an_oversized_held_route_payload_cannot_be_certified() {
     store.put_node(&route.hash(), &route.encode()).unwrap();
     assert!(Trie::new(&store).is_complete(route.hash()).is_err());
     assert!(store.known.borrow().is_empty());
+}
+
+#[test]
+#[ignore = "120k-entry addressed-value validation cost measurement"]
+fn addressed_payload_validation_at_the_documented_corpus_size() {
+    let store = Observed::default();
+    let source = Trie::new(&store.bytes);
+    let mut root = Hash::EMPTY;
+    // Distinct metadata-sized payloads expose the new byte-read cost without
+    // making the fixture itself exceed the bounded validation environment.
+    let mut payload = vec![7; 1024];
+    for index in 0..120_000u32 {
+        payload[..4].copy_from_slice(&index.to_le_bytes());
+        root = source
+            .insert(
+                root,
+                format!("f:media/dir{:02}/file{index:06}", index % 100).as_bytes(),
+                &payload,
+            )
+            .unwrap();
+    }
+    let started = std::time::Instant::now();
+    assert!(Trie::new(&store).is_complete(root).unwrap());
+    let elapsed = started.elapsed();
+    let reads = store
+        .calls
+        .borrow()
+        .iter()
+        .filter(|call| **call == "node")
+        .count();
+    assert!(reads < 4 * 120_000);
+    assert_eq!(store.payload_bytes_read.get(), 120_000 * payload.len());
+    eprintln!(
+        "120k-entry addressed completeness: {elapsed:?}; {reads} node reads; {} payload bytes read",
+        store.payload_bytes_read.get()
+    );
 }

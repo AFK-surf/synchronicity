@@ -1225,7 +1225,7 @@ mod tests {
                     value: synch_mpt::ValueRef::Hash(value),
                 };
                 let encoded = leaf.encode();
-                let hash = Hash::new(&encoded);
+                let hash = leaf.hash();
                 synch_mpt::NodeStore::put_node(store.as_ref(), &hash, &encoded).unwrap();
                 *slot = Some(hash);
             }
@@ -1234,7 +1234,7 @@ mod tests {
                 value: None,
             };
             let encoded = root_node.encode();
-            let root = Hash::new(&encoded);
+            let root = root_node.hash();
             synch_mpt::NodeStore::put_node(store.as_ref(), &root, &encoded).unwrap();
             root
         };
@@ -1250,42 +1250,68 @@ mod tests {
             2_000,
         );
 
-        // The positions a requester would name: every node, none of the values.
+        // Record the actual requesting operation's payload positions. Its
+        // admission rejects oversized legacy values; retries must name the
+        // same address rather than manufacturing progress from those bytes.
         let positions = |root: Hash| -> (tempfile::TempDir, Vec<(Vec<u8>, Hash)>) {
+            use synch_verified::suspend::{PeerReply, PeerRequest};
             let (dir, bare) = test_store();
-            let reachable = Trie::new(store.as_ref()).reachable(root).unwrap();
-            for node in &reachable.nodes {
-                let bytes = synch_mpt::NodeStore::get_node(store.as_ref(), node)
-                    .unwrap()
-                    .unwrap();
-                synch_mpt::NodeStore::put_node(bare.as_ref(), node, &bytes).unwrap();
-            }
             let mut values = Vec::new();
             let origin = synch_core::OriginId::named("fixture", "example.test").unwrap();
-            let _cancelled = bare.fetch_trie(
-                root,
-                &origin,
-                1,
-                &synch_mpt::Scope::full(),
-                None,
-                None,
-                MAX_BATCH as u64,
-                3,
-                |request| {
-                    match request {
-                        synch_verified::suspend::PeerRequest::Nodes { .. } => {
-                            panic!("every node was copied across")
-                        }
-                        synch_verified::suspend::PeerRequest::Values { wants, .. } => {
-                            values = wants
-                                .iter()
-                                .map(|(path, hash)| (path.clone(), Hash::from_slice(hash).unwrap()))
-                                .collect();
-                        }
-                    }
-                    None
-                },
-            );
+            let result = bare
+                .fetch_trie(
+                    root,
+                    &origin,
+                    1,
+                    &synch_mpt::Scope::full(),
+                    None,
+                    None,
+                    MAX_BATCH as u64,
+                    3,
+                    |request| {
+                        Some(match request {
+                            PeerRequest::Nodes { wants, .. } => PeerReply::Nodes {
+                                served: wants
+                                    .iter()
+                                    .map(|(_, hash)| {
+                                        (
+                                            hash.clone(),
+                                            synch_mpt::NodeStore::get_node(
+                                                store.as_ref(),
+                                                &Hash::from_slice(hash).unwrap(),
+                                            )
+                                            .unwrap()
+                                            .unwrap(),
+                                        )
+                                    })
+                                    .collect(),
+                                missing: vec![],
+                                redacted: vec![],
+                            },
+                            PeerRequest::Values { wants, .. } => PeerReply::Values {
+                                served: wants
+                                    .iter()
+                                    .map(|(path, hash)| {
+                                        let key = Hash::from_slice(hash).unwrap();
+                                        if !values.iter().any(|(_, existing)| *existing == key) {
+                                            values.push((path.clone(), key));
+                                        }
+                                        (
+                                            hash.clone(),
+                                            synch_mpt::NodeStore::get_value(store.as_ref(), &key)
+                                                .unwrap()
+                                                .unwrap(),
+                                        )
+                                    })
+                                    .collect(),
+                                missing: vec![],
+                            },
+                        })
+                    },
+                )
+                .unwrap()
+                .unwrap();
+            assert_eq!(result, root == ceiling_root);
             assert!(!values.is_empty());
             (dir, values)
         };
