@@ -503,4 +503,135 @@ theorem branch_one_write (digestWidth : Width d) (shaped : Shaped before)
   exact ⟨included, finalShape, rootWidth, rootClosed,
     fun _ _ => (entries _ _).trans (branch_one_entries bound)⟩
 
+private theorem branch_one_wrap (digestWidth : Width d) (shaped : Shaped before)
+    {position : UInt8} (bound : position.toNat < 16)
+    (nibbles : Nibbles segment) (small : segment.length < 2 ^ 64)
+    (childWidth : child.size = 32) (childClosed : Closed before.read child)
+    (ownValid : ValueOk own) (ownClosed : ∃ bytes, ValueDenotes before.read own bytes)
+    (safe : SafeWrites d before (do
+      let branch ← put (.branch (setChild emptyChildren position (some child)) (some own))
+      wrapInExtension segment branch).run)
+    (ran : execute d before (do
+      let branch ← put (.branch (setChild emptyChildren position (some child)) (some own))
+      wrapInExtension segment branch).run = some (.ok root, after)) :
+    RecordsIncluded before.read after.read ∧ Shaped after ∧ root.size = 32 ∧ Closed after.read root ∧
+      ∀ key bytes, GraphValue after.read root key bytes ↔
+        (key = segment ∧ ValueDenotes before.read own bytes) ∨
+          ∃ tail, key = segment ++ position :: tail ∧ GraphValue before.read child tail bytes := by
+  simp only [run_bind] at safe
+  have firstSafe := safe_bind_left _ safe
+  rw [execute_run_bind] at ran
+  cases first : execute d before
+      (put (.branch (setChild emptyChildren position (some child)) (some own))).run with
+  | none => simp [first] at ran
+  | some reply =>
+    obtain ⟨reply, middle⟩ := reply
+    cases reply with
+    | error error => simp [first] at ran
+    | ok branch =>
+      have restSafe := safe_bind_right _ safe first
+      simp only [bindCont_ok] at restSafe
+      simp only [first] at ran
+      obtain ⟨included, middleShape, branchWidth, branchClosed, branchEntries⟩ :=
+        branch_one_write digestWidth shaped bound childWidth childClosed ownValid ownClosed firstSafe first
+      obtain ⟨laterIncluded, finalShape, rootWidth, rootClosed, entries⟩ :=
+        wrap_exact digestWidth middleShape nibbles small branchWidth branchClosed restSafe ran
+      refine ⟨fun space key bytes admitted held => laterIncluded space key bytes admitted
+        (included space key bytes admitted held), finalShape, rootWidth, rootClosed, ?_⟩
+      intro key bytes
+      rw [entries]
+      constructor
+      · rintro ⟨tail, spelling, meaning⟩
+        rcases (branchEntries tail bytes).mp meaning with ⟨rfl, ownMeaning⟩ | ⟨below, rfl, childMeaning⟩
+        · exact Or.inl ⟨by simpa using spelling, ownMeaning⟩
+        · exact Or.inr ⟨below, spelling, childMeaning⟩
+      · rintro (⟨rfl, ownMeaning⟩ | ⟨tail, rfl, childMeaning⟩)
+        · exact ⟨[], by simp, (branchEntries [] bytes).mpr (Or.inl ⟨rfl, ownMeaning⟩)⟩
+        · exact ⟨position :: tail, rfl,
+            (branchEntries _ bytes).mpr (Or.inr ⟨tail, rfl, childMeaning⟩)⟩
+
+/-- When the old key is a proper prefix of the inserted key, the actual split
+retains its payload at the ancestor and adds precisely the new descendant. -/
+theorem split_leaf_old_prefix (digestWidth : Width d) (shaped : Shaped before)
+    (keyNibbles : Nibbles key)
+    (small : key.length < 2 ^ 64) (different : suffix ≠ key)
+    (oldValid : ValueOk old) (oldClosed : ∃ bytes, ValueDenotes before.read old bytes)
+    (valueValid : ValueOk value) (valueMeaning : ValueDenotes before.read value bytes)
+    (oldEnds : suffix.drop (commonPrefix suffix key) = [])
+    {position : UInt8} (newContinues : key.drop (commonPrefix suffix key) = position :: tail)
+    (safe : SafeWrites d before (splitLeaf suffix old key value).run)
+    (ran : execute d before (splitLeaf suffix old key value).run = some (.ok root, after)) :
+    RecordsIncluded before.read after.read ∧ Shaped after ∧ root.size = 32 ∧ Closed after.read root ∧
+      ∀ probe result, GraphValue after.read root probe result ↔
+        Overwrite (NodeEntries before.read (.leaf (nibblesOf suffix) old)) key bytes probe result := by
+  have beqDifferent : (suffix == key) = false := beq_eq_false_iff_ne.mpr different
+  simp only [splitLeaf, beqDifferent, Bool.false_eq_true, ↓reduceIte, oldEnds, newContinues] at safe ran
+  have tailNibbles : Nibbles tail := nibbles_tail (newContinues ▸ nibbles_drop keyNibbles _)
+  have tailSmall : tail.length < 2 ^ 64 := by
+    have length := congrArg List.length newContinues
+    simp only [List.length_drop, List.length_cons] at length
+    omega
+  have bound : position.toNat < 16 := by
+    have := nibbles_head (newContinues ▸ nibbles_drop keyNibbles _)
+    omega
+  have leafWf : (Node.leaf (nibblesOf tail) value).wf :=
+    ⟨nibblesOf_wf tailNibbles tailSmall, valueValid.1⟩
+  simp only [run_bind] at safe
+  have firstSafe := safe_bind_left _ safe
+  rw [execute_run_bind] at ran
+  cases first : execute d before (put (.leaf (nibblesOf tail) value)).run with
+  | none => simp [first] at ran
+  | some reply =>
+    obtain ⟨reply, middle⟩ := reply
+    cases reply with
+    | error error => simp [first] at ran
+    | ok child =>
+      have restSafe := safe_bind_right _ safe first
+      simp only [bindCont_ok] at restSafe
+      simp only [first] at ran
+      obtain ⟨included, middleShape, childWidth, childClosed, _⟩ :=
+        put_exact digestWidth shaped leafWf (by simpa [checkInvariants] using valueValid.2)
+          ⟨bytes, valueMeaning⟩ firstSafe first
+      have oldAfter : ∃ result, ValueDenotes middle.read old result :=
+        node_closed_preserved (node := .leaf ByteArray.empty old) oldClosed included
+      have oldSame : ∀ result, ValueDenotes middle.read old result ↔ ValueDenotes before.read old result := by
+        intro result
+        simpa [NodeEntries] using (node_entries_unchanged (node := .leaf ByteArray.empty old)
+          (key := []) (bytes := result) oldClosed included)
+      have prefixSmall : (key.take (commonPrefix suffix key)).length < 2 ^ 64 := by
+        simp only [List.length_take]
+        omega
+      obtain ⟨laterIncluded, finalShape, rootWidth, rootClosed, entries⟩ :=
+        branch_one_wrap digestWidth middleShape bound (nibbles_take keyNibbles _) prefixSmall
+          childWidth childClosed oldValid oldAfter restSafe ran
+      have oldSpelling : key.take (commonPrefix suffix key) = suffix := by
+        have spelling := commonPrefix_reconstruct suffix key
+        simpa only [oldEnds, List.append_nil] using spelling
+      have newSpelling : key.take (commonPrefix suffix key) ++ position :: tail = key := by
+        rw [← newContinues]
+        exact List.take_append_drop _ _
+      refine ⟨fun space address data admitted held => laterIncluded space address data admitted
+        (included space address data admitted held), finalShape, rootWidth, rootClosed, ?_⟩
+      intro probe result
+      have leafEntries : ∀ query, GraphValue middle.read child query result ↔ query = tail ∧ result = bytes := by
+        intro query
+        simpa [nibblesOf, TrieWalkProofs.toList_eq] using
+          (put_leaf_exact (key := query) (result := result) leafWf valueMeaning first)
+      rw [entries]
+      have target := distinct_leaf_update (store := before.read) (old := old)
+        (bytes := bytes) (probe := probe) (result := result) different
+      have oldMeaning : NodeEntries before.read (.leaf (nibblesOf suffix) old) =
+          (fun probe result => probe = suffix ∧ ValueDenotes before.read old result) := by
+        funext probe result
+        simp [NodeEntries, nibblesOf, TrieWalkProofs.toList_eq]
+      rw [oldMeaning, target]
+      simp only [oldSame, leafEntries]
+      constructor
+      · rintro (⟨ownKey, ownMeaning⟩ | ⟨below, newKey, rfl, newMeaning⟩)
+        · exact Or.inr ⟨ownKey.trans oldSpelling, ownMeaning⟩
+        · exact Or.inl ⟨newKey.trans newSpelling, newMeaning⟩
+      · rintro (⟨newKey, newMeaning⟩ | ⟨ownKey, ownMeaning⟩)
+        · exact Or.inr ⟨tail, newKey.trans newSpelling.symm, rfl, newMeaning⟩
+        · exact Or.inl ⟨ownKey.trans oldSpelling.symm, ownMeaning⟩
+
 end Synchronicity.TrieInsertSemantics
