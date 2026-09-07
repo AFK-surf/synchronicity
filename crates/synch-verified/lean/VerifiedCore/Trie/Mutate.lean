@@ -6,12 +6,13 @@ import VerifiedCore.Trie.Program
 import VerifiedCore.Trie.Verify
 
 /-! The trie write path: insert and remove over raw node reads, the digest
-primitive and raw content-addressed writes. Canonical form is maintained on
-every mutation, so any two tries holding the same key/value map have the
-same root regardless of the operations that produced them: an extension
-always sits above a branch and never has an empty segment, a branch always
-has at least two occupants, and a removed key never rewrites a path it did
-not change. -/
+primitive and raw content-addressed writes. Mutations preserve canonical node
+encoding and structural invariants: extensions have nonempty segments above
+branching or routing nodes, branches have at least two occupants, and routing
+nodes have at least one. Removing an absent key leaves the root unchanged.
+Legacy compressed and routing representations can encode the same entries
+under different roots; these invariants do not assert a unique root for every
+key/value map. -/
 namespace VerifiedCore.Trie
 
 open Host
