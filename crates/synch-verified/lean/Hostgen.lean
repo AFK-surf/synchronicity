@@ -81,6 +81,8 @@ what a finished command reports. Each gets Lean `Encode`/`Decode` instances
 and a Rust mirror with the same codecs; order is by dependency. -/
 def messages : List Name := [
   ``VerifiedCore.Host.Probed,
+  ``VerifiedCore.Replication.Exchange.Advertised,
+  ``VerifiedCore.Replication.Exchange.ExchangePlan,
   ``VerifiedCore.Cas.Codec.CellType, ``VerifiedCore.Cas.PinHolder, ``VerifiedCore.Cas.Input.Kind,
   ``VerifiedCore.Cas.Outcome, ``VerifiedCore.Origin.Error, ``VerifiedCore.Trie.LookupError,
   ``VerifiedCore.Trie.Value, ``VerifiedCore.Trie.Diff.Change, ``VerifiedCore.Trie.Proof.Proof,

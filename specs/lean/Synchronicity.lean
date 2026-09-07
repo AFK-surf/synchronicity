@@ -42,3 +42,4 @@ import Synchronicity.TrieCollectProofs
 import Synchronicity.TrieWalkProofs
 import Synchronicity.TrieMerkleProofs
 import Synchronicity.SuspensionProofs
+import Synchronicity.ExchangeProofs

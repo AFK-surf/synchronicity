@@ -147,10 +147,22 @@ impl Store {
     /// for knowing what time it is now, and every expiry check refuses an
     /// instant it cannot trust.
     pub fn trust_instant(&self, reading: i64) -> Result<i64> {
+        Self::trust_instant_on(&self.conn(), reading)
+    }
+
+    /// Dates a trust decision against the transaction's own clock floor.
+    pub(crate) fn trust_instant_on(conn: &rusqlite::Connection, reading: i64) -> Result<i64> {
         if !clock_is_trusted(reading) {
             return Ok(reading);
         }
-        Ok(reading.max(self.trust_floor()?))
+        let floor: Option<String> = conn
+            .query_row(
+                "SELECT value FROM config WHERE key = ?1",
+                rusqlite::params![CLOCK_FLOOR_KEY],
+                |row| row.get(0),
+            )
+            .optional()?;
+        Ok(reading.max(floor.and_then(|text| text.parse::<i64>().ok()).unwrap_or(0)))
     }
 
     /// What the clock reads and whether trust can be dated by it.

@@ -174,6 +174,33 @@ fn put_binding_in(conn: &rusqlite::Connection, binding: &Binding) -> Result<()> 
 }
 
 impl crate::db::Txn<'_> {
+    /// Publication authority and provenance judged from the same snapshot as
+    /// the head flip. A revoked issuer or changed binding cannot be hidden by
+    /// an earlier read outside this transaction.
+    pub fn promotion_authority(
+        &self,
+        origin: &OriginId,
+        now: i64,
+    ) -> Result<(PublishScope, Option<OriginId>)> {
+        let scope = Store::publish_scope_on(self.conn(), origin, now)?;
+        let own: Option<String> = self
+            .conn()
+            .query_row(
+                "SELECT value FROM config WHERE key = 'self_origin_id'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let owner = if own.as_deref() == Some(origin.canonical().as_str())
+            || matches!(scope, PublishScope::Unrestricted)
+        {
+            None
+        } else {
+            Some(origin.clone())
+        };
+        Ok((scope, owner))
+    }
+
     /// The scope one origin's leaves may be materialized under, inside the
     /// transaction.
     ///
@@ -304,7 +331,14 @@ impl Store {
     }
 
     fn query_bindings(&self, filter: &str, args: impl rusqlite::Params) -> Result<Vec<Binding>> {
-        let conn = self.conn();
+        Self::query_bindings_on(&self.conn(), filter, args)
+    }
+
+    fn query_bindings_on(
+        conn: &rusqlite::Connection,
+        filter: &str,
+        args: impl rusqlite::Params,
+    ) -> Result<Vec<Binding>> {
         let sql = format!(
             "SELECT origin_id, node_id, source, domain, issuer, spaces, note, added_at, expires_at
              FROM bindings {filter} ORDER BY origin_id, added_at"
@@ -426,13 +460,28 @@ impl Store {
     ///
     /// `now` must already have been through [`Store::trust_instant`].
     fn live_among(&self, rows: Vec<Binding>, now: i64) -> Result<Vec<Binding>> {
+        Self::live_among_on(&self.conn(), rows, now)
+    }
+
+    fn live_among_on(
+        conn: &rusqlite::Connection,
+        rows: Vec<Binding>,
+        now: i64,
+    ) -> Result<Vec<Binding>> {
         let mut live = Vec::with_capacity(rows.len());
         for binding in rows {
             if !binding.is_live(now) {
                 continue;
             }
             match (&binding.source, &binding.issuer) {
-                (BindingSource::Delegated, Some(issuer)) if self.vouched_for(issuer, now)? => {}
+                (BindingSource::Delegated, Some(issuer))
+                    if Self::query_bindings_on(
+                        conn,
+                        "WHERE origin_id = ?1",
+                        params![issuer.canonical()],
+                    )?
+                    .iter()
+                    .any(|b| b.is_rooted() && b.is_live(now)) => {}
                 // A delegated row with no issuer names nothing that could have
                 // vouched for it, so nothing has — and one whose issuer is no
                 // longer rooted-live has been cut off with it.
@@ -679,7 +728,18 @@ impl Store {
     /// This is the publish-scope question (§3.5), asked of the *origin* whose
     /// trie is being materialized rather than of a connection's peer key.
     pub fn publish_scope(&self, origin: &OriginId, now: i64) -> Result<PublishScope> {
-        let live = self.live_bindings_for_origin(origin, now)?;
+        Self::publish_scope_on(&self.conn(), origin, now)
+    }
+
+    fn publish_scope_on(
+        conn: &rusqlite::Connection,
+        origin: &OriginId,
+        now: i64,
+    ) -> Result<PublishScope> {
+        let now = Self::trust_instant_on(conn, now)?;
+        let rows =
+            Self::query_bindings_on(conn, "WHERE origin_id = ?1", params![origin.canonical()])?;
+        let live = Self::live_among_on(conn, rows, now)?;
         if live.is_empty() {
             return Ok(PublishScope::Untrusted);
         }
@@ -701,8 +761,6 @@ impl Store {
     /// for everything else — a confined origin, and an origin with no live
     /// binding at all, which is judged as strictly as a confined one rather
     /// than as an unrestricted one.
-    // `Provenance.Confined`: the origins whose tries are judged with
-    // provenance, which is every origin that is not rooted.
     pub fn provenance_owner(&self, origin: &OriginId, now: i64) -> Result<Option<OriginId>> {
         if self.self_origin()?.as_ref() == Some(origin) {
             return Ok(None);
@@ -1252,6 +1310,91 @@ mod tests {
             added_at: at(0),
             expires_at: Some(at(1000)),
         }
+    }
+
+    #[test]
+    fn promotion_uses_permission_changes_inside_its_transaction() {
+        let (_d, store) = store();
+        let issuer_key = SecretKey::generate().public();
+        let issuer = OriginId::Key(issuer_key);
+        let subject = SecretKey::generate().public();
+        let origin = OriginId::Key(subject);
+        store
+            .put_binding(&binding(issuer.clone(), issuer_key, None))
+            .unwrap();
+        store
+            .put_binding(&binding(origin.clone(), subject, None))
+            .unwrap();
+        store
+            .put_binding(&delegation(subject, issuer.clone(), &["photos"]))
+            .unwrap();
+        assert_eq!(
+            store.publish_scope(&origin, at(0)).unwrap(),
+            PublishScope::Unrestricted
+        );
+
+        store
+            .transaction::<_, StoreError>(|txn| {
+                txn.remove_binding(&origin, &subject, BindingSource::Static)?;
+                txn.set_config("local_scope", "photos")?;
+                assert_eq!(
+                    txn.promotion_authority(&origin, at(0))?,
+                    (
+                        PublishScope::Confined(vec!["photos".into()]),
+                        Some(origin.clone())
+                    )
+                );
+                assert_eq!(
+                    txn.materialization_scope(&origin)?,
+                    Scope::of(&synch_core::scope_prefixes(&["photos".into()]))
+                );
+                // Revoking the issuer in this same snapshot also revokes its
+                // delegate, without waiting for a later binding sweep.
+                txn.remove_binding(&issuer, &issuer_key, BindingSource::Static)?;
+                assert_eq!(
+                    txn.promotion_authority(&origin, at(0))?,
+                    (PublishScope::Untrusted, Some(origin.clone()))
+                );
+                Ok(())
+            })
+            .unwrap();
+    }
+
+    #[test]
+    fn promotion_dates_authority_with_its_transaction_clock_floor() {
+        let (_d, store) = store();
+        let issuer_key = SecretKey::generate().public();
+        let issuer = OriginId::Key(issuer_key);
+        let subject = SecretKey::generate().public();
+        let origin = OriginId::Key(subject);
+        store
+            .put_binding(&binding(issuer.clone(), issuer_key, Some(at(10))))
+            .unwrap();
+        store
+            .put_binding(&delegation(subject, issuer, &["photos"]))
+            .unwrap();
+        assert!(matches!(
+            store.publish_scope(&origin, at(0)).unwrap(),
+            PublishScope::Confined(_)
+        ));
+        store
+            .transaction::<_, StoreError>(|txn| {
+                txn.set_config("trust_clock_floor", &at(10).to_string())?;
+                assert_eq!(
+                    txn.promotion_authority(&origin, at(0))?,
+                    (PublishScope::Untrusted, Some(origin.clone()))
+                );
+                // Being this node's own origin removes the provenance requirement,
+                // but does not turn expired publishing authority into permission.
+                txn.set_self_origin(&origin)?;
+                assert_eq!(
+                    txn.promotion_authority(&origin, at(0))?,
+                    (PublishScope::Untrusted, None)
+                );
+                assert_eq!(txn.materialization_scope(&origin)?, Scope::full());
+                Ok(())
+            })
+            .unwrap();
     }
 
     #[test]

@@ -12,6 +12,7 @@ mod generated {
 
 pub mod cas;
 pub mod history;
+pub mod replication;
 pub mod host;
 mod native;
 mod operation;

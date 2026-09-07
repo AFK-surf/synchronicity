@@ -15,6 +15,27 @@ instance : Decode Host.Probed where
     let a1 ← Decode.decode
     return .mk a0 a1
 
+instance : Encode Replication.Exchange.Advertised where
+  encode out value := match value with
+    | .mk a0 a1 a2 => out |>.put a0 |>.put a1 |>.put a2
+
+instance : Decode Replication.Exchange.Advertised where
+  decode := do
+    let a0 ← Decode.decode
+    let a1 ← Decode.decode
+    let a2 ← Decode.decode
+    return .mk a0 a1 a2
+
+instance : Encode Replication.Exchange.ExchangePlan where
+  encode out value := match value with
+    | .mk a0 a1 => out |>.put a0 |>.put a1
+
+instance : Decode Replication.Exchange.ExchangePlan where
+  decode := do
+    let a0 ← Decode.decode
+    let a1 ← Decode.decode
+    return .mk a0 a1
+
 instance : Encode Cas.Codec.CellType where
   encode out value := match value with
     | .null => out.push 0
@@ -595,6 +616,7 @@ instance : Encode Commands.Command where
     | .trieVerifyProof a0 a1 a2 a3 => out.push 42 |>.put a0 |>.put a1 |>.put a2 |>.put a3
     | .peerProbe a0 a1 a2 => out.push 43 |>.put a0 |>.put a1 |>.put a2
     | .trieComplete a0 a1 a2 a3 => out.push 44 |>.put a0 |>.put a1 |>.put a2 |>.put a3
+    | .planExchange a0 a1 a2 => out.push 45 |>.put a0 |>.put a1 |>.put a2
 
 instance : Decode Commands.Command where
   decode := do
@@ -644,6 +666,7 @@ instance : Decode Commands.Command where
     | 42 => return .trieVerifyProof (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode)
     | 43 => return .peerProbe (← Decode.decode) (← Decode.decode) (← Decode.decode)
     | 44 => return .trieComplete (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 45 => return .planExchange (← Decode.decode) (← Decode.decode) (← Decode.decode)
     | _ => throw ()
 
 end VerifiedCore

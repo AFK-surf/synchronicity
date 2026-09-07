@@ -1202,6 +1202,16 @@ pub(crate) fn run<S: Storage>(
     )
 }
 
+/// Execute a pure command. Any requested host capability is a protocol error.
+pub(crate) fn run_pure(command: &Command) -> Result<Vec<u8>, OperationError<std::convert::Infallible>> {
+    execute(
+        start(command),
+        |_, _, _| Err(OperationError::Protocol),
+        &[],
+        Capabilities::default(),
+    )
+}
+
 /// Same ownership contract as `run`, narrowed to byte-reading capabilities.
 pub(crate) fn run_readonly<S: ByteStorage>(
     storage: &mut S,

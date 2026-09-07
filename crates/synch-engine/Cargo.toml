@@ -21,6 +21,7 @@ postcard.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 synch-core.workspace = true
+synch-verified.workspace = true
 synch-mpt.workspace = true
 synch-net.workspace = true
 synch-sock.workspace = true

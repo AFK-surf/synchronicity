@@ -18,6 +18,7 @@ import VerifiedCore.Trie.Diff
 import VerifiedCore.Trie.Proof
 import VerifiedCore.Trie.Complete
 import VerifiedCore.Host.Peer
+import VerifiedCore.Replication.Exchange
 
 /-! The shapes that cross the command boundary: what a caller asks for and
 what a finished command reports. `hostgen` derives the codecs of every type
@@ -157,6 +158,8 @@ inductive Command where
   requested provenance, guarded by the completeness memo's generation. -/
   | trieComplete (root : ByteArray) (prefixes : Option (List ByteArray)) (exact : List ByteArray)
       (owner : Option String)
+  /-- Plan both directions of one metadata head exchange. -/
+  | planExchange (ours theirs servable : List Replication.Exchange.Advertised)
 
 /-- Malformed metadata or a column of the wrong storage class, as pin
 acquisition and deletion report it. -/
