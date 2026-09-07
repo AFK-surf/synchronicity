@@ -80,8 +80,9 @@ and a Rust mirror with the same codecs; order is by dependency. -/
 def messages : List Name := [
   ``VerifiedCore.Cas.Codec.CellType, ``VerifiedCore.Cas.PinHolder, ``VerifiedCore.Cas.Input.Kind,
   ``VerifiedCore.Cas.Outcome, ``VerifiedCore.Origin.Error, ``VerifiedCore.Trie.LookupError,
-  ``VerifiedCore.Trie.Value, ``VerifiedCore.Trie.Diff.Change,
+  ``VerifiedCore.Trie.Value, ``VerifiedCore.Trie.Diff.Change, ``VerifiedCore.Trie.Proof.Proof,
   ``VerifiedCore.Trie.Refusal, ``VerifiedCore.Trie.Verdict, ``VerifiedCore.Trie.MutationError,
+  ``VerifiedCore.Trie.Proof.VerifyError,
   ``VerifiedCore.Cas.Receive.ProvenSubtree, ``VerifiedCore.Cas.Project.Blob,
   ``VerifiedCore.Cas.Project.Summary, ``VerifiedCore.Cas.Project.Pin,
   ``VerifiedCore.Trie.Serve.NodeAnswer, ``VerifiedCore.Trie.Serve.ValueAnswer,
@@ -108,6 +109,8 @@ def rustName (name : Name) : String :=
   | ``VerifiedCore.Cas.Project.Pin => "ProjectedPin"
   | ``VerifiedCore.Trie.Value => "TrieValue"
   | ``VerifiedCore.Trie.Diff.Change => "TrieChange"
+  | ``VerifiedCore.Trie.Proof.Proof => "TrieProof"
+  | ``VerifiedCore.Trie.Proof.VerifyError => "ProofVerifyError"
   | _ => name.getString!
 
 /-- The private transport's tags. Numbering is historical, so it is a table

@@ -17,6 +17,7 @@ import VerifiedCore.Trie.Memo
 import VerifiedCore.Trie.Collect
 import VerifiedCore.Trie.Walk
 import VerifiedCore.Trie.Diff
+import VerifiedCore.Trie.Proof
 import VerifiedCore.Replication.History
 
 /-! The one native entry point. A command arrives as a packet, decoded with
@@ -285,6 +286,11 @@ def dispatch : Command → Native
   | .trieMaterialize oldRoot newRoot prefixes exact =>
     if oldRoot.size != 32 || newRoot.size != 32 then protocol
     else command (Trie.Diff.materialize (E := Trie.Diff.Effects) ⟨prefixes, exact⟩ oldRoot newRoot) walking
+  | .trieProve root keySize =>
+    if root.size != 32 then malformedRoot else command (Trie.Proof.proveInput root 0 keySize) hostOnly
+  | .trieVerifyProof root key nodes value =>
+    if root.size != 32 then protocol
+    else command (Trie.Proof.verify (E := Host.Digest) root key nodes value) hostOnly
 
 /-- Every command starts here: an undecodable packet is a protocol failure
 before any effect is requested. -/

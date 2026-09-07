@@ -6,8 +6,8 @@ use crate::{
 
 pub use crate::generated::{
     Collected, LookupDomainError, MutationDomainError, NodeAnswer, NodeRefusal, NodeVerdict,
-    TrieChange, TrieCollectDomainError, TrieServeDomainError, TrieValue, TrieWalkDomainError,
-    ValueAnswer,
+    ProofVerifyError, TrieChange, TrieCollectDomainError, TrieProof, TrieServeDomainError,
+    TrieValue, TrieWalkDomainError, ValueAnswer,
 };
 pub use crate::operation::OperationError;
 use crate::{host::Storage, operation::Decode};
@@ -713,6 +713,66 @@ pub fn memo_key<D: Digest>(
     let result = operation::run_digest(digest, &[], &command)?;
     let key: Vec<u8> = terminal(&result).map_err(|()| OperationError::Protocol)?;
     key.try_into().map_err(|_| OperationError::Protocol)
+}
+
+/// A completed proof verification's failure: the host, a node of the proof
+/// that is no canonical node, or the lookup over the proof's nodes.
+#[derive(Debug)]
+pub enum VerifyProofError<E> {
+    Operation(OperationError<E>),
+    Refused(NodeRefusal),
+    Lookup(LookupError<E>),
+}
+
+/// The Merkle proof for `key` against `root`: the nodes on its path, root
+/// first, and the out-of-line payload when the proved value is one. Lean
+/// owns the descent, its bounds and what the proof carries; the key is
+/// borrowed until the operation admits its size.
+pub fn prove<S: ByteStorage>(
+    storage: &mut S,
+    root: &[u8; 32],
+    key: &[u8],
+) -> Result<TrieProof, LookupError<S::Error>> {
+    let command = Command::TrieProve {
+        root: root.to_vec(),
+        key_size: key.len() as u64,
+    };
+    let result =
+        operation::run_readonly(storage, &[key], &command).map_err(|error| match error {
+            OperationError::Host(error) => LookupError::Host(error),
+            OperationError::MalformedMetadata(_) | OperationError::Protocol => {
+                LookupError::Protocol
+            }
+        })?;
+    let outcome: Result<TrieProof, LookupDomainError> =
+        terminal(&result).map_err(|()| LookupError::Protocol)?;
+    outcome.map_err(domain)
+}
+
+/// Verifies a proof against `root` for `key`: the lookup over the proof's
+/// nodes as a raw snapshot addressed by the digests the host supplies,
+/// answering the proved value or an absence. Nothing is read from storage.
+pub fn verify_proof<D: Digest>(
+    digest: &mut D,
+    root: &[u8; 32],
+    key: &[u8],
+    nodes: &[&[u8]],
+    value: Option<&[u8]>,
+) -> Result<Option<Vec<u8>>, VerifyProofError<D::Error>> {
+    let command = Command::TrieVerifyProof {
+        root: root.to_vec(),
+        key: key.to_vec(),
+        nodes: nodes.iter().map(|node| node.to_vec()).collect(),
+        value: value.map(<[u8]>::to_vec),
+    };
+    let result =
+        operation::run_digest(digest, &[], &command).map_err(VerifyProofError::Operation)?;
+    let outcome: Result<Option<Vec<u8>>, ProofVerifyError> =
+        terminal(&result).map_err(|()| VerifyProofError::Operation(OperationError::Protocol))?;
+    outcome.map_err(|error| match error {
+        ProofVerifyError::Refused(refusal) => VerifyProofError::Refused(refusal),
+        ProofVerifyError::Lookup(error) => VerifyProofError::Lookup(domain(error)),
+    })
 }
 
 /// Completed walk failure, preserving original host errors.

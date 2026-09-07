@@ -49,7 +49,7 @@ of those as a metadata invariant.
 | `first_key_outside` | `reconcile.rs:735` | `Trie/Scope.lean` |
 | `reachable`, `reach_into` and `Store::gc_trie` mark-and-sweep | `synch-store/src/gc.rs:53-110` | `Trie/Collect.lean` (done; `Trie::reachable` stays a Rust test oracle) |
 | `Scope` (`admits_path`, `contains_subtree`, `admits_key_path`, `memo_key_for`) | everywhere above | `Trie/Scope.lean` |
-| `prove`, `Proof::verify` (feature `proofs`, no production caller) | none | `Trie/Proof.lean`, last |
+| `prove`, `Proof::verify` (feature `proofs`, no production caller) | none | `Trie/Proof.lean` (done; `Proof` and `Trie::prove` are facades) |
 
 After the cutover, `NodeStore` shrinks to raw record access (`get/put_node`,
 `get/put_value`, the `redacted_nodes` and `trie_node_origins` rows, the memo
@@ -332,10 +332,38 @@ not needed for safety. Cutover: `gc.rs`'s mark loop, `sweep_unmarked` and
 the memo-key layout in `synch-mpt` are deleted; `Trie::reachable` stays a
 test oracle; `retained_roots_in` stays under `cfg(test)`.
 
-**T8. Merkle proofs** (`Trie/Proof.lean`). `prove` is `get` with its node
-trace; `verify` is `get` over the proof's nodes as a raw snapshot. Both
-follow from `TrieProgramProofs`. Last, because nothing in production calls
-them.
+**T8. Merkle proofs** (`Trie/Proof.lean`). Done. `Trie::prove` is the
+whole command `trieProve`: `get`'s descent under the same key and depth
+bounds, recording every node it reads and the payload when the value found
+is out of line (`proveAt`, `found`). `Proof::verify` is the whole command
+`trieVerifyProof` over the `Digest` algebra alone: each node admitted at
+the canonical ingress boundary and addressed by the digest of its kind's
+tag and bytes (`addressNodes`), the payload by its plain digest, and then
+`get` run again over those nodes as a raw snapshot (`executeReads`,
+`snapshotOf`, `check`), so a path the proof does not cover is a missing
+node, a substituted payload a missing value, and bytes that are no node a
+refusal; nothing is read from any store. Proved (`TrieMerkleProofs`): the
+core's snapshot evaluator is the one the lookup's semantics are stated
+over (`executeReads_eq`), so verification is the lookup over the proof's
+snapshot by definition (`check_is_get`) and a verified value is a
+root-to-key path through the proof's own nodes with its payload
+(`verified_value_is_a_path`, from `get_semantic_sound`); over any snapshot
+the lookup is answered within verification's budget with a domain result,
+so the protocol refusal is unreachable (`check_answers`, from
+`get_read_bound`); on a host that answers its digests, verifying is the
+pure model over the host's digest (`verify_run`); and the round trip: on a
+store addressed by its digests (every node canonical and stored under the
+digest of its tag and bytes, every payload under its digest), the descent
+with its trace reads exactly what the lookup reads, so over any snapshot
+covering the proof the lookup answers as it does on the store
+(`proveAt_lookup`), and the proof `prove` builds verifies to exactly what
+`get` answers (`prove_verifies`). Fixtures on a canonical six-node trie:
+the proofs of three present keys and an absent one with the reads each
+costs, their verification with one digest per node, and the refusals a
+truncated path, a substituted payload, a foreign root and non-node bytes
+earn, with a failure injected at every effect. Cutover: `proof.rs` keeps
+the `Proof` type and two facades; the Rust descent and the in-memory
+verification store are deleted.
 
 ## 5. CAS slices, in order
 
@@ -569,7 +597,9 @@ Publication migration ── C6
 
 F1 and C1/T1 can start together. T3 and C4 wait for F2. Relative size: F2
 and T3 are the large items; T1, C3 and C7 are small; the rest are medium.
-C2 shrank when the Bao tree was fixed on the Rust side.
+C2 shrank when the Bao tree was fixed on the Rust side. Every slice that
+does not wait on F2 or the Publication migration is done: what remains is
+F2, then T3, T4 and C4, and C6 with Publication.
 
 ## 9. What the end state claims, and what it does not
 

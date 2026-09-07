@@ -16,17 +16,16 @@
 //! that constant sizes **bao hash-tree slice proofs** in the blob path
 //! (`synch-net`'s `GetProof`), a different structure for a different purpose.
 //! Partial replication is what would make this live; §13 is where that is.
+//!
+//! Both halves are Lean operations (`Trie/Proof.lean`): proving is the
+//! lookup with its node trace, verifying is the lookup over the proof's own
+//! nodes as a raw snapshot, and `specs/lean` (`TrieMerkleProofs`) proves the
+//! round trip and that a verified value is a path through the proof's nodes.
 
 use serde::{Deserialize, Serialize};
 use synch_core::Hash;
 
-use crate::{
-    error::MptError,
-    nibbles::Nibbles,
-    node::{TrieNode, ValueRef},
-    store::{MemStore, NodeStore},
-    trie::{root_opt, Trie},
-};
+use crate::{error::MptError, store::NodeStore, trie::Trie};
 
 /// A Merkle proof for a single key against a root.
 #[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
@@ -43,83 +42,48 @@ impl Proof {
     /// Returns the proved value, or `None` for a proof of absence. Any node
     /// that does not hash correctly, or a path that is not fully covered by the
     /// proof, is an error — a prover cannot claim absence by omission.
+    ///
+    /// The whole verification is the Lean operation `Trie.Proof.verify`: each
+    /// node admitted at the canonical ingress boundary and addressed by the
+    /// digest of its kind's tag and bytes, the payload by its plain digest,
+    /// and the lookup `Trie::get` runs, run again over those nodes as a raw
+    /// snapshot. Rust supplies BLAKE3; nothing is read from any store.
     pub fn verify(&self, root: Hash, key: &[u8]) -> Result<Option<Vec<u8>>, MptError> {
-        let store = MemStore::new();
-        for encoded in &self.nodes {
-            let hash = TrieNode::hash_of_encoded(encoded)?;
-            store
-                .put_node(&hash, encoded)
-                .expect("in-memory store is infallible");
-        }
-        if let Some(value) = &self.value {
-            let hash = Hash::new(value);
-            store
-                .put_value(&hash, value)
-                .expect("in-memory store is infallible");
-        }
-        Trie::new(&store).get(root, key)
+        use synch_verified::trie::VerifyProofError;
+        let nodes: Vec<&[u8]> = self.nodes.iter().map(Vec::as_slice).collect();
+        synch_verified::trie::verify_proof(
+            &mut crate::lean_storage::Blake3,
+            root.as_bytes(),
+            key,
+            &nodes,
+            self.value.as_deref(),
+        )
+        .map_err(|error| match error {
+            VerifyProofError::Operation(error) => crate::lean_storage::operation_error(error),
+            VerifyProofError::Refused(refusal) => crate::lean_storage::refusal_error(refusal),
+            VerifyProofError::Lookup(error) => crate::lean_storage::lookup_error(error),
+        })
     }
 }
 
 impl<S: NodeStore + ?Sized> Trie<'_, S> {
     /// Builds a Merkle proof for `key` against `root`.
+    ///
+    /// The Lean operation `Trie.Proof.prove` is `Trie::get`'s descent with
+    /// its node trace: the same key bound, the same depth bound, every node
+    /// read on the way down, and the payload when the value found is out of
+    /// line. Rust supplies raw node reads.
     pub fn prove(&self, root: Hash, key: &[u8]) -> Result<Proof, MptError> {
-        if key.len() > synch_core::MAX_KEY_LEN {
-            return Err(MptError::KeyTooLong(key.len()));
-        }
-        let nibbles = Nibbles::from_bytes(key);
-        let mut rest = nibbles.as_slice();
-        let mut current = root_opt(root);
-        let mut proof = Proof::default();
-        // The same bound `Trie::get` descends under, and for the same reason:
-        // a value past the depth any valid key reaches is invisible to every
-        // structural walk, so answering about it would split the two readers.
-        let mut steps = 0usize;
-        loop {
-            steps += 1;
-            if steps > crate::trie::MAX_DEPTH_NIBBLES + 1 {
-                return Err(MptError::NonCanonical(
-                    "proof descended further than any valid key is long".into(),
-                ));
-            }
-            let Some(hash) = current else {
-                return Ok(proof);
-            };
-            let encoded = self
-                .store()
-                .get_node(&hash)
-                .map_err(MptError::store)?
-                .ok_or(MptError::MissingNode(hash))?;
-            proof.nodes.push(encoded.clone());
-            match TrieNode::decode(&encoded)? {
-                TrieNode::Leaf { key_rest, value } => {
-                    if key_rest.as_slice() == rest {
-                        if let ValueRef::Hash(h) = value {
-                            proof.value = Some(self.resolve(&ValueRef::Hash(h))?);
-                        }
-                    }
-                    return Ok(proof);
-                }
-                TrieNode::Ext { prefix, child } => {
-                    let p = prefix.as_slice();
-                    if !rest.starts_with(p) {
-                        return Ok(proof);
-                    }
-                    rest = &rest[p.len()..];
-                    current = Some(child);
-                }
-                TrieNode::Branch { children, value } => {
-                    if rest.is_empty() {
-                        if let Some(ValueRef::Hash(h)) = value {
-                            proof.value = Some(self.resolve(&ValueRef::Hash(h))?);
-                        }
-                        return Ok(proof);
-                    }
-                    current = children[rest[0] as usize];
-                    rest = &rest[1..];
-                }
-            }
-        }
+        let proof = synch_verified::trie::prove(
+            &mut crate::lean_storage::Bytes(self.store()),
+            root.as_bytes(),
+            key,
+        )
+        .map_err(crate::lean_storage::lookup_error)?;
+        Ok(Proof {
+            nodes: proof.nodes,
+            value: proof.value,
+        })
     }
 }
 

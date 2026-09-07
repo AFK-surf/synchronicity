@@ -71,7 +71,11 @@ values, the scoped streaming materialization) is three whole commands over
 raw node reads, the `Redaction` algebra for the refusals a peer recorded,
 `Digest`, and an `Apply` algebra that hands each change to the host as it
 is found; `synch-mpt`'s cursor, descent, scan, diff and materialization
-loops are deleted. History retention now runs as a
+loops are deleted. Merkle proofs (`Trie/Proof.lean`: the lookup with its
+node trace, and the lookup again over the proof's nodes as a raw snapshot
+addressed by their digests) are two whole commands, the second over the
+`Digest` algebra alone; the Rust descent and in-memory verification store
+of the `proofs` feature are deleted. History retention now runs as a
 complete Lean operation over raw scans and a separate Ed25519 primitive; the
 Rust retention loop and receipt/fork helpers are removed. Raw scans retain
 rows before a trailing host failure so Lean owns first-error selection.

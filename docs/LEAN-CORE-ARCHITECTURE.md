@@ -504,6 +504,18 @@ Integration review has identified specific gates, not waived limitations:
   is within the limit (`scan_sound`), and fixtures for the scan, the diff,
   the materialization and a failure injected at every effect. The Rust
   cursor, descent, scan, diff and materialization loops are deleted.
+- Merkle proofs for single keys (the off-by-default `proofs` feature) are
+  the commands `trieProve` and `trieVerifyProof` (`Trie/Proof.lean`).
+  Proving is `get`'s descent with its node trace; verifying admits each
+  node at the ingress boundary, addresses it by the digest of its tag and
+  bytes through `Digest` alone, and runs `get` again over those nodes as a
+  raw snapshot, so a path the proof does not cover is a missing node and a
+  substituted payload a missing value. `TrieMerkleProofs` proves that a
+  verified value is a path through the proof's own nodes
+  (`verified_value_is_a_path`), that verification is always answered
+  (`check_answers`), and the round trip on a store addressed by its
+  digests (`prove_verifies`), with fixtures and a failure injected at every
+  effect. The Rust descent and in-memory verification store are deleted.
 - Native tests now cover acquisition transport, every effect-failure position,
   repeated polling, malformed replies and terminal resume. Generic SQLite tests
   cover UPSERT identity/time preservation, raw cells, failed commit, abandoned

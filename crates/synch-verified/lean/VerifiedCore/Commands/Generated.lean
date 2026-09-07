@@ -126,6 +126,16 @@ instance : Decode Trie.Diff.Change where
     let a2 ← Decode.decode
     return .mk a0 a1 a2
 
+instance : Encode Trie.Proof.Proof where
+  encode out value := match value with
+    | .mk a0 a1 => out |>.put a0 |>.put a1
+
+instance : Decode Trie.Proof.Proof where
+  decode := do
+    let a0 ← Decode.decode
+    let a1 ← Decode.decode
+    return .mk a0 a1
+
 instance : Encode Trie.Refusal where
   encode out value := match value with
     | .decode a0 => out.push 0 |>.put a0
@@ -170,6 +180,18 @@ instance : Decode Trie.MutationError where
     | 2 => return .missingNode (← Decode.decode)
     | 3 => return .decode (← Decode.decode)
     | 4 => return .depthExceeded
+    | _ => throw ()
+
+instance : Encode Trie.Proof.VerifyError where
+  encode out value := match value with
+    | .refused a0 => out.push 0 |>.put a0
+    | .lookup a0 => out.push 1 |>.put a0
+
+instance : Decode Trie.Proof.VerifyError where
+  decode := do
+    match ← readByte with
+    | 0 => return .refused (← Decode.decode)
+    | 1 => return .lookup (← Decode.decode)
     | _ => throw ()
 
 instance : Encode Cas.Receive.ProvenSubtree where
@@ -541,6 +563,8 @@ instance : Encode Commands.Command where
     | .trieScan a0 a1 a2 a3 => out.push 38 |>.put a0 |>.put a1 |>.put a2 |>.put a3
     | .trieDiff a0 a1 => out.push 39 |>.put a0 |>.put a1
     | .trieMaterialize a0 a1 a2 a3 => out.push 40 |>.put a0 |>.put a1 |>.put a2 |>.put a3
+    | .trieProve a0 a1 => out.push 41 |>.put a0 |>.put a1
+    | .trieVerifyProof a0 a1 a2 a3 => out.push 42 |>.put a0 |>.put a1 |>.put a2 |>.put a3
 
 instance : Decode Commands.Command where
   decode := do
@@ -586,6 +610,8 @@ instance : Decode Commands.Command where
     | 38 => return .trieScan (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode)
     | 39 => return .trieDiff (← Decode.decode) (← Decode.decode)
     | 40 => return .trieMaterialize (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 41 => return .trieProve (← Decode.decode) (← Decode.decode)
+    | 42 => return .trieVerifyProof (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode)
     | _ => throw ()
 
 end VerifiedCore

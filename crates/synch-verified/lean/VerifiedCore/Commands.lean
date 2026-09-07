@@ -15,6 +15,7 @@ import VerifiedCore.Trie.Serve
 import VerifiedCore.Trie.Collect
 import VerifiedCore.Trie.Walk
 import VerifiedCore.Trie.Diff
+import VerifiedCore.Trie.Proof
 
 /-! The shapes that cross the command boundary: what a caller asks for and
 what a finished command reports. `hostgen` derives the codecs of every type
@@ -141,6 +142,12 @@ inductive Command where
   materializer, one at a time with its new value resolved; answers how many. -/
   | trieMaterialize (oldRoot newRoot : ByteArray) (prefixes : Option (List ByteArray))
       (exact : List ByteArray)
+  /-- The Merkle proof for a key (the run's first byte input) against a root:
+  the nodes on its path and the out-of-line payload, if any. -/
+  | trieProve (root : ByteArray) (keySize : UInt64)
+  /-- Verify a proof against a root for a key: the lookup over the proof's
+  nodes, answering the proved value or an absence. -/
+  | trieVerifyProof (root key : ByteArray) (nodes : List ByteArray) (value : Option ByteArray)
 
 /-- Malformed metadata or a column of the wrong storage class, as pin
 acquisition and deletion report it. -/
