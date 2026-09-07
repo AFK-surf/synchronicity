@@ -63,3 +63,4 @@ import Synchronicity.TrieFetchSuspensionProofs
 
 import Synchronicity.CasInlineHistories
 import Synchronicity.TriePublicationRouting
+import Synchronicity.TrieScopeCheckProofs
