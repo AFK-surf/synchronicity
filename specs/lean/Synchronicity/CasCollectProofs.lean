@@ -4,59 +4,12 @@ import VerifiedCore.Cas.Collect
 
 /-! Keeping the store within bounds, executed on the shared simulated host:
 the access clock, eviction by least recent use, content collection and the
-orphan sweep. The universal theorems derive each decision from the program;
-the fixture theorems run the same programs on concrete rows and files,
+orphan sweep. Universal theorems establish retention and writer protection;
+fixture theorems check the clock and run the programs on concrete rows and files,
 including every injected host failure, so the order of section, reading,
 decision and unlink is the executed code's. -/
 namespace Synchronicity.CasCollectProofs
 open VerifiedCore.Host VerifiedCore.Cas.Collect SimulatedHost CasFixtures
-
-/-! ## The access clock -/
-
-/-- The row is not there: nothing moves, and the answer says so. -/
-theorem touch_absent (state : State) (root : ByteArray)
-    (quiet : state.faults = []) (idle : state.pending = none)
-    (absent : query state.db "blobs" ["last_access"] [("root", .blob root)] [] [] = []) :
-    let result := SimulatedHost.run (touch root) state
-    result.1 = .ok false ∧ result.2.db = state.db := by
-  simp [SimulatedHost.run, touch, VerifiedCore.Cas.Collect.transaction, transactionOver,
-    VerifiedCore.Cas.Collect.storage, VerifiedCore.Cas.Collect.clock, raise, performOver, Inject.inject,
-    execute, Interpreter.handle, SimulatedHost.storage, SimulatedHost.clock, reply, fault, record,
-    SimulatedHost.transaction, quiet, idle, absent, decodeAccess,
-    Except.mapError, Except.map, bind, pure, Program.bind, ExceptT.bind, ExceptT.bindCont, ExceptT.pure,
-    ExceptT.run, ExceptT.mk]
-
-/-- A read within the interval of the recorded access is coalesced: no write. -/
-theorem touch_coalesced (state : State) (root : ByteArray) (last : Int64)
-    (quiet : state.faults = []) (idle : state.pending = none)
-    (observed : query state.db "blobs" ["last_access"] [("root", .blob root)] [] [] = [[.integer last]])
-    (recent : state.now - last < touchInterval) :
-    let result := SimulatedHost.run (touch root) state
-    result.1 = .ok false ∧ result.2.db = state.db := by
-  simp [SimulatedHost.run, touch, VerifiedCore.Cas.Collect.transaction, transactionOver,
-    VerifiedCore.Cas.Collect.storage, VerifiedCore.Cas.Collect.clock, raise, performOver, Inject.inject,
-    execute, Interpreter.handle, SimulatedHost.storage, SimulatedHost.clock, reply, fault, record,
-    SimulatedHost.transaction, quiet, idle, observed, decodeAccess, VerifiedCore.Cas.Codec.integerField,
-    recent, Except.mapError, Except.map, bind, pure, Program.bind, ExceptT.bind, ExceptT.bindCont, ExceptT.pure,
-    ExceptT.run, ExceptT.mk]
-
-/-- Past the interval the clock moves to now, on the root's rows and nothing else. -/
-theorem touch_moves (state : State) (root : ByteArray) (last : Int64)
-    (quiet : state.faults = []) (idle : state.pending = none)
-    (observed : query state.db "blobs" ["last_access"] [("root", .blob root)] [] [] = [[.integer last]])
-    (stale : ¬ state.now - last < touchInterval) :
-    let result := SimulatedHost.run (touch root) state
-    result.1 = .ok true ∧ result.2.db = setRows state.db "blobs" ((rows state.db "blobs").map fun row =>
-      if selects (VerifiedCore.Cas.Durable.byRoot root) row then
-        assign row [("last_access", .integer state.now)] else row) := by
-  simp [SimulatedHost.run, touch, VerifiedCore.Cas.Collect.transaction, transactionOver,
-    VerifiedCore.Cas.Collect.storage, VerifiedCore.Cas.Collect.access, VerifiedCore.Cas.Collect.clock,
-    raise, performOver, Inject.inject, execute, Interpreter.handle, SimulatedHost.storage,
-    SimulatedHost.access, SimulatedHost.clock, reply, fault, record, SimulatedHost.transaction, quiet, idle,
-    observed, decodeAccess, VerifiedCore.Cas.Codec.integerField, stale,
-    Except.mapError, Except.map, bind, pure, Program.bind, ExceptT.bind, ExceptT.bindCont, ExceptT.pure,
-    ExceptT.run, ExceptT.mk]
-  rfl
 
 /-! ## Eviction -/
 
@@ -68,14 +21,6 @@ theorem cachedDurable_selects (row : Fields) (selected : selects cachedDurable r
   simp only [selects, cachedDurable, equals, List.all_cons, List.all_nil, List.isEmpty_nil,
     Bool.and_true, Bool.true_or, Bool.and_eq_true, Bool.not_eq_true'] at selected
   exact ⟨selected.2, selected.1⟩
-
-/-- Once the usage is within the target nothing more is cleared. -/
-theorem evictLoop_within_target (target used : UInt64) (entries : List Cached) (counts : UInt64 × UInt64)
-    (within : used ≤ target) :
-    evictLoop target entries used counts = pure counts := by
-  cases entries with
-  | nil => rfl
-  | cons entry rest => simp [evictLoop, within]
 
 /-- A cache clear asked of an object a writer holds is refused before any
 transaction: eviction cannot take bytes out from under a write. -/

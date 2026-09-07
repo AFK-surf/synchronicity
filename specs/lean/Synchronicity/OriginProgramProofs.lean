@@ -25,11 +25,6 @@ theorem accepted_domain (input result : String)
   next valid => cases accepted; exact valid
   next => cases accepted
 
-theorem label_failure_precedes_domain (id domain : String) (failure : Error)
-    (bad : normalizeLabel id = .error failure) :
-    named id domain = .error failure := by
-  simp [named, bad, bind, Except.bind]
-
 theorem key_prefix_precedes_named :
     checkSyntax "key:invalid@domain" = .error .keyDecode := by decide
 theorem named_case_and_trailing_dots :

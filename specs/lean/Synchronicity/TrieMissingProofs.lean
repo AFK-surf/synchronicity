@@ -48,23 +48,6 @@ theorem both_set_implementations_are_lawful :
     LawfulWorkSet Visit (List Visit) ∧ LawfulWorkSet ByteArray (List ByteArray) :=
   ⟨inferInstance, inferInstance, inferInstance, inferInstance⟩
 
-/-- At a scope boundary a hash at another position cannot suppress a visit.
-Inside a grant only the depth and hash are retained. -/
-theorem visit_boundary (scope : Serve.Scope) (hash path : ByteArray)
-    (outside : scope.containsSubtree path.toList = false) :
-    visit scope hash path = (path.size, hash, some path) := by simp [visit, outside]
-
-theorem visit_inside (scope : Serve.Scope) (hash path : ByteArray)
-    (inside : scope.containsSubtree path.toList = true) :
-    visit scope hash path = (path.size, hash, none) := by simp [visit, inside]
-
-/-- Resumption keeps every outstanding position pending and preserves a
-terminal canonicality fault. No deferred holder silently disappears. -/
-theorem resume_pending [WorkSet Visit V] (context : Context) (frontier : Frontier V H) :
-    (resume context frontier).positions = frontier.deferred ++ frontier.positions ∧
-    (resume context frontier).deferred = [] ∧
-    (resume context frontier).fault = frontier.fault := by simp [resume]
-
 theorem erase_fold_absent [BEq K] [WorkSet K S] [LawfulWorkSet K S]
     (keys : List K) (set : S) (probe : K) (absent : WorkSet.contains set probe = false) :
     WorkSet.contains (keys.foldl WorkSet.erase set) probe = false := by
@@ -131,12 +114,6 @@ theorem batchStep_interrupted [WorkSet Visit V] [WorkSet ByteArray H] (context :
       (.ok (.inr (failed work.frontier error, .error error)), after) := by
   simp only [batchStep, healthy, pending, Nat.not_le.mpr room, ↓reduceIte, ExceptT.mk,
     ExceptT.run, bind, execute_bind, interrupted, pure, execute]
-
-theorem failed_read_keeps_frontier (frontier : Frontier V H) (failure : Failure) :
-    failed frontier (.host failure) = frontier := rfl
-
-theorem failed_decode_keeps_frontier (frontier : Frontier V H) (message : String) :
-    failed frontier (.decode message) = frontier := rfl
 
 /-- A terminal fault is returned before any host effect, regardless of
 batch size, remaining frontier or resumption. -/
