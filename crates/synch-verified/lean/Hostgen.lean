@@ -83,6 +83,7 @@ def messages : List Name := [
   ``VerifiedCore.Host.Probed,
   ``VerifiedCore.Replication.Exchange.Advertised,
   ``VerifiedCore.Replication.Exchange.ExchangePlan,
+  ``VerifiedCore.Replication.Contact.ContactPlan,
   ``VerifiedCore.Cas.Codec.CellType, ``VerifiedCore.Cas.PinHolder, ``VerifiedCore.Cas.Input.Kind,
   ``VerifiedCore.Cas.Outcome, ``VerifiedCore.Origin.Error, ``VerifiedCore.Trie.LookupError,
   ``VerifiedCore.Trie.Value, ``VerifiedCore.Trie.Diff.Change, ``VerifiedCore.Trie.Proof.Proof,

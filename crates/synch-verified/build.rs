@@ -67,6 +67,7 @@ fn main() {
         "Trie/Fetch",
         "Replication/History",
         "Replication/Exchange",
+        "Replication/Contact",
         "Commands",
         "Commands/Generated",
         "Entry",

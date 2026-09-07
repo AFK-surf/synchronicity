@@ -21,6 +21,7 @@ import VerifiedCore.Trie.Complete
 import VerifiedCore.Trie.Fetch
 import VerifiedCore.Host.Peer
 import VerifiedCore.Replication.Exchange
+import VerifiedCore.Replication.Contact
 
 /-! The shapes that cross the command boundary: what a caller asks for and
 what a finished command reports. `hostgen` derives the codecs of every type
@@ -171,6 +172,8 @@ inductive Command where
   | trieNormalize (root : ByteArray)
   /-- Read one complete CAS projection within a transaction owned by the caller. -/
   | casBlobIn (tx : UInt64) (root : ByteArray)
+  /-- Select the next bounded batch of eligible peers in cyclic order. -/
+  | planContact (peers : List ByteArray) (cursor : Option ByteArray) (maximum : UInt64)
 
 /-- Malformed metadata or a column of the wrong storage class, as pin
 acquisition and deletion report it. -/

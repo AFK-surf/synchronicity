@@ -36,6 +36,16 @@ instance : Decode Replication.Exchange.ExchangePlan where
     let a1 ← Decode.decode
     return .mk a0 a1
 
+instance : Encode Replication.Contact.ContactPlan where
+  encode out value := match value with
+    | .mk a0 a1 => out |>.put a0 |>.put a1
+
+instance : Decode Replication.Contact.ContactPlan where
+  decode := do
+    let a0 ← Decode.decode
+    let a1 ← Decode.decode
+    return .mk a0 a1
+
 instance : Encode Cas.Codec.CellType where
   encode out value := match value with
     | .null => out.push 0
@@ -644,6 +654,7 @@ instance : Encode Commands.Command where
     | .trieFetch a0 a1 a2 a3 a4 a5 a6 a7 a8 => out.push 46 |>.put a0 |>.put a1 |>.put a2 |>.put a3 |>.put a4 |>.put a5 |>.put a6 |>.put a7 |>.put a8
     | .trieNormalize a0 => out.push 47 |>.put a0
     | .casBlobIn a0 a1 => out.push 48 |>.put a0 |>.put a1
+    | .planContact a0 a1 a2 => out.push 49 |>.put a0 |>.put a1 |>.put a2
 
 instance : Decode Commands.Command where
   decode := do
@@ -697,6 +708,7 @@ instance : Decode Commands.Command where
     | 46 => return .trieFetch (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode)
     | 47 => return .trieNormalize (← Decode.decode)
     | 48 => return .casBlobIn (← Decode.decode) (← Decode.decode)
+    | 49 => return .planContact (← Decode.decode) (← Decode.decode) (← Decode.decode)
     | _ => throw ()
 
 end VerifiedCore

@@ -170,6 +170,8 @@ struct NodeInner {
     /// The batch between staging and one signed root (§7.1).
     publisher: Publisher,
     ad_clock: std::sync::Mutex<std::collections::HashMap<Hash, i64>>,
+    /// Serializes bounded repair rounds and retains their last completed peer.
+    contact_cursor: tokio::sync::Mutex<Option<Vec<u8>>>,
     /// Content roots that provider discovery has failed to resolve, and when
     /// each may be asked about again (§6.3).
     ///
@@ -898,6 +900,7 @@ impl Node {
                 config,
                 publisher,
                 ad_clock: std::sync::Mutex::new(Default::default()),
+                contact_cursor: tokio::sync::Mutex::new(None),
                 provider_misses: std::sync::Mutex::new(Default::default()),
                 checkout_writes: std::sync::Mutex::new(Default::default()),
                 program_bytes: crate::sockets::ProgramBytesCache::new(),
@@ -1452,6 +1455,10 @@ impl Node {
         }
         self.spaces_changed();
         Ok(())
+    }
+
+    pub(crate) fn contact_cursor(&self) -> &tokio::sync::Mutex<Option<Vec<u8>>> {
+        &self.inner.contact_cursor
     }
 
     /// Tells the watcher that the set of spaces changed (§7.1).

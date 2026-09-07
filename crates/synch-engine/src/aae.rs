@@ -6,10 +6,9 @@
 //! relayed onward; at the §12 sizes the publisher's own fan-out already reaches
 //! everyone it can reach, so the pull path below is what covers a member the
 //! origin cannot dial. Periodic: every `aae_interval` (±50 % jitter) a
-//! bounded random sample of trusted peers gets a full `Hello` push-pull
-//! exchange. Candidates are tried in sequence until one advances local state,
-//! so a bad member cannot hide a healthy one without turning every round into
-//! an all-to-all exchange.
+//! bounded batch of trusted peers gets a full `Hello` push-pull exchange.
+//! Completed rounds rotate through eligible peers in identifier order. Every
+//! selected peer gets its turn, even after another peer advances local state.
 
 use std::time::Duration;
 
@@ -121,15 +120,6 @@ impl Node {
         Ok(report)
     }
 
-    /// [`Node::dialable_peers`] on the blocking pool.
-    ///
-    /// Two queries over `device_keys` and `bindings`, which is store work like
-    /// any other: every async caller reaches the set this way.
-    pub(crate) async fn dialable_peers_off_runtime(&self) -> Result<Vec<NodeId>> {
-        let node = self.clone();
-        crate::blocking::offload(move || node.dialable_peers()).await
-    }
-
     /// Every peer this node may dial, with the last address it was seen at.
     ///
     /// One hop to the blocking pool for the whole membership rather than a
@@ -172,14 +162,15 @@ impl Node {
             .collect())
     }
 
-    /// Runs one periodic round over a bounded random sample of trusted peers.
+    /// Runs one periodic round over the next bounded batch of trusted peers.
     ///
     /// Candidates are tried sequentially because reconciliation shares one
     /// pending slot per origin: concurrent exchanges can otherwise abandon a
-    /// head while another healthy peer is fetching it. A reachable peer that
-    /// only receives our state does not end the fallback; the round stops when
-    /// an exchange advances local state or the sample is exhausted.
+    /// head while another healthy peer is fetching it. Every selected peer is
+    /// attempted, even after progress. Completed rounds advance the cursor;
+    /// cancellation leaves it unchanged so unattempted peers keep their turn.
     pub async fn anti_entropy_round(&self) -> Result<RoundReport> {
+        let mut cursor = self.contact_cursor().lock().await;
         // An upgraded publisher must not wait for a file edit to replace an
         // old compressed root that cannot prove private scoped omissions.
         // Failure is retried next round and does not stall unrelated syncing.
@@ -188,13 +179,33 @@ impl Node {
         {
             tracing::debug!(%error, "publication format upgrade deferred");
         }
-        let mut peers = self.dialable_peers_off_runtime().await?;
-        if peers.is_empty() {
-            return Ok(RoundReport::default());
-        }
-        let start = (jitter_seed() % peers.len() as u64) as usize;
-        peers.rotate_left(start);
-        peers.truncate(ANTI_ENTROPY_FANOUT);
+        let node = self.clone();
+        let completed = cursor.clone();
+        let (peers, next_cursor) = crate::blocking::offload(move || {
+            let eligible = node.dialable_peers()?;
+            let plan = synch_verified::replication::plan_contact(
+                eligible
+                    .iter()
+                    .map(|peer| peer.as_bytes().to_vec())
+                    .collect(),
+                completed,
+                ANTI_ENTROPY_FANOUT as u64,
+            )
+            .map_err(|error| EngineError::Record(error.to_string()))?;
+            let peers = plan
+                .positions
+                .into_iter()
+                .map(|position| {
+                    usize::try_from(position)
+                        .ok()
+                        .and_then(|position| eligible.get(position))
+                        .copied()
+                        .ok_or_else(|| EngineError::Record("invalid Lean contact position".into()))
+                })
+                .collect::<Result<Vec<_>>>()?;
+            Ok((peers, plan.cursor))
+        })
+        .await?;
 
         let mut report = RoundReport::default();
         let budget = self.config().sync_round_budget.min(PERIODIC_PEER_BUDGET);
@@ -206,9 +217,6 @@ impl Node {
                         report.peer = Some(peer);
                         report.sync = sync;
                     }
-                    if made_local_progress {
-                        return Ok(report);
-                    }
                 }
                 Err(e) => {
                     tracing::debug!(peer = %peer.fmt_short(), error = %e, "peer unreachable");
@@ -216,6 +224,7 @@ impl Node {
                 }
             }
         }
+        *cursor = next_cursor;
         Ok(report)
     }
 

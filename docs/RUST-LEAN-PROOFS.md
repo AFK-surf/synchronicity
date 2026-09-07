@@ -281,13 +281,20 @@ Make the environmental conditions explicit:
    contracts hold. Summaries, claimed locations and peer refusals are not
    trusted as proofs of content or of authorized absence.
 
-The initial theorem must state contact fairness explicitly. The current scheduler
-rotates candidates using clock-derived xorshift jitter (`jitter_seed() % len`);
-this is not independent probabilistic sampling, and neither task fairness nor
-periodic execution proves that every required peer gets contacted. Connect the
-actual candidate filters and rotation to fair service, or change the scheduler
-to ensure it. An almost-sure convergence claim needs an appropriate randomness
-model and cannot be inferred from the current jitter implementation.
+Periodic contact selection now runs the whole Lean `Replication.Contact.plan`
+operation. It orders distinct eligible peer identifiers and selects the next
+bounded batch after the last completed cursor. The engine serializes periodic
+rounds, attempts every selected peer even after progress, and advances the
+in-memory cursor only when the batch finishes. Cancellation does not spend the
+unattempted turns. Clock jitter controls the interval, not peer selection.
+
+The required contact theorem is: once eligibility stabilizes, every eligible
+peer gets an attempt within `ceil(peer count / batch size)` completed rounds,
+independently of query ordering or other peers' failures. Native tests cover
+that behavior; the formal bounded-turn theorem and its connection to actual
+eligibility and completed attempts remain open. Continued completed rounds are
+an explicit runtime condition; infinitely cancelled rounds or repeated process
+restarts do not establish progress. This does not yet prove eventual consistency.
 
 There is also an advertisement bound: `local_summaries` truncates sorted origins
 at `MAX_HEADS_PER_MESSAGE`. Bounding active membership is insufficient if retained
@@ -308,7 +315,7 @@ The relevant paths include:
 - `synch-core` signed-head ordering and identity/record contracts;
 - `synch-engine/src/reconcile.rs`: offers, summaries, scope adoption,
   `sync_with`, pending fetches, refusals, target-specific cleanup and promotion;
-- `synch-engine/src/aae.rs`: periodic/reactive scheduling, candidate sampling,
+- `synch-engine/src/aae.rs`: periodic/reactive scheduling, contact rotation,
   attempt budgets, maintenance and retries;
 - `synch-net` authentication and mpt request/reply handling;
 - the executable Trie admission, requesting walk, completeness, serving,
@@ -500,6 +507,7 @@ completed cutover from being mistaken for a completed user guarantee.
 | CAS C4: cloud composition | Rust `backend.rs` | Migrate complete provider adoption/hydration/finalize/read/serve commands, including trusted-range ingestion and complete-proof path. |
 | CAS C6: source holds and publication advertisement | Rust inside publication transaction | Migrate with the entry/head/reference publication command, never as independently committing calls. |
 | History pruning | Production Lean `Replication/History` | Retention/fork witness support proved. Adoption, reconciliation and scheduling still require implementation-connected M1–M8 proofs. |
+| Peer contact selection | Production Lean `Replication/Contact`, called by serialized periodic rounds | Native bounded-turn and duplicate/order cases checked. Formal bounded service and composition with actual eligibility, failures and cancellation remain required for M1/M6. |
 | Head exchange selection | Production Lean `Replication/Exchange`, called by engine reconciliation | Selects request origins and push indices from advertised/servable heads. Exact newer-version requests, duplicate/order invariance and push selection support M2. Signature/admission/availability inputs and subsequent adoption remain separate obligations. |
 | Promotion authority snapshot | Rust `try_promote`, with permissions/authority read in its publication transaction | Snapshot-consistent permission checks and full own-view readiness have native regressions. This is a safety fix, not a Lean promotion theorem or closure of P3/M4/M8. |
 

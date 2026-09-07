@@ -335,6 +335,10 @@ def dispatch : Command → Native
     if root.size != 32 then protocol
     else command (Trie.Complete.isComplete (Std.HashSet Trie.Missing.Visit) (Std.HashSet ByteArray)
       ⟨⟨prefixes, exact⟩, owner⟩ root) completing
+  | .planContact peers cursor maximum =>
+    if peers.length > UInt64.size || !(peers.all (·.size == 32)) ||
+        cursor.any (·.size != 32) || maximum == 0 || maximum > 256 then protocol
+    else pure (terminalOf (Replication.Contact.plan peers cursor maximum.toNat))
   | .planExchange ours theirs servable =>
     if servable.length > UInt64.size ||
         !(ours ++ theirs ++ servable).all (·.root.size == 32) then protocol
