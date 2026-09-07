@@ -291,6 +291,7 @@ def dispatch : Command → Native
   | .trieVerifyProof root key nodes value =>
     if root.size != 32 then protocol
     else command (Trie.Proof.verify (E := Host.Digest) root key nodes value) hostOnly
+  | .peerProbe root wants inTransaction => command (Host.Peer.probe root wants inTransaction) hostOnly
 
 /-- Every command starts here: an undecodable packet is a protocol failure
 before any effect is requested. -/

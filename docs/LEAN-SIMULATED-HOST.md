@@ -63,6 +63,11 @@ namespace of the same name, which a fixture keeps consistent with the rows.
 construction hashes with. `Redaction.isRedacted` answers whether `redacted`
 records the hash, at the given position or at any; `Apply.applyChange`
 appends the change to `applied`, in the order it was handed over.
+`Peer.fetchNodes` and `Peer.fetchValues` answer each want by its hash from
+`peerNodes` and `peerValues` (the pair served, or the hash absent, in want
+order), name the absent hashes in `peerRedacted` as refusals, and refuse the
+whole request as the protocol failure while a transaction is pending, the
+way the runner refuses to suspend inside one.
 
 `faults` selects ordinary failures by effect index in the accumulated trace.
 `scanFault` models a failure after the returned scan prefix. Failed ordinary

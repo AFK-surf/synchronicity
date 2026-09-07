@@ -8,6 +8,7 @@ import VerifiedCore.Host.Sweep
 import VerifiedCore.Host.Memo
 import VerifiedCore.Host.Digest
 import VerifiedCore.Host.Walk
+import VerifiedCore.Host.Peer
 import Synchronicity.Decidable
 
 /-! One stateful host for composed CAS proofs. Successful replies are computed
@@ -51,6 +52,11 @@ structure State where
   materialization was handed, in walk order. -/
   redacted : List (ByteArray × ByteArray) := []
   applied : List (ByteArray × UInt64 × Option ByteArray) := []
+  /-- What a peer holds: node and value bytes by hash, and the hashes it
+  holds but may not show. -/
+  peerNodes : List (ByteArray × ByteArray) := []
+  peerValues : List (ByteArray × ByteArray) := []
+  peerRedacted : List ByteArray := []
   nextHandle : UInt64 := 1
   synced : List ObjectKey := []
   output : List UInt8 := []
@@ -399,6 +405,29 @@ def apply : Apply A → State → Result A
   | .applyChange key kind new, state => reply state "apply" fun state =>
       (.ok (), { state with applied := state.applied ++ [(key, kind, new)] })
 
+/-- A peer answers each want by its hash from what it holds, as the pair the
+runner admits, and names the rest as absent, in want order. -/
+def peerAnswer (held : List (ByteArray × ByteArray)) (wants : List (ByteArray × ByteArray)) :
+    List (ByteArray × ByteArray) × List ByteArray :=
+  wants.foldr (fun (_, hash) (served, missing) =>
+    match held.find? (·.1 == hash) with
+    | some (_, bytes) => ((hash, bytes) :: served, missing)
+    | none => (served, hash :: missing)) ([], [])
+
+/-- A peer as the runner presents it: a request while a transaction is open
+is refused the way the runner refuses it, as a protocol failure delivered
+into the program, so no connection is held across the round trip; otherwise
+the served pairs, the absences and, for nodes, the refusals. -/
+def peer : Peer A → State → Result A
+  | .fetchNodes _ wants, state => reply state "peer:nodes" fun state =>
+      if state.pending.isSome then (.error invalid, state) else
+      let (served, rest) := peerAnswer state.peerNodes wants
+      (.ok (served, rest.filter (fun hash => !state.peerRedacted.contains hash),
+        rest.filter state.peerRedacted.contains), state)
+  | .fetchValues _ wants, state => reply state "peer:values" fun state =>
+      if state.pending.isSome then (.error invalid, state) else
+      (.ok (peerAnswer state.peerValues wants), state)
+
 /-- Capability composition is shared by every proof and every operation. -/
 class Interpreter (E : Type → Type) where
   handle : E A → State → Result A
@@ -420,6 +449,7 @@ instance : Interpreter Sweep := ⟨sweep⟩
 instance : Interpreter Memo := ⟨memo⟩
 instance : Interpreter Redaction := ⟨redaction⟩
 instance : Interpreter Apply := ⟨apply⟩
+instance : Interpreter Peer := ⟨peer⟩
 instance [Interpreter L] [Interpreter R] : Interpreter (EffectSum L R) where
   handle
     | .left effect, state => Interpreter.handle effect state

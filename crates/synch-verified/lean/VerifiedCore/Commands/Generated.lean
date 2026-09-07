@@ -5,6 +5,16 @@ import VerifiedCore.Commands
 namespace VerifiedCore
 open Host.Wire
 
+instance : Encode Host.Probed where
+  encode out value := match value with
+    | .mk a0 a1 => out |>.put a0 |>.put a1
+
+instance : Decode Host.Probed where
+  decode := do
+    let a0 ← Decode.decode
+    let a1 ← Decode.decode
+    return .mk a0 a1
+
 instance : Encode Cas.Codec.CellType where
   encode out value := match value with
     | .null => out.push 0
@@ -565,6 +575,7 @@ instance : Encode Commands.Command where
     | .trieMaterialize a0 a1 a2 a3 => out.push 40 |>.put a0 |>.put a1 |>.put a2 |>.put a3
     | .trieProve a0 a1 => out.push 41 |>.put a0 |>.put a1
     | .trieVerifyProof a0 a1 a2 a3 => out.push 42 |>.put a0 |>.put a1 |>.put a2 |>.put a3
+    | .peerProbe a0 a1 a2 => out.push 43 |>.put a0 |>.put a1 |>.put a2
 
 instance : Decode Commands.Command where
   decode := do
@@ -612,6 +623,7 @@ instance : Decode Commands.Command where
     | 40 => return .trieMaterialize (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode)
     | 41 => return .trieProve (← Decode.decode) (← Decode.decode)
     | 42 => return .trieVerifyProof (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 43 => return .peerProbe (← Decode.decode) (← Decode.decode) (← Decode.decode)
     | _ => throw ()
 
 end VerifiedCore

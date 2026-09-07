@@ -16,6 +16,7 @@ import VerifiedCore.Trie.Collect
 import VerifiedCore.Trie.Walk
 import VerifiedCore.Trie.Diff
 import VerifiedCore.Trie.Proof
+import VerifiedCore.Host.Peer
 
 /-! The shapes that cross the command boundary: what a caller asks for and
 what a finished command reports. `hostgen` derives the codecs of every type
@@ -148,6 +149,9 @@ inductive Command where
   /-- Verify a proof against a root for a key: the lookup over the proof's
   nodes, answering the proved value or an absence. -/
   | trieVerifyProof (root key : ByteArray) (nodes : List ByteArray) (value : Option ByteArray)
+  /-- The suspending runner's self-test: two peer round trips, inside a
+  transaction when told to. -/
+  | peerProbe (root : ByteArray) (wants : List (ByteArray × ByteArray)) (inTransaction : Bool)
 
 /-- Malformed metadata or a column of the wrong storage class, as pin
 acquisition and deletion report it. -/

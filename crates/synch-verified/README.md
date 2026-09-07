@@ -75,7 +75,12 @@ loops are deleted. Merkle proofs (`Trie/Proof.lean`: the lookup with its
 node trace, and the lookup again over the proof's nodes as a raw snapshot
 addressed by their digests) are two whole commands, the second over the
 `Digest` algebra alone; the Rust descent and in-memory verification store
-of the `proofs` feature are deleted. History retention now runs as a
+of the `proofs` feature are deleted. A program may wait on a peer
+(`Host/Peer.lean`: the node and value round trips a fetch makes): the
+`suspend` module runs such a command to its first request and hands the
+continuation back as a `Suspension`, resumed with the reply and storage
+supplied again, never inside a transaction; `peerProbe` is the fixture that
+exercises both suspensions and the refusal inside a transaction. History retention now runs as a
 complete Lean operation over raw scans and a separate Ed25519 primitive; the
 Rust retention loop and receipt/fork helpers are removed. Raw scans retain
 rows before a trailing host failure so Lean owns first-error selection.

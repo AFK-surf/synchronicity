@@ -31,6 +31,7 @@ fn main() {
         "Host/Sweep",
         "Host/Memo",
         "Host/Walk",
+        "Host/Peer",
         "Crypto",
         "Host/Codec",
         "Host/Generated",

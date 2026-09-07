@@ -98,7 +98,7 @@ carries policy; each is a primitive the current Rust code already performs.
 | `Memo` (new) | `forgetExcept keep` (done, T7), `isKnown key`, `generation`, `certify key generation` | the completeness cache; invalidation on mutation edges is a host resource guarantee like `Lease` |
 | `Redaction` (new) | `isRedacted hash path` | the refusals a peer recorded, read by every structural walk at a position it finds nothing at (done, T6) |
 | `Apply` (new) | `applyChange key kind new` | the streaming materialization: each change handed to the host as the walk finds it, so a promotion never collects the diff (done, T6) |
-| `Peer` (new) | `fetchNodes wants : Reply (List (path × hash × bytes))`, `fetchValues` | the reconcile fetch loop (§4, T3) |
+| `Peer` (new) | `fetchNodes root wants : Reply (served × missing × redacted)`, `fetchValues root wants : Reply (served × missing)` | the reconcile fetch loop's round trips; a program suspends on them (done, F2) |
 
 The tag table in `Hostgen.lean` grows accordingly. The simulated host gains
 sparse files, a provider object map with a NotFound switch, a memo with a
@@ -126,6 +126,45 @@ document demands:
 Without F2 the walk would have to serialize its frontier, deferred set and
 dedup set across every batch. Those sets reach the 8 M-position ceiling on
 hostile input, so that fallback is rejected on cost, not only on shape.
+
+**Done.** The `Peer` algebra (`Host/Peer.lean`) is the two round trips a
+fetch makes, `fetchNodes` and `fetchValues`, each naming the root and the
+(position, hash) wants. The runner (`operation.rs`, exposed as
+`synch_verified::suspend`) treats them as suspending effects: a run started
+with `run_suspending` comes back as a `Step`, either `Done` with the decoded
+terminal or `Suspended` with a `Suspension` that owns the Lean continuation
+and reports its `PeerRequest`; `Suspension::resume` takes the `PeerReply`
+(the served pairs, the absences and, for nodes, the refusals, or the host
+error a failed round trip stands for), supplies storage again, and runs on.
+The continuation stays thread-confined (the Lean objects are single-threaded
+and marking them shared would make every in-place update a copy), so the
+engine hosts a suspended fetch on one blocking thread with a channel each
+way; that is T3's helper. Request identity is the pending frame's tag: a
+reply of the other kind is a protocol failure delivered into the program,
+so its own cleanup runs, as is a peer request from a run that may not
+suspend. Dropping a `Suspension` drops the continuation. The guard is
+enforced twice. The runner counts transactions open from a begin that
+succeeded until a commit or rollback that succeeded and answers a peer
+request while one is open with a protocol failure, so the program's own
+transaction wrapper rolls back; no byte inputs are held across a suspension.
+On the Lean side `SuspensionProofs` defines `Balanced`, the discipline as a
+predicate over a program and a guard that classifies which effects open,
+close and suspend: along every path of replies a suspending effect is raised
+only while no transaction is open. `Suspending` is `Balanced` from outside a
+transaction with a transaction open at the end only of a failed run, and it
+composes: through `pure`, `bind`, a raised effect, and `transactionOver`
+around a body that keeps the transaction open and never suspends. The
+`peerProbe` command is the fixture: two round trips outside a transaction,
+or inside one when told to. It is proved `Suspending` outside and proved not
+to be inside; on the simulated host, whose peer refuses a request while a
+transaction is pending the way the runner does, it is proved to answer the
+counts on one side and the protocol failure with the rollback on the other.
+The Rust runner tests drive the same probe through both suspensions, the
+refusal inside a transaction (trace `begin`, `rollback`), a failed round
+trip, a reply of the other kind, a dropped suspension and a run that may not
+suspend. Cancellation runs the host's abandonment as before: the
+continuation is dropped and the storage session it would have used was
+never held.
 
 ### F3. Proof conventions for hashes
 
@@ -597,9 +636,9 @@ Publication migration ── C6
 
 F1 and C1/T1 can start together. T3 and C4 wait for F2. Relative size: F2
 and T3 are the large items; T1, C3 and C7 are small; the rest are medium.
-C2 shrank when the Bao tree was fixed on the Rust side. Every slice that
-does not wait on F2 or the Publication migration is done: what remains is
-F2, then T3, T4 and C4, and C6 with Publication.
+C2 shrank when the Bao tree was fixed on the Rust side. F2 is done, so
+what remains is T3, T4 and C4 (C4 still needs the `Provider` algebra), and
+C6 with Publication.
 
 ## 9. What the end state claims, and what it does not
 

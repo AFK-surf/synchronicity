@@ -573,7 +573,12 @@ replies become failures to the pending Lean program and follow its rollback path
 Rust's private synchronous runner owns one thread-confined native continuation.
 It exposes no handles, polling or resume API to callers/host implementations,
 and consumes exactly one typed host result for each pending request. Repeated
-internal polling is inert; completed programs cannot restart. No SQLite guards
+internal polling is inert; completed programs cannot restart. The one way a
+continuation leaves the runner is a `Peer` effect: a run started through
+`synch_verified::suspend` comes back as a `Suspension` that owns the
+continuation, names the pending request, and is resumed once with the reply
+and fresh storage; it stays on its thread, and the runner only suspends while
+no storage transaction is open. No SQLite guards
 move across awaits or threads. The raw SQLite interpreter borrows the caller's
 guarded connection for the entire operation and rejects stale transaction IDs,
 including writes after SQLite has automatically rolled back. Its Drop path
@@ -621,9 +626,16 @@ claim of origin/key validity or complete corrupt-storage error compatibility.
 
 Only a host failure's opaque token crosses into Lean; Rust retains the original
 error object until Lean completes. Thus a later rollback failure cannot overwrite
-the error the operation chose. This implementation does not yet expose an async
-resumption API; any such API needs explicit request identity and cancellation
-contracts rather than exporting the current private pointer operations.
+the error the operation chose. The resumption API (`synch_verified::suspend`)
+exports no pointer operation: a `Suspension` is a value that owns the
+continuation and the errors registered so far, its request identity is the
+pending frame's tag (a reply of the other kind is a protocol failure delivered
+into the program), and cancellation is dropping it. It is handed out only
+outside a transaction: the runner counts transactions open from a begin that
+succeeded until a commit or rollback that succeeded and answers a peer request
+while one is open with a protocol failure, and `SuspensionProofs` states the
+same discipline over programs (`Balanced`, `Suspending`), so a program the
+runner would refuse is one the proofs reject.
 
 ### Next CAS operation slices
 

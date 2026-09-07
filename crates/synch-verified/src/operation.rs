@@ -678,8 +678,191 @@ fn sink_reply<E, A: EncodeReply>(
     }
 }
 
+/// What a suspended program asked a peer for: the root it is fetching under
+/// and, for each want, the position asked at and the hash expected there.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PeerRequest {
+    Nodes {
+        root: Vec<u8>,
+        wants: Vec<(Vec<u8>, Vec<u8>)>,
+    },
+    Values {
+        root: Vec<u8>,
+        wants: Vec<(Vec<u8>, Vec<u8>)>,
+    },
+}
+
+/// What came back for a request: the pairs served, the hashes the peer did
+/// not have and, for nodes, the hashes it holds but may not show; or the
+/// host error that stands for the round trip failing, delivered into the
+/// program the way any host failure is.
+#[derive(Debug)]
+pub enum PeerReply<E> {
+    Nodes {
+        served: Vec<(Vec<u8>, Vec<u8>)>,
+        missing: Vec<Vec<u8>>,
+        redacted: Vec<Vec<u8>>,
+    },
+    Values {
+        served: Vec<(Vec<u8>, Vec<u8>)>,
+        missing: Vec<Vec<u8>>,
+    },
+    Failed(E),
+}
+
+/// Where a suspending run stands: finished with its decoded value, or waiting
+/// on a peer with its continuation owned by the caller.
+#[derive(Debug)]
+pub enum Step<T, E> {
+    Done(T),
+    Suspended(Suspension<T, E>),
+}
+
+/// A program waiting on a peer. It owns the Lean continuation, so it stays
+/// on the thread that started the run and holds no storage: the runner only
+/// suspends while no transaction is open, and the storage handed to `resume`
+/// may be a fresh one. Dropping it drops the continuation unanswered.
+pub struct Suspension<T, E> {
+    state: Handle,
+    request: PeerRequest,
+    tag: u8,
+    errors: Vec<Option<E>>,
+    finish: fn(&[u8]) -> Result<T, ()>,
+}
+
+impl<T, E> std::fmt::Debug for Suspension<T, E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Suspension")
+            .field("request", &self.request)
+            .finish_non_exhaustive()
+    }
+}
+
+impl<T, E> Suspension<T, E> {
+    /// What the program is waiting for.
+    pub fn request(&self) -> &PeerRequest {
+        &self.request
+    }
+
+    /// Answer the request and run on until the next suspension or the end. A
+    /// reply of the other kind is a protocol failure delivered into the
+    /// program, so its own cleanup runs.
+    pub(crate) fn continue_with<S: Storage<Error = E>>(
+        mut self,
+        answer: PeerReply<E>,
+        storage: &mut S,
+        capabilities: Capabilities<'_, E>,
+    ) -> Result<Step<T, E>, OperationError<E>> {
+        let response = match (self.tag, answer) {
+            (
+                72,
+                PeerReply::Nodes {
+                    served,
+                    missing,
+                    redacted,
+                },
+            ) => reply(
+                72,
+                Ok::<_, E>((served, missing, redacted)),
+                &mut self.errors,
+                |out, (served, missing, redacted)| {
+                    pairs(out, &served);
+                    hashes(out, &missing);
+                    hashes(out, &redacted);
+                },
+            ),
+            (73, PeerReply::Values { served, missing }) => reply(
+                73,
+                Ok::<_, E>((served, missing)),
+                &mut self.errors,
+                |out, (served, missing)| {
+                    pairs(out, &served);
+                    hashes(out, &missing);
+                },
+            ),
+            (tag, PeerReply::Failed(error)) => {
+                reply(tag, Err::<(), _>(error), &mut self.errors, |_, ()| {})
+            }
+            _ => protocol_failure(),
+        };
+        self.state.resume(&response);
+        drive(
+            Run {
+                state: self.state,
+                errors: self.errors,
+                open: 0,
+                suspendable: true,
+                finish: self.finish,
+            },
+            |frame, capabilities, errors| dispatch(storage, capabilities, frame, errors),
+            &[],
+            capabilities,
+        )
+    }
+}
+
+fn pairs(out: &mut Vec<u8>, values: &[(Vec<u8>, Vec<u8>)]) {
+    word(out, values.len() as u64);
+    for (key, value) in values {
+        bytes(out, key);
+        bytes(out, value);
+    }
+}
+fn hashes(out: &mut Vec<u8>, values: &[Vec<u8>]) {
+    word(out, values.len() as u64);
+    for value in values {
+        bytes(out, value);
+    }
+}
+
+fn owned_pairs(wants: &[(&[u8], &[u8])]) -> Vec<(Vec<u8>, Vec<u8>)> {
+    wants
+        .iter()
+        .map(|(position, hash)| (position.to_vec(), hash.to_vec()))
+        .collect()
+}
+
+/// A run in progress: the continuation, the host errors it has registered,
+/// how many storage transactions it holds open (a suspension is refused
+/// while any is), whether it may suspend at all, and how its terminal is
+/// read.
+struct Run<T, E> {
+    state: Handle,
+    errors: Vec<Option<E>>,
+    open: usize,
+    suspendable: bool,
+    finish: fn(&[u8]) -> Result<T, ()>,
+}
+
 fn execute<E>(
-    mut state: Handle,
+    state: Handle,
+    host: impl FnMut(
+        Frame<'_>,
+        &mut Capabilities<'_, E>,
+        &mut Vec<Option<E>>,
+    ) -> Result<Vec<u8>, OperationError<E>>,
+    inputs: &[&[u8]],
+    capabilities: Capabilities<'_, E>,
+) -> Result<Vec<u8>, OperationError<E>> {
+    let run = Run {
+        state,
+        errors: Vec::new(),
+        open: 0,
+        suspendable: false,
+        finish: |bytes| Ok(bytes.to_vec()),
+    };
+    match drive(run, host, inputs, capabilities)? {
+        Step::Done(result) => Ok(result),
+        Step::Suspended(_) => Err(OperationError::Protocol),
+    }
+}
+
+/// Drive a run until it ends or, when allowed, suspends on a peer. A peer
+/// request in a run that may not suspend, or while a transaction is open, is
+/// a protocol failure delivered into the program, so its own cleanup runs
+/// before it terminates.
+fn drive<T, E>(
+    mut run: Run<T, E>,
     mut host: impl FnMut(
         Frame<'_>,
         &mut Capabilities<'_, E>,
@@ -687,12 +870,40 @@ fn execute<E>(
     ) -> Result<Vec<u8>, OperationError<E>>,
     inputs: &[&[u8]],
     mut capabilities: Capabilities<'_, E>,
-) -> Result<Vec<u8>, OperationError<E>> {
-    let mut errors = Vec::new();
+) -> Result<Step<T, E>, OperationError<E>> {
     loop {
-        let packet = state.packet();
+        let packet = run.state.packet();
         let frame = decode(packet.as_bytes()).map_err(|()| OperationError::Protocol)?;
+        let opens = matches!(frame, Frame::Begin);
+        let closes = matches!(frame, Frame::Commit(_) | Frame::Rollback(_));
         let response = match frame {
+            Frame::FetchNodes(root, wants) if run.suspendable && run.open == 0 => {
+                let request = PeerRequest::Nodes {
+                    root: root.to_vec(),
+                    wants: owned_pairs(&wants),
+                };
+                return Ok(Step::Suspended(Suspension {
+                    state: run.state,
+                    request,
+                    tag: 72,
+                    errors: run.errors,
+                    finish: run.finish,
+                }));
+            }
+            Frame::FetchValues(root, wants) if run.suspendable && run.open == 0 => {
+                let request = PeerRequest::Values {
+                    root: root.to_vec(),
+                    wants: owned_pairs(&wants),
+                };
+                return Ok(Step::Suspended(Suspension {
+                    state: run.state,
+                    request,
+                    tag: 73,
+                    errors: run.errors,
+                    finish: run.finish,
+                }));
+            }
+            Frame::FetchNodes(..) | Frame::FetchValues(..) => protocol_failure(),
             // The transferred bytes go from the file straight into the tail of
             // the output sink; they are never a reply payload. A sink that
             // cannot grow is a protocol failure delivered as a file failure,
@@ -711,7 +922,7 @@ fn execute<E>(
                         Ok(()) => vec![1, 52],
                         Err(failure) => {
                             output.shrink(count);
-                            file_reply(52, Err::<(), _>(failure), &mut errors, |_, ()| {})
+                            file_reply(52, Err::<(), _>(failure), &mut run.errors, |_, ()| {})
                         }
                     },
                     Err(OperationError::Host(error)) => file_reply(
@@ -720,7 +931,7 @@ fn execute<E>(
                             error,
                             kind: FileFailureKind::Other,
                         }),
-                        &mut errors,
+                        &mut run.errors,
                         |_, ()| {},
                     ),
                     Err(_) => {
@@ -745,8 +956,13 @@ fn execute<E>(
                     .as_deref_mut()
                     .ok_or(OperationError::Protocol)?;
                 match bao.encode_slice(root, size, inline, &spans) {
-                    Ok(encoded) => sink_reply(55, encoded, output, &mut errors, Some),
-                    Err(error) => reply(55, Err::<u64, _>(error), &mut errors, EncodeReply::encode),
+                    Ok(encoded) => sink_reply(55, encoded, output, &mut run.errors, Some),
+                    Err(error) => reply(
+                        55,
+                        Err::<u64, _>(error),
+                        &mut run.errors,
+                        EncodeReply::encode,
+                    ),
                 }
             }
             Frame::EncodeProof(root, size, spans, level, budget) => {
@@ -760,18 +976,20 @@ fn execute<E>(
                     .ok_or(OperationError::Protocol)?;
                 match bao.encode_proof(root, size, &spans, level, budget) {
                     Ok(Some(encoded)) => {
-                        sink_reply(56, encoded, output, &mut errors, |count| Some(Some(count)))
+                        sink_reply(56, encoded, output, &mut run.errors, |count| {
+                            Some(Some(count))
+                        })
                     }
                     Ok(None) => reply(
                         56,
                         Ok::<Option<u64>, _>(None),
-                        &mut errors,
+                        &mut run.errors,
                         EncodeReply::encode,
                     ),
                     Err(error) => reply(
                         56,
                         Err::<Option<u64>, _>(error),
-                        &mut errors,
+                        &mut run.errors,
                         EncodeReply::encode,
                     ),
                 }
@@ -791,7 +1009,7 @@ fn execute<E>(
                     Some(encoded) => reply(
                         57,
                         bao.decode_inline(root, size, inline, &spans, encoded),
-                        &mut errors,
+                        &mut run.errors,
                         EncodeReply::encode,
                     ),
                     None => protocol_failure(),
@@ -809,7 +1027,7 @@ fn execute<E>(
                     Some(encoded) => reply(
                         58,
                         bao.decode_slice(root, size, &spans, encoded),
-                        &mut errors,
+                        &mut run.errors,
                         EncodeReply::encode,
                     ),
                     None => protocol_failure(),
@@ -827,7 +1045,7 @@ fn execute<E>(
                     Some(encoded) => reply(
                         61,
                         bao.write_proof(root, size, &spans, level, encoded),
-                        &mut errors,
+                        &mut run.errors,
                         |out, (wrote, proven)| {
                             out.push(u8::from(wrote));
                             word(out, proven.len() as u64);
@@ -846,7 +1064,7 @@ fn execute<E>(
                 Some(output) => match output.append(bytes) {
                     Ok(()) => vec![1, 37],
                     Err(OperationError::Host(error)) => {
-                        reply(37, Err::<(), _>(error), &mut errors, |_, ()| {})
+                        reply(37, Err::<(), _>(error), &mut run.errors, |_, ()| {})
                     }
                     // An allocation/capacity failure is not an invented backing
                     // store error. Deliver protocol failure into Lean so its
@@ -883,10 +1101,15 @@ fn execute<E>(
                     }
                 }
             }
-            Frame::Done(result) => return Ok(result.to_vec()),
+            Frame::Done(result) => {
+                return (run.finish)(result)
+                    .map(Step::Done)
+                    .map_err(|()| OperationError::Protocol)
+            }
             Frame::Failure(code, token) => {
                 return Err(match (code, token) {
-                    (1, token) if token > 0 => errors
+                    (1, token) if token > 0 => run
+                        .errors
                         .get_mut((token - 1) as usize)
                         .and_then(Option::take)
                         .map(OperationError::Host)
@@ -895,12 +1118,21 @@ fn execute<E>(
                     _ => OperationError::Protocol,
                 })
             }
-            frame => host(frame, &mut capabilities, &mut errors)?,
+            frame => host(frame, &mut capabilities, &mut run.errors)?,
         };
+        // A transaction counts as open from a begin that succeeded until a
+        // commit or rollback that succeeded; a failed close keeps it counted,
+        // so a later suspension is still refused.
+        if opens && response.get(1) == Some(&16) {
+            run.open += 1;
+        }
+        if closes && matches!(response.get(1), Some(17 | 18)) {
+            run.open = run.open.saturating_sub(1);
+        }
         // No request borrows packet data past this point. Release the packet
         // before constructing the next continuation to limit peak retention.
         drop(packet);
-        state.resume(&response);
+        run.state.resume(&response);
     }
 }
 
@@ -1011,6 +1243,32 @@ pub(crate) fn run_digest<D: crate::host::Digest>(
             dispatch_readonly::<NoBytes<D::Error>>(None, capabilities, frame, errors)
         },
         inputs,
+        capabilities,
+    )
+}
+
+/// Run one command over the relational host and whatever raw services it may
+/// direct, letting it suspend on a peer: the caller gets the continuation
+/// back with each request and answers it through `Suspension::continue_with`,
+/// supplying storage again at that point. Byte inputs are never held across
+/// a suspension, so there are none.
+pub(crate) fn run_suspending<T, S: Storage>(
+    storage: &mut S,
+    capabilities: Capabilities<'_, S::Error>,
+    command: &Command,
+    finish: fn(&[u8]) -> Result<T, ()>,
+) -> Result<Step<T, S::Error>, OperationError<S::Error>> {
+    let run = Run {
+        state: start(command),
+        errors: Vec::new(),
+        open: 0,
+        suspendable: true,
+        finish,
+    };
+    drive(
+        run,
+        |frame, capabilities, errors| dispatch(storage, capabilities, frame, errors),
+        &[],
         capabilities,
     )
 }
@@ -1949,6 +2207,176 @@ mod tests {
                 assert_eq!(script.calls, expected);
             }
         }
+    }
+
+    fn probe(
+        script: &mut Script,
+        in_transaction: bool,
+    ) -> Result<Step<crate::generated::Probed, &'static str>, OperationError<&'static str>> {
+        crate::suspend::probe(
+            script,
+            &[1; 32],
+            &[(vec![5, 6], vec![2; 32]), (vec![], vec![3; 32])],
+            in_transaction,
+        )
+    }
+
+    fn suspended<T: std::fmt::Debug, E: std::fmt::Debug>(
+        step: Result<Step<T, E>, OperationError<E>>,
+    ) -> Suspension<T, E> {
+        match step {
+            Ok(Step::Suspended(suspension)) => suspension,
+            other => panic!("expected a suspension, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn a_probe_suspends_on_each_round_trip_and_counts_the_answers() {
+        let mut script = Script::default();
+        let first = suspended(probe(&mut script, false));
+        assert_eq!(
+            *first.request(),
+            PeerRequest::Nodes {
+                root: vec![1; 32],
+                wants: vec![(vec![5, 6], vec![2; 32]), (vec![], vec![3; 32])],
+            }
+        );
+        let second = suspended(first.resume(
+            PeerReply::Nodes {
+                served: vec![(vec![5, 6], vec![9, 9, 9])],
+                missing: vec![vec![3; 32]],
+                redacted: vec![],
+            },
+            &mut script,
+        ));
+        assert_eq!(
+            *second.request(),
+            PeerRequest::Values {
+                root: vec![1; 32],
+                wants: vec![(vec![5, 6], vec![2; 32]), (vec![], vec![3; 32])],
+            }
+        );
+        let done = second.resume(
+            PeerReply::Values {
+                served: vec![(vec![], vec![7]), (vec![5, 6], vec![])],
+                missing: vec![vec![3; 32], vec![4; 32], vec![5; 32]],
+            },
+            &mut script,
+        );
+        match done {
+            Ok(Step::Done(probed)) => assert_eq!(
+                probed,
+                crate::generated::Probed {
+                    served: 3,
+                    missing: 4
+                }
+            ),
+            other => panic!("expected the count, got {other:?}"),
+        }
+        assert!(script.calls.is_empty());
+    }
+
+    #[test]
+    fn a_suspension_inside_a_transaction_is_refused_and_rolled_back() {
+        let mut script = Script::default();
+        assert!(matches!(
+            probe(&mut script, true),
+            Err(OperationError::Protocol)
+        ));
+        assert_eq!(script.calls, ["begin", "rollback"]);
+    }
+
+    #[test]
+    fn a_failed_round_trip_is_the_hosts_error() {
+        let mut script = Script::default();
+        let first = suspended(probe(&mut script, false));
+        assert!(matches!(
+            first.resume(PeerReply::Failed("primary"), &mut script),
+            Err(OperationError::Host("primary"))
+        ));
+        let mut script = Script::default();
+        let second = suspended(suspended(probe(&mut script, false)).resume(
+            PeerReply::Nodes {
+                served: vec![],
+                missing: vec![],
+                redacted: vec![],
+            },
+            &mut script,
+        ));
+        assert!(matches!(
+            second.resume(PeerReply::Failed("primary"), &mut script),
+            Err(OperationError::Host("primary"))
+        ));
+    }
+
+    #[test]
+    fn a_reply_of_the_other_kind_is_a_protocol_failure() {
+        let mut script = Script::default();
+        let first = suspended(probe(&mut script, false));
+        assert!(matches!(
+            first.resume(
+                PeerReply::Values {
+                    served: vec![],
+                    missing: vec![]
+                },
+                &mut script
+            ),
+            Err(OperationError::Protocol)
+        ));
+    }
+
+    #[test]
+    fn a_dropped_suspension_releases_its_continuation() {
+        let mut script = Script::default();
+        let first = suspended(probe(&mut script, false));
+        drop(first);
+        let again = suspended(probe(&mut script, false));
+        assert!(matches!(again.request(), PeerRequest::Nodes { .. }));
+    }
+
+    #[test]
+    fn a_run_that_may_not_suspend_refuses_peer_requests() {
+        let mut script = Script::default();
+        let command = Command::PeerProbe {
+            root: vec![1; 32],
+            wants: vec![],
+            in_transaction: false,
+        };
+        assert!(matches!(
+            run(&mut script, Capabilities::default(), &[], &command),
+            Err(OperationError::Protocol)
+        ));
+        assert!(script.calls.is_empty());
+    }
+
+    #[test]
+    fn peer_replies_are_written_in_the_order_the_program_reads_them() {
+        let mut errors: Vec<Option<&'static str>> = Vec::new();
+        let packet = reply(
+            72,
+            Ok::<_, &'static str>((
+                vec![(vec![1], vec![2, 3])],
+                vec![vec![4]],
+                vec![vec![5], vec![6]],
+            )),
+            &mut errors,
+            |out, (served, missing, redacted)| {
+                pairs(out, &served);
+                hashes(out, &missing);
+                hashes(out, &redacted);
+            },
+        );
+        let mut reader = Reader(&packet);
+        assert_eq!(reader.byte(), Ok(1));
+        assert_eq!(reader.byte(), Ok(72));
+        assert_eq!(
+            reader.list(|r| Ok((r.bytes()?, r.bytes()?))),
+            Ok(vec![(vec![1], vec![2, 3])])
+        );
+        assert_eq!(reader.list(Reader::bytes), Ok(vec![vec![4]]));
+        assert_eq!(reader.list(Reader::bytes), Ok(vec![vec![5], vec![6]]));
+        reader.end().unwrap();
+        assert!(errors.is_empty());
     }
 
     fn state() -> Handle {
