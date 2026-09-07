@@ -436,13 +436,42 @@ completed cutover from being mistaken for a completed user guarantee.
 | CAS C3/C5/C7: durability, collection, projections | Production Lean | Repair responsibility, collection protection and projection support exist. Clock/LRU/diagnostics are regression details; cloud/publication retention composition remains open. |
 | CAS C4: cloud composition | Rust `backend.rs` | Migrate complete provider adoption/hydration/finalize/read/serve commands, including trusted-range ingestion and complete-proof path. |
 | CAS C6: source holds and publication advertisement | Rust inside publication transaction | Migrate with the entry/head/reference publication command, never as independently committing calls. |
-| History pruning | Production Lean `Replication/History` | Retention/fork witness support proved. Head selection, reconciliation and scheduling still require implementation-connected M1–M8 proofs. |
+| History pruning | Production Lean `Replication/History` | Retention/fork witness support proved. Adoption, reconciliation and scheduling still require implementation-connected M1–M8 proofs. |
+| Head exchange selection | Production Lean `Replication/Exchange`, called by engine reconciliation | Selects request origins and push indices from advertised/servable heads. Exact newer-version requests, duplicate/order invariance and push selection support M2. Signature/admission/availability inputs and subsequent adoption remain separate obligations. |
+| Promotion authority snapshot | Rust `try_promote`, with permissions/authority read in its publication transaction | Snapshot-consistent permission checks and full own-view readiness have native regressions. This is a safety fix, not a Lean promotion theorem or closure of P3/M4/M8. |
 
 The operator-only CAS migration tool, staging-directory layout sweep and provider
 SDK remain Rust. They are not alternate implementations of migrated domain policy.
 Performance evidence includes the 120,000-entry completeness corpus: both paths
 read 160,533 nodes; one local debug run measured 0.668 s Rust and 0.733 s Lean.
 These are measurements, not a portability theorem or substitute for CI.
+
+### Latest mptsync checkpoint
+
+`ExchangeProofs.requests_exactly_newer_versions` states that an origin is requested
+exactly when its greatest remote advertisement exceeds the greatest local one.
+`advertisement_order_and_duplicates_do_not_hide_updates` proves the same result
+for lists containing the same per-origin versions despite order and multiplicity.
+`pushes_only_servable_updates` ties selected pushes to the supplied servable list,
+and `selected_positions_refer_to_servable_heads` establishes actual list-index
+membership under the native list-length bound. These are proofs about the planner
+the engine executes; they do not authenticate those inputs or prove later adoption.
+
+`ExchangeVersionProofs.version_order_is_sequence_then_root` connects the executable
+planner's numeric key to unsigned sequence ordering followed by lexicographic
+root-byte ordering for 32-byte roots. Thus the comparison used in the request and
+push proofs agrees with the independently specified product order; it is not just
+an arbitrary ordering function named “version”. Native admission enforces root width.
+
+The promotion fix reads publication authority and permissions in the same
+transaction snapshot as readiness checks and materialization. Promoting our own
+version requires a complete whole view even if local read permissions are narrower.
+Focused native validation passed the four promotion tests, including newly covered
+revocation/accepted-view preservation and incomplete-own-view rejection; the store
+library suite passed 284 tests with four ignored. These tests support the Rust
+composition change, not a formal atomic-promotion or eventual-consistency claim.
+The new exchange proofs passed their individual Lean checks; aggregate proof,
+axiom, native and platform gates remain required for the final checkpoint.
 
 ## Path to all proof goals
 
@@ -707,6 +736,7 @@ already established end to end.
 | `TrieServeProofs`, `TrieServePrivacyProofs` | P4. Keep actual-position resolution and response-loop checks. Complete the link to independently authorized content and provenance across relays. The current existential witnesses/per-position predicate checks are not an end-to-end privacy theorem. |
 | `TrieCollectProofs` | P3/P5. Keep protection of every reachable retained node/value and the sweep bridge. Proving that nothing unreachable is retained is not necessary for preservation; leaks and cost remain testable. |
 | `TrieMerkleProofs` | P1/P4 for users of the optional proof API. Keep verification meaning and construction/verification round trip. Do not expand this into a new network-proof feature merely to add proofs. |
+| `ExchangeProofs`, `ExchangeVersionProofs` | P8/M2 support added after the starting inventory. Actual head-exchange selection is exact and invariant under duplicate/reordered advertisements; selected pushes refer to supplied servable heads, and the numeric comparison agrees with sequence/root order. This establishes selection, not authentication, promotion, scheduler fairness or eventual consistency. |
 | `HistoryProgramProofs`, `OriginProgramProofs` | P4/P7. Keep identity normalization/validation, current-version and fork-evidence protection. Remove an unused error-precedence theorem. The history retention proofs do not establish global convergence, publication atomicity or all authorization behavior. |
 | `HostProgramProofs`, `HostResourceProofs`, `SuspensionProofs` | Supporting P1/P3/P5/P6. Keep reusable composition, cleanup and suspension discipline. A correct toy peer probe is evidence about the runner contract, not proof of an as-yet-unimplemented fetch. |
 | `HostWireProofs`, `WireBufferProofs`, `WireWordProofs` | Supporting P1/P6. Keep typed-result preservation, malformed/truncated reply rejection and byte-order arguments. Concrete acknowledgements are compatibility regressions; native interpreter refinement remains an explicit boundary. |
