@@ -109,4 +109,33 @@ theorem persisted_plan_has_exact_coverage (row durable complete : Bool)
         have limit := bound span belongs
         exact ⟨member, by omega⟩
 
+/-- At the same object size, committing verified groups adds exactly those
+groups to the saved availability. Serialization and complete-row encoding do
+not change that union. -/
+theorem unchanged_size_coverage (size : UInt64) (complete durable : Bool)
+    (bitmap : Option ByteArray) (incoming : List GroupSpan) (group : Nat) :
+    let old := match bitmap with | none => [] | some bytes => Cas.Codec.decodeRawBitmap bytes
+    let planned := planCasCommit true durable complete size size old incoming
+    spansContain (Cas.Serve.held (metadata size planned)) group =
+      (spansContain (Cas.Serve.held ⟨size, complete, bitmap, none⟩) group ||
+        (spansContain incoming group && group < (groupCount size).toNat)) := by
+  dsimp only
+  rw [persisted_plan_has_exact_coverage]
+  apply Bool.eq_iff_iff.mpr
+  have law := CasPlanProofs.cas_plan_membership true durable complete size size
+    (match bitmap with | none => [] | some bytes => Cas.Codec.decodeRawBitmap bytes) incoming group
+  dsimp only at law
+  rw [law]
+  cases complete with
+  | false =>
+    cases bitmap with
+    | none => simp [settleSize, Cas.Serve.held, spansContain]
+    | some bytes =>
+      simp only [Cas.Serve.held, Bool.false_eq_true, if_false,
+        Cas.Read.decodeBitmap, Cas.Read.decodeRawBitmap]
+      simp only [Bool.or_eq_true, Bool.and_eq_true, decide_eq_true_eq]
+      rw [CasPlanProofs.normalize_spans_membership]
+      simp [settleSize, spansContain, List.any_append, or_and_right]
+  | true => simp [settleSize, Cas.Serve.held, spansContain, or_and_right]
+
 end Synchronicity.CasBitmapProofs
