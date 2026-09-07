@@ -1914,23 +1914,47 @@ fn exchange_plan(
 ) -> Result<(Vec<SignedHead>, Vec<OriginId>)> {
     use synch_verified::replication::{plan_exchange, Advertised};
     let summaries = |heads: &[HeadSummary]| {
-        heads.iter().map(|head| Advertised {
-            origin: head.origin.canonical(),
-            seq: head.seq,
-            root: head.root.0.to_vec(),
-        }).collect()
+        heads
+            .iter()
+            .map(|head| Advertised {
+                origin: head.origin.canonical(),
+                seq: head.seq,
+                root: head.root.0.to_vec(),
+            })
+            .collect()
     };
-    let plan = plan_exchange(summaries(ours), summaries(theirs), servable.iter().map(|head| Advertised {
-        origin: head.origin.canonical(),
-        seq: head.seq,
-        root: head.root.0.to_vec(),
-    }).collect()).map_err(|error| EngineError::Record(error.to_string()))?;
-    let push = plan.push.into_iter().map(|position| {
-        usize::try_from(position).ok().and_then(|position| servable.get(position)).cloned()
-            .ok_or_else(|| EngineError::Record("invalid Lean exchange head position".into()))
-    }).collect::<Result<Vec<_>>>()?;
-    let mut want = plan.want.into_iter().map(|origin| origin.parse::<OriginId>()
-        .map_err(|error| EngineError::Record(error.to_string())))
+    let plan = plan_exchange(
+        summaries(ours),
+        summaries(theirs),
+        servable
+            .iter()
+            .map(|head| Advertised {
+                origin: head.origin.canonical(),
+                seq: head.seq,
+                root: head.root.0.to_vec(),
+            })
+            .collect(),
+    )
+    .map_err(|error| EngineError::Record(error.to_string()))?;
+    let push = plan
+        .push
+        .into_iter()
+        .map(|position| {
+            usize::try_from(position)
+                .ok()
+                .and_then(|position| servable.get(position))
+                .cloned()
+                .ok_or_else(|| EngineError::Record("invalid Lean exchange head position".into()))
+        })
+        .collect::<Result<Vec<_>>>()?;
+    let mut want = plan
+        .want
+        .into_iter()
+        .map(|origin| {
+            origin
+                .parse::<OriginId>()
+                .map_err(|error| EngineError::Record(error.to_string()))
+        })
         .collect::<Result<Vec<_>>>()?;
     // Preserve the wire's existing OriginId ordering (key origins first,
     // then named origins by domain/id), which differs from canonical text.
@@ -2317,6 +2341,28 @@ mod tests {
         let pending: Vec<_> = summaries.iter().filter(|s| !s.complete).collect();
         assert_eq!(pending.len(), 1);
         assert_eq!(pending[0].seq, 2);
+    }
+
+    #[test]
+    fn promotion_of_our_own_version_requires_the_whole_view() {
+        use synch_mpt::NodeStore;
+
+        let (_d, store, key, origin) = setup();
+        store.set_self_origin(&origin).unwrap();
+        store.set_read_scope(Some(&["photos".into()])).unwrap();
+        let pending = SignedHead::sign(&key, origin.clone(), 1, Hash::new(b"unfetched"), 0);
+        store.put_head(Slot::Pending, &pending, 0, 0).unwrap();
+        store.note_redacted(&pending.root, &[]).unwrap();
+
+        // A refusal could satisfy the restricted foreign-origin walk. Our
+        // recovered version is materialized in full, so that answer cannot
+        // justify replacing our own view with an empty one.
+        assert_eq!(
+            Syncer::new(store.clone()).try_promote(&origin, 0).unwrap(),
+            Promotion::Waiting
+        );
+        assert_eq!(store.complete_head(&origin).unwrap(), None);
+        assert_eq!(store.pending_head(&origin).unwrap(), Some(pending));
     }
 
     #[test]
