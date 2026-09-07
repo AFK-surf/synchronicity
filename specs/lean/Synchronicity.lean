@@ -58,3 +58,4 @@ import Synchronicity.CasAdvertisementProofs
 import Synchronicity.TrieNormalizeProofs
 import Synchronicity.CasTransferHistories
 import Synchronicity.TrieFetchProofs
+import Synchronicity.ContactProofs

@@ -290,9 +290,13 @@ unattempted turns. Clock jitter controls the interval, not peer selection.
 
 The required contact theorem is: once eligibility stabilizes, every eligible
 peer gets an attempt within `ceil(peer count / batch size)` completed rounds,
-independently of query ordering or other peers' failures. Native tests cover
-that behavior; the formal bounded-turn theorem and its connection to actual
-eligibility and completed attempts remain open. Continued completed rounds are
+independently of query ordering or other peers' failures.
+`ContactProofs.every_peer_has_a_bounded_turn` now checks this bound for the
+executable cyclic selection, assuming completed cursor transitions. The same
+module proves that peer ordering preserves all 32 identifier bytes and that
+a completed batch moves every unserved peer forward by the batch size.
+Connecting the actual native index/returned cursor and engine attempts to those
+transitions remains open; the theorem must not assume that connection. Continued completed rounds are
 an explicit runtime condition; infinitely cancelled rounds or repeated process
 restarts do not establish progress. This does not yet prove eventual consistency.
 
@@ -507,7 +511,7 @@ completed cutover from being mistaken for a completed user guarantee.
 | CAS C4: cloud composition | Rust `backend.rs` | Migrate complete provider adoption/hydration/finalize/read/serve commands, including trusted-range ingestion and complete-proof path. |
 | CAS C6: source holds and publication advertisement | Rust inside publication transaction | Migrate with the entry/head/reference publication command, never as independently committing calls. |
 | History pruning | Production Lean `Replication/History` | Retention/fork witness support proved. Adoption, reconciliation and scheduling still require implementation-connected M1–M8 proofs. |
-| Peer contact selection | Production Lean `Replication/Contact`, called by serialized periodic rounds | Native bounded-turn and duplicate/order cases checked. Formal bounded service and composition with actual eligibility, failures and cancellation remain required for M1/M6. |
+| Peer contact selection | Production Lean `Replication/Contact`, called by serialized periodic rounds | Native bounded-turn and duplicate/order cases checked. Bounded service of the actual cyclic selection is proved; connecting the native index/cursor, eligibility and completed engine attempts remains required for M1/M6. |
 | Head exchange selection | Production Lean `Replication/Exchange`, called by engine reconciliation | Selects request origins and push indices from advertised/servable heads. Exact newer-version requests, duplicate/order invariance and push selection support M2. Signature/admission/availability inputs and subsequent adoption remain separate obligations. |
 | Promotion authority snapshot | Rust `try_promote`, with permissions/authority read in its publication transaction | Snapshot-consistent permission checks and full own-view readiness have native regressions. This is a safety fix, not a Lean promotion theorem or closure of P3/M4/M8. |
 

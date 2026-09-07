@@ -23,11 +23,12 @@ def index (peers : List ByteArray) : Index :=
 /-- The cyclic order begins strictly after the previous completed plan's
 last peer. Removing that peer from eligibility does not reset everybody's
 turn; adding peers does not rely on a stable input-list ordering. -/
-def cycle (peers : Index) (cursor : Option ByteArray) : List (Nat × (Nat × ByteArray)) :=
-  let last := cursor.map key |>.getD 0
-  let ordered := peers.toList
+def cycleAt (ordered : List (Nat × α)) (last : Nat) : List (Nat × α) :=
   ordered.filter (fun entry => last < entry.1) ++
     ordered.filter (fun entry => entry.1 ≤ last)
+
+def cycle (peers : Index) (cursor : Option ByteArray) : List (Nat × (Nat × ByteArray)) :=
+  cycleAt peers.toList (cursor.map key |>.getD 0)
 
 def plan (peers : List ByteArray) (cursor : Option ByteArray) (maximum : Nat) : ContactPlan :=
   let selected := (cycle (index peers) cursor).take maximum
