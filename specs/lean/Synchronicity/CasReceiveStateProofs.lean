@@ -44,7 +44,9 @@ theorem existing_receive_execution (state : State) (root : ByteArray) (size : UI
     lookupFile result.2.files ("cas_payload", root) = some
       (state.decodedPayload root size (Cas.Serve.pairsOf (window size served)) input
         ((lookupFile state.files ("cas_payload", root)).getD ByteArray.empty)) ∧
-    result.2.faults = [] ∧ result.2.pending = none := by
+    result.2.faults = [] ∧ result.2.pending = none ∧
+    result.2.hash = state.hash ∧ result.2.decodeSlice = state.decodeSlice ∧
+    result.2.decodedPayload = state.decodedPayload ∧ result.2.decodeSliceFailure = state.decodeSliceFailure := by
   have selected (table : String) (fields : Fields) :
       selects ⟨table, fields, [], []⟩ = fun row => equals row fields := by
     funext row
@@ -85,7 +87,9 @@ theorem interrupted_decoder_keeps_committed_metadata (state : State) (root : Byt
     lookupFile result.2.files ("cas_payload", root) = some
       (state.decodedPayload root size (Cas.Serve.pairsOf (window size served)) input
         ((lookupFile state.files ("cas_payload", root)).getD ByteArray.empty)) ∧
-    result.2.faults = [] ∧ result.2.pending = none := by
+    result.2.faults = [] ∧ result.2.pending = none ∧
+    result.2.hash = state.hash ∧ result.2.decodeSlice = state.decodeSlice ∧
+    result.2.decodedPayload = state.decodedPayload ∧ result.2.decodeSliceFailure = state.decodeSliceFailure := by
   have selected (table : String) (fields : Fields) :
       selects ⟨table, fields, [], []⟩ = fun row => equals row fields := by
     funext row
