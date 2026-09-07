@@ -1,3 +1,5 @@
+import VerifiedCore.Postcard
+
 /-!
 The trie domain's existing postcard representation, both directions. This is
 internal domain code, not a codec service exposed to Rust. Local reads
@@ -21,32 +23,17 @@ inductive Node where
   | branch (children : List (Option ByteArray)) (value : Option Value)
   deriving BEq, DecidableEq
 
-/-- A parser answers its value and the octets after it, or why it stopped. -/
-abbrev Parser (α : Type) := List UInt8 → Except String (α × List UInt8)
-
-def parseByte : Parser UInt8
-  | [] => .error "unexpected end of node"
-  | b :: rest => .ok (b, rest)
+/-- Shared postcard primitives retain the trie codec's established names. -/
+abbrev Parser := Postcard.Parser
+abbrev parseByte := Postcard.parseByte
 
 def takeOctets : Nat → Parser (List UInt8)
   | 0, input => .ok ([], input)
   | _ + 1, [] => .error "unexpected end of node"
   | n + 1, b :: rest => (takeOctets n rest).map fun (bs, rest) => (b :: bs, rest)
 
-/-- Postcard uses a bounded unsigned LEB128 for lengths and enum tags. The
-tenth byte of a length may carry only the top bit of a u64. -/
-def varintAux : Nat → Nat → Nat → Nat → Parser Nat
-  | 0, _, _, _, _ => .error "varint overflow"
-  | fuel + 1, limit, shift, acc, input => do
-    let (b, rest) ← parseByte input
-    let b := b.toNat
-    if b > limit then .error "varint overflow"
-    else
-      let acc := acc + (b % 128) * 2 ^ shift
-      if b < 128 then .ok (acc, rest)
-      else varintAux fuel (if fuel == 1 then 1 else 255) (shift + 7) acc rest
-
-def parseLength : Parser Nat := varintAux 10 255 0 0
+abbrev varintAux := Postcard.varintAux
+abbrev parseLength := Postcard.parseLength
 
 /-- Enum variants are encoded as u32, not as host-sized lengths. -/
 def tagAux : Nat → Nat → Nat → Parser Nat
@@ -122,10 +109,7 @@ What the write path stores and what the ingress boundary compares against.
 Minimal LEB128 lengths, u32 enum tags, one byte per option, raw 32-byte
 addresses: the postcard bytes `synch-mpt`'s derived `Serialize` produces. -/
 
-def leb128 (n : Nat) : List UInt8 :=
-  if n < 128 then [n.toUInt8] else (n % 128 + 128).toUInt8 :: leb128 (n / 128)
-termination_by n
-decreasing_by omega
+abbrev leb128 := Postcard.leb128
 
 def encodeValue : Value → List UInt8
   | .inline bytes => 0 :: (leb128 bytes.size ++ bytes.data.toList)

@@ -36,49 +36,6 @@ theorem slice_persists_payload (state : State) (root : ByteArray) (size : UInt64
     bind, pure, Program.bind, ExceptT.bind, ExceptT.bindCont, ExceptT.pure, ExceptT.run, ExceptT.mk]
 
 
-/-- Further receives settle against the existing raw row at the same size,
-merge its persisted coverage, and retain the actual updated payload. -/
-theorem further_slice_persists_payload (state : State) (root : ByteArray) (size : UInt64)
-    (served : List (UInt64 × UInt64)) (bitmap : Option ByteArray) (previousNow now : Int64) (tier : Cas.IngestCommit.Tier)
-    (quiet : state.faults = []) (idle : state.pending = none) (clean : state.scanFault = none)
-    (existing : rows state.db "blobs" =
-      [Cas.IngestCommit.values root size false bitmap none previousNow .local])
-    (width : root.size = 32) (unleased : state.counters = [])
-    (large : ¬ size ≤ inlineMax) (nonempty : window size served ≠ [])
-    (verifies : state.decodeSlice root size (Cas.Serve.pairsOf (window size served)) 0 = true) :
-    let result := SimulatedHost.run (writeSlice root size served 0 now tier) state
-    result.1 = .ok (Cas.Serve.pairsOf (window size served)) ∧
-    rows result.2.db "blobs" =
-      [(Cas.IngestCommit.values root size
-        (Cas.IngestCommit.plan (some ⟨size, false, false, bitmap⟩) size (window size served)).complete
-        (let decided := Cas.IngestCommit.plan (some ⟨size, false, false, bitmap⟩) size (window size served)
-         if decided.complete || decided.spans.isEmpty then none
-         else some (Cas.Codec.encodeRawBitmap decided.spans)) none now tier).drop 1 ++ [("root", .blob root)]] ∧
-    lookupFile result.2.files ("cas_payload", root) = some
-      (state.decodedPayload root size (Cas.Serve.pairsOf (window size served)) 0
-        ((lookupFile state.files ("cas_payload", root)).getD ByteArray.empty)) ∧
-    result.2.faults = [] := by
-  have accepted (incoming : List GroupSpan) :
-      (Cas.IngestCommit.plan (some ⟨size, false, false, bitmap⟩) size incoming).accepted = true := by
-    simp [Cas.IngestCommit.plan, planCasCommit, settleSize]
-  cases finished : (Cas.IngestCommit.plan (some ⟨size, false, false, bitmap⟩) size (window size served)).complete <;>
-    cases bitmap <;> cases tier <;>
-    simp [SimulatedHost.run, writeSlice, leased, admit, commit, metadata?, settle,
-    VerifiedCore.Cas.Receive.access, VerifiedCore.Cas.Receive.lease, VerifiedCore.Cas.Receive.bao,
-    Cas.IngestCommit.admit, Cas.IngestCommit.commitGroups, Cas.IngestCommit.commitIn,
-    Cas.IngestCommit.decodeClaim, Cas.IngestCommit.claimColumns,
-    within, ensure, transactionOver, raise, performOver, Inject.inject, Program.mapEffects,
-    execute, Interpreter.handle, storage, SimulatedHost.access, upsert, SimulatedHost.lease,
-    SimulatedHost.bao, SimulatedHost.transaction, reply, fault, record, quiet, idle, clean,
-    scanFailure, existing, query, large, nonempty, verifies, accepted, finished, unleased, counter, setCounter,
-    Cas.IngestCommit.values, Cas.IngestCommit.assignments, project, selects, equals,
-    Cas.Read.decodeRow, Cas.Read.blobField, Cas.Read.integerField, Cas.Read.optionalBlobField,
-    Cas.Codec.blobField, Cas.Codec.integerField, Cas.Codec.optionalBlobField,
-    conflict, conflictValue, assign, cell, width,
-    lookupFile, writeFile, upsertRows, Except.mapError, Except.map, Except.bind, Except.pure,
-    bind, pure, Program.bind, ExceptT.bind, ExceptT.bindCont, ExceptT.pure, ExceptT.run, ExceptT.mk]
-  all_goals decide +kernel
-
 /-- The actual receive row is the metadata later consumed by Read. -/
 theorem recorded_metadata (state : State) (root : ByteArray) (size : UInt64)
     (complete : Bool) (bitmap inline : Option ByteArray) (now : Int64)

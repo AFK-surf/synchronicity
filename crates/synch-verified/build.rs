@@ -37,6 +37,7 @@ fn main() {
         "Host/Generated",
         "Origin",
         "Cas",
+        "Postcard",
         "Cas/Codec",
         "Cas/Program",
         "Cas/ReadCodec",

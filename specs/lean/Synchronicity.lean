@@ -50,3 +50,4 @@ import Synchronicity.CasReceivePromises
 import Synchronicity.TrieWriteSemantics
 import Synchronicity.CasContentProofs
 import Synchronicity.CasReceiveStateProofs
+import Synchronicity.CasBitmapProofs
