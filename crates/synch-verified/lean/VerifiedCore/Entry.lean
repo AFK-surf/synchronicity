@@ -15,6 +15,8 @@ import VerifiedCore.Cas.Project
 import VerifiedCore.Trie.Serve
 import VerifiedCore.Trie.Memo
 import VerifiedCore.Trie.Collect
+import VerifiedCore.Trie.Walk
+import VerifiedCore.Trie.Diff
 import VerifiedCore.Replication.History
 
 /-! The one native entry point. A command arrives as a packet, decoded with
@@ -155,6 +157,17 @@ def collectingTrie [Encode A] : Except Trie.Collect.Error A → Host.Reply ByteA
       | .exhausted => .exhausted
       | .host _ => .malformed) : Except _ A)
 
+def walking [Encode A] : Except Trie.Walk.Error A → Host.Reply ByteArray
+  | .ok value => terminalOf (Except.ok value : Except TrieWalkDomainError A)
+  | .error (.host hostFailure) => .error hostFailure
+  | .error error => terminalOf (Except.error (match error with
+      | .missingNode hash => TrieWalkDomainError.missingNode hash
+      | .missingValue hash => .missingValue hash
+      | .decode message => .decode message
+      | .oddDepthValue => .oddDepthValue
+      | .ceiling => .ceiling
+      | .host _ => .ceiling) : Except _ A)
+
 def projecting [Encode A] : Except Cas.Project.Error A → Host.Reply ByteArray
   | .ok value => terminalOf (Except.ok value : Except ProjectDomainError A)
   | .error (.host hostFailure) => .error hostFailure
@@ -263,6 +276,15 @@ def dispatch : Command → Native
   | .trieMemoKey root prefixes exact owner =>
     if root.size != 32 then protocol
     else command (Trie.Memo.keyFor (E := Host.Digest) id ⟨prefixes, exact⟩ root owner) hostOnly
+  | .trieScan root keyPrefix startAfter limit =>
+    if root.size != 32 then protocol
+    else command (Trie.Walk.scan (E := Trie.Walk.Effects) root keyPrefix startAfter limit) walking
+  | .trieDiff oldRoot newRoot =>
+    if oldRoot.size != 32 || newRoot.size != 32 then protocol
+    else command (Trie.Diff.diff (E := Trie.Diff.Effects) oldRoot newRoot) walking
+  | .trieMaterialize oldRoot newRoot prefixes exact =>
+    if oldRoot.size != 32 || newRoot.size != 32 then protocol
+    else command (Trie.Diff.materialize (E := Trie.Diff.Effects) ⟨prefixes, exact⟩ oldRoot newRoot) walking
 
 /-- Every command starts here: an undecodable packet is a protocol failure
 before any effect is requested. -/

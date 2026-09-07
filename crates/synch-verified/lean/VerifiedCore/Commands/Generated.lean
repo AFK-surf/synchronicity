@@ -103,6 +103,29 @@ instance : Decode Trie.LookupError where
     | 4 => return .depthExceeded
     | _ => throw ()
 
+instance : Encode Trie.Value where
+  encode out value := match value with
+    | .inline a0 => out.push 0 |>.put a0
+    | .hash a0 => out.push 1 |>.put a0
+
+instance : Decode Trie.Value where
+  decode := do
+    match ← readByte with
+    | 0 => return .inline (← Decode.decode)
+    | 1 => return .hash (← Decode.decode)
+    | _ => throw ()
+
+instance : Encode Trie.Diff.Change where
+  encode out value := match value with
+    | .mk a0 a1 a2 => out |>.put a0 |>.put a1 |>.put a2
+
+instance : Decode Trie.Diff.Change where
+  decode := do
+    let a0 ← Decode.decode
+    let a1 ← Decode.decode
+    let a2 ← Decode.decode
+    return .mk a0 a1 a2
+
 instance : Encode Trie.Refusal where
   encode out value := match value with
     | .decode a0 => out.push 0 |>.put a0
@@ -406,6 +429,24 @@ instance : Decode Commands.TrieCollectDomainError where
     | 5 => return .exhausted
     | _ => throw ()
 
+instance : Encode Commands.TrieWalkDomainError where
+  encode out value := match value with
+    | .missingNode a0 => out.push 0 |>.put a0
+    | .missingValue a0 => out.push 1 |>.put a0
+    | .decode a0 => out.push 2 |>.put a0
+    | .oddDepthValue => out.push 3
+    | .ceiling => out.push 4
+
+instance : Decode Commands.TrieWalkDomainError where
+  decode := do
+    match ← readByte with
+    | 0 => return .missingNode (← Decode.decode)
+    | 1 => return .missingValue (← Decode.decode)
+    | 2 => return .decode (← Decode.decode)
+    | 3 => return .oddDepthValue
+    | 4 => return .ceiling
+    | _ => throw ()
+
 instance : Encode Commands.Ingested where
   encode out value := match value with
     | .mk a0 a1 => out |>.put a0 |>.put a1
@@ -497,6 +538,9 @@ instance : Encode Commands.Command where
     | .trieResolve a0 a1 => out.push 35 |>.put a0 |>.put a1
     | .trieCollect a0 a1 => out.push 36 |>.put a0 |>.put a1
     | .trieMemoKey a0 a1 a2 a3 => out.push 37 |>.put a0 |>.put a1 |>.put a2 |>.put a3
+    | .trieScan a0 a1 a2 a3 => out.push 38 |>.put a0 |>.put a1 |>.put a2 |>.put a3
+    | .trieDiff a0 a1 => out.push 39 |>.put a0 |>.put a1
+    | .trieMaterialize a0 a1 a2 a3 => out.push 40 |>.put a0 |>.put a1 |>.put a2 |>.put a3
 
 instance : Decode Commands.Command where
   decode := do
@@ -539,6 +583,9 @@ instance : Decode Commands.Command where
     | 35 => return .trieResolve (← Decode.decode) (← Decode.decode)
     | 36 => return .trieCollect (← Decode.decode) (← Decode.decode)
     | 37 => return .trieMemoKey (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 38 => return .trieScan (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 39 => return .trieDiff (← Decode.decode) (← Decode.decode)
+    | 40 => return .trieMaterialize (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode)
     | _ => throw ()
 
 end VerifiedCore

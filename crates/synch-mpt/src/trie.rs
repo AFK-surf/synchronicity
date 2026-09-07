@@ -6,57 +6,10 @@ use synch_core::{Hash, OriginId, MAX_KEY_LEN};
 
 use crate::{
     error::MptError,
-    nibbles::Nibbles,
     node::{TrieNode, ValueRef},
     scope::Scope,
     store::NodeStore,
 };
-
-/// A position in the trie, which may sit *inside* a compressed node.
-///
-/// Extension and leaf nodes compress several nibble levels into one stored
-/// node; a cursor can therefore be "half way through" such a node, in which
-/// case it has no hash of its own. Diffing and scanning both walk cursors, so
-/// they share one uniform view of the structure regardless of compression.
-// A branch node is much larger than the other variants; boxing it would cost an
-// allocation on the hottest walk in the crate for no benefit, since cursors are
-// short-lived stack values.
-#[allow(clippy::large_enum_variant)]
-#[derive(Debug, Clone)]
-pub(crate) enum Cursor {
-    /// Nothing is stored at this position.
-    Empty,
-    /// A node. A cursor may sit part-way through a compressed node, in which
-    /// case this is the virtual remainder rather than a whole stored one.
-    At {
-        /// The node itself.
-        node: TrieNode,
-    },
-}
-
-impl Cursor {
-    pub(crate) fn is_empty(&self) -> bool {
-        matches!(self, Cursor::Empty)
-    }
-
-    pub(crate) fn value_ref(&self) -> Option<&ValueRef> {
-        match self {
-            Cursor::Empty => None,
-            Cursor::At { node, .. } => match node {
-                TrieNode::Leaf { key_rest, value } if key_rest.is_empty() => Some(value),
-                TrieNode::Leaf { .. } | TrieNode::Ext { .. } => None,
-                TrieNode::Branch { value, .. } => value.as_ref(),
-            },
-        }
-    }
-
-    pub(crate) fn node_ref(&self) -> Option<&TrieNode> {
-        match self {
-            Cursor::Empty => None,
-            Cursor::At { node, .. } => Some(node),
-        }
-    }
-}
 
 /// How deep, in nibbles, any walk over trie structure descends.
 ///
@@ -84,64 +37,11 @@ pub const MAX_DEPTH_NIBBLES: usize = MAX_KEY_LEN * 2;
 /// only on *first cold materialization* (join, restore, `repair rebuild-views`).
 /// Existing followers keep syncing it happily; the refusal at least names the
 /// situation rather than reading as one more unparseable record.
-const WALK_POSITION_CEILING: usize = 8_000_000;
-
-/// Keeps a structural walk proportional to the work it is allowed to do.
 ///
-/// A peer's node graph is a DAG: nothing stops a branch pointing all sixteen
-/// children at one hash, and sixteen such branches stacked are seventeen
-/// distinct nodes — which `MissingWalk` fetches happily and `is_complete`
-/// passes — yet 16^16 positions to walk. Depth bounds do not help; the
-/// explosion is in breadth.
-///
-/// Deduping positions by node hash is *not* the fix: structural sharing means
-/// one leaf node legitimately sits at as many positions as there are keys with
-/// that value, so pruning repeats silently drops keys from source scans and changes
-/// from `diff`. Neither is classifying the shape — a former rule capping
-/// arrivals at a multiple of the *distinct* node count collapsed on an ordinary
-/// corpus: sixty thousand keys with one identical value make every leaf the
-/// same node, ~ten distinct nodes carrying sixty thousand positions, blowing
-/// the ratio exactly as a fan-out bomb does. The two cases are not separable by
-/// this measurement, so the walk is bounded by work and nothing else.
-#[derive(Debug, Default)]
-pub(crate) struct FanoutGuard {
-    /// Positions of every kind, against the absolute ceiling.
-    positions: usize,
-}
-
-impl FanoutGuard {
-    /// Records one visited position, failing if the walk has outrun its budget.
-    pub(crate) fn visit(&mut self) -> Result<(), MptError> {
-        self.positions += 1;
-        if self.positions > WALK_POSITION_CEILING {
-            return Err(MptError::NonCanonical(format!(
-                "structural walk exceeded {WALK_POSITION_CEILING} positions. If this is a cold \
-                 materialization of an origin that has been publishing for a long time, this \
-                 node cannot adopt it at all — its trie has grown past what any *first* \
-                 adoption here can walk, while incremental followers are unaffected"
-            )));
-        }
-        Ok(())
-    }
-}
-
-/// One step of a [`Trie::descend`] walk: the parent's state, the child
-/// nibble, and the child's path (already pushed), deciding a [`Step`].
-pub(crate) type StepFn<'s, T> = dyn FnMut(&T, u8, &[u8]) -> Result<Step<T>, MptError> + 's;
-
-/// What one step of a [`Trie::descend`] walk decided about a child position.
-pub(crate) enum Step<T> {
-    /// A real position worth descending: charged against the walk ceiling,
-    /// its state pushed as the next level.
-    Descend(T),
-    /// A real position not worth descending — a diff whose subtrees are
-    /// structurally shared, say. Charged, not pushed.
-    Visited,
-    /// Nothing there, or pruned before it was read. Uncharged.
-    Skip,
-    /// The walk has what it came for; unwind everything.
-    Stop,
-}
+/// The walk itself, and the charge against this ceiling, is Lean's
+/// `Trie.Walk.descend` (`walkPositionCeiling`); this is the figure the
+/// refusal names.
+pub(crate) const WALK_POSITION_CEILING: usize = 8_000_000;
 
 /// Maps the empty-trie sentinel onto `None`.
 pub(crate) fn root_opt(root: Hash) -> Option<Hash> {
@@ -597,11 +497,6 @@ impl<'a, S: NodeStore + ?Sized> Trie<'a, S> {
         r.map_err(MptError::store)
     }
 
-    fn load(&self, hash: &Hash) -> Result<TrieNode, MptError> {
-        let data = Self::wrap(self.store.get_node(hash))?.ok_or(MptError::MissingNode(*hash))?;
-        TrieNode::decode(&data)
-    }
-
     /// Reads a node's bytes without requiring it to be present, for the walks
     /// whose whole purpose is finding out whether it is.
     pub(crate) fn load_raw(&self, hash: &Hash) -> Result<Option<Vec<u8>>, MptError> {
@@ -747,61 +642,7 @@ impl<'a, S: NodeStore + ?Sized> Trie<'a, S> {
         }
     }
 
-    // ---- cursors, iteration, range scans ----------------------------------
-
-    pub(crate) fn cursor_at(&self, hash: Option<Hash>) -> Result<Cursor, MptError> {
-        match hash {
-            None => Ok(Cursor::Empty),
-            Some(h) => match self.load(&h) {
-                Ok(node) => Ok(Cursor::At { node }),
-                // A refused position holds nothing this node may see, so to a
-                // walk over what it *does* hold it is empty rather than absent
-                // (§5.5). Both roots of a diff redact the same positions, so no
-                // spurious change is emitted; otherwise promotion's
-                // materialization would fail on a subtree withheld on purpose.
-                // Asked of the hash at any position: a node that is missing
-                // here and was refused somewhere was refused at every spine
-                // position the scoped fetch walked, and the diff skips the
-                // unadmitted positions before it cursors them.
-                Err(MptError::MissingNode(_)) if self.is_redacted_raw(&h, None)? => {
-                    Ok(Cursor::Empty)
-                }
-                Err(e) => Err(e),
-            },
-        }
-    }
-
-    pub(crate) fn cursor_child(&self, cursor: &Cursor, nibble: u8) -> Result<Cursor, MptError> {
-        let Cursor::At { node, .. } = cursor else {
-            return Ok(Cursor::Empty);
-        };
-        match node {
-            TrieNode::Leaf { key_rest, value } => {
-                let k = key_rest.as_slice();
-                if k.first() != Some(&nibble) {
-                    return Ok(Cursor::Empty);
-                }
-                // Part-way through a compressed node: no stored hash of its own.
-                Ok(Cursor::At {
-                    node: TrieNode::leaf(Nibbles::from_nibbles(&k[1..]), value.clone()),
-                })
-            }
-            TrieNode::Ext { prefix, child } => {
-                let p = prefix.as_slice();
-                if p.first() != Some(&nibble) {
-                    return Ok(Cursor::Empty);
-                }
-                if p.len() == 1 {
-                    self.cursor_at(Some(*child))
-                } else {
-                    Ok(Cursor::At {
-                        node: TrieNode::ext(Nibbles::from_nibbles(&p[1..]), *child),
-                    })
-                }
-            }
-            TrieNode::Branch { children, .. } => self.cursor_at(children[nibble as usize]),
-        }
-    }
+    // ---- iteration, range scans -------------------------------------------
 
     /// Every key/value pair under `root`, in lexicographic key order.
     pub fn iter(&self, root: Hash) -> Result<Vec<Entry>, MptError> {
@@ -813,7 +654,12 @@ impl<'a, S: NodeStore + ?Sized> Trie<'a, S> {
     /// and capped at `limit` results.
     ///
     /// This is the directory-listing primitive (§4.1) and the S3
-    /// `ListObjectsV2` cursor (§9.4).
+    /// `ListObjectsV2` cursor (§9.4). The whole walk is the Lean operation
+    /// `Trie.Walk.scan`: the cursor through stored and compressed nodes, the
+    /// hostile-shape defences (a depth past which no valid key can begin, the
+    /// absolute ceiling on positions visited), the resume cursor's pruning
+    /// and the key order. Rust supplies raw node reads and the refusals a
+    /// peer recorded, which read as empty positions (§5.5).
     pub fn scan(
         &self,
         root: Hash,
@@ -821,140 +667,15 @@ impl<'a, S: NodeStore + ?Sized> Trie<'a, S> {
         start_after: Option<&[u8]>,
         limit: Option<usize>,
     ) -> Result<Vec<Entry>, MptError> {
-        let prefix_nibbles = Nibbles::from_bytes(prefix);
-        let mut cursor = self.cursor_at(root_opt(root))?;
-        for &n in prefix_nibbles.as_slice() {
-            cursor = self.cursor_child(&cursor, n)?;
-            if cursor.is_empty() {
-                return Ok(Vec::new());
-            }
-        }
-        let after = start_after.map(Nibbles::from_bytes);
-        let mut path = prefix_nibbles.as_slice().to_vec();
-        let mut out = Vec::new();
-        self.collect(&cursor, &mut path, after.as_ref(), limit, &mut out)?;
-        Ok(out)
-    }
-
-    /// Drives one structural walk with an explicit heap stack: the hostile-trie
-    /// defences, held once for every descent (source-scan collection, `diff`'s
-    /// lockstep walk).
-    ///
-    /// Depth is attacker-controlled — a peer's trie is fetched by hash and
-    /// nothing about its shape is canonicalized, so it may chain extensions to
-    /// any depth — and a recursive walk would meet that with a stack overflow:
-    /// an abort rather than an error, in `diff`'s case inside head promotion
-    /// (§5.2, §12). So the frames live on the heap, the walk stops past
-    /// [`MAX_DEPTH_NIBBLES`] (below which no valid key can begin), and every
-    /// real position is charged against [`FanoutGuard`]'s ceiling, which keeps
-    /// the walk proportional to the trie — a fan-out DAG cannot turn a handful
-    /// of nodes into an unbounded walk.
-    ///
-    /// `step` is handed the parent's state, the child nibble, and the child's
-    /// path (already pushed); what it answers is a [`Step`]. `path` keeps
-    /// whatever prefix it arrives with. The ceiling is charged on the step's
-    /// *answer*, so the position that trips it has already done its own work
-    /// (emitted its change, taken its value) before the walk refuses — one
-    /// position's worth of slack against an 8 M bound, accepted so the driver
-    /// need not know in advance which children are real.
-    pub(crate) fn descend<T>(
-        &self,
-        start: T,
-        path: &mut Vec<u8>,
-        step: &mut StepFn<'_, T>,
-    ) -> Result<(), MptError> {
-        let base = path.len();
-        let mut guard = FanoutGuard::default();
-        let mut stack: Vec<(T, u8)> = vec![(start, 0)];
-        while let Some(top) = stack.len().checked_sub(1) {
-            let nibble = stack[top].1;
-            if nibble >= 16 || path.len() >= MAX_DEPTH_NIBBLES {
-                stack.pop();
-                if path.len() > base {
-                    path.pop();
-                }
-                continue;
-            }
-            stack[top].1 += 1;
-            path.push(nibble);
-            match step(&stack[top].0, nibble, path)? {
-                Step::Descend(child) => {
-                    guard.visit()?;
-                    stack.push((child, 0));
-                }
-                Step::Visited => {
-                    guard.visit()?;
-                    path.pop();
-                }
-                Step::Skip => {
-                    path.pop();
-                }
-                // The prefix contract holds on every exit, the early one
-                // included: a caller that reuses the buffer after a stopped
-                // walk must find it as it was handed over.
-                Step::Stop => {
-                    path.truncate(base);
-                    return Ok(());
-                }
-            }
-        }
-        Ok(())
-    }
-
-    /// Walks a subtree, collecting values ([`Trie::descend`]).
-    fn collect(
-        &self,
-        cursor: &Cursor,
-        path: &mut Vec<u8>,
-        after: Option<&Nibbles>,
-        limit: Option<usize>,
-        out: &mut Vec<Entry>,
-    ) -> Result<(), MptError> {
-        let after_bytes = after.map(|a| a.to_bytes().unwrap_or_default());
-        self.take_value(cursor, path, after_bytes.as_deref(), limit, out)?;
-        self.descend(cursor.clone(), path, &mut |parent, nibble, path| {
-            if limit.is_some_and(|l| out.len() >= l) {
-                return Ok(Step::Stop);
-            }
-            if after.is_some_and(|a| subtree_is_below(path, a.as_slice())) {
-                return Ok(Step::Skip);
-            }
-            let child = self.cursor_child(parent, nibble)?;
-            if child.is_empty() {
-                return Ok(Step::Skip);
-            }
-            self.take_value(&child, path, after_bytes.as_deref(), limit, out)?;
-            Ok(Step::Descend(child))
-        })
-    }
-
-    /// Emits the value sitting exactly at `path`, if there is one and the scan
-    /// cursor has passed it.
-    fn take_value(
-        &self,
-        cursor: &Cursor,
-        path: &[u8],
-        after: Option<&[u8]>,
-        limit: Option<usize>,
-        out: &mut Vec<Entry>,
-    ) -> Result<(), MptError> {
-        if limit.is_some_and(|l| out.len() >= l) {
-            return Ok(());
-        }
-        let Some(value) = cursor.value_ref() else {
-            return Ok(());
-        };
-        let key = Nibbles::from_nibbles(path)
-            .to_bytes()
-            .ok_or(MptError::OddDepthValue)?;
-        let include = match after {
-            Some(a) => key.as_slice() > a,
-            None => true,
-        };
-        if include {
-            out.push((key, self.resolve(value)?));
-        }
-        Ok(())
+        synch_verified::trie::scan(
+            &mut crate::lean_storage::Bytes(self.store),
+            &mut crate::lean_storage::Redactions(self.store),
+            root.as_bytes(),
+            prefix,
+            start_after,
+            limit.map(|limit| limit as u64),
+        )
+        .map_err(crate::lean_storage::walk_error)
     }
 
     // ---- completeness and reachability ------------------------------------
@@ -1218,22 +939,10 @@ impl<'a, S: NodeStore + ?Sized> Trie<'a, S> {
     }
 }
 
-/// True if every key under nibble path `path` sorts at or before `after`.
-///
-/// Used to prune whole subtrees when resuming a scan from a continuation token.
-fn subtree_is_below(path: &[u8], after: &[u8]) -> bool {
-    let shared = path.len().min(after.len());
-    match path[..shared].cmp(&after[..shared]) {
-        std::cmp::Ordering::Less => true,
-        std::cmp::Ordering::Greater => false,
-        // A prefix of `after`: the subtree may straddle the cursor, so descend.
-        std::cmp::Ordering::Equal => false,
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::nibbles::Nibbles;
     use crate::{node::NO_CHILDREN, store::MemStore};
 
     #[test]
@@ -1790,25 +1499,5 @@ mod tests {
 
         // A full scope has nothing to find, however the trie is shaped.
         assert_eq!(trie.first_key_outside(root, &Scope::full()).unwrap(), None);
-    }
-}
-
-#[cfg(test)]
-mod guard_tests {
-    use super::*;
-
-    /// The guard stops a walk at exactly the ceiling, driven directly in
-    /// microseconds; the end-to-end wiring twin lives `#[ignore]`d in
-    /// fanout_bomb.rs because it must walk all 8 000 000 positions.
-    #[test]
-    fn the_walk_guard_stops_at_the_ceiling() {
-        let mut guard = FanoutGuard::default();
-        for i in 0..WALK_POSITION_CEILING {
-            guard
-                .visit()
-                .unwrap_or_else(|e| panic!("refused at position {i}, under the ceiling: {e}"));
-        }
-        let err = guard.visit().expect_err("the ceiling must be enforced");
-        assert!(err.to_string().contains("exceeded"), "{err}");
     }
 }

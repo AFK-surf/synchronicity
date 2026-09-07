@@ -63,7 +63,15 @@ arms, vouching and answer assembly are deleted. Collecting the trie
 kept, the set-wise sweeps) is one whole command in one transaction over
 raw reads, `Storage.deleteExcept` and a `Memo` algebra, with the memo keys
 (`Trie/Memo.lean`) laid out in Lean for every reader; `synch-store`'s mark
-loop and sweeps and `synch-mpt`'s key layout are deleted. History retention now runs as a
+loop and sweeps and `synch-mpt`'s key layout are deleted. Walking a trie
+(`Trie/Walk.lean`, `Trie/Diff.lean`: the cursor, the explicit-stack descent
+with its depth bound, position ceiling and trampolined loop, the range scan,
+the lockstep diff with shared subtrees pruned unread and values compared as
+values, the scoped streaming materialization) is three whole commands over
+raw node reads, the `Redaction` algebra for the refusals a peer recorded,
+`Digest`, and an `Apply` algebra that hands each change to the host as it
+is found; `synch-mpt`'s cursor, descent, scan, diff and materialization
+loops are deleted. History retention now runs as a
 complete Lean operation over raw scans and a separate Ed25519 primitive; the
 Rust retention loop and receipt/fork helpers are removed. Raw scans retain
 rows before a trailing host failure so Lean owns first-error selection.

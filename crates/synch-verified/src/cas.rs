@@ -86,7 +86,8 @@ decode_list!(
     Vec<u8>,
     (Vec<u8>, Vec<u8>),
     Option<Vec<u8>>,
-    String
+    String,
+    crate::generated::TrieChange
 );
 
 fn project<T: Decode, S: Storage>(

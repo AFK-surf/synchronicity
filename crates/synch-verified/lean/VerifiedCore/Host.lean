@@ -16,6 +16,23 @@ instance : Monad (Program E) where
   pure := Program.pure
   bind := Program.bind
 
+/-- Runs `body` again on each `.inl` it answers and stops at its first
+`.inr`, spending one unit of `fuel` per iteration and one per effect. The
+compiled loop is a loop: an iteration that needed no effect continues
+without nesting a native call, and the host re-enters only at an effect,
+so a long run of pure iterations (a walk down a compressed node's segment,
+a fan-out unwinding) costs no native stack, and the loop refuses with
+`exhausted` rather than running on when the budget is spent. -/
+def Program.iterate (body : S → Program E (Except ε (S ⊕ R))) (exhausted : ε) :
+    Nat → Program E (Except ε (S ⊕ R)) → Program E (Except ε R)
+  | 0, _ => .pure (.error exhausted)
+  | fuel + 1, program =>
+    match program with
+    | .pure (.error error) => .pure (.error error)
+    | .pure (.ok (.inr result)) => .pure (.ok result)
+    | .pure (.ok (.inl next)) => iterate body exhausted fuel (body next)
+    | .request effect resume => .request effect fun reply => iterate body exhausted fuel (resume reply)
+
 /-- Inject capabilities without interpreting effects or changing continuations. -/
 def Program.mapEffects (inject : {B : Type} → E B → F B) : Program E A → Program F A
   | .pure value => .pure value
@@ -126,6 +143,12 @@ inductive Storage : Type → Type where
 abbrev OperationOver (E : Type → Type) (Error A : Type) := ExceptT Error (Program E) A
 abbrev OperationWith (Error A : Type) := OperationOver Storage Error A
 abbrev Operation (A : Type) := OperationWith Failure A
+
+/-- `Program.iterate` for an operation: `body` from `start` until it answers
+`.inr`, within `fuel` iterations and effects. -/
+def OperationOver.iterate (body : S → OperationOver E Error (S ⊕ R)) (exhausted : Error)
+    (fuel : Nat) (start : S) : OperationOver E Error R :=
+  ExceptT.mk (Program.iterate (fun state => (body state).run) exhausted fuel (body start).run)
 
 def perform (effect : Storage (Reply A)) : Operation A :=
   ExceptT.mk (.request effect .pure)

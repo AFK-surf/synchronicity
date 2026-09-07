@@ -7,6 +7,7 @@ import VerifiedCore.Host.Bao
 import VerifiedCore.Host.Sweep
 import VerifiedCore.Host.Memo
 import VerifiedCore.Host.Digest
+import VerifiedCore.Host.Walk
 import Synchronicity.Decidable
 
 /-! One stateful host for composed CAS proofs. Successful replies are computed
@@ -46,6 +47,10 @@ structure State where
   have forgotten some of them. -/
   certified : List ByteArray := []
   memoGeneration : UInt64 := 0
+  /-- The refusals a peer recorded, as (hash, position), and the changes a
+  materialization was handed, in walk order. -/
+  redacted : List (ByteArray × ByteArray) := []
+  applied : List (ByteArray × UInt64 × Option ByteArray) := []
   nextHandle : UInt64 := 1
   synced : List ObjectKey := []
   output : List UInt8 := []
@@ -384,6 +389,16 @@ def memo : Memo A → State → Result A
       let certified := state.certified.filter fun key => keep.contains key
       (.ok (), { state with certified, memoGeneration := state.memoGeneration + 1 })
 
+/-- A refusal is looked up by hash at a position, or at any. -/
+def redaction : Redaction A → State → Result A
+  | .isRedacted hash path, state => reply state "redacted" fun state =>
+      (.ok (state.redacted.any fun entry => entry.1 == hash && path.all (· == entry.2)), state)
+
+/-- The materializer records what it was handed, in order. -/
+def apply : Apply A → State → Result A
+  | .applyChange key kind new, state => reply state "apply" fun state =>
+      (.ok (), { state with applied := state.applied ++ [(key, kind, new)] })
+
 /-- Capability composition is shared by every proof and every operation. -/
 class Interpreter (E : Type → Type) where
   handle : E A → State → Result A
@@ -403,6 +418,8 @@ instance : Interpreter Digest := ⟨digest⟩
 instance : Interpreter Bao := ⟨bao⟩
 instance : Interpreter Sweep := ⟨sweep⟩
 instance : Interpreter Memo := ⟨memo⟩
+instance : Interpreter Redaction := ⟨redaction⟩
+instance : Interpreter Apply := ⟨apply⟩
 instance [Interpreter L] [Interpreter R] : Interpreter (EffectSum L R) where
   handle
     | .left effect, state => Interpreter.handle effect state
@@ -437,6 +454,46 @@ theorem execute_bind [Interpreter E] (program : Program E A) (next : A → Progr
   | request effect resume ih =>
     simp only [Program.bind, execute]
     exact ih _ _
+
+/-- A loop's iteration runs on the state its predecessor left. -/
+theorem execute_iterate_request [Interpreter E] (body : S → Program E (Except ε (S ⊕ R)))
+    (exhausted : ε) (fuel : Nat) (effect : E B) (resume : B → Program E (Except ε (S ⊕ R)))
+    (state : State) :
+    execute (Program.iterate body exhausted (fuel + 1) (.request effect resume)) state =
+      let (reply, state) := Interpreter.handle effect state
+      execute (Program.iterate body exhausted fuel (resume reply)) state := by
+  simp only [Program.iterate, execute]
+
+/-- What a loop answers satisfies `Q` whenever every iteration keeps `P` and
+stops only with `Q`, starting from a program that does the same. -/
+theorem iterate_sound [Interpreter E] (body : S → Program E (Except ε (S ⊕ R))) (exhausted : ε)
+    (P : S → Prop) (Q : R → Prop)
+    (kept : ∀ start state next, P start →
+      (execute (body start) state).1 = .ok (.inl next) → P next)
+    (stopped : ∀ start state result, P start →
+      (execute (body start) state).1 = .ok (.inr result) → Q result)
+    (fuel : Nat) : ∀ (program : Program E (Except ε (S ⊕ R))) (state : State),
+    (∀ next, (execute program state).1 = .ok (.inl next) → P next) →
+    (∀ result, (execute program state).1 = .ok (.inr result) → Q result) →
+    ∀ result, (execute (Program.iterate body exhausted fuel program) state).1 = .ok result →
+      Q result := by
+  induction fuel with
+  | zero => intro program state _ _ result ran; simp [Program.iterate, execute] at ran
+  | succ fuel ih =>
+    intro program state keeps stops result ran
+    match program with
+    | .pure (.error error) => simp [Program.iterate, execute] at ran
+    | .pure (.ok (.inr answer)) =>
+      simp only [Program.iterate, execute, Except.ok.injEq] at ran
+      exact ran ▸ stops answer rfl
+    | .pure (.ok (.inl next)) =>
+      simp only [Program.iterate] at ran
+      exact ih (body next) state (kept next state · (keeps next rfl)) (stopped next state · (keeps next rfl))
+        result ran
+    | .request effect resume =>
+      rw [execute_iterate_request] at ran
+      simp only [execute] at keeps stops
+      exact ih _ _ keeps stops result ran
 
 /-- Lifting an operation changes its capability position, not its semantics. -/
 theorem execute_mapEffects [Interpreter E] [Interpreter F]

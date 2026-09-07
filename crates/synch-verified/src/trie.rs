@@ -6,7 +6,8 @@ use crate::{
 
 pub use crate::generated::{
     Collected, LookupDomainError, MutationDomainError, NodeAnswer, NodeRefusal, NodeVerdict,
-    TrieCollectDomainError, TrieServeDomainError, ValueAnswer,
+    TrieChange, TrieCollectDomainError, TrieServeDomainError, TrieValue, TrieWalkDomainError,
+    ValueAnswer,
 };
 pub use crate::operation::OperationError;
 use crate::{host::Storage, operation::Decode};
@@ -712,4 +713,120 @@ pub fn memo_key<D: Digest>(
     let result = operation::run_digest(digest, &[], &command)?;
     let key: Vec<u8> = terminal(&result).map_err(|()| OperationError::Protocol)?;
     key.try_into().map_err(|_| OperationError::Protocol)
+}
+
+/// Completed walk failure, preserving original host errors.
+#[derive(Debug)]
+pub enum WalkError<E> {
+    Operation(OperationError<E>),
+    Domain(TrieWalkDomainError),
+}
+
+/// The services a walk directs besides raw node reads: the refusals a peer
+/// recorded, the digest a value comparison uses, and, for a materialization,
+/// the taker of each change.
+pub struct WalkResources<'a, E> {
+    pub redaction: &'a mut dyn crate::host::Redaction<Error = E>,
+    pub digest: Option<&'a mut dyn Digest<Error = E>>,
+    pub apply: Option<&'a mut dyn crate::host::Apply<Error = E>>,
+}
+impl<E> std::fmt::Debug for WalkResources<'_, E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("WalkResources").finish_non_exhaustive()
+    }
+}
+
+fn walked<T: Decode, S: ByteStorage>(
+    storage: &mut S,
+    resources: WalkResources<'_, S::Error>,
+    command: &Command,
+) -> Result<T, WalkError<S::Error>> {
+    let capabilities = operation::Capabilities {
+        redaction: Some(resources.redaction),
+        digest: resources.digest,
+        apply: resources.apply,
+        ..operation::Capabilities::default()
+    };
+    let result =
+        operation::run_walk(storage, capabilities, &[], command).map_err(WalkError::Operation)?;
+    let outcome: Result<T, TrieWalkDomainError> =
+        terminal(&result).map_err(|()| WalkError::Operation(OperationError::Protocol))?;
+    outcome.map_err(WalkError::Domain)
+}
+
+/// One listed entry: the key and its value's bytes.
+pub type ScanEntry = (Vec<u8>, Vec<u8>);
+
+/// Every pair under a root whose key starts with `prefix`, in key order,
+/// optionally resuming strictly after `start_after` and capped at `limit`.
+/// Lean owns the cursor, the hostile-shape defences and the order; a
+/// refused position reads as empty.
+pub fn scan<S: ByteStorage>(
+    storage: &mut S,
+    redaction: &mut dyn crate::host::Redaction<Error = S::Error>,
+    root: &[u8; 32],
+    prefix: &[u8],
+    start_after: Option<&[u8]>,
+    limit: Option<u64>,
+) -> Result<Vec<ScanEntry>, WalkError<S::Error>> {
+    let command = Command::TrieScan {
+        root: root.to_vec(),
+        key_prefix: prefix.to_vec(),
+        start_after: start_after.map(<[u8]>::to_vec),
+        limit,
+    };
+    let resources = WalkResources {
+        redaction,
+        digest: None,
+        apply: None,
+    };
+    walked(storage, resources, &command)
+}
+
+/// Every differing key between two roots, in key order, each with its old
+/// and new value references. A value is compared as a value: inline bytes
+/// and the address of the same bytes out of line are one value.
+pub fn diff<S: ByteStorage>(
+    storage: &mut S,
+    redaction: &mut dyn crate::host::Redaction<Error = S::Error>,
+    digest: &mut dyn Digest<Error = S::Error>,
+    old_root: &[u8; 32],
+    new_root: &[u8; 32],
+) -> Result<Vec<TrieChange>, WalkError<S::Error>> {
+    let command = Command::TrieDiff {
+        old_root: old_root.to_vec(),
+        new_root: new_root.to_vec(),
+    };
+    let resources = WalkResources {
+        redaction,
+        digest: Some(digest),
+        apply: None,
+    };
+    walked(storage, resources, &command)
+}
+
+/// The diff a head promotion applies: every change the scope admits handed
+/// to `apply` as it is found, with only its new value resolved; answers
+/// how many were handed over. The scope is an Authorization-domain input.
+pub fn materialize<S: ByteStorage>(
+    storage: &mut S,
+    redaction: &mut dyn crate::host::Redaction<Error = S::Error>,
+    digest: &mut dyn Digest<Error = S::Error>,
+    apply: &mut dyn crate::host::Apply<Error = S::Error>,
+    old_root: &[u8; 32],
+    new_root: &[u8; 32],
+    scope: ServeScope,
+) -> Result<u64, WalkError<S::Error>> {
+    let command = Command::TrieMaterialize {
+        old_root: old_root.to_vec(),
+        new_root: new_root.to_vec(),
+        prefixes: scope.prefixes,
+        exact: scope.exact,
+    };
+    let resources = WalkResources {
+        redaction,
+        digest: Some(digest),
+        apply: Some(apply),
+    };
+    walked(storage, resources, &command)
 }

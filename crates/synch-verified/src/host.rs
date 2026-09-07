@@ -3,8 +3,8 @@
 //! types they exchange are defined here.
 
 pub use crate::generated::{
-    Bao, ByteWrites, Clock, Construct, Crypto, Digest, FileIO, Lease, Memo, Output, Resources,
-    SourceIO, Storage, Sweep, TemporaryFiles,
+    Apply, Bao, ByteWrites, Clock, Construct, Crypto, Digest, FileIO, Lease, Memo, Output,
+    Redaction, Resources, SourceIO, Storage, Sweep, TemporaryFiles,
 };
 
 /// The raw services an ingestion directs besides its relational storage. The

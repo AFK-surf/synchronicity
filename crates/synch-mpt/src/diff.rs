@@ -7,14 +7,7 @@
 
 use synch_core::Hash;
 
-use crate::{
-    error::MptError,
-    nibbles::Nibbles,
-    node::ValueRef,
-    scope::Scope,
-    store::NodeStore,
-    trie::{root_opt, Cursor, Step, Trie},
-};
+use crate::{error::MptError, node::ValueRef, scope::Scope, store::NodeStore, trie::Trie};
 
 /// What happened to one key between two roots.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -52,116 +45,32 @@ impl Change {
 impl<S: NodeStore + ?Sized> Trie<'_, S> {
     /// Diffs two roots, returning one [`Change`] per differing key in
     /// lexicographic key order.
-    pub fn diff(&self, old_root: Hash, new_root: Hash) -> Result<Vec<Change>, MptError> {
-        let mut out = Vec::new();
-        self.diff_each_scoped(old_root, new_root, &Scope::full(), |change| {
-            out.push(change);
-            Ok(())
-        })?;
-        out.sort_by(|x, y| x.key.cmp(&y.key));
-        Ok(out)
-    }
-
-    /// Diffs two roots within `scope`, handing each [`Change`] to `emit` as it
-    /// is found.
     ///
-    /// Unordered, unlike [`Trie::diff`]: sorting needs the whole set in memory,
-    /// which is the thing a streaming walk exists not to need.
-    pub(crate) fn diff_each_scoped(
-        &self,
-        old_root: Hash,
-        new_root: Hash,
-        scope: &Scope,
-        mut emit: impl FnMut(Change) -> Result<(), MptError>,
-    ) -> Result<(), MptError> {
-        if old_root == new_root {
-            return Ok(());
-        }
-        let a = self.cursor_at(root_opt(old_root))?;
-        let b = self.cursor_at(root_opt(new_root))?;
-        self.diff_walk(a, b, scope, &mut |change| {
-            // Traversing a grant's spine does not grant its branch value.
-            // Filter before resolving payloads during materialization.
-            if scope.admits_key_path(Nibbles::from_bytes(&change.key).as_slice()) {
-                emit(change)?;
-            }
-            Ok(())
+    /// The whole diff is the Lean operation `Trie.Diff.diff`: both tries
+    /// walked in lockstep with the shared descent's defences, every subtree
+    /// whose two sides are the same node pruned, and a value compared as a
+    /// value rather than as a representation (inline bytes and the address
+    /// of the same bytes out of line are one value, decided by the digest
+    /// without touching the store). Rust supplies raw node reads, the
+    /// refusals a peer recorded and BLAKE3.
+    pub fn diff(&self, old_root: Hash, new_root: Hash) -> Result<Vec<Change>, MptError> {
+        synch_verified::trie::diff(
+            &mut crate::lean_storage::Bytes(self.store()),
+            &mut crate::lean_storage::Redactions(self.store()),
+            &mut crate::lean_storage::Blake3,
+            old_root.as_bytes(),
+            new_root.as_bytes(),
+        )
+        .map_err(crate::lean_storage::walk_error)?
+        .into_iter()
+        .map(|change| {
+            Ok(Change {
+                key: change.key,
+                old: change.old.map(crate::lean_storage::value_ref).transpose()?,
+                new: change.new.map(crate::lean_storage::value_ref).transpose()?,
+            })
         })
-    }
-
-    /// Walks both tries in lockstep ([`Trie::descend`]), which is what holds
-    /// the hostile-shape defences: this runs inside the head-promotion
-    /// transaction (§5.2), holding the write lock, so an unbounded or
-    /// overflowing walk here is a cluster-wide outage rather than a slow
-    /// query.
-    fn diff_walk(
-        &self,
-        a: Cursor,
-        b: Cursor,
-        scope: &Scope,
-        emit: &mut dyn FnMut(Change) -> Result<(), MptError>,
-    ) -> Result<(), MptError> {
-        let mut path: Vec<u8> = Vec::new();
-        if !self.enter(&a, &b, &path, emit)? {
-            return Ok(());
-        }
-        self.descend((a, b), &mut path, &mut |pair, nibble, path| {
-            // The same boundary the fetch stopped at: an out-of-scope position
-            // holds nothing this node was sent, so descending it would fail on
-            // an absence that is the design working. Tested before the cursors
-            // are taken, since taking them reads the absent node (§5.5).
-            // `ScopedSync.DiffReach`; `diff_never_misses` is why, over a root
-            // complete within the scope, this walk reads no absent node.
-            if !scope.admits_path(path) {
-                return Ok(Step::Skip);
-            }
-            let ca = self.cursor_child(&pair.0, nibble)?;
-            let cb = self.cursor_child(&pair.1, nibble)?;
-            // Charged only where something is actually there, as `collect`
-            // charges only a non-empty child: a branch has sixteen slots and
-            // an ordinary trie leaves most empty, so billing all sixteen
-            // measured *frames entered* — sixteen times per real position —
-            // against the ceiling the scan walk is measured by, and refused
-            // the first-adoption diff of ~57 k files at §14's shape, well
-            // inside the 100 k initial index §7.1 names.
-            if ca.is_empty() && cb.is_empty() {
-                return Ok(Step::Skip);
-            }
-            match self.enter(&ca, &cb, path, emit)? {
-                true => Ok(Step::Descend((ca, cb))),
-                false => Ok(Step::Visited),
-            }
-        })
-    }
-
-    /// Records the difference between the values at one position, and reports
-    /// whether the subtree below it is worth descending into.
-    fn enter(
-        &self,
-        a: &Cursor,
-        b: &Cursor,
-        path: &[u8],
-        emit: &mut dyn FnMut(Change) -> Result<(), MptError>,
-    ) -> Result<bool, MptError> {
-        match (a.node_ref(), b.node_ref()) {
-            (None, None) => return Ok(false),
-            // Structural sharing: identical nodes have identical subtrees.
-            (Some(x), Some(y)) if x == y => return Ok(false),
-            _ => {}
-        }
-        let va = a.value_ref();
-        let vb = b.value_ref();
-        if !same_value(va, vb) {
-            let key = Nibbles::from_nibbles(path)
-                .to_bytes()
-                .ok_or(MptError::OddDepthValue)?;
-            emit(Change {
-                key,
-                old: va.cloned(),
-                new: vb.cloned(),
-            })?;
-        }
-        Ok(true)
+        .collect()
     }
 
     /// Diffs two roots and resolves every value to bytes.
@@ -206,6 +115,10 @@ impl<S: NodeStore + ?Sized> Trie<'_, S> {
     /// descend into a subtree it was never sent and fail on an absence that
     /// is the design working (§5.5). Promotion's materialization is scoped
     /// exactly as the fetch that filled the trie was.
+    ///
+    /// The Lean operation `Trie.Diff.materialize` drives the walk and hands
+    /// each change to `apply` through the `Apply` host service, in walk order;
+    /// the scope is its Authorization-domain input.
     pub fn for_each_resolved_change_scoped<E, F>(
         &self,
         old_root: Hash,
@@ -217,59 +130,28 @@ impl<S: NodeStore + ?Sized> Trie<'_, S> {
         E: From<MptError>,
         F: FnMut(ChangeView<'_>) -> Result<(), E>,
     {
-        let mut count = 0usize;
-        let mut stopped: Option<E> = None;
-        let walked = self.diff_each_scoped(old_root, new_root, scope, |change| {
-            let new = change.new.as_ref().map(|v| self.resolve(v)).transpose()?;
-            let view = ChangeView {
-                key: &change.key,
-                kind: change.kind(),
-                new: new.as_deref(),
-            };
-            match apply(view) {
-                Ok(()) => {
-                    count += 1;
-                    Ok(())
-                }
-                Err(e) => {
-                    stopped = Some(e);
-                    Err(MptError::WalkStopped)
-                }
-            }
-        });
+        let mut applier = crate::lean_storage::Applier {
+            apply: &mut apply,
+            stopped: None,
+        };
+        let walked = synch_verified::trie::materialize(
+            &mut crate::lean_storage::Bytes(self.store()),
+            &mut crate::lean_storage::Redactions(self.store()),
+            &mut crate::lean_storage::Blake3,
+            &mut applier,
+            old_root.as_bytes(),
+            new_root.as_bytes(),
+            synch_verified::trie::ServeScope {
+                prefixes: scope.prefixes().map(<[Vec<u8>]>::to_vec),
+                exact: scope.exact().to_vec(),
+            },
+        )
+        .map_err(crate::lean_storage::walk_error);
         // The caller's own error, not the sentinel that carried it out.
-        if let Some(e) = stopped {
+        if let Some(e) = applier.stopped {
             return Err(e);
         }
-        walked?;
-        Ok(count)
-    }
-}
-
-/// True if two value references denote the same bytes.
-///
-/// `ValueRef` has two representations for one value — inline, or a hash of an
-/// out-of-line payload — and which one a node carries is a storage decision,
-/// not part of the value. Comparing references directly would report a change
-/// where there is none: `Inline(x)` and `Hash(blake3(x))` resolve identically.
-/// Nothing would be corrupted, but rows would re-materialize unchanged, the
-/// "every reported key really differs" contract would break, and a peer could
-/// force a full re-materialization by republishing with representations
-/// flipped.
-///
-/// Compared without touching the store: the out-of-line hash *is* the BLAKE3
-/// of the value, so the inline side can be hashed and compared directly.
-fn same_value(a: Option<&ValueRef>, b: Option<&ValueRef>) -> bool {
-    match (a, b) {
-        (None, None) => true,
-        (Some(x), Some(y)) => match (x, y) {
-            (ValueRef::Inline(p), ValueRef::Inline(q)) => p == q,
-            (ValueRef::Hash(p), ValueRef::Hash(q)) => p == q,
-            (ValueRef::Inline(p), ValueRef::Hash(q)) | (ValueRef::Hash(q), ValueRef::Inline(p)) => {
-                &Hash::new(p) == q
-            }
-        },
-        _ => false,
+        Ok(usize::try_from(walked?).unwrap_or(usize::MAX))
     }
 }
 

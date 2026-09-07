@@ -28,7 +28,8 @@ abbrev State := Program Storage (Reply ByteArray)
 distinct typed algebra. Existing storage packets retain their exact bytes. -/
 abbrev WriteEffects := EffectSum Construct
   (EffectSum Upsert (EffectSum Resources (EffectSum Lease (EffectSum SourceIO
-    (EffectSum Digest (EffectSum ByteWrites (EffectSum Bao (EffectSum Sweep Memo))))))))
+    (EffectSum Digest (EffectSum ByteWrites (EffectSum Bao (EffectSum Sweep
+      (EffectSum Memo (EffectSum Redaction Apply))))))))))
 abbrev NativeEffects := EffectSum Storage (EffectSum Crypto
   (EffectSum Access (EffectSum FileIO (EffectSum Clock (EffectSum Output WriteEffects)))))
 abbrev NativeState := Program NativeEffects (Reply ByteArray)

@@ -482,6 +482,28 @@ Integration review has identified specific gates, not waived limitations:
   key layout; and runs the pass on a concrete store with a failure injected
   at every effect. The Rust mark loop, temp-table sweeps and key layout are
   deleted; `Trie::reachable` stays a test oracle.
+- Walking a trie is now the three commands `trieScan`, `trieDiff` and
+  `trieMaterialize` (`Trie/Walk.lean`, `Trie/Diff.lean`) over raw node
+  reads, the new `Redaction` algebra (`isRedacted hash path`: a position the
+  store lacks reads as empty when the peer recorded a refusal for it, and as
+  a missing node otherwise), `Digest`, and the new `Apply` algebra
+  (`applyChange key kind new`: the materialization hands each change to the
+  host as the walk finds it, so a promotion never collects the diff and the
+  caller's own error travels back unchanged). Lean owns the cursor, the one
+  explicit-stack descent every walk shares with its hostile-shape defences
+  (a depth past which no valid key begins, the absolute ceiling on positions,
+  a candidate filter so a position costs one step, and `Program.iterate`, a
+  trampolined loop that continues a pure iteration without nesting a native
+  call), the range scan's pruning and limit, the lockstep diff that prunes a
+  position both sides address alike before reading either, and the value
+  comparison that reconciles inline bytes with the digest of their address
+  without touching the store. `TrieWalkProofs` proves the key packing, the
+  value comparison, that any descent keeps every frame under its base and
+  never charges past the ceiling (`walk_sound`, `descend_refuses_past_the_ceiling`),
+  that every entry a scan lists has the prefix, sorts after the cursor and
+  is within the limit (`scan_sound`), and fixtures for the scan, the diff,
+  the materialization and a failure injected at every effect. The Rust
+  cursor, descent, scan, diff and materialization loops are deleted.
 - Native tests now cover acquisition transport, every effect-failure position,
   repeated polling, malformed replies and terminal resume. Generic SQLite tests
   cover UPSERT identity/time preservation, raw cells, failed commit, abandoned

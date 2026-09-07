@@ -60,7 +60,9 @@ content-addressed relation serves through `readBytes` live in the file
 namespace of the same name, which a fixture keeps consistent with the rows.
 `Memo.forgetExcept` filters `certified` down to the kept keys and advances
 `memoGeneration`; `Digest.blake3` answers with the same `hash` parameter
-construction hashes with.
+construction hashes with. `Redaction.isRedacted` answers whether `redacted`
+records the hash, at the given position or at any; `Apply.applyChange`
+appends the change to `applied`, in the order it was handed over.
 
 `faults` selects ordinary failures by effect index in the accumulated trace.
 `scanFault` models a failure after the returned scan prefix. Failed ordinary

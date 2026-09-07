@@ -546,6 +546,30 @@ fn dispatch_readonly<S: ByteStorage>(
                 EncodeReply::encode,
             ))
         }
+        Frame::IsRedacted(hash, path) => {
+            let redaction = capabilities
+                .redaction
+                .as_deref_mut()
+                .ok_or(OperationError::Protocol)?;
+            Ok(reply(
+                70,
+                redaction.is_redacted(hash, path),
+                errors,
+                EncodeReply::encode,
+            ))
+        }
+        Frame::ApplyChange(key, kind, new) => {
+            let apply = capabilities
+                .apply
+                .as_deref_mut()
+                .ok_or(OperationError::Protocol)?;
+            Ok(reply(
+                71,
+                apply.apply_change(key, kind, new),
+                errors,
+                EncodeReply::encode,
+            ))
+        }
         _ => Err(OperationError::Protocol),
     }
 }
@@ -586,6 +610,8 @@ pub(crate) struct Capabilities<'a, E> {
     pub(crate) bao: Option<&'a mut dyn crate::host::Bao<Error = E>>,
     pub(crate) sweep: Option<&'a mut dyn crate::host::Sweep<Error = E>>,
     pub(crate) memo: Option<&'a mut dyn crate::host::Memo<Error = E>>,
+    pub(crate) redaction: Option<&'a mut dyn crate::host::Redaction<Error = E>>,
+    pub(crate) apply: Option<&'a mut dyn crate::host::Apply<Error = E>>,
 }
 
 impl<E> Default for Capabilities<'_, E> {
@@ -605,6 +631,8 @@ impl<E> Default for Capabilities<'_, E> {
             bao: None,
             sweep: None,
             memo: None,
+            redaction: None,
+            apply: None,
         }
     }
 }
@@ -935,6 +963,26 @@ pub(crate) fn run_bytes<S: ByteStorage>(
         writes: Some(writes),
         ..Capabilities::default()
     };
+    execute(
+        state,
+        |frame, capabilities, errors| {
+            dispatch_readonly(Some(&mut *storage), capabilities, frame, errors)
+        },
+        inputs,
+        capabilities,
+    )
+}
+
+/// Same ownership contract as `run`, narrowed to byte reads and the walk
+/// services the caller supplies (the refusals, the digest, the materializer):
+/// what a structural walk over the trie needs and nothing relational.
+pub(crate) fn run_walk<S: ByteStorage>(
+    storage: &mut S,
+    capabilities: Capabilities<'_, S::Error>,
+    inputs: &[&[u8]],
+    command: &Command,
+) -> Result<Vec<u8>, OperationError<S::Error>> {
+    let state = start(command);
     execute(
         state,
         |frame, capabilities, errors| {

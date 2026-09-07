@@ -10,6 +10,7 @@ import VerifiedCore.Host.Digest
 import VerifiedCore.Host.Bao
 import VerifiedCore.Host.Sweep
 import VerifiedCore.Host.Memo
+import VerifiedCore.Host.Walk
 import VerifiedCore.Host.Writes
 import VerifiedCore.Commands
 
@@ -71,7 +72,7 @@ def algebras : List Name := [
   ``VerifiedCore.Host.Construct, ``VerifiedCore.Host.Upsert, ``VerifiedCore.Host.Resources,
   ``VerifiedCore.Host.Lease, ``VerifiedCore.Host.SourceIO, ``VerifiedCore.Host.Digest,
   ``VerifiedCore.Host.ByteWrites, ``VerifiedCore.Host.Bao, ``VerifiedCore.Host.Sweep,
-  ``VerifiedCore.Host.Memo]
+  ``VerifiedCore.Host.Memo, ``VerifiedCore.Host.Redaction, ``VerifiedCore.Host.Apply]
 
 /-- The types that cross the command boundary: what a caller asks for and
 what a finished command reports. Each gets Lean `Encode`/`Decode` instances
@@ -79,6 +80,7 @@ and a Rust mirror with the same codecs; order is by dependency. -/
 def messages : List Name := [
   ``VerifiedCore.Cas.Codec.CellType, ``VerifiedCore.Cas.PinHolder, ``VerifiedCore.Cas.Input.Kind,
   ``VerifiedCore.Cas.Outcome, ``VerifiedCore.Origin.Error, ``VerifiedCore.Trie.LookupError,
+  ``VerifiedCore.Trie.Value, ``VerifiedCore.Trie.Diff.Change,
   ``VerifiedCore.Trie.Refusal, ``VerifiedCore.Trie.Verdict, ``VerifiedCore.Trie.MutationError,
   ``VerifiedCore.Cas.Receive.ProvenSubtree, ``VerifiedCore.Cas.Project.Blob,
   ``VerifiedCore.Cas.Project.Summary, ``VerifiedCore.Cas.Project.Pin,
@@ -88,7 +90,7 @@ def messages : List Name := [
   ``VerifiedCore.Commands.DurableDomainError, ``VerifiedCore.Commands.ServeDomainError,
   ``VerifiedCore.Commands.ReceiveDomainError, ``VerifiedCore.Commands.CollectDomainError,
   ``VerifiedCore.Commands.ProjectDomainError, ``VerifiedCore.Commands.TrieServeDomainError,
-  ``VerifiedCore.Commands.TrieCollectDomainError,
+  ``VerifiedCore.Commands.TrieCollectDomainError, ``VerifiedCore.Commands.TrieWalkDomainError,
   ``VerifiedCore.Commands.Ingested, ``VerifiedCore.Commands.Committed, ``VerifiedCore.Commands.Served,
   ``VerifiedCore.Commands.Evicted, ``VerifiedCore.Commands.Collected, ``VerifiedCore.Commands.Command]
 
@@ -104,6 +106,8 @@ def rustName (name : Name) : String :=
   | ``VerifiedCore.Cas.Project.Blob => "ProjectedBlob"
   | ``VerifiedCore.Cas.Project.Summary => "ProjectedSummary"
   | ``VerifiedCore.Cas.Project.Pin => "ProjectedPin"
+  | ``VerifiedCore.Trie.Value => "TrieValue"
+  | ``VerifiedCore.Trie.Diff.Change => "TrieChange"
   | _ => name.getString!
 
 /-- The private transport's tags. Numbering is historical, so it is a table
@@ -130,7 +134,8 @@ def tags : List (String × Nat) := [
   ("Bao.writeProof", 61), ("Bao.promoteRun", 62),
   ("Lease.order", 63), ("Access.snapshotExcluding", 64),
   ("Sweep.fileBytes", 65), ("Sweep.fileModified", 66), ("Sweep.listObjects", 67),
-  ("Storage.deleteExcept", 68), ("Memo.forgetExcept", 69)]
+  ("Storage.deleteExcept", 68), ("Memo.forgetExcept", 69),
+  ("Redaction.isRedacted", 70), ("Apply.applyChange", 71)]
 
 /-- Which Rust service answers an algebra by default. -/
 def defaultRoute : String → Route
@@ -148,6 +153,8 @@ def defaultRoute : String → Route
   | "Bao" => .capability "bao" "Bao"
   | "Sweep" => .capability "sweep" "Sweep"
   | "Memo" => .capability "memo" "Memo"
+  | "Redaction" => .capability "redaction" "Redaction"
+  | "Apply" => .capability "apply" "Apply"
   | _ => .special
 
 /-- Which Rust service each effect belongs to. The command inputs, the
@@ -175,6 +182,8 @@ def traitDoc : String → String
   | "TemporaryFiles" => "/// Invocation-owned staging resources. Abandonment releases handles and\n/// removes unpublished temporary names; replacement consumes temporary ownership."
   | "Lease" => "/// Opaque counted resource leases ordered against competing deletion, and\n/// the remover's critical section they are ordered against. Host abandonment\n/// releases outstanding tokens; policy chooses their lifetime."
   | "Sweep" => "/// The object store as a directory: what each object's files cost on disk,\n/// when they were written, and which objects have files at all. The layout is\n/// this host's; what is evicted, collected or unlinked is the operation's."
+  | "Redaction" => "/// The refusals a peer recorded: whether this store may see a node at a\n/// position, or at any. What a walk does with a refused position is the\n/// operation's."
+  | "Apply" => "/// The materializer of a head promotion: takes each change as the walk\n/// finds it, in walk order, inside the transaction the flip runs in. A\n/// refusal is this host's failure and stops the walk."
   | "Memo" => "/// The completeness memo. Forgetting is bound to the mutating transaction as\n/// a lease is: certification stays disabled until that transaction's edge,\n/// commit or rollback, so a reader that started before the mutation cannot\n/// certify its stale snapshot afterwards."
   | "SourceIO" => "/// Raw input observations. Successful bounded reads may be short at EOF;\n/// freeze retains an immutable copy under an invocation-owned input handle."
   | "Construct" => "/// Bulk object construction over resources the requesting operation owns.\n///\n/// The operation decides what is built, from which opened source and into\n/// which owned temporaries; the host streams the bytes, hashes them into the\n/// BLAKE3 tree and lays out the Bao outboard. Neither call publishes, flushes\n/// or records anything."
@@ -194,7 +203,7 @@ def traitExtras : String → String
 
 def traitOrder : List String :=
   ["Storage", "Resources", "Crypto", "FileIO", "Clock", "Output", "Construct", "TemporaryFiles",
-    "Lease", "SourceIO", "Digest", "ByteWrites", "Bao", "Sweep", "Memo"]
+    "Lease", "SourceIO", "Digest", "ByteWrites", "Bao", "Sweep", "Memo", "Redaction", "Apply"]
 
 def baseTy : Name → Option Ty
   | ``UInt64 | ``VerifiedCore.Host.Transaction => some .u64
@@ -321,7 +330,7 @@ def leanAlgebra (algebra : Algebra) : String := Id.run do
   return out
 
 def leanFile (all : Array Algebra) : String := Id.run do
-  let mut out := "import VerifiedCore.Host.Codec\nimport VerifiedCore.Crypto\nimport VerifiedCore.Host.Construct\nimport VerifiedCore.Host.Source\nimport VerifiedCore.Host.Digest\nimport VerifiedCore.Host.Writes\nimport VerifiedCore.Host.Bao\nimport VerifiedCore.Host.Sweep\nimport VerifiedCore.Host.Memo\n\n"
+  let mut out := "import VerifiedCore.Host.Codec\nimport VerifiedCore.Crypto\nimport VerifiedCore.Host.Construct\nimport VerifiedCore.Host.Source\nimport VerifiedCore.Host.Digest\nimport VerifiedCore.Host.Writes\nimport VerifiedCore.Host.Bao\nimport VerifiedCore.Host.Sweep\nimport VerifiedCore.Host.Memo\nimport VerifiedCore.Host.Walk\n\n"
   out := out ++ "/-! GENERATED by `hostgen` from the effect algebras; do not edit. Each\nalgebra's tags, names, request encoder, reply decoder and `WireEffect`\ninstance follow from its constructors and the tag table. -/\nnamespace VerifiedCore.Host\nopen Wire\n"
   for algebra in all do
     out := out ++ "\n" ++ leanAlgebra algebra
@@ -686,7 +695,8 @@ def main (args : List String) : IO UInt32 := do
   let modules : Array Name := #[`VerifiedCore.Host, `VerifiedCore.Crypto, `VerifiedCore.Host.Access,
     `VerifiedCore.Host.Construct, `VerifiedCore.Host.Upsert, `VerifiedCore.Host.Resources,
     `VerifiedCore.Host.Source, `VerifiedCore.Host.Digest, `VerifiedCore.Host.Writes,
-    `VerifiedCore.Host.Bao, `VerifiedCore.Host.Sweep, `VerifiedCore.Host.Memo, `VerifiedCore.Commands]
+    `VerifiedCore.Host.Bao, `VerifiedCore.Host.Sweep, `VerifiedCore.Host.Memo, `VerifiedCore.Host.Walk,
+    `VerifiedCore.Commands]
   let env ← importModules (modules.map fun module => ({ module } : Import)) {} 0
   let (lean, commands, rust) ← Prod.fst <$> (Meta.MetaM.toIO (do
       let all ← algebras.toArray.mapM readAlgebra

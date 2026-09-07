@@ -41,11 +41,11 @@ of those as a metadata invariant.
 |---|---|---|
 | `Trie::insert`, `apply`, `remove` and the canonicalization helpers `insert_at`, `split_leaf`, `split_ext`, `wrap_in_ext`, `remove_at`, `merge_down`, `collapse` | `synch-engine/src/node.rs` publish path | `Trie/Mutate.lean` |
 | `TrieNode::encode`, `hash_of_encoded`, `check_invariants`, `hashes_to` (ingress canonicality) | `synch-engine/src/reconcile.rs:1834` | `Trie/Codec.lean` gains an encoder; `Trie/Verify.lean` |
-| `iter`, `scan` (with redaction check) | `node.rs`, `replica.rs`, S3 listing | `Trie/Scan.lean` |
-| `diff`, `diff_each_scoped`, `for_each_resolved_change_scoped` | `synch-store/src/views.rs:1185` (materialization) | `Trie/Diff.lean` |
-| `MissingWalk` (`next_batch`, `resume`, `is_exhausted`, faults, dedup, deferral) | `reconcile.rs:889-962` | `Trie/Walk.lean` |
+| `iter`, `scan` (with redaction check) | `node.rs`, `replica.rs`, S3 listing | `Trie/Walk.lean` (done; `Trie::scan`/`iter` are facades) |
+| `diff`, `diff_each_scoped`, `for_each_resolved_change_scoped` | `synch-store/src/views.rs:1185` (materialization) | `Trie/Diff.lean` (done; the `Apply` algebra streams each change to the host) |
+| `MissingWalk` (`next_batch`, `resume`, `is_exhausted`, faults, dedup, deferral) | `reconcile.rs:889-962` | `Trie/Missing.lean` |
 | `is_complete_scoped_for` and the memo protocol | `reconcile.rs`, `aae.rs`, `membership.rs` | `Trie/Complete.lean` |
-| `resolve_paths`, `Scope::admits_node` (serve-side admission) | `synch-net/src/mpt.rs:299-377` | `Trie/Serve.lean` (done; `Scope::admits_path`, `contains_subtree` and `admits_value` stay Rust on the requesting walk until T3/T6) |
+| `resolve_paths`, `Scope::admits_node` (serve-side admission) | `synch-net/src/mpt.rs:299-377` | `Trie/Serve.lean` (done; `Scope::admits_path`, `contains_subtree` and `admits_value` stay Rust on the requesting walk until T3) |
 | `first_key_outside` | `reconcile.rs:735` | `Trie/Scope.lean` |
 | `reachable`, `reach_into` and `Store::gc_trie` mark-and-sweep | `synch-store/src/gc.rs:53-110` | `Trie/Collect.lean` (done; `Trie::reachable` stays a Rust test oracle) |
 | `Scope` (`admits_path`, `contains_subtree`, `admits_key_path`, `memo_key_for`) | everywhere above | `Trie/Scope.lean` |
@@ -96,6 +96,8 @@ carries policy; each is a primitive the current Rust code already performs.
 | `Bao` (new, a whole host service like `Construct`) | `decodeSlice stream payload outboard size ranges` (verifies a slice stream against the root, writes only verified groups and their outboard nodes, answers the verified spans), `encodeSlice payload outboard size ranges → output`, `encodeProof`, `verifyProof`, `promoteRun` (compare-then-copy of one donor run) | every Bao computation: slice receive and serve, delta-sync proofs and promotion. Implemented in Rust on `bao-tree`/`blake3`, tested against standard vectors, and a stated trust assumption; Lean directs which ranges are asked for and what a reply means, never the tree |
 | `Provider` (new) | `head root`, `readRange root offset len into handle`, `readOutboard root into handle`, `putPair payload outboard`, `putPairBytes`, `scratchSweep`, with a raw failure kind `notFound | other` | cloud adoption, hydration, finalize; Lean applies the §6.4 rule, the host only classifies |
 | `Memo` (new) | `forgetExcept keep` (done, T7), `isKnown key`, `generation`, `certify key generation` | the completeness cache; invalidation on mutation edges is a host resource guarantee like `Lease` |
+| `Redaction` (new) | `isRedacted hash path` | the refusals a peer recorded, read by every structural walk at a position it finds nothing at (done, T6) |
+| `Apply` (new) | `applyChange key kind new` | the streaming materialization: each change handed to the host as the walk finds it, so a promotion never collects the diff (done, T6) |
 | `Peer` (new) | `fetchNodes wants : Reply (List (path × hash × bytes))`, `fetchValues` | the reconcile fetch loop (§4, T3) |
 
 The tag table in `Hostgen.lean` grows accordingly. The simulated host gains
@@ -239,16 +241,57 @@ the two `mpt.rs` arms delegate to `Store::serve_trie_nodes` and
 `Scope::admits_node` are deleted, and `Trie::resolve_paths` is kept only as
 the walk tests' in-memory oracle. `Scope::admits_path`, `contains_subtree`
 and `admits_value` remain in Rust for the *requesting* walk (`MissingWalk`)
-and move with T3/T6.
+and move with T3.
 
-**T6. Scan, iteration and diff** (`Trie/Scan.lean`, `Trie/Diff.lean`).
-`scan prefix startAfter limit` with the positional redaction check; `diff`
-and the scoped, streaming, resolve-new-side-only variant materialization
-uses, including the `same_value` inline-versus-hash comparison that must not
-touch the store. Proofs: `scan` lists exactly the denotation restricted to
-the prefix, in key order, up to the limit; `diff old new` is the symmetric
-difference of the two denotations; pruning identical subtrees is sound under
-F3. Cutover: `views.rs:1185`, `node.rs`, `replica.rs`.
+**T6. Scan, iteration and diff** (`Trie/Walk.lean`, `Trie/Diff.lean`).
+Done. One structural walk serves every reader: a cursor that moves one
+nibble at a time through stored and compressed nodes alike, a position the
+store lacks reading as empty when the peer recorded a refusal for it (the
+new `Redaction.isRedacted`) and as a missing node otherwise, and one
+explicit-stack descent (`descend`) holding the hostile-shape defences for
+every walk: a depth past which no valid key can begin, an absolute ceiling
+on positions visited, a candidate filter (`Cursor.nextChild`) so a
+position costs one step rather than sixteen, and the loop itself written
+as `Program.iterate`, a trampoline that continues a pure iteration without
+nesting a native call, so a 50 000-deep extension chain or a compressed
+node spelling thousands of nibbles costs heap, not stack. `scan root prefix
+startAfter limit` (the commands `trieScan`; `Trie::iter` is the empty
+prefix) descends the prefix, then collects in key order, pruning every
+subtree that sorts before the cursor and stopping when the limit is full.
+`diff old new` (`trieDiff`) walks both roots in lockstep, prunes a position
+both sides address alike before reading either, compares a value as a
+value (`sameValue`: inline bytes against the digest of the address, through
+`Digest`, never the store), and answers the changes in key order.
+`materialize scope old new` (`trieMaterialize`) is the same walk confined
+to the scope the fetch was confined to, each change resolved on its new
+side only and handed to the host through the new `Apply.applyChange` as it
+is found, answering how many were handed over; the host's callback error
+travels back through `Applier` unchanged. Proved (`TrieWalkProofs`): the
+nibble packing a key goes through and back (`bytesOfNibbles_keyNibbles`,
+`bytesOfNibbles_odd`, `prefix_of_keyNibbles`); the value comparison
+(`sameValue_inline`, `sameValue_mixed`, `sameValue_absent`); over any step
+and any effect algebra the descent keeps every frame under the walk's base,
+never charges past the ceiling and keeps whatever the step keeps of the
+accumulator (`descend_step`, `walk_sound`, via the loop's own
+`iterate_sound`), and at the ceiling a real position is refused
+(`descend_refuses_past_the_ceiling`, the theorem the fan-out bomb test
+now stands on); every entry a scan lists starts with the prefix, sorts
+strictly after the resume cursor, and the listing is within the limit
+(`takeValue_sound`, `collect_sound`, `scan_sound`); and on a concrete trie
+the listing under prefix, cursor and limit with the reads each costs, a
+refused position reading as empty against the same absence unexplained, a
+diff against the empty root, one value under two representations being no
+change by one digest, a shared subtree pruned unread, the streamed
+materialization in walk order whole and scoped, and a failure injected at
+every effect of all three. Open: the denotational claims (a scan lists
+*exactly* the denotation under the prefix; a diff is *the* symmetric
+difference), which need F3's injectivity premise and a denotation of
+stored graphs. Cutover: `Trie::scan`, `iter`, `diff`, `diff_resolved` and
+`for_each_resolved_change_scoped` are facades over the Lean commands with
+the store's refusals, BLAKE3 and the caller's callback as capabilities;
+the Rust `Cursor`, `FanoutGuard`, `descend`, `collect`, `take_value`,
+`subtree_is_below`, `diff_each_scoped`, `diff_walk`, `enter` and
+`same_value` are deleted.
 
 **T7. Trie collection** (`Trie/Collect.lean`). Done. `Store::gc_trie` is
 the whole command `trieCollect`: one immediate transaction that reads the

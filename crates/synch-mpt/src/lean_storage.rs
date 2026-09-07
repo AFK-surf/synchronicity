@@ -101,3 +101,89 @@ pub(crate) fn mutation_error(error: synch_verified::trie::MutationDomainError) -
         }
     }
 }
+
+/// The refusals a peer recorded, answered by the node store.
+pub(crate) struct Redactions<'a, S: ?Sized>(pub(crate) &'a S);
+
+impl<S: NodeStore + ?Sized> synch_verified::host::Redaction for Redactions<'_, S> {
+    type Error = MptError;
+    fn is_redacted(&mut self, hash: &[u8], path: Option<&[u8]>) -> Result<bool, MptError> {
+        let hash = Hash::from_slice(hash).map_err(MptError::store)?;
+        self.0.is_redacted(&hash, path).map_err(MptError::store)
+    }
+}
+
+/// The materializer of a head promotion as a walk service: each change is
+/// handed to the caller's closure, and the first refusal is kept aside so
+/// the caller's own error comes back rather than the sentinel that carried
+/// it out of the walk.
+pub(crate) struct Applier<'a, E> {
+    pub(crate) apply: &'a mut dyn FnMut(crate::ChangeView<'_>) -> Result<(), E>,
+    pub(crate) stopped: Option<E>,
+}
+
+impl<E> std::fmt::Debug for Applier<'_, E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Applier").finish_non_exhaustive()
+    }
+}
+
+impl<E> synch_verified::host::Apply for Applier<'_, E> {
+    type Error = MptError;
+    fn apply_change(&mut self, key: &[u8], kind: u64, new: Option<&[u8]>) -> Result<(), MptError> {
+        let kind = match kind {
+            0 => crate::ChangeKind::Added,
+            1 => crate::ChangeKind::Changed,
+            2 => crate::ChangeKind::Deleted,
+            _ => return Err(protocol_error()),
+        };
+        match (self.apply)(crate::ChangeView { key, kind, new }) {
+            Ok(()) => Ok(()),
+            Err(error) => {
+                self.stopped = Some(error);
+                Err(MptError::WalkStopped)
+            }
+        }
+    }
+}
+
+/// A walk's refusal is one of the store's existing diagnostics, by name.
+pub(crate) fn walk_error(error: synch_verified::trie::WalkError<MptError>) -> MptError {
+    use synch_verified::trie::{TrieWalkDomainError, WalkError};
+    match error {
+        WalkError::Operation(error) => operation_error(error),
+        WalkError::Domain(TrieWalkDomainError::MissingNode(hash)) => {
+            match Hash::from_slice(&hash) {
+                Ok(hash) => MptError::MissingNode(hash),
+                Err(_) => protocol_error(),
+            }
+        }
+        WalkError::Domain(TrieWalkDomainError::MissingValue(hash)) => match Hash::from_slice(&hash)
+        {
+            Ok(hash) => MptError::MissingValue(hash),
+            Err(_) => protocol_error(),
+        },
+        WalkError::Domain(TrieWalkDomainError::Decode(message)) => MptError::Decode(message),
+        WalkError::Domain(TrieWalkDomainError::OddDepthValue) => MptError::OddDepthValue,
+        WalkError::Domain(TrieWalkDomainError::Ceiling) => MptError::NonCanonical(format!(
+            "structural walk exceeded {} positions. If this is a cold \
+             materialization of an origin that has been publishing for a long time, this \
+             node cannot adopt it at all — its trie has grown past what any *first* \
+             adoption here can walk, while incremental followers are unaffected",
+            crate::trie::WALK_POSITION_CEILING
+        )),
+    }
+}
+
+/// A value reference as Lean reports it, in the store's own type.
+pub(crate) fn value_ref(
+    value: synch_verified::trie::TrieValue,
+) -> Result<crate::ValueRef, MptError> {
+    use synch_verified::trie::TrieValue;
+    Ok(match value {
+        TrieValue::Inline(bytes) => crate::ValueRef::Inline(bytes),
+        TrieValue::Hash(address) => {
+            crate::ValueRef::Hash(Hash::from_slice(&address).map_err(|_| protocol_error())?)
+        }
+    })
+}

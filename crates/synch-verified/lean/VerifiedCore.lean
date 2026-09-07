@@ -15,6 +15,8 @@ import VerifiedCore.Trie.Mutate
 import VerifiedCore.Trie.Serve
 import VerifiedCore.Trie.Memo
 import VerifiedCore.Trie.Collect
+import VerifiedCore.Trie.Walk
+import VerifiedCore.Trie.Diff
 import VerifiedCore.Replication.History
 
 /-!

@@ -13,6 +13,8 @@ import VerifiedCore.Cas.Collect
 import VerifiedCore.Cas.Project
 import VerifiedCore.Trie.Serve
 import VerifiedCore.Trie.Collect
+import VerifiedCore.Trie.Walk
+import VerifiedCore.Trie.Diff
 
 /-! The shapes that cross the command boundary: what a caller asks for and
 what a finished command reports. `hostgen` derives the codecs of every type
@@ -130,6 +132,15 @@ inductive Command where
   `owner`'s own when given, is memoized under. -/
   | trieMemoKey (root : ByteArray) (prefixes : Option (List ByteArray)) (exact : List ByteArray)
       (owner : Option String)
+  /-- Every pair under a root whose key starts with `keyPrefix`, in key
+  order, optionally resuming strictly after `startAfter` and capped at `limit`. -/
+  | trieScan (root keyPrefix : ByteArray) (startAfter : Option ByteArray) (limit : Option UInt64)
+  /-- Every differing key between two roots, in key order. -/
+  | trieDiff (oldRoot newRoot : ByteArray)
+  /-- Hand every change between two roots that the scope admits to the
+  materializer, one at a time with its new value resolved; answers how many. -/
+  | trieMaterialize (oldRoot newRoot : ByteArray) (prefixes : Option (List ByteArray))
+      (exact : List ByteArray)
 
 /-- Malformed metadata or a column of the wrong storage class, as pin
 acquisition and deletion report it. -/
@@ -203,6 +214,17 @@ inductive TrieCollectDomainError where
   | column (column : String) (reason : String)
   | origin (error : Origin.Error)
   | exhausted
+  deriving BEq, DecidableEq
+
+/-- How a walk refuses: a node or value the walk needs and the store does
+not hold, a node that does not decode, a value at a depth no byte key ends
+at, or more positions than a trie of the permitted size has. -/
+inductive TrieWalkDomainError where
+  | missingNode (hash : ByteArray)
+  | missingValue (hash : ByteArray)
+  | decode (message : String)
+  | oddDepthValue
+  | ceiling
   deriving BEq, DecidableEq
 
 /-- How a projection refuses: a malformed row, a column of the wrong class,
