@@ -1,4 +1,5 @@
 import VerifiedCore.Trie.Walk
+import VerifiedCore.Trie.Mutate
 import Std.Data.HashSet.Basic
 
 /-! The requesting walk. Its frontier, deferred positions and deduplication
@@ -39,6 +40,7 @@ inductive Fault where
   | nodeDepth (depth : Nat)
   | valueDepth (depth : Nat)
   | expectedBranch (hash : ByteArray)
+  | valueLength (hash : ByteArray) (size : Nat) (routing : Bool)
   deriving BEq, DecidableEq
 
 inductive Error where
@@ -63,6 +65,9 @@ structure Context where
 structure Batch where
   nodes : List (ByteArray × ByteArray) := []
   values : List (ByteArray × ByteArray) := []
+  /-- Small addressed payloads are permitted only when an inspected routing
+  holder requested them, even if a legacy holder asked for the hash first. -/
+  routeValues : List ByteArray := []
   deriving BEq, DecidableEq
 
 def Batch.size (batch : Batch) : Nat := batch.nodes.length + batch.values.length
@@ -136,9 +141,20 @@ def pairedChildren (reference : Option Node) : Node → List Position
         | some (.branch theirs _) => (theirs[index]?).getD none
         | _ => none
       ⟨paired, hash, ⟨#[index.toUInt8]⟩⟩
+  | .route children _ =>
+    children.zipIdx.filterMap fun (child, index) => child.map fun hash =>
+      let paired := match reference with
+        | some (.route theirs _) => (theirs[index]?).getD none
+        | _ => none
+      ⟨paired, hash, ⟨#[index.toUInt8]⟩⟩
 
 def isBranch : Node → Bool
   | .branch _ _ => true
+  | .route _ _ => true
+  | _ => false
+
+def isRoute : Node → Bool
+  | .route _ _ => true
   | _ => false
 
 inductive Checked where
@@ -146,7 +162,7 @@ inductive Checked where
   | absent
   | boundary
   | expand (children : List Position) (pendingBranch : Option ByteArray)
-      (absentValues : List ByteArray)
+      (absentValues : List ByteArray) (routing : Bool := false)
 
 /-- Inspect one pending position without changing any frontier state.
 Every storage failure or decode error therefore leaves it retryable. -/
@@ -187,9 +203,14 @@ def inspect [WorkSet Visit V] [WorkSet ByteArray H] (context : Context)
     | _ => pure ()
     let absent ← if context.scope.admitsValue position.path.toList node then
         node.valueHashes.filterM fun hash => do
-          return !(← rowPresent valueSpace [("hash", .blob hash)])
+          match ← storage (.readBytes valueSpace hash) with
+          | none => return true
+          | some bytes =>
+            if bytes.size > maxValueBytes || (!isRoute node && bytes.size ≤ inlineValueMax) then
+              throw (.canonical (.valueLength hash bytes.size (isRoute node)))
+            return false
       else pure []
-    return .expand (pairedChildren reference node) pendingBranch absent
+    return .expand (pairedChildren reference node) pendingBranch absent (isRoute node)
 
 structure Work (V H : Type) where
   frontier : Frontier V H
@@ -223,20 +244,23 @@ def commit [WorkSet Visit V] [WorkSet ByteArray H] (context : Context)
         seen := WorkSet.insert work.frontier.seen (visit context.scope position.hash position.path)
         deferred := position :: work.frontier.deferred }
       batch := { work.batch with nodes := (position.path, position.hash) :: work.batch.nodes } }
-  | .expand children pendingBranch absentValues =>
+  | .expand children pendingBranch absentValues routing =>
     let pending := WorkSet.erase work.frontier.mustBeBranch position.hash
     let pending := match pendingBranch with
       | none => pending
       | some child => WorkSet.insert pending child
     let positions := pushChildren context.scope position.path children rest
     let (asked, values) := askValues position.path absentValues work.asked work.batch.values
+    let routeValues := if routing then absentValues.foldl (fun known hash =>
+      if known.contains hash then known else hash :: known) work.batch.routeValues
+      else work.batch.routeValues
     { frontier := { work.frontier with
         positions
         seen := WorkSet.insert work.frontier.seen (visit context.scope position.hash position.path)
         mustBeBranch := pending
         deferred := if absentValues.isEmpty then work.frontier.deferred
           else position :: work.frontier.deferred }
-      batch := { work.batch with values }
+      batch := { work.batch with values, routeValues }
       asked }
 
 /-- Only canonicality faults poison the walk. A failed host read or decode
@@ -248,7 +272,7 @@ def failed (frontier : Frontier V H) : Error → Frontier V H
 abbrev BatchResult (V H : Type) := Frontier V H × Except Error Batch
 
 def finished (work : Work V H) : BatchResult V H :=
-  (work.frontier, .ok ⟨work.batch.nodes.reverse, work.batch.values.reverse⟩)
+  (work.frontier, .ok ⟨work.batch.nodes.reverse, work.batch.values.reverse, work.batch.routeValues⟩)
 
 /-- A batch stops before its next position once it has enough wants. The
 error is returned with the recoverable state, not thrown past its owner. -/

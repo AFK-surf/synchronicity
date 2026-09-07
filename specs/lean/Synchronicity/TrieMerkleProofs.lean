@@ -155,6 +155,18 @@ theorem lookup_ok (store : RawSnapshot) (fuel : Nat) : ∀ (address : Option Byt
                 | some value => exact resolve_ok store value budget answer ran
               | cons nibble rest => exact ih _ _ budget answer ran
 
+            | route children value =>
+              simp only [decoded] at ran
+              cases key with
+              | nil =>
+                cases value with
+                | none =>
+                  change Proof.executeReads store budget (.pure (.ok (.ok none) : Reply LookupResult)) = _ at ran
+                  simp [Proof.executeReads] at ran
+                  exact ⟨_, ran.symm⟩
+                | some value => exact resolve_ok store (.hash value) budget answer ran
+              | cons nibble rest => exact ih _ _ budget answer ran
+
 /-- Over any snapshot the lookup is answered within the budget verification
 grants it, with a domain result: verification never reaches its protocol
 refusal. -/
@@ -414,6 +426,23 @@ theorem proveAt_keeps (store : RawSnapshot) (fuel : Nat) : ∀ (address : Option
                   exact List.mem_reverse.mpr (tail raw' mem)
               | cons nibble rest => exact fun raw' mem => ih _ _ _ budget proof ran raw' (tail raw' mem)
 
+            | route children value =>
+              simp only [decoded] at ran
+              cases rest with
+              | nil =>
+                cases value with
+                | none =>
+                  change Proof.executeReads store budget (.pure (.ok (.ok ⟨(raw :: acc).reverse, none⟩)) : Program Storage (Reply Result)) = _ at ran
+                  simp [Proof.executeReads] at ran
+                  subst ran
+                  exact fun raw' mem => mem_pushed (tail raw' mem)
+                | some value =>
+                  obtain ⟨nodes, _⟩ := found_run store (.hash value) (raw :: acc) budget proof ran
+                  intro raw' mem
+                  rw [nodes]
+                  exact List.mem_reverse.mpr (tail raw' mem)
+              | cons nibble rest => exact fun raw' mem => ih _ _ _ budget proof ran raw' (tail raw' mem)
+
 /-- The lookup over a covering snapshot reads the node the store holds at
 `address`, then continues as the lookup over the store does. -/
 theorem lookup_step (store snapshot : RawSnapshot) (address raw : ByteArray)
@@ -595,6 +624,46 @@ theorem proveAt_lookup (store : RawSnapshot) (fuel : Nat) : ∀ (address : Optio
                   cases budget'' <;> rfl
                 | some value =>
                   obtain ⟨stored'', rest'⟩ := valued value proof ran
+                  refine ⟨stored'', fun snapshot covers budget' => ?_⟩
+                  obtain ⟨_, covered, agrees⟩ := rest' snapshot covers
+                  refine lookup_step store snapshot address raw held covered _ _ rfl (fun budget'' => ?_) budget'
+                  dsimp only [Program.bind, ExceptT.bindCont]
+                  rw [decoded]
+                  dsimp only
+                  exact agrees budget''
+              | cons nibble rest =>
+                obtain ⟨stored'', agrees⟩ :=
+                  ih ((children[nibble.toNat]?).getD none) rest (raw :: acc) budget proof stored' ran
+                refine ⟨stored'', fun snapshot covers budget' => ?_⟩
+                have inProof : raw ∈ proof.nodes :=
+                  proveAt_keeps store fuel _ rest (raw :: acc) budget proof ran raw (List.mem_cons_self ..)
+                refine lookup_step store snapshot address raw held (covers.1 raw inProof address held) _ _ rfl
+                  (fun budget'' => ?_) budget'
+                dsimp only [Program.bind, ExceptT.bindCont]
+                rw [decoded]
+                dsimp only
+                exact agrees snapshot covers budget''
+
+            | route children value =>
+              simp only [decoded] at ran
+              cases rest with
+              | nil =>
+                cases value with
+                | none =>
+                  change Proof.executeReads store budget (.pure (.ok (.ok ⟨(raw :: acc).reverse, none⟩)) : Program Storage (Reply Result)) = _ at ran
+                  simp [Proof.executeReads] at ran
+                  obtain ⟨stored'', rest'⟩ := ended proof (by rw [← ran]; simp)
+                  refine ⟨stored'', fun snapshot covers budget' => ?_⟩
+                  obtain ⟨_, covered⟩ := rest' snapshot covers
+                  refine lookup_step store snapshot address raw held covered _ _ rfl (fun budget'' => ?_) budget'
+                  dsimp only [Program.bind, ExceptT.bindCont]
+                  rw [decoded]
+                  dsimp only
+                  change Proof.executeReads _ budget'' (.pure (.ok (.ok none) : Reply LookupResult)) =
+                    Proof.executeReads _ budget'' (.pure (.ok (.ok none) : Reply LookupResult))
+                  cases budget'' <;> rfl
+                | some value =>
+                  obtain ⟨stored'', rest'⟩ := valued (.hash value) proof ran
                   refine ⟨stored'', fun snapshot covers budget' => ?_⟩
                   obtain ⟨_, covered, agrees⟩ := rest' snapshot covers
                   refine lookup_step store snapshot address raw held covered _ _ rfl (fun budget'' => ?_) budget'

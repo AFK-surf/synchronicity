@@ -21,6 +21,9 @@ inductive Node where
   | leaf (suffix : ByteArray) (value : Value)
   | extension (segment : ByteArray) (child : ByteArray)
   | branch (children : List (Option ByteArray)) (value : Option Value)
+  /-- One nibble of authenticated routing, including terminal and unary
+  positions. A payload is always a separate address, never inline bytes. -/
+  | route (children : List (Option ByteArray)) (value : Option ByteArray)
   deriving BEq, DecidableEq
 
 /-- Shared postcard primitives retain the trie codec's established names. -/
@@ -97,6 +100,10 @@ def parseNode : Parser Node := fun input => do
     let (cs, rest) ← parseChildren 16 rest
     let (v, rest) ← parseOptional parseValue rest
     .ok (.branch cs v, rest)
+  | 3 => do
+    let (cs, rest) ← parseChildren 16 rest
+    let (v, rest) ← parseOptional parseAddress rest
+    .ok (.route cs v, rest)
   | _ => .error "invalid node variant"
 
 /-- Local storage decoding: unused input is intentionally ignored. -/
@@ -128,6 +135,10 @@ def encodeNode : Node → List UInt8
     2 :: (encodeChildren cs ++ (match v with
       | none => [0]
       | some v => 1 :: encodeValue v))
+  | .route cs v =>
+    3 :: (encodeChildren cs ++ (match v with
+      | none => [0]
+      | some address => 1 :: address.data.toList))
 
 def encode (n : Node) : ByteArray := ⟨(encodeNode n).toArray⟩
 
@@ -151,5 +162,8 @@ def Node.wf : Node → Prop
   | .branch cs v =>
     cs.length = 16 ∧ (∀ child ∈ cs, ∀ h, child = some h → h.size = 32) ∧
       (∀ x, v = some x → x.wf)
+  | .route cs v =>
+    cs.length = 16 ∧ (∀ child ∈ cs, ∀ h, child = some h → h.size = 32) ∧
+      (∀ h, v = some h → h.size = 32)
 
 end VerifiedCore.Trie

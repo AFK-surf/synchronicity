@@ -58,6 +58,11 @@ inductive Closed (store : RawSnapshot) : ByteArray → Prop where
       (payload : ∀ v, value = some v → ∃ bytes, ValueDenotes store v bytes)
       (below : ∀ (index : Nat) child, children[index]? = some (some child) → Closed store child) :
       Closed store root
+  | route (held : store nodeSpace root = some raw)
+      (decoded : decode raw = .ok (.route children value))
+      (payload : ∀ address, value = some address → ∃ bytes, ValueDenotes store (.hash address) bytes)
+      (below : ∀ (index : Nat) child, children[index]? = some (some child) → Closed store child) :
+      Closed store root
 
 /-- A saved version is either the distinguished empty snapshot or a finite
 stored graph containing all its referenced records. -/
@@ -84,6 +89,11 @@ theorem closed_preserved (closed : Closed before root) (included : RecordsInclud
     apply Closed.branch (included _ _ _ (.inl rfl) held) decoded _ ih
     intro value selected
     obtain ⟨bytes, denotes⟩ := payload value selected
+    exact ⟨bytes, value_preserved included denotes⟩
+  | route held decoded payload _ ih =>
+    apply Closed.route (included _ _ _ (.inl rfl) held) decoded _ ih
+    intro address selected
+    obtain ⟨bytes, denotes⟩ := payload address selected
     exact ⟨bytes, value_preserved included denotes⟩
 
 private theorem original_value (included : RecordsIncluded before after)
@@ -119,6 +129,8 @@ theorem closed_snapshot_no_new_entries (closed : Closed before root)
     | branchValue _ _ _ _ _ now parsed _ => simp_all
     | extension _ _ _ _ _ _ now parsed _ _ => simp_all
     | branchChild _ _ _ _ _ _ _ _ now parsed _ _ => simp_all
+    | routeValue _ _ _ _ _ now parsed _ => simp_all
+    | routeChild _ _ _ _ _ _ _ _ now parsed _ _ => simp_all
   | extension held decoded nonempty below ih =>
     have retained := included _ _ _ (.inl rfl) held
     cases entry with
@@ -131,6 +143,8 @@ theorem closed_snapshot_no_new_entries (closed : Closed before root)
       obtain ⟨rfl, rfl⟩ := parsed
       exact .extension _ _ _ _ _ _ held decoded nonempty (ih path)
     | branchChild _ _ _ _ _ _ _ _ now parsed _ _ => simp_all
+    | routeValue _ _ _ _ _ now parsed _ => simp_all
+    | routeChild _ _ _ _ _ _ _ _ now parsed _ _ => simp_all
   | branch held decoded payload below ih =>
     have retained := included _ _ _ (.inl rfl) held
     cases entry with
@@ -148,6 +162,27 @@ theorem closed_snapshot_no_new_entries (closed : Closed before root)
       simp only [decoded, Except.ok.injEq, Node.branch.injEq] at parsed
       obtain ⟨rfl, rfl⟩ := parsed
       exact .branchChild _ _ _ _ _ _ _ _ held decoded edge (ih _ _ edge path)
+    | routeValue _ _ _ _ _ now parsed _ => simp_all
+    | routeChild _ _ _ _ _ _ _ _ now parsed _ _ => simp_all
+  | route held decoded payload below ih =>
+    have retained := included _ _ _ (.inl rfl) held
+    cases entry with
+    | leaf _ _ _ _ _ now parsed _ => simp_all
+    | branchValue _ _ _ _ _ now parsed _ => simp_all
+    | extension _ _ _ _ _ _ now parsed _ _ => simp_all
+    | branchChild _ _ _ _ _ _ _ _ now parsed _ _ => simp_all
+    | routeValue address raw children value bytes now parsed denotes =>
+      have same := retained.symm.trans now
+      cases same
+      simp only [decoded, Except.ok.injEq, Node.route.injEq] at parsed
+      obtain ⟨rfl, rfl⟩ := parsed
+      exact .routeValue _ _ _ _ _ held decoded (original_value included (payload _ rfl) denotes)
+    | routeChild address raw children value nibble child tail bytes now parsed edge path =>
+      have same := retained.symm.trans now
+      cases same
+      simp only [decoded, Except.ok.injEq, Node.route.injEq] at parsed
+      obtain ⟨rfl, rfl⟩ := parsed
+      exact .routeChild _ _ _ _ _ _ _ _ held decoded edge (ih _ _ edge path)
 
 /-- Any executed mutation with nonconflicting writes leaves every entry of
 an already stored version exactly unchanged. The new root may describe a
@@ -177,6 +212,10 @@ def NodeEntries (store : RawSnapshot) : Node → List UInt8 → ByteArray → Pr
   | .branch _ value, [], bytes => ∃ v, value = some v ∧ ValueDenotes store v bytes
   | .branch children _, nibble :: tail, bytes =>
     ∃ child, children[nibble.toNat]? = some (some child) ∧ GraphValue store child tail bytes
+  | .route _ value, [], bytes =>
+    ∃ address, value = some address ∧ ValueDenotes store (.hash address) bytes
+  | .route children _, nibble :: tail, bytes =>
+    ∃ child, children[nibble.toNat]? = some (some child) ∧ GraphValue store child tail bytes
 
 theorem graph_node_entries (held : store nodeSpace root = some raw)
     (decoded : decode raw = .ok node) :
@@ -191,6 +230,9 @@ theorem graph_node_entries (held : store nodeSpace root = some raw)
     | extension address raw segment child tail bytes now parsed nonempty below =>
       simp_all [NodeEntries]
     | branchChild address raw children value nibble child tail bytes now parsed edge below =>
+      simp_all [NodeEntries]
+    | routeValue address raw children value bytes now parsed denotes => simp_all [NodeEntries]
+    | routeChild address raw children value nibble child tail bytes now parsed edge below =>
       simp_all [NodeEntries]
   · intro entry
     cases node with
@@ -208,6 +250,14 @@ theorem graph_node_entries (held : store nodeSpace root = some raw)
       | cons nibble tail =>
         obtain ⟨child, edge, below⟩ := entry
         exact .branchChild _ _ _ _ _ _ _ _ held decoded edge below
+    | route children value =>
+      cases key with
+      | nil =>
+        obtain ⟨address, rfl, denotes⟩ := entry
+        exact .routeValue _ _ _ _ _ held decoded denotes
+      | cons nibble tail =>
+        obtain ⟨child, edge, below⟩ := entry
+        exact .routeChild _ _ _ _ _ _ _ _ held decoded edge below
 
 /-- The references a freshly constructed node needs are already present.
 This is the induction invariant used while rebuilding a modified path. -/
@@ -217,12 +267,15 @@ def NodeClosed (store : RawSnapshot) : Node → Prop
   | .branch children value =>
     (∀ v, value = some v → ∃ bytes, ValueDenotes store v bytes) ∧
     (∀ (index : Nat) child, children[index]? = some (some child) → Closed store child)
+  | .route children value =>
+    (∀ address, value = some address → ∃ bytes, ValueDenotes store (.hash address) bytes) ∧
+    (∀ (index : Nat) child, children[index]? = some (some child) → Closed store child)
 
 theorem loaded_node_closed (closed : Closed store root)
     (held : store nodeSpace root = some raw) (decoded : decode raw = .ok node) :
     NodeClosed store node := by
   cases closed <;> simp_all [NodeClosed]
-  assumption
+  all_goals assumption
 
 theorem node_entries_unchanged (closed : NodeClosed before node)
     (included : RecordsIncluded before after) :
@@ -241,6 +294,20 @@ theorem node_entries_unchanged (closed : NodeClosed before node)
     · rintro ⟨nonempty, tail, key, found⟩
       exact ⟨nonempty, tail, key, graph_value_preserved included found⟩
   | branch children value =>
+    cases key with
+    | nil =>
+      constructor
+      · rintro ⟨v, selected, found⟩
+        exact ⟨v, selected, original_value included (closed.1 v selected) found⟩
+      · rintro ⟨v, selected, found⟩
+        exact ⟨v, selected, value_preserved included found⟩
+    | cons nibble tail =>
+      constructor
+      · rintro ⟨child, edge, found⟩
+        exact ⟨child, edge, closed_snapshot_no_new_entries (closed.2 _ _ edge) included found⟩
+      · rintro ⟨child, edge, found⟩
+        exact ⟨child, edge, graph_value_preserved included found⟩
+  | route children value =>
     cases key with
     | nil =>
       constructor
@@ -281,6 +348,13 @@ theorem put_node_closed (closed : NodeClosed s.read node) (wellFormed : node.wf)
     apply Closed.branch held decoded
     · intro v selected
       obtain ⟨bytes, denotes⟩ := closed.1 v selected
+      exact ⟨bytes, value_preserved included denotes⟩
+    · intro index child edge
+      exact closed_preserved (closed.2 index child edge) included
+  | route children value =>
+    apply Closed.route held decoded
+    · intro address selected
+      obtain ⟨bytes, denotes⟩ := closed.1 address selected
       exact ⟨bytes, value_preserved included denotes⟩
     · intro index child edge
       exact closed_preserved (closed.2 index child edge) included

@@ -159,7 +159,6 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::missing_oracle::MissingWalk;
     use crate::testutil::store;
     use crate::{Binding, BindingSource, Slot};
     use synch_core::{OriginId, SignedHead};
@@ -177,24 +176,50 @@ mod tests {
     /// The positions a walk emits under `root`, paired with the hashes it
     /// claims for them, copying every node it meets into `into`.
     fn positions(store: &Store, root: Hash, scope: Scope, into: &MemStore) -> Vec<(Vec<u8>, Hash)> {
-        let mut walk = MissingWalk::scoped(None, root, scope);
-        let mut wants: Vec<(Vec<u8>, Hash)> = Vec::new();
-        loop {
-            let batch = walk.next_batch(&Trie::new(into), 64).unwrap();
-            if batch.is_empty() {
-                break;
-            }
-            for (path, hash) in &batch.nodes {
-                let bytes = store.get_node(hash).unwrap().unwrap();
-                into.put_node(hash, &bytes).unwrap();
-                wants.push((path.clone(), *hash));
-            }
-            for (_, hash) in &batch.values {
-                let bytes = store.get_value(hash).unwrap().unwrap();
-                into.put_value(hash, &bytes).unwrap();
-            }
-            walk.resume();
-        }
+        use synch_verified::suspend::{PeerReply, PeerRequest};
+        let (_dir, destination) = crate::testutil::store();
+        let mut wants = Vec::new();
+        assert!(destination
+            .fetch_trie(
+                root,
+                &crate::testutil::origin(),
+                1,
+                &scope,
+                None,
+                None,
+                64,
+                3,
+                |request| Some(match request {
+                    PeerRequest::Nodes { wants: nodes, .. } => PeerReply::Nodes {
+                        served: nodes
+                            .iter()
+                            .map(|(path, hash)| {
+                                let key = Hash::from_slice(hash).unwrap();
+                                let bytes = store.get_node(&key).unwrap().unwrap();
+                                into.put_node(&key, &bytes).unwrap();
+                                wants.push((path.clone(), key));
+                                (hash.clone(), bytes)
+                            })
+                            .collect(),
+                        missing: vec![],
+                        redacted: vec![],
+                    },
+                    PeerRequest::Values { wants: values, .. } => PeerReply::Values {
+                        served: values
+                            .iter()
+                            .map(|(_, hash)| {
+                                let key = Hash::from_slice(hash).unwrap();
+                                let bytes = store.get_value(&key).unwrap().unwrap();
+                                into.put_value(&key, &bytes).unwrap();
+                                (hash.clone(), bytes)
+                            })
+                            .collect(),
+                        missing: vec![],
+                    },
+                })
+            )
+            .unwrap()
+            .unwrap());
         wants
     }
 
@@ -360,29 +385,38 @@ mod tests {
         // and the delegate's copy ends up holding its space and not the
         // other one.
         let scope = Scope::of(&synch_core::scope_prefixes(&["photos".to_string()]));
-        let copy = MemStore::new();
-        let mut walk = MissingWalk::scoped(None, root, scope.clone());
-        let mut served_any = true;
-        while served_any {
-            served_any = false;
-            let batch = walk.next_batch(&Trie::new(&copy), 64).unwrap();
-            if batch.is_empty() {
-                break;
-            }
-            let (nodes, missing, redacted) = store
-                .serve_trie_nodes(&delegate, &root, &batch.nodes)
-                .unwrap();
-            assert!(
-                missing.is_empty() && redacted.is_empty(),
-                "an honest walk asks within its grant"
-            );
-            for (hash, bytes) in nodes {
-                copy.put_node(&hash, &bytes).unwrap();
-                served_any = true;
-            }
-            walk.resume();
-        }
-        assert!(walk.is_exhausted(), "the scoped walk was served whole");
+        use synch_verified::suspend::{PeerReply, PeerRequest};
+        let (_copy_dir, copy) = crate::testutil::store();
+        assert!(
+            copy.fetch_trie(root, &issuer, 1, &scope, None, None, 64, 3, |request| {
+                Some(match request {
+                    PeerRequest::Nodes { wants, .. } => {
+                        let wants: Vec<_> = wants
+                            .iter()
+                            .map(|(path, hash)| (path.clone(), Hash::from_slice(hash).unwrap()))
+                            .collect();
+                        let (nodes, missing, redacted) =
+                            store.serve_trie_nodes(&delegate, &root, &wants).unwrap();
+                        assert!(
+                            missing.is_empty() && redacted.is_empty(),
+                            "an honest fetch asks within its grant"
+                        );
+                        PeerReply::Nodes {
+                            served: nodes
+                                .into_iter()
+                                .map(|(hash, bytes)| (hash.as_bytes().to_vec(), bytes))
+                                .collect(),
+                            missing: vec![],
+                            redacted: vec![],
+                        }
+                    }
+                    PeerRequest::Values { .. } => panic!("fixture has only inline values"),
+                })
+            })
+            .unwrap()
+            .unwrap(),
+            "the scoped fetch was served whole"
+        );
         let view = Trie::new(&copy);
         assert_eq!(
             view.get(root, b"f:photos/a.jpg").unwrap().as_deref(),

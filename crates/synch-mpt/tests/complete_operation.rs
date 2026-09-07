@@ -1,10 +1,4 @@
-//! The whole native completeness operation, including its memo and raw host
-//! boundary. The independent Rust requesting walk remains an oracle until
-//! its own fetch cutover.
-#[path = "support/missing_walk.rs"]
-mod missing_oracle;
-use missing_oracle::MissingWalk;
-
+//! The whole native completeness operation, including its memo and raw host boundary.
 use std::{
     cell::{Cell, RefCell},
     collections::HashSet,
@@ -125,9 +119,6 @@ fn a_refusal_cannot_turn_missing_shared_entries_into_a_complete_empty_view() {
     assert!(!trie.is_complete_scoped(root, &scope).unwrap());
     assert!(destination.known.borrow().is_empty());
     assert!(trie.scan(root, b"shared/", None, None).is_err());
-    let mut walk = MissingWalk::scoped(None, root, scope);
-    assert!(!walk.next_batch(&trie, 64).unwrap().is_empty());
-    assert!(!walk.is_exhausted());
 }
 
 #[test]
@@ -137,7 +128,7 @@ fn a_new_certificate_follows_reads_and_a_known_one_skips_them() {
     assert!(trie.is_complete(root).unwrap());
     assert_eq!(
         *store.calls.borrow(),
-        ["known", "generation", "node", "value_presence", "certify"]
+        ["known", "generation", "node", "value_payload", "certify"]
     );
     store.calls.borrow_mut().clear();
     assert!(trie.is_complete(root).unwrap());
@@ -157,7 +148,7 @@ fn an_invalidation_during_the_walk_cannot_certify_a_fresh_ticket() {
 
 #[test]
 fn host_failures_are_preserved_and_never_leave_a_certificate() {
-    for (index, effect) in ["known", "generation", "node", "value_presence", "certify"]
+    for (index, effect) in ["known", "generation", "node", "value_payload", "certify"]
         .iter()
         .enumerate()
     {
@@ -184,7 +175,7 @@ fn a_missing_value_is_not_certified_and_a_transaction_can_answer_without_caching
     store.calls.borrow_mut().clear();
     assert!(!Trie::new(&store).is_complete(root).unwrap());
     assert!(!store.calls.borrow().contains(&"certify"));
-    assert!(!store.calls.borrow().contains(&"value_payload"));
+    assert!(store.calls.borrow().contains(&"value_payload"));
 }
 
 #[test]
@@ -216,7 +207,7 @@ fn narrower_scope_and_unowned_answers_cannot_certify_other_views() {
 }
 
 #[test]
-fn native_completeness_matches_the_requesting_walk_on_a_shared_partial_trie() {
+fn scoped_and_full_views_require_their_addressed_payloads() {
     let store = MemStore::new();
     let trie = Trie::new(&store);
     let mut root = Hash::EMPTY;
@@ -228,20 +219,16 @@ fn native_completeness_matches_the_requesting_walk_on_a_shared_partial_trie() {
         exact: vec![b"beta".to_vec()],
     });
     for candidate in [&scope, &Scope::full()] {
-        let mut oracle = MissingWalk::scoped(None, root, candidate.clone());
-        let expected = oracle.next_batch(&trie, 1).unwrap().is_empty();
-        assert_eq!(trie.is_complete_scoped(root, candidate).unwrap(), expected);
+        assert!(trie.is_complete_scoped(root, candidate).unwrap());
     }
     store.clear_values();
     for candidate in [&scope, &Scope::full()] {
-        let mut oracle = MissingWalk::scoped(None, root, candidate.clone());
-        let expected = oracle.next_batch(&trie, 1).unwrap().is_empty();
-        assert_eq!(trie.is_complete_scoped(root, candidate).unwrap(), expected);
+        assert!(!trie.is_complete_scoped(root, candidate).unwrap());
     }
 }
 
 #[test]
-#[ignore = "120k-entry completeness cost comparison at the documented corpus size"]
+#[ignore = "120k-entry native completeness cost at the documented corpus size"]
 fn completeness_at_the_documented_corpus_size() {
     let store = Observed::default();
     let source = Trie::new(&store.bytes);
@@ -257,19 +244,6 @@ fn completeness_at_the_documented_corpus_size() {
     }
     let trie = Trie::new(&store);
     let started = std::time::Instant::now();
-    let mut oracle = MissingWalk::new(root);
-    assert!(oracle.next_batch(&trie, 1).unwrap().is_empty());
-    assert!(oracle.is_exhausted());
-    let rust_elapsed = started.elapsed();
-    let rust_reads = store
-        .calls
-        .borrow()
-        .iter()
-        .filter(|call| **call == "node")
-        .count();
-    store.calls.borrow_mut().clear();
-
-    let started = std::time::Instant::now();
     assert!(trie.is_complete(root).unwrap());
     let lean_elapsed = started.elapsed();
     let lean_reads = store
@@ -278,9 +252,51 @@ fn completeness_at_the_documented_corpus_size() {
         .iter()
         .filter(|call| **call == "node")
         .count();
-    assert_eq!(
-        lean_reads, rust_reads,
-        "the cutover must retain the walk's read cost"
+    // A radix tree has fewer than two nodes per entry, apart from compressed
+    // path nodes. Re-reading extensions' children is bounded by one per edge.
+    assert!(
+        lean_reads < 4 * 120_000,
+        "unexpected repeated traversal: {lean_reads}"
     );
-    eprintln!("120k-entry completeness: Rust {rust_elapsed:?}, Lean {lean_elapsed:?}; {lean_reads} node reads each");
+    eprintln!("120k-entry native completeness: {lean_elapsed:?}; {lean_reads} node reads");
+}
+
+#[test]
+fn a_small_route_payload_cannot_certify_a_legacy_holder_of_the_same_hash() {
+    use synch_mpt::{TrieNode, ValueRef};
+    let store = Observed::default();
+    let payload = b"small";
+    let value = Hash::new(payload);
+    store.put_value(&value, payload).unwrap();
+    let route = TrieNode::Route {
+        children: [None; 16],
+        value: Some(value),
+    };
+    let legacy = TrieNode::Leaf {
+        key_rest: synch_mpt::Nibbles::new(),
+        value: ValueRef::Hash(value),
+    };
+    for node in [&route, &legacy] {
+        store.put_node(&node.hash(), &node.encode()).unwrap();
+    }
+    let trie = Trie::new(&store);
+    assert!(trie.is_complete(route.hash()).unwrap());
+    assert!(trie.is_complete(legacy.hash()).is_err());
+    assert!(!store.known.borrow().contains(&legacy.hash()));
+}
+
+#[test]
+fn an_oversized_held_route_payload_cannot_be_certified() {
+    use synch_mpt::TrieNode;
+    let store = Observed::default();
+    let payload = vec![7; 32769];
+    let value = Hash::new(&payload);
+    store.put_value(&value, &payload).unwrap();
+    let route = TrieNode::Route {
+        children: [None; 16],
+        value: Some(value),
+    };
+    store.put_node(&route.hash(), &route.encode()).unwrap();
+    assert!(Trie::new(&store).is_complete(route.hash()).is_err());
+    assert!(store.known.borrow().is_empty());
 }

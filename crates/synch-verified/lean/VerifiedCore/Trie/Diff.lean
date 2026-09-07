@@ -69,6 +69,12 @@ def sameChild : Cursor → Cursor → UInt8 → Bool
     match (a[nibble.toNat]?).getD none, (b[nibble.toNat]?).getD none with
     | some x, some y => x == y
     | _, _ => false
+  | .at (.route a _), .at (.route b _), nibble
+  | .at (.route a _), .at (.branch b _), nibble
+  | .at (.branch a _), .at (.route b _), nibble =>
+    match (a[nibble.toNat]?).getD none, (b[nibble.toNat]?).getD none with
+    | some x, some y => x == y
+    | _, _ => false
   | _, _, _ => false
 
 /-- The next nibble under which either side may have a child. -/

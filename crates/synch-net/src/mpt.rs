@@ -1260,11 +1260,34 @@ mod tests {
                     .unwrap();
                 synch_mpt::NodeStore::put_node(bare.as_ref(), node, &bytes).unwrap();
             }
-            let missing = crate::missing_oracle::MissingWalk::new(root)
-                .next_batch(&Trie::new(bare.as_ref()), MAX_BATCH)
-                .unwrap();
-            assert!(missing.nodes.is_empty(), "every node was copied across");
-            (dir, missing.values)
+            let mut values = Vec::new();
+            let origin = synch_core::OriginId::named("fixture", "example.test").unwrap();
+            let _cancelled = bare.fetch_trie(
+                root,
+                &origin,
+                1,
+                &synch_mpt::Scope::full(),
+                None,
+                None,
+                MAX_BATCH as u64,
+                3,
+                |request| {
+                    match request {
+                        synch_verified::suspend::PeerRequest::Nodes { .. } => {
+                            panic!("every node was copied across")
+                        }
+                        synch_verified::suspend::PeerRequest::Values { wants, .. } => {
+                            values = wants
+                                .iter()
+                                .map(|(path, hash)| (path.clone(), Hash::from_slice(hash).unwrap()))
+                                .collect();
+                        }
+                    }
+                    None
+                },
+            );
+            assert!(!values.is_empty());
+            (dir, values)
         };
         let (_at_dir, at_ceiling) = positions(ceiling_root);
         let (_over_dir, oversized) = positions(oversized_root);

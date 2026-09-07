@@ -1,6 +1,6 @@
 //! A trie DAG fans out exponentially in `diff`, but not in the fetch that
 //! admits it. Nothing canonicalises a peer's node graph, and a branch may
-//! point all sixteen children at the same hash: `MissingWalk` deduplicates on
+//! point all sixteen children at the same hash: the Lean requesting operation deduplicates on
 //! hash, so the structure is `k + 1` nodes on the wire and `is_complete`
 //! answers yes, while `diff_walk` walks *positions* and expands into 16^k
 //! paths — one SQLite read each, one `Change` per leaf visit, inside the

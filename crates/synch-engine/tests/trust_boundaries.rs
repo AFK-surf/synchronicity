@@ -1,9 +1,6 @@
 //! Containment at the trust boundaries of mptsync (§5.5, §12), over real
 //! endpoints. Each test states a property the design promises.
 
-#[path = "../../synch-mpt/tests/support/missing_walk.rs"]
-mod missing_oracle;
-
 use synch_core::{delegation_key, file_key, now_ns, Delegation, Hash, NodeId, SignedHead};
 use synch_engine::{reconcile::HeadOutcome, FetchOutcome, Syncer};
 use synch_mpt::{NodeStore, Scope, Trie, TrieNode};
@@ -27,25 +24,58 @@ fn delegation(subject: &NodeId, spaces: &[&str]) -> (Vec<u8>, Vec<u8>) {
 
 /// Every node of `root`'s trie by position.
 fn walk_all(store: &synch_store::Store, root: Hash) -> Vec<(Vec<u8>, Hash)> {
-    let empty = synch_mpt::MemStore::new();
-    let mut walk = missing_oracle::MissingWalk::new(root);
+    use synch_verified::suspend::{PeerReply, PeerRequest};
+    let dir = tempfile::tempdir().unwrap();
+    let destination = synch_store::Store::open(dir.path()).unwrap();
+    let origin = synch_core::OriginId::named("fixture", "example.test").unwrap();
     let mut all = Vec::new();
-    loop {
-        let batch = walk.next_batch(&Trie::new(&empty), 512).unwrap();
-        if batch.is_empty() {
-            break;
-        }
-        for (path, hash) in &batch.nodes {
-            all.push((path.clone(), *hash));
-            let bytes = store.get_node(hash).unwrap().unwrap();
-            empty.put_node(hash, &bytes).unwrap();
-        }
-        for (_, hash) in &batch.values {
-            let bytes = store.get_value(hash).unwrap().unwrap();
-            empty.put_value(hash, &bytes).unwrap();
-        }
-        walk.resume();
-    }
+    assert!(destination
+        .fetch_trie(
+            root,
+            &origin,
+            1,
+            &synch_mpt::Scope::full(),
+            None,
+            None,
+            256,
+            3,
+            |request| Some(match request {
+                PeerRequest::Nodes { wants, .. } => PeerReply::Nodes {
+                    served: wants
+                        .iter()
+                        .map(|(path, hash)| {
+                            let hash_key = Hash::from_slice(hash).unwrap();
+                            all.push((path.clone(), hash_key));
+                            (
+                                hash.clone(),
+                                synch_mpt::NodeStore::get_node(store, &hash_key)
+                                    .unwrap()
+                                    .unwrap(),
+                            )
+                        })
+                        .collect(),
+                    missing: vec![],
+                    redacted: vec![],
+                },
+                PeerRequest::Values { wants, .. } => PeerReply::Values {
+                    served: wants
+                        .iter()
+                        .map(|(_, hash)| (
+                            hash.clone(),
+                            synch_mpt::NodeStore::get_value(
+                                store,
+                                &Hash::from_slice(hash).unwrap()
+                            )
+                            .unwrap()
+                            .unwrap()
+                        ))
+                        .collect(),
+                    missing: vec![],
+                },
+            })
+        )
+        .unwrap()
+        .unwrap());
     all
 }
 
@@ -215,7 +245,7 @@ async fn a_non_canonical_node_fails_its_origin_and_not_the_exchange() {
 
     // `a` publishes a root that hashes fine and decodes fine but is
     // non-canonical: a branch with a single occupant.
-    let (value, _) = synch_mpt::ValueRef::for_value(b"x");
+    let value = synch_mpt::ValueRef::Inline(b"x".to_vec());
     let leaf = TrieNode::Leaf {
         key_rest: synch_mpt::Nibbles::from_nibbles(&[1, 2, 3]),
         value,

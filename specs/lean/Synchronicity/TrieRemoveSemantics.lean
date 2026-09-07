@@ -32,6 +32,15 @@ inductive Absent (store : RawSnapshot) : ByteArray → List UInt8 → Prop where
       (decoded : decode raw = .ok (.branch children value))
       (edge : childAt children nibble = some child)
       (below : Absent store child key) : Absent store root (nibble :: key)
+  | routeValue (held : store nodeSpace root = some raw)
+      (decoded : decode raw = .ok (.route children none)) : Absent store root []
+  | routeEmpty (held : store nodeSpace root = some raw)
+      (decoded : decode raw = .ok (.route children value))
+      (empty : childAt children nibble = none) : Absent store root (nibble :: key)
+  | routeBelow (held : store nodeSpace root = some raw)
+      (decoded : decode raw = .ok (.route children value))
+      (edge : childAt children nibble = some child)
+      (below : Absent store child key) : Absent store root (nibble :: key)
 
 private theorem execute_load (held : s.read nodeSpace address = some raw)
     (decoded : decode raw = .ok node) :
@@ -115,6 +124,48 @@ theorem absent_lookup (absent : Absent store root key)
         | zero => simp only [List.length_cons] at enough; omega
         | succ fuel => exact TrieProgramProofs.execute_pure _ _ _
   | branchBelow held decoded edge below ih =>
+    cases fuel with
+    | zero => omega
+    | succ fuel =>
+      cases budget with
+      | zero => omega
+      | succ budget =>
+        change executeReads store (budget + 1) (.request (.readBytes nodeSpace _) _) = _
+        rw [executeReads]
+        dsimp only [Program.bind, ExceptT.bindCont]
+        simp only [held, decoded]
+        change executeReads store budget (lookup fuel (childAt _ _) _).run = _
+        rw [edge]
+        exact ih fuel budget (by simp only [List.length_cons] at enough; omega) (by omega)
+  | routeValue held decoded =>
+    cases fuel with
+    | zero => omega
+    | succ fuel =>
+      cases budget with
+      | zero => omega
+      | succ budget =>
+        change executeReads store (budget + 1) (.request (.readBytes nodeSpace _) _) = _
+        rw [executeReads]
+        dsimp only [Program.bind, ExceptT.bindCont]
+        simp only [held, decoded]
+        exact TrieProgramProofs.execute_pure _ _ _
+  | routeEmpty held decoded empty =>
+    cases fuel with
+    | zero => omega
+    | succ fuel =>
+      cases budget with
+      | zero => omega
+      | succ budget =>
+        change executeReads store (budget + 1) (.request (.readBytes nodeSpace _) _) = _
+        rw [executeReads]
+        dsimp only [Program.bind, ExceptT.bindCont]
+        simp only [held, decoded]
+        change executeReads store budget (lookup fuel (childAt _ _) _).run = _
+        rw [empty]
+        cases fuel with
+        | zero => simp only [List.length_cons] at enough; omega
+        | succ fuel => exact TrieProgramProofs.execute_pure _ _ _
+  | routeBelow held decoded edge below ih =>
     cases fuel with
     | zero => omega
     | succ fuel =>
@@ -229,6 +280,19 @@ theorem lookup_missing_is_absent (shaped : Shaped s)
             | some child =>
               rw [edge] at missing
               exact .branchBelow held decoded edge (ih budget child key missing)
+        | route children value =>
+          cases key with
+          | nil =>
+            cases value with
+            | none => exact .routeValue held decoded
+            | some value => exact (value_ne_missing (.hash value) budget missing).elim
+          | cons nibble key =>
+            change executeReads s.read budget (lookup fuel (childAt children nibble) key).run = _ at missing
+            cases edge : childAt children nibble with
+            | none => exact .routeEmpty held decoded edge
+            | some child =>
+              rw [edge] at missing
+              exact .routeBelow held decoded edge (ih budget child key missing)
 
 /-- The complete removal continuation, including its actual reconstruction
 stack, preserves all storage when the key is absent. -/
@@ -277,6 +341,26 @@ theorem absent_removal_continuation (absent : Absent s.read root key)
       rw [descendRemove, execute_run_bind, execute_run_bind, execute_load held decoded]
       simp [empty]
   | branchBelow held decoded edge below ih =>
+    cases fuel with
+    | zero => omega
+    | succ fuel =>
+      rw [descendRemove, execute_run_bind, execute_run_bind, execute_load held decoded]
+      simp only [edge]
+      rw [← execute_run_bind, ih fuel (by simp only [List.length_cons] at enough; omega)]
+      simp [unwind]
+  | routeValue held decoded =>
+    cases fuel with
+    | zero => omega
+    | succ fuel =>
+      rw [descendRemove, execute_run_bind, execute_run_bind, execute_load held decoded]
+      simp
+  | routeEmpty held decoded empty =>
+    cases fuel with
+    | zero => omega
+    | succ fuel =>
+      rw [descendRemove, execute_run_bind, execute_run_bind, execute_load held decoded]
+      simp [empty]
+  | routeBelow held decoded edge below ih =>
     cases fuel with
     | zero => omega
     | succ fuel =>

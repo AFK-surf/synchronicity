@@ -507,6 +507,7 @@ instance : Encode Commands.TrieMissingDomainError where
     | .valueDepth a0 => out.push 2 |>.put a0
     | .expectedBranch a0 => out.push 3 |>.put a0
     | .exhausted => out.push 4
+    | .valueLength a0 a1 a2 => out.push 5 |>.put a0 |>.put a1 |>.put a2
 
 instance : Decode Commands.TrieMissingDomainError where
   decode := do
@@ -516,6 +517,7 @@ instance : Decode Commands.TrieMissingDomainError where
     | 2 => return .valueDepth (← Decode.decode)
     | 3 => return .expectedBranch (← Decode.decode)
     | 4 => return .exhausted
+    | 5 => return .valueLength (← Decode.decode) (← Decode.decode) (← Decode.decode)
     | _ => throw ()
 
 instance : Encode Commands.TrieFetchDomainError where
@@ -638,6 +640,7 @@ instance : Encode Commands.Command where
     | .trieComplete a0 a1 a2 a3 => out.push 44 |>.put a0 |>.put a1 |>.put a2 |>.put a3
     | .planExchange a0 a1 a2 => out.push 45 |>.put a0 |>.put a1 |>.put a2
     | .trieFetch a0 a1 a2 a3 a4 a5 a6 a7 a8 => out.push 46 |>.put a0 |>.put a1 |>.put a2 |>.put a3 |>.put a4 |>.put a5 |>.put a6 |>.put a7 |>.put a8
+    | .trieNormalize a0 => out.push 47 |>.put a0
 
 instance : Decode Commands.Command where
   decode := do
@@ -689,6 +692,7 @@ instance : Decode Commands.Command where
     | 44 => return .trieComplete (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode)
     | 45 => return .planExchange (← Decode.decode) (← Decode.decode) (← Decode.decode)
     | 46 => return .trieFetch (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 47 => return .trieNormalize (← Decode.decode)
     | _ => throw ()
 
 end VerifiedCore

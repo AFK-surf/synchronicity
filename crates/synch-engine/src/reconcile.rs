@@ -1567,6 +1567,15 @@ fn fetch_domain_error(error: synch_verified::trie::TrieFetchDomainError) -> Engi
                 "node {} sits under an extension but is not a branch",
                 hex::encode(bytes)
             )),
+            Walk::ValueLength {
+                hash,
+                size,
+                routing,
+            } => MptError::NonCanonical(format!(
+                "addressed value {} has invalid length {size} for a {} holder",
+                hex::encode(hash),
+                if routing { "routing" } else { "legacy" },
+            )),
             Walk::Exhausted => {
                 MptError::NonCanonical("the requesting walk outran its work budget".into())
             }
@@ -2003,7 +2012,7 @@ mod tests {
     /// is contained to an origin and the other ends the exchange.
     #[test]
     fn a_refused_node_shape_is_the_origins_fault_and_wrong_bytes_are_the_peers() {
-        let (value, _) = synch_mpt::ValueRef::for_value(b"x");
+        let value = synch_mpt::ValueRef::Inline(b"x".to_vec());
         let leaf = synch_mpt::TrieNode::Leaf {
             key_rest: synch_mpt::Nibbles::from_nibbles(&[1, 2, 3]),
             value,
@@ -2270,7 +2279,7 @@ mod containment_tests {
         // invalid — an extension whose child is a leaf, which no canonical
         // trie contains (§4.3). Stored through `put_node` directly, because
         // this is what a peer serving a hand-built graph looks like.
-        let (value, _) = synch_mpt::ValueRef::for_value(&[7u8; 4]);
+        let value = synch_mpt::ValueRef::Inline(vec![7u8; 4]);
         let child = synch_mpt::TrieNode::Leaf {
             key_rest: synch_mpt::Nibbles::from_nibbles(&[1, 2]),
             value,

@@ -55,6 +55,7 @@ fn main() {
         "Trie/Program",
         "Trie/Verify",
         "Trie/Mutate",
+        "Trie/Normalize",
         "Trie/Serve",
         "Trie/Memo",
         "Trie/Collect",

@@ -55,6 +55,13 @@ def proveAt : Nat → Option ByteArray → List UInt8 → List ByteArray → Ope
           | none => return .ok ⟨nodes.reverse, none⟩
           | some value => found value nodes
         | nibble :: rest => proveAt fuel ((children[nibble.toNat]?).getD none) rest nodes
+      | .ok (.route children value) =>
+        match rest with
+        | [] =>
+          match value with
+          | none => return .ok ⟨nodes.reverse, none⟩
+          | some address => found (.hash address) nodes
+        | nibble :: rest => proveAt fuel ((children[nibble.toNat]?).getD none) rest nodes
 
 /-- The proof for a key against a root: the same descent as `get`, under
 the same bounds, with every node it read. -/

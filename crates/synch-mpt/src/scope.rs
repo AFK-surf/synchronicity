@@ -117,25 +117,6 @@ impl Scope {
         self.contains_subtree(key) || self.exact.iter().any(|k| k == key)
     }
 
-    /// Whether the value carried by a node belongs to a granted key. A branch
-    /// may travel on the spine without granting the value at the branch itself.
-    ///
-    /// The requesting walk's half of the value rule: which payloads it asks
-    /// for. The serving half — whether a node at a position may travel whole
-    /// given what it reveals, and whether a value it carries goes out — is
-    /// Lean's `Trie.Serve.Scope.admitsNode` and `admitsValue`.
-    pub fn admits_value(&self, path: &[u8], node: &crate::node::TrieNode) -> bool {
-        match node {
-            crate::node::TrieNode::Leaf { key_rest, .. } => {
-                let mut key = path.to_vec();
-                key.extend_from_slice(key_rest.as_slice());
-                self.admits_key_path(&key)
-            }
-            crate::node::TrieNode::Branch { .. } => self.admits_key_path(path),
-            crate::node::TrieNode::Ext { .. } => false,
-        }
-    }
-
     /// True if a whole byte key lies inside this scope.
     ///
     /// Stricter than [`Scope::admits_path`]: a key is a leaf position, so

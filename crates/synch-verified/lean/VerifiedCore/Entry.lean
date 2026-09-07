@@ -200,6 +200,8 @@ def completing [Encode A] : Except Trie.Missing.Error A → Host.Reply ByteArray
     terminalOf (Except.error (TrieMissingDomainError.valueDepth depth) : Except _ A)
   | .error (.canonical (.expectedBranch hash)) =>
     terminalOf (Except.error (TrieMissingDomainError.expectedBranch hash) : Except _ A)
+  | .error (.canonical (.valueLength hash size routing)) =>
+    terminalOf (Except.error (TrieMissingDomainError.valueLength hash size routing) : Except _ A)
   | .error .exhausted => terminalOf (Except.error TrieMissingDomainError.exhausted : Except _ A)
 
 def protocol : Native := .pure (.error protocolFailure)
@@ -214,6 +216,7 @@ def fetching [Encode A] : Except Trie.Fetch.Error A → Host.Reply ByteArray
       | .canonical (.nodeDepth depth) => .nodeDepth depth
       | .canonical (.valueDepth depth) => .valueDepth depth
       | .canonical (.expectedBranch hash) => .expectedBranch hash
+      | .canonical (.valueLength hash size routing) => .valueLength hash size routing
       | .exhausted => .exhausted
     terminalOf (Except.error (TrieFetchDomainError.walk error) : Except _ A)
   | .error (.origin refusal) => terminalOf (Except.error (TrieFetchDomainError.origin refusal) : Except _ A)
@@ -256,6 +259,8 @@ def dispatch : Command → Native
   | .trieInsert root keySize valueSize =>
     if root.size != 32 then malformedRoot
     else command (Trie.insertInput root keySize valueSize) mutation
+  | .trieNormalize root =>
+    if root.size != 32 then malformedRoot else command (Trie.Normalize.publication root) mutation
   | .trieRemove root keySize =>
     if root.size != 32 then malformedRoot else command (Trie.removeInput root keySize) mutation
   | .pruneHistory origin before => command (Replication.History.prune origin before) retention

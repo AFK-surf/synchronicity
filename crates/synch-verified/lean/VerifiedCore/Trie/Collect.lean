@@ -53,7 +53,7 @@ def transaction (body : Transaction → Action A) : Action A :=
 
 /-- The nodes a node names below itself. -/
 def _root_.VerifiedCore.Trie.Node.childHashes : Node → List ByteArray
-  | .branch children _ => children.filterMap id
+  | .branch children _ | .route children _ => children.filterMap id
   | .extension _ child => [child]
   | .leaf _ _ => []
 

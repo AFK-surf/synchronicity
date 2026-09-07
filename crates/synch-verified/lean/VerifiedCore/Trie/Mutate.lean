@@ -65,6 +65,15 @@ def valueRef (bytes : ByteArray) : Mutate Value := do
   request (ByteWrites.putBytes valueSpace hash bytes)
   return .hash hash
 
+/-- A routing position never embeds its payload. Reuse an existing address
+or store the inline bytes under their digest, including small payloads. -/
+def addressValue : Value → Mutate ByteArray
+  | .hash address => pure address
+  | .inline bytes => do
+    let address ← request (Digest.blake3 bytes)
+    request (ByteWrites.putBytes valueSpace address bytes)
+    return address
+
 def commonPrefix : List UInt8 → List UInt8 → Nat
   | a :: as, b :: bs => if a == b then commonPrefix as bs + 1 else 0
   | _, _ => 0
@@ -131,6 +140,7 @@ trip a constant-depth step, whatever the trie's depth. -/
 inductive InsertFrame where
   | extension (segment : ByteArray)
   | branch (children : List (Option ByteArray)) (value : Option Value) (nibble : UInt8)
+  | route (children : List (Option ByteArray)) (value : Option ByteArray) (nibble : UInt8)
 
 /-- Descend to the one position an insert changes, answering the subtree
 that replaces it and the frames above it. Each level is entered by consuming
@@ -154,6 +164,11 @@ def descend : Nat → Option ByteArray → List UInt8 → Value → List InsertF
       | nibble :: rest =>
         descend fuel (childAt children nibble) rest value (.branch children branchValue nibble :: stack)
     | .leaf suffix old => return (← splitLeaf suffix.data.toList old rest value, stack)
+    | .route children routeValue =>
+      match rest with
+      | [] => return (← put (.route children (some (← addressValue value))), stack)
+      | nibble :: rest =>
+        descend fuel (childAt children nibble) rest value (.route children routeValue nibble :: stack)
 
 /-- Rebuild the path above a replaced subtree, innermost frame first. -/
 def rebuild : ByteArray → List InsertFrame → Mutate ByteArray
@@ -161,6 +176,8 @@ def rebuild : ByteArray → List InsertFrame → Mutate ByteArray
   | built, .extension segment :: stack => do rebuild (← put (.extension segment built)) stack
   | built, .branch children value nibble :: stack => do
     rebuild (← put (.branch (setChild children nibble (some built)) value)) stack
+  | built, .route children value nibble :: stack => do
+    rebuild (← put (.route (setChild children nibble (some built)) value)) stack
 
 def insertAt (fuel : Nat) (cursor : Option ByteArray) (rest : List UInt8) (value : Value) :
     Mutate ByteArray := do
@@ -183,7 +200,7 @@ def mergeDown (segment : List UInt8) (child : ByteArray) : Mutate ByteArray := d
   | .leaf suffix value => put (.leaf (nibblesOf (segment ++ suffix.data.toList)) value)
   | .extension below grandchild =>
     put (.extension (nibblesOf (segment ++ below.data.toList)) grandchild)
-  | .branch _ _ => put (.extension (nibblesOf segment) child)
+  | .branch _ _ | .route _ _ => put (.extension (nibblesOf segment) child)
 
 /-- The occupied slots of a branch, with their nibbles, from slot `first`. -/
 def occupiedFrom : Nat → List (Option ByteArray) → List (UInt8 × ByteArray)
@@ -204,12 +221,21 @@ def collapse (children : List (Option ByteArray)) (value : Option Value) :
   | [(nibble, child)], none => return some (← mergeDown [nibble] child)
   | _, value => return some (← put (.branch children value))
 
+/-- Existing routing ancestors keep their routing form through edits. Only
+the empty node disappears; a terminal or unary route remains meaningful. -/
+def retainRoute (children : List (Option ByteArray)) (value : Option ByteArray) :
+    Mutate (Option ByteArray) := do
+  if occupants children (value.map Value.hash) == 0 then return none
+  return some (← put (.route children value))
+
 /-- One level of a removal's descent. Carries the level's own address as
 well, so an unchanged child is answered with the node already stored rather
 than an identical rebuild. -/
 inductive RemoveFrame where
   | extension (address : ByteArray) (segment : List UInt8) (child : ByteArray)
   | branch (address : ByteArray) (children : List (Option ByteArray)) (value : Option Value)
+      (nibble : UInt8) (child : ByteArray)
+  | route (address : ByteArray) (children : List (Option ByteArray)) (value : Option ByteArray)
       (nibble : UInt8) (child : ByteArray)
 
 /-- Descend to the key, answering what replaces the lowest level (`none` for
@@ -235,6 +261,17 @@ def descendRemove : Nat → ByteArray → List UInt8 → List RemoveFrame →
         | none => return (some address, stack)
         | some child =>
           descendRemove fuel child rest (.branch address children value nibble child :: stack)
+    | .route children value =>
+      match rest with
+      | [] =>
+        match value with
+        | none => return (some address, stack)
+        | some _ => return (← retainRoute children none, stack)
+      | nibble :: rest =>
+        match childAt children nibble with
+        | none => return (some address, stack)
+        | some child =>
+          descendRemove fuel child rest (.route address children value nibble child :: stack)
 
 /-- Unwind the path above a replaced level. A level whose child came back
 unchanged is itself unchanged, which is what keeps removing an absent key
@@ -250,6 +287,9 @@ def unwind : Option ByteArray → List RemoveFrame → Mutate (Option ByteArray)
   | result, .branch address children value nibble child :: stack =>
     if result == some child then unwind (some address) stack
     else do unwind (← collapse (setChild children nibble result) value) stack
+  | result, .route address children value nibble child :: stack =>
+    if result == some child then unwind (some address) stack
+    else do unwind (← retainRoute (setChild children nibble result) value) stack
 
 def removeAt (fuel : Nat) (address : ByteArray) (rest : List UInt8) : Mutate (Option ByteArray) := do
   let (result, stack) ← descendRemove fuel address rest []

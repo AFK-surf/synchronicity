@@ -219,7 +219,7 @@ theorem commit_admitted [WorkSet Visit V] [WorkSet ByteArray H] (context : Conte
     rcases List.mem_cons.mp mem with rfl | old
     · exact atPath
     · exact held.2.1 want old
-  | expand children pendingBranch values =>
+  | expand children pendingBranch values routing =>
     refine ⟨⟨pushChildren_admitted _ _ _ _ tail, ?_⟩, held.2.1,
       askValues_admitted _ _ _ _ _ atPath held.2.2⟩
     change PositionsAdmitted context.scope (if values.isEmpty then work.frontier.deferred
@@ -316,7 +316,10 @@ def withoutValue : State :=
   { graph with files := graph.files.filter fun entry => entry.1.1 != valueSpace }
 
 def withValue : State :=
-  { graph with db := (valueSpace, [[("hash", .blob valueHash), ("value", .blob payload)]]) :: graph.db }
+  { graph with
+    files := ((valueSpace, valueHash), ⟨Array.replicate 129 1⟩) ::
+      (graph.files.filter fun entry => entry.1.1 != valueSpace)
+    db := (valueSpace, [[("hash", .blob valueHash), ("value", .blob payload)]]) :: graph.db }
 
 /-- The same immutable frontier is passed to the next command; only the
 host state changes when the caller stores a fetched payload. -/
@@ -333,15 +336,15 @@ def summary (result : Except Missing.Error (BatchResult (List Visit) (List ByteA
 again on a resumed round, then exhaustion follows only after it arrives. -/
 theorem missing_value_repeats_until_it_arrives :
     let first := batchRun full initialFull 64 withoutValue
-    (summary first.1 == .ok (.ok ⟨[], [(bytes atLeafB, valueHash)]⟩, false, [], [leafBHash])) ∧
+    (summary first.1 == .ok (.ok ⟨[], [(bytes atLeafB, valueHash)], []⟩, false, [], [leafBHash])) ∧
     (match first.1 with
       | .error _ => false
       | .ok (frontier, _) =>
         let retry := batchRun full (resume full frontier) 64 withoutValue
         let complete := batchRun full (resume full frontier) 64 withValue
-        summary retry.1 == .ok (.ok ⟨[], [(bytes atLeafB, valueHash)]⟩, false, [], [leafBHash]) &&
+        summary retry.1 == .ok (.ok ⟨[], [(bytes atLeafB, valueHash)], []⟩, false, [], [leafBHash]) &&
         summary complete.1 == .ok (.ok {}, true, [], []) &&
-        complete.2.trace == ["bytes:" ++ nodeSpace, "snapshot:" ++ valueSpace]) = true := by
+        complete.2.trace == ["bytes:" ++ nodeSpace, "bytes:" ++ valueSpace]) = true := by
   decide +kernel
 
 /-- One missing hash may be held by two nodes: ask once per batch but defer
@@ -352,7 +355,7 @@ theorem shared_value_defers_every_holder :
           ((nodeSpace, leafAHash), encode (.leaf (bytes [0]) (.hash valueHash))),
           ((nodeSpace, leafBHash), encode (.leaf (bytes [1]) (.hash valueHash)))] }
     let first := batchRun full initialFull 64 state
-    summary first.1 == .ok (.ok ⟨[], [(bytes [2], valueHash)]⟩, false, [], [leafAHash, leafBHash]) := by
+    summary first.1 == .ok (.ok ⟨[], [(bytes [2], valueHash)], []⟩, false, [], [leafAHash, leafBHash]) := by
   decide +kernel
 
 /-- A refused node remains missing on a grant's spine as well as inside it.
@@ -361,11 +364,11 @@ theorem refusals_cannot_satisfy_missing_positions :
     (let context : Context := ⟨onLeafA, none⟩
      let state : State := { redacted := [(rootHash, bytes [])] }
      let result := batchRun context (initial context none rootHash) 64 state
-     summary result.1 == .ok (.ok ⟨[(bytes [], rootHash)], []⟩, false, [], [rootHash]) &&
+     summary result.1 == .ok (.ok ⟨[(bytes [], rootHash)], [], []⟩, false, [], [rootHash]) &&
        result.2.trace == ["bytes:" ++ nodeSpace]) ∧
     (let state : State := { redacted := [(rootHash, bytes [])] }
      let result := batchRun full initialFull 64 state
-     summary result.1 == .ok (.ok ⟨[(bytes [], rootHash)], []⟩, false, [], [rootHash]) &&
+     summary result.1 == .ok (.ok ⟨[(bytes [], rootHash)], [], []⟩, false, [], [rootHash]) &&
        result.2.trace == ["bytes:" ++ nodeSpace]) := by
   decide +kernel
 
@@ -375,7 +378,7 @@ theorem a_held_boundary_is_expanded :
     let context : Context := ⟨onLeafB, none⟩
     let state := { withoutValue with redacted := [(rootHash, bytes [])] }
     summary (batchRun context (initial context none rootHash) 64 state).1 ==
-      .ok (.ok ⟨[], [(bytes atLeafB, valueHash)]⟩, false, [], [leafBHash]) := by
+      .ok (.ok ⟨[], [(bytes atLeafB, valueHash)], []⟩, false, [], [leafBHash]) := by
   decide +kernel
 
 /-- A confined root needs provenance even when another origin supplied all
@@ -383,7 +386,7 @@ its bytes. A reference known complete for the same owner prunes before reads. -/
 theorem provenance_and_reference_are_distinct_inputs :
     (let context : Context := ⟨⟨none, []⟩, some "stranger"⟩
      let result := batchRun context (initial context none rootHash) 64 withValue
-     summary result.1 == .ok (.ok ⟨[(bytes [], rootHash)], []⟩, false, [], [rootHash]) &&
+     summary result.1 == .ok (.ok ⟨[(bytes [], rootHash)], [], []⟩, false, [], [rootHash]) &&
        result.2.trace == ["snapshot:trie_node_origins"]) ∧
     (let result := batchRun full (initial full (some rootHash) rootHash) 64 withValue
      summary result.1 == .ok (.ok {}, true, [], []) && result.2.trace == []) := by
@@ -411,7 +414,7 @@ theorem a_late_extension_child_is_still_checked :
     (match first.1 with
       | .error _ => false
       | .ok (frontier, result) =>
-        result == .ok ⟨[(bytes [1], leafAHash)], []⟩ && frontier.mustBeBranch.contains leafAHash &&
+        result == .ok ⟨[(bytes [1], leafAHash)], [], []⟩ && frontier.mustBeBranch.contains leafAHash &&
         (let supplied := { state with files := ((nodeSpace, leafAHash), encode leafANode) :: state.files }
          match (batchRun full (resume full frontier) 64 supplied).1 with
          | .error _ => false
@@ -424,7 +427,7 @@ theorem the_batch_limit_keeps_unfinished_positions :
     (let result := batchRun full initialFull 0 {}
      summary result.1 == .ok (.ok {}, false, [rootHash], []) && result.2.trace == []) ∧
     (let result := batchRun full initialFull 1 {}
-     summary result.1 == .ok (.ok ⟨[(bytes [], rootHash)], []⟩, false, [], [rootHash]) &&
+     summary result.1 == .ok (.ok ⟨[(bytes [], rootHash)], [], []⟩, false, [], [rootHash]) &&
        result.2.trace == ["bytes:" ++ nodeSpace]) := by
   decide +kernel
 
@@ -461,6 +464,37 @@ theorem every_interrupted_read_can_retry :
         CasFixtures.failed result && !frontier.positions.isEmpty &&
         frontier.fault.isNone && first.2.files == withValue.files && first.2.db == withValue.db &&
         summary (batchRun full frontier 64 withValue).1 == .ok (.ok {}, true, [], [])) = true := by
+  decide +kernel
+
+end Synchronicity.TrieMissingProofs
+
+namespace Synchronicity.TrieMissingProofs
+open VerifiedCore VerifiedCore.Host SimulatedHost
+open VerifiedCore.Trie VerifiedCore.Trie.Missing TrieServeProofs
+
+/-- A locally present small payload cannot establish completeness through a
+legacy addressed holder, even if another snapshot legitimately stored it. -/
+theorem small_legacy_payload_is_rejected :
+    ((batchRun full initialFull 64 graph).1.map Prod.snd) ==
+      .ok (.error (.canonical (.valueLength valueHash payload.size false))) := by
+  decide +kernel
+
+/-- Routing holders may address small payloads without forcing their bytes
+into the routing node disclosed to a reader. -/
+theorem small_route_payload_is_complete :
+    let state : State := { files :=
+      [((nodeSpace, rootHash), encode (.route (slots []) (some valueHash))),
+       ((valueSpace, valueHash), payload)] }
+    summary (batchRun full initialFull 64 state).1 == .ok (.ok {}, true, [], []) := by
+  decide +kernel
+
+/-- Presence alone never certifies an oversized routing payload. -/
+theorem oversized_route_payload_is_rejected :
+    let state : State := { files :=
+      [((nodeSpace, rootHash), encode (.route (slots []) (some valueHash))),
+       ((valueSpace, valueHash), ⟨Array.replicate 32769 0⟩)] }
+    ((batchRun full initialFull 64 state).1.map Prod.snd) ==
+      .ok (.error (.canonical (.valueLength valueHash 32769 true))) := by
   decide +kernel
 
 end Synchronicity.TrieMissingProofs

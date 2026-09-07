@@ -6,6 +6,7 @@ import VerifiedCore.Origin
 import VerifiedCore.Trie.Program
 import VerifiedCore.Trie.Verify
 import VerifiedCore.Trie.Mutate
+import VerifiedCore.Trie.Normalize
 import VerifiedCore.Cas.Durable
 import VerifiedCore.Cas.Serve
 import VerifiedCore.Cas.Receive
@@ -166,6 +167,9 @@ inductive Command where
       (prefixes : Option (List ByteArray)) (exact : List ByteArray) (owner : Option String)
       (reference : Option ByteArray) (maximum retryLimit : UInt64)
 
+  /-- Prepare routing spines for a private scoped publication. -/
+  | trieNormalize (root : ByteArray)
+
 /-- Malformed metadata or a column of the wrong storage class, as pin
 acquisition and deletion report it. -/
 inductive LifecycleDomainError where
@@ -248,6 +252,7 @@ inductive TrieMissingDomainError where
   | valueDepth (depth : Nat)
   | expectedBranch (hash : ByteArray)
   | exhausted
+  | valueLength (hash : ByteArray) (size : Nat) (routing : Bool)
   deriving BEq, DecidableEq
 
 inductive TrieFetchDomainError where

@@ -25,7 +25,9 @@ pub const ALPN_BLOB: &[u8] = b"sync/blob/1";
 /// protocol: reordering one changes the wire. `Hello`'s check is the whole
 /// compatibility story — a peer on another version is refused, not negotiated
 /// with.
-pub const PROTO_VERSION: u16 = 3;
+// Version 4 adds publication routing nodes. Refuse older peers during Hello
+// before they could mistake an unsupported node kind for an invalid origin.
+pub const PROTO_VERSION: u16 = 4;
 
 /// Maximum number of hashes per `GetNodes`/`GetValues` batch (§5.1).
 pub const MAX_BATCH: usize = 256;

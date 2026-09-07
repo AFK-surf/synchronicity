@@ -49,6 +49,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
+synch-verified.workspace = true
 # This crate's own tests need the harness; production builds do not.
 synch-net = { path = ".", features = ["sim"] }
 hex.workspace = true

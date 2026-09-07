@@ -3,9 +3,6 @@
 //! replicated state and nothing else, sees only its spaces, cannot reach
 //! content it was not delegated, and cannot publish outside its list.
 
-#[path = "../../synch-mpt/tests/support/missing_walk.rs"]
-mod missing_oracle;
-
 use synch_core::{
     delegation_key, file_key, now_ns, ChunkRanges, Delegation, FileEntry, Hash, NodeId, SignedHead,
 };
@@ -54,10 +51,7 @@ async fn a_spine_branch_exposes_its_children_but_not_its_own_payload() {
         .unwrap();
     assert!(matches!(
         TrieNode::decode(&issuer.store.get_node(&carrier).unwrap().unwrap()).unwrap(),
-        TrieNode::Branch {
-            value: Some(synch_mpt::ValueRef::Hash(_)),
-            ..
-        }
+        TrieNode::Route { value: Some(_), .. }
     ));
     let hash = Hash::new(&private);
     let client = connect(&delegate, &issuer).await;
@@ -124,31 +118,58 @@ fn walk_all(
     store: &dyn synch_mpt::NodeStore<Error = StoreError>,
     root: Hash,
 ) -> Vec<(Vec<u8>, Hash)> {
-    let empty = synch_mpt::MemStore::new();
-    let mut walk = missing_oracle::MissingWalk::new(root);
+    use synch_verified::suspend::{PeerReply, PeerRequest};
+    let dir = tempfile::tempdir().unwrap();
+    let destination = synch_store::Store::open(dir.path()).unwrap();
+    let origin = synch_core::OriginId::named("fixture", "example.test").unwrap();
     let mut all = Vec::new();
-    loop {
-        let batch = walk.next_batch(&Trie::new(&empty), 512).unwrap();
-        if batch.is_empty() {
-            break;
-        }
-        for (path, hash) in &batch.nodes {
-            all.push((path.clone(), *hash));
-            let bytes = synch_mpt::NodeStore::get_node(store, hash)
-                .unwrap()
-                .unwrap();
-            synch_mpt::NodeStore::put_node(&empty, hash, &bytes).unwrap();
-        }
-        // Out-of-line values too: a node whose values have not arrived is
-        // deferred again, so the walk would never terminate.
-        for (_, hash) in &batch.values {
-            let bytes = synch_mpt::NodeStore::get_value(store, hash)
-                .unwrap()
-                .unwrap();
-            synch_mpt::NodeStore::put_value(&empty, hash, &bytes).unwrap();
-        }
-        walk.resume();
-    }
+    assert!(destination
+        .fetch_trie(
+            root,
+            &origin,
+            1,
+            &synch_mpt::Scope::full(),
+            None,
+            None,
+            256,
+            3,
+            |request| Some(match request {
+                PeerRequest::Nodes { wants, .. } => PeerReply::Nodes {
+                    served: wants
+                        .iter()
+                        .map(|(path, hash)| {
+                            let hash_key = Hash::from_slice(hash).unwrap();
+                            all.push((path.clone(), hash_key));
+                            (
+                                hash.clone(),
+                                synch_mpt::NodeStore::get_node(store, &hash_key)
+                                    .unwrap()
+                                    .unwrap(),
+                            )
+                        })
+                        .collect(),
+                    missing: vec![],
+                    redacted: vec![],
+                },
+                PeerRequest::Values { wants, .. } => PeerReply::Values {
+                    served: wants
+                        .iter()
+                        .map(|(_, hash)| (
+                            hash.clone(),
+                            synch_mpt::NodeStore::get_value(
+                                store,
+                                &Hash::from_slice(hash).unwrap()
+                            )
+                            .unwrap()
+                            .unwrap()
+                        ))
+                        .collect(),
+                    missing: vec![],
+                },
+            })
+        )
+        .unwrap()
+        .unwrap());
     all
 }
 
@@ -585,7 +606,7 @@ async fn a_value_is_refused_by_the_coverage_of_the_node_that_holds_it() {
     // Only the withheld space's manifest is published: with nothing else under
     // `m:` the trie collapses, and the leaf carrying the record sits on the
     // very spine the grant's own `m:` keys run through.
-    issuer.publish(
+    issuer.publish_legacy(
         1,
         &[],
         &[

@@ -608,6 +608,19 @@ theorem preserves_valueRef (bytes : ByteArray) (small : bytes.size < 2 ^ 64) (B 
     exact ⟨shaped_write_value shaped _ _, runs_write_value runs _ _,
       fun _ eq => by cases eq; exact ⟨width _, rfl⟩⟩
 
+theorem preserves_addressValue {value : Value} (ok : ValueOk value) (B : Nat) :
+    Preserves (addressValue value) B B (fun h => h.size = 32) := by
+  cases value with
+  | hash h => exact preserves_pure B ok.1
+  | inline bytes =>
+    intro d width s shaped runs r s' ran
+    simp only [addressValue, run_bind, digest_run, program_bind_request, program_bind_pure,
+      mapError_ok, bindCont_ok, execute_digest, write_run, execute_write, run_pure,
+      execute_pure, Option.some.injEq, Prod.mk.injEq] at ran
+    obtain ⟨rfl, rfl⟩ := ran
+    exact ⟨shaped_write_value shaped _ _, runs_write_value runs _ _,
+      fun _ eq => by cases eq; exact width _⟩
+
 theorem preserves_wrapInExtension {segment : List UInt8} (nib : Nibbles segment)
     {child : ByteArray} (width : child.size = 32) {b₀ b₁ : Nat} (le : b₀ ≤ b₁)
     (within : segment.length ≤ b₁) (small : b₁ < 2 ^ 64) :
@@ -690,6 +703,38 @@ theorem wf_branch {cs : List (Option ByteArray)} {value : Option Value} (ok : Br
     (Node.branch cs value).wf :=
   ⟨ok.1, ok.2.1, fun x eq => (ok.2.2 x eq).1⟩
 
+def RouteOk (cs : List (Option ByteArray)) (value : Option ByteArray) : Prop :=
+  BranchOk cs (value.map Value.hash)
+
+theorem routeOk_of_loaded {cs : List (Option ByteArray)} {value : Option ByteArray}
+    (wf : (Node.route cs value).wf) (inv : checkInvariants (.route cs value) = .ok ()) :
+    RouteOk cs value ∧ 1 ≤ occupants cs (value.map Value.hash) := by
+  refine ⟨⟨wf.1, wf.2.1, ?_⟩, ?_⟩
+  · intro x eq
+    cases value with
+    | none => cases eq
+    | some h =>
+      cases eq
+      exact ⟨wf.2.2 h rfl, rfl⟩
+  · simp only [checkInvariants] at inv
+    split at inv
+    · cases inv
+    · rename_i nonzero
+      simp only [beq_iff_eq] at nonzero
+      omega
+
+theorem wf_route {cs : List (Option ByteArray)} {value : Option ByteArray}
+    (ok : RouteOk cs value) : (Node.route cs value).wf := by
+  refine ⟨ok.1, ok.2.1, ?_⟩
+  intro h eq
+  subst value
+  exact (ok.2.2 (.hash h) rfl).1
+
+theorem checkInvariants_route {cs : List (Option ByteArray)} {value : Option ByteArray}
+    (occupied : 1 ≤ occupants cs (value.map Value.hash)) :
+    checkInvariants (.route cs value) = .ok () := by
+  simp [checkInvariants, show occupants cs (value.map Value.hash) ≠ 0 by omega]
+
 theorem preserves_mergeDown {segment : List UInt8} (nib : Nibbles segment) (nonempty : segment ≠ [])
     {child : ByteArray} (width : child.size = 32) {L B : Nat} (within : segment.length ≤ L)
     (small : L + B < 2 ^ 64) :
@@ -723,6 +768,14 @@ theorem preserves_mergeDown {segment : List UInt8} (nib : Nibbles segment) (none
       simp only [List.size_toArray, len]
       omega
   | branch cs value =>
+    refine preserves_put (n := .extension (nibblesOf segment) child)
+      ⟨nibblesOf_wf nib (by omega), width⟩ ?_ (by omega) ?_
+    · show (if segment.toArray.size == 0 then _ else _) = _
+      simp [nonzero]
+    · show segment.toArray.size ≤ L + B
+      simp only [List.size_toArray]
+      omega
+  | route cs value =>
     refine preserves_put (n := .extension (nibblesOf segment) child)
       ⟨nibblesOf_wf nib (by omega), width⟩ ?_ (by omega) ?_
     · show (if segment.toArray.size == 0 then _ else _) = _
@@ -990,6 +1043,7 @@ read from a canonical node within the run bound. -/
 def FrameOk (B : Nat) : InsertFrame → Prop
   | .extension segment => nibblesWf segment ∧ segment.size ≤ B ∧ segment.size ≠ 0
   | .branch children value _ => BranchOk children value ∧ 2 ≤ occupants children value
+  | .route children value _ => RouteOk children value ∧ 1 ≤ occupants children (value.map Value.hash)
 
 def StackOk (B : Nat) (stack : List InsertFrame) : Prop := ∀ frame ∈ stack, FrameOk B frame
 
@@ -1028,6 +1082,14 @@ theorem preserves_rebuild {B : Nat} :
       unfold rebuild
       refine preserves_bind (preserves_put (wf_branch (branchOk_setChild bok nibble width))
         (checkInvariants_branch (branchOk_setChild bok nibble width)
+          (Nat.le_trans two (occupants_setChild_ge ..)))
+        (Nat.le_refl _) (by show (0 : Nat) ≤ B; exact Nat.zero_le _))
+        (fun h hw => ih h rest hw) (Nat.le_refl _)
+    | route children value nibble =>
+      obtain ⟨bok, two⟩ := fok
+      unfold rebuild
+      refine preserves_bind (preserves_put (wf_route (branchOk_setChild bok nibble width))
+        (checkInvariants_route
           (Nat.le_trans two (occupants_setChild_ge ..)))
         (Nat.le_refl _) (by show (0 : Nat) ≤ B; exact Nat.zero_le _))
         (fun h hw => ih h rest hw) (Nat.le_refl _)
@@ -1092,6 +1154,21 @@ theorem preserves_descend {B : Nat} (small : B < 2 ^ 64) {value : Value} (valOk 
           exact ih (childAt children nibble) rest _ (nibbles_tail nib)
             (by simp only [List.length_cons] at restB; omega)
             (stackOk_cons ⟨bok, two⟩ ok)
+      | route children routeValue =>
+        dsimp only
+        obtain ⟨bok, occupied⟩ := routeOk_of_loaded wf inv
+        cases rest with
+        | nil =>
+          refine preserves_bind (preserves_addressValue valOk B) (fun address width => ?_) (Nat.le_refl _)
+          exact preserves_bind (preserves_put
+            (wf_route (value := some address) (branchOk_value bok (x := .hash address) ⟨width, rfl⟩))
+            (checkInvariants_route (by simp [occupants]))
+            (Nat.le_refl _) (by show (0 : Nat) ≤ B; exact Nat.zero_le _))
+            (fun h hw => preserves_pure B ⟨hw, ok⟩) (Nat.le_refl _)
+        | cons nibble rest =>
+          exact ih (childAt children nibble) rest _ (nibbles_tail nib)
+            (by simp only [List.length_cons] at restB; omega)
+            (stackOk_cons ⟨bok, occupied⟩ ok)
       | leaf suffix old =>
         dsimp only
         obtain ⟨sufWf, oldWf⟩ := wf
@@ -1149,6 +1226,7 @@ def RemoveFrameOk : RemoveFrame → Prop
   | .extension address segment child =>
     Nibbles segment ∧ segment ≠ [] ∧ child.size = 32 ∧ address.size = 32
   | .branch address children value _ _ => BranchOk children value ∧ address.size = 32
+  | .route address children value _ _ => RouteOk children value ∧ address.size = 32
 
 def RStackOk (stack : List RemoveFrame) : Prop := ∀ frame ∈ stack, RemoveFrameOk frame
 
@@ -1170,6 +1248,7 @@ def stackCost : List RemoveFrame → Nat
   | [] => 0
   | .extension _ segment _ :: stack => segment.length + stackCost stack
   | .branch _ _ _ _ _ :: stack => 1 + stackCost stack
+  | .route _ _ _ _ _ :: stack => 1 + stackCost stack
 
 def ResultOk (r : Option ByteArray) : Prop := ∀ h, r = some h → h.size = 32
 
@@ -1184,6 +1263,18 @@ theorem branchOk_setChild_result {cs : List (Option ByteArray)} {value : Option 
   rcases List.mem_or_eq_of_mem_set mem with inner | rfl
   · exact ok.2.1 c inner h eq
   · exact rok h eq
+
+theorem preserves_retainRoute {cs : List (Option ByteArray)} {value : Option ByteArray}
+    (ok : RouteOk cs value) (B : Nat) :
+    Preserves (retainRoute cs value) B (B + 1) ResultOk := by
+  unfold retainRoute
+  refine preserves_ite _
+    (fun _ => preserves_weaken (preserves_pure B resultOk_none) (by omega) fun _ h => h)
+    (fun occupied => ?_)
+  refine preserves_bind (preserves_put (wf_route ok)
+    (checkInvariants_route (by simp only [beq_iff_eq] at occupied; omega))
+    (b₀ := B) (b₁ := B + 1) (by omega) (by exact Nat.zero_le _))
+    (fun h width => preserves_pure _ (resultOk_some width)) (Nat.le_refl _)
 
 theorem preserves_unwind : ∀ (stack : List RemoveFrame) (result : Option ByteArray) (b : Nat),
     RStackOk stack → ResultOk result → b + stackCost stack < 2 ^ 64 →
@@ -1226,6 +1317,17 @@ theorem preserves_unwind : ∀ (stack : List RemoveFrame) (result : Option ByteA
         (fun _ => ?_)
       refine preserves_bind (preserves_collapse (branchOk_setChild_result bok nibble rok)
         (B := b) (by omega))
+        (fun r rok' => preserves_weaken (ih r (b + 1) rest rok' (by omega)) (by omega) fun _ h => h)
+        (by omega)
+    | route address children value nibble child =>
+      obtain ⟨bok, awidth⟩ := fok
+      simp only [stackCost] at small ⊢
+      unfold unwind
+      try dsimp only
+      refine preserves_ite _ (fun _ => preserves_weaken
+        (ih (some address) b rest (resultOk_some awidth) (by omega)) (by omega) fun _ h => h)
+        (fun _ => ?_)
+      refine preserves_bind (preserves_retainRoute (branchOk_setChild_result bok nibble rok) b)
         (fun r rok' => preserves_weaken (ih r (b + 1) rest rok' (by omega)) (by omega) fun _ h => h)
         (by omega)
 
@@ -1302,6 +1404,36 @@ theorem preserves_descendRemove {B : Nat} (small : B + 1 < 2 ^ 64) :
           try dsimp only
           have cwidth := bok.2.1 (some child) (mem_of_childAt probe) child rfl
           refine preserves_weaken (ih child rest (.branch address children value nibble child :: stack)
+            cwidth (nibbles_tail nib) (rstackOk_cons ⟨bok, awidth⟩ ok))
+            (Nat.le_refl _) (fun r ⟨rok, sok, cost⟩ => ⟨rok, sok, ?_⟩)
+          simp only [stackCost, List.length_cons] at cost ⊢
+          omega
+    | route children value =>
+      dsimp only
+      obtain ⟨bok, _⟩ := routeOk_of_loaded wf inv
+      cases rest with
+      | nil =>
+        cases value with
+        | none =>
+          try dsimp only
+          exact preserves_weaken (preserves_pure B ⟨resultOk_some awidth, ok, Nat.le_add_right _ _⟩)
+            (by omega) fun _ h => h
+        | some x =>
+          try dsimp only
+          have bok' : BranchOk children none := ⟨bok.1, bok.2.1, fun _ h => by cases h⟩
+          exact preserves_bind (preserves_retainRoute (value := none) bok' B)
+            (fun r rok => preserves_pure _ ⟨rok, ok, Nat.le_add_right _ _⟩) (Nat.le_refl _)
+      | cons nibble rest =>
+        dsimp only
+        cases probe : childAt children nibble with
+        | none =>
+          try dsimp only
+          exact preserves_weaken (preserves_pure B ⟨resultOk_some awidth, ok, Nat.le_add_right _ _⟩)
+            (by omega) fun _ h => h
+        | some child =>
+          try dsimp only
+          have cwidth := bok.2.1 (some child) (mem_of_childAt probe) child rfl
+          refine preserves_weaken (ih child rest (.route address children value nibble child :: stack)
             cwidth (nibbles_tail nib) (rstackOk_cons ⟨bok, awidth⟩ ok))
             (Nat.le_refl _) (fun r ⟨rok, sok, cost⟩ => ⟨rok, sok, ?_⟩)
           simp only [stackCost, List.length_cons] at cost ⊢

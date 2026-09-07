@@ -177,19 +177,20 @@ theorem verify_admitted (d : ByteArray → ByteArray) (fuel : Nat) {expected byt
 requested hash under some kind's tag, and the peer's otherwise. -/
 theorem verify_refused (d : ByteArray → ByteArray) (fuel : Nat) {expected bytes : ByteArray}
     {refusal : Refusal} (h : admit bytes = .error refusal) :
-    executeDigest d (fuel + 3) (verify expected bytes).run =
+    executeDigest d (fuel + 4) (verify expected bytes).run =
       some (.ok (if tags.any (fun tag => d (tag ++ bytes) == expected)
         then .originFault refusal else .peerFault)) := by
   simp only [verify, h, tags, List.any_cons, List.any_nil, Bool.or_false]
   cases leaf : (d (leafTag ++ bytes) == expected) <;>
     cases ext : (d (extensionTag ++ bytes) == expected) <;>
     cases branch : (d (branchTag ++ bytes) == expected) <;>
-    simp [hashesToAny, leaf, ext, branch]
+    cases route : (d (routeTag ++ bytes) == expected) <;>
+    simp [hashesToAny, leaf, ext, branch, route]
 
 /-- Acceptance names a digest equality: the host said the tagged bytes hash
 to the requested address. -/
 theorem accepted_hashes (d : ByteArray → ByteArray) {expected bytes : ByteArray}
-    (h : executeDigest d 3 (verify expected bytes).run = some (.ok .accepted)) :
+    (h : executeDigest d 4 (verify expected bytes).run = some (.ok .accepted)) :
     ∃ n, admit bytes = .ok n ∧ d (tagOf n ++ bytes) = expected := by
   cases admitted : admit bytes with
   | error refusal =>
@@ -197,7 +198,7 @@ theorem accepted_hashes (d : ByteArray → ByteArray) {expected bytes : ByteArra
     split at h <;> cases h
   | ok n =>
     refine ⟨n, rfl, ?_⟩
-    rw [verify_admitted d 2 admitted] at h
+    rw [verify_admitted d 3 admitted] at h
     split at h
     · exact (byteArray_beq_iff _ _).mp (by assumption)
     · cases h
@@ -205,11 +206,11 @@ theorem accepted_hashes (d : ByteArray → ByteArray) {expected bytes : ByteArra
 /-- An origin fault is never pronounced on bytes that hash to nothing wanted. -/
 theorem origin_fault_hashes (d : ByteArray → ByteArray) {expected bytes : ByteArray}
     {refusal : Refusal}
-    (h : executeDigest d 3 (verify expected bytes).run = some (.ok (.originFault refusal))) :
+    (h : executeDigest d 4 (verify expected bytes).run = some (.ok (.originFault refusal))) :
     admit bytes = .error refusal ∧ ∃ tag ∈ tags, d (tag ++ bytes) = expected := by
   cases admitted : admit bytes with
   | ok n =>
-    rw [verify_admitted d 2 admitted] at h
+    rw [verify_admitted d 3 admitted] at h
     split at h <;> cases h
   | error r =>
     rw [verify_refused d 0 admitted] at h

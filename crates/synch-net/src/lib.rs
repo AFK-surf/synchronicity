@@ -43,7 +43,3 @@ pub use error::{NetError, Result};
 pub use mpt::{HeadSink, MptClient};
 pub use rekor::{ProofError, RekorProof};
 pub use tuf::{PinState, TufError, TufMetadata};
-
-#[cfg(test)]
-#[path = "../../synch-mpt/tests/support/missing_walk.rs"]
-mod missing_oracle;

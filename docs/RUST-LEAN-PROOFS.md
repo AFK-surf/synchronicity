@@ -117,39 +117,42 @@ scoped-sync behavior or closure of eventual consistency. Legitimate private
 omissions still need authenticated proof or a representation/protocol change;
 do not weaken the existing successful-sharing requirements to hide this gap.
 
-### Representation work required for private omissions
+### Routing publications and older signed versions
 
-The implementation path to evaluate is an explicit routing node above every
-possible authorization boundary, retaining compression inside a fully shared
-subtree. A routing node discloses one edge at a time; a missing edge can then
-establish that the granted path is absent without transmitting an unrelated
-private suffix. Values on a routing spine must be separate addressed payloads,
-so a private exact key does not prevent revealing its shared descendants.
-This is planned representation work, not a property of the current format.
+The new publication form uses explicit routing nodes above authorization
+boundaries, retaining compression inside a shared subtree. A routing node
+reveals one level of child commitments and has only an optional addressed
+payload. Unary and terminal routing nodes are valid: a private exact key can
+therefore prove that it has no granted descendants without revealing its value.
+An absent child provides authenticated nonmembership; an unprovided child does
+not. Small out-of-line payloads are valid for routing nodes. The requesting
+walk checks held value sizes too, so storing a small routing payload under an
+address cannot legitimize a malformed legacy reference to the same address.
 
-Derive routing boundaries from the metadata schema and all possible scopes,
-not the grants currently installed on one device. Cover `f:<space>/`, exact
-`r:<space>` and `m:space/<space>`, `m:self`, and the public delegation namespace.
-The new form must preserve the independently defined entries. Only the routing
-spines need expansion; per-file paths within a shared space retain compression.
-Measure the storage, publication and fetch cost on the existing large corpus.
+`Trie.Normalize.publication` executes normalization with an explicit work stack.
+Its boundary rule depends on the metadata schema, not currently installed
+grants. It preserves compressed `d:` and `b:` subtrees and file subtrees below
+`f:<space>/`; exact-key and otherwise unresolved spines remain routed. The Rust
+publisher calls this command in its publication transaction before signing and
+final materialization. Native tests cover exact entries, old-root preservation,
+idempotence, route edits, empty roots and the deepest supported exact key. The
+previously failing empty permitted-view integration fixture now passes with
+routing publications and unchanged privacy/progress assertions. These tests do
+not replace the required normalization, serving/completion and promotion proofs.
 
-Implement and check these dependencies together:
+Protocol version **4** requires peers to understand the new node form. Upgrade
+communicating peers together; the Hello version check rejects an older peer
+before unsupported node bytes could be misclassified as an invalid publisher.
+Old signed roots and their bytes remain readable; relays cannot alter them.
+A legacy restricted view that lacks authentic absence evidence stays incomplete.
 
-1. Specify the new canonical node form, address domains and format negotiation.
-   Extend codecs, verification, traversal, serving, mutation and collection;
-   permit verified small out-of-line values where the new form requires them.
-2. Normalize real publications and prove exact entry preservation. Generic
-   mutation may compress a spine, so publication must establish the routing
-   invariant before signing and atomically retain the resulting graph.
-3. Connect permitted-path traversal to actual served bytes, authenticated
-   nonmembership and exact completion. Preserve both the empty permitted-view
-   fixture and the private-value-above-shared-descendant case.
-4. Upgrade actual publishers to republish preserved logical entries under a
-   later signed version. Relays cannot change a legacy signed root. Keep
-   legacy full reads and explicit incomplete restricted views honest; prove
-   convergence through the implemented upgrade/publication path rather than
-   silently assuming away accepted older roots.
+The publisher upgrade path uses the ordinary publication transaction and
+sequence/recovery checks to republish preserved entries under a later signature,
+without waiting for a file edit. Anti-entropy retries a deferred upgrade while
+continuing unrelated syncing. The convergence proof must include that actual
+path; it may not silently assume away accepted older roots. Remaining acceptance
+work is exact normalization semantics, routing coverage for every supported
+scope, atomic retention/publication, the formal upgrade/recovery composition, and cost measurements on the existing large corpus.
 
 A signed refusal alone does not prove consistency with the signed snapshot.
 Plain hashes of space names are also insufficient to hide guessable private
@@ -370,6 +373,14 @@ retain Rust orchestration that repeatedly calls fine-grained Lean policy helpers
 A separate model with a matching Rust comment or source anchor is not verification
 of that implementation.
 
+Delete displaced Rust implementations, including algorithms retained only as
+test oracles. Preserve meaningful regression and cost coverage by exercising
+the actual native Lean command with controlled raw storage, transport and
+failure inputs. A second policy algorithm is not a host service. Cryptographic
+and Bao primitives, provider SDKs, serialization schemas and historical data
+migrations remain Rust where they implement the stated trust boundary rather
+than duplicate a migrated domain operation.
+
 ```text
 CLI / RPC / scanner event
           |
@@ -474,7 +485,7 @@ completed cutover from being mistaken for a completed user guarantee.
 | --- | --- | --- |
 | Foundation F1/F2 | Lean carrier, raw capabilities, native runtime and peer suspension integrated | Shared host, wire, cleanup and suspension lemmas/tests exist. Provider suspension still needs C4 integration; verify discipline for each real suspending program. |
 | Trie T1/T2: ingress and mutation | Production Lean (`Codec`, `Verify`, `Mutate`) | Canonical encoding/address preservation proved. Exact update/remove map meaning and whole-path depth remain open (P2). |
-| Trie T3: requesting fetch | Production Lean `Fetch`, with a pinned Rust worker interpreting peer waits | Inspection, verified response admission, provenance writes, bounded retries and pending-target updates moved into the whole suspended operation. Four real-store tests cover admission, atomic rejection, cancellation and released database access across waits. Remove the remaining exported Rust test oracle and prove the actual operation against faithful shared byte storage; exhaustion still does not establish P3. |
+| Trie T3: requesting fetch | Production Lean `Fetch`, with a pinned Rust worker interpreting peer waits | Inspection, verified response admission, provenance writes, bounded retries and pending-target updates moved into the whole suspended operation. Five store unit tests and five transfer integration tests cover verified progress, invalidation, atomic rejection, cancellation, released database access and transfer cost. The duplicate Rust requesting/resolution oracles are deleted. Prove the actual operation against faithful shared byte storage; exhaustion still does not establish P3. |
 | Trie T4: completeness | Production Lean `Complete` and scope/owner memo key | Ticket/key discipline and native regressions checked. Justified omission and exact-view coverage are open, including the root-refusal issue above. |
 | Trie T5: serving | Production Lean `Serve`; authorization inputs still composed in Rust | Actual-position resolution and whole-response scope predicates proved. Connect grants, publisher authority, provenance and transmitted bytes for P4/M5. |
 | Trie T6: scan/diff | Production Lean `Walk`/`Diff`, streaming host application | Prefix/cursor/limit constraints and fixtures exist. Exact listings/differences and atomic faithful materialization remain open (P2/P3/M4). |
@@ -490,8 +501,8 @@ completed cutover from being mistaken for a completed user guarantee.
 
 The operator-only CAS migration tool, staging-directory layout sweep and provider
 SDK remain Rust. They are not alternate implementations of migrated domain policy.
-Performance evidence includes the 120,000-entry completeness corpus: both paths
-read 160,533 nodes; one local debug run measured 0.668 s Rust and 0.733 s Lean.
+Historical performance evidence includes the 120,000-entry completeness corpus:
+the Lean command and the now-deleted Rust walk each read 160,533 nodes; one local debug run measured 0.668 s Rust and 0.733 s Lean.
 These are measurements, not a portability theorem or substitute for CI.
 
 ### Latest mptsync checkpoint
@@ -529,12 +540,13 @@ the target origin, sequence and root, so a stale attempt does not target a newer
 pending version. These are implementation facts and native regression coverage;
 whole-operation transaction, interruption and convergence theorems remain open.
 
-The integration checkpoint passed four real-store fetch tests, seven native
-completeness tests (one stress test ignored), and 179 engine unit tests. The engine
-integration run stopped at `a_compressed_node_spanning_out_of_scope_is_a_boundary_not_an_absence`:
-a delegate granted `photos` must finish an empty permitted view when the publisher
-only has a private `finance/q3.pdf`, without learning that private name. Preserve
-this expectation. The current refusal correction alone cannot satisfy it.
+Routing validation passed the three native publication tests, the automatic
+legacy-republication regression, and all eight delegation integration tests.
+The empty permitted-view test and the private-ancestor-payload test retain their
+behavioral assertions. A separate legacy compressed fixture still checks that
+an admitted position cannot disclose an ungranted payload. The requesting and
+representation proof modules passed focused warning-free builds; aggregate,
+standalone kernel and broader platform checks remain required for this change.
 
 ### Newly checked snapshot and content composition
 
@@ -556,6 +568,15 @@ restriction. It is a composition lemma, not yet the user theorem that any sequen
 of valid partial receives preserves all readable content. In particular, the
 trusted decoder must preserve previously verified bytes even if it writes part
 of an answer and then fails; a successful-verification flag alone is insufficient.
+
+`CasReceiveHistoryProofs.further_transfer_preserves_readable_content` now connects
+all receive outcomes for unchanged-size file-backed content to exact subsequent
+reads: productive receives, decoder interruptions, already-complete duplicates
+and empty windows preserve previously available ranges. A successful receive
+also establishes the next stored-content invariant from its actual rows and
+file bytes. This uses the explicit primitive byte-preservation contract, not a
+premise that the later read succeeds. Iterated-history equivalence, inline
+content and other injected host-failure paths remain open.
 
 ## Path to all proof goals
 

@@ -37,6 +37,7 @@ def nibbleRun : Node → Nat
   | .leaf suffix _ => suffix.size
   | .extension segment _ => segment.size
   | .branch _ _ => 0
+  | .route _ _ => 0
 
 def checkValue : Value → Except Refusal Unit
   | .inline bytes =>
@@ -60,6 +61,9 @@ def checkInvariants : Node → Except Refusal Unit
     | some v => checkValue v
     | none => pure ()
     if occupants cs v < 2 then throw (.nonCanonical "a branch has fewer than two occupants")
+  | .route cs v =>
+    if occupants cs (v.map Value.hash) == 0 then
+      .error (.nonCanonical "a routing node has no occupants") else .ok ()
 
 /-- Everything the boundary checks before hashing: canonical image, the key
 bound `get` and the walks share, and the invariants. -/
@@ -72,14 +76,16 @@ def admit (bytes : ByteArray) : Except Refusal Node := do
 def leafTag : ByteArray := "synch-mpt/1/leaf".toUTF8
 def extensionTag : ByteArray := "synch-mpt/1/ext".toUTF8
 def branchTag : ByteArray := "synch-mpt/1/branch".toUTF8
+def routeTag : ByteArray := "synch-mpt/2/route".toUTF8
 
 /-- Domain separation: `BLAKE3(tag ‖ canonical encoding)` per node kind. -/
 def tagOf : Node → ByteArray
   | .leaf _ _ => leafTag
   | .extension _ _ => extensionTag
   | .branch _ _ => branchTag
+  | .route _ _ => routeTag
 
-def tags : List ByteArray := [leafTag, extensionTag, branchTag]
+def tags : List ByteArray := [leafTag, extensionTag, branchTag, routeTag]
 
 abbrev Effects := EffectSum Storage Digest
 abbrev Action (A : Type) := OperationOver Effects Failure A

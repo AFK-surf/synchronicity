@@ -60,6 +60,13 @@ def lookup : Nat → Option ByteArray → List UInt8 → Operation LookupResult
           | none => return .ok none
           | some value => resolveValue value
         | nibble :: rest => lookup fuel ((children[nibble.toNat]?).getD none) rest
+      | .ok (.route children value) =>
+        match rest with
+        | [] =>
+          match value with
+          | none => return .ok none
+          | some address => resolveValue (.hash address)
+        | nibble :: rest => lookup fuel ((children[nibble.toNat]?).getD none) rest
 
 /-- Lookup the caller's byte key in a root. The zero root is the empty trie,
 but zero-valued child hashes are ordinary stored addresses, as before.

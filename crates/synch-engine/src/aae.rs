@@ -180,6 +180,14 @@ impl Node {
     /// only receives our state does not end the fallback; the round stops when
     /// an exchange advances local state or the sample is exhausted.
     pub async fn anti_entropy_round(&self) -> Result<RoundReport> {
+        // An upgraded publisher must not wait for a file edit to replace an
+        // old compressed root that cannot prove private scoped omissions.
+        // Failure is retried next round and does not stall unrelated syncing.
+        let publisher = self.clone();
+        if let Err(error) = crate::blocking::offload(move || publisher.upgrade_publication()).await
+        {
+            tracing::debug!(%error, "publication format upgrade deferred");
+        }
         let mut peers = self.dialable_peers_off_runtime().await?;
         if peers.is_empty() {
             return Ok(RoundReport::default());

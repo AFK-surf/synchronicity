@@ -135,6 +135,18 @@ theorem node_roundtrip {n : Node} (wf : n.wf) (rest : List UInt8) :
     | some v =>
       have := value_roundtrip (val v rfl) rest
       simp [kids, optional_some, this]
+  | route cs v =>
+    obtain ⟨len, widths, val⟩ := wf
+    simp only [encodeNode, List.cons_append, List.append_assoc]
+    rw [show (3 : UInt8) = (3 : Nat).toUInt8 from rfl, parseNode, tag_small (by omega)]
+    simp only [bind_ok]
+    have kids := children_roundtrip cs widths
+    rw [len] at kids
+    cases v with
+    | none => simp [kids, optional_none]
+    | some address =>
+      have := address_roundtrip (val address rfl) rest
+      simp [kids, optional_some, this]
 
 /-- The decoder reads back exactly what the encoder wrote, for every
 well-formed node. -/

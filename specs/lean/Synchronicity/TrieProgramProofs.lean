@@ -70,6 +70,15 @@ theorem lookup_read_bound (fuel : Nat) (address : Option ByteArray) (key : List 
                 | some v =>
                   simpa [Nat.add_comm, ExceptT.run] using read_bound_mono (k := fuel) (resolve_read_bound v)
               | cons nibble rest => exact ih _ _
+            | route children value =>
+              cases key with
+              | nil =>
+                cases value with
+                | none => exact .done _
+                | some address =>
+                  simpa [Nat.add_comm, ExceptT.run] using
+                    read_bound_mono (k := fuel) (resolve_read_bound (.hash address))
+              | cons nibble rest => exact ih _ _
 
 /-- A caller cannot cause writes, transactions or unrelated namespace reads;
 even hostile stored nodes admit at most 8194 primitive reads. -/
@@ -166,6 +175,19 @@ inductive GraphValue (store : RawSnapshot) : ByteArray → List UInt8 → ByteAr
       (tail : List UInt8) (bytes : ByteArray)
       (held : store nodeSpace address = some raw)
       (decoded : decode raw = .ok (.branch children value))
+      (edge : children[nibble.toNat]? = some (some child))
+      (below : GraphValue store child tail bytes) :
+      GraphValue store address (nibble :: tail) bytes
+  | routeValue (address raw : ByteArray) (children : List (Option ByteArray))
+      (value bytes : ByteArray)
+      (held : store nodeSpace address = some raw)
+      (decoded : decode raw = .ok (.route children (some value)))
+      (denotes : ValueDenotes store (.hash value) bytes) : GraphValue store address [] bytes
+  | routeChild (address raw : ByteArray) (children : List (Option ByteArray))
+      (value : Option ByteArray) (nibble : UInt8) (child : ByteArray)
+      (tail : List UInt8) (bytes : ByteArray)
+      (held : store nodeSpace address = some raw)
+      (decoded : decode raw = .ok (.route children value))
       (edge : children[nibble.toNat]? = some (some child))
       (below : GraphValue store child tail bytes) :
       GraphValue store address (nibble :: tail) bytes
@@ -286,6 +308,25 @@ theorem lookup_semantic_sound (store : RawSnapshot) (fuel budget : Nat)
                   | none => simp [h] at selected
                   | some entry => simpa [h] using selected
                 exact .branchChild _ _ _ _ _ _ _ _ held decoded edge below
+            | route children value =>
+              simp only [decoded] at returned
+              cases key with
+              | nil =>
+                cases value with
+                | none =>
+                  change executeReads store budget (.pure (.ok (.ok none) : Reply LookupResult)) = _ at returned
+                  simp at returned
+                | some value =>
+                  exact .routeValue _ _ _ _ _ held decoded
+                    (resolve_semantic_sound store budget (.hash value) bytes returned)
+              | cons nibble rest =>
+                obtain ⟨child, selected, below⟩ :=
+                  ih budget ((children[nibble.toNat]?).getD none) rest returned
+                have edge : children[nibble.toNat]? = some (some child) := by
+                  cases h : children[nibble.toNat]? with
+                  | none => simp [h] at selected
+                  | some entry => simpa [h] using selected
+                exact .routeChild _ _ _ _ _ _ _ _ held decoded edge below
 
 /-- Successful execution of the exported domain operation witnesses an
 actual root-to-key path and that path's own payload, not merely a successful
@@ -379,6 +420,31 @@ theorem lookup_semantic_complete (path : GraphValue store root key bytes)
         have positive : 0 < segment.toList.length := List.length_pos_iff.mpr nonempty
         exact ih fuel budget (by simp only [List.length_append] at enough; omega) (by omega)
   | branchChild address raw children value nibble child tail bytes held decoded edge below ih =>
+    cases fuel with
+    | zero => omega
+    | succ fuel =>
+      cases budget with
+      | zero => omega
+      | succ budget =>
+        change executeReads store (budget + 1) (.request (.readBytes nodeSpace address) _) = _
+        rw [executeReads]
+        dsimp only [Program.bind, ExceptT.bindCont]
+        simp only [held, decoded]
+        rw [edge]
+        exact ih fuel budget (by simp only [List.length_cons] at enough; omega) (by omega)
+  | routeValue address raw children value bytes held decoded denotes =>
+    cases fuel with
+    | zero => omega
+    | succ fuel =>
+      cases budget with
+      | zero => omega
+      | succ budget =>
+        change executeReads store (budget + 1) (.request (.readBytes nodeSpace address) _) = _
+        rw [executeReads]
+        dsimp only [Program.bind, ExceptT.bindCont]
+        simp only [held, decoded]
+        exact resolve_semantic_complete denotes budget (by omega)
+  | routeChild address raw children value nibble child tail bytes held decoded edge below ih =>
     cases fuel with
     | zero => omega
     | succ fuel =>

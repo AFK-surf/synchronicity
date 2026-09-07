@@ -1,7 +1,9 @@
 //! Trie nodes, their canonical encoding, and their domain-separated hashing (§4.3).
 
 use serde::{Deserialize, Serialize};
-use synch_core::{Hash, INLINE_VALUE_MAX};
+use synch_core::Hash;
+#[cfg(test)]
+use synch_core::INLINE_VALUE_MAX;
 
 use crate::{error::MptError, nibbles::Nibbles};
 
@@ -11,28 +13,19 @@ pub(crate) const LEAF_TAG: &[u8] = b"synch-mpt/1/leaf";
 pub(crate) const EXT_TAG: &[u8] = b"synch-mpt/1/ext";
 /// Domain-separation tag for [`TrieNode::Branch`] hashing.
 pub(crate) const BRANCH_TAG: &[u8] = b"synch-mpt/1/branch";
+/// Domain-separation tag for private-scope routing nodes.
+pub(crate) const ROUTE_TAG: &[u8] = b"synch-mpt/2/route";
 
 /// How a leaf's value is carried.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum ValueRef {
-    /// A value of at most [`INLINE_VALUE_MAX`] bytes, embedded in the node.
+    /// A value of at most [`synch_core::INLINE_VALUE_MAX`] bytes, embedded in the node.
     Inline(Vec<u8>),
     /// A larger value, stored out-of-line and addressed by its BLAKE3 hash.
     Hash(Hash),
 }
 
 impl ValueRef {
-    /// Chooses the representation for `value`, returning the out-of-line
-    /// payload that must be stored alongside it, if any.
-    pub fn for_value(value: &[u8]) -> (ValueRef, Option<(Hash, Vec<u8>)>) {
-        if value.len() <= INLINE_VALUE_MAX {
-            (ValueRef::Inline(value.to_vec()), None)
-        } else {
-            let hash = Hash::new(value);
-            (ValueRef::Hash(hash), Some((hash, value.to_vec())))
-        }
-    }
-
     /// The out-of-line value hash, if this reference is not inline.
     pub(crate) fn out_of_line(&self) -> Option<Hash> {
         match self {
@@ -77,6 +70,17 @@ pub enum TrieNode {
         /// The value of the key ending exactly at this node, if any.
         value: Option<ValueRef>,
     },
+    /// A publication routing node. Child choices can be disclosed without
+    /// disclosing any payload or a compressed private key suffix.
+    ///
+    /// Unlike a compressed branch, one occupant is valid, including a sole
+    /// addressed value that proves there are no descendant keys.
+    Route {
+        /// Child hashes by nibble.
+        children: [Option<Hash>; 16],
+        /// Address of the value ending here; even small payloads stay separate.
+        value: Option<Hash>,
+    },
 }
 
 impl TrieNode {
@@ -96,6 +100,7 @@ impl TrieNode {
             TrieNode::Leaf { .. } => LEAF_TAG,
             TrieNode::Ext { .. } => EXT_TAG,
             TrieNode::Branch { .. } => BRANCH_TAG,
+            TrieNode::Route { .. } => ROUTE_TAG,
         }
     }
 
@@ -113,7 +118,7 @@ impl TrieNode {
     /// [`MAX_KEY_LEN`](synch_core::MAX_KEY_LEN) (the per-node half of the depth
     /// bound; Lean `Trie.Missing.nextBatch` bounds the *path*), and satisfy the
     /// structural invariants the node kinds document: a non-empty extension
-    /// prefix, inline values within [`INLINE_VALUE_MAX`], at least two
+    /// prefix, inline values within [`synch_core::INLINE_VALUE_MAX`], at least two
     /// occupants of a branch. Two halves need more than one node and are
     /// checked where the structure is walked and where values arrive: an
     /// extension above a non-branch (Lean `Trie.Missing.nextBatch`), and
@@ -158,13 +163,16 @@ impl TrieNode {
         match self {
             TrieNode::Leaf { .. } => Vec::new(),
             TrieNode::Ext { child, .. } => vec![*child],
-            TrieNode::Branch { children, .. } => children.iter().flatten().copied().collect(),
+            TrieNode::Branch { children, .. } | TrieNode::Route { children, .. } => {
+                children.iter().flatten().copied().collect()
+            }
         }
     }
 
     /// The hashes of any out-of-line values this node references.
     pub fn value_hashes(&self) -> Vec<Hash> {
         match self {
+            TrieNode::Route { value, .. } => value.iter().copied().collect(),
             TrieNode::Leaf { value, .. } => value.out_of_line().into_iter().collect(),
             TrieNode::Ext { .. } => Vec::new(),
             TrieNode::Branch { value, .. } => value
@@ -217,20 +225,25 @@ mod tests {
     use super::*;
 
     #[test]
-    fn value_ref_inlines_small_values() {
-        // Exactly at the boundary stays inline; one byte past it goes out of
-        // line — the split decides node hashing and wire shape.
+    fn insertion_stores_only_values_above_the_inline_boundary_separately() {
+        use crate::{MemStore, NodeStore, Trie};
+        let store = MemStore::default();
+        let trie = Trie::new(&store);
         let edge = vec![7u8; INLINE_VALUE_MAX];
-        let (r, extra) = ValueRef::for_value(&edge);
-        assert!(matches!(r, ValueRef::Inline(_)));
-        assert!(extra.is_none());
+        let small = trie.insert(Hash::EMPTY, b"key", &edge).unwrap();
+        let node = TrieNode::decode(&store.get_node(&small).unwrap().unwrap()).unwrap();
+        assert!(
+            matches!(node, TrieNode::Leaf { value: ValueRef::Inline(bytes), .. } if bytes == edge)
+        );
+        assert!(store.get_value(&Hash::new(&edge)).unwrap().is_none());
 
         let big = vec![7u8; INLINE_VALUE_MAX + 1];
-        let (r, extra) = ValueRef::for_value(&big);
-        let (h, payload) = extra.unwrap();
-        assert_eq!(r, ValueRef::Hash(h));
-        assert_eq!(h, Hash::new(&big));
-        assert_eq!(payload, big);
+        let large = trie.insert(Hash::EMPTY, b"key", &big).unwrap();
+        let node = TrieNode::decode(&store.get_node(&large).unwrap().unwrap()).unwrap();
+        assert!(
+            matches!(node, TrieNode::Leaf { value: ValueRef::Hash(hash), .. } if hash == Hash::new(&big))
+        );
+        assert_eq!(store.get_value(&Hash::new(&big)).unwrap(), Some(big));
     }
 
     #[test]

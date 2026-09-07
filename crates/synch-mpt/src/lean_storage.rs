@@ -125,6 +125,14 @@ pub(crate) fn complete<S: NodeStore + ?Sized>(
             )),
             Err(_) => protocol_error(),
         },
+        CompleteError::Domain(Domain::ValueLength {
+            hash,
+            size,
+            routing,
+        }) => MptError::NonCanonical(format!(
+            "addressed value {hash:?} has invalid length {size} for a {} holder",
+            if routing { "routing" } else { "legacy" },
+        )),
         CompleteError::Domain(Domain::Exhausted) => {
             MptError::NonCanonical("the completeness walk outran its work budget".into())
         }

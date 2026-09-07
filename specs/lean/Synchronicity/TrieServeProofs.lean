@@ -70,11 +70,27 @@ theorem admitsPath_of_containsSubtree (scope : Scope) (path : Path)
     obtain ⟨g, mem, h⟩ := inside
     exact .inl ⟨g, mem, .inr h⟩
 
+/-- Granting a value also grants the route needed to authenticate its position. -/
+theorem admitsPath_of_admitsKeyPath (scope : Scope) (path : Path)
+    (allowed : scope.admitsKeyPath path = true) : scope.admitsPath path = true := by
+  simp only [Scope.admitsKeyPath, Bool.or_eq_true, List.any_eq_true] at allowed
+  rcases allowed with inside | ⟨key, member, same⟩
+  · exact admitsPath_of_containsSubtree scope path inside
+  · have same' : key.toList = path := by simpa using same
+    subst path
+    unfold Scope.admitsPath
+    cases scope.prefixes with
+    | none => rfl
+    | some prefixes =>
+      simp only [Bool.or_eq_true]
+      exact .inr (List.any_eq_true.mpr ⟨key, member, by simp⟩)
+
 /-- Inside a grant no node is redacted: whatever a node spells below a
 position the grant contains, it spells inside the grant. -/
 theorem no_redaction_inside_grant (scope : Scope) (path : Path) (node : Node)
     (inside : scope.containsSubtree path = true) : scope.admitsNode path node = true := by
   cases node with
+  | route _ _ => exact admitsPath_of_containsSubtree scope path inside
   | branch children value =>
     cases value with
     | none => simp [Scope.admitsNode]
@@ -93,6 +109,7 @@ two handlers draw one boundary. -/
 theorem admitsNode_of_admitsValue (scope : Scope) (path : Path) (node : Node)
     (value : scope.admitsValue path node = true) : scope.admitsNode path node = true := by
   cases node with
+  | route _ _ => exact admitsPath_of_admitsKeyPath scope path value
   | branch children v =>
     cases v with
     | none => simp [Scope.admitsNode]
@@ -112,6 +129,17 @@ theorem exact_key_admits_itself (scope : Scope) (key : ByteArray) (granted : key
     scope.admitsKeyPath key.toList = true := by
   simp only [Scope.admitsKeyPath, Bool.or_eq_true, List.any_eq_true]
   exact .inr ⟨key, granted, beq_self_eq_true _⟩
+
+/-- A granted descendant remains authenticatable even when a shorter key is
+private: its routing ancestor can travel, while that ancestor's payload cannot. -/
+theorem granted_descendant_keeps_private_ancestor_private (scope : Scope) (path rest : Path)
+    (children : List (Option ByteArray)) (payload : Option ByteArray)
+    (granted : scope.admitsKeyPath (path ++ rest) = true)
+    (privateKey : scope.admitsKeyPath path = false) :
+    scope.admitsNode path (.route children payload) = true ∧
+      scope.admitsValue path (.route children payload) = false := by
+  exact ⟨admitsPath_of_append scope path rest
+    (admitsPath_of_admitsKeyPath scope (path ++ rest) granted), privateKey⟩
 
 /-! ## The descent
 
@@ -138,6 +166,12 @@ inductive Reaches (lookup : ByteArray → Option ByteArray) : ByteArray → Path
       (edge : children[nibble.toNat]? = some (some child))
       (below : Reaches lookup child rest found) :
       Reaches lookup hash (nibble :: rest) found
+  | route (hash raw child found : ByteArray) (children : List (Option ByteArray))
+      (value : Option ByteArray) (nibble : UInt8) (rest : Path)
+      (held : lookup hash = some raw) (decoded : decode raw = .ok (.route children value))
+      (edge : children[nibble.toNat]? = some (some child))
+      (below : Reaches lookup child rest found) :
+      Reaches lookup hash (nibble :: rest) found
 
 theorem Reaches.trans {lookup : ByteArray → Option ByteArray} {hash middle found : ByteArray}
     {path rest : Path} (above : Reaches lookup hash path middle)
@@ -149,6 +183,8 @@ theorem Reaches.trans {lookup : ByteArray → Option ByteArray} {hash middle fou
     exact .extension hash raw segment child found (tail ++ rest) held decoded nonempty (ih below)
   | branch hash raw child middle children value nibble tail held decoded edge _ ih =>
     exact .branch hash raw child found children value nibble (tail ++ rest) held decoded edge (ih below)
+  | route hash raw child middle children value nibble tail held decoded edge _ ih =>
+    exact .route hash raw child found children value nibble (tail ++ rest) held decoded edge (ih below)
 
 @[simp] theorem nodesOf_record (state : State) (event : String) :
     nodesOf (record state event) = nodesOf state := rfl
@@ -244,6 +280,20 @@ theorem descend_sound (fuel : Nat) : ∀ (consumed : Nat) (current : Option Byte
                     ih _ _ _ _ { record state ("bytes:" ++ nodeSpace) with faults := [] } _ _ rfl ran
                   cases same
                   exact .branch hash raw child found children value nibble below held decoded
+                    (getD_none_eq_some edge) reached
+            | route children value =>
+              simp only at ran
+              split at ran
+              · simp [execute, ExceptT.mk, pure, ExceptT.pure] at ran
+              · rename_i inRange
+                cases edge : (children[nibble.toNat]?).getD none with
+                | none => simp [edge, execute, ExceptT.mk, pure, ExceptT.pure] at ran
+                | some child =>
+                  simp only [edge] at ran
+                  obtain ⟨start, same, reached⟩ :=
+                    ih _ _ _ _ { record state ("bytes:" ++ nodeSpace) with faults := [] } _ _ rfl ran
+                  cases same
+                  exact .route hash raw child found children value nibble below held decoded
                     (getD_none_eq_some edge) reached
 
 /-! ## The trail
@@ -404,6 +454,41 @@ theorem descend_trail (fuel : Nat) : ∀ (consumed : Nat) (current : Option Byte
                     have split : step.1 - consumed = (step.1 - (consumed + 1)) + 1 := by omega
                     rw [split, List.take_succ_cons]
                     exact Reaches.branch hash raw child step.2 children value nibble _ held decoded
+                      (getD_none_eq_some edge) reached
+            | route children value =>
+              simp only
+              split
+              · simp only [execute, ExceptT.mk, pure, ExceptT.pure]
+                refine ⟨by trivial, by trivial, ?_⟩
+                intro found trail' same step mem
+                cases same
+                exact .inl mem
+              · cases edge : (children[nibble.toNat]?).getD none with
+                | none =>
+                  simp only [execute, ExceptT.mk, pure, ExceptT.pure]
+                  refine ⟨by trivial, by trivial, ?_⟩
+                  intro found trail' same step mem
+                  cases same
+                  exact .inl mem
+                | some child =>
+                  obtain ⟨files, faults, steps⟩ := ih (consumed + 1) (some child) below
+                    (trail ++ [(consumed + 1, child)]) { record state ("bytes:" ++ nodeSpace) with faults := [] } rfl
+                  refine ⟨files, faults, ?_⟩
+                  intro found trail' ran step mem
+                  rcases steps found trail' ran step mem with old | ⟨start, same, lower, upper, reached⟩
+                  · rcases List.mem_append.mp old with old | new
+                    · exact .inl old
+                    · simp only [List.mem_singleton] at new
+                      subst new
+                      refine .inr ⟨hash, rfl, by omega, by simp, ?_⟩
+                      simp only [Nat.add_sub_cancel_left, List.take_succ_cons, List.take_zero]
+                      exact Reaches.route hash raw child child children value nibble [] held decoded
+                        (getD_none_eq_some edge) (.here child)
+                  · cases same
+                    refine .inr ⟨hash, rfl, by omega, by simp; omega, ?_⟩
+                    have split : step.1 - consumed = (step.1 - (consumed + 1)) + 1 := by omega
+                    rw [split, List.take_succ_cons]
+                    exact Reaches.route hash raw child step.2 children value nibble _ held decoded
                       (getD_none_eq_some edge) reached
 
 /-- Executing a bound program runs the first, then the continuation on the

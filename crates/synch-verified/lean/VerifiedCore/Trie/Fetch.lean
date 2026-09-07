@@ -70,7 +70,8 @@ def inspect [WorkSet Visit V] [WorkSet ByteArray H] (target : Target)
 Invalid origin values remain missing; valid bytes already committed by
 earlier answers remain useful if a later answer fails or is cancelled. -/
 def admit [WorkSet ByteArray H] (target : Target) (values : Bool)
-    (requested : List (ByteArray × ByteArray)) (served : List (ByteArray × ByteArray)) :
+    (requested : List (ByteArray × ByteArray)) (served : List (ByteArray × ByteArray))
+    (routeValues : List ByteArray := []) :
     Action Nat := transactionOver Inject.inject Error.host fun tx => do
   let mut outstanding : H := requested.foldl
     (fun set (_, hash) => WorkSet.insert set hash) (WorkSet.empty ByteArray)
@@ -80,7 +81,7 @@ def admit [WorkSet ByteArray H] (target : Target) (values : Bool)
     outstanding := WorkSet.erase outstanding hash
     if values then
       if (← request (Digest.blake3 bytes)) != hash then throw (.valueHash hash)
-      if bytes.size > inlineValueMax && bytes.size ≤ maxValueBytes then
+      if (bytes.size > inlineValueMax || routeValues.contains hash) && bytes.size ≤ maxValueBytes then
         request (Storage.upsert tx valueSpace [("hash", .blob hash), ("data", .blob bytes)] ["hash"] [])
         learned := learned + 1
     else
@@ -126,7 +127,7 @@ def step [WorkSet Visit V] [WorkSet ByteArray H] (target : Target)
     learned := learned + (← admit (H := H) target false missing.nodes served)
   if !missing.values.isEmpty then
     let (served, _) ← request (Peer.fetchValues target.root missing.values)
-    learned := learned + (← admit (H := H) target true missing.values served)
+    learned := learned + (← admit (H := H) target true missing.values served missing.routeValues)
   let unproductive := if learned == 0 then state.unproductive + 1 else 0
   if unproductive ≥ retryLimit then
     abandon target

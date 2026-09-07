@@ -73,6 +73,7 @@ def Cursor.value : Cursor → Option Value
   | .at (.leaf suffix value) => if suffix.size == 0 then some value else none
   | .at (.extension _ _) => none
   | .at (.branch _ value) => value
+  | .at (.route _ value) => value.map Value.hash
 
 /-- The node at an address. A missing referenced node is an incomplete
 snapshot, even if a peer refused it. A refusal is not authenticated evidence
@@ -104,7 +105,7 @@ def cursorChild [Inject Storage E] [Inject Redaction E] (cursor : Cursor) (nibbl
       else if rest.isEmpty then cursorAt (some child)
       else pure (.at (.extension ⟨rest.toArray⟩ child))
     | [] => pure .empty
-  | .at (.branch children _) => cursorAt ((children[nibble.toNat]?).getD none)
+  | .at (.branch children _) | .at (.route children _) => cursorAt ((children[nibble.toNat]?).getD none)
 
 /-- One nibble of `follow`: the run is over, or the cursor's child under
 the next nibble, empty as soon as one leads nowhere. -/
@@ -142,7 +143,8 @@ def Cursor.nextChild : Cursor → UInt8 → Option UInt8
   | .empty, _ => none
   | .at (.leaf suffix _), nibble => (suffix[0]?).filter (nibble ≤ ·)
   | .at (.extension segment _), nibble => (segment[0]?).filter (nibble ≤ ·)
-  | .at (.branch children _), nibble => occupied (children.drop nibble.toNat) nibble.toNat
+  | .at (.branch children _), nibble | .at (.route children _), nibble =>
+    occupied (children.drop nibble.toNat) nibble.toNat
 where
   occupied : List (Option ByteArray) → Nat → Option UInt8
     | [], _ => none

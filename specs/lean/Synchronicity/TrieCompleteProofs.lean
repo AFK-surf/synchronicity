@@ -91,7 +91,7 @@ theorem a_new_certificate_follows_the_walk :
     result.1 == .ok true && result.2.certified == [rootHash] &&
       result.2.trace == ["memo:known", "memo:generation", "bytes:" ++ nodeSpace,
         "bytes:" ++ nodeSpace, "bytes:" ++ nodeSpace, "bytes:" ++ nodeSpace,
-        "bytes:" ++ nodeSpace, "snapshot:" ++ valueSpace, "bytes:" ++ nodeSpace, "memo:certify"] := by
+        "bytes:" ++ nodeSpace, "bytes:" ++ valueSpace, "bytes:" ++ nodeSpace, "memo:certify"] := by
   decide +kernel
 
 theorem a_missing_value_prevents_certification :

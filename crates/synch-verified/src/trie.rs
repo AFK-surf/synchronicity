@@ -294,6 +294,23 @@ pub fn insert<S: ByteStorage>(
     ))
 }
 
+/// Prepare the stored root for private scoped publication. Lean owns the
+/// schema routing and all reads/writes; the caller owns the publication commit.
+pub fn normalize_publication<S: ByteStorage>(
+    storage: &mut S,
+    writes: &mut dyn ByteWrites<Error = S::Error>,
+    digest: &mut dyn Digest<Error = S::Error>,
+    root: &[u8; 32],
+) -> Mutation<S::Error> {
+    mutated(operation::run_bytes(
+        storage,
+        writes,
+        digest,
+        &[],
+        &Command::TrieNormalize(root.to_vec()),
+    ))
+}
+
 /// Remove a key, answering the new root; an absent key leaves it unchanged.
 pub fn remove<S: ByteStorage>(
     storage: &mut S,

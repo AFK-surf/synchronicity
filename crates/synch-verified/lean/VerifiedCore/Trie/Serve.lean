@@ -55,6 +55,7 @@ def Scope.admitsNode (scope : Scope) (path : Path) : Node → Bool
     | some (.inline _) => scope.admitsKeyPath path
   | .extension segment _ => scope.isFull || scope.admitsPath (path ++ segment.toList)
   | .leaf suffix _ => scope.isFull || scope.admitsKeyPath (path ++ suffix.toList)
+  | .route _ _ => scope.admitsPath path
 
 /-- The value a node carries belongs to a granted key; a branch may travel
 on the spine without granting the value at the branch itself. -/
@@ -62,11 +63,13 @@ def Scope.admitsValue (scope : Scope) (path : Path) : Node → Bool
   | .leaf suffix _ => scope.admitsKeyPath (path ++ suffix.toList)
   | .branch _ _ => scope.admitsKeyPath path
   | .extension _ _ => false
+  | .route _ _ => scope.admitsKeyPath path
 
 /-- The out-of-line values a node references. -/
 def _root_.VerifiedCore.Trie.Node.valueHashes : Node → List ByteArray
   | .leaf _ (.hash address) => [address]
   | .branch _ (some (.hash address)) => [address]
+  | .route _ value => value.toList
   | _ => []
 
 inductive Error where
@@ -117,7 +120,7 @@ def descend : Nat → Nat → Option ByteArray → Path → List (Nat × ByteArr
         if spelled.isEmpty || !spelled.isPrefixOf rest then return (none, trail)
         let consumed := consumed + spelled.length
         descend fuel consumed (some child) (rest.drop spelled.length) (trail ++ [(consumed, child)])
-      | .ok (.branch children _) =>
+      | .ok (.branch children _) | .ok (.route children _) =>
         match rest with
         | [] => return (some hash, trail)
         | nibble :: below =>

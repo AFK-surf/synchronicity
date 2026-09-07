@@ -75,6 +75,26 @@ impl WireNode {
         files: &[(&str, &str, &[u8])],
         extra: &[(Vec<u8>, Vec<u8>)],
     ) -> SignedHead {
+        self.publish_form(seq, files, extra, true)
+    }
+
+    /// Build a historical compressed publication for compatibility and trust-boundary tests.
+    pub(crate) fn publish_legacy(
+        &self,
+        seq: u64,
+        files: &[(&str, &str, &[u8])],
+        extra: &[(Vec<u8>, Vec<u8>)],
+    ) -> SignedHead {
+        self.publish_form(seq, files, extra, false)
+    }
+
+    fn publish_form(
+        &self,
+        seq: u64,
+        files: &[(&str, &str, &[u8])],
+        extra: &[(Vec<u8>, Vec<u8>)],
+        routing: bool,
+    ) -> SignedHead {
         let trie = Trie::new(self.store.as_ref());
         // One transaction, as every production writer of the complete slot does it (§5.2).
         let old = self.root();
@@ -100,6 +120,10 @@ impl WireNode {
         }
         for (key, value) in extra {
             root = trie.insert(root, key, value).unwrap();
+        }
+        // The fixture uses the same native publication form as Node::publish.
+        if routing {
+            root = trie.normalize_publication(root).unwrap();
         }
         let head = SignedHead::sign(&self.secret, self.origin.clone(), seq, root, now_ns());
         self.store

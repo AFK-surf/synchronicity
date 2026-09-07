@@ -45,9 +45,3 @@ pub use proof::Proof;
 pub use scope::Scope;
 pub use store::{MemStore, NodeStore};
 pub use trie::{Entry, Reachable, Trie};
-
-#[cfg(test)]
-extern crate self as synch_mpt;
-#[cfg(test)]
-#[path = "../tests/support/missing_walk.rs"]
-mod missing_oracle;

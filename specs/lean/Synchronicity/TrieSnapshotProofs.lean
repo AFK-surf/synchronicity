@@ -49,6 +49,12 @@ theorem graph_value_preserved (included : RecordsIncluded part whole)
   | branchChild address raw children v nibble child tail bytes held decoded edge _ ih =>
     exact .branchChild address raw children v nibble child tail bytes
       (included _ _ _ (.inl rfl) held) decoded edge ih
+  | routeValue address raw children v bytes held decoded denotes =>
+    exact .routeValue address raw children v bytes
+      (included _ _ _ (.inl rfl) held) decoded (value denotes)
+  | routeChild address raw children v nibble child tail bytes held decoded edge _ ih =>
+    exact .routeChild address raw children v nibble child tail bytes
+      (included _ _ _ (.inl rfl) held) decoded edge ih
 
 /-- At the production read budget, reading a value is exactly membership in
 the selected snapshot. The statement includes empty roots and oversized keys. -/
