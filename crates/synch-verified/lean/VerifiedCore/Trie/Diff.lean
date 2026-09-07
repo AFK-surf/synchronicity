@@ -109,21 +109,15 @@ def diffEach [Inject Storage E] [Inject Redaction E] [Inject Digest E] (scope : 
         | none => pure acc
       return (if worth then .descend (ca, cb) else .visited, acc)) (a, b) [] acc
 
-def insertByKey (change : Change) : List Change → List Change
-  | [] => [change]
-  | head :: rest =>
-    if Serve.before change.key.toList head.key.toList then change :: head :: rest
-    else head :: insertByKey change rest
-
-def sortByKey : List Change → List Change
-  | [] => []
-  | change :: rest => insertByKey change (sortByKey rest)
-
-/-- Every differing key between two roots, in key order. -/
+/-- Every differing key between two roots, in key order: the walk visits
+positions depth-first with nibbles ascending and reports a position's own
+value before anything below it, which is the keys' lexicographic order, so
+the changes are listed as they were found. A sort here would cost the
+corpus squared and, written by recursion, the native stack. -/
 def diff [Inject Storage E] [Inject Redaction E] [Inject Digest E] (oldRoot newRoot : ByteArray) :
     OperationOver E Error (List Change) := do
   let changes ← diffEach ⟨none, []⟩ (fun acc change => pure (change :: acc)) oldRoot newRoot []
-  return sortByKey changes
+  return changes.reverse
 
 /-- The diff a head promotion applies: streamed, one change at a time, only
 the new side resolved (the old side decides nothing but whether the change
