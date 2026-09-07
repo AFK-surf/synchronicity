@@ -308,7 +308,7 @@ impl MptProtocol {
                 // deduplicated; and the answer stops at the byte budget. A
                 // short answer is an ordinary answer: the requester's walk
                 // defers everything it asked for and re-offers what did not
-                // come back (`MissingWalk::resume`).
+                // come back (the Lean requesting walk resumes its deferred positions).
                 let (nodes, missing, redacted) = crate::blocking::offload(move || {
                     Ok(store.serve_trie_nodes(&peer, &root, &wants)?)
                 })
@@ -672,7 +672,7 @@ impl MptClient {
     ///
     /// At most [`MAX_BATCH`] hashes: the responder refuses a longer request
     /// outright, so a caller that oversteps loses the whole batch rather than
-    /// the tail of it. `MissingWalk::next_batch` is the only caller and stops at
+    /// the tail of it. The Lean requesting operation is the production caller and stops at
     /// the cap.
     pub async fn get_nodes(
         &self,
@@ -1260,7 +1260,7 @@ mod tests {
                     .unwrap();
                 synch_mpt::NodeStore::put_node(bare.as_ref(), node, &bytes).unwrap();
             }
-            let missing = synch_mpt::MissingWalk::new(root)
+            let missing = crate::missing_oracle::MissingWalk::new(root)
                 .next_batch(&Trie::new(bare.as_ref()), MAX_BATCH)
                 .unwrap();
             assert!(missing.nodes.is_empty(), "every node was copied across");

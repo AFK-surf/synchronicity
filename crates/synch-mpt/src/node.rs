@@ -111,12 +111,12 @@ impl TrieNode {
     /// re-encode to exactly themselves (so a peer cannot smuggle padding past
     /// the hash), keep one node's nibble run within twice
     /// [`MAX_KEY_LEN`](synch_core::MAX_KEY_LEN) (the per-node half of the depth
-    /// bound; `MissingWalk::next_batch` bounds the *path*), and satisfy the
+    /// bound; Lean `Trie.Missing.nextBatch` bounds the *path*), and satisfy the
     /// structural invariants the node kinds document: a non-empty extension
     /// prefix, inline values within [`INLINE_VALUE_MAX`], at least two
     /// occupants of a branch. Two halves need more than one node and are
     /// checked where the structure is walked and where values arrive: an
-    /// extension above a non-branch ([`crate::MissingWalk::next_batch`]), and
+    /// extension above a non-branch (Lean `Trie.Missing.nextBatch`), and
     /// an out-of-line value small enough to be inline (the fetch's `put`).
     ///
     /// Rust supplies the BLAKE3 primitive and names the refusal; the decision

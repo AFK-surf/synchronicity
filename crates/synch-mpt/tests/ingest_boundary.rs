@@ -7,6 +7,10 @@
 //! `insert`), and under-occupied branches giving one map several distinct
 //! roots. All are rejected at the boundary, before they reach a store.
 
+#[path = "support/missing_walk.rs"]
+mod missing_oracle;
+use missing_oracle::MissingWalk;
+
 use synch_core::{Hash, INLINE_VALUE_MAX, MAX_KEY_LEN, MAX_TRIE_VALUE_LEN};
 use synch_mpt::{MemStore, MptError, Nibbles, NodeStore, Trie, TrieNode, ValueRef};
 
@@ -125,8 +129,6 @@ fn an_under_occupied_branch_is_refused() {
 /// several distinct roots, silently disabling `MissingWalk::scoped`'s pruning.
 #[test]
 fn an_extension_above_a_non_branch_is_refused_by_the_walk() {
-    use synch_mpt::MissingWalk;
-
     let store = MemStore::new();
     let child = TrieNode::Leaf {
         key_rest: Nibbles::from_nibbles(&[1, 2]),
@@ -232,7 +234,7 @@ fn the_key_depth_ceiling_is_one_thing_to_every_reader() {
         child = branch(&store, ext, ext);
     }
 
-    let mut walk = synch_mpt::MissingWalk::new(child);
+    let mut walk = MissingWalk::new(child);
     let err = loop {
         match walk.next_batch(&trie, 256) {
             Ok(missing) => {

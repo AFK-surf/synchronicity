@@ -3,6 +3,9 @@
 //! replicated state and nothing else, sees only its spaces, cannot reach
 //! content it was not delegated, and cannot publish outside its list.
 
+#[path = "../../synch-mpt/tests/support/missing_walk.rs"]
+mod missing_oracle;
+
 use synch_core::{
     delegation_key, file_key, now_ns, ChunkRanges, Delegation, FileEntry, Hash, NodeId, SignedHead,
 };
@@ -122,7 +125,7 @@ fn walk_all(
     root: Hash,
 ) -> Vec<(Vec<u8>, Hash)> {
     let empty = synch_mpt::MemStore::new();
-    let mut walk = synch_mpt::MissingWalk::new(root);
+    let mut walk = missing_oracle::MissingWalk::new(root);
     let mut all = Vec::new();
     loop {
         let batch = walk.next_batch(&Trie::new(&empty), 512).unwrap();

@@ -1,9 +1,13 @@
 //! Storage failures must leave the Rust walk's selected read pending, not complete.
 
+#[path = "support/missing_walk.rs"]
+mod missing_oracle;
+use missing_oracle::MissingWalk;
+
 use std::{cell::Cell, io};
 
 use synch_core::Hash;
-use synch_mpt::{MemStore, MissingWalk, Nibbles, NodeStore, Trie, TrieNode, ValueRef};
+use synch_mpt::{MemStore, Nibbles, NodeStore, Trie, TrieNode, ValueRef};
 
 struct InterruptingStore {
     inner: MemStore,

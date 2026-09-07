@@ -305,4 +305,97 @@ mod tests {
         assert!(!destination.has_node(&root).unwrap());
         assert!(!destination.owns_node(&owner, &root).unwrap());
     }
+
+    #[test]
+    fn invalidation_between_replies_discards_the_pruning_reference() {
+        let (_source_dir, source) = store();
+        let (_destination_dir, destination) = store();
+        let trie = Trie::new(&source);
+        let old = trie.insert(Hash::EMPTY, b"a", b"first").unwrap();
+        let old = trie.insert(old, b"b", b"second").unwrap();
+        let retained = trie.reachable(old).unwrap();
+        let removed = *retained
+            .nodes
+            .iter()
+            .find(|hash| {
+                matches!(
+                    synch_mpt::TrieNode::decode(&source.get_node(hash).unwrap().unwrap()).unwrap(),
+                    synch_mpt::TrieNode::Leaf { .. }
+                )
+            })
+            .unwrap();
+        for hash in &retained.nodes {
+            destination
+                .put_node(hash, &source.get_node(hash).unwrap().unwrap())
+                .unwrap();
+        }
+        assert!(Trie::new(&destination).is_complete(old).unwrap());
+        let new = trie.insert(old, b"c", b"third").unwrap();
+        let mut invalidated = false;
+        let mut asked_for_removed = false;
+        let result = destination
+            .fetch_trie(
+                new,
+                &origin(),
+                2,
+                &Scope::full(),
+                None,
+                Some(old),
+                256,
+                3,
+                |request| {
+                    if !invalidated {
+                        destination
+                            .transaction(|txn| -> Result<()> {
+                                txn.invalidate_completeness();
+                                txn.conn().execute(
+                                    "DELETE FROM trie_nodes WHERE hash = ?1",
+                                    [removed.as_bytes().as_slice()],
+                                )?;
+                                Ok(())
+                            })
+                            .unwrap();
+                        invalidated = true;
+                    }
+                    let PeerRequest::Nodes { wants, .. } = request else {
+                        panic!("inline values")
+                    };
+                    asked_for_removed |= wants
+                        .iter()
+                        .any(|(_, hash)| hash.as_slice() == removed.as_bytes());
+                    Some(PeerReply::Nodes {
+                        served: wants
+                            .iter()
+                            .map(|(_, hash)| {
+                                (
+                                    hash.clone(),
+                                    source
+                                        .get_node(&Hash::from_slice(hash).unwrap())
+                                        .unwrap()
+                                        .unwrap(),
+                                )
+                            })
+                            .collect(),
+                        missing: vec![],
+                        redacted: vec![],
+                    })
+                },
+            )
+            .unwrap()
+            .unwrap();
+        assert!(result);
+        assert!(
+            asked_for_removed,
+            "a stale reference skipped the deleted shared leaf"
+        );
+        assert!(Trie::new(&destination).is_complete(new).unwrap());
+        assert_eq!(
+            Trie::new(&destination).get(new, b"a").unwrap(),
+            Some(b"first".to_vec())
+        );
+        assert_eq!(
+            Trie::new(&destination).get(new, b"b").unwrap(),
+            Some(b"second".to_vec())
+        );
+    }
 }

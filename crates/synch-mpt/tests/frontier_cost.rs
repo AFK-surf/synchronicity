@@ -2,10 +2,14 @@
 //! a fetch reads each node about once, and one against a held root touches
 //! only what changed.
 
+#[path = "support/missing_walk.rs"]
+mod missing_oracle;
+use missing_oracle::MissingWalk;
+
 use std::{cell::Cell, convert::Infallible};
 
 use synch_core::Hash;
-use synch_mpt::{MemStore, MissingWalk, NodeStore, Scope, Trie};
+use synch_mpt::{MemStore, NodeStore, Scope, Trie};
 
 /// A store that counts the node reads made through it.
 #[derive(Debug)]

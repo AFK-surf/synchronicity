@@ -1,6 +1,9 @@
 //! Containment at the trust boundaries of mptsync (§5.5, §12), over real
 //! endpoints. Each test states a property the design promises.
 
+#[path = "../../synch-mpt/tests/support/missing_walk.rs"]
+mod missing_oracle;
+
 use synch_core::{delegation_key, file_key, now_ns, Delegation, Hash, NodeId, SignedHead};
 use synch_engine::{reconcile::HeadOutcome, FetchOutcome, Syncer};
 use synch_mpt::{NodeStore, Scope, Trie, TrieNode};
@@ -25,7 +28,7 @@ fn delegation(subject: &NodeId, spaces: &[&str]) -> (Vec<u8>, Vec<u8>) {
 /// Every node of `root`'s trie by position.
 fn walk_all(store: &synch_store::Store, root: Hash) -> Vec<(Vec<u8>, Hash)> {
     let empty = synch_mpt::MemStore::new();
-    let mut walk = synch_mpt::MissingWalk::new(root);
+    let mut walk = missing_oracle::MissingWalk::new(root);
     let mut all = Vec::new();
     loop {
         let batch = walk.next_batch(&Trie::new(&empty), 512).unwrap();

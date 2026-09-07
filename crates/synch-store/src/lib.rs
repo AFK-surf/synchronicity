@@ -66,3 +66,7 @@ pub use views::{
     EntryRow, LocalFile, ReplicaPolicy, ReplicaRow, SourceKind, SourceRow,
     DEFAULT_REPLICA_GRACE_SECS,
 };
+
+#[cfg(test)]
+#[path = "../../synch-mpt/tests/support/missing_walk.rs"]
+mod missing_oracle;

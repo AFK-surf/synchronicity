@@ -159,10 +159,11 @@ impl Store {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::missing_oracle::MissingWalk;
     use crate::testutil::store;
     use crate::{Binding, BindingSource, Slot};
     use synch_core::{OriginId, SignedHead};
-    use synch_mpt::{MemStore, MissingWalk, Nibbles, NodeStore, Scope, Trie, TrieNode};
+    use synch_mpt::{MemStore, Nibbles, NodeStore, Scope, Trie, TrieNode};
 
     fn publish(store: &Store, keys: &[&[u8]]) -> Hash {
         let trie = Trie::new(store);

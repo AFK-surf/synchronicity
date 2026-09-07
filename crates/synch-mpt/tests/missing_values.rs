@@ -6,8 +6,12 @@
 //! on unservable heads" property — `MAX_UNPRODUCTIVE_ROUNDS` could never fire —
 //! and `note_complete` vouched for a root the node cannot serve (F5).
 
+#[path = "support/missing_walk.rs"]
+mod missing_oracle;
+use missing_oracle::MissingWalk;
+
 use synch_core::Hash;
-use synch_mpt::{MemStore, MissingWalk, Trie};
+use synch_mpt::{MemStore, Trie};
 
 #[test]
 fn a_missing_out_of_line_value_is_asked_for_until_it_arrives() {

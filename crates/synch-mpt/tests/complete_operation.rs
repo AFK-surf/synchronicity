@@ -1,6 +1,10 @@
 //! The whole native completeness operation, including its memo and raw host
 //! boundary. The independent Rust requesting walk remains an oracle until
 //! its own fetch cutover.
+#[path = "support/missing_walk.rs"]
+mod missing_oracle;
+use missing_oracle::MissingWalk;
+
 use std::{
     cell::{Cell, RefCell},
     collections::HashSet,
@@ -8,7 +12,7 @@ use std::{
 };
 
 use synch_core::{Hash, OriginId, ScopeKeys, INLINE_VALUE_MAX};
-use synch_mpt::{MemStore, MissingWalk, NodeStore, Scope, Trie};
+use synch_mpt::{MemStore, NodeStore, Scope, Trie};
 
 #[derive(Default)]
 struct Observed {
