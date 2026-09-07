@@ -188,7 +188,7 @@ private theorem cursor_valid_closed (valid : CursorValid store cursor) : CursorC
   | stored root => exact valid.2
   | node node => exact valid.1
 
-private theorem node_closed_preserved (closed : NodeClosed before node)
+theorem node_closed_preserved (closed : NodeClosed before node)
     (included : RecordsIncluded before after) : NodeClosed after node := by
   have payload : ∀ {value bytes}, ValueDenotes before value bytes → ValueDenotes after value bytes := by
     intro value bytes denotes
