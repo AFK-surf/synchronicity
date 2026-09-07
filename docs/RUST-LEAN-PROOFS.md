@@ -405,6 +405,12 @@ and Bao primitives, provider SDKs, serialization schemas and historical data
 migrations remain Rust where they implement the stated trust boundary rather
 than duplicate a migrated domain operation.
 
+A migration checkpoint is complete only after production callers use the Lean
+command and the displaced Rust algorithm is deleted, including fallback paths
+and test-only copies. Check callers across the workspace, not just the migrated
+crate. Tests should assert observable outcomes against independent fixtures;
+calling two implementations of the same policy is not the acceptance criterion.
+
 ```text
 CLI / RPC / scanner event
           |
@@ -526,12 +532,13 @@ completed cutover from being mistaken for a completed user guarantee.
 | CAS local ingest/read/heal/lifecycle | Production Lean | Named scoped P1/P5/P6 results below; extend fresh-store/intact-content assumptions to relevant histories. |
 | CAS C1/C2: serve/verified receive/delta promotion | Production Lean with trusted Bao service | Fresh full receive-to-read and exact reads of backed verified ranges are checked; successful existing-row receive persists actual planner/decoder output over arbitrary raw databases. Connect repeated receives to the backing/coverage invariant, including decoder failures and partial physical writes. |
 | CAS C3/C5/C7: durability, collection, projections | Production Lean | Repair responsibility, collection protection and projection support exist. Blob projections now compute verified groups and canonical advertised spans, including inside an existing publication transaction; the live Rust bitmap decoder and advertisement policy are deleted. `CasAdvertisementProofs.stored_partial_advertisements_offer_saved_content` proves that every byte advertised by an actual partial, non-durable projection is backed by the saved content. Durable provider availability and cloud/publication retention composition remain open. Clock/LRU/diagnostics are regression details. |
-| CAS C4: cloud composition | Rust `backend.rs` | Migrate complete provider adoption/hydration/finalize/read/serve commands, including trusted-range ingestion and complete-proof path. |
+| CAS C4: cloud composition | Rust `backend.rs`; checked Lean `Cas/Cloud` preparation is not yet wired | Whole adoption and hydration operations are defined over raw provider/cache effects. Production cutover, deletion of the displaced Rust, native provider suspension, finalize/read/serve migration and proofs remain open. Adoption must reread coverage after clearing an unattested cache; old coverage cannot justify skipping restored ranges. |
 | CAS C6: source holds and publication advertisement | Rust inside publication transaction | Migrate with the entry/head/reference publication command, never as independently committing calls. |
 | History pruning | Production Lean `Replication/History` | Retention/fork witness support proved. Adoption, reconciliation and scheduling still require implementation-connected M1–M8 proofs. |
 | Peer contact selection | Production Lean `Replication/Contact`, called by serialized periodic rounds | Native bounded-turn and duplicate/order cases checked. Bounded service through the actual native index, returned cursor and selected peer positions is proved for fixed eligible input. Actual eligibility and completed engine attempts still require composition for M1/M6. |
 | Head exchange selection | Production Lean `Replication/Exchange`, called by engine reconciliation | Selects request origins and push indices from advertised/servable heads. Exact newer-version requests, duplicate/order invariance and push selection support M2. Signature/admission/availability inputs and subsequent adoption remain separate obligations. |
 | Origin parsing | Production Lean `Origin.parse`/`named`/normalization, shared by public `synch-core` APIs and retained-history validation | The Rust parser and normalization algorithms are deleted. Whole named construction uses one command. Rust supplies primitive point validation and preserves typed wire identities; host/transport failure remains distinct from invalid syntax or key bytes. Store diagnostics share the same conversion. Existing origin proofs now describe the public implementation too; full publisher-authority composition remains open. |
+| Authorization reads and scope construction | Rust bindings and callers; checked Lean `Authorization` preparation is not yet wired | Whole live-binding, peer/origin and local-authority operations are being connected to typed native endpoints. Delete Rust liveness, grant builders and test-only policy oracles at cutover; prove the authority supplied to serving and publication reflects the actual valid grants. |
 | Promotion authority snapshot | Rust `try_promote`, with permissions/authority read in its publication transaction | Snapshot-consistent permission checks and full own-view readiness have native regressions. This is a safety fix, not a Lean promotion theorem or closure of P3/M4/M8. |
 
 The operator-only CAS migration tool, staging-directory layout sweep and provider

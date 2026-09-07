@@ -762,27 +762,28 @@ pub enum PeerReply<E> {
     Failed(E),
 }
 
-/// Where a suspending run stands: finished with its decoded value, or waiting
-/// on a peer with its continuation owned by the caller.
+/// A completed operation or an owned continuation waiting for external IO.
+/// The request type identifies the external service; peer requests are the
+/// default for existing network callers.
 #[derive(Debug)]
-pub enum Step<T, E> {
+pub enum Step<T, E, R = PeerRequest> {
     Done(T),
-    Suspended(Suspension<T, E>),
+    Suspended(Suspension<T, E, R>),
 }
 
-/// A program waiting on a peer. It owns the Lean continuation, so it stays
+/// A program waiting for external IO. It owns the Lean continuation, so it stays
 /// on the thread that started the run and holds no storage: the runner only
 /// suspends while no transaction is open, and the storage handed to `resume`
 /// may be a fresh one. Dropping it drops the continuation unanswered.
-pub struct Suspension<T, E> {
+pub struct Suspension<T, E, R = PeerRequest> {
     state: Handle,
-    request: PeerRequest,
+    request: R,
     tag: u8,
     errors: Vec<Option<E>>,
     finish: fn(&[u8]) -> Result<T, ()>,
 }
 
-impl<T, E> std::fmt::Debug for Suspension<T, E> {
+impl<T, E, R: std::fmt::Debug> std::fmt::Debug for Suspension<T, E, R> {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
         f.debug_struct("Suspension")
             .field("request", &self.request)
@@ -790,12 +791,14 @@ impl<T, E> std::fmt::Debug for Suspension<T, E> {
     }
 }
 
-impl<T, E> Suspension<T, E> {
+impl<T, E, R> Suspension<T, E, R> {
     /// What the program is waiting for.
-    pub fn request(&self) -> &PeerRequest {
+    pub fn request(&self) -> &R {
         &self.request
     }
+}
 
+impl<T, E> Suspension<T, E> {
     /// Answer the request and run on until the next suspension or the end. A
     /// reply of the other kind is a protocol failure delivered into the
     /// program, so its own cleanup runs.
@@ -843,7 +846,7 @@ impl<T, E> Suspension<T, E> {
                 state: self.state,
                 errors: self.errors,
                 open: 0,
-                suspendable: true,
+                request: Some(peer_request),
                 finish: self.finish,
             },
             |frame, capabilities, errors| dispatch(storage, capabilities, frame, errors),
@@ -874,15 +877,37 @@ fn owned_pairs(wants: &[(&[u8], &[u8])]) -> Vec<(Vec<u8>, Vec<u8>)> {
         .collect()
 }
 
+fn peer_request(frame: &Frame<'_>) -> Option<(PeerRequest, u8)> {
+    match frame {
+        Frame::FetchNodes(root, wants) => Some((
+            PeerRequest::Nodes {
+                root: root.to_vec(),
+                wants: owned_pairs(wants),
+            },
+            72,
+        )),
+        Frame::FetchValues(root, wants) => Some((
+            PeerRequest::Values {
+                root: root.to_vec(),
+                wants: owned_pairs(wants),
+            },
+            73,
+        )),
+        _ => None,
+    }
+}
+
 /// A run in progress: the continuation, the host errors it has registered,
 /// how many storage transactions it holds open (a suspension is refused
-/// while any is), whether it may suspend at all, and how its terminal is
-/// read.
-struct Run<T, E> {
+/// while any is), which external requests may suspend, and how its terminal
+/// is read.
+type RequestDecoder<R> = fn(&Frame<'_>) -> Option<(R, u8)>;
+
+struct Run<T, E, R> {
     state: Handle,
     errors: Vec<Option<E>>,
     open: usize,
-    suspendable: bool,
+    request: Option<RequestDecoder<R>>,
     finish: fn(&[u8]) -> Result<T, ()>,
 }
 
@@ -896,11 +921,11 @@ fn execute<E>(
     inputs: &[&[u8]],
     capabilities: Capabilities<'_, E>,
 ) -> Result<Vec<u8>, OperationError<E>> {
-    let run = Run {
+    let run: Run<_, _, PeerRequest> = Run {
         state,
         errors: Vec::new(),
         open: 0,
-        suspendable: false,
+        request: None,
         finish: |bytes| Ok(bytes.to_vec()),
     };
     match drive(run, host, inputs, capabilities)? {
@@ -913,8 +938,8 @@ fn execute<E>(
 /// request in a run that may not suspend, or while a transaction is open, is
 /// a protocol failure delivered into the program, so its own cleanup runs
 /// before it terminates.
-fn drive<T, E>(
-    mut run: Run<T, E>,
+fn drive<T, E, R>(
+    mut run: Run<T, E, R>,
     mut host: impl FnMut(
         Frame<'_>,
         &mut Capabilities<'_, E>,
@@ -922,39 +947,24 @@ fn drive<T, E>(
     ) -> Result<Vec<u8>, OperationError<E>>,
     inputs: &[&[u8]],
     mut capabilities: Capabilities<'_, E>,
-) -> Result<Step<T, E>, OperationError<E>> {
+) -> Result<Step<T, E, R>, OperationError<E>> {
     loop {
         let packet = run.state.packet();
         let frame = decode(packet.as_bytes()).map_err(|()| OperationError::Protocol)?;
         let opens = matches!(frame, Frame::Begin);
         let closes = matches!(frame, Frame::Commit(_) | Frame::Rollback(_));
+        if run.open == 0 {
+            if let Some((request, tag)) = run.request.and_then(|decode| decode(&frame)) {
+                return Ok(Step::Suspended(Suspension {
+                    state: run.state,
+                    request,
+                    tag,
+                    errors: run.errors,
+                    finish: run.finish,
+                }));
+            }
+        }
         let response = match frame {
-            Frame::FetchNodes(root, wants) if run.suspendable && run.open == 0 => {
-                let request = PeerRequest::Nodes {
-                    root: root.to_vec(),
-                    wants: owned_pairs(&wants),
-                };
-                return Ok(Step::Suspended(Suspension {
-                    state: run.state,
-                    request,
-                    tag: 72,
-                    errors: run.errors,
-                    finish: run.finish,
-                }));
-            }
-            Frame::FetchValues(root, wants) if run.suspendable && run.open == 0 => {
-                let request = PeerRequest::Values {
-                    root: root.to_vec(),
-                    wants: owned_pairs(&wants),
-                };
-                return Ok(Step::Suspended(Suspension {
-                    state: run.state,
-                    request,
-                    tag: 73,
-                    errors: run.errors,
-                    finish: run.finish,
-                }));
-            }
             Frame::FetchNodes(..) | Frame::FetchValues(..) => protocol_failure(),
             // The transferred bytes go from the file straight into the tail of
             // the output sink; they are never a reply payload. A sink that
@@ -1345,7 +1355,7 @@ pub(crate) fn run_suspending<T, S: Storage>(
         state: start(command),
         errors: Vec::new(),
         open: 0,
-        suspendable: true,
+        request: Some(peer_request),
         finish,
     };
     drive(
