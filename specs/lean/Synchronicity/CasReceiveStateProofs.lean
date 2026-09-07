@@ -63,4 +63,44 @@ theorem existing_receive_execution (state : State) (root : ByteArray) (size : UI
       lookupFile, writeFile, Except.mapError, Except.map,
       bind, pure, Program.bind, ExceptT.bind, ExceptT.bindCont, ExceptT.pure, ExceptT.run, ExceptT.mk]
 
+/-- A decoder may write a verified prefix and then fail. The failed receive
+keeps the committed coverage unchanged; its physical prefix remains in the
+same raw file for retry. Byte preservation is a separate Bao contract. -/
+theorem interrupted_decoder_keeps_committed_metadata (state : State) (root : ByteArray) (size : UInt64)
+    (served : List (UInt64 × UInt64)) (input : UInt64) (now : Int64)
+    (tier : Cas.IngestCommit.Tier) (claim : Cas.IngestCommit.Claim)
+    (row : Cas.Read.Metadata) (raw : Row) (rest : List Row)
+    (quiet : state.faults = []) (idle : state.pending = none) (clean : state.scanFault = none)
+    (observedClaim : Cas.IngestCommit.decodeClaim
+      (query state.db "blobs" Cas.IngestCommit.claimColumns [("root", .blob root)] [] []) = .ok (some claim))
+    (observed : CasReadPromises.observation state root = raw :: rest)
+    (decoded : Cas.Read.decodeRow raw = .ok row)
+    (incomplete : row.complete = false)
+    (admitted : (Cas.IngestCommit.plan (some claim) size []).accepted = true)
+    (large : ¬ size ≤ inlineMax) (nonempty : window size served ≠ [])
+    (interrupted : state.decodeSlice root size (Cas.Serve.pairsOf (window size served)) input = false) :
+    let result := SimulatedHost.run (writeSlice root size served input now tier) state
+    result.1 = .error (.host state.decodeSliceFailure) ∧
+    result.2.db = state.db ∧
+    lookupFile result.2.files ("cas_payload", root) = some
+      (state.decodedPayload root size (Cas.Serve.pairsOf (window size served)) input
+        ((lookupFile state.files ("cas_payload", root)).getD ByteArray.empty)) ∧
+    result.2.faults = [] ∧ result.2.pending = none := by
+  have selected (table : String) (fields : Fields) :
+      selects ⟨table, fields, [], []⟩ = fun row => equals row fields := by
+    funext row
+    simp [selects]
+  simp only [unordered_query] at observedClaim
+  simp only [CasReadPromises.observation, selected] at observed
+  simp [SimulatedHost.run, writeSlice, leased, admit, commit, metadata?, settle,
+      VerifiedCore.Cas.Receive.access, VerifiedCore.Cas.Receive.lease, VerifiedCore.Cas.Receive.bao,
+      Cas.IngestCommit.admit, Cas.IngestCommit.commitGroups, Cas.IngestCommit.commitIn,
+      within, ensure, transactionOver, raise, performOver, Inject.inject, Program.mapEffects,
+      execute, Interpreter.handle, SimulatedHost.access, SimulatedHost.lease,
+      SimulatedHost.bao, reply, fault, record, quiet, idle, clean,
+      scanFailure, observedClaim, observed, decoded, incomplete, admitted,
+      selected, large, nonempty, interrupted, counter, setCounter,
+      lookupFile, writeFile, Except.mapError, Except.map,
+      bind, pure, Program.bind, ExceptT.bind, ExceptT.bindCont, ExceptT.pure, ExceptT.run, ExceptT.mk]
+
 end Synchronicity.CasReceiveStateProofs

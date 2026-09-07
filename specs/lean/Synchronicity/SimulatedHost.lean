@@ -91,10 +91,12 @@ structure State where
   decodeInline : ByteArray → UInt64 → Option ByteArray → List (UInt64 × UInt64) → UInt64 →
     Option ByteArray := fun _ _ inline _ _ => some (inline.getD ByteArray.empty)
   decodeSlice : ByteArray → UInt64 → List (UInt64 × UInt64) → UInt64 → Bool := fun _ _ _ _ => true
+  decodeSliceFailure : Failure := ⟨3, 0⟩
   /-- The trusted Bao decoder's physical result, using the existing payload.
   Content composition must require that this transformation writes the verified
-  bytes and preserves previously verified bytes. A successful verification bit
-  alone does not establish either fact. -/
+  bytes and preserves previously verified bytes. The transformation also runs
+  on error: the native decoder can persist a verified prefix before failing.
+  A successful verification bit alone does not establish either fact. -/
   decodedPayload : ByteArray → UInt64 → List (UInt64 × UInt64) → UInt64 → ByteArray →
     ByteArray := fun _ _ _ _ previous => previous
   proven : ByteArray → UInt64 → List (UInt64 × UInt64) → UInt64 → UInt64 →
@@ -369,11 +371,11 @@ def bao : Bao A → State → Result A
       | none => (.error invalid, state)
       | some buffer => (.ok buffer, state)
   | .decodeSlice root size spans input, state => reply state "bao:decodeSlice" fun state =>
-      if state.decodeSlice root size spans input then
-        let previous := (lookupFile state.files ("cas_payload", root)).getD ByteArray.empty
-        let bytes := state.decodedPayload root size spans input previous
-        (.ok (), { state with files := writeFile state.files ("cas_payload", root) bytes })
-      else (.error invalid, state)
+      let previous := (lookupFile state.files ("cas_payload", root)).getD ByteArray.empty
+      let bytes := state.decodedPayload root size spans input previous
+      let result : Reply Unit := if state.decodeSlice root size spans input then .ok ()
+        else .error state.decodeSliceFailure
+      (result, { state with files := writeFile state.files ("cas_payload", root) bytes })
   | .flushObject root, state => reply state "bao:flush" fun state =>
       (.ok (), { state with synced := ("cas_payload", root) :: state.synced })
   | .trimObject _ _, state => reply state "bao:trim" fun state => (.ok (), state)
