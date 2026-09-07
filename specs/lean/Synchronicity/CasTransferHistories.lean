@@ -143,4 +143,59 @@ theorem transfer_preserves_version (saved : StoredFile state root content)
         intro g
         simp [next, StoredFile.metadata, verifiedGroups, failure]
 
+/-- Each invocation receives the previous invocation's actual stored state,
+including physical writes left by a failed decoder. -/
+def receiveAll (root : ByteArray) (size : UInt64) : List Transfer → State → State
+  | [], state => state
+  | transfer :: rest, state => receiveAll root size rest (receive root size transfer state).2
+
+/-- Any finite history retains the named content and records exactly the
+union of its previously saved groups and successfully verified transfers.
+Failures and duplicates require no special reset or reconstructed host. -/
+theorem history_preserves_version (saved : StoredFile state root content)
+    (ready : Ready state) (correct : DecoderCorrect state root content saved.size) (transfers : List Transfer) :
+    ∃ final : StoredFile (receiveAll root saved.size transfers state) root content,
+      final.size = saved.size ∧ Ready (receiveAll root saved.size transfers state) ∧
+      DecoderCorrect (receiveAll root saved.size transfers state) root content final.size ∧
+      (receiveAll root saved.size transfers state).decodeSlice = state.decodeSlice ∧
+      ∀ g, spansContain (Cas.Serve.held final.metadata) g =
+        (spansContain (Cas.Serve.held saved.metadata) g ||
+          transfers.any (fun transfer => verifiedGroups state root saved.size transfer g)) := by
+  induction transfers generalizing state with
+  | nil =>
+    simp only [receiveAll]
+    refine ⟨saved, rfl, ready, correct, True.intro, ?_⟩
+    intro g
+    simp
+  | cons transfer rest ih =>
+    simp only [receiveAll]
+    obtain ⟨next, same, nextReady, nextCorrect, decision, coverage⟩ :=
+      transfer_preserves_version saved ready correct transfer
+    have tail := ih next nextReady nextCorrect
+    rw [same] at tail
+    obtain ⟨final, size, finalReady, finalCorrect, finalDecision, finalCoverage⟩ := tail
+    refine ⟨final, size, finalReady, finalCorrect, finalDecision.trans decision, ?_⟩
+    intro g
+    rw [finalCoverage, coverage]
+    simp only [verifiedGroups, decision, List.any_cons, Bool.or_assoc]
+
+/-- Further transfers never take away readable content, even across a whole
+history of failed, overlapping, repeated, or already-complete requests. The
+read runs on the resulting files and rows, and returns the same exact bytes. -/
+theorem transfers_preserve_readable_content (saved : StoredFile state root content)
+    (ready : Ready state) (correct : DecoderCorrect state root content saved.size)
+    (transfers : List Transfer) (offset length : UInt64)
+    (valid : offset.toNat ≤ saved.size.toNat)
+    (available : Cas.Read.covered saved.metadata offset
+      (min (offset.toNat + length.toNat) saved.size.toNat).toUInt64 = true) :
+    CasReadPromises.readResult (receiveAll root saved.size transfers state) root (.range offset length) = .ok
+      (content.extract offset.toNat (min (offset.toNat + length.toNat) content.size)).data.toList := by
+  obtain ⟨final, size, finalReady, _, _, coverage⟩ := history_preserves_version saved ready correct transfers
+  apply final.reads offset length finalReady.quiet (by simpa only [size] using valid)
+  rw [size]
+  apply CasRangeProofs.additional_groups_preserve_readable_ranges saved.metadata final.metadata _ _ _ available
+  intro g old
+  rw [coverage]
+  simp [old]
+
 end Synchronicity.CasTransferHistories

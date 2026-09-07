@@ -576,8 +576,8 @@ extends the read result to arbitrary available nonempty ranges: every returned
 byte equals the corresponding intended content byte, although other groups may
 be absent. `CasReceiveStateProofs.existing_receive_execution` establishes actual
 row and decoder-output persistence without the previous single-row/empty-lease
-restriction. It is a composition lemma, not yet the user theorem that any sequence
-of valid partial receives preserves all readable content. In particular, the
+restriction. It is a composition lemma; the history theorem below supplies the
+user-facing preservation result for unchanged-size file-backed content. The
 trusted decoder must preserve previously verified bytes even if it writes part
 of an answer and then fails; a successful-verification flag alone is insufficient.
 
@@ -587,8 +587,16 @@ reads: productive receives, decoder interruptions, already-complete duplicates
 and empty windows preserve previously available ranges. A successful receive
 also establishes the next stored-content invariant from its actual rows and
 file bytes. This uses the explicit primitive byte-preservation contract, not a
-premise that the later read succeeds. Iterated-history equivalence, inline
-content and other injected host-failure paths remain open.
+premise that the later read succeeds.
+
+`CasTransferHistories.transfers_preserve_readable_content` extends that result
+to arbitrary finite histories of actual receive commands, including failed,
+overlapping and repeated transfers. Every invocation uses the previous one's
+actual files and rows. `history_preserves_version` also establishes exactly the
+union of initially held and successfully verified groups. This is a preservation
+result under the stated raw decoder and healthy metadata-store contracts;
+order/replay equivalence of final reads, inline content and other injected
+host-failure paths remain open.
 
 ## Path to all proof goals
 
