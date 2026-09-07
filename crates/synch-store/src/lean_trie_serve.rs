@@ -384,7 +384,9 @@ mod tests {
         // Every position the scoped walk asks for is answered or redacted
         // and the delegate's copy ends up holding its space and not the
         // other one.
-        let scope = Scope::of(&synch_core::scope_prefixes(&["photos".to_string()]));
+        let scope = store
+            .scope_for_key(&delegate, synch_core::now_ns())
+            .unwrap();
         use synch_verified::suspend::{PeerReply, PeerRequest};
         let (_copy_dir, copy) = crate::testutil::store();
         assert!(

@@ -165,33 +165,7 @@ impl Store {
         node_id: &synch_core::NodeId,
         now: i64,
     ) -> Result<Option<(synch_core::OriginId, Option<Vec<String>>)>> {
-        let live: Vec<crate::bindings::Binding> = self
-            .live_bindings(now)?
-            .into_iter()
-            .filter(|b| &b.node_id == node_id)
-            .collect();
-        let Some(first) = live.first() else {
-            return Ok(None);
-        };
-        // A key bound to several origins speaks for the rooted one where there
-        // is one: that is the binding that makes it unrestricted, and picking
-        // a delegated origin beside it would name the caller by the narrower
-        // grant while treating it as the wider one.
-        let origin = live
-            .iter()
-            .find(|b| b.is_rooted())
-            .unwrap_or(first)
-            .origin
-            .clone();
-        if live.iter().any(|b| b.is_rooted()) {
-            return Ok(Some((origin, None)));
-        }
-        // Two rooted origins may delegate the same key independently, so their
-        // grants add rather than conflict.
-        let mut spaces: Vec<String> = live.into_iter().flat_map(|b| b.spaces).collect();
-        spaces.sort();
-        spaces.dedup();
-        Ok(Some((origin, Some(spaces))))
+        crate::lean_authorization::socket_authority(self, node_id, now)
     }
 }
 

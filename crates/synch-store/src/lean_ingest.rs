@@ -56,6 +56,7 @@ fn directory_policy() -> cas::DirectoryPolicy {
 }
 
 /// Records verified groups through the Lean metadata commit.
+#[cfg(test)]
 pub(crate) fn commit_groups(
     store: &Store,
     root: &Hash,
@@ -84,6 +85,7 @@ pub(crate) fn commit_groups(
 
 /// Refuses a size the row's claim cannot yield to, before any bytes are
 /// decoded against it.
+#[cfg(test)]
 pub(crate) fn admit_size(store: &Store, root: &Hash, size: u64) -> Result<()> {
     let mut storage = crate::lean_storage::Session::new(store);
     cas::admit_size(&mut storage, root.as_bytes(), size).map_err(error)

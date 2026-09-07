@@ -7,7 +7,7 @@ use synch_core::{
     delegation_key, file_key, now_ns, ChunkRanges, Delegation, FileEntry, Hash, NodeId, SignedHead,
 };
 use synch_engine::Syncer;
-use synch_mpt::{Scope, Trie};
+use synch_mpt::Trie;
 use synch_store::{Slot, StoreError};
 
 mod common;
@@ -242,7 +242,7 @@ async fn a_delegate_is_admitted_by_replicated_state_and_sees_only_its_spaces() {
         .get(head.root, &file_key("finance", "q3.pdf").unwrap())
         .is_err());
     // The scope check agrees with what actually landed.
-    let scope = Scope::of(&synch_core::scope_prefixes(&["photos".to_string()]));
+    let scope = delegate.store.local_trie_scope().unwrap();
     assert!(trie.is_complete_scoped(head.root, &scope).unwrap());
     assert!(!trie.is_complete(head.root).unwrap());
 

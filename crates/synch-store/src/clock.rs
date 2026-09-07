@@ -139,32 +139,6 @@ impl Store {
         self.trust_floor()
     }
 
-    /// The instant a trust decision is evaluated at: `reading`, floored by
-    /// `Store::trust_floor`.
-    ///
-    /// An untrustworthy reading is returned unchanged rather than rescued by
-    /// the floor — a stored floor is evidence about the past, not a substitute
-    /// for knowing what time it is now, and every expiry check refuses an
-    /// instant it cannot trust.
-    pub fn trust_instant(&self, reading: i64) -> Result<i64> {
-        Self::trust_instant_on(&self.conn(), reading)
-    }
-
-    /// Dates a trust decision against the transaction's own clock floor.
-    pub(crate) fn trust_instant_on(conn: &rusqlite::Connection, reading: i64) -> Result<i64> {
-        if !clock_is_trusted(reading) {
-            return Ok(reading);
-        }
-        let floor: Option<String> = conn
-            .query_row(
-                "SELECT value FROM config WHERE key = ?1",
-                rusqlite::params![CLOCK_FLOOR_KEY],
-                |row| row.get(0),
-            )
-            .optional()?;
-        Ok(reading.max(floor.and_then(|text| text.parse::<i64>().ok()).unwrap_or(0)))
-    }
-
     /// What the clock reads and whether trust can be dated by it.
     pub fn clock_status(&self, reading: i64) -> Result<ClockStatus> {
         let floor = self.trust_floor()?;
@@ -190,7 +164,6 @@ mod tests {
         let good = MIN_TRUSTED_NS + 10_000;
         assert_eq!(store.advance_trust_floor(good).unwrap(), good);
         // A dead-RTC reading stays untrustworthy, whatever the floor says.
-        assert_eq!(store.trust_instant(0).unwrap(), 0);
         let status = store.clock_status(0).unwrap();
         assert!(!status.trusted);
         assert_eq!(status.floor, good);
@@ -207,9 +180,7 @@ mod tests {
         // Trust time can stand still, never run backwards.
         let stepped_back = MIN_TRUSTED_NS + 1_000;
         assert_eq!(store.advance_trust_floor(stepped_back).unwrap(), high);
-        assert_eq!(store.trust_instant(stepped_back).unwrap(), high);
         assert!(store.clock_status(stepped_back).unwrap().stepped_back);
-        assert_eq!(store.trust_instant(high + 5).unwrap(), high + 5);
 
         // A reading far past the floor cannot pin it — one wild reading must
         // not jam the floor forever — while ordinary advances still land.

@@ -13,6 +13,7 @@ use crate::{Result, StoreError};
 
 #[cfg(test)]
 thread_local! {
+    static SQL_SCAN_WORK: std::cell::Cell<(usize, i32)> = const { std::cell::Cell::new((0, 0)) };
     static BYTE_READ_CALLS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
 
@@ -20,6 +21,12 @@ thread_local! {
 #[cfg(test)]
 pub(crate) fn take_byte_read_calls() -> usize {
     BYTE_READ_CALLS.with(|calls| calls.replace(0))
+}
+
+/// Actual SQL work on this test thread: projected rows and full-scan steps.
+#[cfg(test)]
+pub(crate) fn take_sql_scan_work() -> (usize, i32) {
+    SQL_SCAN_WORK.with(|work| work.replace((0, 0)))
 }
 
 /// Raw keyed resources; no CAS protection or cleanup policy is interpreted here.
@@ -292,6 +299,14 @@ impl Storage for Session<'_> {
     fn read_bytes(&mut self, space: &str, key: &[u8]) -> Result<Option<Vec<u8>>> {
         #[cfg(test)]
         BYTE_READ_CALLS.with(|calls| calls.set(calls.get() + 1));
+        if matches!(space, "cas_payload" | "cas_outboard") {
+            let path = crate::lean_resources::target(self.store, space, key)?;
+            return match std::fs::read(path) {
+                Ok(bytes) => Ok(Some(bytes)),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(None),
+                Err(error) => Err(error.into()),
+            };
+        }
         if let Some(storage) = self.active.as_mut() {
             storage.read_bytes(space, key)
         } else {
@@ -425,6 +440,18 @@ fn columns_for(relation: &str) -> Result<&'static [&'static str]> {
         ]),
         "trie_nodes" | "trie_values" => Ok(&["hash", "data"]),
         "trie_node_origins" => Ok(&["origin_id", "hash"]),
+        "bindings" => Ok(&[
+            "origin_id",
+            "node_id",
+            "source",
+            "domain",
+            "issuer",
+            "spaces",
+            "note",
+            "added_at",
+            "expires_at",
+        ]),
+        "device_keys" => Ok(&["node_id", "state", "created_at"]),
         "config" => Ok(&["key", "value"]),
         _ => Err(StoreError::invalid("unsupported storage relation")),
     }
@@ -767,6 +794,14 @@ impl Storage for SqliteStorage<'_> {
                 }
             }
         }
+        #[cfg(test)]
+        SQL_SCAN_WORK.with(|work| {
+            let (rows, steps) = work.get();
+            work.set((
+                rows + scan.rows.len(),
+                steps + statement.get_status(rusqlite::StatementStatus::FullscanStep),
+            ));
+        });
         Ok(scan)
     }
 

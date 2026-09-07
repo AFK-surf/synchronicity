@@ -237,6 +237,19 @@ impl Drop for Pool<'_> {
 pub(crate) struct Files<'a>(Rc<RefCell<Pool<'a>>>);
 
 impl<'a> Files<'a> {
+    /// Writes literal bytes into an invocation-owned temporary. This does not
+    /// publish, flush, consume, or choose a destination for the handle.
+    pub(crate) fn write_temporary(&mut self, handle: u64, offset: u64, bytes: &[u8]) -> Result<()> {
+        self.0
+            .borrow_mut()
+            .temporary(handle)?
+            .file
+            .as_mut()
+            .ok_or_else(|| StoreError::invalid("temporary file is closed"))?
+            .write_all_at(offset, bytes)?;
+        Ok(())
+    }
+
     pub(crate) fn new(store: &'a Store, input: Input<'a>) -> Self {
         Self(Rc::new(RefCell::new(Pool {
             store,
@@ -250,7 +263,7 @@ impl<'a> Files<'a> {
     }
 }
 
-fn target(store: &Store, space: &str, key: &[u8]) -> Result<PathBuf> {
+pub(crate) fn target(store: &Store, space: &str, key: &[u8]) -> Result<PathBuf> {
     let root = Hash::from_slice(key).map_err(|error| StoreError::invalid(error.to_string()))?;
     match space {
         "cas_payload" => Ok(store.blob_path(&root)),

@@ -314,17 +314,6 @@ impl CloudStore {
         self.read_object_range(&key, range).await
     }
 
-    /// Reads the complete outboard object.
-    pub(crate) async fn read_outboard(&self, root: &Hash) -> Result<Bytes> {
-        let key = Self::outboard_key(root);
-        let buffer = self
-            .operator
-            .read(&key)
-            .await
-            .map_err(|source| cloud("read", &key, source))?;
-        Ok(buffer.to_bytes())
-    }
-
     /// Deletes a final pair idempotently for NotFound-path tests. Production
     /// final CAS keys are append-only.
     #[cfg(test)]
@@ -363,6 +352,24 @@ impl CloudStore {
             .await
             .map_err(|source| cloud("write", key, source))?;
         Ok(())
+    }
+
+    /// Reads literal object metadata without deciding whether a CAS pair exists.
+    pub(crate) async fn stat_object(&self, key: &str) -> Result<u64> {
+        self.operator
+            .stat(key)
+            .await
+            .map(|metadata| metadata.content_length())
+            .map_err(|source| cloud("stat", key, source))
+    }
+
+    /// Reads one literal object; availability and repair policy belong to Lean.
+    pub(crate) async fn read_object(&self, key: &str) -> Result<Bytes> {
+        self.operator
+            .read(key)
+            .await
+            .map(|buffer| buffer.to_bytes())
+            .map_err(|source| cloud("read", key, source))
     }
 
     /// Reads a byte range from an arbitrary backend-private object key.
@@ -520,7 +527,7 @@ mod tests {
             payload[17..91_337]
         );
         assert!(!cloud
-            .read_outboard(&ingested.root)
+            .read_object(&CloudStore::outboard_key(&ingested.root))
             .await
             .unwrap()
             .is_empty());

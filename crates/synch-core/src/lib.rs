@@ -22,10 +22,10 @@ pub use origin::{NodeId, OriginId};
 pub use path::{normalize_native_path, normalize_path, MAX_KEY_LEN};
 pub use record::{
     blob_key, delegation_key, dir_prefix, file_key, manifest_key, parse_blob_key,
-    parse_delegation_key, parse_file_key, parse_replica_claim_key, publish_prefixes,
-    replica_claim_key, scope_prefixes, space_info_key, space_prefix, validate_space, AdState,
-    BlobAd, Delegation, EntryKind, FileEntry, KeyError, NodeManifest, ReplicaClaim, ScopeKeys,
-    SpaceInfo, AD_SPAN_GRANULARITY, MAX_AD_SPANS, MAX_DELEGATION_SPACES, RECORD_VERSION,
+    parse_delegation_key, parse_file_key, parse_replica_claim_key, replica_claim_key,
+    space_info_key, space_prefix, validate_space, AdState, BlobAd, Delegation, EntryKind,
+    FileEntry, KeyError, NodeManifest, ReplicaClaim, ScopeKeys, SpaceInfo, AD_SPAN_GRANULARITY,
+    MAX_AD_SPANS, MAX_DELEGATION_SPACES, RECORD_VERSION,
 };
 pub use sock::{
     display_text_is_safe, parse_socket_manifest, valid_ebpf_stack_frame_size, Declaration,

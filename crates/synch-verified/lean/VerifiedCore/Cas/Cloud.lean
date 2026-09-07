@@ -146,6 +146,16 @@ def hydrateStep (root : ByteArray) (size : UInt64) (stop offset : Nat) : Action 
   cacheTrustedRange root size offset.toUInt64 bytes
   return .inl endOffset
 
+/-- The recursion budget counts provider windows, not host effects. Every
+window's transaction and cleanup run to completion before the next window;
+there is no effect budget that could cut off a pending rollback. -/
+def hydrateWindows (root : ByteArray) (size : UInt64) (stop : Nat) : Nat → Nat → Action Unit
+  | 0, _ => throw .protocol
+  | remaining + 1, offset => do
+    match ← hydrateStep root size stop offset with
+    | .inr () => return ()
+    | .inl next => hydrateWindows root size stop remaining next
+
 def hydrate (root : ByteArray) (size : UInt64) (groups : List GroupSpan) : Action Unit := do
   if groups.isEmpty then return ()
   leased root do
@@ -154,7 +164,7 @@ def hydrate (root : ByteArray) (size : UInt64) (groups : List GroupSpan) : Actio
     for span in groups do
       let start := min (span.start * 16384) size.toNat
       let stop := min (span.stop * 16384) size.toNat
-      OperationOver.iterate (hydrateStep root size stop) Error.protocol ((stop - start) / windowBytes + 2) start
+      hydrateWindows root size stop ((stop - start) / windowBytes + 2) start
 
 /-- Restore the complete durable object into cache. Existing inline bytes or
 complete files need no provider wait; only real provider absence heals the

@@ -66,6 +66,7 @@ pub(crate) fn reconcile_scratch(store: &Store, marker: &str) -> Result<bool> {
 
 /// The caller holds the CAS ordering guard, so the writer count Lean reads
 /// first cannot change before the rows and files it then clears.
+#[cfg(test)]
 pub(crate) fn clear_cache(store: &Store, conn: &rusqlite::Connection, root: &Hash) -> Result<bool> {
     let mut storage = crate::lean_storage::SqliteStorage::new(conn);
     let mut resources = crate::lean_storage::Resources(store);

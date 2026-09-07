@@ -39,10 +39,14 @@ impl OriginId {
 
     /// The canonical text rendering, as stored in the `origin_id` SQL columns (§10).
     pub fn canonical(&self) -> String {
-        match self {
-            OriginId::Key(k) => format!("key:{}", k.to_z32()),
-            OriginId::Named { domain, id } => format!("{id}@{domain}"),
-        }
+        let value = match self {
+            OriginId::Key(key) => verified::Parsed::Key(key.as_bytes().to_vec()),
+            OriginId::Named { domain, id } => verified::Parsed::Named(verified::Named {
+                domain: domain.clone(),
+                id: id.clone(),
+            }),
+        };
+        verified::canonical(&value).expect("canonical origin serialization failed")
     }
 
     /// The device key, if this origin is key-identified.
@@ -196,6 +200,19 @@ mod tests {
     use iroh_base::SecretKey;
 
     use super::*;
+
+    #[test]
+    fn canonical_key_uses_the_independent_rfc8032_wire_vector() {
+        let bytes = [
+            215, 90, 152, 1, 130, 177, 10, 183, 213, 75, 254, 211, 201, 100, 7, 58, 14, 225, 114,
+            243, 218, 166, 35, 37, 175, 2, 26, 104, 247, 7, 81, 26,
+        ];
+        let key = NodeId::from_bytes(&bytes).unwrap();
+        assert_eq!(
+            OriginId::Key(key).canonical(),
+            "key:47pjoycnsrfmxikm95jh13y88e8qnhzu5kungjpxyepgt7a8krpy"
+        );
+    }
 
     #[test]
     fn key_origin_round_trip() {

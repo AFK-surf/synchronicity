@@ -590,14 +590,17 @@ impl Syncer {
         let judged: std::cell::RefCell<Option<Verdict>> = std::cell::RefCell::new(None);
         // The completeness check, slot flip, derived entries and retention
         // decisions share this commit. The exact shared-view guarantee is
-        // an open composition obligation in `docs/RUST-LEAN-PROOFS.md`.
+        // an open composition obligation in `docs/LEAN.md`.
         let promoted = self.store.transaction(|txn| -> Result<Promotion> {
             // Read permissions in the same snapshot as completeness and the
             // resulting view. A grant change before this transaction must not
             // leave promotion using an older, wider publication authority or
             // a narrower completeness check than materialization uses.
             let read_scope = txn.materialization_scope(origin)?;
-            let (publish_scope, owner) = txn.promotion_authority(origin, now)?;
+            let authority = txn.promotion_authority(origin, now)?;
+            let publish_scope = authority.publication;
+            let owner = authority.provenance;
+            let publish_keys = authority.trie_scope;
             let Some(pending) = txn.head(origin, Slot::Pending)? else {
                 return Ok(Promotion::Idle);
             };
@@ -714,9 +717,8 @@ impl Syncer {
                     return Ok(Promotion::Refused);
                 }
                 PublishScope::Unrestricted => {}
-                PublishScope::Confined(spaces) => {
-                    let scope = Scope::of(&synch_core::publish_prefixes(spaces));
-                    if let Some(key) = trie.first_key_outside(pending.head.root, &scope)? {
+                PublishScope::Confined(_) => {
+                    if let Some(key) = trie.first_key_outside(pending.head.root, &publish_keys)? {
                         tracing::warn!(
                             origin = %origin,
                             seq = pending.head.seq,
@@ -1200,11 +1202,7 @@ impl Syncer {
         // rooted binding for a delegate, which is exactly the distinction that
         // closes it. A delegate bootstrapping holds a static or DNS binding for
         // the peers it dials, so it still learns its own scope.
-        let rooted = self
-            .store
-            .live_bindings(now_ns())?
-            .into_iter()
-            .any(|b| b.node_id == peer && b.is_rooted());
+        let rooted = self.store.is_rooted_key(&peer, now_ns())?;
         if !rooted {
             if *declared != DeclaredScope::Untrusted {
                 tracing::debug!(

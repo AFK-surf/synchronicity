@@ -57,6 +57,14 @@ impl Scope {
         }
     }
 
+    /// Reconstruct the grant returned by a complete verified authorization read.
+    pub fn from_verified(scope: synch_verified::authorization::TrieScope) -> Scope {
+        Scope {
+            prefixes: scope.prefixes,
+            exact: scope.exact,
+        }
+    }
+
     /// True if this scope is the whole keyspace.
     pub fn is_full(&self) -> bool {
         self.prefixes.is_none()
@@ -121,7 +129,14 @@ mod tests {
     fn a_scope_hands_its_parts_to_the_serving_side() {
         assert_eq!(Scope::full().prefixes(), None);
         assert!(Scope::full().exact().is_empty());
-        let scope = Scope::of(&synch_core::scope_prefixes(&["photos".to_string()]));
+        let scope = Scope::of(&synch_core::ScopeKeys {
+            prefixes: vec![b"d:".to_vec(), b"f:photos/".to_vec()],
+            exact: vec![
+                b"m:self".to_vec(),
+                b"m:space/photos".to_vec(),
+                b"r:photos".to_vec(),
+            ],
+        });
         let prefixes = scope.prefixes().expect("a delegated scope is bounded");
         assert!(prefixes.contains(&path(b"f:photos/")));
         assert!(scope.exact().contains(&path(b"m:space/photos")));

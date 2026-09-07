@@ -14,17 +14,14 @@ use std::{
 };
 
 use bao_tree::{
-    io::{
-        outboard::PreOrderOutboard,
-        sync::{decode_ranges, WriteAt},
-    },
+    io::{outboard::PreOrderOutboard, sync::decode_ranges},
     BaoTree, BlockSize, ChunkNum,
 };
 use rusqlite::{params, OptionalExtension};
-use synch_core::{
-    group_count, groups_for_byte_range, BlobAd, ChunkRanges, GroupRange, Hash, CHUNK_GROUP_LOG2,
-    CHUNK_GROUP_SIZE, INLINE_BLOB_MAX,
-};
+use synch_core::{BlobAd, ChunkRanges, GroupRange, Hash, CHUNK_GROUP_LOG2};
+
+#[cfg(test)]
+use synch_core::{group_count, CHUNK_GROUP_SIZE};
 
 use crate::{
     db::{hash_column, Store, Txn},
@@ -149,54 +146,6 @@ pub(crate) fn fsync_file(file: &File) -> Result<()> {
 pub(crate) use synch_core::fs::fsync_parent;
 
 pub(crate) use synch_core::fs::replace_file;
-
-/// Writes a file whole and flushes it (contents and directory entry) to stable
-/// storage before returning.
-///
-/// Staged and renamed, never written in place. `File::create` truncates first,
-/// and the object this replaces may already be held complete: re-ingesting
-/// content the CAS already has is routine, not exotic — a duplicate file
-/// anywhere in a scanned tree, the scanner's racily-clean re-ingest, an
-/// explicit re-`put` — and for a large object the window between the truncate
-/// and the last byte is the length of the whole write. A power loss inside it
-/// left the object with its `complete = 1` row intact and a truncated outboard
-/// behind it: still advertised by `local_ad`, still `has_complete_blob`, but no
-/// longer satisfying the stable-storage promise represented by that row. The
-/// payload beside it already staged and renamed ([`Store::ingest_file`]); this
-/// is the same rule applied to the file that describes it.
-///
-/// The staging file lives in the staging directory, which [`Store::gc_staging`]
-/// sweeps by age, so a crash between the write and the rename leaks nothing
-/// permanently.
-fn write_and_sync(
-    staging_dir: &std::path::Path,
-    path: &std::path::Path,
-    data: &[u8],
-) -> Result<()> {
-    std::fs::create_dir_all(staging_dir)?;
-    let staging = staging_dir.join(format!("{}.tmp", synch_core::fs::unique_suffix()));
-    let write = || -> Result<()> {
-        let mut file = File::create(&staging)?;
-        file.write_all(data)?;
-        fsync_file(&file)?;
-        Ok(())
-    };
-    if let Err(e) = write() {
-        let _ = std::fs::remove_file(&staging);
-        return Err(e);
-    }
-    if let Some(parent) = path.parent() {
-        std::fs::create_dir_all(parent)?;
-    }
-    // `rename` is atomic within a filesystem: a reader sees either the whole
-    // old file or the whole new one, never a truncated prefix of either.
-    if let Err(e) = replace_file(&staging, path) {
-        let _ = std::fs::remove_file(&staging);
-        return Err(e.into());
-    }
-    fsync_parent(path);
-    Ok(())
-}
 
 /// Who holds a pin (`docs/REPLICATION.md` §3.1).
 ///
@@ -493,6 +442,7 @@ impl Store {
     /// complete, durable or final-group-holding row can refuse; a changed
     /// tree shape resets an unattested bitmap; and the merged groups are
     /// written as ranges, `NULL` when there are none or all.
+    #[cfg(test)]
     pub(crate) fn commit_groups(
         &self,
         root: &Hash,
@@ -508,6 +458,7 @@ impl Store {
     /// by the same Lean settlement outside a transaction, so a writer never
     /// decodes bytes (and writes an outboard of the wrong shape) against a
     /// claim the commit would refuse anyway.
+    #[cfg(test)]
     pub(crate) fn admit_size(&self, root: &Hash, size: u64) -> Result<()> {
         crate::lean_ingest::admit_size(self, root, size)
     }
@@ -635,20 +586,10 @@ impl Store {
         self.blob_path(root).is_file() && self.outboard_path(root).is_file()
     }
 
-    /// Reads the whole cached outboard when present.
-    pub(crate) fn cached_outboard(&self, root: &Hash) -> Option<Vec<u8>> {
-        std::fs::read(self.outboard_path(root)).ok()
-    }
-
-    /// Caches a complete remote outboard without claiming any payload groups.
-    pub(crate) fn cache_outboard(&self, root: &Hash, bytes: &[u8]) -> Result<()> {
-        let _lease = self.lease_write(root);
-        write_and_sync(&self.staging_dir(), &self.outboard_path(root), bytes)
-    }
-
     /// Drops only reconstructible local bytes while retaining a remote durable
     /// claim. The row changes first, so a crash can leave only harmless orphan
     /// files, never a warm-cache claim with missing bytes.
+    #[cfg(test)]
     pub(crate) fn clear_blob_cache(&self, root: &Hash) -> Result<bool> {
         // Cache eviction retains the remote claim; callers select durable
         // cache rows. Non-durable staged rows can instead be removed, as in
@@ -1055,80 +996,6 @@ impl Store {
         requested: &ChunkRanges,
     ) -> Result<(Vec<u8>, ChunkRanges)> {
         crate::lean_serve::encode_slice(self, root, requested)
-    }
-
-    /// Caches one group-aligned range returned by the trusted remote backend.
-    ///
-    /// This deliberately does not run the bytes back through bao. OpenDAL's
-    /// successful write/read contract is the storage-integrity boundary; bao
-    /// verification remains for slices received from peers in [`Store::write_slice`].
-    pub(crate) fn cache_trusted_range(
-        &self,
-        root: &Hash,
-        size: u64,
-        offset: u64,
-        bytes: &[u8],
-        now: i64,
-    ) -> Result<ChunkRanges> {
-        let end = offset
-            .checked_add(bytes.len() as u64)
-            .ok_or_else(|| StoreError::invalid("trusted cache range overflowed"))?;
-        if offset > size || end > size {
-            return Err(StoreError::RangeOutOfBounds {
-                start: offset,
-                end,
-                size,
-            });
-        }
-        if !offset.is_multiple_of(CHUNK_GROUP_SIZE)
-            || (end != size && !end.is_multiple_of(CHUNK_GROUP_SIZE))
-        {
-            return Err(StoreError::invalid(
-                "trusted cache writes must cover whole chunk groups",
-            ));
-        }
-        let served = if size == 0 {
-            ChunkRanges::single(0, 1)
-        } else {
-            ChunkRanges::from_ranges([groups_for_byte_range(offset, end)])
-                .intersect(&ChunkRanges::single(0, group_count(size)))
-        };
-        if served.is_empty() {
-            return Ok(served);
-        }
-
-        let _lease = self.lease_write(root);
-        self.admit_size(root, size)?;
-        if self.blob(root)?.is_some_and(|row| row.complete) {
-            return Ok(ChunkRanges::empty());
-        }
-
-        if size <= INLINE_BLOB_MAX {
-            if offset != 0 || end != size {
-                return Err(StoreError::invalid(
-                    "an inline cache fill must contain the whole object",
-                ));
-            }
-            self.commit_groups(root, size, &served, Some(bytes.to_vec()), now)?;
-            return Ok(served);
-        }
-
-        let payload_path = self.blob_path(root);
-        if let Some(parent) = payload_path.parent() {
-            std::fs::create_dir_all(parent)?;
-        }
-        let mut payload = OpenOptions::new()
-            .read(true)
-            .write(true)
-            .create(true)
-            .truncate(false)
-            .open(&payload_path)?;
-        payload.write_all_at(offset, bytes)?;
-        fsync_file(&payload)?;
-        fsync_parent(&payload_path);
-        let commit = self.commit_groups(root, size, &served, None, now)?;
-        self.trim_to_size(root, commit);
-        Ok(served)
     }
 
     /// Decodes a received bao slice into the CAS, verifying every group against

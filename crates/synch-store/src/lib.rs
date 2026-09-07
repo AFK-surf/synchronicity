@@ -10,7 +10,9 @@ pub mod db;
 pub mod error;
 pub mod gc;
 pub mod heads;
+mod lean_authorization;
 mod lean_bao;
+mod lean_cloud;
 mod lean_collect;
 mod lean_diagnostics;
 mod lean_durable;
@@ -45,7 +47,7 @@ pub mod unified;
 pub mod uploads;
 pub mod views;
 
-pub use bindings::{Binding, BindingSource, PublishScope};
+pub use bindings::{Binding, BindingSource, BindingStatus, PromotionAuthority, PublishScope};
 pub use cas::{PinHolder, PinRow};
 pub use clock::ClockStatus;
 pub use db::{
