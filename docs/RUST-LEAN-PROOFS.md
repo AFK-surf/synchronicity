@@ -117,6 +117,44 @@ scoped-sync behavior or closure of eventual consistency. Legitimate private
 omissions still need authenticated proof or a representation/protocol change;
 do not weaken the existing successful-sharing requirements to hide this gap.
 
+### Representation work required for private omissions
+
+The implementation path to evaluate is an explicit routing node above every
+possible authorization boundary, retaining compression inside a fully shared
+subtree. A routing node discloses one edge at a time; a missing edge can then
+establish that the granted path is absent without transmitting an unrelated
+private suffix. Values on a routing spine must be separate addressed payloads,
+so a private exact key does not prevent revealing its shared descendants.
+This is planned representation work, not a property of the current format.
+
+Derive routing boundaries from the metadata schema and all possible scopes,
+not the grants currently installed on one device. Cover `f:<space>/`, exact
+`r:<space>` and `m:space/<space>`, `m:self`, and the public delegation namespace.
+The new form must preserve the independently defined entries. Only the routing
+spines need expansion; per-file paths within a shared space retain compression.
+Measure the storage, publication and fetch cost on the existing large corpus.
+
+Implement and check these dependencies together:
+
+1. Specify the new canonical node form, address domains and format negotiation.
+   Extend codecs, verification, traversal, serving, mutation and collection;
+   permit verified small out-of-line values where the new form requires them.
+2. Normalize real publications and prove exact entry preservation. Generic
+   mutation may compress a spine, so publication must establish the routing
+   invariant before signing and atomically retain the resulting graph.
+3. Connect permitted-path traversal to actual served bytes, authenticated
+   nonmembership and exact completion. Preserve both the empty permitted-view
+   fixture and the private-value-above-shared-descendant case.
+4. Upgrade actual publishers to republish preserved logical entries under a
+   later signed version. Relays cannot change a legacy signed root. Keep
+   legacy full reads and explicit incomplete restricted views honest; prove
+   convergence through the implemented upgrade/publication path rather than
+   silently assuming away accepted older roots.
+
+A signed refusal alone does not prove consistency with the signed snapshot.
+Plain hashes of space names are also insufficient to hide guessable private
+names. Neither is a substitute for authenticated structural absence.
+
 Likewise, `TrieServePrivacyProofs` checks the implemented per-position scope
 rules across an answer. That is useful support for P4, but is not a complete
 access-control theorem: grant validity, actual source/position linkage,
