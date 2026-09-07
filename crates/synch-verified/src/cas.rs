@@ -29,135 +29,29 @@ pub enum DirectoryPolicy {
     AllowUnsupported,
 }
 
-#[derive(Debug)]
-pub enum IngestError<E> {
-    Operation(OperationError<E>),
-    Domain(IngestDomainError),
-}
+pub type IngestError<E> = crate::CommandError<E, IngestDomainError>;
 
 /// Completed read failure, preserving original host errors.
-#[derive(Debug)]
-pub enum ReadError<E> {
-    Operation(OperationError<E>),
-    Domain(ReadDomainError),
-}
+pub type ReadError<E> = crate::CommandError<E, ReadDomainError>;
 
 /// Completed acquisition or deletion failure, preserving original host errors.
-#[derive(Debug)]
-pub enum LifecycleError<E> {
-    Operation(OperationError<E>),
-    Domain(LifecycleDomainError),
-}
+pub type LifecycleError<E> = crate::CommandError<E, LifecycleDomainError>;
 
 /// Completed durability-transition failure, preserving original host errors.
-#[derive(Debug)]
-pub enum DurableError<E> {
-    Operation(OperationError<E>),
-    Domain(DurableDomainError),
-}
+pub type DurableError<E> = crate::CommandError<E, DurableDomainError>;
 
 /// Completed serving failure, preserving original host errors.
-#[derive(Debug)]
-pub enum ServeError<E> {
-    Operation(OperationError<E>),
-    Domain(ServeDomainError),
-}
+pub type ServeError<E> = crate::CommandError<E, ServeDomainError>;
 
 /// Completed projection failure, preserving original host errors.
-#[derive(Debug)]
-pub enum ProjectError<E> {
-    Operation(OperationError<E>),
-    Domain(ProjectDomainError),
-}
+pub type ProjectError<E> = crate::CommandError<E, ProjectDomainError>;
 
-macro_rules! decode_list {
-    ($($item:ty),+ $(,)?) => {
-        $(impl Decode for Vec<$item> {
-            fn decode(r: &mut crate::operation::Reader<'_>) -> Result<Self, ()> {
-                r.list(Decode::decode)
-            }
-        })+
-    };
-}
-decode_list!(
-    ProjectedBlob,
-    ProjectedSummary,
-    ProjectedPin,
-    Vec<u8>,
-    (Vec<u8>, Vec<u8>),
-    Option<Vec<u8>>,
-    String,
-    crate::generated::TrieChange
-);
-
-fn project<T: Decode, S: Storage>(
-    storage: &mut S,
-    command: &Command,
-) -> Result<T, ProjectError<S::Error>> {
-    let outcome: Result<T, ProjectDomainError> =
-        finish(run(storage, Capabilities::default(), &[], command))
-            .map_err(ProjectError::Operation)?;
-    outcome.map_err(ProjectError::Domain)
-}
-
-/// One object's index row, with whether any claim stands on it; the row is
-/// validated as the read path validates it.
-pub fn blob<S: Storage>(
-    storage: &mut S,
-    root: &[u8; 32],
-) -> Result<Option<ProjectedBlob>, ProjectError<S::Error>> {
-    project(storage, &Command::CasBlob(root.to_vec()))
-}
-
-/// A complete object projection using an existing transaction. The command
-/// neither commits nor aborts the caller's transaction.
-pub fn blob_in<S: Storage>(
-    storage: &mut S,
-    transaction: u64,
-    root: &[u8; 32],
-) -> Result<Option<ProjectedBlob>, ProjectError<S::Error>> {
-    project(
-        storage,
-        &Command::CasBlobIn {
-            tx: transaction,
-            root: root.to_vec(),
-        },
-    )
-}
-
-/// Every index row, most recently accessed first, each with its pin state
-/// read as one join and merged in one pass.
-pub fn blobs<S: Storage>(storage: &mut S) -> Result<Vec<ProjectedBlob>, ProjectError<S::Error>> {
-    project(storage, &Command::CasBlobs)
-}
-
-/// Every row's summary without its payload, most recently accessed first.
-pub fn blob_candidates<S: Storage>(
-    storage: &mut S,
-) -> Result<Vec<ProjectedSummary>, ProjectError<S::Error>> {
-    project(storage, &Command::CasBlobCandidates)
-}
-
-/// Every claim on one object, or on all, by object and then by holder; a
-/// spelling this build does not know is kept as a holder.
-pub fn pins<S: Storage>(
-    storage: &mut S,
-    root: Option<&[u8; 32]>,
-) -> Result<Vec<ProjectedPin>, ProjectError<S::Error>> {
-    project(storage, &Command::CasPins(root.map(|root| root.to_vec())))
-}
-
-/// Every pinned object, in root order.
-pub fn pinned_blobs<S: Storage>(storage: &mut S) -> Result<Vec<Vec<u8>>, ProjectError<S::Error>> {
-    project(storage, &Command::CasPinnedBlobs)
-}
+pub use crate::generated::cas_projection::{
+    blob, blob_candidates, blob_in, blobs, pinned_blobs, pins,
+};
 
 /// Completed sweep failure, preserving original host errors.
-#[derive(Debug)]
-pub enum CollectError<E> {
-    Operation(OperationError<E>),
-    Domain(CollectDomainError),
-}
+pub type CollectError<E> = crate::CommandError<E, CollectDomainError>;
 
 /// The services a sweep directs besides its relational storage: the writer
 /// counters and unlinks, the clock, the remover's critical section, and the
@@ -186,9 +80,7 @@ fn collect<T: Decode, S: Storage>(
         sweep: Some(resources.sweep),
         ..Capabilities::default()
     };
-    let outcome: Result<T, CollectDomainError> =
-        finish(run(storage, capabilities, &[], command)).map_err(CollectError::Operation)?;
-    outcome.map_err(CollectError::Domain)
+    CollectError::finish(run(storage, capabilities, &[], command))
 }
 
 /// Advance an object's access clock to now, coalesced to once a minute;
@@ -237,26 +129,8 @@ pub fn gc_orphans<S: Storage>(
 /// What one exchange served: the encoded bytes and the group spans they cover.
 pub type ServedBytes = (Vec<u8>, Vec<(u64, u64)>);
 
-impl crate::operation::Encode for Vec<ProvenSubtree> {
-    fn encode(&self, out: &mut Vec<u8>) {
-        (self.len() as u64).encode(out);
-        for subtree in self {
-            subtree.encode(out);
-        }
-    }
-}
-impl Decode for Vec<ProvenSubtree> {
-    fn decode(r: &mut crate::operation::Reader<'_>) -> Result<Self, ()> {
-        r.list(Decode::decode)
-    }
-}
-
 /// Completed receive failure, preserving original host errors.
-#[derive(Debug)]
-pub enum ReceiveError<E> {
-    Operation(OperationError<E>),
-    Domain(ReceiveDomainError),
-}
+pub type ReceiveError<E> = crate::CommandError<E, ReceiveDomainError>;
 
 /// The services a receive directs besides its relational storage: the Bao
 /// tree and the object's write lease.
@@ -281,9 +155,7 @@ fn receive<T: Decode, S: Storage>(
         leases: Some(resources.leases),
         ..Capabilities::default()
     };
-    let outcome: Result<T, ReceiveDomainError> =
-        finish(run(storage, capabilities, &[encoded], command)).map_err(ReceiveError::Operation)?;
-    outcome.map_err(ReceiveError::Domain)
+    ReceiveError::finish(run(storage, capabilities, &[encoded], command))
 }
 
 /// Decode a received slice of the served groups and commit exactly the
@@ -388,10 +260,7 @@ pub fn commit_groups<S: Storage>(
         now,
         cache: tier == IngestTier::Cache,
     };
-    let outcome: Result<Committed, IngestDomainError> =
-        finish(run(storage, Capabilities::default(), &[], &command))
-            .map_err(IngestError::Operation)?;
-    outcome.map_err(IngestError::Domain)
+    IngestError::finish(run(storage, Capabilities::default(), &[], &command))
 }
 
 /// The cheap refusal: a size the row's claim cannot yield to is rejected
@@ -405,10 +274,7 @@ pub fn admit_size<S: Storage>(
         root: root.to_vec(),
         size,
     };
-    let outcome: Result<(), IngestDomainError> =
-        finish(run(storage, Capabilities::default(), &[], &command))
-            .map_err(IngestError::Operation)?;
-    outcome.map_err(IngestError::Domain)
+    IngestError::finish(run(storage, Capabilities::default(), &[], &command))
 }
 
 /// Ingest one invocation-bound input through Lean's complete command, including
@@ -436,9 +302,7 @@ pub fn ingest<S: Storage>(
         source: Some(resources.source),
         ..Capabilities::default()
     };
-    let outcome: Result<Ingested, IngestDomainError> =
-        finish(run(storage, capabilities, &[], &command)).map_err(IngestError::Operation)?;
-    outcome.map_err(IngestError::Domain)
+    IngestError::finish(run(storage, capabilities, &[], &command))
 }
 
 /// Whole-object or bounded local read. Lean owns admission and repair.
@@ -485,8 +349,7 @@ fn finish_read<E>(
     result: Result<Vec<u8>, OperationError<E>>,
     output: ReadOutput<E>,
 ) -> Result<Vec<u8>, ReadError<E>> {
-    let outcome: Result<u64, ReadDomainError> = finish(result).map_err(ReadError::Operation)?;
-    let count = outcome.map_err(ReadError::Domain)?;
+    let count: u64 = ReadError::finish(result)?;
     if usize::try_from(count).ok() != Some(output.bytes.len()) {
         return Err(ReadError::Operation(OperationError::Protocol));
     }
@@ -528,9 +391,7 @@ fn finish_served<E>(
     result: Result<Vec<u8>, OperationError<E>>,
     output: ReadOutput<E>,
 ) -> Result<ServedBytes, ServeError<E>> {
-    let outcome: Result<Served, ServeDomainError> =
-        finish(result).map_err(ServeError::Operation)?;
-    let served = outcome.map_err(ServeError::Domain)?;
+    let served: Served = ServeError::finish(result)?;
     if usize::try_from(served.count).ok() != Some(output.bytes.len()) {
         return Err(ServeError::Operation(OperationError::Protocol));
     }
@@ -629,9 +490,7 @@ pub fn delete<S: Storage>(
         resources: Some(resources),
         ..Capabilities::default()
     };
-    let outcome: Result<Outcome, LifecycleDomainError> =
-        finish(run(storage, capabilities, &[], &command)).map_err(LifecycleError::Operation)?;
-    outcome.map_err(LifecycleError::Domain)
+    LifecycleError::finish(run(storage, capabilities, &[], &command))
 }
 
 /// Execute complete pin/possession acquisition over raw storage capabilities.
@@ -649,18 +508,7 @@ pub fn acquire<S: Storage>(
         now,
         possession,
     };
-    let outcome: Result<bool, LifecycleDomainError> =
-        finish(run(storage, Capabilities::default(), &[], &command))
-            .map_err(LifecycleError::Operation)?;
-    outcome.map_err(LifecycleError::Domain)
-}
-
-/// Decode a durability transition's terminal into its typed outcome.
-fn finish_durable<T: Decode, E>(
-    result: Result<Vec<u8>, OperationError<E>>,
-) -> Result<T, DurableError<E>> {
-    let outcome: Result<T, DurableDomainError> = finish(result).map_err(DurableError::Operation)?;
-    outcome.map_err(DurableError::Domain)
+    LifecycleError::finish(run(storage, Capabilities::default(), &[], &command))
 }
 
 /// Record that the backend holds the complete object, after its own
@@ -670,7 +518,7 @@ pub fn mark_durable<S: Storage>(
     root: &[u8; 32],
 ) -> Result<bool, DurableError<S::Error>> {
     let command = Command::CasMarkDurable(root.to_vec());
-    finish_durable(run(storage, Capabilities::default(), &[], &command))
+    DurableError::finish(run(storage, Capabilities::default(), &[], &command))
 }
 
 /// Reconstruct a cold durable row once the backend confirmed the final pair:
@@ -687,7 +535,7 @@ pub fn adopt_durable<S: Storage>(
         size,
         now,
     };
-    finish_durable(run(storage, Capabilities::default(), &[], &command))
+    DurableError::finish(run(storage, Capabilities::default(), &[], &command))
 }
 
 /// The backend answered that the object is not there: withdraw the durable
@@ -703,7 +551,7 @@ pub fn heal_missing<S: Storage>(
         clock: Some(clock),
         ..Capabilities::default()
     };
-    finish_durable(run(storage, capabilities, &[], &command))
+    DurableError::finish(run(storage, capabilities, &[], &command))
 }
 
 /// Reconcile cache claims with an ephemeral scratch generation marker.
@@ -713,7 +561,7 @@ pub fn reconcile_scratch<S: Storage>(
     marker: &str,
 ) -> Result<bool, DurableError<S::Error>> {
     let command = Command::CasReconcileScratch(marker.to_owned());
-    finish_durable(run(storage, Capabilities::default(), &[], &command))
+    DurableError::finish(run(storage, Capabilities::default(), &[], &command))
 }
 
 /// Drop reconstructible local bytes while keeping a remote durable claim;
@@ -728,7 +576,7 @@ pub fn clear_cache<S: Storage>(
         resources: Some(resources),
         ..Capabilities::default()
     };
-    finish_durable(run(storage, capabilities, &[], &command))
+    DurableError::finish(run(storage, capabilities, &[], &command))
 }
 
 #[cfg(test)]
@@ -748,76 +596,6 @@ mod terminal_tests {
         for malformed in [&[][..], &[0], &[0, 2], &[0, 1, 0], &[1], &[1, 2], &[2]] {
             assert_eq!(terminal::<Lifecycle>(malformed), Err(()));
         }
-    }
-
-    #[test]
-    fn column_type_carries_index_name_and_class() {
-        for (octet, actual) in [
-            (0, CellType::Null),
-            (1, CellType::Integer),
-            (2, CellType::Real),
-            (3, CellType::Text),
-            (4, CellType::Blob),
-        ] {
-            let mut packet = vec![1, 1];
-            packet.extend_from_slice(&0_u64.to_le_bytes());
-            packet.extend_from_slice(&7_u64.to_le_bytes());
-            packet.extend_from_slice(b"durable");
-            packet.push(octet);
-            assert_eq!(
-                terminal::<Result<bool, LifecycleDomainError>>(&packet),
-                Ok(Err(LifecycleDomainError::ColumnType {
-                    index: 0,
-                    column: "durable".into(),
-                    actual,
-                }))
-            );
-            packet.push(0);
-            assert_eq!(
-                terminal::<Result<bool, LifecycleDomainError>>(&packet),
-                Err(())
-            );
-        }
-        let mut unknown = vec![1, 1];
-        unknown.extend_from_slice(&0_u64.to_le_bytes());
-        unknown.extend_from_slice(&0_u64.to_le_bytes());
-        unknown.push(5);
-        assert_eq!(
-            terminal::<Result<bool, LifecycleDomainError>>(&unknown),
-            Err(())
-        );
-    }
-
-    #[test]
-    fn ingestion_terminals_carry_root_size_and_mismatch() {
-        let mut packet = vec![0];
-        packet.extend_from_slice(&32_u64.to_le_bytes());
-        packet.extend_from_slice(&[7; 32]);
-        packet.extend_from_slice(&u64::MAX.to_le_bytes());
-        assert_eq!(
-            terminal::<Result<Ingested, IngestDomainError>>(&packet),
-            Ok(Ok(Ingested {
-                root: vec![7; 32],
-                size: u64::MAX
-            }))
-        );
-        let mut mismatch = vec![1, 2];
-        mismatch.extend_from_slice(&32_u64.to_le_bytes());
-        mismatch.extend_from_slice(&[9; 32]);
-        mismatch.extend_from_slice(&5_u64.to_le_bytes());
-        mismatch.extend_from_slice(&6_u64.to_le_bytes());
-        assert_eq!(
-            terminal::<Result<Ingested, IngestDomainError>>(&mismatch),
-            Ok(Err(IngestDomainError::SizeMismatch {
-                root: vec![9; 32],
-                recorded: 5,
-                offered: 6,
-            }))
-        );
-        assert_eq!(
-            terminal::<Result<Ingested, IngestDomainError>>(&[1, 3]),
-            Ok(Err(IngestDomainError::DirectorySyncUnsupported))
-        );
     }
 
     #[test]

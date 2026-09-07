@@ -1,5 +1,9 @@
 //! Private synchronous transport for raw storage/resource and crypto effects.
 pub(crate) use crate::generated::{decode, dispatch, Command, Frame};
+use crate::generated::{
+    external_failure, peer_reply, peer_request, provider_reply, provider_request,
+};
+pub use crate::generated::{PeerReply, PeerRequest, ProviderReply, ProviderRequest};
 use crate::host::{
     ByteStorage, Cell, Clock, ConflictValue, Exclusion, Fields, FileFailure, FileFailureKind,
     FileIO, Join, Order, Resources, Row, Scan, Selection, SourceValue, Storage, SyncStatus,
@@ -29,6 +33,25 @@ impl<E: std::error::Error + 'static> std::error::Error for OperationError<E> {
             Self::Host(error) => Some(error),
             _ => None,
         }
+    }
+}
+
+/// A completed command failure, retaining the original host or domain error.
+#[derive(Debug)]
+pub enum CommandError<E, D> {
+    Operation(OperationError<E>),
+    Domain(D),
+}
+
+impl<E, D> CommandError<E, D> {
+    pub(crate) fn finish<T: Decode>(result: Result<Vec<u8>, OperationError<E>>) -> Result<T, Self>
+    where
+        D: Decode,
+    {
+        let bytes = result.map_err(Self::Operation)?;
+        let outcome: Result<T, D> =
+            terminal(&bytes).map_err(|()| Self::Operation(OperationError::Protocol))?;
+        outcome.map_err(Self::Domain)
     }
 }
 
@@ -321,35 +344,13 @@ impl EncodeReply for Vec<u8> {
         bytes(out, &value);
     }
 }
-impl EncodeReply for Option<u64> {
+impl<T: EncodeReply> EncodeReply for Option<T> {
     fn encode(out: &mut Vec<u8>, value: Self) {
         match value {
             None => out.push(0),
             Some(value) => {
                 out.push(1);
-                word(out, value);
-            }
-        }
-    }
-}
-impl EncodeReply for Option<i64> {
-    fn encode(out: &mut Vec<u8>, value: Self) {
-        match value {
-            None => out.push(0),
-            Some(value) => {
-                out.push(1);
-                word(out, value as u64);
-            }
-        }
-    }
-}
-impl EncodeReply for Option<Vec<u8>> {
-    fn encode(out: &mut Vec<u8>, value: Self) {
-        match value {
-            None => out.push(0),
-            Some(value) => {
-                out.push(1);
-                bytes(out, &value);
+                T::encode(out, value);
             }
         }
     }
@@ -371,6 +372,16 @@ impl EncodeReply for SyncStatus {
 /// How a command argument is written into the packet that starts a run.
 pub(crate) trait Encode {
     fn encode(&self, out: &mut Vec<u8>);
+
+    fn encode_slice(values: &[Self], out: &mut Vec<u8>)
+    where
+        Self: Sized,
+    {
+        word(out, values.len() as u64);
+        for value in values {
+            value.encode(out);
+        }
+    }
 }
 impl Encode for u64 {
     fn encode(&self, out: &mut Vec<u8>) {
@@ -387,9 +398,19 @@ impl Encode for bool {
         out.push(u8::from(*self));
     }
 }
-impl Encode for Vec<u8> {
+impl Encode for u8 {
     fn encode(&self, out: &mut Vec<u8>) {
-        bytes(out, self);
+        out.push(*self);
+    }
+
+    // Keep byte payloads bulk-copied rather than visiting every octet.
+    fn encode_slice(values: &[Self], out: &mut Vec<u8>) {
+        bytes(out, values);
+    }
+}
+impl<T: Encode> Encode for Vec<T> {
+    fn encode(&self, out: &mut Vec<u8>) {
+        T::encode_slice(self, out);
     }
 }
 impl Encode for String {
@@ -414,36 +435,13 @@ impl<A: Encode, B: Encode> Encode for (A, B) {
         self.1.encode(out);
     }
 }
-impl Encode for Vec<(u64, u64)> {
-    fn encode(&self, out: &mut Vec<u8>) {
-        word(out, self.len() as u64);
-        for pair in self {
-            pair.encode(out);
-        }
-    }
-}
-macro_rules! encode_list {
-    ($($item:ty),+ $(,)?) => {
-        $(impl Encode for Vec<$item> {
-            fn encode(&self, out: &mut Vec<u8>) {
-                word(out, self.len() as u64);
-                for item in self {
-                    item.encode(out);
-                }
-            }
-        })+
-    };
-}
-encode_list!(
-    Vec<u8>,
-    String,
-    (Vec<u8>, Vec<u8>),
-    crate::generated::ParsedOrigin
-);
-
 /// How a terminal value is read back once a run has finished.
 pub(crate) trait Decode: Sized {
     fn decode(r: &mut Reader<'_>) -> Result<Self, ()>;
+
+    fn decode_vec(r: &mut Reader<'_>) -> Result<Vec<Self>, ()> {
+        r.list(Self::decode)
+    }
 }
 impl Decode for () {
     fn decode(_: &mut Reader<'_>) -> Result<Self, ()> {
@@ -465,9 +463,18 @@ impl Decode for bool {
         r.boolean()
     }
 }
-impl Decode for Vec<u8> {
+impl Decode for u8 {
     fn decode(r: &mut Reader<'_>) -> Result<Self, ()> {
+        r.byte()
+    }
+
+    fn decode_vec(r: &mut Reader<'_>) -> Result<Vec<Self>, ()> {
         r.bytes()
+    }
+}
+impl<T: Decode> Decode for Vec<T> {
+    fn decode(r: &mut Reader<'_>) -> Result<Self, ()> {
+        T::decode_vec(r)
     }
 }
 impl Decode for String {
@@ -487,11 +494,6 @@ impl<T: Decode> Decode for Option<T> {
 impl<A: Decode, B: Decode> Decode for (A, B) {
     fn decode(r: &mut Reader<'_>) -> Result<Self, ()> {
         Ok((Decode::decode(r)?, Decode::decode(r)?))
-    }
-}
-impl Decode for Vec<(u64, u64)> {
-    fn decode(r: &mut Reader<'_>) -> Result<Self, ()> {
-        r.list(Decode::decode)
     }
 }
 /// A finished command: its value, or the domain error that ended it.
@@ -697,7 +699,7 @@ impl<E> Default for Capabilities<'_, E> {
 }
 
 /// A protocol failure delivered into the program, so its own cleanup runs.
-fn protocol_failure() -> Vec<u8> {
+pub(crate) fn protocol_failure() -> Vec<u8> {
     let mut out = vec![1, 0];
     word(&mut out, 3);
     word(&mut out, 0);
@@ -737,66 +739,6 @@ fn sink_reply<E, A: EncodeReply>(
     }
 }
 
-/// What a suspended program asked a peer for: the root it is fetching under
-/// and, for each want, the position asked at and the hash expected there.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum PeerRequest {
-    Nodes {
-        root: Vec<u8>,
-        wants: Vec<(Vec<u8>, Vec<u8>)>,
-    },
-    Values {
-        root: Vec<u8>,
-        wants: Vec<(Vec<u8>, Vec<u8>)>,
-    },
-}
-
-/// What came back for a request: the pairs served, the hashes the peer did
-/// not have and, for nodes, the hashes it holds but may not show; or the
-/// host error that stands for the round trip failing, delivered into the
-/// program the way any host failure is.
-#[derive(Debug)]
-pub enum PeerReply<E> {
-    Nodes {
-        served: Vec<(Vec<u8>, Vec<u8>)>,
-        missing: Vec<Vec<u8>>,
-        redacted: Vec<Vec<u8>>,
-    },
-    Values {
-        served: Vec<(Vec<u8>, Vec<u8>)>,
-        missing: Vec<Vec<u8>>,
-    },
-    Failed(E),
-}
-
-/// Literal immutable-object IO requested by a suspended cloud operation.
-#[derive(Debug, Clone, PartialEq, Eq)]
-pub enum ProviderRequest {
-    Stat {
-        space: String,
-        key: Vec<u8>,
-    },
-    ReadAll {
-        space: String,
-        key: Vec<u8>,
-    },
-    ReadRange {
-        space: String,
-        key: Vec<u8>,
-        offset: u64,
-        count: u64,
-    },
-}
-
-/// Raw provider results. Only the provider's actual not-found error is
-/// classified as missing; all errors retain their original host allocation.
-#[derive(Debug)]
-pub enum ProviderReply<E> {
-    Stat(Result<u64, FileFailure<E>>),
-    ReadAll(Result<Vec<u8>, FileFailure<E>>),
-    ReadRange(Result<Vec<u8>, FileFailure<E>>),
-}
-
 pub type ProviderStep<T, E> = Step<T, E, ProviderRequest>;
 pub type ProviderSuspension<T, E> = Suspension<T, E, ProviderRequest>;
 
@@ -817,7 +759,6 @@ pub enum Step<T, E, R = PeerRequest> {
 pub struct Suspension<T, E, R = PeerRequest> {
     state: Handle,
     request: R,
-    tag: u8,
     errors: Vec<Option<E>>,
     finish: fn(&[u8]) -> Result<T, ()>,
 }
@@ -847,38 +788,7 @@ impl<T, E> Suspension<T, E> {
         storage: &mut S,
         capabilities: Capabilities<'_, E>,
     ) -> Result<Step<T, E>, OperationError<E>> {
-        let response = match (self.tag, answer) {
-            (
-                72,
-                PeerReply::Nodes {
-                    served,
-                    missing,
-                    redacted,
-                },
-            ) => reply(
-                72,
-                Ok::<_, E>((served, missing, redacted)),
-                &mut self.errors,
-                |out, (served, missing, redacted)| {
-                    pairs(out, &served);
-                    hashes(out, &missing);
-                    hashes(out, &redacted);
-                },
-            ),
-            (73, PeerReply::Values { served, missing }) => reply(
-                73,
-                Ok::<_, E>((served, missing)),
-                &mut self.errors,
-                |out, (served, missing)| {
-                    pairs(out, &served);
-                    hashes(out, &missing);
-                },
-            ),
-            (tag, PeerReply::Failed(error)) => {
-                reply(tag, Err::<(), _>(error), &mut self.errors, |_, ()| {})
-            }
-            _ => protocol_failure(),
-        };
+        let response = peer_reply(&self.request, answer, &mut self.errors);
         self.continue_response(response, storage, capabilities, peer_request)
     }
 }
@@ -915,99 +825,18 @@ impl<T, E> ProviderSuspension<T, E> {
         storage: &mut S,
         capabilities: Capabilities<'_, E>,
     ) -> Result<ProviderStep<T, E>, OperationError<E>> {
-        let response = match (&self.request, answer) {
-            (ProviderRequest::Stat { .. }, ProviderReply::Stat(value)) => {
-                file_reply(self.tag, value, &mut self.errors, EncodeReply::encode)
-            }
-            (ProviderRequest::ReadAll { .. }, ProviderReply::ReadAll(value))
-            | (ProviderRequest::ReadRange { .. }, ProviderReply::ReadRange(value)) => {
-                file_reply(self.tag, value, &mut self.errors, EncodeReply::encode)
-            }
-            // Provider effects use the FileReply envelope even on malformed
-            // host replies, so Lean can run its resource cleanup continuation.
-            _ => file_protocol_failure(),
-        };
+        let response = provider_reply(&self.request, answer, &mut self.errors);
         self.continue_response(response, storage, capabilities, provider_request)
     }
 }
 
-fn pairs(out: &mut Vec<u8>, values: &[(Vec<u8>, Vec<u8>)]) {
-    word(out, values.len() as u64);
-    for (key, value) in values {
-        bytes(out, key);
-        bytes(out, value);
-    }
-}
-fn hashes(out: &mut Vec<u8>, values: &[Vec<u8>]) {
-    word(out, values.len() as u64);
-    for value in values {
-        bytes(out, value);
-    }
-}
-
-fn owned_pairs(wants: &[(&[u8], &[u8])]) -> Vec<(Vec<u8>, Vec<u8>)> {
-    wants
-        .iter()
-        .map(|(position, hash)| (position.to_vec(), hash.to_vec()))
-        .collect()
-}
-
-fn peer_request(frame: &Frame<'_>) -> Option<(PeerRequest, u8)> {
-    match frame {
-        Frame::FetchNodes(root, wants) => Some((
-            PeerRequest::Nodes {
-                root: root.to_vec(),
-                wants: owned_pairs(wants),
-            },
-            72,
-        )),
-        Frame::FetchValues(root, wants) => Some((
-            PeerRequest::Values {
-                root: root.to_vec(),
-                wants: owned_pairs(wants),
-            },
-            73,
-        )),
-        _ => None,
-    }
-}
-
-fn provider_request(frame: &Frame<'_>) -> Option<(ProviderRequest, u8)> {
-    match frame {
-        Frame::ProviderStat(space, key) => Some((
-            ProviderRequest::Stat {
-                space: space.clone(),
-                key: key.to_vec(),
-            },
-            77,
-        )),
-        Frame::ProviderReadAll(space, key) => Some((
-            ProviderRequest::ReadAll {
-                space: space.clone(),
-                key: key.to_vec(),
-            },
-            78,
-        )),
-        Frame::ProviderReadRange(space, key, offset, count) => Some((
-            ProviderRequest::ReadRange {
-                space: space.clone(),
-                key: key.to_vec(),
-                offset: *offset,
-                count: *count,
-            },
-            79,
-        )),
-        _ => None,
-    }
-}
-
-fn file_protocol_failure() -> Vec<u8> {
+pub(crate) fn file_protocol_failure() -> Vec<u8> {
     let mut response = protocol_failure();
     response.push(2); // FileFailureKind.other
     response
 }
 
-type RequestDecoder<R> = fn(&Frame<'_>) -> Option<(R, u8)>;
+type RequestDecoder<R> = fn(&Frame<'_>) -> Option<R>;
 
 /// The shared transport state, including connection ownership. External IO
 /// may suspend only after every transaction and remover section is closed.
@@ -1068,21 +897,16 @@ fn drive<T, E, R>(
             _ => None,
         };
         if run.open == 0 && run.sections.is_empty() {
-            if let Some((request, tag)) = run.request.and_then(|decode| decode(&frame)) {
+            if let Some(request) = run.request.and_then(|decode| decode(&frame)) {
                 return Ok(Step::Suspended(Suspension {
                     state: run.state,
                     request,
-                    tag,
                     errors: run.errors,
                     finish: run.finish,
                 }));
             }
         }
         let response = match frame {
-            Frame::FetchNodes(..) | Frame::FetchValues(..) => protocol_failure(),
-            Frame::ProviderStat(..) | Frame::ProviderReadAll(..) | Frame::ProviderReadRange(..) => {
-                file_protocol_failure()
-            }
             // The transferred bytes go from the file straight into the tail of
             // the output sink; they are never a reply payload. A sink that
             // cannot grow is a protocol failure delivered as a file failure,
@@ -1297,7 +1121,10 @@ fn drive<T, E, R>(
                     _ => OperationError::Protocol,
                 })
             }
-            frame => host(frame, &mut capabilities, &mut run.errors)?,
+            frame => match external_failure(&frame) {
+                Some(response) => response,
+                None => host(frame, &mut capabilities, &mut run.errors)?,
+            },
         };
         // A transaction counts as open from a begin that succeeded until a
         // commit or rollback that succeeded; a failed close keeps it counted,
@@ -2589,36 +2416,6 @@ mod tests {
             Err(OperationError::Protocol)
         ));
         assert!(script.calls.is_empty());
-    }
-
-    #[test]
-    fn peer_replies_are_written_in_the_order_the_program_reads_them() {
-        let mut errors: Vec<Option<&'static str>> = Vec::new();
-        let packet = reply(
-            72,
-            Ok::<_, &'static str>((
-                vec![(vec![1], vec![2, 3])],
-                vec![vec![4]],
-                vec![vec![5], vec![6]],
-            )),
-            &mut errors,
-            |out, (served, missing, redacted)| {
-                pairs(out, &served);
-                hashes(out, &missing);
-                hashes(out, &redacted);
-            },
-        );
-        let mut reader = Reader(&packet);
-        assert_eq!(reader.byte(), Ok(1));
-        assert_eq!(reader.byte(), Ok(72));
-        assert_eq!(
-            reader.list(|r| Ok((r.bytes()?, r.bytes()?))),
-            Ok(vec![(vec![1], vec![2, 3])])
-        );
-        assert_eq!(reader.list(Reader::bytes), Ok(vec![vec![4]]));
-        assert_eq!(reader.list(Reader::bytes), Ok(vec![vec![5], vec![6]]));
-        reader.end().unwrap();
-        assert!(errors.is_empty());
     }
 
     fn state() -> Handle {

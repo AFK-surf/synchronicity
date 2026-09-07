@@ -21,10 +21,11 @@ import VerifiedCore.Commands
 and prints the two sides of the host boundary from them: the Lean request
 encoders, reply decoders and command codecs (`VerifiedCore/Host/Generated.lean`,
 `VerifiedCore/Commands/Generated.lean`, kept in the tree) and the Rust frames,
-decoder, dispatch, host traits, mirrored types and test-double stubs
+decoder, dispatch, host traits, mirrored types, external-wait conversions
+and test-double stubs
 (`generated.rs`, printed into Cargo's output directory by `build.rs`). Wire
-tags and the routing of each effect to a Rust service are the only tables it
-holds; the shapes come from the inductives. Run it after changing an algebra
+tags, effect routing and public API name mappings are explicit; shapes come
+from the Lean inductives and operation types. Run it after changing an algebra
 or a command type; `build.rs` and CI run it with `--check`. -/
 open Lean Meta
 
@@ -63,10 +64,11 @@ structure Algebra where
   ctors : Array Ctor
 
 /-- Where a Rust frame is served: by the relational host, by an optional
-capability, or by hand in the interpreter loop. -/
+capability, an external wait, or by hand in the interpreter loop. -/
 inductive Route where
   | storage
   | capability (field trait : String)
+  | external
   | special
 
 def algebras : List Name := [
@@ -188,6 +190,7 @@ def defaultRoute : String → Route
   | "Redaction" => .capability "redaction" "Redaction"
   | "Apply" => .capability "apply" "Apply"
   | "CacheIO" => .capability "cache" "CacheIO"
+  | "Peer" | "Provider" => .external
   | _ => .special
 
 /-- Which Rust service each effect belongs to. The command inputs, the
@@ -464,7 +467,7 @@ def rustTypeAll (all : Array Algebra) (route : Algebra → Ctor → Route) : Lis
       let trait := match route algebra ctor with
         | .storage => some "Storage"
         | .capability _ trait => some trait
-        | .special => none
+        | .external | .special => none
       if let some trait := trait then
         groups := groups.map fun (name, members) =>
           if name == trait then (name, members.push (algebra, ctor)) else (name, members)
@@ -561,7 +564,7 @@ def rustDispatch (all : Array Algebra) : String := Id.run do
         | .storage => ("storage", "")
         | .capability field _ =>
           ("host", s!"            let host = capabilities.{field}.as_deref_mut().ok_or(OperationError::Protocol)?;\n")
-        | .special => ("", "")
+        | .external | .special => ("", "")
       if receiver.isEmpty || handledByLoop.contains (algebra.short ++ "." ++ ctor.short) then continue
       let call := s!"{receiver}.{snake ctor.short}({args})"
       let body := match ctor.wrapper, ctor.result with
@@ -649,6 +652,94 @@ partial def rustMessageTy : Ty → String
   | .message rust _ => rust
   | t => rustOwned t
 
+/-- Preserve public API names; field types and wire order come from Lean. -/
+def externalVariant (ctor : Ctor) : String :=
+  pascal (if ctor.short.startsWith "fetch" then (ctor.short.drop 5).toString else ctor.short)
+
+def externalFields : String → List String
+  | "Peer.fetchNodes" => ["served", "missing", "redacted"]
+  | "Peer.fetchValues" => ["served", "missing"]
+  | _ => []
+
+/-- Named success fields follow the right-associated Lean product. -/
+def productFields : Ty → List Ty
+  | .prod a b => a :: productFields b
+  | t => [t]
+
+/-- Copy a borrowed frame field into a request that can outlive its packet. -/
+partial def ownFrame (ty : Ty) (value : String) (borrowed := true) : String :=
+  match ty with
+  | .bytes => s!"({value}).to_vec()"
+  | .u64 | .nat | .int64 | .bool | .unit => if borrowed then s!"*({value})" else value
+  | .list t => s!"({value}).iter().map(|value| {ownFrame t "value"}).collect()"
+  | .option t => s!"({value}).as_ref().map(|value| {ownFrame t "value"})"
+  | .prod a b => s!"({ownFrame a s!"({value}).0" false}, {ownFrame b s!"({value}).1" false})"
+  | _ => s!"({value}).clone()"
+
+def externalFailure : Wrapper → String
+  | .reply => "crate::operation::protocol_failure()"
+  | .fileReply => "crate::operation::file_protocol_failure()"
+
+/-- Generate the owned requests, typed replies, conversions and rejection
+packets of external services. The runner still owns suspension and cleanup. -/
+def rustExternal (all : Array Algebra) : MetaM String := do
+  let mut out := ""
+  let mut refused := "pub(crate) fn external_failure(frame: &Frame<'_>) -> Option<Vec<u8>> {\n    match frame {\n"
+  for algebra in all do
+    let ctors := algebra.ctors.filter fun ctor => match route algebra.short ctor.short with
+      | .external => true
+      | _ => false
+    if ctors.isEmpty then continue
+    let request := algebra.short ++ "Request"
+    let response := algebra.short ++ "Reply"
+    let service := snake algebra.short |>.drop 1 |>.toString
+    let mut replies := s!"/// Replies to {request}; failures retain their original host error.\n#[derive(Debug)]\npub enum {response}<E> \{\n"
+    let mut decode := s!"pub(crate) fn {service}_request(frame: &Frame<'_>) -> Option<{request}> \{\n    match frame \{\n"
+    let mut encode := s!"pub(crate) fn {service}_reply<E>(request: &{request}, answer: {response}<E>, errors: &mut Vec<Option<E>>) -> Vec<u8> \{\n    match (request, answer) \{\n"
+    let mut failures := ""
+    out := out ++ docLines "" algebra.doc ++ s!"#[derive(Debug, Clone, PartialEq, Eq)]\npub enum {request} \{\n"
+    for ctor in ctors do
+      let variant := externalVariant ctor
+      let names := externalFields (algebra.short ++ "." ++ ctor.short)
+      let fields := productFields ctor.result
+      if !names.isEmpty && (names.length != fields.length || ctor.wrapper != .reply) then
+        throwError "hostgen: external reply names do not match {ctor.full}"
+      out := out ++ docLines "    " ctor.doc ++ s!"    {variant} \{\n"
+      for field in ctor.fields do
+        out := out ++ s!"        {snake field.name}: {rustMessageTy field.ty},\n"
+      out := out ++ "    },\n"
+      let binders := ctor.fields.toList.zipIdx.map fun (_, i) => s!"a{i}"
+      let frame := s!"Frame::{frameName algebra ctor}" ++
+        (if binders.isEmpty then "" else s!"({String.intercalate ", " binders})")
+      decode := decode ++ s!"        {frame} => Some({request}::{variant} \{\n"
+      for field in ctor.fields, i in [:ctor.fields.size] do
+        decode := decode ++ s!"            {snake field.name}: {ownFrame field.ty s!"a{i}"},\n"
+      decode := decode ++ "        }),\n"
+      let expected := s!"{request}::{variant} \{ .. }"
+      if names.isEmpty then
+        let error := if ctor.wrapper == .fileReply then "FileFailure<E>" else "E"
+        replies := replies ++ s!"    {variant}(Result<{rustMessageTy ctor.result}, {error}>),\n"
+        let envelope := if ctor.wrapper == .fileReply then "file_reply" else "reply"
+        encode := encode ++ s!"        ({expected}, {response}::{variant}(value)) => {envelope}({ctor.tag}, value, errors, |out, value| value.encode(out)),\n"
+      else
+        replies := replies ++ s!"    {variant} \{\n"
+        for (name, ty) in names.zip fields do
+          replies := replies ++ s!"        {name}: {rustMessageTy ty},\n"
+        replies := replies ++ "    },\n"
+        encode := encode ++ s!"        ({expected}, {response}::{variant} \{ {String.intercalate ", " names} }) => reply({ctor.tag}, Ok::<(), E>(()), errors, |out, ()| \{\n"
+        for name in names do
+          encode := encode ++ s!"            {name}.encode(out);\n"
+        encode := encode ++ "        }),\n"
+      if ctor.wrapper == .reply then
+        encode := encode ++ s!"        ({expected}, {response}::Failed(error)) => reply({ctor.tag}, Err::<(), _>(error), errors, |_, ()| \{}),\n"
+      failures := failures ++ s!"        ({expected}, _) => {externalFailure ctor.wrapper},\n"
+      let pattern := s!"Frame::{frameName algebra ctor}" ++ (if binders.isEmpty then "" else "(..)")
+      refused := refused ++ s!"        {pattern} => Some({externalFailure ctor.wrapper}),\n"
+    if ctors.any (·.wrapper == .reply) then replies := replies ++ "    Failed(E),\n"
+    out := out ++ "}\n\n" ++ replies ++ "}\n\n" ++ decode ++ "        _ => None,\n    }\n}\n\n"
+    out := out ++ encode ++ failures ++ "    }\n}\n\n"
+  return out ++ refused ++ "        _ => None,\n    }\n}\n"
+
 /-- Messages only this crate constructs. -/
 def crateOnly : List Name := [``VerifiedCore.Commands.Command]
 
@@ -716,10 +807,67 @@ def rustMessage (message : Message) : String := Id.run do
 def rustMessages (all : Array Message) : String :=
   String.join (all.toList.map rustMessage)
 
-def rustFile (all : Array Algebra) (messages : Array Message) : String :=
+/-- Storage-only CAS entry points. Argument and success types are read from
+both the command constructor and the production operation; the table only
+associates names. These commands share Entry.projecting's domain error. -/
+def projections : List (String × Name) := [
+  ("casBlob", ``VerifiedCore.Cas.Project.blob),
+  ("casBlobIn", ``VerifiedCore.Cas.Project.blobIn),
+  ("casBlobs", ``VerifiedCore.Cas.Project.blobs),
+  ("casBlobCandidates", ``VerifiedCore.Cas.Project.candidates),
+  ("casPins", ``VerifiedCore.Cas.Project.pins),
+  ("casPinnedBlobs", ``VerifiedCore.Cas.Project.pinnedBlobs)]
+
+/-- The public projection API accepts content addresses, never arbitrary bytes. -/
+def projectionParam (field : Field) : MetaM (String × String) := do
+  let name := snake field.name
+  match field.ty with
+  | .bytes => return (s!"{name}: &[u8; 32]", s!"{name}.to_vec()")
+  | .option .bytes => return (s!"{name}: Option<&[u8; 32]>", s!"{name}.map(|value| value.to_vec())")
+  | .u64 => return (s!"{name}: u64", name)
+  | _ => throwError "hostgen: unsupported projection argument {field.name}"
+
+def rustProjections (messages : Array Message) : MetaM String := do
+  let some commands := messages.find? (·.full == ``VerifiedCore.Commands.Command)
+    | throwError "hostgen: command message missing"
+  let mut out := "pub(crate) mod cas_projection {\n    use super::*;\n\n"
+  for (name, operation) in projections do
+    let some ctor := commands.ctors.find? (·.short == name)
+      | throwError "hostgen: projection command {name} missing"
+    let info ← getConstInfo operation
+    let result ← forallTelescope info.type fun args result => do
+      unless result.isAppOfArity ``VerifiedCore.Cas.Project.Action 1 do
+        throwError "hostgen: {operation} is not a storage-only projection"
+      unless args.size == ctor.fields.size do
+        throwError "hostgen: {operation} arguments differ from {name}"
+      for arg in args, field in ctor.fields do
+        let ty ← inferType arg
+        -- Transaction is a UInt64 alias, not a separate wire type.
+        let ty := if ty.isConstOf ``VerifiedCore.Host.Transaction then mkConst ``UInt64 else ty
+        unless (← parseTy ty) == field.ty do
+          throwError "hostgen: {operation} argument {field.name} differs from {name}"
+      parseTy result.getAppArgs.back!
+    let params ← ctor.fields.mapM projectionParam
+    let signature := String.intercalate ", " ("storage: &mut S" :: params.toList.map Prod.fst)
+    let variant := "Command::" ++ pascal name
+    let command := match ctor.fields.toList, params.toList with
+      | [], _ => variant
+      | [_], [(_, value)] => s!"{variant}({value})"
+      | fields, params =>
+        let values := (fields.zip params).map fun (pair : Field × (String × String)) =>
+          if snake pair.1.name == pair.2.2 then pair.2.2 else s!"{snake pair.1.name}: {pair.2.2}"
+        variant ++ " { " ++ String.intercalate ", " values ++ " }"
+    let publicName := ((snake name).drop 4).toString
+    let doc ← findDocString? (← getEnv) operation
+    out := out ++ docLines "    " (doc.or ctor.doc)
+    out := out ++ s!"    pub fn {publicName}<S: Storage>({signature}) -> Result<{rustMessageTy result}, crate::cas::ProjectError<S::Error>> \{\n"
+    out := out ++ s!"        crate::CommandError::finish(crate::operation::run(storage, Capabilities::default(), &[], &{command}))\n    }\n\n"
+  return out ++ "}\n"
+
+def rustFile (all : Array Algebra) (messages : Array Message) (projections external : String) : String :=
   "// Printed by lean/Hostgen.lean at build time from the Lean effect algebras\n// and command types; included from lib.rs, never edited or committed.\n\nuse crate::host::*;\nuse crate::operation::{\n    file_reply, reply, scan_reply, Capabilities, Decode, Encode, EncodeReply, OperationError,\n    Reader,\n};\n\n"
   ++ rustTraits all ++ rustFrames all ++ rustDispatch all ++ "\n" ++ rustUnexpected all ++ "\n"
-  ++ (rustMessages messages).trimAsciiEnd.toString ++ "\n"
+  ++ (rustMessages messages).trimAsciiEnd.toString ++ "\n\n" ++ projections ++ "\n" ++ external
 
 end Hostgen
 
@@ -750,7 +898,9 @@ def main (args : List String) : IO UInt32 := do
       let all ← algebras.toArray.mapM readAlgebra
       checkTags all
       let messages ← messages.toArray.mapM readMessage
-      return (leanFile all, leanCommandsFile messages, rustFile all messages))
+      let projections ← rustProjections messages
+      let external ← rustExternal all
+      return (leanFile all, leanCommandsFile messages, rustFile all messages projections external))
     { fileName := "<hostgen>", fileMap := default } { env })
   let mut stale := false
   for (path, text) in [("VerifiedCore/Host/Generated.lean", lean),

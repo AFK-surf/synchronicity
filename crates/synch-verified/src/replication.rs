@@ -37,33 +37,6 @@ pub fn plan_contact(
     terminal(&bytes).map_err(|()| OperationError::Protocol)
 }
 
-impl operation::Encode for Vec<Advertised> {
-    fn encode(&self, out: &mut Vec<u8>) {
-        (self.len() as u64).encode(out);
-        for head in self {
-            head.encode(out);
-        }
-    }
-}
-impl operation::Decode for Vec<Advertised> {
-    fn decode(reader: &mut operation::Reader<'_>) -> Result<Self, ()> {
-        reader.list(operation::Decode::decode)
-    }
-}
-impl operation::Encode for Vec<u64> {
-    fn encode(&self, out: &mut Vec<u8>) {
-        (self.len() as u64).encode(out);
-        for position in self {
-            position.encode(out);
-        }
-    }
-}
-impl operation::Decode for Vec<u64> {
-    fn decode(reader: &mut operation::Reader<'_>) -> Result<Self, ()> {
-        reader.list(operation::Decode::decode)
-    }
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;

@@ -11,16 +11,10 @@ pub use crate::generated::{
 pub use crate::operation::OperationError;
 
 /// Syntax/point rejection remains distinct from failure of the host primitive.
-#[derive(Debug)]
-pub enum Error<E> {
-    Operation(OperationError<E>),
-    Domain(DomainError),
-}
+pub type Error<E> = crate::CommandError<E, DomainError>;
 
 fn finish<A: Decode, E>(result: Vec<u8>) -> Result<A, Error<E>> {
-    let outcome: Result<A, DomainError> =
-        terminal(&result).map_err(|()| Error::Operation(OperationError::Protocol))?;
-    outcome.map_err(Error::Domain)
+    Error::finish(Ok(result))
 }
 
 /// Parse syntax, normalize named components, and validate decoded key bytes.

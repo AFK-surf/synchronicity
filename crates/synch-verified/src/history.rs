@@ -2,17 +2,13 @@
 //! command and hands its terminal back; it contains no retention algorithm.
 use crate::{
     host::{Crypto, Storage},
-    operation::{run, terminal, Capabilities, Command, OperationError},
+    operation::{run, Capabilities, Command},
 };
 
 pub use crate::generated::{CellType, HistoryDomainError as DomainError, OriginError};
 
 /// Retention failure, preserving the original host error when applicable.
-#[derive(Debug)]
-pub enum Error<E> {
-    Operation(OperationError<E>),
-    Domain(DomainError),
-}
+pub type Error<E> = crate::CommandError<E, DomainError>;
 
 /// Run retention with raw storage and primitive crypto. Lean owns transactions,
 /// validation, retention decisions, mutations and rollback/error selection.
@@ -30,16 +26,14 @@ pub fn prune<S: Storage>(
         crypto: Some(crypto),
         ..Capabilities::default()
     };
-    let result = run(storage, capabilities, &[], &command).map_err(Error::Operation)?;
-    let outcome: Result<u64, DomainError> =
-        terminal(&result).map_err(|()| Error::Operation(OperationError::Protocol))?;
-    outcome.map_err(Error::Domain)
+    Error::finish(run(storage, capabilities, &[], &command))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::host::{Cell, Fields, Join, Order, Row};
+    use crate::operation::{terminal, OperationError};
     use std::{cell::RefCell, rc::Rc};
 
     type Trace = Rc<RefCell<Vec<&'static str>>>;

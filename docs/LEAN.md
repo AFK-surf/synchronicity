@@ -34,7 +34,11 @@ Test actual native commands against independent observations, not policy oracles
 Unmigrated operations remain Rust within scope, as do provider SDKs, cryptography,
 transport, platform adapters and historical data conversions.
 
-Hostgen derives typed codecs. The native runner checks framing, buffer/continuation
+Hostgen derives typed codecs and the storage-only CAS projection entry points
+from Lean command and operation types. External Peer/Provider requests,
+replies, owned-frame conversions and failure envelopes are generated from
+their effect algebras; the runner owns waiting and continuation lifetimes.
+Rust shares the command-error wrapper and container codecs. The native runner checks framing, buffer/continuation
 ownership and original failures; there is no selectable Rust fallback. Peer/provider
 waits hold no database transaction, connection guard or removal-ordering section.
 Writer protection may span a wait. Cancellation drops the owned continuation,
