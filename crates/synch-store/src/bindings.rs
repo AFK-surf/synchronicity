@@ -183,21 +183,7 @@ impl crate::db::Txn<'_> {
         now: i64,
     ) -> Result<(PublishScope, Option<OriginId>)> {
         let scope = Store::publish_scope_on(self.conn(), origin, now)?;
-        let own: Option<String> = self
-            .conn()
-            .query_row(
-                "SELECT value FROM config WHERE key = 'self_origin_id'",
-                [],
-                |row| row.get(0),
-            )
-            .optional()?;
-        let owner = if own.as_deref() == Some(origin.canonical().as_str())
-            || matches!(scope, PublishScope::Unrestricted)
-        {
-            None
-        } else {
-            Some(origin.clone())
-        };
+        let owner = Store::provenance_owner_on(self.conn(), origin, &scope)?;
         Ok((scope, owner))
     }
 
@@ -762,13 +748,38 @@ impl Store {
     /// binding at all, which is judged as strictly as a confined one rather
     /// than as an unrestricted one.
     pub fn provenance_owner(&self, origin: &OriginId, now: i64) -> Result<Option<OriginId>> {
-        if self.self_origin()?.as_ref() == Some(origin) {
-            return Ok(None);
-        }
-        Ok(match self.publish_scope(origin, now)? {
-            PublishScope::Unrestricted => None,
-            PublishScope::Untrusted | PublishScope::Confined(_) => Some(origin.clone()),
-        })
+        let conn = self.conn();
+        let scope = Self::publish_scope_on(&conn, origin, now)?;
+        Self::provenance_owner_on(&conn, origin, &scope)
+    }
+
+    fn provenance_owner_on(
+        conn: &rusqlite::Connection,
+        origin: &OriginId,
+        scope: &PublishScope,
+    ) -> Result<Option<OriginId>> {
+        let own: Option<String> = conn
+            .query_row(
+                "SELECT value FROM config WHERE key = 'self_origin_id'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()?;
+        // Parse configuration just as `self_origin` does; corrupt identity
+        // configuration must not silently choose a different provenance rule.
+        let own = own
+            .map(|text| {
+                text.parse::<OriginId>()
+                    .map_err(|e| StoreError::column("config.self_origin_id", e.to_string()))
+            })
+            .transpose()?;
+        Ok(
+            if own.as_ref() == Some(origin) || matches!(scope, PublishScope::Unrestricted) {
+                None
+            } else {
+                Some(origin.clone())
+            },
+        )
     }
 
     /// The scope this node itself may read, as last declared by a peer (§5.5).
@@ -851,18 +862,6 @@ impl Store {
             );
         }
         Ok(issuers)
-    }
-
-    /// Whether `origin` holds a live rooted binding — the premise every
-    /// delegation it issued depends on.
-    ///
-    /// `origin_id` leads the `bindings` primary key, so this is an index seek
-    /// over that origin's own rows and nothing else.
-    fn vouched_for(&self, origin: &OriginId, now: i64) -> Result<bool> {
-        Ok(self
-            .bindings_for_origin(origin)?
-            .iter()
-            .any(|b| b.is_rooted() && b.is_live(now)))
     }
 
     /// The spaces this node's own live delegations grant it, or `None` when
