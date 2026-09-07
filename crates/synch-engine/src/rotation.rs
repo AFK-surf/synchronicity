@@ -561,7 +561,7 @@ mod tests {
         .unwrap();
 
         let answers = a.peer_bindings(&a_origin).await.unwrap();
-        assert!(answers[0].reachable());
+        assert!(answers[0].reachable(), "{:?}", answers[0].keys);
         assert!(
             answers[0].holds(&plan.new_key),
             "the new key has propagated: {:?}",

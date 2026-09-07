@@ -24,7 +24,7 @@ def ownKeys (tx : Transaction) (own : Option Origin.Parsed) : Action (List ByteA
     | some (.key bytes) => [(⟨bytes.toArray⟩ : ByteArray)]
     | _ => []
   let scan ← storage (.scanRows tx "device_keys" ["node_id", "state", "created_at"] []
-    [⟨"state", false⟩, ⟨"created_at", true⟩])
+    [⟨"created_at", true⟩])
   let keys ← scan.rows.mapM fun row => do
     match row with
     | [key, state, created] =>
@@ -32,12 +32,16 @@ def ownKeys (tx : Transaction) (own : Option Origin.Parsed) : Action (List ByteA
       let state ← checked (textField 1 "state" state)
       let _ ← checked (integerField 2 "created_at" created)
       let key ← keyField "device_keys.node_id" key
-      if state != "active" && state != "retiring" then throw (.column "device_keys.state" state)
-      return key
+      if state != "active" && state != "retiring" && state != "staged" then
+        throw (.column "device_keys.state" state)
+      return (key, state == "active")
     | _ => throw .malformed
   match scan.failure with
   | some failure => throw (.host failure)
-  | none => return first ++ keys
+  | none =>
+    -- Staged keys are owned too. Partition the time-ordered rows stably so
+    -- staged and retiring keys keep their shared newest-first order.
+    return first ++ (keys.filter (·.2)).map (·.1) ++ (keys.filter (!·.2)).map (·.1)
 
 def localSpacesIn (tx : Transaction) : Action (Option (List String)) := do
   return (← config tx "local_scope").map decodeSpaces

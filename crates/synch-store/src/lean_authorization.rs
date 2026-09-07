@@ -631,6 +631,43 @@ mod tests {
     }
 
     #[test]
+    fn local_authority_includes_staged_keys_in_ownership_order() {
+        let (_dir, store) = crate::testutil::store();
+        store
+            .set_self_origin(&OriginId::named("self", "x.example").unwrap())
+            .unwrap();
+        let mut expected = Vec::new();
+        for (name, state, created) in [
+            ("active", crate::KeyState::Active, 1),
+            ("staged", crate::KeyState::Staged, 30),
+            ("retiring", crate::KeyState::Retiring, 20),
+        ] {
+            let key = SecretKey::generate();
+            store.add_device_key(&key, state, created).unwrap();
+            let issuer = OriginId::named(name, "x.example").unwrap();
+            store
+                .put_binding(&root_binding(
+                    issuer.clone(),
+                    SecretKey::generate().public(),
+                ))
+                .unwrap();
+            store
+                .put_binding(&delegate(key.public(), issuer.clone(), i64::MAX))
+                .unwrap();
+            expected.push(issuer);
+        }
+        assert_eq!(store.own_issuers(MIN_TRUSTED_NS).unwrap(), expected);
+        store
+            .conn()
+            .execute(
+                "UPDATE device_keys SET state = 'unknown' WHERE state = 'staged'",
+                [],
+            )
+            .unwrap();
+        assert!(store.own_issuers(MIN_TRUSTED_NS).is_err());
+    }
+
+    #[test]
     fn indexed_authority_does_not_scan_unrelated_bindings() {
         let (_dir, store) = crate::testutil::store();
         let issuer_key = SecretKey::generate().public();
