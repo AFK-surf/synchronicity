@@ -138,6 +138,98 @@ theorem absent_has_no_entry (absent : Absent store root key) :
   rw [missing] at present
   cases present
 
+private theorem value_ne_missing (value : Value) (budget : Nat) :
+    executeReads store budget (resolveValue value).run ≠ some (.ok (.ok none)) := by
+  cases value with
+  | inline bytes =>
+    change executeReads store budget (.pure (.ok (.ok (some bytes)) : Reply LookupResult)) ≠ _
+    simp
+  | hash hash =>
+    cases budget with
+    | zero => change none ≠ _; simp
+    | succ budget =>
+      change executeReads store (budget + 1) (.request (.readBytes valueSpace hash) _) ≠ _
+      rw [executeReads]
+      dsimp only [Program.bind, ExceptT.bindCont]
+      cases store valueSpace hash with
+      | none =>
+        change executeReads store budget (.pure (.ok (.error (.missingValue hash)) : Reply LookupResult)) ≠ _
+        simp
+      | some bytes =>
+        change executeReads store budget (.pure (.ok (.ok (some bytes)) : Reply LookupResult)) ≠ _
+        simp
+
+/-- A successful missing-key answer supplies structural absence in a
+canonical store. This direction matters: callers need not manufacture an
+extra absence certificate independently of the actual read. -/
+theorem lookup_missing_is_absent (shaped : Shaped s)
+    (fuel budget : Nat) (root : ByteArray) (key : List UInt8)
+    (missing : executeReads s.read budget (lookup fuel (some root) key).run =
+      some (.ok (.ok none))) : Absent s.read root key := by
+  induction fuel generalizing root key budget with
+  | zero =>
+    change executeReads s.read budget (.pure (.ok (.error .depthExceeded) : Reply LookupResult)) = _ at missing
+    simp at missing
+  | succ fuel ih =>
+    cases budget with
+    | zero => contradiction
+    | succ budget =>
+      change executeReads s.read (budget + 1) (.request (.readBytes nodeSpace root) _) = _ at missing
+      rw [executeReads] at missing
+      dsimp only [Program.bind, ExceptT.bindCont] at missing
+      cases held : s.read nodeSpace root with
+      | none =>
+        simp only [held] at missing
+        change executeReads s.read budget (.pure (.ok (.error (.missingNode root)) : Reply LookupResult)) = _ at missing
+        simp at missing
+      | some raw =>
+        obtain ⟨node, decoded, _, _, invariants⟩ := shaped root raw held
+        simp only [held, decoded] at missing
+        cases node with
+        | leaf suffix value =>
+          dsimp only at missing
+          split at missing
+          · exact (value_ne_missing value budget missing).elim
+          · rename_i different
+            apply Absent.leaf held decoded
+            simpa only [TrieWalkProofs.toList_eq, beq_iff_eq] using different
+        | extension segment child =>
+          dsimp only at missing
+          have nonempty : segment.data.toList ≠ [] := by
+            intro empty
+            have zero : segment.size = 0 := by
+              have := Array.length_toList (xs := segment.data)
+              rw [empty] at this
+              exact this.symm
+            simp [checkInvariants, zero] at invariants
+          split at missing
+          · rename_i outside
+            have notEmpty : segment.toList.isEmpty = false := by
+              simpa [TrieWalkProofs.toList_eq] using nonempty
+            apply Absent.extensionOutside held decoded
+            rw [notEmpty] at outside
+            simpa only [Bool.false_or, Bool.not_eq_true', TrieWalkProofs.toList_eq] using outside
+          · rename_i inside
+            simp only [Bool.or_eq_true, not_or] at inside
+            have starts : segment.data.toList.isPrefixOf key = true := by
+              simpa [TrieWalkProofs.toList_eq] using inside.2
+            apply Absent.extensionBelow held decoded starts nonempty
+            apply ih budget child
+            simpa only [TrieWalkProofs.toList_eq, ExceptT.run] using missing
+        | branch children value =>
+          cases key with
+          | nil =>
+            cases value with
+            | none => exact .branchValue held decoded
+            | some value => exact (value_ne_missing value budget missing).elim
+          | cons nibble key =>
+            change executeReads s.read budget (lookup fuel (childAt children nibble) key).run = _ at missing
+            cases edge : childAt children nibble with
+            | none => exact .branchEmpty held decoded edge
+            | some child =>
+              rw [edge] at missing
+              exact .branchBelow held decoded edge (ih budget child key missing)
+
 /-- The complete removal continuation, including its actual reconstruction
 stack, preserves all storage when the key is absent. -/
 theorem absent_removal_continuation (absent : Absent s.read root key)
@@ -206,5 +298,19 @@ theorem remove_absent_preserves_snapshot (absent : Absent s.read root (keyNibble
   change execute d s (removeAt depthBudget root (keyNibbles key)).run = _ at unchanged
   rw [unchanged]
   rfl
+
+/-- If reading a key says it is absent, deleting it leaves the snapshot and
+all stored bytes unchanged. Canonicality is the existing invariant maintained
+by production insertion and removal; no completeness/refusal flag is assumed. -/
+theorem remove_missing_key_changes_nothing (shaped : Shaped s)
+    (bounded : key.size ≤ maxKeyBytes) (nonempty : isEmptyRoot root = false)
+    (missing : executeReads s.read (maxKeyBytes * 2 + 2) (Trie.get root key).run =
+      some (.ok (.ok none))) :
+    execute d s (Trie.remove root key).run = some (.ok root, s) := by
+  apply remove_absent_preserves_snapshot (bounded := bounded) (nonempty := nonempty)
+  apply lookup_missing_is_absent shaped (maxKeyBytes * 2 + 1) (maxKeyBytes * 2 + 2)
+  unfold Trie.get at missing
+  change root.data.all (· == 0) = false at nonempty
+  simpa only [Nat.not_lt.mpr bounded, ↓reduceIte, nonempty, Bool.false_eq_true] using missing
 
 end Synchronicity.TrieRemoveSemantics
