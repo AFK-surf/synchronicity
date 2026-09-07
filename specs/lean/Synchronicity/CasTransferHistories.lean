@@ -198,4 +198,104 @@ theorem transfers_preserve_readable_content (saved : StoredFile state root conte
   rw [coverage]
   simp [old]
 
+private theorem read_throw (error : Cas.Read.Error) :
+    (throw error : Cas.Read.Action A) = ExceptT.mk (Program.pure (.error error)) := rfl
+
+private theorem invalid_read (saved : StoredFile state root content) (offset length : UInt64)
+    (quiet : state.faults = []) (invalid : saved.size.toNat < offset.toNat) :
+    CasReadPromises.readResult state root (.range offset length) =
+      .error (.range offset (min (offset.toNat + length.toNat) saved.size.toNat).toUInt64 saved.size) := by
+  obtain ⟨raw, observed, decoded⟩ := saved.observed
+  unfold CasReadPromises.observation at observed
+  simp [CasReadPromises.readResult, run, Cas.Read.read, Cas.Read.metadata,
+    Cas.Read.requestAccess, raise, performOver, Inject.inject,
+    execute, Interpreter.handle, access, reply, fault, record, quiet, observed, decoded,
+    StoredFile.metadata, invalid, bind, pure, Program.bind, ExceptT.bind, ExceptT.bindCont,
+    ExceptT.pure, read_throw, ExceptT.run, ExceptT.mk, Except.mapError, publish]
+
+private theorem unavailable_read (saved : StoredFile state root content) (offset length : UInt64)
+    (quiet : state.faults = []) (valid : offset.toNat ≤ saved.size.toNat)
+    (nonempty : offset.toNat ≠ min (offset.toNat + length.toNat) saved.size.toNat)
+    (unavailable : Cas.Read.covered saved.metadata offset
+      (min (offset.toNat + length.toNat) saved.size.toNat).toUInt64 = false) :
+    CasReadPromises.readResult state root (.range offset length) = .error .unavailable := by
+  obtain ⟨raw, observed, decoded⟩ := saved.observed
+  unfold CasReadPromises.observation at observed
+  simp [CasReadPromises.readResult, run, Cas.Read.read, Cas.Read.metadata,
+    Cas.Read.requestAccess, raise, performOver, Inject.inject,
+    execute, Interpreter.handle, access, reply, fault, record, quiet, observed, decoded,
+    Nat.not_lt.mpr valid, nonempty, bind, pure, Program.bind, ExceptT.bind, ExceptT.bindCont,
+    ExceptT.pure, read_throw, ExceptT.run, ExceptT.mk, Except.mapError, publish, StoredFile.metadata]
+  simp only [StoredFile.metadata] at unavailable
+  simp [unavailable, execute]
+
+/-- Equal saved coverage means identical public read results: the same exact
+bytes, the same unavailable response, or the same invalid-range response. -/
+private theorem equal_coverage_equal_reads (left : StoredFile before root content)
+    (right : StoredFile after root content) (leftQuiet : before.faults = [])
+    (rightQuiet : after.faults = [])
+    (coverage : ∀ g, spansContain (Cas.Serve.held left.metadata) g =
+      spansContain (Cas.Serve.held right.metadata) g) (offset length : UInt64) :
+    CasReadPromises.readResult before root (.range offset length) =
+      CasReadPromises.readResult after root (.range offset length) := by
+  have size : right.size = left.size := UInt64.toNat_inj.mp (right.sameSize.trans left.sameSize.symm)
+  by_cases valid : offset.toNat ≤ left.size.toNat
+  · have covered : Cas.Read.covered left.metadata offset
+        (min (offset.toNat + length.toNat) left.size.toNat).toUInt64 =
+      Cas.Read.covered right.metadata offset
+        (min (offset.toNat + length.toNat) left.size.toNat).toUInt64 := by
+      apply Bool.eq_iff_iff.mpr
+      constructor
+      · apply CasRangeProofs.additional_groups_preserve_readable_ranges
+        intro g member
+        rw [← coverage]
+        exact member
+      · apply CasRangeProofs.additional_groups_preserve_readable_ranges
+        intro g member
+        rw [coverage]
+        exact member
+    by_cases available : Cas.Read.covered left.metadata offset
+        (min (offset.toNat + length.toNat) left.size.toNat).toUInt64 = true
+    · rw [left.reads offset length leftQuiet valid available,
+        right.reads offset length rightQuiet (by simpa only [size] using valid)
+          (by simpa only [size, ← covered] using available)]
+    · have missing := Bool.eq_false_iff.mpr available
+      have nonempty : offset.toNat ≠ min (offset.toNat + length.toNat) left.size.toNat := by
+        intro empty
+        have same : (min (offset.toNat + length.toNat) left.size.toNat).toUInt64 = offset := by
+          rw [← empty]; simp
+        simp [same, Cas.Read.covered] at missing
+      rw [unavailable_read left offset length leftQuiet valid nonempty missing,
+        unavailable_read right offset length rightQuiet (by simpa only [size] using valid)
+          (by simpa only [size] using nonempty) (by simpa only [size, ← covered] using missing)]
+  · rw [invalid_read left offset length leftQuiet (by omega),
+      invalid_read right offset length rightQuiet (by rw [size]; omega), size]
+
+/-- Reordering the same transfers does not change what any subsequent range
+read returns, including failures and partially available content. -/
+theorem transfer_order_does_not_change_reads (saved : StoredFile state root content)
+    (ready : Ready state) (correct : DecoderCorrect state root content saved.size)
+    (first second : List Transfer) (reordered : first.Perm second) (offset length : UInt64) :
+    CasReadPromises.readResult (receiveAll root saved.size first state) root (.range offset length) =
+      CasReadPromises.readResult (receiveAll root saved.size second state) root (.range offset length) := by
+  obtain ⟨left, _, leftReady, _, _, leftCoverage⟩ := history_preserves_version saved ready correct first
+  obtain ⟨right, _, rightReady, _, _, rightCoverage⟩ := history_preserves_version saved ready correct second
+  apply equal_coverage_equal_reads left right leftReady.quiet rightReady.quiet _ offset length
+  intro g
+  rw [leftCoverage, rightCoverage, reordered.any_eq]
+
+/-- Retrying an entire transfer history does not change subsequent read
+results. Verified bytes may be rewritten, but remain the same named content. -/
+theorem replaying_transfers_does_not_change_reads (saved : StoredFile state root content)
+    (ready : Ready state) (correct : DecoderCorrect state root content saved.size)
+    (transfers : List Transfer) (offset length : UInt64) :
+    CasReadPromises.readResult (receiveAll root saved.size (transfers ++ transfers) state) root (.range offset length) =
+      CasReadPromises.readResult (receiveAll root saved.size transfers state) root (.range offset length) := by
+  obtain ⟨left, _, leftReady, _, _, leftCoverage⟩ := history_preserves_version saved ready correct (transfers ++ transfers)
+  obtain ⟨right, _, rightReady, _, _, rightCoverage⟩ := history_preserves_version saved ready correct transfers
+  apply equal_coverage_equal_reads left right leftReady.quiet rightReady.quiet _ offset length
+  intro g
+  rw [leftCoverage, rightCoverage]
+  simp
+
 end Synchronicity.CasTransferHistories

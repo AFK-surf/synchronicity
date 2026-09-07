@@ -599,8 +599,13 @@ overlapping and repeated transfers. Every invocation uses the previous one's
 actual files and rows. `history_preserves_version` also establishes exactly the
 union of initially held and successfully verified groups. This is a preservation
 result under the stated raw decoder and healthy metadata-store contracts;
-order/replay equivalence of final reads, inline content and other injected
-host-failure paths remain open.
+`transfer_order_does_not_change_reads` and
+`replaying_transfers_does_not_change_reads` also prove identical actual final
+range-read results after reordering or replay, including unavailable and invalid
+ranges. They preserve the same trusted decoder behavior through the history.
+Bootstrap from an absent content row into these histories, the separate
+read-all request form, inline content and other injected host-failure paths
+remain open.
 
 ## Path to all proof goals
 
