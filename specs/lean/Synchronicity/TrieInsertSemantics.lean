@@ -175,4 +175,104 @@ theorem put_frame_exact (digestWidth : Width d) (shaped : Shaped before)
   exact ⟨included, shaped_write_node shaped (canonical_encode wf canonical), digestWidth _,
     closedAfter, exactEntries⟩
 
+private theorem frame_entries_congr
+    (same : ∀ key bytes, first key bytes ↔ second key bytes) :
+    FrameEntries store frame first key bytes ↔ FrameEntries store frame second key bytes := by
+  cases frame with
+  | extension segment =>
+    exact and_congr Iff.rfl (exists_congr fun tail => and_congr Iff.rfl (same tail bytes))
+  | branch children value position =>
+    cases key with
+    | nil => exact Iff.rfl
+    | cons nibble tail =>
+      simp only [FrameEntries]
+      split <;> first | exact same tail bytes | exact Iff.rfl
+  | route children value position =>
+    cases key with
+    | nil => exact Iff.rfl
+    | cons nibble tail =>
+      simp only [FrameEntries]
+      split <;> first | exact same tail bytes | exact Iff.rfl
+
+private theorem context_entries_congr (stack : List InsertFrame)
+    (same : ∀ key bytes, first key bytes ↔ second key bytes) :
+    ContextEntries store stack first key bytes ↔ ContextEntries store stack second key bytes := by
+  induction stack generalizing first second with
+  | nil => exact same key bytes
+  | cons frame stack ih =>
+    exact ih (fun key bytes => frame_entries_congr (key := key) (bytes := bytes) same)
+
+/-- Every ancestor remembers complete existing entries, independently of
+whether its replacement child was present before the insertion. -/
+def ContextReady (store : RawSnapshot) (stack : List InsertFrame) : Prop :=
+  ∀ frame ∈ stack, FrameReady store frame
+
+private theorem context_ready_preserved (ready : ContextReady before stack)
+    (included : RecordsIncluded before after) : ContextReady after stack :=
+  fun frame member => frame_ready_preserved (ready frame member) included
+
+private theorem context_entries_unchanged (stack : List InsertFrame)
+    (ready : ContextReady before stack) (included : RecordsIncluded before after) :
+    ContextEntries after stack inside key bytes ↔ ContextEntries before stack inside key bytes := by
+  induction stack generalizing inside with
+  | nil => exact Iff.rfl
+  | cons frame stack ih =>
+    have tailReady : ContextReady before stack :=
+      fun ancestor member => ready ancestor (List.mem_cons_of_mem _ member)
+    exact (ih tailReady).trans
+      (context_entries_congr stack (fun key bytes => frame_entries_unchanged
+        (key := key) (bytes := bytes) (ready frame (by simp)) included))
+
+private theorem rebuild_cons_run :
+    (rebuild built (frame :: stack)).run =
+      (do let root ← put (FrameNode frame built); rebuild root stack).run := by
+  cases frame <;> rfl
+
+/-- Rebuilding the entire actual ancestor stack fills exactly its selected
+subtree. All surrounding entries and every previously stored record retain
+their meaning, for both ordinary and routing ancestors. -/
+theorem rebuild_exact (digestWidth : Width d) (stack : List InsertFrame)
+    (shaped : Shaped before) (ready : ContextReady before.read stack)
+    (width : built.size = 32) (closed : Closed before.read built)
+    (safe : SafeWrites d before (rebuild built stack).run)
+    (ran : execute d before (rebuild built stack).run = some (.ok root, after)) :
+    RecordsIncluded before.read after.read ∧ Shaped after ∧ root.size = 32 ∧ Closed after.read root ∧
+      ∀ key bytes, GraphValue after.read root key bytes ↔
+        ContextEntries before.read stack (GraphValue before.read built) key bytes := by
+  induction stack generalizing before built with
+  | nil =>
+    simp only [rebuild, run_pure, TrieMutateProofs.execute_pure,
+      Option.some.injEq, Prod.mk.injEq, Except.ok.injEq] at ran
+    obtain ⟨rfl, rfl⟩ := ran
+    exact ⟨fun _ _ _ _ held => held, shaped, width, closed, fun _ _ => Iff.rfl⟩
+  | cons frame stack ih =>
+    have headReady : FrameReady before.read frame := ready frame (by simp)
+    have tailReady : ContextReady before.read stack :=
+      fun ancestor member => ready ancestor (List.mem_cons_of_mem _ member)
+    rw [rebuild_cons_run] at safe ran
+    simp only [run_bind] at safe
+    have firstSafe := safe_bind_left _ safe
+    rw [execute_run_bind] at ran
+    cases first : execute d before (put (FrameNode frame built)).run with
+    | none => simp [first] at ran
+    | some reply =>
+      obtain ⟨reply, middle⟩ := reply
+      cases reply with
+      | error error => simp [first] at ran
+      | ok parent =>
+        have restSafe := safe_bind_right _ safe first
+        simp only [bindCont_ok] at restSafe
+        simp only [first] at ran
+        obtain ⟨included, middleShaped, parentWidth, parentClosed, parentEntries⟩ :=
+          put_frame_exact digestWidth shaped headReady width closed firstSafe first
+        obtain ⟨laterIncluded, finalShaped, rootWidth, rootClosed, finalEntries⟩ :=
+          ih middleShaped (context_ready_preserved tailReady included)
+            parentWidth parentClosed restSafe ran
+        refine ⟨fun space key bytes admitted held => laterIncluded space key bytes admitted
+          (included space key bytes admitted held), finalShaped, rootWidth, rootClosed, ?_⟩
+        intro key bytes
+        exact (finalEntries key bytes).trans
+          ((context_entries_unchanged stack tailReady included).trans
+            (context_entries_congr stack parentEntries))
+
 end Synchronicity.TrieInsertSemantics
