@@ -55,6 +55,47 @@ theorem existing_receive_execution (state : State) (root : ByteArray) (size : UI
       lookupFile, writeFile, Except.mapError, Except.map,
       bind, pure, Program.bind, ExceptT.bind, ExceptT.bindCont, ExceptT.pure, ExceptT.run, ExceptT.mk]
 
+/-- The first slice can start among unrelated objects and arbitrary lease
+counters. The actual inserted metadata and physical bytes share one result;
+the decoder contract remains available for all subsequent transfers. -/
+theorem fresh_receive_execution (state : State) (root : ByteArray) (size : UInt64)
+    (served : List (UInt64 × UInt64)) (input : UInt64) (now : Int64)
+    (tier : Cas.IngestCommit.Tier)
+    (quiet : state.faults = []) (idle : state.pending = none) (clean : state.scanFault = none)
+    (absent : (rows state.db "blobs").filter (fun row => equals row [("root", .blob root)]) = [])
+    (large : ¬ size ≤ inlineMax) (nonempty : window size served ≠ [])
+    (verifies : state.decodeSlice root size (Cas.Serve.pairsOf (window size served)) input = true) :
+    let result := SimulatedHost.run (writeSlice root size served input now tier) state
+    let planned := Cas.IngestCommit.plan none size (window size served)
+    result.1 = .ok (Cas.Serve.pairsOf (window size served)) ∧
+    rows result.2.db "blobs" = upsertRows (rows state.db "blobs")
+      (Cas.IngestCommit.values root size planned.complete
+        (if planned.complete || planned.spans.isEmpty then none
+         else some (Cas.Codec.encodeRawBitmap planned.spans)) none now tier)
+      ["root"] Cas.IngestCommit.assignments ∧
+    lookupFile result.2.files ("cas_payload", root) = some
+      (state.decodedPayload root size (Cas.Serve.pairsOf (window size served)) input
+        ((lookupFile state.files ("cas_payload", root)).getD ByteArray.empty)) ∧
+    result.2.faults = [] ∧ result.2.pending = none ∧
+    result.2.hash = state.hash ∧ result.2.decodeSlice = state.decodeSlice ∧
+    result.2.decodedPayload = state.decodedPayload ∧ result.2.decodeSliceFailure = state.decodeSliceFailure ∧
+    result.2.scanFault = state.scanFault := by
+  have selected (table : String) (fields : Fields) :
+      selects ⟨table, fields, [], []⟩ = fun row => equals row fields := by
+    funext row
+    simp [selects]
+  cases finished : (Cas.IngestCommit.plan none size (window size served)).complete <;>
+    simp [SimulatedHost.run, writeSlice, leased, admit, commit, metadata?, settle,
+      VerifiedCore.Cas.Receive.access, VerifiedCore.Cas.Receive.lease, VerifiedCore.Cas.Receive.bao,
+      Cas.IngestCommit.admit, Cas.IngestCommit.commitGroups, Cas.IngestCommit.commitIn,
+      within, ensure, transactionOver, raise, performOver, Inject.inject, Program.mapEffects,
+      execute, Interpreter.handle, storage, SimulatedHost.access, upsert, SimulatedHost.lease,
+      SimulatedHost.bao, SimulatedHost.transaction, reply, fault, record, quiet, idle, clean,
+      scanFailure, absent, Cas.IngestCommit.decodeClaim, CasReceiveProofs.fresh_accepted,
+      unordered_query, selected, large, nonempty, verifies, finished, counter, setCounter,
+      lookupFile, writeFile, Except.mapError, Except.map,
+      bind, pure, Program.bind, ExceptT.bind, ExceptT.bindCont, ExceptT.pure, ExceptT.run, ExceptT.mk]
+
 /-- Receiving another slice of an already complete version does not rewrite
 its saved bytes or metadata. Empty requests also make no storage change. -/
 theorem complete_receive_execution (state : State) (root : ByteArray) (size : UInt64)

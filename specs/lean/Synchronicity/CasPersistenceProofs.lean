@@ -70,6 +70,31 @@ theorem receive_upsert_selects_record (table : List Fields) (prior : Fields)
     simp [Cas.IngestCommit.assignments]
   simp [conflict, rootUnchanged]
 
+/-- A first receive inserts exactly one selected record without requiring
+an otherwise empty database. -/
+theorem receive_upsert_selects_new_record (table : List Fields)
+    (root : ByteArray) (size : UInt64) (complete : Bool) (bitmap : Option ByteArray)
+    (now : Int64) (tier : Cas.IngestCommit.Tier)
+    (absent : table.filter (fun row => equals row [("root", .blob root)]) = []) :
+    let incoming := Cas.IngestCommit.values root size complete bitmap none now tier
+    (upsertRows table incoming ["root"] Cas.IngestCommit.assignments).filter
+      (fun row => equals row [("root", .blob root)]) = [incoming] := by
+  let incoming := Cas.IngestCommit.values root size complete bitmap none now tier
+  have named : cell incoming "root" = .blob root := by simp [incoming, Cas.IngestCommit.values, cell]
+  have same := root_conflict root incoming named
+  have empty : table.any (conflict ["root"] incoming) = false := by
+    rw [same]
+    apply Bool.eq_false_iff.mpr
+    intro found
+    obtain ⟨row, present, matched⟩ := List.any_eq_true.mp found
+    have member : row ∈ table.filter (fun row => equals row [("root", .blob root)]) :=
+      List.mem_filter.mpr ⟨present, matched⟩
+    rw [absent] at member
+    simp at member
+  change (upsertRows table incoming ["root"] Cas.IngestCommit.assignments).filter _ = [incoming]
+  simp only [upsertRows, empty, Bool.false_eq_true, if_false, List.filter_append, absent, List.nil_append]
+  simp [incoming, Cas.IngestCommit.values, equals, cell]
+
 /-- The actual conflict assignment preserves a file-backed record's absence
 of inline bytes and exposes exactly the newly committed read metadata. -/
 theorem updated_record_decodes (prior : Fields) (root : ByteArray) (size : UInt64)

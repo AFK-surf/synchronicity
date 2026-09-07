@@ -315,6 +315,65 @@ theorem successful_transfer_saves_verified_content
   rw [coverage]
   exact plannedGroup
 
+/-- The first successful slice establishes the saved-content invariant from
+its actual new row and decoder output, even when the remainder is missing. -/
+theorem first_transfer_saves_verified_content (state : State) (root content : ByteArray)
+    (size : UInt64) (served : List (UInt64 × UInt64)) (input : UInt64) (now : Int64)
+    (tier : Cas.IngestCommit.Tier) (quiet : state.faults = []) (idle : state.pending = none)
+    (clean : state.scanFault = none)
+    (absent : (rows state.db "blobs").filter (fun row => equals row [("root", .blob root)]) = [])
+    (width : root.size = 32) (identity : state.hash content = root)
+    (sameSize : size.toNat = content.size) (large : ¬ size ≤ Cas.Receive.inlineMax)
+    (decoder : DecoderCorrect state root content size)
+    (nonempty : Cas.Receive.window size served ≠ [])
+    (verifies : state.decodeSlice root size (Cas.Serve.pairsOf (Cas.Receive.window size served)) input = true) :
+    let received := SimulatedHost.run (Cas.Receive.writeSlice root size served input now tier) state
+    ∃ saved : StoredFile received.2 root content,
+      saved.size = size ∧ saved.metadata = CasBitmapProofs.metadata size
+        (Cas.IngestCommit.plan none size (Cas.Receive.window size served)) ∧
+      ∀ g, spansContain (Cas.Serve.held saved.metadata) g = spansContain (Cas.Receive.window size served) g := by
+  let incoming := Cas.Receive.window size served
+  let planned := Cas.IngestCommit.plan none size incoming
+  let bitmap := (CasBitmapProofs.metadata size planned).bitmap
+  let received := SimulatedHost.run (Cas.Receive.writeSlice root size served input now tier) state
+  have execution := CasReceiveStateProofs.fresh_receive_execution state root size served input now tier
+    quiet idle clean absent large nonempty verifies
+  obtain ⟨_, stored, physical, _, _, hash, _⟩ := execution
+  have plannedCoverage (g : Nat) :
+      spansContain (Cas.Serve.held (CasBitmapProofs.metadata size planned)) g = spansContain incoming g := by
+    have coverage := CasBitmapProofs.persisted_plan_has_exact_coverage false false false 0 size [] incoming g
+    have membership := CasPlanProofs.cas_plan_membership false false false 0 size [] incoming g
+    change spansContain (Cas.Serve.held (CasBitmapProofs.metadata size planned)) g = spansContain planned.spans g at coverage
+    rw [coverage]
+    apply Bool.eq_iff_iff.mpr
+    simp only [planned, Cas.IngestCommit.plan] at *
+    rw [membership]
+    simp [settleSize]
+    exact fun member => ((CasPlanProofs.normalize_spans_membership _ _ _).1 member).2
+  have sound : AgreesOn (payload received.2 root) content (held size planned.complete bitmap) := by
+    intro i inside available
+    have groupInside := byte_group_inside size i (by omega)
+    rw [← read_groups size planned.complete bitmap (i / 16384) groupInside] at available
+    change spansContain (Cas.Serve.held (CasBitmapProofs.metadata size planned)) (i / 16384) = true at available
+    rw [plannedCoverage] at available
+    have correct := (decoder incoming input (payload state root) (CasPlanProofs.normalize_spans_bounds _ _)).2 verifies
+    change lookupFile received.2.files ("cas_payload", root) = _ at physical
+    simpa only [payload, physical, Option.getD_some] using correct i inside available
+  let record := Cas.IngestCommit.values root size planned.complete bitmap none now tier
+  let saved : StoredFile received.2 root content :=
+    { size := size, complete := planned.complete, bitmap := bitmap,
+      durable := if planned.complete && tier == .local then 1 else 0,
+      accessed := now, row := record,
+      recorded := by
+        constructor <;> simp [record, Cas.IngestCommit.values, cell] <;> rfl
+      selected := by
+        change rows received.2.db "blobs" = _ at stored
+        rw [stored]
+        exact CasPersistenceProofs.receive_upsert_selects_new_record _ root size planned.complete bitmap now tier absent
+      width := width, identity := by rw [hash]; exact identity,
+      sameSize := sameSize, large := large, sound := sound }
+  exact ⟨saved, rfl, rfl, plannedCoverage⟩
+
 /-- A failed transfer can write a verified prefix, but content already saved
 remains readable byte for byte. This runs the real receive and then the real
 read against its resulting files and database. -/

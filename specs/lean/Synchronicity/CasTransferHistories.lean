@@ -198,6 +198,85 @@ theorem transfers_preserve_readable_content (saved : StoredFile state root conte
   rw [coverage]
   simp [old]
 
+/-- An object absent from the database can enter an arbitrary receive
+history through its first verified slice. The final raw state retains exactly
+the groups verified by those transfers, including interrupted retries. -/
+theorem first_transfer_and_history_save_content (state : State) (root content : ByteArray)
+    (size : UInt64) (first : Transfer) (rest : List Transfer)
+    (ready : Ready state)
+    (absent : (rows state.db "blobs").filter (fun row => equals row [("root", .blob root)]) = [])
+    (width : root.size = 32) (identity : state.hash content = root)
+    (sameSize : size.toNat = content.size) (large : ¬ size ≤ Cas.Receive.inlineMax)
+    (correct : DecoderCorrect state root content size)
+    (nonempty : Cas.Receive.window size first.served ≠ [])
+    (verifies : state.decodeSlice root size (Cas.Serve.pairsOf (Cas.Receive.window size first.served)) first.input = true) :
+    ∃ final : StoredFile (receiveAll root size (first :: rest) state) root content,
+      final.size = size ∧ Ready (receiveAll root size (first :: rest) state) ∧
+      ∀ g, spansContain (Cas.Serve.held final.metadata) g =
+        (first :: rest).any (fun transfer => verifiedGroups state root size transfer g) := by
+  simp only [receiveAll]
+  obtain ⟨saved, sizeSaved, _, coverage⟩ := first_transfer_saves_verified_content state root content size
+    first.served first.input first.now first.tier ready.quiet ready.idle ready.clean absent width identity
+    sameSize large correct nonempty verifies
+  have execution := CasReceiveStateProofs.fresh_receive_execution state root size first.served first.input
+    first.now first.tier ready.quiet ready.idle ready.clean absent large nonempty verifies
+  obtain ⟨_, _, _, quiet, idle, _, decision, bytes, _, clean⟩ := execution
+  have savedReady : Ready (receive root size first state).2 := ⟨quiet, idle, clean.trans ready.clean⟩
+  have savedCorrect : DecoderCorrect (receive root size first state).2 root content saved.size := by
+    rw [sizeSaved]
+    exact decoder_preserved _ _ _ _ _ correct decision bytes
+  have tail := history_preserves_version saved savedReady savedCorrect rest
+  rw [sizeSaved] at tail
+  obtain ⟨final, finalSize, finalReady, _, _, finalCoverage⟩ := tail
+  refine ⟨final, finalSize, finalReady, ?_⟩
+  intro g
+  rw [finalCoverage, coverage]
+  simp only [List.any_cons, verifiedGroups, decision, verifies, Bool.true_and]
+
+/-- Once successful transfers have covered the object, a whole-object read
+returns exactly its named content, even if the history also contained failed,
+overlapping or repeated transfers. The object started absent. -/
+theorem receiving_all_content_makes_the_whole_readable (state : State) (root content : ByteArray)
+    (size : UInt64) (first : Transfer) (rest : List Transfer) (ready : Ready state)
+    (absent : (rows state.db "blobs").filter (fun row => equals row [("root", .blob root)]) = [])
+    (width : root.size = 32) (identity : state.hash content = root)
+    (sameSize : size.toNat = content.size) (large : ¬ size ≤ Cas.Receive.inlineMax)
+    (correct : DecoderCorrect state root content size)
+    (nonempty : Cas.Receive.window size first.served ≠ [])
+    (verifies : state.decodeSlice root size (Cas.Serve.pairsOf (Cas.Receive.window size first.served)) first.input = true)
+    (allReceived : ∀ g, g < (groupCount size).toNat →
+      (first :: rest).any (fun transfer => verifiedGroups state root size transfer g) = true) :
+    CasReadPromises.readResult (receiveAll root size (first :: rest) state) root .all = .ok content.data.toList := by
+  obtain ⟨final, finalSize, finalReady, coverage⟩ := first_transfer_and_history_save_content
+    state root content size first rest ready absent width identity sameSize large correct nonempty verifies
+  obtain ⟨raw, observed, decoded⟩ := final.observed
+  unfold CasReadPromises.readResult SimulatedHost.run
+  rw [CasReadPromises.full_read_is_range { (receiveAll root size (first :: rest) state) with output := [] }
+    root final.metadata raw [] finalReady.quiet observed decoded]
+  change CasReadPromises.readResult _ root (.range 0 final.size) = _
+  have available : Cas.Read.covered final.metadata 0 final.size = true := by
+    have positive : (0 : UInt64) < final.size := by
+      rw [finalSize]
+      change 0 < size.toNat
+      change ¬ size.toNat ≤ 16384 at large
+      omega
+    apply (CasRangeProofs.read_range_iff_groups _ _ _ positive).2
+    intro g _ inside
+    rw [coverage]
+    apply allReceived
+    rw [CasPlanProofs.groupCount_spec]
+    split
+    · rename_i zero
+      subst size
+      simp [finalSize] at positive
+    · rw [finalSize] at inside
+      have sizePositive : 0 < size.toNat := by
+        change ¬ size.toNat ≤ 16384 at large
+        omega
+      omega
+  have read := final.reads 0 final.size finalReady.quiet (by simp) (by simpa using available)
+  simpa [final.sameSize] using read
+
 private theorem read_throw (error : Cas.Read.Error) :
     (throw error : Cas.Read.Action A) = ExceptT.mk (Program.pure (.error error)) := rfl
 
