@@ -80,11 +80,7 @@ pub fn resume_fetch<S: Storage>(
 }
 
 /// Original host/transport failure or the requesting walk's shape refusal.
-#[derive(Debug)]
-pub enum CompleteError<E> {
-    Operation(OperationError<E>),
-    Domain(TrieMissingDomainError),
-}
+pub type CompleteError<E> = crate::CommandError<E, TrieMissingDomainError>;
 
 /// The raw services completeness reads besides the node bytes.
 pub struct CompleteResources<'a, E> {
@@ -123,19 +119,11 @@ pub fn is_complete<S: ByteStorage>(
         redaction: Some(resources.redaction),
         ..operation::Capabilities::default()
     };
-    let result = operation::run_walk(storage, capabilities, &[], &command)
-        .map_err(CompleteError::Operation)?;
-    let outcome: Result<bool, TrieMissingDomainError> =
-        terminal(&result).map_err(|()| CompleteError::Operation(OperationError::Protocol))?;
-    outcome.map_err(CompleteError::Domain)
+    CompleteError::finish(operation::run_walk(storage, capabilities, &[], &command))
 }
 
 /// Completed serving failure, preserving original host errors.
-#[derive(Debug)]
-pub enum ServeError<E> {
-    Operation(OperationError<E>),
-    Domain(TrieServeDomainError),
-}
+pub type ServeError<E> = crate::CommandError<E, TrieServeDomainError>;
 
 /// Which part of a trie a peer may see: allowed nibble prefixes, or every
 /// prefix when `None`, and exact keys. An Authorization-domain input.
@@ -149,11 +137,12 @@ fn served<T: Decode, S: Storage>(
     storage: &mut S,
     command: &Command,
 ) -> Result<T, ServeError<S::Error>> {
-    let result = operation::run(storage, operation::Capabilities::default(), &[], command)
-        .map_err(ServeError::Operation)?;
-    let outcome: Result<T, TrieServeDomainError> =
-        terminal(&result).map_err(|()| ServeError::Operation(OperationError::Protocol))?;
-    outcome.map_err(ServeError::Domain)
+    ServeError::finish(operation::run(
+        storage,
+        operation::Capabilities::default(),
+        &[],
+        command,
+    ))
 }
 
 fn wanted(wants: &[(Vec<u8>, [u8; 32])]) -> Vec<(Vec<u8>, Vec<u8>)> {
@@ -786,11 +775,7 @@ mod write_tests {
 }
 
 /// Completed collection failure, preserving original host errors.
-#[derive(Debug)]
-pub enum CollectError<E> {
-    Operation(OperationError<E>),
-    Domain(TrieCollectDomainError),
-}
+pub type CollectError<E> = crate::CommandError<E, TrieCollectDomainError>;
 
 /// The services a trie sweep directs besides its relational storage: the
 /// digest behind the memo keys, and the completeness memo itself.
@@ -825,11 +810,7 @@ pub fn collect<S: Storage>(
         memo: Some(resources.memo),
         ..operation::Capabilities::default()
     };
-    let result =
-        operation::run(storage, capabilities, &[], &command).map_err(CollectError::Operation)?;
-    let outcome: Result<Collected, TrieCollectDomainError> =
-        terminal(&result).map_err(|()| CollectError::Operation(OperationError::Protocol))?;
-    outcome.map_err(CollectError::Domain)
+    CollectError::finish(operation::run(storage, capabilities, &[], &command))
 }
 
 /// The key a completeness answer for `root` under a scope, and as `owner`'s
@@ -915,11 +896,7 @@ pub fn verify_proof<D: Digest>(
 }
 
 /// Completed walk failure, preserving original host errors.
-#[derive(Debug)]
-pub enum WalkError<E> {
-    Operation(OperationError<E>),
-    Domain(TrieWalkDomainError),
-}
+pub type WalkError<E> = crate::CommandError<E, TrieWalkDomainError>;
 
 /// The services a walk directs besides raw node reads: the refusals a peer
 /// recorded, the digest a value comparison uses, and, for a materialization,
@@ -946,11 +923,7 @@ fn walked<T: Decode, S: ByteStorage>(
         apply: resources.apply,
         ..operation::Capabilities::default()
     };
-    let result =
-        operation::run_walk(storage, capabilities, &[], command).map_err(WalkError::Operation)?;
-    let outcome: Result<T, TrieWalkDomainError> =
-        terminal(&result).map_err(|()| WalkError::Operation(OperationError::Protocol))?;
-    outcome.map_err(WalkError::Domain)
+    WalkError::finish(operation::run_walk(storage, capabilities, &[], command))
 }
 
 /// One listed entry: the key and its value's bytes.

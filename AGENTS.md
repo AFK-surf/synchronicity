@@ -32,6 +32,13 @@ Use four-space indentation and let `rustfmt` own Rust layout. Follow Rust conven
 
 Place unit tests near implementation and integration tests in `<crate>/tests/*.rs`; frontend tests use `*.test.ts`. Name tests after observable behavior. Add regression coverage for bug fixes, especially trust boundaries and cross-platform behavior. The `synch-engine` and ignored `synch-mpt` stress tests are intentionally separated in CI; run targeted variants when touching those areas.
 
+- Test meaningful behavior, not trivial properties or code that is correct by construction.
+- When proofs cover the same operation and assumptions, keep only the necessary native and host-boundary checks.
+- Exercise production code with independent expectations and assertions that establish what the test name claims.
+- Test shared codecs once per mechanism; rely on Hostgen and compilation for generated layouts and conversions.
+- Prune redundant tests during refactors while preserving fault, cancellation, validation and platform regressions.
+- Run relevant checks; broaden or repeat them only for new changes, failures or unresolved concerns.
+
 ## Commit & Pull Request Guidelines
 
 History favors concise, imperative subjects, optionally scoped (`mptsync: ...`, `fix(sock): ...`). Explain the user-visible or invariant-level outcome. Pull requests should include rationale, linked issues, commands run, and platform or migration impact. Include screenshots for dashboard changes and update docs and the core proofs when guarantees change. Never commit credentials; use documented `SYNCH_*` and `CP_*` environment variables.

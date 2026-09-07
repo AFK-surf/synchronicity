@@ -2,7 +2,7 @@
 //! Rust transports typed requests/results and supplies primitive point validation.
 use crate::{
     host::{Crypto, Storage},
-    operation::{run, terminal, Capabilities, Command, Decode, OperationError},
+    operation::{run, Capabilities, Command, Decode},
 };
 
 pub use crate::generated::{
@@ -12,29 +12,7 @@ pub use crate::generated::{
     MetadataRefusal, OriginAuthority, ParsedOrigin as Origin, PeerAuthority, SocketAuthority,
 };
 
-impl Decode for Vec<Origin> {
-    fn decode(reader: &mut crate::operation::Reader<'_>) -> Result<Self, ()> {
-        reader.list(Decode::decode)
-    }
-}
-
-impl Decode for Vec<Binding> {
-    fn decode(reader: &mut crate::operation::Reader<'_>) -> Result<Self, ()> {
-        reader.list(Decode::decode)
-    }
-}
-
-impl Decode for Vec<BindingStatus> {
-    fn decode(reader: &mut crate::operation::Reader<'_>) -> Result<Self, ()> {
-        reader.list(Decode::decode)
-    }
-}
-
-#[derive(Debug)]
-pub enum Error<E> {
-    Operation(OperationError<E>),
-    Domain(DomainError),
-}
+pub type Error<E> = crate::CommandError<E, DomainError>;
 
 fn execute<S: Storage, A: Decode>(
     storage: &mut S,
@@ -45,10 +23,7 @@ fn execute<S: Storage, A: Decode>(
         crypto: Some(crypto),
         ..Capabilities::default()
     };
-    let result = run(storage, capabilities, &[], &command).map_err(Error::Operation)?;
-    let outcome: Result<A, DomainError> =
-        terminal(&result).map_err(|()| Error::Operation(OperationError::Protocol))?;
-    outcome.map_err(Error::Domain)
+    Error::finish(run(storage, capabilities, &[], &command))
 }
 
 pub fn bindings<S: Storage>(

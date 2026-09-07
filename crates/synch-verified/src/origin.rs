@@ -11,16 +11,10 @@ pub use crate::generated::{
 pub use crate::operation::OperationError;
 
 /// Syntax/point rejection remains distinct from failure of the host primitive.
-#[derive(Debug)]
-pub enum Error<E> {
-    Operation(OperationError<E>),
-    Domain(DomainError),
-}
+pub type Error<E> = crate::CommandError<E, DomainError>;
 
 fn finish<A: Decode, E>(result: Vec<u8>) -> Result<A, Error<E>> {
-    let outcome: Result<A, DomainError> =
-        terminal(&result).map_err(|()| Error::Operation(OperationError::Protocol))?;
-    outcome.map_err(Error::Domain)
+    Error::finish(Ok(result))
 }
 
 /// Parse syntax, normalize named components, and validate decoded key bytes.
@@ -81,7 +75,9 @@ mod tests {
     }
 
     #[test]
-    fn syntax_and_named_operations_do_not_call_crypto() {
+    fn native_named_parse_does_not_request_crypto() {
+        // Syntax and callback policy are proved in OriginProgramProofs;
+        // keep one native command/host integration check.
         let mut point = Point {
             result: Err("must not call"),
             keys: Vec::new(),
@@ -93,50 +89,7 @@ mod tests {
                 domain: "cluster.example".into()
             })
         );
-        assert!(matches!(
-            parse(&mut point, "key:invalid@domain"),
-            Err(Error::Domain(DomainError::KeyDecode))
-        ));
-        assert!(matches!(
-            parse(&mut point, "nas@cluster@example"),
-            Err(Error::Domain(DomainError::Domain(_)))
-        ));
         assert!(point.keys.is_empty());
-        assert!(matches!(
-            named("bad_id", "bad domain"),
-            Err(Error::Domain(DomainError::Label(_)))
-        ));
-        assert!(matches!(
-            normalize_label("K"),
-            Err(Error::Domain(DomainError::Label(_)))
-        ));
-        assert_eq!(
-            normalize_domain("Cluster.Example...").unwrap(),
-            "cluster.example"
-        );
-        assert_eq!(normalize_label("-A-1").unwrap(), "-a-1");
-    }
-
-    #[test]
-    fn key_result_framing_rejects_truncation_and_trailing_bytes() {
-        use crate::operation::Encode;
-        let mut encoded = vec![0]; // Successful terminal.
-        Parsed::Key(vec![7; 32]).encode(&mut encoded);
-        assert_eq!(
-            finish::<Parsed, Infallible>(encoded.clone()).unwrap(),
-            Parsed::Key(vec![7; 32])
-        );
-        let mut truncated = encoded.clone();
-        truncated.pop();
-        assert!(matches!(
-            finish::<Parsed, Infallible>(truncated),
-            Err(Error::Operation(OperationError::Protocol))
-        ));
-        encoded.push(0);
-        assert!(matches!(
-            finish::<Parsed, Infallible>(encoded),
-            Err(Error::Operation(OperationError::Protocol))
-        ));
     }
 
     #[test]

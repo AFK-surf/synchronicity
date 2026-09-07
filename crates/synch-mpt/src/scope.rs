@@ -115,30 +115,3 @@ impl Scope {
         self.memo_key_for(None, root)
     }
 }
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    fn path(bytes: &[u8]) -> Vec<u8> {
-        Nibbles::from_bytes(bytes).as_slice().to_vec()
-    }
-
-    /// The serving side reads a scope back as exactly what it was built from.
-    #[test]
-    fn a_scope_hands_its_parts_to_the_serving_side() {
-        assert_eq!(Scope::full().prefixes(), None);
-        assert!(Scope::full().exact().is_empty());
-        let scope = Scope::of(&synch_core::ScopeKeys {
-            prefixes: vec![b"d:".to_vec(), b"f:photos/".to_vec()],
-            exact: vec![
-                b"m:self".to_vec(),
-                b"m:space/photos".to_vec(),
-                b"r:photos".to_vec(),
-            ],
-        });
-        let prefixes = scope.prefixes().expect("a delegated scope is bounded");
-        assert!(prefixes.contains(&path(b"f:photos/")));
-        assert!(scope.exact().contains(&path(b"m:space/photos")));
-    }
-}
