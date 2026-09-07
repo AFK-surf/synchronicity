@@ -404,4 +404,103 @@ theorem replace_leaf_exact (digestWidth : Width d) (shaped : Shaped before)
   by_cases same : probe = suffix <;>
     simpa [Overwrite, NodeEntries, nibblesOf, TrieWalkProofs.toList_eq, same] using entries
 
+private theorem commonPrefix_shared (left right : List UInt8) :
+    left.take (commonPrefix left right) = right.take (commonPrefix left right) := by
+  induction left generalizing right with
+  | nil => simp [commonPrefix]
+  | cons first rest ih =>
+    cases right with
+    | nil => simp [commonPrefix]
+    | cons second tail =>
+      simp only [commonPrefix]
+      split
+      · rename_i same
+        have equal : first = second := beq_iff_eq.mp same
+        subst second
+        simp only [List.take_succ_cons]
+        exact congrArg (first :: ·) (ih tail)
+      · rfl
+
+private theorem commonPrefix_reconstruct (left right : List UInt8) :
+    right.take (commonPrefix left right) ++ left.drop (commonPrefix left right) = left := by
+  rw [← commonPrefix_shared]
+  exact List.take_append_drop _ _
+
+private theorem distinct_leaf_update (different : suffix ≠ key) :
+    Overwrite (fun probe result => probe = suffix ∧ ValueDenotes store old result)
+      key bytes probe result ↔
+    (probe = key ∧ result = bytes) ∨ (probe = suffix ∧ ValueDenotes store old result) := by
+  constructor
+  · rintro (changed | ⟨_, prior⟩)
+    · exact Or.inl changed
+    · exact Or.inr prior
+  · rintro (changed | ⟨rfl, prior⟩)
+    · exact Or.inl changed
+    · exact Or.inr ⟨different, rfl, prior⟩
+
+private theorem branch_one_entries {position : UInt8} (bound : position.toNat < 16) :
+    NodeEntries store (.branch (setChild emptyChildren position (some child)) (some own)) key bytes ↔
+      (key = [] ∧ ValueDenotes store own bytes) ∨
+        ∃ tail, key = position :: tail ∧ GraphValue store child tail bytes := by
+  cases key with
+  | nil => simp [NodeEntries]
+  | cons nibble tail =>
+    by_cases same : nibble = position
+    · subst nibble
+      simp only [NodeEntries, setChild,
+        List.getElem?_set_self (show position.toNat < emptyChildren.length from bound), Option.some.injEq]
+      simp
+    · simp only [NodeEntries, setChild_getElem_ne emptyChildren (Ne.symm same)]
+      have empty : ∀ root, emptyChildren[nibble.toNat]? ≠ some (some root) := by
+        intro root selected
+        have member := List.mem_of_getElem? selected
+        simp only [emptyChildren, List.mem_replicate] at member
+        cases member.2
+      simp [empty, same]
+
+private theorem branch_one_closed {position : UInt8}
+    (childClosed : Closed store child) (ownClosed : ∃ bytes, ValueDenotes store own bytes)
+    (bound : position.toNat < 16) :
+    NodeClosed store (.branch (setChild emptyChildren position (some child)) (some own)) := by
+  refine ⟨fun value selected => ?_, ?_⟩
+  · cases selected
+    exact ownClosed
+  · intro index root selected
+    by_cases same : index = position.toNat
+    · subst index
+      simp only [setChild,
+        List.getElem?_set_self (show position.toNat < emptyChildren.length from bound), Option.some.injEq] at selected
+      cases selected
+      exact childClosed
+    · rw [setChild, List.getElem?_set_ne (Ne.symm same)] at selected
+      have member := List.mem_of_getElem? selected
+      simp only [emptyChildren, List.mem_replicate] at member
+      cases member.2
+
+/-- The branch written when one split key ends above the other retains both
+the ancestor payload and the complete child subtree, with no extra entries. -/
+theorem branch_one_write (digestWidth : Width d) (shaped : Shaped before)
+    {position : UInt8} (bound : position.toNat < 16)
+    (childWidth : child.size = 32) (childClosed : Closed before.read child)
+    (ownValid : ValueOk own) (ownClosed : ∃ bytes, ValueDenotes before.read own bytes)
+    (safe : SafeWrites d before
+      (put (.branch (setChild emptyChildren position (some child)) (some own))).run)
+    (ran : execute d before
+      (put (.branch (setChild emptyChildren position (some child)) (some own))).run =
+        some (.ok root, after)) :
+    RecordsIncluded before.read after.read ∧ Shaped after ∧ root.size = 32 ∧ Closed after.read root ∧
+      ∀ key bytes, GraphValue after.read root key bytes ↔
+        (key = [] ∧ ValueDenotes before.read own bytes) ∨
+          ∃ tail, key = position :: tail ∧ GraphValue before.read child tail bytes := by
+  have valid := branchOk_value (branchOk_setChild branchOk_empty position childWidth) ownValid
+  have slot : emptyChildren[position.toNat]? = some none := emptyChildren_none bound
+  have occupied : 2 ≤ occupants (setChild emptyChildren position (some child)) (some own) := by
+    rw [occupants_setChild_of_none slot, occupants_value, occupants_empty_none]
+    decide
+  obtain ⟨included, finalShape, rootWidth, rootClosed, entries⟩ :=
+    put_exact digestWidth shaped (wf_branch valid) (checkInvariants_branch valid occupied)
+      (branch_one_closed childClosed ownClosed bound) safe ran
+  exact ⟨included, finalShape, rootWidth, rootClosed,
+    fun _ _ => (entries _ _).trans (branch_one_entries bound)⟩
+
 end Synchronicity.TrieInsertSemantics
