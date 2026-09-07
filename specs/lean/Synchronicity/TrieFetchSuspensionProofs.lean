@@ -125,4 +125,141 @@ theorem inspection_closes_before_the_next_wait [Missing.WorkSet Missing.Visit V]
           NoWait.seq (NoWait.request _ rfl) fun _ => NoWait.pure _
       · exact NoWait.seq (NoWait.pure _) fun _ => NoWait.pure _
 
+private theorem NoWait.forIn (items : List A) (initial : B)
+    (body : A → B → Fetch.Action (ForInStep B))
+    (quiet : ∀ item value, NoWait (body item value).run) :
+    NoWait (forIn items initial body).run := by
+  induction items generalizing initial with
+  | nil => exact NoWait.pure _
+  | cons item rest ih =>
+    rw [List.forIn_cons]
+    refine NoWait.seq (quiet item initial) fun step => ?_
+    cases step with
+    | done _ => exact NoWait.pure _
+    | yield next => exact ih next
+
+private theorem NoWait.within [Inject E Fetch.Effects] (operation : OperationOver E ε A)
+    (translate : ε → Fetch.Error)
+    (quiet : ∀ {B} (effect : E B), guard.suspends (Inject.inject effect) = false) :
+    NoWait (within translate operation).run := by
+  apply NoWait.bind
+  · intro isOpen
+    exact mapped_without_waits operation.run Inject.inject guard quiet isOpen
+  · intro result
+    exact NoWait.pure _
+
+/-- An entire reply, of any length, is processed without a network wait
+inside its transaction. Success commits before fetching another reply;
+a validation or host failure terminates the admission. -/
+theorem admission_closes_before_the_next_wait [Missing.WorkSet ByteArray H]
+    (target : Fetch.Target) (values : Bool)
+    (requested served : List (ByteArray × ByteArray)) (routeValues : List ByteArray) :
+    Suspending guard (Fetch.admit (H := H) target values requested served routeValues) := by
+  unfold Fetch.admit
+  apply transaction_without_waits
+  intro tx
+  refine NoWait.seq ?_ fun _ => NoWait.pure _
+  apply NoWait.forIn
+  intro item accumulator
+  obtain ⟨hash, bytes⟩ := item
+  obtain ⟨outstanding, learned⟩ := accumulator
+  dsimp only
+  split
+  · exact NoWait.pure _
+  · split
+    · refine NoWait.seq (NoWait.request _ rfl) fun observed => ?_
+      split
+      · exact NoWait.pure _
+      · split
+        · exact NoWait.seq (NoWait.request _ rfl) fun _ => NoWait.pure _
+        · exact NoWait.pure _
+    · refine NoWait.seq (NoWait.within (Trie.verify hash bytes) _ ?_) fun verdict => ?_
+      · intro B effect
+        cases effect <;> rfl
+      · cases verdict with
+        | peerFault => exact NoWait.pure _
+        | originFault _ => exact NoWait.pure _
+        | accepted =>
+          refine NoWait.seq (NoWait.request _ rfl) fun _ => ?_
+          cases target.context.owner with
+          | none => exact NoWait.pure _
+          | some _ => exact NoWait.seq (NoWait.request _ rfl) fun _ => NoWait.pure _
+
+private theorem touch_closes (target : Fetch.Target) : Suspending guard (Fetch.touch target) := by
+  unfold Fetch.touch
+  refine Suspending.seq (Suspending.ofRaise _ _ rfl rfl) fun _ => ?_
+  apply transaction_without_waits
+  intro tx
+  exact NoWait.seq (NoWait.request _ rfl) fun _ => NoWait.pure _
+
+private theorem abandon_closes (target : Fetch.Target) : Suspending guard (Fetch.abandon target) := by
+  unfold Fetch.abandon
+  apply transaction_without_waits
+  intro tx
+  exact NoWait.seq (NoWait.request _ rfl) fun _ => NoWait.pure _
+
+/-- A complete requesting round waits for peers only between transactions,
+for every possible reply and whether it makes progress, retries or retires
+its pending version. -/
+theorem round_waits_only_between_transactions [Missing.WorkSet Missing.Visit V]
+    [Missing.WorkSet ByteArray H] (target : Fetch.Target) (maximum retryLimit : Nat)
+    (state : Fetch.State V H) : Suspending guard (Fetch.step target maximum retryLimit state) := by
+  unfold Fetch.step
+  refine Suspending.seq (inspection_closes_before_the_next_wait _ _ _) fun inspected => ?_
+  obtain ⟨state, missing, certified⟩ := inspected
+  dsimp only
+  repeat' first
+    | exact Suspending.ofPure _
+    | (refine Suspending.seq (admission_closes_before_the_next_wait _ _ _ _ _) fun _ => ?_)
+    | (refine Suspending.seq (touch_closes _) fun _ => ?_)
+    | (refine Suspending.seq (abandon_closes _) fun _ => ?_)
+    | (refine Suspending.seq (Suspending.ofRaise _ _ rfl rfl) fun _ => ?_)
+    | split
+
+private theorem iterate_balanced (g : Guard F)
+    (body : S → Program F (Except ε (S ⊕ R))) (exhausted : ε)
+    (safeBody : ∀ state, Suspending g (ExceptT.mk (body state))) (fuel : Nat)
+    (program : Program F (Except ε (S ⊕ R))) (isOpen : Bool)
+    (safe : Balanced g isOpen program
+      (fun result openNow => ∀ value, result = .ok value → openNow = false)) :
+    Balanced g isOpen (Program.iterate body exhausted fuel program)
+      (fun result openNow => ∀ value, result = .ok value → openNow = false) := by
+  induction fuel generalizing program isOpen with
+  | zero => exact .pure fun _ h => nomatch h
+  | succ fuel ih =>
+    cases program with
+    | pure result =>
+      cases safe with
+      | pure closed =>
+        cases result with
+        | error failure => exact .pure fun _ h => nomatch h
+        | ok next =>
+          cases next with
+          | inl state =>
+            have wasClosed := closed _ rfl
+            subst isOpen
+            exact ih (body state) false (safeBody state)
+          | inr value => exact .pure fun _ _ => closed _ rfl
+    | request effect resume =>
+      cases safe with
+      | request outside replies =>
+        exact .request outside fun reply => ih (resume reply) _ (replies reply)
+
+/-- Starting without a reference snapshot, the whole requesting loop holds
+no transaction across any peer wait, however many rounds it executes and
+whatever the host or peer answers. -/
+theorem cold_fetch_waits_only_between_transactions (V H : Type)
+    [Missing.WorkSet Missing.Visit V] [Missing.WorkSet ByteArray H]
+    (target : Fetch.Target) (maximum retryLimit : Nat) :
+    Suspending guard (Fetch.fetch V H target none maximum retryLimit) := by
+  unfold Fetch.fetch
+  refine Suspending.seq (Suspending.ofRaise _ _ rfl rfl) fun generation => ?_
+  change Suspending guard (OperationOver.iterate
+    (Fetch.step (V := V) (H := H) target maximum retryLimit) .exhausted Missing.batchFuel
+    ⟨Missing.initial target.context none target.root, generation, 0, 0⟩)
+  apply iterate_balanced
+  · intro state
+    exact round_waits_only_between_transactions _ _ _ _
+  · exact round_waits_only_between_transactions _ _ _ _
+
 end Synchronicity.TrieFetchSuspensionProofs
