@@ -229,6 +229,84 @@ inductive Pending (store : RawSnapshot) : List Normalize.Work → List Entries �
       Pending store (.assemble (children.map Prod.fst) address :: work)
         ((children.map Prod.snd).reverse ++ results) target
 
+/-- The addresses selected by the executable scheduler, before attaching their
+independently defined subtree meanings. -/
+private def selectedChildren (children : List (Option ByteArray)) : List (UInt8 × ByteArray) :=
+  (List.range 16).filterMap fun index =>
+    ((children[index]?).getD none).map fun address => (index.toUInt8, address)
+
+private theorem selected_children_mem {children : List (Option ByteArray)}
+    (width : children.length = 16) :
+    (nibble, root) ∈ selectedChildren children ↔
+      children[nibble.toNat]? = some (some root) := by
+  constructor
+  · intro selected
+    obtain ⟨index, member, selected⟩ := List.mem_filterMap.mp selected
+    have bound : index < 16 := List.mem_range.mp member
+    cases probe : children[index]? with
+    | none => simp [probe] at selected
+    | some slot =>
+      cases slot with
+      | none => simp [probe] at selected
+      | some child =>
+        simp only [probe, Option.getD_some, Option.map_some, Option.some.injEq,
+          Prod.mk.injEq] at selected
+        obtain ⟨same, rfl⟩ := selected
+        have indexSame : nibble.toNat = index := by
+          rw [← same]
+          exact TrieCodecProofs.toNat_ofNat_of_lt (by omega)
+        simpa [indexSame] using probe
+  · intro selected
+    have bound : nibble.toNat < 16 := by
+      obtain ⟨bound, _⟩ := List.getElem?_eq_some_iff.mp selected
+      omega
+    exact List.mem_filterMap.mpr ⟨nibble.toNat, List.mem_range.mpr bound, by simp [selected]⟩
+
+private theorem selected_children_distinct :
+    ((selectedChildren children).map Prod.fst).Nodup := by
+  unfold List.Nodup
+  rw [List.pairwise_map, selectedChildren, List.pairwise_filterMap]
+  apply List.Pairwise.imp_of_mem (p := List.nodup_range (n := 16))
+  intro left right leftMem rightMem different edge leftSelected other rightSelected same
+  have leftBound : left < 16 := List.mem_range.mp leftMem
+  have rightBound : right < 16 := List.mem_range.mp rightMem
+  have position : ∀ (index : Nat) (edge : UInt8 × ByteArray),
+      (((children[index]?).getD none).map fun address => (index.toUInt8, address)) = some edge →
+      edge.1 = index.toUInt8 := by
+    intro index edge selected
+    cases slot : (children[index]?).getD none with
+    | none => simp [slot] at selected
+    | some address => simpa [slot] using (congrArg (Option.map Prod.fst) selected).symm
+  have equal := congrArg UInt8.toNat ((position left edge leftSelected).symm.trans
+    (same.trans (position right other rightSelected)))
+  rw [TrieCodecProofs.toNat_ofNat_of_lt (by omega),
+    TrieCodecProofs.toNat_ofNat_of_lt (by omega)] at equal
+  exact different equal
+
+private theorem selected_views_map : SelectedViews store children =
+    (selectedChildren children).map (fun edge => (edge.1, GraphValue store edge.2)) := by
+  simp [SelectedViews, selectedChildren, List.map_filterMap, Option.map_map, Function.comp_def]
+
+/-- Scheduling a forest visits every selected child before consuming its
+results, in exactly the reverse stack order used by the actual assembler. -/
+private theorem prepend_visits_meaning
+    (selected : List (UInt8 × ByteArray))
+    (valid : ∀ edge ∈ selected, edge.2.size = 32 ∧ Closed store edge.2)
+    (below : Pending store work
+      ((selected.map (fun edge => GraphValue store edge.2)).reverse ++ results) target) :
+    Pending store
+      ((selected.map fun edge => Normalize.Work.visit (path ++ [edge.1]) (.stored edge.2)) ++ work)
+      results target := by
+  induction selected generalizing results with
+  | nil => simpa using below
+  | cons edge rest ih =>
+    simp only [List.map_cons, List.cons_append]
+    apply Pending.visit (cursor := .stored edge.2) (entries := GraphValue store edge.2)
+      (valid edge (by simp)) (fun _ _ => Iff.rfl)
+    apply ih (fun child member => valid child (by simp [member]))
+    simpa only [List.map_cons, List.reverse_cons, List.append_assoc,
+      List.singleton_append] using below
+
 /-- Actual child slots realize these relative entry sets. Width and closure
 allow their enclosing routing node to be stored and read canonically. -/
 structure ChildrenMeaning (store : RawSnapshot) (children : List (Option ByteArray))
@@ -240,6 +318,40 @@ structure ChildrenMeaning (store : RawSnapshot) (children : List (Option ByteArr
   entries : ∀ nibble tail bytes,
     (∃ child, children[nibble.toNat]? = some (some child) ∧ GraphValue store child tail bytes) ↔
       RoutedEntries none views (nibble :: tail) bytes
+
+private theorem selected_children_meaning
+    (shape : RouteOk children none)
+    (closed : ∀ (index : Nat) root, children[index]? = some (some root) → Closed store root) :
+    ChildrenMeaning store children (SelectedViews store children) := by
+  refine ⟨shape, closed, ?_, ?_⟩
+  · intro nibble
+    rw [selected_views_map]
+    simp only [List.map_map, Function.comp_def, List.mem_map]
+    constructor
+    · rintro ⟨root, edge⟩
+      exact ⟨(nibble, root), (selected_children_mem shape.1).mpr edge, rfl⟩
+    · rintro ⟨⟨position, root⟩, member, same⟩
+      cases same
+      exact ⟨root, (selected_children_mem shape.1).mp member⟩
+  · intro nibble tail bytes
+    exact (selected_views_exact shape.1).symm
+
+private theorem selected_children_occupied
+    (width : children.length = 16) (occupied : 0 < children.countP Option.isSome) :
+    SelectedViews store children ≠ [] := by
+  obtain ⟨slot, member, present⟩ := List.countP_pos_iff.mp occupied
+  cases slot with
+  | none => cases present
+  | some root =>
+    obtain ⟨index, edge⟩ := List.mem_iff_getElem?.mp member
+    have bound : index < 16 := by
+      have := (List.getElem?_eq_some_iff.mp edge).1
+      omega
+    have selected : (index.toUInt8, GraphValue store root) ∈ SelectedViews store children := by
+      exact List.mem_filterMap.mpr ⟨index, List.mem_range.mpr bound, by simp [edge]⟩
+    intro empty
+    rw [empty] at selected
+    exact List.not_mem_nil selected
 
 private theorem empty_children_meaning : ChildrenMeaning store emptyChildren [] := by
   refine ⟨branchOk_empty, ?_, ?_, ?_⟩
@@ -422,6 +534,95 @@ theorem state_meaning_preserved (meaning : StateMeaning before state target)
     (included : RecordsIncluded before after) : StateMeaning after state target := by
   obtain ⟨entries, pending, completed⟩ := meaning
   exact ⟨entries, pending_preserved pending included, completed_preserved completed included⟩
+
+/-- The real scheduler preserves the parent entry set while placing all of
+its children ahead of the assembly operation. No child is omitted or repeated. -/
+theorem schedule_meaning
+    (width : children.length = 16)
+    (valid : ∀ (index : Nat) root, children[index]? = some (some root) →
+      root.size = 32 ∧ Closed store root)
+    (payloadMeaning : PayloadMeaning store address payload)
+    (occupied : SelectedViews store children ≠ [] ∨ payload.isSome = true)
+    (below : Pending store state.work
+      (RoutedEntries payload (SelectedViews store children) :: results) target)
+    (ready : Completed store state.results results) :
+    StateMeaning store (Normalize.schedule path children address state) target := by
+  have distinct : ((SelectedViews store children).map Prod.fst).Nodup := by
+    simpa only [selected_views_map, List.map_map, Function.comp_def] using
+      (selected_children_distinct (children := children))
+  have nibbles : ∀ position ∈ (SelectedViews store children).map Prod.fst,
+      position.toNat < 16 := by
+    intro position member
+    rw [selected_views_map] at member
+    simp only [List.map_map, Function.comp_def] at member
+    obtain ⟨edge, selected, same⟩ := List.mem_map.mp member
+    have slot := (selected_children_mem width).mp selected
+    have bound := (List.getElem?_eq_some_iff.mp slot).1
+    simpa only [same, width] using bound
+  have pending := Pending.assemble (SelectedViews store children) distinct nibbles
+    occupied payloadMeaning below
+  rw [selected_views_map] at pending
+  simp only [List.map_map, Function.comp_def] at pending
+  have scheduled := prepend_visits_meaning (path := path) (selectedChildren children)
+    (fun edge member => valid _ _ ((selected_children_mem width).mp member)) pending
+  exact ⟨results, scheduled, ready⟩
+
+private theorem route_node_meaning
+    (valid : CursorValid store (.node (.route children address))) :
+    ∃ payload, PayloadMeaning store address payload ∧
+      (SelectedViews store children ≠ [] ∨ payload.isSome = true) ∧
+      ∀ key bytes, NodeEntries store (.route children address) key bytes ↔
+        RoutedEntries payload (SelectedViews store children) key bytes := by
+  have childrenMeaning := selected_children_meaning
+    (store := store) ⟨valid.2.1.1, valid.2.1.2.1, by simp⟩ valid.1.2
+  cases address with
+  | none =>
+    have positive : 0 < children.countP Option.isSome := by
+      have invariant := valid.2.2
+      simp only [checkInvariants, occupants, Option.map_none, Option.isSome_none,
+        Bool.false_eq_true, ↓reduceIte, Nat.add_zero] at invariant
+      by_cases zero : children.countP Option.isSome = 0
+      · simp [zero] at invariant
+      · omega
+    have occupied := selected_children_occupied (store := store) valid.2.1.1 positive
+    exact ⟨none, .absent, .inl occupied,
+      (assembled_node_meaning childrenMeaning .absent (.inl occupied)).2.2.2⟩
+  | some address =>
+    obtain ⟨bytes, denotes⟩ := valid.1.1 address rfl
+    cases denotes with
+    | stored _ _ held =>
+      have payload : PayloadMeaning store (some address) (some bytes) :=
+        .present (valid.2.1.2.2 address rfl) held
+      exact ⟨some bytes, payload, .inr rfl,
+        (assembled_node_meaning childrenMeaning payload (.inr rfl)).2.2.2⟩
+
+/-- Visiting an existing routing node schedules exactly its own stored
+payload and child entries; even a private terminal value remains distinct
+from an empty subtree. -/
+theorem route_step_preserves
+    (meaning : StateMeaning before.read ⟨.visit path (.node (.route children address)) :: work, results⟩ target)
+    (within : path.length ≤ maxKeyBytes * 2)
+    (spine : Normalize.belowBoundary path = false)
+    (ran : execute d before (Normalize.step
+      ⟨.visit path (.node (.route children address)) :: work, results⟩).run =
+      some (.ok (.inl next), after)) :
+    after = before ∧ StateMeaning after.read next target := by
+  simp only [Normalize.step, Nat.not_lt.mpr within, ↓reduceIte, spine, Bool.false_eq_true,
+    run_bind, run_pure, program_bind_pure, bindCont_ok, TrieMutateProofs.execute_pure,
+    Option.some.injEq, Prod.mk.injEq, Except.ok.injEq, Sum.inl.injEq] at ran
+  obtain ⟨rfl, rfl⟩ := ran
+  obtain ⟨views, pending, ready⟩ := meaning
+  cases pending with
+  | visit valid exactEntries below =>
+    rename_i entries
+    obtain ⟨payload, payloadMeaning, occupied, parentEntries⟩ := route_node_meaning valid
+    have same : RoutedEntries payload (SelectedViews before.read children) = entries := by
+      funext key bytes
+      exact propext ((parentEntries key bytes).symm.trans (exactEntries key bytes))
+    refine ⟨rfl, schedule_meaning valid.2.1.1 ?_ payloadMeaning occupied ?_ ready⟩
+    · intro index root edge
+      exact ⟨valid.2.1.2.1 _ (List.mem_of_getElem? edge) _ rfl, valid.1.2 _ _ edge⟩
+    · simpa only [same] using below
 
 private theorem expand_unary_meaning
     (meaning : StateMeaning store ⟨.visit path cursor :: work, results⟩ target)
