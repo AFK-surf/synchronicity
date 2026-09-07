@@ -6,11 +6,78 @@ use crate::{
 
 pub use crate::generated::{
     Collected, LookupDomainError, MutationDomainError, NodeAnswer, NodeRefusal, NodeVerdict,
-    ProofVerifyError, TrieChange, TrieCollectDomainError, TrieMissingDomainError, TrieProof,
-    TrieServeDomainError, TrieValue, TrieWalkDomainError, ValueAnswer,
+    ProofVerifyError, TrieChange, TrieCollectDomainError, TrieFetchDomainError,
+    TrieMissingDomainError, TrieProof, TrieServeDomainError, TrieValue, TrieWalkDomainError,
+    ValueAnswer,
 };
 pub use crate::operation::OperationError;
 use crate::{host::Storage, operation::Decode};
+
+/// The result of one execution interval of the requesting operation.
+pub type FetchStep<E> = crate::suspend::Step<Result<bool, TrieFetchDomainError>, E>;
+
+/// Primitive services used by a requesting operation between peer waits.
+pub struct FetchResources<'a, E> {
+    pub digest: &'a mut dyn Digest<Error = E>,
+    pub memo: &'a mut dyn crate::host::Memo<Error = E>,
+    pub clock: &'a mut dyn crate::host::Clock<Error = E>,
+}
+
+impl<E> std::fmt::Debug for FetchResources<'_, E> {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("FetchResources").finish_non_exhaustive()
+    }
+}
+
+impl<'a, E> FetchResources<'a, E> {
+    fn capabilities(self) -> operation::Capabilities<'a, E> {
+        operation::Capabilities {
+            digest: Some(self.digest),
+            memo: Some(self.memo),
+            clock: Some(self.clock),
+            ..operation::Capabilities::default()
+        }
+    }
+}
+
+/// Start the whole fetch. Its frontier remains in the Lean continuation;
+/// callers only transport requests and resume it on the originating thread.
+#[allow(clippy::too_many_arguments)]
+pub fn fetch<S: Storage>(
+    storage: &mut S,
+    resources: FetchResources<'_, S::Error>,
+    root: &[u8; 32],
+    origin: String,
+    seq: u64,
+    scope: ServeScope,
+    owner: Option<String>,
+    reference: Option<Vec<u8>>,
+    maximum: u64,
+    retry_limit: u64,
+) -> Result<FetchStep<S::Error>, OperationError<S::Error>> {
+    let command = Command::TrieFetch {
+        root: root.to_vec(),
+        origin,
+        seq,
+        prefixes: scope.prefixes,
+        exact: scope.exact,
+        owner,
+        reference,
+        maximum,
+        retry_limit,
+    };
+    operation::run_suspending(storage, resources.capabilities(), &command, terminal)
+}
+
+/// Resume a fetch after a peer reply, supplying fresh raw service borrows.
+pub fn resume_fetch<S: Storage>(
+    suspended: crate::suspend::Suspension<Result<bool, TrieFetchDomainError>, S::Error>,
+    answer: crate::suspend::PeerReply<S::Error>,
+    storage: &mut S,
+    resources: FetchResources<'_, S::Error>,
+) -> Result<FetchStep<S::Error>, OperationError<S::Error>> {
+    suspended.continue_with(answer, storage, resources.capabilities())
+}
 
 /// Original host/transport failure or the requesting walk's shape refusal.
 #[derive(Debug)]

@@ -518,6 +518,26 @@ instance : Decode Commands.TrieMissingDomainError where
     | 4 => return .exhausted
     | _ => throw ()
 
+instance : Encode Commands.TrieFetchDomainError where
+  encode out value := match value with
+    | .walk a0 => out.push 0 |>.put a0
+    | .origin a0 => out.push 1 |>.put a0
+    | .nodeHash a0 => out.push 2 |>.put a0
+    | .valueHash a0 => out.push 3 |>.put a0
+    | .unsolicited a0 a1 => out.push 4 |>.put a0 |>.put a1
+    | .exhausted => out.push 5
+
+instance : Decode Commands.TrieFetchDomainError where
+  decode := do
+    match ← readByte with
+    | 0 => return .walk (← Decode.decode)
+    | 1 => return .origin (← Decode.decode)
+    | 2 => return .nodeHash (← Decode.decode)
+    | 3 => return .valueHash (← Decode.decode)
+    | 4 => return .unsolicited (← Decode.decode) (← Decode.decode)
+    | 5 => return .exhausted
+    | _ => throw ()
+
 instance : Encode Commands.Ingested where
   encode out value := match value with
     | .mk a0 a1 => out |>.put a0 |>.put a1
@@ -617,6 +637,7 @@ instance : Encode Commands.Command where
     | .peerProbe a0 a1 a2 => out.push 43 |>.put a0 |>.put a1 |>.put a2
     | .trieComplete a0 a1 a2 a3 => out.push 44 |>.put a0 |>.put a1 |>.put a2 |>.put a3
     | .planExchange a0 a1 a2 => out.push 45 |>.put a0 |>.put a1 |>.put a2
+    | .trieFetch a0 a1 a2 a3 a4 a5 a6 a7 a8 => out.push 46 |>.put a0 |>.put a1 |>.put a2 |>.put a3 |>.put a4 |>.put a5 |>.put a6 |>.put a7 |>.put a8
 
 instance : Decode Commands.Command where
   decode := do
@@ -667,6 +688,7 @@ instance : Decode Commands.Command where
     | 43 => return .peerProbe (← Decode.decode) (← Decode.decode) (← Decode.decode)
     | 44 => return .trieComplete (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode)
     | 45 => return .planExchange (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 46 => return .trieFetch (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode)
     | _ => throw ()
 
 end VerifiedCore

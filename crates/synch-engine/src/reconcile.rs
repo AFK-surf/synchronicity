@@ -21,7 +21,9 @@ use std::{
 };
 
 use synch_core::{now_ns, DeclaredScope, Hash, HeadSummary, OriginId, SignedHead, MAX_BATCH};
-use synch_mpt::{Scope, Trie, TrieNode};
+#[cfg(test)]
+use synch_mpt::TrieNode;
+use synch_mpt::{Scope, Trie};
 use synch_store::{PublishScope, Slot, Store};
 
 use synch_net::{HeadSink, MptClient, NetError};
@@ -56,20 +58,6 @@ pub const MAX_RETAINED_FORKS: usize = 8;
 /// never counted — that case is the maintenance pass's `pending_head_ttl`
 /// sweep, and the two together are what §5.2 means by no wedging.
 pub const MAX_UNPRODUCTIVE_ROUNDS: u32 = 3;
-
-/// How many times one fetch re-walks a trie it found whole but the store
-/// refused to certify, before handing the head to promotion as it stands.
-///
-/// Certification is refused while another handle on the same database holds
-/// a memo-invalidating transaction, or when the generation counter has
-/// saturated. Neither is a peer's fault, so [`MAX_UNPRODUCTIVE_ROUNDS`] does
-/// not apply; but each retry is a full descent of the trie inside a write
-/// transaction, and a refusal that persists (a long GC sweep on the other
-/// handle, or saturation, which never clears) would otherwise spin this
-/// fetch on the blocking pool for as long as it lasts. Promotion rechecks
-/// completeness in its own transaction, so leaving it to the next reconcile
-/// round costs nothing but the wait.
-const MAX_UNCERTIFIED_WALKS: u32 = 3;
 
 /// What a promotion attempt concluded.
 ///
@@ -827,32 +815,19 @@ impl Syncer {
         // and the walk is unchanged, for a delegated one a stop at the boundary
         // rather than a request it would be refused — and reading it is a store
         // read, which belongs on the same hop rather than on the runtime.
-        let (reference, scope, held, owner, mut generation) = {
+        let (reference, scope, held, owner) = {
             let store = self.store.clone();
             let origin = origin.clone();
             crate::blocking::offload(move || {
-                let generation = synch_mpt::NodeStore::completeness_generation(store.as_ref())?;
-                let trie = Trie::new(store.as_ref());
-                let scope = store.local_trie_scope()?;
+                let scope = store.materialization_scope(&origin)?;
                 let held = store.complete_head(&origin)?;
                 // Whose provenance the walk carries: a confined origin's trie
                 // is fetched as *its*, so a node this store already holds from
                 // another origin's trie is asked for again, and the reference
                 // must be complete with the same provenance (§5.5).
                 let owner = store.provenance_owner(&origin, now_ns())?;
-                let reference = match &held {
-                    // Reuse only a reference checked under the same scope
-                    // and provenance. The safety of recorded refusal
-                    // boundaries is still part of the completion obligation
-                    // documented in `docs/RUST-LEAN-PROOFS.md`.
-                    Some(head)
-                        if trie.is_complete_scoped_for(owner.as_ref(), head.root, &scope)? =>
-                    {
-                        Some(head.root)
-                    }
-                    _ => None,
-                };
-                Ok((reference, scope, held, owner, generation))
+                let reference = held.as_ref().map(|head| head.root);
+                Ok((reference, scope, held, owner))
             })
             .await?
         };
@@ -881,349 +856,91 @@ impl Syncer {
             .await?;
             return Ok(FetchOutcome::Refused);
         }
-        let mut walk = synch_mpt::MissingWalk::for_origin(
-            owner.clone(),
-            reference,
-            pending.root,
-            scope.clone(),
-        );
-        let mut unproductive = 0u32;
-        let mut uncertified = 0u32;
-        loop {
-            // One walk across the whole fetch, resumed rather than restarted:
-            // beginning again at the root for every batch makes a cold fetch
-            // re-descend everything it has already pulled, once per batch. The
-            // walk travels into the blocking pool and back so its position
-            // survives each round trip.
-            let store = self.store.clone();
-            let walk_owner = owner.clone();
-            let walk_scope = scope.clone();
-            let (missing, returned, current_generation, certified) =
-                crate::blocking::offload(move || {
-                    store.transaction(|txn| -> Result<_> {
-                        let current = synch_mpt::NodeStore::completeness_generation(txn)?;
-                        if current != generation {
-                            // A boundary or the pruning reference changed. Start
-                            // from the target without trusting the old frontier.
-                            walk = synch_mpt::MissingWalk::for_origin(
-                                walk_owner.clone(),
-                                None,
-                                pending.root,
-                                walk_scope.clone(),
-                            );
+        // Lean retains the whole requesting walk on one blocking worker. Only
+        // owned requests and replies cross to the runtime; no continuation,
+        // database session or connection guard crosses a network wait.
+        use synch_verified::suspend::{PeerReply, PeerRequest};
+        let (requests_tx, mut requests_rx) = tokio::sync::mpsc::channel(1);
+        let store = self.store.clone();
+        let fetch_origin = origin.clone();
+        let (fetch_seq, fetch_root) = (pending.seq, pending.root);
+        let fetching = crate::blocking::offload(move || {
+            store
+                .fetch_trie(
+                    fetch_root,
+                    &fetch_origin,
+                    fetch_seq,
+                    &scope,
+                    owner.as_ref(),
+                    reference,
+                    MAX_BATCH as u64,
+                    MAX_UNPRODUCTIVE_ROUNDS.into(),
+                    |request| {
+                        let (reply_tx, reply_rx) = std::sync::mpsc::sync_channel(1);
+                        requests_tx
+                            .blocking_send((request.clone(), reply_tx))
+                            .ok()?;
+                        reply_rx.recv().ok()
+                    },
+                )
+                .map_err(fetch_operation_error)?
+                .map_err(fetch_domain_error)
+        });
+        tokio::pin!(fetching);
+        let fetched = loop {
+            tokio::select! {
+                result = &mut fetching => break result,
+                request = requests_rx.recv() => {
+                    let Some((request, reply_tx)) = request else {
+                        break fetching.await;
+                    };
+                    let (root, wants, values) = match request {
+                        PeerRequest::Nodes { root, wants } => (root, wants, false),
+                        PeerRequest::Values { root, wants } => (root, wants, true),
+                    };
+                    let root = Hash::from_slice(&root).map_err(|e| EngineError::invalid(e.to_string()))?;
+                    let wants = wants.into_iter().map(|(path, hash)| {
+                        Hash::from_slice(&hash).map(|hash| (path, hash))
+                            .map_err(|e| EngineError::invalid(e.to_string()))
+                    }).collect::<Result<Vec<_>>>()?;
+                    let reply = if values {
+                        let response = client.get_values(root, &wants).await?;
+                        PeerReply::Values {
+                            served: response.values.into_iter().map(|(h, b)| (h.as_bytes().to_vec(), b)).collect(),
+                            missing: response.missing.into_iter().map(|h| h.as_bytes().to_vec()).collect(),
                         }
-                        let missing = walk.next_batch(&Trie::new(txn), MAX_BATCH)?;
-                        // Pruning is sound only while the reference and the
-                        // drained frontier belong to this same generation.
-                        let certified = walk.is_exhausted()
-                            && synch_mpt::NodeStore::note_complete_at(
-                                store.as_ref(),
-                                &walk_scope.memo_key_for(walk_owner.as_ref(), pending.root)?,
-                                current,
-                            )?;
-                        Ok((missing, walk, current, certified))
-                    })
-                })
-                .await?;
-            walk = returned;
-            generation = current_generation;
-            if missing.is_empty() {
-                if certified {
-                    break;
+                    } else {
+                        let response = client.get_nodes(root, &wants).await?;
+                        PeerReply::Nodes {
+                            served: response.nodes.into_iter().map(|(h, b)| (h.as_bytes().to_vec(), b)).collect(),
+                            missing: response.missing.into_iter().map(|h| h.as_bytes().to_vec()).collect(),
+                            redacted: response.redacted.into_iter().map(|h| h.as_bytes().to_vec()).collect(),
+                        }
+                    };
+                    // A cancelled driver drops this sender. The blocked worker
+                    // then drops the continuation with no live transaction.
+                    let _ = reply_tx.send(reply);
                 }
-                if walk.is_exhausted() {
-                    // Whole, but the store would not vouch for the snapshot.
-                    // Re-walk from the root without trusting the old frontier,
-                    // a bounded number of times: the refusal is not a peer's
-                    // doing, and promotion below rechecks completeness in its
-                    // own transaction anyway.
-                    uncertified += 1;
-                    if uncertified >= MAX_UNCERTIFIED_WALKS {
-                        tracing::debug!(
-                            origin = %origin,
-                            seq = pending.seq,
-                            walks = uncertified,
-                            "trie drained but certification kept being refused; \
-                             leaving the head to promotion"
-                        );
-                        break;
-                    }
-                    walk = synch_mpt::MissingWalk::for_origin(
-                        owner.clone(),
-                        None,
-                        pending.root,
-                        scope.clone(),
-                    );
-                }
-                walk.resume();
-                continue;
             }
-
-            let mut learned = 0usize;
-            if !missing.nodes.is_empty() {
-                let response = client.get_nodes(pending.root, &missing.nodes).await?;
+        };
+        match fetched {
+            Ok(false) => return Ok(FetchOutcome::Abandoned),
+            Ok(true) => {}
+            Err(error) if is_origin_fault(&error) => {
+                self.refuse(verdict);
                 let store = self.store.clone();
-                let requested: Vec<Hash> = missing.nodes.iter().map(|(_, hash)| *hash).collect();
-                // A boundary the peer reported is recorded before anything
-                // else, and counts as progress: the walk then treats it as
-                // satisfied rather than absent, so the fetch converges instead
-                // of retrying to the §5.2 abandonment clause (§5.5).
-                //
-                // Recorded against the *positions* this round asked the hash
-                // at, never against the bare hash — the same rule
-                // `take_served` applies to `nodes` and `values`, and for the
-                // same reason. Unfiltered, a peer that answers every request
-                // with one arbitrary hash in `redacted` resets `unproductive`
-                // every round, so the abandonment clause never fires and the
-                // fetch never ends. And a refusal is about where a node sits:
-                // one node can stand at two spine positions and be refused at
-                // only one of them, so the responder judges every position and
-                // a hash that came back served, or absent somewhere, was not
-                // refused outright and is not a boundary at all this round.
-                // Only spine positions are recorded, because those are the only
-                // ones the walk consults the memo for.
-                let served: std::collections::HashSet<Hash> =
-                    response.nodes.iter().map(|(hash, _)| *hash).collect();
-                let absent: std::collections::HashSet<Hash> =
-                    response.missing.iter().copied().collect();
-                let refused: std::collections::HashSet<Hash> = response
-                    .redacted
-                    .iter()
-                    .copied()
-                    .filter(|hash| !served.contains(hash) && !absent.contains(hash))
-                    .collect();
-                let boundary: Vec<(Vec<u8>, Hash)> = missing
-                    .nodes
-                    .iter()
-                    .filter(|(path, hash)| refused.contains(hash) && !scope.contains_subtree(path))
-                    .cloned()
-                    .collect();
-                learned += boundary
-                    .iter()
-                    .map(|(_, hash)| *hash)
-                    .collect::<std::collections::HashSet<Hash>>()
-                    .len();
-                if !boundary.is_empty() {
-                    let store = self.store.clone();
-                    crate::blocking::offload(move || {
-                        // One transaction, for the reason the node batch below
-                        // is one: a row per autocommit statement is a write
-                        // connection and a WAL frame per boundary.
-                        store.transaction(|txn| -> Result<()> {
-                            // Record the responder's refusals at the
-                            // requested positions, not against bare hashes.
-                            for (path, hash) in &boundary {
-                                synch_mpt::NodeStore::note_redacted(txn, hash, path)?;
-                            }
-                            Ok(())
-                        })
-                    })
-                    .await?;
-                }
-                let owner = owner.clone();
-                let stored = crate::blocking::offload(move || {
-                    // One transaction per batch, not one per node. Written
-                    // through the `Store`, each `put_node` is a bare `execute`
-                    // in autocommit — its own transaction, its own acquisition
-                    // of the one write connection, its own WAL frame — so a
-                    // `MAX_BATCH` response cost up to 256 of them, and a cold
-                    // bootstrap of an n-node trie cost n. Measured at 3.8x on
-                    // 10 240 puts. The batch is also atomic this way, which is
-                    // what §10 asks of a multi-step write; nothing is lost by a
-                    // rollback either, since trie nodes are content-addressed
-                    // and simply re-fetched.
-                    store.transaction(|txn| {
-                        take_served(
-                            &requested,
-                            &response.nodes,
-                            "node",
-                            verify_node,
-                            |hash, bytes| {
-                                synch_mpt::NodeStore::put_node(txn, hash, bytes)?;
-                                // Served under this origin's root by a peer
-                                // vouching for it: that is what provenance
-                                // records, in the same transaction as the
-                                // node (§5.5).
-                                if let Some(origin) = &owner {
-                                    synch_mpt::NodeStore::note_owned(txn, origin, hash)?;
-                                }
-                                Ok(true)
-                            },
-                        )
-                    })
-                })
-                .await;
-                learned += match stored {
-                    Ok(stored) => stored,
-                    // The origin published a node this build refuses (§12).
-                    // The batch rolled back, and the head is retired by name
-                    // here rather than left for the sweep: it holds
-                    // `head_floor` above everything this node can serve, and
-                    // its trie can never complete — the refused node is never
-                    // stored, so every later fetch would meet it again. The
-                    // verdict is remembered so the next exchange does not
-                    // re-adopt and re-fetch it, and the fault propagates so
-                    // this exchange counts the origin as left behind and
-                    // carries on with every other.
-                    Err(e) if is_origin_fault(&e) => {
-                        tracing::warn!(
-                            origin = %origin,
-                            seq = pending.seq,
-                            error = %e,
-                            "abandoning pending head: the origin published a trie node this node refuses"
-                        );
-                        self.refuse(verdict.clone());
-                        let store = self.store.clone();
-                        let (origin, seq, root) = (origin.clone(), pending.seq, pending.root);
-                        crate::blocking::offload(move || {
-                            Ok(store.clear_head_at(&origin, Slot::Pending, seq, &root)?)
-                        })
-                        .await?;
-                        return Err(e);
-                    }
-                    Err(e) => return Err(e),
-                };
-            }
-            if !missing.values.is_empty() {
-                let response = client.get_values(pending.root, &missing.values).await?;
-                let store = self.store.clone();
-                let requested: Vec<Hash> = missing.values.iter().map(|(_, hash)| *hash).collect();
-                learned += crate::blocking::offload(move || {
-                    // One transaction per batch, as for nodes above.
-                    store.transaction(|txn| {
-                        take_served(
-                            &requested,
-                            &response.values,
-                            "value",
-                            verify_value,
-                            |hash, bytes| {
-                                // Two bounds on what an origin may put in a
-                                // value, and both are refusals of *that origin's*
-                                // data rather than of the peer relaying it — the
-                                // serving peer sent exactly what it was asked for
-                                // (§12).
-                                //
-                                // A value small enough to be inline must *be*
-                                // inline. `ValueRef::for_value` makes that true of
-                                // everything this node builds, and nothing made it
-                                // true of what arrives: the ingress boundary rejects
-                                // an oversized inline value and had no rule the
-                                // other way, because the payload is not in the
-                                // node. This is the first place both are in hand.
-                                // Left unchecked it is a second root for the same
-                                // key/value map — the thing structural sharing and
-                                // the reference-pruning walk rest on not happening
-                                // — plus an extra round trip and an extra
-                                // `trie_values` row per leaf, at the publisher's
-                                // choosing.
-                                //
-                                // And a value has an upper bound at last
-                                // (`MAX_TRIE_VALUE_LEN`): the key side was bounded
-                                // three ways and this side by the frame alone, at
-                                // 16 MiB each with no limit on how many, which is
-                                // what let one small trie cost every peer
-                                // gigabytes to serve and terabytes to materialize.
-                                //
-                                // *Refused*, not raised. Returning an error here
-                                // rolled the whole batch back — losing the
-                                // legitimate values in it — and propagated out of
-                                // `fetch_pending` through `?`, so `learned == 0`
-                                // was never reached, `unproductive` never advanced,
-                                // and the `MAX_UNPRODUCTIVE_ROUNDS` escape the
-                                // comment claimed could not fire for this fault at
-                                // all: the head sat holding `head_floor` until the
-                                // `pending_head_ttl` sweep took it, thirty times
-                                // longer. Skipping the value leaves the walk asking
-                                // for it and the counter counting, which is what
-                                // the rule was always meant to do.
-                                if bytes.len() <= synch_core::INLINE_VALUE_MAX {
-                                    tracing::warn!(
-                                        %hash,
-                                        len = bytes.len(),
-                                        ceiling = synch_core::INLINE_VALUE_MAX,
-                                        "refusing an out-of-line value small enough to be inline"
-                                    );
-                                    return Ok(false);
-                                }
-                                if bytes.len() > synch_core::MAX_TRIE_VALUE_LEN {
-                                    tracing::warn!(
-                                        %hash,
-                                        len = bytes.len(),
-                                        ceiling = synch_core::MAX_TRIE_VALUE_LEN,
-                                        "refusing a trie value past the size ceiling"
-                                    );
-                                    return Ok(false);
-                                }
-                                synch_mpt::NodeStore::put_value(txn, hash, bytes)?;
-                                Ok(true)
-                            },
-                        )
-                    })
-                })
-                .await?;
-            }
-
-            // Stop retrying this peer after repeated rounds without progress.
-            // This counter is not a proof of eventual fetch completion.
-            if learned == 0 {
-                unproductive += 1;
-                if unproductive >= MAX_UNPRODUCTIVE_ROUNDS {
-                    // No wedging on unservable heads: abandon the pending head
-                    // and let head selection re-run. Structural sharing makes
-                    // the restart cost proportional to what actually changed.
-                    tracing::warn!(
-                        origin = %origin,
-                        seq = pending.seq,
-                        "abandoning pending head: providers persistently missing nodes"
-                    );
-                    // The head this fetch judged, not whatever is in the slot
-                    // now: a `HeadPush` accepted while we were between round
-                    // trips would otherwise be deleted by a verdict that was
-                    // never about it.
-                    let store = self.store.clone();
-                    let (origin, seq, root) = (origin.clone(), pending.seq, pending.root);
-                    let dropped = crate::blocking::offload(move || {
-                        Ok(store.clear_head_at(&origin, Slot::Pending, seq, &root)?)
-                    })
-                    .await?;
-                    if !dropped {
-                        tracing::debug!(
-                            "a newer head arrived while this one was being fetched; \
-                             leaving the slot to it"
-                        );
-                    }
-                    return Ok(FetchOutcome::Abandoned);
-                }
-            } else {
-                unproductive = 0;
-                // Progress restarts the slot's staleness clock. The clock is on
-                // the slot rather than on the head occupying it (see
-                // `put_head_in`), so without this a trie that legitimately
-                // takes longer than `pending_head_ttl` to fetch would be swept
-                // out from under the fetch that is filling it.
-                //
-                // Named, because this fetch has been working on `pending.root`
-                // since before the first round trip and the slot may have moved
-                // on since: stamping whatever is there would let progress on
-                // this root hold the sweep off a head nobody can serve.
-                let store = self.store.clone();
-                let touched = origin.clone();
-                let (seq, root) = (pending.seq, pending.root);
+                let origin = origin.clone();
                 crate::blocking::offload(move || {
-                    Ok(store.touch_pending_at(&touched, seq, &root, now_ns())?)
+                    Ok(store.clear_head_at(&origin, Slot::Pending, pending.seq, &pending.root)?)
                 })
                 .await?;
+                return Err(error);
             }
-            // Everything just stored goes back on the frontier, so the nodes
-            // that arrived expand into their own children.
-            walk.resume();
+            Err(error) => return Err(error),
         }
 
-        // The drained walk was certified in its snapshot above, or drained and
-        // refused certification [`MAX_UNCERTIFIED_WALKS`] times. Promotion
-        // rechecks completeness in its own transaction in either case — the
-        // generation may have changed, or never been certifiable — and
-        // atomically materializes the diff with the head flip.
+        // Promotion rechecks completeness and permissions in its own
+        // transaction before atomically replacing the visible view.
         let syncer = self.clone();
         let origin = origin.clone();
         let promoted =
@@ -1759,6 +1476,7 @@ fn serves_trie(
 /// repeat must not count as progress even if one arrives.
 ///
 /// Returns how many were stored.
+#[cfg(test)]
 fn take_served(
     requested: &[synch_core::Hash],
     served: &[(synch_core::Hash, Vec<u8>)],
@@ -1796,6 +1514,67 @@ fn take_served(
     Ok(stored)
 }
 
+fn fetch_operation_error(
+    error: synch_verified::trie::OperationError<synch_store::StoreError>,
+) -> EngineError {
+    use synch_verified::trie::OperationError;
+    match error {
+        OperationError::Host(error) => error.into(),
+        OperationError::Protocol | OperationError::MalformedMetadata(_) => {
+            EngineError::invalid("invalid native requesting-operation protocol")
+        }
+    }
+}
+
+fn fetch_domain_error(error: synch_verified::trie::TrieFetchDomainError) -> EngineError {
+    use synch_mpt::MptError;
+    use synch_verified::trie::{
+        NodeRefusal, TrieFetchDomainError as Fetch, TrieMissingDomainError as Walk,
+    };
+    let hash =
+        |bytes: &[u8]| Hash::from_slice(bytes).map_err(|e| EngineError::invalid(e.to_string()));
+    match error {
+        Fetch::Origin(refusal) => EngineError::Mpt(match refusal {
+            NodeRefusal::Decode(message) => MptError::Decode(message),
+            NodeRefusal::NonCanonical(message) => MptError::NonCanonical(message),
+            NodeRefusal::KeyTooLong(size) => {
+                MptError::KeyTooLong(usize::try_from(size).unwrap_or(usize::MAX))
+            }
+        }),
+        Fetch::NodeHash(bytes) => match hash(&bytes) {
+            Ok(expected) => NetError::NodeHashMismatch { expected }.into(),
+            Err(error) => error,
+        },
+        Fetch::ValueHash(bytes) => match hash(&bytes) {
+            Ok(expected) => NetError::ValueHashMismatch { expected }.into(),
+            Err(error) => error,
+        },
+        Fetch::Unsolicited { value, hash: bytes } => NetError::Unexpected(format!(
+            "peer served unrequested or repeated trie {} {}",
+            if value { "value" } else { "node" },
+            hex::encode(bytes),
+        ))
+        .into(),
+        Fetch::Walk(error) => EngineError::Mpt(match error {
+            Walk::Decode(message) => MptError::Decode(message),
+            Walk::NodeDepth(depth) => MptError::NonCanonical(format!(
+                "a trie node sits past the maximum depth at {depth}"
+            )),
+            Walk::ValueDepth(depth) => MptError::NonCanonical(format!(
+                "a trie value sits past the maximum depth at {depth}"
+            )),
+            Walk::ExpectedBranch(bytes) => MptError::NonCanonical(format!(
+                "node {} sits under an extension but is not a branch",
+                hex::encode(bytes)
+            )),
+            Walk::Exhausted => {
+                MptError::NonCanonical("the requesting walk outran its work budget".into())
+            }
+        }),
+        Fetch::Exhausted => EngineError::invalid("the requesting operation outran its work budget"),
+    }
+}
+
 /// Whether served node bytes are the node they were requested as, and whose
 /// fault it is when they are not.
 ///
@@ -1809,6 +1588,7 @@ fn take_served(
 /// the second as the first aborted every exchange with every peer serving
 /// that origin, at whichever origin sorted after it, and left the head pending
 /// for the sweep to retire and the next exchange to re-adopt.
+#[cfg(test)]
 fn verify_node(expected: &synch_core::Hash, bytes: &[u8]) -> Result<()> {
     // The decision is the Lean operation `Trie.verify`; a host or transport
     // failure of that operation is this node's own, not a verdict.
@@ -1826,6 +1606,7 @@ fn verify_node(expected: &synch_core::Hash, bytes: &[u8]) -> Result<()> {
 /// A value has no shape to refuse at this point: the bounds on what an origin
 /// may put in one are applied by the `put` that follows, which refuses the
 /// payload without failing the batch.
+#[cfg(test)]
 fn verify_value(expected: &synch_core::Hash, bytes: &[u8]) -> Result<()> {
     if &synch_core::Hash::new(bytes) == expected {
         return Ok(());

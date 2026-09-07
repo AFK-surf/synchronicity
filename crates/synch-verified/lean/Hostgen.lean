@@ -98,6 +98,7 @@ def messages : List Name := [
   ``VerifiedCore.Commands.ProjectDomainError, ``VerifiedCore.Commands.TrieServeDomainError,
   ``VerifiedCore.Commands.TrieCollectDomainError, ``VerifiedCore.Commands.TrieWalkDomainError,
   ``VerifiedCore.Commands.TrieMissingDomainError,
+  ``VerifiedCore.Commands.TrieFetchDomainError,
   ``VerifiedCore.Commands.Ingested, ``VerifiedCore.Commands.Committed, ``VerifiedCore.Commands.Served,
   ``VerifiedCore.Commands.Evicted, ``VerifiedCore.Commands.Collected, ``VerifiedCore.Commands.Command]
 

@@ -17,6 +17,7 @@ import VerifiedCore.Trie.Walk
 import VerifiedCore.Trie.Diff
 import VerifiedCore.Trie.Proof
 import VerifiedCore.Trie.Complete
+import VerifiedCore.Trie.Fetch
 import VerifiedCore.Host.Peer
 import VerifiedCore.Replication.Exchange
 
@@ -160,6 +161,10 @@ inductive Command where
       (owner : Option String)
   /-- Plan both directions of one metadata head exchange. -/
   | planExchange (ours theirs servable : List Replication.Exchange.Advertised)
+  /-- Fetch a named pending version, retaining its requesting walk across peer waits. -/
+  | trieFetch (root : ByteArray) (origin : String) (seq : UInt64)
+      (prefixes : Option (List ByteArray)) (exact : List ByteArray) (owner : Option String)
+      (reference : Option ByteArray) (maximum retryLimit : UInt64)
 
 /-- Malformed metadata or a column of the wrong storage class, as pin
 acquisition and deletion report it. -/
@@ -242,6 +247,15 @@ inductive TrieMissingDomainError where
   | nodeDepth (depth : Nat)
   | valueDepth (depth : Nat)
   | expectedBranch (hash : ByteArray)
+  | exhausted
+  deriving BEq, DecidableEq
+
+inductive TrieFetchDomainError where
+  | walk (error : TrieMissingDomainError)
+  | origin (refusal : Trie.Refusal)
+  | nodeHash (hash : ByteArray)
+  | valueHash (hash : ByteArray)
+  | unsolicited (value : Bool) (hash : ByteArray)
   | exhausted
   deriving BEq, DecidableEq
 

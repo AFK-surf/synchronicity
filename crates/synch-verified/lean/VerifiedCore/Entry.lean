@@ -204,6 +204,25 @@ def completing [Encode A] : Except Trie.Missing.Error A → Host.Reply ByteArray
 
 def protocol : Native := .pure (.error protocolFailure)
 
+def fetching [Encode A] : Except Trie.Fetch.Error A → Host.Reply ByteArray
+  | .ok value => terminalOf (Except.ok value : Except TrieFetchDomainError A)
+  | .error (.host hostFailure) | .error (.walk (.host hostFailure)) => .error hostFailure
+  | .error (.walk error) =>
+    let error := match error with
+      | .host _ => TrieMissingDomainError.exhausted
+      | .decode message => .decode message
+      | .canonical (.nodeDepth depth) => .nodeDepth depth
+      | .canonical (.valueDepth depth) => .valueDepth depth
+      | .canonical (.expectedBranch hash) => .expectedBranch hash
+      | .exhausted => .exhausted
+    terminalOf (Except.error (TrieFetchDomainError.walk error) : Except _ A)
+  | .error (.origin refusal) => terminalOf (Except.error (TrieFetchDomainError.origin refusal) : Except _ A)
+  | .error (.nodeHash hash) => terminalOf (Except.error (TrieFetchDomainError.nodeHash hash) : Except _ A)
+  | .error (.valueHash hash) => terminalOf (Except.error (TrieFetchDomainError.valueHash hash) : Except _ A)
+  | .error (.unsolicited value hash) =>
+    terminalOf (Except.error (TrieFetchDomainError.unsolicited value hash) : Except _ A)
+  | .error .exhausted => terminalOf (Except.error TrieFetchDomainError.exhausted : Except _ A)
+
 def dispatch : Command → Native
   | .acquire root holder now possession =>
     if root.size != 32 then malformedRoot
@@ -314,6 +333,11 @@ def dispatch : Command → Native
     if servable.length > UInt64.size ||
         !(ours ++ theirs ++ servable).all (·.root.size == 32) then protocol
     else pure (terminalOf (Replication.Exchange.plan ours theirs servable))
+  | .trieFetch root origin seq prefixes exact owner reference maximum retryLimit =>
+    if root.size != 32 || reference.any (·.size != 32) || maximum == 0 || maximum > 256 ||
+        retryLimit == 0 || retryLimit > 3 then protocol
+    else command (Trie.Fetch.fetch (Std.HashSet Trie.Missing.Visit) (Std.HashSet ByteArray)
+      ⟨root, origin, seq, ⟨⟨prefixes, exact⟩, owner⟩⟩ reference maximum.toNat retryLimit.toNat) fetching
 
 /-- Every command starts here: an undecodable packet is a protocol failure
 before any effect is requested. -/

@@ -62,6 +62,7 @@ fn main() {
         "Trie/Proof",
         "Trie/Missing",
         "Trie/Complete",
+        "Trie/Fetch",
         "Replication/History",
         "Replication/Exchange",
         "Commands",
