@@ -144,8 +144,13 @@ whole normalization preserves exactly the entries of any complete valid stored
 snapshot, through every actual work-stack case and the effect-counted loop.
 Its local write contract preserves encountered stored bytes and excludes a
 nonempty output colliding with the reserved empty root. This proves unchanged
-published content; bounded termination and the routing form needed for private
-scoped service remain separate obligations.
+published content. `TriePublicationRouting.publication_routed` now proves the
+actual successful operation produces the routing form, and
+`normalized_nodes_are_admitted` proves its needed nodes pass the actual serving
+scope policy when grants contain any deliberately compressed subtree they
+intersect. The actual authorization builder must still establish that schema
+compatibility; arbitrary exact/prefix grants need not satisfy it. Bounded
+termination and full serving/fetch/promotion composition remain open.
 
 Protocol version **4** requires peers to understand the new node form. Upgrade
 communicating peers together; the Hello version check rejects an older peer
@@ -158,8 +163,8 @@ sequence/recovery checks to republish preserved entries under a later signature,
 without waiting for a file edit. Anti-entropy retries a deferred upgrade while
 continuing unrelated syncing. The convergence proof must include that actual
 path; it may not silently assume away accepted older roots. Remaining acceptance
-work is routing coverage for every supported scope, bounded normalization
-progress, atomic retention/publication, the formal upgrade/recovery composition, and cost measurements on the existing large corpus.
+work is compatibility of actual scope construction with the proved routing form,
+bounded normalization progress, atomic retention/publication, the formal upgrade/recovery composition, and cost measurements on the existing large corpus.
 
 A signed refusal alone does not prove consistency with the signed snapshot.
 Plain hashes of space names are also insufficient to hide guessable private
@@ -519,13 +524,13 @@ completed cutover from being mistaken for a completed user guarantee.
 | Trie T7/T8: collection and optional Merkle proofs | Production Lean `Collect`/`Proof` | Reachable retained nodes/values survive collection; proof verification/lookup and construction round trip checked. Retention through actual pending/publication transitions remains a composition obligation. |
 | CAS local ingest/read/heal/lifecycle | Production Lean | Named scoped P1/P5/P6 results below; extend fresh-store/intact-content assumptions to relevant histories. |
 | CAS C1/C2: serve/verified receive/delta promotion | Production Lean with trusted Bao service | Fresh full receive-to-read and exact reads of backed verified ranges are checked; successful existing-row receive persists actual planner/decoder output over arbitrary raw databases. Connect repeated receives to the backing/coverage invariant, including decoder failures and partial physical writes. |
-| CAS C3/C5/C7: durability, collection, projections | Production Lean | Repair responsibility, collection protection and projection support exist. Blob projections now compute verified groups and canonical advertised spans, including inside an existing publication transaction; the Rust bitmap decoder and advertisement policy are deleted. `CasAdvertisementProofs.stored_partial_advertisements_offer_saved_content` proves that every byte advertised by an actual partial, non-durable projection is backed by the saved content. Durable provider availability and cloud/publication retention composition remain open. Clock/LRU/diagnostics are regression details. |
+| CAS C3/C5/C7: durability, collection, projections | Production Lean | Repair responsibility, collection protection and projection support exist. Blob projections now compute verified groups and canonical advertised spans, including inside an existing publication transaction; the live Rust bitmap decoder and advertisement policy are deleted. `CasAdvertisementProofs.stored_partial_advertisements_offer_saved_content` proves that every byte advertised by an actual partial, non-durable projection is backed by the saved content. Durable provider availability and cloud/publication retention composition remain open. Clock/LRU/diagnostics are regression details. |
 | CAS C4: cloud composition | Rust `backend.rs` | Migrate complete provider adoption/hydration/finalize/read/serve commands, including trusted-range ingestion and complete-proof path. |
 | CAS C6: source holds and publication advertisement | Rust inside publication transaction | Migrate with the entry/head/reference publication command, never as independently committing calls. |
 | History pruning | Production Lean `Replication/History` | Retention/fork witness support proved. Adoption, reconciliation and scheduling still require implementation-connected M1–M8 proofs. |
 | Peer contact selection | Production Lean `Replication/Contact`, called by serialized periodic rounds | Native bounded-turn and duplicate/order cases checked. Bounded service through the actual native index, returned cursor and selected peer positions is proved for fixed eligible input. Actual eligibility and completed engine attempts still require composition for M1/M6. |
 | Head exchange selection | Production Lean `Replication/Exchange`, called by engine reconciliation | Selects request origins and push indices from advertised/servable heads. Exact newer-version requests, duplicate/order invariance and push selection support M2. Signature/admission/availability inputs and subsequent adoption remain separate obligations. |
-| Origin parsing | Lean inside retained-history validation; duplicate Rust parser still serves public `synch-core` APIs | Cut over complete origin parsing and normalization APIs to the existing Lean implementation, retaining only primitive public-key point validation in Rust. This newly identified duplicate must be removed before closure. |
+| Origin parsing | Production Lean `Origin.parse`/`named`/normalization, shared by public `synch-core` APIs and retained-history validation | The Rust parser and normalization algorithms are deleted. Whole named construction uses one command. Rust supplies primitive point validation and preserves typed wire identities; host/transport failure remains distinct from invalid syntax or key bytes. Store diagnostics share the same conversion. Existing origin proofs now describe the public implementation too; full publisher-authority composition remains open. |
 | Promotion authority snapshot | Rust `try_promote`, with permissions/authority read in its publication transaction | Snapshot-consistent permission checks and full own-view readiness have native regressions. This is a safety fix, not a Lean promotion theorem or closure of P3/M4/M8. |
 
 The operator-only CAS migration tool, staging-directory layout sweep and provider
@@ -542,6 +547,15 @@ with warnings denied. The scope command rejects missing unresolved boundaries an
 unresolved paths beyond the key bound, while skipping fully granted subtrees.
 These checks establish the migration regression baseline, not its still-open
 entry-authorization theorem or full promotion composition.
+
+Origin cutover validation: core build (56 jobs), Hostgen `--check`, all 59
+`synch-core` tests, three native origin-facade tests, MPT (43 passed; four
+ignored), store host/native tests (103 passed; four ignored), seven fetch
+integration tests and the cloud-memory backend contract passed. These include
+nested native calls from provenance checks and distinct invalid-point versus
+host-failure results. All-target/all-feature Clippy for core, verified, MPT and
+store passed with warnings denied. `synch-core` now requires the mandatory
+native Lean dependency; its serialized origin shape remains unchanged.
 
 ### Latest mptsync checkpoint
 
