@@ -139,10 +139,13 @@ idempotence, route edits, empty roots and the deepest supported exact key. The
 previously failing empty permitted-view integration fixture now passes with
 routing publications and unchanged privacy/progress assertions. These tests do
 not replace the required normalization, serving/completion and promotion proofs.
-`TrieNormalizeProofs` now proves exact entry preservation for the actual
-assembly, compressed leaf-edge and finishing steps. The remaining visit cases
-and iteration composition are still required before claiming that the whole
-normalization operation preserves a published snapshot.
+`TrieNormalizeProofs.publication_preserves_entries` now proves that a successful
+whole normalization preserves exactly the entries of any complete valid stored
+snapshot, through every actual work-stack case and the effect-counted loop.
+Its local write contract preserves encountered stored bytes and excludes a
+nonempty output colliding with the reserved empty root. This proves unchanged
+published content; bounded termination and the routing form needed for private
+scoped service remain separate obligations.
 
 Protocol version **4** requires peers to understand the new node form. Upgrade
 communicating peers together; the Hello version check rejects an older peer
@@ -155,8 +158,8 @@ sequence/recovery checks to republish preserved entries under a later signature,
 without waiting for a file edit. Anti-entropy retries a deferred upgrade while
 continuing unrelated syncing. The convergence proof must include that actual
 path; it may not silently assume away accepted older roots. Remaining acceptance
-work is exact normalization semantics, routing coverage for every supported
-scope, atomic retention/publication, the formal upgrade/recovery composition, and cost measurements on the existing large corpus.
+work is routing coverage for every supported scope, bounded normalization
+progress, atomic retention/publication, the formal upgrade/recovery composition, and cost measurements on the existing large corpus.
 
 A signed refusal alone does not prove consistency with the signed snapshot.
 Plain hashes of space names are also insufficient to hide guessable private
@@ -609,8 +612,11 @@ through its first successful nonempty transfer, allowing unrelated database
 rows, lease counters and input handles. `receiving_all_content_makes_the_whole_readable`
 then proves that the actual whole-object read returns the named content once
 successful transfers cover every group. This currently covers large file-backed
-objects with a successful first transfer; an initial failed/empty prefix,
-inline histories and other injected host-failure paths remain open.
+objects through arbitrary initial failed or empty attempts, followed by enough
+verified coverage. `CasInlineHistories` separately proves that an actual verified
+small-object receive, including empty content, saves the exact decoder buffer and
+remains wholly readable after arbitrary later transfers. Initial inline failure
+histories and other injected host-failure paths remain open.
 
 ## Path to all proof goals
 

@@ -1084,6 +1084,97 @@ theorem stored_step_preserves (digestWidth : Width d) (shaped : Shaped before)
       exact node_step_preserves digestWidth shaped
         (replace_cursor_meaning meaning nodeValid exactEntries) within spine restSafe ran
 
+private theorem node_step_not_finished
+    (within : path.length ≤ maxKeyBytes * 2) (spine : Normalize.belowBoundary path = false)
+    (ran : execute d before (Normalize.step ⟨.visit path (.node node) :: work, results⟩).run =
+      some (.ok (.inr root), after)) : False := by
+  cases node with
+  | leaf suffix value =>
+    cases spelling : suffix.toList <;> cases value <;>
+      simp [Normalize.step, Nat.not_lt.mpr within, spine, spelling, addressValue,
+        execute_put, run_bind, digest_run, program_bind_request,
+        program_bind_pure, execute_bind, execute_digest, mapError_ok, bindCont_ok,
+        write_run, execute_write, TrieMutateProofs.execute_pure] at ran
+  | extension segment child =>
+    cases spelling : segment.toList <;>
+      simp [Normalize.step, Nat.not_lt.mpr within, spine, spelling] at ran
+  | branch children value =>
+    cases value with
+    | none => simp [Normalize.step, Nat.not_lt.mpr within, spine, Normalize.addressOptional] at ran
+    | some value =>
+      cases value <;>
+        simp [Normalize.step, Nat.not_lt.mpr within, spine, Normalize.addressOptional,
+          addressValue, run_bind, digest_run,
+          program_bind_request, program_bind_pure, execute_digest,
+          mapError_ok, bindCont_ok, write_run, execute_write,
+          TrieMutateProofs.execute_pure] at ran
+  | route children value => simp [Normalize.step, Nat.not_lt.mpr within, spine] at ran
+
+private theorem finished_step_has_no_work
+    (ran : execute d before (Normalize.step state).run = some (.ok (.inr root), after)) :
+    state.work = [] := by
+  obtain ⟨work, results⟩ := state
+  cases work with
+  | nil => rfl
+  | cons task work =>
+    exfalso
+    cases task with
+    | assemble positions value =>
+      simp only [Normalize.step] at ran
+      cases assembled : Normalize.assembleChildren positions.reverse results emptyChildren with
+      | none => simp [assembled] at ran
+      | some pair =>
+        obtain ⟨children, rest⟩ := pair
+        simp [assembled, execute_bind, execute_put, bindCont_ok] at ran
+    | visit path cursor =>
+      by_cases over : path.length > maxKeyBytes * 2
+      · simp [Normalize.step, over] at ran
+      · have within : path.length ≤ maxKeyBytes * 2 := Nat.le_of_not_gt over
+        cases spine : Normalize.belowBoundary path with
+        | true =>
+          cases cursor <;> simp [Normalize.step, over, spine, execute_bind, execute_put, bindCont_ok] at ran
+        | false =>
+          cases cursor with
+          | node node => exact node_step_not_finished within spine ran
+          | stored address =>
+            rw [stored_step_as_node within spine, execute_run_bind] at ran
+            cases first : execute d before (load address).run with
+            | none => simp [first] at ran
+            | some reply =>
+              obtain ⟨reply, middle⟩ := reply
+              cases reply with
+              | error error => simp [first] at ran
+              | ok node =>
+                simp only [first] at ran
+                exact node_step_not_finished within spine ran
+
+/-- Every successful continuation of the actual normalization machine
+preserves the original entries, including all stored and constructed nodes. -/
+theorem step_preserves_entries (digestWidth : Width d) (shaped : Shaped before)
+    (meaning : StateMeaning before.read state target)
+    (safe : SafeWrites d before (Normalize.step state).run)
+    (ran : execute d before (Normalize.step state).run = some (.ok (.inl next), after)) :
+    Shaped after ∧ StateMeaning after.read next target := by
+  obtain ⟨work, results⟩ := state
+  cases work with
+  | nil =>
+    cases results with
+    | nil => simp [Normalize.step] at ran
+    | cons root rest => cases rest <;> simp [Normalize.step] at ran
+  | cons task work =>
+    cases task with
+    | assemble positions address => exact assembly_step_preserves digestWidth shaped meaning safe ran
+    | visit path cursor =>
+      by_cases over : path.length > maxKeyBytes * 2
+      · simp [Normalize.step, over] at ran
+      · have within : path.length ≤ maxKeyBytes * 2 := Nat.le_of_not_gt over
+        cases spine : Normalize.belowBoundary path with
+        | true => exact boundary_visit_preserves digestWidth shaped meaning within spine safe ran
+        | false =>
+          cases cursor with
+          | stored root => exact stored_step_preserves digestWidth shaped meaning within spine safe ran
+          | node node => exact node_step_preserves digestWidth shaped meaning within spine safe ran
+
 /-- The initial machine state represents exactly the input version. -/
 theorem initial_state_meaning (width : root.size = 32) (closed : Closed store root) :
     StateMeaning store ⟨[.visit [] (.stored root)], []⟩ (GraphValue store root) := by
@@ -1172,5 +1263,91 @@ theorem iterate_store_invariant
           cases write
           exact ih _ _ (fun reply after tailSafe tailRan => post reply after ⟨safe.1, tailSafe⟩ tailRan)
             result after safe.2 ran
+
+/-- A successful publication of a complete nonempty stored version preserves
+exactly every key and payload. Compatibility is required only at addresses
+actually written; no global injectivity of the digest is assumed. The fixed
+work limit may still refuse a version before it succeeds. -/
+theorem publication_preserves_graph (digestWidth : Width d) (shaped : Shaped before)
+    (width : root.size = 32) (closed : Closed before.read root)
+    (nonempty : isEmptyRoot root = false)
+    (safe : SafeWrites d before (Normalize.publication root).run)
+    (ran : execute d before (Normalize.publication root).run = some (.ok normalized, after)) :
+    Shaped after ∧ normalized.size = 32 ∧ Closed after.read normalized ∧
+      ∀ key bytes, GraphValue after.read normalized key bytes ↔ GraphValue before.read root key bytes := by
+  let invariant := fun (store : Store) state =>
+    Shaped store ∧ StateMeaning store.read state (GraphValue before.read root)
+  let finished := fun (store : Store) (result : ByteArray) =>
+    Shaped store ∧ result.size = 32 ∧ Closed store.read result ∧
+      ∀ key bytes, GraphValue store.read result key bytes ↔ GraphValue before.read root key bytes
+  have step : ∀ state store reply finalStore, invariant store state →
+      SafeWrites d store (Normalize.step state).run →
+      execute d store (Normalize.step state).run = some (.ok reply, finalStore) →
+      match reply with | .inl next => invariant finalStore next | .inr result => finished finalStore result := by
+    intro state store reply finalStore current safeStep ranStep
+    cases reply with
+    | inl next => exact step_preserves_entries digestWidth current.1 current.2 safeStep ranStep
+    | inr result =>
+      have empty := finished_step_has_no_work ranStep
+      obtain ⟨work, results⟩ := state
+      simp only at empty
+      subst work
+      obtain ⟨rfl, output⟩ := finish_step_returns_exact current.2 ranStep
+      exact ⟨current.1, output⟩
+  have initial : invariant before ⟨[.visit [] (.stored root)], []⟩ :=
+    ⟨shaped, initial_state_meaning width closed⟩
+  simp only [Normalize.publication, nonempty, Bool.false_eq_true, ↓reduceIte,
+    OperationOver.iterate] at safe ran
+  exact iterate_store_invariant (d := d) (S := Normalize.State) (R := ByteArray)
+    (fun state => (Normalize.step state).run)
+    (.domain .depthExceeded) invariant finished
+    (fun state store reply finalStore current safeStep ranStep => by
+      cases reply with
+      | inl next => exact step state store (.inl next) finalStore current safeStep ranStep
+      | inr result => exact step state store (.inr result) finalStore current safeStep ranStep)
+    Normalize.workFuel
+    (Normalize.step ⟨[.visit [] (.stored root)], []⟩).run before
+    (fun reply finalStore initialSafe initialRan => by
+      cases reply with
+      | inl next => exact step _ before (.inl next) finalStore initial initialSafe initialRan
+      | inr result => exact step _ before (.inr result) finalStore initial initialSafe initialRan)
+    normalized after safe ran
+
+/-- Publishing a complete stored snapshot changes its representation, while
+preserving exactly the entries users can read. The normalized nonempty root
+must not collide with the reserved all-zero empty root. -/
+theorem publication_preserves_entries (digestWidth : Width d) (shaped : Shaped before)
+    (width : root.size = 32) (stored : StoredSnapshot before.read root)
+    (reserved : isEmptyRoot root = false → isEmptyRoot normalized = false)
+    (safe : SafeWrites d before (Normalize.publication root).run)
+    (ran : execute d before (Normalize.publication root).run = some (.ok normalized, after)) :
+    ∀ key bytes, Entry after.read normalized key bytes ↔ Entry before.read root key bytes := by
+  cases nonempty : isEmptyRoot root with
+  | true =>
+    simp only [Normalize.publication, nonempty, ↓reduceIte, run_pure,
+      TrieMutateProofs.execute_pure, Option.some.injEq, Prod.mk.injEq, Except.ok.injEq] at ran
+    obtain ⟨rfl, rfl⟩ := ran
+    intro key bytes
+    have emptyZero : isEmptyRoot emptyRoot = true := by simp [isEmptyRoot, emptyRoot]
+    constructor
+    · intro entry
+      have zero : isEmptyRoot emptyRoot = false := entry.2.1
+      exact Bool.noConfusion (emptyZero.symm.trans zero)
+    · intro entry
+      have zero : isEmptyRoot root = false := entry.2.1
+      exact Bool.noConfusion (nonempty.symm.trans zero)
+  | false =>
+    have closed : Closed before.read root := by
+      rcases stored with empty | closed
+      · have zero : isEmptyRoot root = true := empty
+        exact Bool.noConfusion (zero.symm.trans nonempty)
+      · exact closed
+    have exactEntries := (publication_preserves_graph digestWidth shaped width closed nonempty safe ran).2.2.2
+    have output := reserved nonempty
+    have inputZero : root.data.all (· == 0) = false := nonempty
+    have outputZero : normalized.data.all (· == 0) = false := output
+    intro key bytes
+    simp only [Entry, inputZero, outputZero, true_and]
+    exact and_congr Iff.rfl (exactEntries (keyNibbles key) bytes)
 
 end Synchronicity.TrieNormalizeProofs
