@@ -124,11 +124,16 @@ command returns `pending`, it is proved to install its candidate in committed pe
 rows, after history trimming and commit; a matching row exists, and every
 matching row has that candidate's sequence and root. Success also requires reading
 both complete/pending floors, beating every decoded floor and executing the slot
-write. These acceptance results allow arbitrary injected host failures, deriving
-successful writes and commit from the command's success. History trimming preserves
-all staged heads and the transaction token even on failure. Connecting decoded floors
-to initial database invariants and composing acceptance with all suspended-work
-interleavings remain open for M3.
+write. Both reads and the pre-write state retain the initial committed heads table
+and the same transaction token: authorization, immutable history recording and slot
+decoding cannot change those heads. Any normal refusal (`badSignature`, `unbound`,
+or `notNewer`) leaves every committed heads row unchanged after the whole command,
+although history retention may change. These acceptance results allow arbitrary
+injected host failures, deriving successful writes and commit from command success.
+History trimming preserves all staged heads and the transaction token even on failure.
+The slot reader's inner join omits orphan pointers. Deriving decoded floors from
+well-formed initial slot/history records, and composing acceptance with all
+suspended-work interleavings, remain open for M3.
 
 For M4, every execution prefix of the actual materializer preserves the committed
 database: its streamed file/provider/delegation and retention writes cannot commit

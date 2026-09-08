@@ -9,6 +9,7 @@ namespace Synchronicity.ReconciliationAcceptance
 open VerifiedCore VerifiedCore.Host VerifiedCore.Replication SimulatedHost
 open TrieServePrivacyProofs (bind_ok)
 open TransactionSuccess (bind_success)
+open ReconciliationFrame
 
 theorem commit_installs (tx : Transaction) (state : State)
     (succeeded : (storage (.commit tx) state).1 = .ok ()) :
@@ -31,6 +32,9 @@ theorem commit_installs (tx : Transaction) (state : State)
 theorem accepted_observes_and_writes (head : Head) (now : Int64) (keep : Nat) (state : State)
     (accepted : (execute (Reconcile.accept head now keep) state).1 = .ok .pending) :
     ∃ tx beforeComplete beforePending beforeWrite afterWrite complete pending,
+      heads beforeComplete = some (tx, rows state.db "heads") ∧
+      heads beforePending = some (tx, rows state.db "heads") ∧
+      heads beforeWrite = some (tx, rows state.db "heads") ∧
       execute (History.readSlot tx (Origin.canonical head.origin) "complete") beforeComplete =
         (.ok complete, beforePending) ∧
       execute (History.readSlot tx (Origin.canonical head.origin) "pending") beforePending =
@@ -38,25 +42,37 @@ theorem accepted_observes_and_writes (head : Head) (now : Int64) (keep : Nat) (s
       (∀ old ∈ complete ++ pending, Reconcile.newer head.seq head.root old.pointer = true) ∧
       execute (Reconcile.putSlot tx "pending" head now now) beforeWrite = (.ok (), afterWrite) := by
   unfold Reconcile.accept at accepted
-  obtain ⟨signature, checked, _, accepted⟩ := bind_ok _ _ _ _ accepted
+  obtain ⟨signature, checked, verified, accepted⟩ := bind_ok _ _ _ _ accepted
+  have signatureFrame : checked.db = state.db := by
+    have kept := signature_preserves_db head state
+    simpa only [verified] using kept
   cases signature with
   | false => cases accepted
   | true =>
-    obtain ⟨tx, opened, finished, _, body, _⟩ :=
+    obtain ⟨tx, opened, finished, started, body, _⟩ :=
       TransactionSuccess.transaction_success _ _ _ checked _ accepted
+    have initial := begin_heads checked opened tx started
     have accepted := congrArg Prod.fst body
-    obtain ⟨instant, timed, _, accepted⟩ := bind_ok _ _ _ _ accepted
-    obtain ⟨live, bound, _, accepted⟩ := bind_ok _ _ _ _ accepted
+    obtain ⟨instant, timed, timedRead, accepted⟩ := bind_ok _ _ _ _ accepted
+    have timedFrame := executed_heads _ (auth_only _ (trustInstant_only tx now)) _ _ _ timedRead
+    obtain ⟨live, bound, liveRead, accepted⟩ := bind_ok _ _ _ _ accepted
+    have liveFrame := executed_heads _ (auth_only _ (liveForKey_only tx head.signedBy instant)) _ _ _ liveRead
     split at accepted
     · cases accepted
-    · obtain ⟨_, beforeComplete, _, accepted⟩ := bind_ok _ _ _ _ accepted
+    · obtain ⟨_, beforeComplete, recorded, accepted⟩ := bind_ok _ _ _ _ accepted
+      have recordFrame := executed_heads _ (record_only tx head now) _ _ _ recorded
       obtain ⟨complete, beforePending, readComplete, accepted⟩ := bind_ok _ _ _ _ accepted
+      have completeFrame := executed_heads _ (readSlot_only tx _ "complete") _ _ _ readComplete
       obtain ⟨pending, beforeWrite, readPending, accepted⟩ := bind_ok _ _ _ _ accepted
+      have pendingFrame := executed_heads _ (readSlot_only tx _ "pending") _ _ _ readPending
+      have original : heads beforeComplete = some (tx, rows state.db "heads") := by
+        rw [recordFrame, liveFrame, timedFrame, initial, signatureFrame]
       dsimp only at accepted
       split at accepted
       · rename_i greater
         obtain ⟨_, afterWrite, written, _⟩ := bind_ok _ _ _ _ accepted
         exact ⟨tx, beforeComplete, beforePending, beforeWrite, afterWrite, complete, pending,
+          original, completeFrame.trans original, pendingFrame.trans (completeFrame.trans original),
           readComplete, readPending, List.all_eq_true.mp greater, written⟩
       · obtain ⟨_, _, _, impossible⟩ := bind_ok _ _ _ _ accepted
         cases impossible
