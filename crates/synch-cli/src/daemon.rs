@@ -132,9 +132,9 @@ pub async fn start(data_dir: &Path, args: impl IntoIterator<Item = OsString>) ->
             ));
         }
 
-        // Binding the listener is earlier than serving it: startup recovery
-        // happens between those two events. A real authenticated round-trip is
-        // the boundary callers need before their next command can succeed.
+        // During startup recovery the listener answers with Unavailable. A
+        // successful authenticated round-trip is the boundary callers need
+        // before their next command can succeed.
         if ready.belongs_to(child.id())
             && tokio::time::timeout(Duration::from_secs(1), control_is_ready(data_dir))
                 .await
@@ -406,7 +406,7 @@ pub async fn run(config: NodeConfig) -> Result<()> {
     let mut stopped = stop_tx.subscribe();
 
     // Bind before announcing: a client that sees the banner can connect.
-    let server = match Server::bind(node.clone(), stop_tx.clone()).await {
+    let (server, startup) = match Server::bind_starting(node.clone(), stop_tx.clone()).await {
         Ok(server) => server,
         Err(e) => {
             // The endpoint is already up; close it properly or iroh shouts
@@ -423,7 +423,12 @@ pub async fn run(config: NodeConfig) -> Result<()> {
         node.origin(),
         render::addr(&node.net().direct_addr())
     );
-    println!("control socket: {}", server.endpoint_name());
+    println!(
+        "control socket: {} (starting; recovery in progress)",
+        server.endpoint_name()
+    );
+    let control = tokio::spawn(server.run());
+    let recovery_started = std::time::Instant::now();
 
     // A completion severed by a stop or a crash left its upload latched, and
     // nothing else ever clears the latch: without this, an upload whose parts
@@ -431,7 +436,12 @@ pub async fn run(config: NodeConfig) -> Result<()> {
     // Off the runtime: it takes a store connection, which §10 keeps off the
     // worker threads.
     let reopening = node.clone();
-    match synch_core::offload(move || reopening.reopen_interrupted_uploads()).await {
+    match startup_progress(
+        "reopening interrupted uploads",
+        synch_core::offload(move || reopening.reopen_interrupted_uploads()),
+    )
+    .await
+    {
         Ok(0) => {}
         Ok(reopened) => tracing::info!(reopened, "reopened interrupted multipart uploads"),
         Err(e) => tracing::warn!(error = %e, "could not reopen interrupted uploads"),
@@ -440,22 +450,35 @@ pub async fn run(config: NodeConfig) -> Result<()> {
     // A restored SQLite replica may trail an acknowledged publish whose bytes
     // already reached the cloud CAS. PeerLs retain the signed head; recover it
     // before scanner or publisher tasks can mint a competing successor.
-    match node.readopt_self_on_startup().await {
+    startup.stage("recovering own head and cloud durability");
+    match startup_progress(
+        "recovering own head and cloud durability",
+        node.readopt_self_on_startup(),
+    )
+    .await
+    {
         Ok(true) => tracing::info!("re-adopted a newer own-origin head from a peer"),
         Ok(false) => {}
         Err(error) => {
+            let _ = stop_tx.send(());
+            let _ = control.await;
             let _ = node.shutdown().await;
             return Err(anyhow::Error::new(error)
                 .context("startup own-head/cloud durability recovery failed"));
         }
     }
 
+    startup.ready();
+    println!(
+        "control ready: startup recovery completed in {:.1}s",
+        recovery_started.elapsed().as_secs_f64()
+    );
     if let Err(error) = signal_background_ready(&data_dir) {
-        crate::control::transport::remove_token(&data_dir);
+        let _ = stop_tx.send(());
+        let _ = control.await;
         let _ = node.shutdown().await;
         return Err(error);
     }
-    let control = tokio::spawn(server.run());
     let aae = spawn_loop(
         "anti-entropy",
         &node,
@@ -900,3 +923,128 @@ where
 
 /// The future the engine loops await to know they should stop.
 type ShutdownSignal = std::pin::Pin<Box<dyn std::future::Future<Output = ()> + Send>>;
+
+// Keep recovery intact while making long disk, dial, and exchange waits visible
+// even with the default log filter. No timeout may turn incomplete recovery into
+// permission to publish.
+async fn startup_progress<T>(stage: &str, work: impl std::future::Future<Output = T>) -> T {
+    let started = std::time::Instant::now();
+    eprintln!("startup: {stage}");
+    tokio::pin!(work);
+    loop {
+        tokio::select! {
+            result = &mut work => {
+                eprintln!("startup: {stage} completed in {:.1}s", started.elapsed().as_secs_f64());
+                return result;
+            }
+            _ = tokio::time::sleep(Duration::from_secs(5)) => {
+                eprintln!("startup: {stage}, {:.1}s elapsed; control requests will report unavailable until recovery completes",
+                    started.elapsed().as_secs_f64());
+            }
+        }
+    }
+}
+
+#[cfg(test)]
+mod startup_tests {
+    use super::*;
+    use crate::control::ErrorCode;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn unavailable_peer_does_not_stall_authenticated_control_during_recovery() {
+        let data = tempfile::tempdir().unwrap();
+        let dir = data.path().to_path_buf();
+        synch_core::offload(move || {
+            Node::init_named_by_zone(
+                &dir,
+                synch_core::OriginId::named("nas", "cluster.example").unwrap(),
+            )
+        })
+        .await
+        .unwrap();
+        let node = Node::open(NodeConfig::loopback(data.path())).await.unwrap();
+        // A bound UDP socket that never speaks QUIC makes this a real stalled
+        // dial, independent of public networks, DNS, or a machine's routing.
+        let blackhole = std::net::UdpSocket::bind("127.0.0.1:0").unwrap();
+        let peer = iroh_base::SecretKey::generate().public();
+        let recovery_node = node.clone();
+        let addr = iroh_base::EndpointAddr::new(peer).with_ip_addr(blackhole.local_addr().unwrap());
+        synch_core::offload(move || -> synch_engine::Result<()> {
+            recovery_node.store().put_binding(&synch_store::Binding {
+                origin: synch_core::OriginId::named("offline", "cluster.example").unwrap(),
+                node_id: peer,
+                source: synch_store::BindingSource::Static,
+                domain: None,
+                issuer: None,
+                spaces: Vec::new(),
+                note: None,
+                added_at: 0,
+                expires_at: None,
+            })?;
+            recovery_node.remember_peer(&addr)?;
+            Ok(())
+        })
+        .await
+        .unwrap();
+
+        let (stop, _) = broadcast::channel(1);
+        let (server, startup) = Server::bind_starting(node.clone(), stop.clone())
+            .await
+            .unwrap();
+        let serving = tokio::spawn(server.run());
+        startup.stage("recovering own head and cloud durability");
+        let recovering = node.clone();
+        let recovery = tokio::spawn(async move { recovering.readopt_self_on_startup().await });
+        tokio::time::sleep(Duration::from_millis(100)).await;
+
+        tokio::time::timeout(Duration::from_secs(2), async {
+            assert!(!control_is_ready(data.path()).await);
+            let mut client = Client::connect(data.path()).await.unwrap();
+            for command in [
+                ControlCommand::Id(pb::Id {}),
+                ControlCommand::KeyRotate(pb::KeyRotate {}),
+            ] {
+                let error = client
+                    .run(command)
+                    .await
+                    .expect_err("recovery must refuse commands");
+                assert_eq!(error.code, ErrorCode::Unavailable);
+                assert!(error.message.contains("recovering own head"));
+                assert!(error.message.contains("retry"));
+            }
+            let mut wrong = Client::connect_with_token(data.path(), vec![0; 32])
+                .await
+                .unwrap();
+            assert_eq!(
+                wrong
+                    .run(ControlCommand::Id(pb::Id {}))
+                    .await
+                    .err()
+                    .unwrap()
+                    .code,
+                ErrorCode::Unauthorized
+            );
+        })
+        .await
+        .expect("control must answer while the peer dial is stalled");
+        assert!(
+            !recovery.is_finished(),
+            "the probe must run during recovery"
+        );
+
+        assert!(!tokio::time::timeout(Duration::from_secs(20), recovery)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap());
+        startup.ready();
+        assert!(
+            tokio::time::timeout(Duration::from_secs(2), control_is_ready(data.path()))
+                .await
+                .unwrap()
+        );
+        let _ = stop.send(());
+        serving.await.unwrap().unwrap();
+        node.shutdown().await.unwrap();
+    }
+}

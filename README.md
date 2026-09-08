@@ -136,6 +136,17 @@ regenerated on every daemon start and sent as a header on every call. The servic
 schema is `crates/synch-cli/proto/control.proto`. With no daemon running, every
 operational/client command fails with a message naming that socket.
 
+During startup recovery, the bound control socket responds with a retryable
+`Unavailable` error naming the current stage and elapsed time. Commands become
+available after the separate `control ready:` announcement; socket existence
+alone is not readiness. Recovery progress is printed every five seconds. With
+`SYNCH_LOG=info`, peer diagnostics identify dial and exchange waits and failures.
+Recovery contacts up to eight peers concurrently, with per-peer deadlines;
+publishing remains blocked until own-head and cloud durability recovery finishes.
+Under launchd or another supervisor, inspect its captured daemon output and retry
+`synch daemon status` until it succeeds. `synch daemon start` performs this
+authenticated readiness check itself.
+
 ## MCP
 
 `synch mcp` serves the Model Context Protocol over stdin and stdout, so an

@@ -161,6 +161,7 @@ pub struct Server {
     served: Served,
     listener: Listener,
     token: Arc<Vec<u8>>,
+    startup: Startup,
     stop: broadcast::Sender<()>,
     /// Subscribed at bind time, not at run time: a stop sent between the two
     /// would otherwise be sent to nobody and the server would wait forever.
@@ -172,6 +173,35 @@ pub struct Server {
     draining: broadcast::Receiver<()>,
 }
 
+/// Shared recovery barrier. Authentication remains active while every RPC is
+/// refused, so no command can publish against history still being recovered.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Startup(Arc<std::sync::Mutex<Option<(&'static str, std::time::Instant)>>>);
+
+impl Startup {
+    pub(crate) fn stage(&self, stage: &'static str) {
+        *self.0.lock().unwrap() = Some((stage, std::time::Instant::now()));
+        tracing::info!(stage, "daemon starting");
+    }
+
+    pub(crate) fn ready(&self) {
+        *self.0.lock().unwrap() = None;
+    }
+
+    fn check(&self) -> Result<(), Status> {
+        if let Some((stage, started)) = *self.0.lock().unwrap() {
+            return Err(ControlError::new(
+                ErrorCode::Unavailable,
+                format!(
+                    "daemon starting: {stage} ({}s in this stage); retry shortly. Check daemon logs for recovery progress and unreachable peers",
+                    started.elapsed().as_secs()
+                ),
+            ).into());
+        }
+        Ok(())
+    }
+}
+
 impl Server {
     /// Binds the control socket for `node`'s data directory and mints a fresh
     /// token.
@@ -180,6 +210,17 @@ impl Server {
     /// socket from a crashed one is removed first.
     pub async fn bind(node: Node, stop: broadcast::Sender<()>) -> std::io::Result<Server> {
         Server::bind_served(Served::Named(node), stop).await
+    }
+
+    pub(crate) async fn bind_starting(
+        node: Node,
+        stop: broadcast::Sender<()>,
+    ) -> std::io::Result<(Server, Startup)> {
+        let mut server = Self::bind(node, stop).await?;
+        let startup = Startup::default();
+        startup.stage("reopening interrupted uploads");
+        server.startup = startup.clone();
+        Ok((server, startup))
     }
 
     /// Binds the socket for a node whose zone has not named it yet (§3.1).
@@ -204,6 +245,7 @@ impl Server {
             served,
             listener,
             token,
+            startup: Startup::default(),
             stop,
             stopping,
             accepting,
@@ -229,6 +271,7 @@ impl Server {
             served: serving,
             mut listener,
             token,
+            startup,
             stop,
             mut stopping,
             mut accepting,
@@ -262,7 +305,7 @@ impl Server {
             })
             .max_decoding_message_size(MAX_MESSAGE_LEN)
             .max_encoding_message_size(MAX_MESSAGE_LEN),
-            Authenticate { token },
+            Authenticate { token, startup },
         );
 
         // Scoped, so that whichever way the drain ends the server future is
@@ -307,6 +350,7 @@ impl Server {
 #[derive(Clone)]
 struct Authenticate {
     token: Arc<Vec<u8>>,
+    startup: Startup,
 }
 
 impl Interceptor for Authenticate {
@@ -335,7 +379,10 @@ impl Interceptor for Authenticate {
             .get_bin(TOKEN_HEADER)
             .and_then(|value| value.to_bytes().ok());
         match presented {
-            Some(bytes) if tokens_match(&bytes, &self.token) => Ok(request),
+            Some(bytes) if tokens_match(&bytes, &self.token) => {
+                self.startup.check()?;
+                Ok(request)
+            }
             _ => Err(ControlError::new(
                 ErrorCode::Unauthorized,
                 format!(
