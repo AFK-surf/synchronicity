@@ -2204,19 +2204,38 @@ async fn a_daemon_stops_while_its_first_scan_is_stalled_on_a_peer() {
     config.publish_quiesce = std::time::Duration::from_secs(300);
     config.aae_interval = std::time::Duration::from_secs(300);
     // Bounds the startup readoption probe of the same silent peer, which runs
-    // before the control server starts accepting and would otherwise hold the
-    // stop request back for the full request deadline. The initial scan's
+    // while control requests report starting. The initial scan's
     // push keeps its deadline — the stop must be heard while it is stalled.
     config.sync_round_budget = std::time::Duration::from_secs(1);
     let running = tokio::spawn(synch_cli::daemon::run(config));
 
-    // Wait for the control socket, then ask the daemon to stop.
-    let mut client = loop {
-        match Client::connect(dir.path()).await {
-            Ok(client) => break client,
-            Err(_) => tokio::time::sleep(std::time::Duration::from_millis(20)).await,
+    // Binding is not readiness. The real daemon must answer during the
+    // silent peer's recovery exchange, then permit stop after recovery.
+    let mut saw_starting = false;
+    let mut client = tokio::time::timeout(std::time::Duration::from_secs(10), async {
+        loop {
+            if let Ok(mut client) = Client::connect(dir.path()).await {
+                match client.run(Command::DaemonStatus(pb::DaemonStatus {})).await {
+                    Ok(mut frames) => {
+                        while frames.next().await.unwrap().is_some() {}
+                        break client;
+                    }
+                    Err(error) => {
+                        assert_eq!(error.code, ErrorCode::Unavailable);
+                        assert!(error.message.contains("daemon starting"));
+                        saw_starting = true;
+                    }
+                }
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(20)).await;
         }
-    };
+    })
+    .await
+    .expect("authenticated readiness must follow bounded recovery");
+    assert!(
+        saw_starting,
+        "control must answer before the silent peer times out"
+    );
     let mut frames = client
         .run(Command::DaemonStop(pb::DaemonStop {}))
         .await

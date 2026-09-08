@@ -210,14 +210,20 @@ impl Node {
             .await?
         };
 
-        for (peer, addr) in self.dial_targets().await? {
+        let targets = self.dial_targets().await?;
+        tracing::info!(peers = targets.len(), exchange_budget_secs = self.config().sync_round_budget.as_secs(),
+            "startup own-head recovery: contacting peers sequentially; each dial has a 10s deadline");
+        for (index, (peer, addr)) in targets.into_iter().enumerate() {
+            let started = std::time::Instant::now();
+            tracing::info!(peer = %peer.fmt_short(), index = index + 1, "startup readoption: dialing peer");
             let client = match self.net().connect_mpt(addr).await {
                 Ok(client) => client,
                 Err(error) => {
-                    tracing::debug!(peer = %peer.fmt_short(), %error, "startup readoption peer unreachable");
+                    tracing::info!(peer = %peer.fmt_short(), elapsed_secs = started.elapsed().as_secs_f64(), %error, "startup readoption peer unreachable");
                     continue;
                 }
             };
+            tracing::info!(peer = %peer.fmt_short(), elapsed_secs = started.elapsed().as_secs_f64(), "startup readoption: exchanging history");
             match tokio::time::timeout(
                 self.config().sync_round_budget,
                 self.syncer().readopt_self_with(&client, &held_keys),
@@ -225,16 +231,17 @@ impl Node {
             .await
             {
                 Ok(Ok(())) => {}
-                Ok(Err(error)) => tracing::debug!(
+                Ok(Err(error)) => tracing::info!(
                     peer = %peer.fmt_short(),
                     %error,
                     "startup readoption exchange failed"
                 ),
-                Err(_) => tracing::debug!(
+                Err(_) => tracing::info!(
                     peer = %peer.fmt_short(),
                     "startup readoption exchange exceeded its sync budget"
                 ),
             }
+            tracing::info!(peer = %peer.fmt_short(), elapsed_secs = started.elapsed().as_secs_f64(), "startup readoption: peer finished");
         }
 
         let after = {
