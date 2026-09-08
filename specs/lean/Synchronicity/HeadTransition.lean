@@ -6,7 +6,7 @@ nor their error branches. Timestamp changes are not version changes.
 Capture evidence belongs to the concrete-to-abstract refinement: giving this
 relation an arbitrary list of keys does not establish M3 for a production run.
 In particular, consumption ends in absence, not an arbitrary replacement. -/
-namespace Synchronicity.Goals.Mptsync
+namespace Synchronicity
 open VerifiedCore VerifiedCore.Replication
 
 inductive HeadSlot where
@@ -61,4 +61,4 @@ theorem HeadChange.replacement_is_newer (change : HeadChange captured origin slo
   | keep => exact False.elim (different rfl)
   | advance _ _ _ forward => exact forward old rfl
 
-end Synchronicity.Goals.Mptsync
+end Synchronicity

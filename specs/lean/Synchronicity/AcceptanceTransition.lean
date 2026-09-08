@@ -2,7 +2,7 @@ import Synchronicity.AcceptanceProtection
 import Synchronicity.HeadView
 
 namespace Synchronicity.AcceptanceTransition
-open VerifiedCore VerifiedCore.Host VerifiedCore.Replication SimulatedHost Goals.Mptsync PrivateDatabase
+open VerifiedCore VerifiedCore.Host VerifiedCore.Replication SimulatedHost PrivateDatabase
 
 theorem refines (head : Head) (now : Int64) (keep : Nat) (state : State) (closed : state.pending = none)
     (before : HeadView.Represents state.db view) (backed : HeadView.Backed state.db view)

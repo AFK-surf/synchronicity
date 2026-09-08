@@ -12,6 +12,8 @@ Organize the proof entry points to mirror the goal hierarchy in `docs/LEAN.md` (
 
 Express goal properties as operation-independent domain invariants or transition relations, not a growing enumeration of command-specific violations. Prove that actual operations refine that common specification. Derive permissions (such as consuming a captured version) from actual reads or continuation provenance; do not assume the desired refinement in execution constructors.
 
+Keep shared domain models outside `Goals`. Dependencies flow from goal-level properties/theorems through operation refinement proofs to domain models, never from domain or operation modules back into `Goals`.
+
 ## Build, Test, and Development Commands
 
 - `cargo build --release` builds workspace binaries into `target/release/`.

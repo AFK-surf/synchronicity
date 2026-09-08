@@ -2,7 +2,7 @@ import Synchronicity.PromotionRowFrame
 import Synchronicity.TargetTransition
 
 namespace Synchronicity.PromotionTransition
-open VerifiedCore VerifiedCore.Host VerifiedCore.Replication SimulatedHost Goals.Mptsync
+open VerifiedCore VerifiedCore.Host VerifiedCore.Replication SimulatedHost
 
 /-- A capture is issued only after the actual begin and preparation reads
 return a pending head. There is no externally supplied cleanup permission. -/

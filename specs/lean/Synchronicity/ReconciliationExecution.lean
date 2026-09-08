@@ -11,7 +11,7 @@ A requester/retirement may resume in a different database, with arbitrary replie
 Transactions are exclusive: each command/resumption starts closed; a finite
 prefix may end inside its own transaction, but another task cannot start there. -/
 namespace Synchronicity.ReconciliationExecution
-open VerifiedCore VerifiedCore.Host VerifiedCore.Commands VerifiedCore.Replication SimulatedHost PrivateDatabase Goals.Mptsync
+open VerifiedCore VerifiedCore.Host VerifiedCore.Commands VerifiedCore.Replication SimulatedHost PrivateDatabase
 
 inductive Event where
   | advertisement (head : Head) (now : Int64) (keep : Nat)

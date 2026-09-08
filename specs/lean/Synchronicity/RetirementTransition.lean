@@ -2,7 +2,7 @@ import Synchronicity.TargetTransition
 import Synchronicity.RetirementProtection
 
 namespace Synchronicity.RetirementTransition
-open VerifiedCore VerifiedCore.Host VerifiedCore.Replication SimulatedHost PrivateDatabase Goals.Mptsync
+open VerifiedCore VerifiedCore.Host VerifiedCore.Replication SimulatedHost PrivateDatabase
 
 theorem fields_match (row : Fields) (pending : Promote.Pending) :
     equals row (TargetTransition.fields (TargetTransition.pendingKey pending)) =

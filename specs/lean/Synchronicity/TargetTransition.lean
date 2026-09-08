@@ -2,7 +2,7 @@ import Synchronicity.HeadView
 import Synchronicity.FetchHeadSafety
 
 namespace Synchronicity.TargetTransition
-open VerifiedCore VerifiedCore.Host VerifiedCore.Replication SimulatedHost Goals.Mptsync
+open VerifiedCore VerifiedCore.Host VerifiedCore.Replication SimulatedHost
 
 def fields (key : CapturedHead) : Fields :=
   [("origin_id", .text key.origin), ("slot", .text "pending"),

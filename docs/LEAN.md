@@ -23,6 +23,8 @@ stated property for the relevant production executions under explicit assumption
 Use operation-independent domain invariants or transition relations, not lists of
 command-specific violations; prove actual operations refine the common property.
 Derive permissions from real reads or captured work, not an assumed safe outcome.
+Keep shared domain models outside `Goals`; operation proofs must not depend on
+goal modules. `Goals` contains the goal-level properties and top-level theorems.
 
 ## Architecture and ownership
 
@@ -134,7 +136,7 @@ M3 safety do not establish exact views or eventual convergence.
 entry point is [Goals/Mptsync/M3.lean](../specs/lean/Synchronicity/Goals/Mptsync/M3.lean):
 `Synchronicity.Goals.Mptsync.M3.Safety` is the property and `M3.safety` its top-level
 theorem. Every finite `Execution` refines the operation-independent
-[head transition relation](../specs/lean/Synchronicity/Goals/Mptsync/HeadTransition.lean):
+[head transition relation](../specs/lean/Synchronicity/HeadTransition.lean):
 for every origin and both slots, keep the version, strictly advance it (sequence,
 then root), or consume exactly the captured **pending** version into absence.
 Complete cannot disappear or regress; capture never permits an older replacement.

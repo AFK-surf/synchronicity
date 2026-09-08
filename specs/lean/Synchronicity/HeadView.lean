@@ -1,4 +1,4 @@
-import Synchronicity.Goals.Mptsync.HeadTransition
+import Synchronicity.HeadTransition
 import Synchronicity.HeadKeyFrame
 import Synchronicity.ReconciliationRead
 import Synchronicity.PromotionBound
@@ -6,7 +6,7 @@ import Synchronicity.PromotionBound
 /-! Relate the domain head view to independently observed raw database rows.
 The representation contract says nothing about what an operation may change. -/
 namespace Synchronicity.HeadView
-open VerifiedCore VerifiedCore.Host VerifiedCore.Replication SimulatedHost Goals.Mptsync
+open VerifiedCore VerifiedCore.Host VerifiedCore.Replication SimulatedHost
 
 def slotName : HeadSlot → String
   | .complete => "complete"

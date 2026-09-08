@@ -2,7 +2,7 @@ import Synchronicity.PromotionTransition
 import Synchronicity.FetchLifecycle
 
 namespace Synchronicity.FetchTransition
-open VerifiedCore VerifiedCore.Host VerifiedCore.Commands VerifiedCore.Replication SimulatedHost PrivateDatabase Goals.Mptsync
+open VerifiedCore VerifiedCore.Host VerifiedCore.Commands VerifiedCore.Replication SimulatedHost PrivateDatabase
 
 theorem selection (origin : Origin.Parsed) (expected : Option (UInt64 × ByteArray))
     (state : State) (closed : state.pending = none)
