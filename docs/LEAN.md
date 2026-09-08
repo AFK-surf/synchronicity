@@ -119,8 +119,16 @@ implementation and integration guarantees, not a complete reconciliation theorem
 
 Checked reconciliation components include exact-target abandonment, timestamp
 updates and post-rollback retirement on arbitrary current rows with successful
-storage, and the executed promotion body's no-downgrade guard. They do not yet
-compose all acceptance and suspended-work interleavings into M3.
+storage, and the executed promotion body's no-downgrade guard. When the full acceptance
+command returns `pending`, it is proved to install its candidate in committed pending
+rows, after history trimming and commit; a matching row exists, and every
+matching row has that candidate's sequence and root. Success also requires reading
+both complete/pending floors, beating every decoded floor and executing the slot
+write. These acceptance results allow arbitrary injected host failures, deriving
+successful writes and commit from the command's success. History trimming preserves
+all staged heads and the transaction token even on failure. Connecting decoded floors
+to initial database invariants and composing acceptance with all suspended-work
+interleavings remain open for M3.
 
 For M4, every execution prefix of the actual materializer preserves the committed
 database: its streamed file/provider/delegation and retention writes cannot commit

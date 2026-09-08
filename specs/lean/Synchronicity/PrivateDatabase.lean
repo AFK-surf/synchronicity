@@ -71,6 +71,30 @@ theorem Only.foldlM (items : List A) (f : B → A → OperationOver E ε B)
   | nil => exact .done _
   | cons item rest ih => exact (safe initial item).seq fun next => ih next
 
+theorem Only.forIn (items : List A) (f : A → B → OperationOver E ε (ForInStep B))
+    (safe : ∀ a b, Only allowed (f a b).run) (initial : B) :
+    Only allowed (forIn items initial f).run := by
+  induction items generalizing initial with
+  | nil => exact .done _
+  | cons item rest ih =>
+    rw [List.forIn_cons]
+    apply (safe item initial).seq
+    intro step
+    cases step with
+    | done _ => exact .done _
+    | yield next => exact ih next
+
+theorem Only.preserves_observation [Interpreter E] (observe : State → O)
+    (program : Program E A) (safe : Only allowed program)
+    (effects : ∀ {B} (e : E B), allowed _ e → ∀ state,
+      observe (Interpreter.handle e state).2 = observe state)
+    (state : State) : observe (execute program state).2 = observe state := by
+  induction safe generalizing state with
+  | done _ => rfl
+  | request good rest ih =>
+    simp only [execute]
+    exact (ih _ _).trans (effects _ good state)
+
 theorem Only.iterate (body : S → OperationOver E ε (S ⊕ A)) (error : ε) (fuel : Nat)
     (safe : ∀ s, Only allowed (body s).run) (start : S) :
     Only allowed (OperationOver.iterate body error fuel start).run := by
