@@ -792,6 +792,43 @@ impl Syncer {
         client: &MptClient,
         origin: &OriginId,
     ) -> Result<FetchOutcome> {
+        self.fetch_pending_slot(client, origin, None).await
+    }
+
+    /// [`Syncer::fetch_pending`] for one specific head, skipped if the slot has
+    /// moved on.
+    ///
+    /// The pending slot is per origin and only ever rises, so when two
+    /// exchanges run at once — several peers dialed concurrently, or a
+    /// `HeadPush` landing mid-round — the head one of them just offered can be
+    /// displaced by a greater one from the other before either fetches. Both
+    /// would then walk the *winner's* root, and the peer that never advertised
+    /// it cannot serve a node of it: it spends its unproductive rounds, then
+    /// abandons that head and clears the slot by name — legitimately, since by
+    /// then it is the head it was fetching — out from under the peer that was
+    /// transferring it. The successful fetch has nothing left to promote, and a
+    /// head the two peers between them could deliver is adopted by neither.
+    ///
+    /// Fetching only what this peer handed over keeps every walk, and every
+    /// abandonment, on a root its own peer advertised. Nothing is lost by
+    /// standing down: the head that took the slot is being driven by the
+    /// exchange that offered it, and the pending pass of any later round picks
+    /// up one that was not.
+    pub(crate) async fn fetch_pending_head(
+        &self,
+        client: &MptClient,
+        head: &SignedHead,
+    ) -> Result<FetchOutcome> {
+        self.fetch_pending_slot(client, &head.origin, Some((head.seq, head.root)))
+            .await
+    }
+
+    async fn fetch_pending_slot(
+        &self,
+        client: &MptClient,
+        origin: &OriginId,
+        expected: Option<(u64, Hash)>,
+    ) -> Result<FetchOutcome> {
         let Some(pending) = ({
             let store = self.store.clone();
             let origin = origin.clone();
@@ -799,6 +836,9 @@ impl Syncer {
         }) else {
             return Ok(FetchOutcome::NoFlip);
         };
+        if expected.is_some_and(|head| head != (pending.seq, pending.root)) {
+            return Ok(FetchOutcome::NoFlip);
+        }
         // What this origin's trie looked like when we last held all of it. Every
         // subtree the new root shares with it is already here, so the walk can
         // skip it outright and descend only what changed (§5.2) — which is the
@@ -1034,7 +1074,7 @@ impl Syncer {
             }
             match self.offer_head_off_runtime(&head).await? {
                 HeadOutcome::Pending => {
-                    let _ = self.fetch_pending(client, &own).await?;
+                    let _ = self.fetch_pending_head(client, &head).await?;
                 }
                 HeadOutcome::Completed
                 | HeadOutcome::NotNewer

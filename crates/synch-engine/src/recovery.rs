@@ -221,7 +221,10 @@ impl Node {
             "startup own-head recovery: contacting peers concurrently; each dial has a 10s deadline");
         // These futures stay owned by startup: cancellation drops every pending
         // dial/exchange, and cloud reconstruction waits for all peers to finish.
-        // Head offers and promotion already recheck ordering transactionally.
+        // Head offers and promotion recheck ordering transactionally, and each
+        // exchange fetches only the head its own peer handed over — peers here
+        // hold different heads of this origin, and the greatest of them is the
+        // one that has to survive whichever peer answers first (§5.2).
         stream::iter(targets.into_iter().enumerate())
             .for_each_concurrent(STARTUP_RECOVERY_CONCURRENCY, |(index, (peer, addr))| {
                 let held_keys = &held_keys;
