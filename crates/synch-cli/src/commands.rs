@@ -344,6 +344,13 @@ fn inspect_socket(file: &Path) -> Result<()> {
             println!("  declares {line}");
         }
     }
+    if declared.unrestricted_egress {
+        println!(
+            "  egress   UNRESTRICTED — any host, on any port, wherever this invocation is \
+             told to go; never the loopback, private, link-local or metadata ranges, which \
+             only a rule naming the address itself reaches"
+        );
+    }
     for write in &declared.tree_writes {
         println!(
             "  tree-write {}  {}  {}",

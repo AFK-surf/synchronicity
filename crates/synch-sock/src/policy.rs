@@ -14,7 +14,10 @@
 
 use std::net::IpAddr;
 
-use synch_core::{sock::egress_rule_matches, Declaration, NodeId, OriginId};
+use synch_core::{
+    sock::{declared_egress_addresses, egress_rule_matches},
+    Declaration, NodeId, OriginId,
+};
 
 /// A syntactically valid device key that identifies nobody.
 ///
@@ -97,6 +100,13 @@ impl PeerIdentity {
 /// What one invocation may do, already computed from the program's manifest.
 #[derive(Debug, Clone, Default, PartialEq, Eq)]
 pub struct EffectivePolicy {
+    /// Whether the manifest declares egress to any destination at all, rather
+    /// than to a list of them.
+    ///
+    /// Outward only: [`address_gate`](Self::address_gate) still refuses the
+    /// ranges a name may never reach, so this is never a route into the
+    /// node's own network.
+    pub unrestricted_egress: bool,
     /// Egress rules the program's manifest declares, as `host` or `host:port`.
     pub egress: Vec<String>,
     /// Exact process capabilities the manifest declares.
@@ -135,6 +145,7 @@ impl EffectivePolicy {
         .unwrap_or(default_max_streams);
 
         EffectivePolicy {
+            unrestricted_egress: declared.unrestricted_egress,
             egress: declared.egress.clone(),
             processes: declared.processes.clone(),
             file_transfers: declared.file_transfers.clone(),
@@ -148,9 +159,22 @@ impl EffectivePolicy {
 
     /// Whether this invocation may connect to `host` on `port`.
     pub(crate) fn egress_allowed(&self, host: &str, port: u16) -> bool {
-        self.egress
-            .iter()
-            .any(|rule| egress_rule_matches(rule, host, port))
+        self.unrestricted_egress
+            || self
+                .egress
+                .iter()
+                .any(|rule| egress_rule_matches(rule, host, port))
+    }
+
+    /// The check to make on the address a destination turns out to have.
+    ///
+    /// Taken once per outbound connection and moved into the connect task,
+    /// which outlives the helper call that started it and has no borrow of the
+    /// policy to make this check with.
+    pub(crate) fn address_gate(&self) -> AddressGate {
+        AddressGate {
+            named: declared_egress_addresses(&self.egress),
+        }
     }
 
     /// The value of a config key.
@@ -162,25 +186,40 @@ impl EffectivePolicy {
     }
 }
 
-/// Whether a resolved address may be connected to under a rule naming `host`.
+/// Which addresses this invocation may be connected to, whatever destination
+/// it named to get there.
 ///
-/// The check the name-based list cannot make. A program that declares
-/// `metadata.example` has named a destination whose address is somebody else's to
-/// point wherever they like — at `127.0.0.1`, at a link-local address, at the
+/// The check the destination list cannot make. A program that declares
+/// `metadata.example` — or declares unrestricted egress and is handed a name by
+/// its caller — has named a destination whose address is somebody else's to
+/// point wherever they like: at `127.0.0.1`, at a link-local address, at the
 /// node's own control socket's interface. So an address in one of those ranges
-/// is refused unless the rule *named that address literally*, which is how a
-/// deliberate local upstream declared as `127.0.0.1:5432` keeps working.
+/// is refused unless the *declaration* named that address literally, which is
+/// how a deliberate local upstream declared as `127.0.0.1:5432` keeps working.
+///
+/// Keying that exception to the declaration rather than to the host the guest
+/// typed is what makes unrestricted egress unrestricted *outward* only: with no
+/// list, there is no literal, and no name or address a program can supply
+/// reaches inward.
 ///
 /// This is not a substitute for the policy check; it runs after it, on what DNS
-/// actually answered.
-pub(crate) fn resolved_address_allowed(host: &str, addr: IpAddr) -> bool {
-    if !is_restricted(addr) {
-        return true;
+/// actually answered — or, for a literal destination, before the connect.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub(crate) struct AddressGate {
+    /// The restricted-range exceptions: addresses the declaration named
+    /// literally, each with the port its rule pins, if any.
+    named: Vec<(IpAddr, Option<u16>)>,
+}
+
+impl AddressGate {
+    /// Whether `addr` may be connected to on `port`.
+    pub(crate) fn allows(&self, addr: IpAddr, port: u16) -> bool {
+        !is_restricted(addr)
+            || self
+                .named
+                .iter()
+                .any(|(named, pinned)| *named == addr && pinned.is_none_or(|p| p == port))
     }
-    // The declaration named this exact address, so approval was unambiguous.
-    host.trim_matches(['[', ']'])
-        .parse::<IpAddr>()
-        .is_ok_and(|literal| literal == addr)
 }
 
 /// Addresses a name must not be allowed to reach by resolving to them.
@@ -288,33 +327,131 @@ mod tests {
         let private = ["10.0.0.1", "172.16.0.1", "192.168.0.1"];
         let public: IpAddr = "93.184.216.34".parse().unwrap();
 
-        assert!(resolved_address_allowed("git.internal", public));
+        let named = armed(&["git.internal"]).address_gate();
+        assert!(named.allows(public, 443));
         assert!(
-            !resolved_address_allowed("git.internal", loopback),
+            !named.allows(loopback, 443),
             "a name resolved onto the node itself"
         );
-        assert!(!resolved_address_allowed("git.internal", metadata));
+        assert!(!named.allows(metadata, 80));
         for address in private {
             assert!(
-                !resolved_address_allowed("git.internal", address.parse().unwrap()),
+                !named.allows(address.parse().unwrap(), 443),
                 "a public name resolved into private address {address}"
             );
         }
 
         // A rule that names the address literally has said yes unambiguously,
-        // which is how a deliberate local upstream keeps working.
-        assert!(resolved_address_allowed("127.0.0.1", loopback));
-        assert!(!resolved_address_allowed("127.0.0.1", metadata));
+        // which is how a deliberate local upstream keeps working — on the port
+        // it named, and no other.
+        let literal = armed(&["127.0.0.1:5432"]).address_gate();
+        assert!(literal.allows(loopback, 5432));
+        assert!(!literal.allows(loopback, 22), "a declared port was ignored");
+        assert!(!literal.allows(metadata, 5432));
+        assert!(armed(&["127.0.0.1"]).address_gate().allows(loopback, 22));
+        assert!(
+            !armed(&["127.0.0.1:99999"])
+                .address_gate()
+                .allows(loopback, 80),
+            "a port that fits nothing became a literal on every port"
+        );
     }
 
     #[test]
     fn an_ipv4_mapped_v6_address_is_the_v4_address_it_maps() {
+        let named = armed(&["git.internal"]).address_gate();
         let mapped: IpAddr = "::ffff:127.0.0.1".parse().unwrap();
-        assert!(!resolved_address_allowed("git.internal", mapped));
+        assert!(!named.allows(mapped, 443));
         let ula: IpAddr = "fd00::1".parse().unwrap();
-        assert!(!resolved_address_allowed("git.internal", ula));
+        assert!(!named.allows(ula, 443));
         let global: IpAddr = "2606:2800:220:1:248:1893:25c8:1946".parse().unwrap();
-        assert!(resolved_address_allowed("git.internal", global));
+        assert!(named.allows(global, 443));
+    }
+
+    #[test]
+    fn an_address_is_named_however_its_rule_spells_it() {
+        // `[::1]:9418`, `::1` and the long form are one address, and an
+        // approval of it must not depend on which the author typed.
+        let loopback: IpAddr = "::1".parse().unwrap();
+        for rule in ["[::1]:9418", "0:0:0:0:0:0:0:1:9418"] {
+            assert!(
+                armed(&[rule]).address_gate().allows(loopback, 9418),
+                "rule {rule} did not name ::1"
+            );
+        }
+    }
+
+    #[test]
+    fn unrestricted_egress_reaches_any_destination_it_was_never_told_about() {
+        let p = EffectivePolicy::granted(
+            &Declaration {
+                unrestricted_egress: true,
+                ..Declaration::default()
+            },
+            vec![],
+            None,
+            64,
+        );
+        assert!(p.egress_allowed("anything.example", 443));
+        assert!(p.egress_allowed("something.else.example", 9418));
+        assert!(p
+            .address_gate()
+            .allows("93.184.216.34".parse().unwrap(), 80));
+    }
+
+    #[test]
+    fn unrestricted_egress_is_outward_only() {
+        // The property that makes the declaration safe to grant: whatever host
+        // or literal address the program is handed, it does not reach the
+        // node's own loopback, its LAN, or a cloud metadata service — because
+        // the exception is what the *declaration* named, not what the guest
+        // typed at connect time.
+        let anywhere = EffectivePolicy::granted(
+            &Declaration {
+                unrestricted_egress: true,
+                ..Declaration::default()
+            },
+            vec![],
+            None,
+            64,
+        );
+        let gate = anywhere.address_gate();
+        for address in [
+            "127.0.0.1",
+            "169.254.169.254",
+            "10.0.0.1",
+            "192.168.1.1",
+            "100.100.0.1",
+            "::1",
+            "fd00::1",
+            "::ffff:127.0.0.1",
+        ] {
+            assert!(
+                anywhere.egress_allowed(address, 80),
+                "the destination list, not the address gate, should have admitted {address}"
+            );
+            assert!(
+                !gate.allows(address.parse().unwrap(), 80),
+                "unrestricted egress reached inward at {address}"
+            );
+        }
+
+        // A program that wants both says both: the list keeps its one remaining
+        // job, which is naming the restricted addresses that are still allowed.
+        let with_upstream = EffectivePolicy::granted(
+            &Declaration {
+                unrestricted_egress: true,
+                egress: vec!["127.0.0.1:5432".into()],
+                ..Declaration::default()
+            },
+            vec![],
+            None,
+            64,
+        );
+        let gate = with_upstream.address_gate();
+        assert!(gate.allows("127.0.0.1".parse().unwrap(), 5432));
+        assert!(!gate.allows("127.0.0.1".parse().unwrap(), 5433));
+        assert!(!gate.allows("169.254.169.254".parse().unwrap(), 80));
     }
 
     #[test]

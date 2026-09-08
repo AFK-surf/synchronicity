@@ -80,6 +80,11 @@ typedef unsigned char sy_u8;
  *
  * Members (all optional except "manifest"): "name"; "egress" (an array of
  * "host" or "host:port" strings — a bare host is any port on it);
+ * "unrestricted_egress" (a bool, for a program whose destinations are its
+ * input: any host on any port, declared once and printed loudly rather than
+ * guessed at in a list that would only look like a bound — but outward only,
+ * so loopback, private, link-local and metadata addresses stay refused unless
+ * "egress" names the address itself);
  * "max_streams"; "stack_frame_size" (a multiple of 16 bytes, 16 through
  * 32768; must match the compiler's eBPF stack-frame setting, default 16384);
  * "guarded_stack_frames" (a bool; guards are on by default when the host page
@@ -310,8 +315,11 @@ extern sy_s64 sy_errno(sy_s64 handle);
 /* ---- outbound connections ---------------------------------------------- */
 
 /* Returns a handle immediately, still connecting; poll for SY_POLL_OUT. Both
- * the name and the address it resolves to are checked against the manifest's egress
- * list, so a name that resolves inward is refused where the address would be. */
+ * the destination and the address it resolves to are checked: the destination
+ * against the manifest's egress list (or against "unrestricted_egress"), the
+ * address against the ranges only a literal rule in that list reaches. So a
+ * name that resolves inward is refused where the address would be, and so is
+ * the address handed straight to sy_tcp_connect_ip. */
 extern sy_s64 sy_tcp_connect(const char *host, sy_u64 host_len, sy_u64 port);
 extern sy_s64 sy_tcp_connect_ip(const void *addr, sy_u64 addr_len, sy_u64 port);
 extern sy_s64 sy_endpoint_info(sy_s64 handle, char *out, sy_u64 out_len);

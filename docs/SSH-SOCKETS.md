@@ -1982,6 +1982,15 @@ static sy_s64 finish_git_forward(
 The destination named in SSH data grants nothing. Both the guest comparison
 and the manifest's egress declaration must permit the connection.
 
+A jump host that forwards wherever its authenticated user asks is the case
+`"unrestricted_egress": true` exists for (`docs/SOCKETS.md` §3.1): the
+destination is genuinely the SSH client's to choose, and a list of guesses
+would be a bound in appearance only. It is still not a route inward — the
+address check refuses loopback, private and metadata ranges that no rule named
+literally — and it moves the whole of the decision into the guest's own
+comparison, which is then the only thing standing between an authenticated
+user and any host this node can reach.
+
 ## 16. Implementation order
 
 The adapter was built in this order, and the separation remains load-bearing

@@ -1082,9 +1082,10 @@ fn open_egress(inner: &Rc<Inner>, host: String, port: u16, literal: bool) -> i64
     }
     // A literal address gets the same check a resolved one would, so the two
     // helpers cannot disagree about where a program may reach.
+    let gate = inner.policy.address_gate();
     if literal {
         if let Ok(addr) = host.trim_matches(['[', ']']).parse() {
-            if !crate::runtime::endpoint::literal_allowed(&host, addr) {
+            if !gate.allows(addr, port) {
                 return errno::EPERM;
             }
         }
@@ -1107,7 +1108,7 @@ fn open_egress(inner: &Rc<Inner>, host: String, port: u16, literal: bool) -> i64
     let permit =
         crate::runtime::endpoint::EgressPermit::take(std::rc::Rc::clone(&inner.egress_open));
     inner.publish_handles();
-    inner.spawn(connect_task(ep, host, port, permit));
+    inner.spawn(connect_task(ep, host, port, gate, permit));
     handle
 }
 

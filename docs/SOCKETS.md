@@ -204,12 +204,35 @@ same root the tree names once the bytes are deployed — its parsed manifest
 rendered canonically, and a load/link validation of the stream program. It
 touches no database, no scanner, no daemon state, and publishes nothing.
 
-Egress with no declaration is denied. Reading the tree is not among the
-declared capabilities and never was denied by one (§7.6). Because the
-manifest is compiled into the object, editing it changes the content root:
-what an activated path serves is always exactly what its current bytes
-declare, and `synch socket ls -l` shows that declaration from the same parse
-admission uses. An update whose manifest does not parse — or whose program
+Egress with no declaration is denied. A program whose destinations are its
+*input* — a proxy told where to go by its caller, a fetcher following a
+redirect — declares that instead of a list, with `"unrestricted_egress":
+true`:
+
+```
+  declares name fetch
+  declares unrestricted-egress enabled
+  egress   UNRESTRICTED — any host, on any port, wherever this invocation is
+           told to go; never the loopback, private, link-local or metadata
+           ranges, which only a rule naming the address itself reaches
+```
+
+The destination list cannot say this and should not learn how: it has no
+wildcards on purpose (§7.9), and thirty-two guesses at what a caller will ask
+for is a bound in appearance only. So the wide claim is made once, in a member
+of its own, and printed where nobody can miss it — the way a `max_bytes: 0`
+tree write is printed loudly. It is unrestricted *outward* and never a way
+inward: the address check below (§7.4) is unchanged, and its one exception is
+an address the declaration named literally. A program that wants both —
+anywhere, plus a local upstream at `127.0.0.1:5432` — declares both, and
+naming restricted addresses is what the destination list still does alongside
+it.
+
+Reading the tree is not among the declared capabilities and never was denied
+by one (§7.6). Because the manifest is compiled into the object, editing it
+changes the content root: what an activated path serves is always exactly what
+its current bytes declare, and `synch socket ls -l` shows that declaration from
+the same parse admission uses. An update whose manifest does not parse — or whose program
 does not load — keeps the path activated and published and refuses every
 connection with a message naming the defect; deploying a fixed object is the
 whole remedy.
@@ -504,9 +527,20 @@ the whole argument.
 | `sy_tcp_connect_ip(addr, alen, port)` | Same, skipping DNS, for a literal address. |
 | `sy_endpoint_info(h, out, len)` | Peer address and connection state of an endpoint the program opened. |
 
-Resolution happens host-side, and **both the name and the resolved address are
-checked** against the manifest's egress list — so a program cannot reach an internal
-address by way of a name that resolves to it.
+Resolution happens host-side, and **both the destination and the resolved
+address are checked** — the destination against the manifest's egress list (or
+against `"unrestricted_egress"`, which admits any of them), and the address
+against the ranges a destination may never reach: loopback, private,
+link-local, unique-local, carrier NAT and the cloud metadata services inside
+them. An address in one of those is refused unless a rule in the manifest's
+egress list names *that address* literally, which is how a deliberate local
+upstream declared as `127.0.0.1:5432` keeps working.
+
+The exception is keyed to what the manifest named, never to what the program
+passed to the helper. That is what makes unrestricted egress safe to grant: a
+program cannot reach an internal address by way of a name that resolves to it,
+nor by handing the literal address to `sy_tcp_connect_ip`, because with no
+list there is no literal.
 
 Closing a connecting handle does not immediately return its place in the
 per-invocation egress budget (§10). Resolution runs on a blocking pool and
@@ -592,6 +626,8 @@ There are no declaration helpers: a declaration is data in the object's
 `synchronicity.manifest` section (§3.1), never an API call. The scalar
 members are `"name"`, `"egress"` (an array of `host` or `host:port` strings —
 a bare host is any port on it, which inspection prints loudly),
+`"unrestricted_egress"` (a bool: any destination at all, printed louder
+still, and outward only — §3.1, §7.4),
 `"max_streams"`, `"stack_frame_size"` (a multiple of 16 from 16 bytes through
 32 KiB; omitting it keeps the 16 KiB default), and `"guarded_stack_frames"`.
 
@@ -945,7 +981,7 @@ own.
 | Faults on ≥ 8 of the last 16 invocations, from ≥ 2 different callers | — | One loud error in the daemon's log naming the program root. Nothing is deactivated for it — activation is the operator's statement about the path, not a judgement about these bytes, and the remedy is deploying a fixed program, which also clears the window. Faults are attributed to the caller whose invocation faulted, and the breadth is the point: any input-triggered bug in a program is a contained fault, and a caller who finds one can repeat it, so a window that counted faults alone would let whoever reached the socket first fill the log for everyone. A program that is genuinely broken faults for whoever asks. |
 | Manifest invalid, no stream entrypoint, or JIT/link failure | refused | `Refused{ProgramInvalid}` naming the defect. The manifest parse and a stream-entrypoint check run at every admission; `synch socket inspect` runs the same checks plus an eager load before anything is deployed, because async-ebpf compiles functions lazily and a bad function would otherwise surface mid-stream. The path stays activated and published: deploying a fixed object is the remedy. |
 | Bytes changed under an activated socket | served | A deployment: the next admission runs the new root, in-flight invocations keep their snapshot, and the per-socket map clears. A replacement landing *during* one admission refuses it `Refused{NotActivated}`; the retry lands on the new program. |
-| Egress to an undeclared destination | stays open | `SY_EPERM` from `sy_tcp_connect`. The host logs it once per socket per hour. |
+| Egress to an undeclared destination | stays open | `SY_EPERM` from `sy_tcp_connect`. The host logs it once per socket per hour. Under `"unrestricted_egress"` no destination is undeclared, but an address in the ranges the declaration did not name literally is still refused the same way. |
 | Daemon shutdown | clean FIN | `Closed{Shutdown}` for every live invocation, inside the SIGTERM budget §9 already allows for. |
 | Preemption watcher failed | refused | That worker refuses new runs — async-ebpf checks this itself rather than risk a guest that cannot be interrupted. Surfacing the degraded worker count in `synch doctor` is not built. |
 | A socket is at its concurrency cap | refused | `Refused{Busy}` naming the cap. The slot is taken at *admission* and released when the invocation ends or the admission is dropped, so a caller that opens streams and never uses them cannot walk through the cap. |

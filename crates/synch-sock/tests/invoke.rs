@@ -391,6 +391,56 @@ async fn undeclared_egress_is_refused() {
     assert_eq!(out, b"refused");
 }
 
+const ANYWHERE: &str = r#"
+#include <synch.h>
+
+SY_MANIFEST("{\"manifest\":1,\"name\":\"anywhere\",\"unrestricted_egress\":true}");
+
+SY_ENTRY sy_s64 entry(void) {
+  /* A destination this program never named, and could not have: under
+     unrestricted egress it is admitted like any other. */
+  sy_s64 out = sy_tcp_connect(SY_STR("wherever.example"), 80);
+  if (out < 0) {
+    sy_write(SY_SELF, SY_STR("outward-refused"));
+    sy_shutdown(SY_SELF);
+    return 1;
+  }
+  /* The node's own loopback, handed straight to the helper that skips DNS.
+     Nothing in the declaration named it, so nothing admits it. */
+  if (sy_tcp_connect_ip(SY_STR("127.0.0.1"), 5432) != SY_EPERM) {
+    sy_write(SY_SELF, SY_STR("inward-allowed"));
+    sy_shutdown(SY_SELF);
+    return 2;
+  }
+  sy_write(SY_SELF, SY_STR("outward-only"));
+  sy_shutdown(SY_SELF);
+  return 0;
+}
+"#;
+
+#[tokio::test]
+async fn unrestricted_egress_admits_any_destination_and_still_refuses_the_way_in() {
+    let elf = compile(ANYWHERE, "anywhere.c");
+    // The manifest is what grants this, so the policy under test is the one
+    // the manifest actually produces rather than one written here to match it.
+    let declared = synch_sock::manifest::manifest_declaration(&elf).expect("the manifest parses");
+    assert!(declared.unrestricted_egress);
+    assert!(declared.egress.is_empty());
+
+    let harness = Harness::new();
+    let (status, out) = exchange(
+        &harness,
+        &elf,
+        b"",
+        EffectivePolicy::granted(&declared, vec![], None, 64),
+        peer(None),
+        vec![],
+    )
+    .await;
+    assert_eq!(status, SockStatus::Ok(0));
+    assert_eq!(out, b"outward-only");
+}
+
 const QUEUE_AND_GO: &str = r#"
 #include <synch.h>
 

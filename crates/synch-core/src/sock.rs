@@ -13,6 +13,8 @@
 //! rides a per-connection control uni-stream ([`SockClosed`]) and the data
 //! stream always closes cleanly.
 
+use std::net::IpAddr;
+
 use serde::{Deserialize, Serialize};
 
 use crate::{hash::Hash, origin::OriginId};
@@ -479,7 +481,27 @@ fn escaped_declaration_value(value: &str) -> String {
 pub struct Declaration {
     /// A human name, for `synch socket ls` and `synch socket ps`.
     pub name: String,
+    /// The program asks to reach **any** destination, rather than a list of
+    /// them (`docs/SOCKETS.md` §3.1).
+    ///
+    /// For a program whose destinations are its input — a proxy told where to
+    /// go by its caller, a fetcher following a redirect — a fixed list is
+    /// either a lie or a wildcard spelled out thirty-two times, and neither
+    /// tells an operator anything true. So it is declared as what it is: one
+    /// loud claim that inspection, `socket ls -l` and the manifest all print
+    /// on its own line, rather than a list nobody can check.
+    ///
+    /// It is unrestricted *outward*, and it is never a way inward: an address
+    /// in the ranges a name may never reach — loopback, link-local, private,
+    /// unique-local, carrier NAT, the cloud metadata services inside them — is
+    /// still refused unless [`egress`](Self::egress) names that address
+    /// literally. So a program that wants both says both.
+    pub unrestricted_egress: bool,
     /// Destinations, as `host` or `host:port`. A bare host is any port on it.
+    ///
+    /// Under [`unrestricted_egress`](Self::unrestricted_egress) the list is
+    /// what still names restricted addresses: everything else it holds is
+    /// already permitted.
     pub egress: Vec<String>,
     /// Exact process capabilities local to this program root.
     pub processes: Vec<ProcessCapability>,
@@ -636,6 +658,12 @@ impl Declaration {
         if !self.name.is_empty() {
             out.push(format!("name {}", escaped_declaration_value(&self.name)));
         }
+        // Before the list, because it is the larger claim: an operator reading
+        // down the rendering must not meet three named hosts and conclude that
+        // three named hosts are the whole of it.
+        if self.unrestricted_egress {
+            out.push("unrestricted-egress enabled".to_string());
+        }
         let mut egress = self.egress.clone();
         egress.sort();
         egress.dedup();
@@ -687,6 +715,9 @@ impl Declaration {
         for line in text.lines().map(str::trim).filter(|l| !l.is_empty()) {
             match line.split_once(' ') {
                 Some(("name", v)) if display_text_is_safe(v) => out.name = v.to_string(),
+                // Only the exact word this build writes: an approval whose
+                // value it cannot read is not one it may widen egress on.
+                Some(("unrestricted-egress", "enabled")) => out.unrestricted_egress = true,
                 Some(("egress", v))
                     if out.egress.len() < MAX_DECLARED_EGRESS && display_text_is_safe(v) =>
                 {
@@ -790,6 +821,8 @@ struct RawManifest {
     #[serde(default)]
     name: Option<String>,
     #[serde(default)]
+    unrestricted_egress: bool,
+    #[serde(default)]
     egress: Vec<String>,
     #[serde(default)]
     max_streams: Option<u32>,
@@ -868,13 +901,31 @@ fn valid_egress_rule(rule: &str) -> Result<(), ManifestError> {
     if rule.is_empty() {
         return Err(invalid("an empty rule names nothing"));
     }
-    if let Some((host, port)) = rule.rsplit_once(':') {
-        if !host.is_empty() && !port.is_empty() && port.bytes().all(|c| c.is_ascii_digit()) {
-            port.parse::<u16>()
-                .map_err(|_| invalid("the port does not fit a u16"))?;
-        }
+    if split_egress_rule(rule).is_none() {
+        return Err(invalid("the port does not fit a u16"));
     }
     Ok(())
+}
+
+/// Splits a declared egress rule into the host it names and the port it pins.
+///
+/// `None` is a rule that can admit nothing: a `:port` suffix of digits too
+/// large for a `u16`. Reporting that as "a bare host, any port" would turn a
+/// typo into the widest rule in the format, so it is its own answer and every
+/// caller treats it as no rule at all.
+///
+/// The split is from the right, and only when what follows is digits: an IPv6
+/// literal is written `[::1]:9418`, and splitting from the left would cut it at
+/// the first colon of the address itself. Brackets around the host are stripped
+/// so `[::1]` and `::1` are the one host they name.
+pub fn split_egress_rule(rule: &str) -> Option<(&str, Option<u16>)> {
+    let (host, port) = match rule.rsplit_once(':') {
+        Some((h, p)) if !h.is_empty() && !p.is_empty() && p.bytes().all(|c| c.is_ascii_digit()) => {
+            (h, Some(p.parse::<u16>().ok()?))
+        }
+        _ => (rule, None),
+    };
+    Some((host.trim_matches(['[', ']']), port))
 }
 
 /// Parses the bytes of a `synchronicity.manifest` section into the
@@ -1004,6 +1055,7 @@ pub fn parse_socket_manifest(bytes: &[u8]) -> Result<Declaration, ManifestError>
 
     let declaration = Declaration {
         name: raw.name.unwrap_or_default(),
+        unrestricted_egress: raw.unrestricted_egress,
         egress: raw.egress,
         processes,
         file_transfers,
@@ -1032,21 +1084,27 @@ fn trim_manifest(bytes: &[u8]) -> &[u8] {
 /// rule admitting `*.internal` would be a rule whose blast radius changes when
 /// somebody else registers a name, and these lists are short by construction.
 pub fn egress_rule_matches(rule: &str, host: &str, port: u16) -> bool {
-    // Split from the right, and only when what follows is digits: an IPv6
-    // literal is written `[::1]:9418`, and splitting from the left would cut it
-    // at the first colon of the address itself.
-    let (rule_host, rule_port) = match rule.rsplit_once(':') {
-        Some((h, p)) if !h.is_empty() && !p.is_empty() && p.bytes().all(|c| c.is_ascii_digit()) => {
-            let Ok(port) = p.parse::<u16>() else {
-                return false;
-            };
-            (h, Some(port))
-        }
-        _ => (rule, None),
+    let Some((rule_host, rule_port)) = split_egress_rule(rule) else {
+        return false;
     };
-    let strip = |s: &str| s.trim_matches(['[', ']']).to_string();
-    strip(rule_host).eq_ignore_ascii_case(&strip(host))
+    rule_host.eq_ignore_ascii_case(host.trim_matches(['[', ']']))
         && rule_port.is_none_or(|declared| declared == port)
+}
+
+/// The addresses a declaration names literally, with the port each rule pins.
+///
+/// The question a rule's *text* cannot answer by string comparison: `::1`,
+/// `[::1]` and `0:0:0:0:0:0:0:1` are one address written three ways. A rule
+/// naming a host contributes nothing — a name is somebody else's to point
+/// wherever they like, which is the whole reason its callers ask this.
+pub fn declared_egress_addresses(rules: &[String]) -> Vec<(IpAddr, Option<u16>)> {
+    rules
+        .iter()
+        .filter_map(|rule| {
+            let (host, port) = split_egress_rule(rule)?;
+            Some((host.parse::<IpAddr>().ok()?, port))
+        })
+        .collect()
 }
 
 /// Decodes [`SockOpen::meta`] under [`MAX_OPEN_META_PAIRS`].
@@ -1281,6 +1339,7 @@ mod tests {
     fn a_declaration_round_trips_through_its_stored_text() {
         let d = Declaration {
             name: "git-http".into(),
+            unrestricted_egress: false,
             egress: vec!["git.internal:9418".into(), "cache.internal".into()],
             processes: vec![],
             file_transfers: vec![],
@@ -1345,6 +1404,63 @@ mod tests {
             .egress
             .iter()
             .any(|rule| egress_rule_matches(rule, "anywhere", 53)));
+    }
+
+    #[test]
+    fn unrestricted_egress_is_declared_once_and_survives_its_stored_text() {
+        let declared = parse_socket_manifest(
+            br#"{"manifest": 1, "name": "fetch", "unrestricted_egress": true}"#,
+        )
+        .unwrap();
+        assert!(declared.unrestricted_egress);
+        assert!(
+            declared.egress.is_empty(),
+            "a destination list appeared from nowhere"
+        );
+
+        // It is the second line an operator reads, before any list that might
+        // otherwise look like the whole of what the program reaches.
+        let rendered = declared.render();
+        assert_eq!(
+            rendered, "name fetch\nunrestricted-egress enabled",
+            "the rendering an approval is stored as changed"
+        );
+        assert_eq!(Declaration::parse(&rendered), declared);
+
+        // A declaration may say both: the list is what still names the
+        // restricted addresses unrestricted egress does not reach.
+        let both = parse_socket_manifest(
+            br#"{"manifest": 1, "unrestricted_egress": true, "egress": ["127.0.0.1:5432"]}"#,
+        )
+        .unwrap();
+        assert!(both.unrestricted_egress);
+        assert_eq!(both.egress, vec!["127.0.0.1:5432".to_string()]);
+        assert_eq!(Declaration::parse(&both.render()), both);
+
+        // And the absent member is the narrow declaration it always was.
+        assert!(
+            !parse_socket_manifest(br#"{"manifest": 1}"#)
+                .unwrap()
+                .unrestricted_egress
+        );
+    }
+
+    #[test]
+    fn only_the_word_this_build_writes_widens_egress() {
+        // Stored approval text is parsed leniently by design; a value this
+        // build cannot read is not one it may open every destination on.
+        for text in [
+            "unrestricted-egress disabled",
+            "unrestricted-egress",
+            "unrestricted-egress true",
+            "unrestricted-egress enabled please",
+            "egress-unrestricted enabled",
+        ] {
+            assert!(
+                !Declaration::parse(text).unrestricted_egress,
+                "{text:?} was read as unrestricted egress"
+            );
+        }
     }
 
     #[test]

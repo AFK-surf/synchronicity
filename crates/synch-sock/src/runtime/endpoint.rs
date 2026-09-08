@@ -13,7 +13,6 @@
 use std::{
     cell::{Cell, RefCell},
     collections::VecDeque,
-    net::IpAddr,
     rc::Rc,
     sync::{
         atomic::{AtomicU64, Ordering},
@@ -27,7 +26,10 @@ use tokio::{
     sync::Notify,
 };
 
-use crate::abi::{errno, poll};
+use crate::{
+    abi::{errno, poll},
+    policy::AddressGate,
+};
 
 /// How much one read syscall pulls in at a time.
 const READ_CHUNK: usize = 16 * 1024;
@@ -700,10 +702,11 @@ async fn write_pump(ep: &Rc<Endpoint>, mut writer: Box<dyn AsyncWrite + Unpin + 
 
 /// Resolves and connects an outbound endpoint, then starts its pumps.
 ///
-/// The policy check on the *name* has already happened in the helper. What
-/// happens here is the check the name-based list cannot make: a name is
+/// The policy check on the *destination* has already happened in the helper.
+/// What happens here is the check the destination cannot make: a name is
 /// somebody else's to point wherever they like, so the address it resolved to
-/// is checked before anything is connected to it.
+/// is checked against the invocation's [`AddressGate`] before anything is
+/// connected to it.
 /// Wrapped like [`writer_task`], and for the same reason with more paths to
 /// forget: an endpoint whose writer never ran at all — a refused name, a
 /// connection nobody answered — owes the far side nothing, and a teardown drain
@@ -741,15 +744,21 @@ impl Drop for EgressPermit {
     }
 }
 
-pub(crate) async fn connect_task(ep: Rc<Endpoint>, host: String, port: u16, permit: EgressPermit) {
-    connect_and_pump(&ep, host, port).await;
+pub(crate) async fn connect_task(
+    ep: Rc<Endpoint>,
+    host: String,
+    port: u16,
+    gate: AddressGate,
+    permit: EgressPermit,
+) {
+    connect_and_pump(&ep, host, port, &gate).await;
     ep.mark_tx_done();
     // Explicit, so that the reason this argument exists survives a refactor
     // that would otherwise see an unused binding and delete it.
     drop(permit);
 }
 
-async fn connect_and_pump(ep: &Rc<Endpoint>, host: String, port: u16) {
+async fn connect_and_pump(ep: &Rc<Endpoint>, host: String, port: u16, gate: &AddressGate) {
     let abandoned = ep.abandoned.notified();
     tokio::pin!(abandoned);
     abandoned.as_mut().enable();
@@ -773,13 +782,14 @@ async fn connect_and_pump(ep: &Rc<Endpoint>, host: String, port: u16) {
     }
     let permitted: Vec<_> = addrs
         .into_iter()
-        .filter(|a| crate::policy::resolved_address_allowed(&host, a.ip()))
+        .filter(|a| gate.allows(a.ip(), port))
         .collect();
     if permitted.is_empty() {
         tracing::warn!(
             host,
             port,
-            "socket egress refused: the name resolved only into ranges a name may not reach"
+            "socket egress refused: the destination resolved only into ranges the \
+             declaration did not name literally"
         );
         ep.fail(errno::EPERM);
         return;
@@ -813,12 +823,6 @@ async fn connect_and_pump(ep: &Rc<Endpoint>, host: String, port: u16) {
         }
     }
     ep.fail(last);
-}
-
-/// Whether an address is one a *name* may resolve to, exposed for the helper
-/// that takes a literal.
-pub(crate) fn literal_allowed(host: &str, addr: IpAddr) -> bool {
-    crate::policy::resolved_address_allowed(host, addr)
 }
 
 #[cfg(test)]
