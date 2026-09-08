@@ -22,7 +22,7 @@ use std::{
 
 use synch_core::{now_ns, DeclaredScope, Hash, HeadSummary, OriginId, SignedHead, MAX_BATCH};
 use synch_mpt::{Scope, Trie};
-use synch_store::{PublishScope, Slot, Store};
+use synch_store::{Slot, Store};
 
 use synch_net::{HeadSink, MptClient, NetError};
 
@@ -43,7 +43,7 @@ use crate::error::{EngineError, Result};
 /// different heads, according to which of the nine each saw first, each then
 /// refusing the other's forever.
 /// The cap is applied by evicting the lowest-ordered retained roots at the seq
-/// instead ([`synch_store::Txn::trim_forks`]), which is the same set on every
+/// instead (inside Lean acceptance), which is the same set on every
 /// peer however the roots arrived.
 pub const MAX_RETAINED_FORKS: usize = 8;
 
@@ -215,14 +215,6 @@ impl Syncer {
             on_pending: None,
             refused: Arc::new(Mutex::new(HashSet::new())),
         }
-    }
-
-    /// Whether this exact promotion has already been tried and failed.
-    fn is_refused(&self, key: &Verdict) -> bool {
-        self.refused
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .contains(key)
     }
 
     /// Remembers that this promotion failed on the origin's own data.
@@ -467,77 +459,12 @@ impl Syncer {
 
     /// Offers a head for adoption, applying the full §5.2 acceptance rule.
     pub fn offer_head(&self, head: &SignedHead, now: i64) -> Result<HeadOutcome> {
-        // 1. The signature must verify under the key that claims to have made it.
-        if head.verify_signature().is_err() {
-            return Ok(HeadOutcome::BadSignature);
-        }
-        // 2. That key must be bound to the claimed origin, right now.
-        if !self.store.is_bound(&head.origin, &head.signed_by, now)? {
-            return Ok(HeadOutcome::Unbound);
-        }
-        // The ordering check and the write that acts on it are one transaction.
-        // Read-then-write across two lock acquisitions would let two concurrent
-        // offers — one per peer connection, all on the blocking pool — both
-        // read the same floor, both decide they supersede it, and both write
-        // the pending slot, so the lower one clobbers the higher and the higher
-        // survives only in `head_history` with nothing to re-drive it.
-        // The history row and pending slot are written together; history
-        // places this root in trie GC retention.
-        let outcome = self.store.transaction(|txn| -> Result<HeadOutcome> {
-            // Verified heads are provable history and fork evidence even
-            // when they lose the ordering comparison, so they are retained
-            // either way (§4.4).
-            txn.record_history(head, now)?;
-
-            // 3. (seq, root) must be strictly greater, lexicographically.
-            //    Strictly greater on seq alone would not converge: two
-            //    peers receiving different same-seq heads in different
-            //    orders would diverge permanently.
-            //
-            //    Nothing else may stand in front of this comparison. It is
-            //    the join that makes head selection order-independent, so a
-            //    head that beats the floor reaches the pending slot however
-            //    many roots the origin has already signed at this seq — the
-            //    width of the fork is a storage question, answered below,
-            //    after the ordering has been settled.
-            let floor = txn.head_floor(&head.origin)?;
-            // Acceptance deliberately does not consult the refusal memo: a
-            // verdict is about a *promotion*, which is a pair of roots, and
-            // only `try_promote` knows both. A head this node has already
-            // failed on is adopted here and retired there, which costs two
-            // indexed writes rather than the diff.
-            // Head selection uses the total order above so that choosing
-            // among the same offered heads does not depend on arrival order.
-            let outcome = if head.supersedes(floor.as_ref()) {
-                txn.put_head(Slot::Pending, head, now, now)?;
-                HeadOutcome::Pending
-            } else {
-                // The history row above keeps this root in
-                // the GC mark set even though no slot ever points at it.
-                HeadOutcome::NotNewer
-            };
-
-            // Same-seq forks are exempt from `root_retention` until the
-            // origin publishes past the forked seq, so a member signing an
-            // unlimited number of roots at one seq would otherwise buy
-            // permanent growth on every peer, surviving even `trust rm`.
-            // Two roots prove the equivocation; past the cap the *lowest*
-            // roots at the seq are evicted, which leaves every peer holding
-            // the same [`MAX_RETAINED_FORKS`] greatest roots whatever order
-            // they arrived in, and never touches the row a slot points at.
-            let evicted = txn.trim_forks(&head.origin, head.seq, MAX_RETAINED_FORKS)?;
-            if evicted > 0 {
-                tracing::warn!(
-                    origin = %head.origin,
-                    seq = head.seq,
-                    evicted,
-                    "same-seq forks past the cap evicted: equivocation is already proven"
-                );
-            }
-            Ok(outcome)
-        })?;
-        if !outcome.accepted() {
-            return Ok(outcome);
+        let outcome = self.store.accept_head(head, now, MAX_RETAINED_FORKS)?;
+        match outcome {
+            synch_store::Acceptance::BadSignature => return Ok(HeadOutcome::BadSignature),
+            synch_store::Acceptance::Unbound => return Ok(HeadOutcome::Unbound),
+            synch_store::Acceptance::NotNewer => return Ok(HeadOutcome::NotNewer),
+            synch_store::Acceptance::Pending => {}
         }
         match self.try_promote(&head.origin, now)? {
             Promotion::Flipped => Ok(HeadOutcome::Completed),
@@ -585,190 +512,24 @@ impl Syncer {
     /// permanently refused, whatever happened to be in the slot, and left the
     /// head that actually failed unrecorded.
     pub fn try_promote(&self, origin: &OriginId, now: i64) -> Result<Promotion> {
-        // What the transaction judged, for the fault arm: it rolls back, so the
-        // head cannot be recovered from the slot afterwards.
-        let judged: std::cell::RefCell<Option<Verdict>> = std::cell::RefCell::new(None);
-        // The completeness check, slot flip, derived entries and retention
-        // decisions share this commit. The exact shared-view guarantee is
-        // an open composition obligation in `docs/LEAN.md`.
-        let promoted = self.store.transaction(|txn| -> Result<Promotion> {
-            // Read permissions in the same snapshot as completeness and the
-            // resulting view. A grant change before this transaction must not
-            // leave promotion using an older, wider publication authority or
-            // a narrower completeness check than materialization uses.
-            let read_scope = txn.materialization_scope(origin)?;
-            let authority = txn.promotion_authority(origin, now)?;
-            let publish_scope = authority.publication;
-            let owner = authority.provenance;
-            let publish_keys = authority.trie_scope;
-            let Some(pending) = txn.head(origin, Slot::Pending)? else {
-                return Ok(Promotion::Idle);
-            };
-            // The displaced root, the verdict key and the memo check all come
-            // before the completeness walk, because the walk is the most likely
-            // thing here to raise and `judged` has to be set before anything
-            // that can: `is_complete` descends a peer's node graph and refuses a
-            // structurally invalid node, which `is_origin_fault` classifies as
-            // the origin's fault — and with `judged` still unset the fault arm
-            // retired nothing and remembered nothing, so the head kept the slot
-            // until the sweep took it and the next exchange re-adopted it. That
-            // is the cycle the memo exists to break, and it was worse than
-            // before the memo existed. None of this work depends on
-            // completeness, and doing the cheap checks first is free.
-            let displaced = txn.complete_head(origin)?;
-            let old_root = displaced
-                .as_ref()
-                .map(|h| h.root)
-                .unwrap_or(synch_core::Hash::EMPTY);
-            let key: Verdict = (
-                pending.head.origin.clone(),
-                pending.head.seq,
-                pending.head.root,
-                old_root,
-            );
-            // Tried before, from this same root, and failed. Retire it without
-            // paying the diff again — leaving it in the slot would hold
-            // `head_floor` above everything this node can serve.
-            if self.is_refused(&key) {
-                txn.clear_head(origin, Slot::Pending)?;
-                return Ok(Promotion::Refused);
-            }
-            *judged.borrow_mut() = Some(key);
-            // The pending head must actually beat the complete one, rather than
-            // rest on "pending is always greater", an invariant `offer_head`
-            // maintains and two other writers do not: `publish` and the key
-            // rotation in `activate` both derive their seq from the *complete*
-            // slot alone and write it directly, never consulting pending. So a
-            // peer relaying an older head of our own origin — signed by a key
-            // of ours that is still bound, which is exactly the §3.4 recovery
-            // shape — can sit in the pending slot while a local publish moves
-            // the complete slot past it, and taking that invariant on trust
-            // would install the lesser head and roll `entries` back to it.
-            let floor = displaced.as_ref().map(|h| (h.seq, h.root));
-            if !pending.head.supersedes(floor.as_ref()) {
-                tracing::debug!(
-                    origin = %origin,
-                    pending = pending.head.seq,
-                    complete = displaced.as_ref().map(|h| h.seq).unwrap_or(0),
-                    "dropping a pending head the complete slot has overtaken"
-                );
-                // Clearing the pending slot leaves the root retained in
-                // `head_history` until that history is pruned.
-                txn.clear_head(origin, Slot::Pending)?;
-                return Ok(Promotion::Idle);
-            }
-            // Only walk after the cheap `(seq, root)` supersession check. This
-            // avoids advertising, checking, and fetching a pending root that the
-            // complete slot has already overtaken. On a restore-from-backup,
-            // where that root shares nothing with the
-            // current one, the last of those is a whole cold trie transfer thrown
-            // away.
-            let trie = Trie::new(txn);
-            // Completeness is a property of a root *and* a scope: what has to
-            // be present is what this node may read, not what the origin
-            // published (§5.5).
-            // And with provenance for a confined origin: what has to be
-            // present is what this node was served as that origin's, not
-            // what it happens to hold from anyone's trie (§5.5).
-            // This check uses origin-specific presence. Connecting the
-            // whole fetch and serving chain to authorization remains open.
-            if !trie.is_complete_scoped_for(owner.as_ref(), pending.head.root, &read_scope)? {
-                return Ok(Promotion::Waiting);
-            }
-            // A delegated origin's trie must hold nothing outside the spaces
-            // it was delegated, and a head whose trie does is refused whole
-            // rather than materialized in part (§3.5): a filtered subset would
-            // leave this node's contents disagreeing with the root the origin
-            // signed, and every peer filtering independently would disagree
-            // with every other. The origin stalls, `doctor` names the key, and
-            // no other origin is affected.
-            //
-            // Below `supersedes` for the reason the walk above is: this
-            // descends the trie too, and a head the complete slot has already
-            // overtaken should pay for neither.
-            //
-            // Cheap despite reading like a scan: the check descends only where
-            // the boundary is unresolved, so it visits the spine and stops.
-            //
-            // Either refusal *retires* the head rather than leaving it to
-            // wait. Its trie is wholly here, so nothing else ever would: the
-            // sweep's staleness rule steps over a complete trie, and §5.2 is
-            // explicit that a head whose promotion this node's own rules
-            // refuse never keeps the slot — left in place it holds
-            // `head_floor` above every lesser head this node could serve, for
-            // as long as the origin does not publish past it. The verdict is
-            // not memoized: it is about the grant, which can move, and
-            // re-reaching it costs a spine walk, not a diff.
-            match &publish_scope {
-                // An origin this node holds no live binding for publishes
-                // nothing it will promote. Not merely a scope question: were
-                // this to fall through as "unrestricted", revoking a
-                // delegation would *promote* the head its scope had been
-                // refusing, which is the opposite of what revoking is for.
-                // Nothing is lost by dropping it: a head re-offered once the
-                // binding is back is re-adopted over a trie already here.
-                PublishScope::Untrusted => {
-                    tracing::debug!(
-                        origin = %origin,
-                        seq = pending.head.seq,
-                        "retiring a pending head: no live binding for this origin"
-                    );
-                    txn.clear_head(origin, Slot::Pending)?;
-                    return Ok(Promotion::Refused);
-                }
-                PublishScope::Unrestricted => {}
-                PublishScope::Confined(_) => {
-                    if let Some(key) = trie.first_key_outside(pending.head.root, &publish_keys)? {
-                        tracing::warn!(
-                            origin = %origin,
-                            seq = pending.head.seq,
-                            key = %synch_mpt::Nibbles::from_nibbles(&key)
-                                .to_bytes()
-                                .map(|b| String::from_utf8_lossy(&b).into_owned())
-                                .unwrap_or_else(|| "<partial>".to_string()),
-                            "refusing a delegated origin's head: it publishes outside its spaces"
-                        );
-                        txn.clear_head(origin, Slot::Pending)?;
-                        return Ok(Promotion::Refused);
-                    }
-                }
-            }
-            // The displaced head is already retained: `put_head` recorded its
-            // signature when it took the slot. Recording it again here would be
-            // a second rule writing the same row, kept honest only by
-            // `INSERT OR IGNORE` (§10, v11).
-            // The displaced root is no longer active or materialized; it
-            // stays retained through `head_history` until pruned.
-            txn.put_head(Slot::Complete, &pending.head, pending.received_at, now)?;
-            txn.clear_head(origin, Slot::Pending)?;
-            // Derive the scoped view in the same transaction as the head
-            // flip. An exact-view theorem must connect completeness to all
-            // authorized entries; walk exhaustion alone is insufficient.
-            txn.materialize_diff(origin, old_root, pending.head.root)?;
-            Ok(Promotion::Flipped)
-        });
+        let refused = self
+            .refused
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .iter()
+            .filter(|key| &key.0 == origin)
+            .map(|key| (key.1, key.2, key.3))
+            .collect();
+        let promoted = self
+            .store
+            .promote_head(origin, now, refused, |seq, root, old| {
+                self.refuse((origin.clone(), seq, root, old));
+            })?;
         let promoted = match promoted {
-            Ok(promoted) => promoted,
-            Err(e) if is_origin_fault(&e) => {
-                if let Some(key) = judged.into_inner() {
-                    // Retire it, and do not try this pair again. The retire
-                    // stops it holding the floor; the memo stops the
-                    // adopt/diff/fail cycle repeating once per exchange.
-                    let (_, seq, root, _) = key.clone();
-                    self.refuse(key);
-                    self.store
-                        .clear_head_at(origin, Slot::Pending, seq, &root)?;
-                    tracing::warn!(
-                        origin = %origin,
-                        seq,
-                        error = %e,
-                        "origin left behind: a head this node cannot materialize \
-                         does not hold the floor"
-                    );
-                }
-                return Err(e);
-            }
-            Err(e) => return Err(e),
+            synch_store::Promotion::Flipped => Promotion::Flipped,
+            synch_store::Promotion::Waiting => Promotion::Waiting,
+            synch_store::Promotion::Refused => Promotion::Refused,
+            synch_store::Promotion::Idle => Promotion::Idle,
         };
         if promoted == Promotion::Flipped {
             tracing::debug!(origin = %origin, "head flipped to complete");
@@ -829,73 +590,14 @@ impl Syncer {
         origin: &OriginId,
         expected: Option<(u64, Hash)>,
     ) -> Result<FetchOutcome> {
-        let Some(pending) = ({
-            let store = self.store.clone();
-            let origin = origin.clone();
-            crate::blocking::offload(move || Ok(store.pending_head(&origin)?)).await?
-        }) else {
-            return Ok(FetchOutcome::NoFlip);
-        };
-        if expected.is_some_and(|head| head != (pending.seq, pending.root)) {
-            return Ok(FetchOutcome::NoFlip);
-        }
-        // What this origin's trie looked like when we last held all of it. Every
-        // subtree the new root shares with it is already here, so the walk can
-        // skip it outright and descend only what changed (§5.2) — which is the
-        // difference between an incremental sync costing the change and costing
-        // the whole tree. Only a root we have *established* is complete will do:
-        // that check is memoized, so it is a lookup after the first time.
-        //
-        // Establishing it the first time is a full walk, so it goes off the
-        // runtime — as does every batch of the walk below, and every batch of
-        // nodes and values committed between the round trips (§10).
-        //
-        // The scope comes back with it: everything below is confined to what
-        // this node may read (§5.5) — for a rooted member the whole keyspace
-        // and the walk is unchanged, for a delegated one a stop at the boundary
-        // rather than a request it would be refused — and reading it is a store
-        // read, which belongs on the same hop rather than on the runtime.
-        let (reference, scope, held, owner) = {
-            let store = self.store.clone();
-            let origin = origin.clone();
-            crate::blocking::offload(move || {
-                let scope = store.materialization_scope(&origin)?;
-                let held = store.complete_head(&origin)?;
-                // Whose provenance the walk carries: a confined origin's trie
-                // is fetched as *its*, so a node this store already holds from
-                // another origin's trie is asked for again, and the reference
-                // must be complete with the same provenance (§5.5).
-                let owner = store.provenance_owner(&origin, now_ns())?;
-                let reference = held.as_ref().map(|head| head.root);
-                Ok((reference, scope, held, owner))
-            })
-            .await?
-        };
-        // The same memo `try_promote` keeps, consulted before the walk. A
-        // trie this build has refused a node of is refused again on every
-        // fetch, so retrying costs the walk and the batch each exchange, from
-        // every peer, forever, with nothing ever banked — while the head is
-        // re-adopted each time because retiring it drops the floor back to
-        // what this node can serve. Keyed with the complete root like a
-        // promotion verdict, which is conservative: the refusal is about the
-        // trie, and re-trying it once the held root moves costs one fetch.
-        let verdict: Verdict = (
-            origin.clone(),
-            pending.seq,
-            pending.root,
-            held.as_ref()
-                .map(|h| h.root)
-                .unwrap_or(synch_core::Hash::EMPTY),
-        );
-        if self.is_refused(&verdict) {
-            let store = self.store.clone();
-            let (origin, seq, root) = (origin.clone(), pending.seq, pending.root);
-            crate::blocking::offload(move || {
-                Ok(store.clear_head_at(&origin, Slot::Pending, seq, &root)?)
-            })
-            .await?;
-            return Ok(FetchOutcome::Refused);
-        }
+        let refused = self
+            .refused
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|key| &key.0 == origin)
+            .map(|key| (key.1, key.2, key.3))
+            .collect();
         // Lean retains the whole requesting walk on one blocking worker. Only
         // owned requests and replies cross to the runtime; no continuation,
         // database session or connection guard crosses a network wait.
@@ -903,16 +605,13 @@ impl Syncer {
         let (requests_tx, mut requests_rx) = tokio::sync::mpsc::channel(1);
         let store = self.store.clone();
         let fetch_origin = origin.clone();
-        let (fetch_seq, fetch_root) = (pending.seq, pending.root);
+        let syncer = self.clone();
         let fetching = crate::blocking::offload(move || {
-            store
-                .fetch_trie(
-                    fetch_root,
+            let fetched = store
+                .fetch_pending(
                     &fetch_origin,
-                    fetch_seq,
-                    &scope,
-                    owner.as_ref(),
-                    reference,
+                    expected,
+                    refused,
                     MAX_BATCH as u64,
                     MAX_UNPRODUCTIVE_ROUNDS.into(),
                     |request| {
@@ -923,8 +622,41 @@ impl Syncer {
                         reply_rx.recv().ok()
                     },
                 )
-                .map_err(fetch_operation_error)?
-                .map_err(fetch_domain_error)
+                .map_err(|error| match error {
+                    synch_verified::CommandError::Operation(error) => fetch_operation_error(error),
+                    synch_verified::CommandError::Domain(error) => {
+                        reconciliation_domain_error(error)
+                    }
+                })?;
+            let report = fetched.report;
+            if let Some((seq, (root, old))) = report.refused {
+                let root =
+                    Hash::from_slice(&root).map_err(|e| EngineError::invalid(e.to_string()))?;
+                let old =
+                    Hash::from_slice(&old).map_err(|e| EngineError::invalid(e.to_string()))?;
+                syncer.refuse((fetch_origin, seq, root, old));
+            }
+            if let Some(error) = report.failure {
+                return Err(reconciliation_domain_error(error));
+            }
+            if fetched.abandoned {
+                return Ok(FetchOutcome::Abandoned);
+            }
+            Ok(match report.promotion {
+                synch_store::Promotion::Flipped => {
+                    for wake in [&syncer.on_change, &syncer.on_replica]
+                        .into_iter()
+                        .flatten()
+                    {
+                        wake.notify_one();
+                    }
+                    FetchOutcome::Completed
+                }
+                synch_store::Promotion::Refused => FetchOutcome::Refused,
+                synch_store::Promotion::Waiting | synch_store::Promotion::Idle => {
+                    FetchOutcome::NoFlip
+                }
+            })
         });
         tokio::pin!(fetching);
         let fetched = loop {
@@ -963,33 +695,7 @@ impl Syncer {
                 }
             }
         };
-        match fetched {
-            Ok(false) => return Ok(FetchOutcome::Abandoned),
-            Ok(true) => {}
-            Err(error) if is_origin_fault(&error) => {
-                self.refuse(verdict);
-                let store = self.store.clone();
-                let origin = origin.clone();
-                crate::blocking::offload(move || {
-                    Ok(store.clear_head_at(&origin, Slot::Pending, pending.seq, &pending.root)?)
-                })
-                .await?;
-                return Err(error);
-            }
-            Err(error) => return Err(error),
-        }
-
-        // Promotion rechecks completeness and permissions in its own
-        // transaction before atomically replacing the visible view.
-        let syncer = self.clone();
-        let origin = origin.clone();
-        let promoted =
-            crate::blocking::offload(move || syncer.try_promote(&origin, now_ns())).await?;
-        Ok(match promoted {
-            Promotion::Flipped => FetchOutcome::Completed,
-            Promotion::Refused => FetchOutcome::Refused,
-            Promotion::Waiting | Promotion::Idle => FetchOutcome::NoFlip,
-        })
+        fetched
     }
 
     /// Runs a `Hello` exchange that pushes and pulls nothing, purely to read
@@ -1487,6 +1193,18 @@ fn fetch_operation_error(
         OperationError::Protocol | OperationError::MalformedMetadata(_) => {
             EngineError::invalid("invalid native requesting-operation protocol")
         }
+    }
+}
+
+fn reconciliation_domain_error(
+    error: synch_verified::reconcile::ReconcileDomainError,
+) -> EngineError {
+    match error {
+        synch_verified::reconcile::ReconcileDomainError::Fetch(error) => fetch_domain_error(error),
+        synch_verified::reconcile::ReconcileDomainError::Missing(error) => {
+            fetch_domain_error(synch_verified::trie::TrieFetchDomainError::Walk(error))
+        }
+        error => EngineError::Store(error.into()),
     }
 }
 

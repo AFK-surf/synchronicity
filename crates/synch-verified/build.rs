@@ -77,8 +77,14 @@ fn main() {
         "Authorization/Projection",
         "Authorization/Local",
         "Authorization/Operations",
+        "Replication/Types",
+        "Replication/Records",
+        "Replication/Reconcile",
+        "Replication/Materialize",
         "Commands",
         "Commands/Generated",
+        "Replication/Promote",
+        "Replication/Fetch",
         "Entry",
     ];
     for module in modules {

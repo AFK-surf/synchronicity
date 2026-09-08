@@ -186,6 +186,7 @@ impl FromStr for OriginId {
 struct PointValidator(Option<NodeId>);
 
 impl synch_verified::host::Crypto for PointValidator {
+    synch_verified::host_unexpected!(verify_ed25519);
     type Error = Infallible;
     fn validate_ed25519(&mut self, bytes: &[u8]) -> Result<bool, Self::Error> {
         self.0 = <&[u8; 32]>::try_from(bytes)

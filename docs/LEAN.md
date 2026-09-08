@@ -105,8 +105,17 @@ convergence.
 | Fetch/serving | Production Lean. Actual rejection/rollback/storage coherence and no transaction across waits; position/response checks and native privacy/cancellation tests. | Productive Fetch progress and end-to-end authority/disclosure. Exhaustion does not prove completeness. |
 | CAS | Production Lean local content operations, coverage, retention/repair, durability, collection and projections. Scoped exact-read, unchanged-size transfer/replay, retention and saved-byte advertisement results. | Broader size-change/host failures and cloud/publication/source-hold composition. |
 | Cloud | Production Lean cache/range restoration, associated adoption, hydration and outboard caching; native content/recovery/cancellation tests. | Remaining discovery/upload/finalize/read/serve orchestration and composed proofs. |
-| Identity/authority | Production Lean origin APIs and whole authority/scope reads, including borrowed promotion transactions. Native expiry, grant, corruption and index tests. | Signed-record ingress, lifecycle policy and grant-to-publication/serving proofs. |
-| Replication | Production Lean history pruning, exchange/contact selection; checked order independence and bounded turns for fixed eligible inputs. Bounded TLA+ recovery checks. | Acceptance, pending transitions, promotion and real scheduling; M1–M8 composition remains open. |
+| Identity/authority | Production Lean origin APIs and whole authority/scope reads, including borrowed promotion transactions and materialized delegation updates. Native expiry, grant, corruption and index tests. | Remaining identity lifecycle policy and grant-to-publication/serving proofs. |
+| Replication | Production Lean signed-head acceptance, history/fork retention, pending-fetch lifecycle, promotion and streamed file/provider/delegation views with replica retention. Signature rejection is proved to preserve storage; exchange/contact selection has checked order independence and bounded turns for fixed eligible inputs. Bounded TLA+ recovery checks. | Advertisement observation, recovery/publication orchestration and real scheduling remain Rust. Exact-view/atomic-promotion proofs and M1–M8 composition remain open. |
+
+Reconciliation reads authority, completeness, slot pointers and derived-view policy
+in the promotion transaction. Failed materialization rolls it back before retiring
+only the judged version. Local metadata type failures remain retryable; structural
+and published-record refusals report a process-local memo key. Rust retains raw
+storage, cryptography, Unicode NFC checks, peer transport, notifications and memo
+storage. The pending-fetch command releases storage sessions across peer waits;
+native regressions cover cancellation, retained progress and retry. These are
+implementation and integration guarantees, not a complete reconciliation theorem.
 
 Content histories require faithful metadata storage and a Bao decoder preserving
 previously verified bytes even after a partial write fails. Fresh-store/inline
@@ -146,7 +155,7 @@ Proofs share raw database/file/resource semantics, including read-your-writes an
 rollback. Do not substitute operation-specific policy answers or assume the desired
 postcondition as an initial invariant.
 
-SQLite isolation, filesystems, provider acknowledgements, BLAKE3, Ed25519, the
+SQLite isolation, filesystems, provider acknowledgements, BLAKE3, Ed25519, Unicode NFC, the
 **whole Bao service**, Rust interpreters, native transport and Lean compiler/runtime
 are trusted contracts. Hash-sensitive results assume collision-freedom on relevant
 data, not global injectivity. Provider acknowledgements must represent real backing;

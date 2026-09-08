@@ -178,6 +178,52 @@ instance : Decode Trie.LookupError where
     | 4 => return .depthExceeded
     | _ => throw ()
 
+instance : Encode Replication.Head where
+  encode out value := match value with
+    | .mk a0 a1 a2 a3 a4 a5 => out |>.put a0 |>.put a1 |>.put a2 |>.put a3 |>.put a4 |>.put a5
+
+instance : Decode Replication.Head where
+  decode := do
+    let a0 ← Decode.decode
+    let a1 ← Decode.decode
+    let a2 ← Decode.decode
+    let a3 ← Decode.decode
+    let a4 ← Decode.decode
+    let a5 ← Decode.decode
+    return .mk a0 a1 a2 a3 a4 a5
+
+instance : Encode Replication.Acceptance where
+  encode out value := match value with
+    | .badSignature => out.push 0
+    | .unbound => out.push 1
+    | .notNewer => out.push 2
+    | .pending => out.push 3
+
+instance : Decode Replication.Acceptance where
+  decode := do
+    match ← readByte with
+    | 0 => return .badSignature
+    | 1 => return .unbound
+    | 2 => return .notNewer
+    | 3 => return .pending
+    | _ => throw ()
+
+instance : Encode Replication.Promotion where
+  encode out value := match value with
+    | .flipped => out.push 0
+    | .waiting => out.push 1
+    | .refused => out.push 2
+    | .idle => out.push 3
+
+instance : Decode Replication.Promotion where
+  decode := do
+    match ← readByte with
+    | 0 => return .flipped
+    | 1 => return .waiting
+    | 2 => return .refused
+    | 3 => return .idle
+    | _ => throw ()
+
 instance : Encode Trie.Value where
   encode out value := match value with
     | .inline a0 => out.push 0 |>.put a0
@@ -612,6 +658,43 @@ instance : Decode Commands.TrieFetchDomainError where
     | 5 => return .exhausted
     | _ => throw ()
 
+instance : Encode Commands.ReconcileDomainError where
+  encode out value := match value with
+    | .history a0 => out.push 0 |>.put a0
+    | .walk a0 => out.push 1 |>.put a0
+    | .missing a0 => out.push 2 |>.put a0
+    | .fetch a0 => out.push 3 |>.put a0
+
+instance : Decode Commands.ReconcileDomainError where
+  decode := do
+    match ← readByte with
+    | 0 => return .history (← Decode.decode)
+    | 1 => return .walk (← Decode.decode)
+    | 2 => return .missing (← Decode.decode)
+    | 3 => return .fetch (← Decode.decode)
+    | _ => throw ()
+
+instance : Encode Commands.PromotionReport where
+  encode out value := match value with
+    | .mk a0 a1 a2 => out |>.put a0 |>.put a1 |>.put a2
+
+instance : Decode Commands.PromotionReport where
+  decode := do
+    let a0 ← Decode.decode
+    let a1 ← Decode.decode
+    let a2 ← Decode.decode
+    return .mk a0 a1 a2
+
+instance : Encode Commands.FetchReport where
+  encode out value := match value with
+    | .mk a0 a1 => out |>.put a0 |>.put a1
+
+instance : Decode Commands.FetchReport where
+  decode := do
+    let a0 ← Decode.decode
+    let a1 ← Decode.decode
+    return .mk a0 a1
+
 instance : Encode Trie.Serve.Scope where
   encode out value := match value with
     | .mk a0 a1 => out |>.put a0 |>.put a1
@@ -822,174 +905,182 @@ instance : Decode Commands.Collected where
 
 instance : Encode Commands.Command where
   encode out value := match value with
-    | .acquire a0 a1 a2 a3 => out.push 0 |>.put a0 |>.put a1 |>.put a2 |>.put a3
-    | .delete a0 a1 => out.push 1 |>.put a0 |>.put a1
-    | .unpin a0 a1 => out.push 2 |>.put a0 |>.put a1
-    | .expire a0 a1 => out.push 3 |>.put a0 |>.put a1
-    | .read a0 a1 => out.push 4 |>.put a0 |>.put a1
-    | .ingest a0 a1 a2 a3 => out.push 5 |>.put a0 |>.put a1 |>.put a2 |>.put a3
-    | .commitGroups a0 a1 a2 a3 a4 a5 => out.push 6 |>.put a0 |>.put a1 |>.put a2 |>.put a3 |>.put a4 |>.put a5
-    | .admitSize a0 a1 => out.push 7 |>.put a0 |>.put a1
-    | .trieGet a0 a1 => out.push 8 |>.put a0 |>.put a1
-    | .trieAdmit a0 => out.push 9 |>.put a0
-    | .trieVerify a0 a1 => out.push 10 |>.put a0 |>.put a1
-    | .trieInsert a0 a1 a2 => out.push 11 |>.put a0 |>.put a1 |>.put a2
-    | .trieRemove a0 a1 => out.push 12 |>.put a0 |>.put a1
-    | .pruneHistory a0 a1 => out.push 13 |>.put a0 |>.put a1
-    | .casMarkDurable a0 => out.push 14 |>.put a0
-    | .casAdoptDurable a0 a1 a2 => out.push 15 |>.put a0 |>.put a1 |>.put a2
-    | .casHealMissing a0 => out.push 16 |>.put a0
-    | .casReconcileScratch a0 => out.push 17 |>.put a0
-    | .casClearCache a0 => out.push 18 |>.put a0
-    | .casEncodeSlice a0 a1 => out.push 19 |>.put a0 |>.put a1
-    | .casEncodeProof a0 a1 a2 a3 => out.push 20 |>.put a0 |>.put a1 |>.put a2 |>.put a3
-    | .casWriteSlice a0 a1 a2 a3 a4 => out.push 21 |>.put a0 |>.put a1 |>.put a2 |>.put a3 |>.put a4
-    | .casWriteProof a0 a1 a2 a3 a4 a5 => out.push 22 |>.put a0 |>.put a1 |>.put a2 |>.put a3 |>.put a4 |>.put a5
-    | .casPromote a0 a1 a2 a3 a4 a5 => out.push 23 |>.put a0 |>.put a1 |>.put a2 |>.put a3 |>.put a4 |>.put a5
-    | .casTouch a0 => out.push 24 |>.put a0
-    | .casEvict a0 a1 => out.push 25 |>.put a0 |>.put a1
-    | .casGcContent a0 => out.push 26 |>.put a0
-    | .casGcOrphans a0 => out.push 27 |>.put a0
-    | .casBlob a0 => out.push 28 |>.put a0
-    | .casBlobs => out.push 29
-    | .casBlobCandidates => out.push 30
-    | .casPins a0 => out.push 31 |>.put a0
-    | .casPinnedBlobs => out.push 32
-    | .trieServeNodes a0 a1 a2 a3 a4 a5 => out.push 33 |>.put a0 |>.put a1 |>.put a2 |>.put a3 |>.put a4 |>.put a5
-    | .trieServeValues a0 a1 a2 a3 a4 a5 => out.push 34 |>.put a0 |>.put a1 |>.put a2 |>.put a3 |>.put a4 |>.put a5
-    | .trieResolve a0 a1 => out.push 35 |>.put a0 |>.put a1
-    | .trieCollect a0 a1 => out.push 36 |>.put a0 |>.put a1
-    | .trieMemoKey a0 a1 a2 a3 => out.push 37 |>.put a0 |>.put a1 |>.put a2 |>.put a3
-    | .trieScan a0 a1 a2 a3 => out.push 38 |>.put a0 |>.put a1 |>.put a2 |>.put a3
-    | .trieDiff a0 a1 => out.push 39 |>.put a0 |>.put a1
-    | .trieMaterialize a0 a1 a2 a3 => out.push 40 |>.put a0 |>.put a1 |>.put a2 |>.put a3
-    | .trieProve a0 a1 => out.push 41 |>.put a0 |>.put a1
-    | .trieVerifyProof a0 a1 a2 a3 => out.push 42 |>.put a0 |>.put a1 |>.put a2 |>.put a3
-    | .peerProbe a0 a1 a2 => out.push 43 |>.put a0 |>.put a1 |>.put a2
-    | .providerProbe a0 a1 => out.push 44 |>.put a0 |>.put a1
-    | .cloudEnsureCached a0 a1 => out.push 45 |>.put a0 |>.put a1
-    | .cloudEnsureRanges a0 a1 a2 => out.push 46 |>.put a0 |>.put a1 |>.put a2
-    | .cloudHydrate a0 a1 a2 => out.push 47 |>.put a0 |>.put a1 |>.put a2
-    | .cloudOutboard a0 a1 => out.push 48 |>.put a0 |>.put a1
-    | .trieComplete a0 a1 a2 a3 => out.push 49 |>.put a0 |>.put a1 |>.put a2 |>.put a3
-    | .planExchange a0 a1 a2 => out.push 50 |>.put a0 |>.put a1 |>.put a2
-    | .trieFetch a0 a1 a2 a3 a4 a5 a6 a7 a8 => out.push 51 |>.put a0 |>.put a1 |>.put a2 |>.put a3 |>.put a4 |>.put a5 |>.put a6 |>.put a7 |>.put a8
-    | .trieNormalize a0 => out.push 52 |>.put a0
-    | .casBlobIn a0 a1 => out.push 53 |>.put a0 |>.put a1
-    | .planContact a0 a1 a2 => out.push 54 |>.put a0 |>.put a1 |>.put a2
-    | .trieFirstOutside a0 a1 a2 => out.push 55 |>.put a0 |>.put a1 |>.put a2
-    | .originParse a0 => out.push 56 |>.put a0
-    | .originNamed a0 a1 => out.push 57 |>.put a0 |>.put a1
-    | .originNormalizeLabel a0 => out.push 58 |>.put a0
-    | .originNormalizeDomain a0 => out.push 59 |>.put a0
-    | .originCanonical a0 => out.push 60 |>.put a0
-    | .authBindings a0 a1 a2 => out.push 61 |>.put a0 |>.put a1 |>.put a2
-    | .authBindingStatuses a0 => out.push 62 |>.put a0
-    | .authTrustedKeys a0 => out.push 63 |>.put a0
-    | .authTrustedOrigins a0 => out.push 64 |>.put a0
-    | .authTrustedKey a0 a1 => out.push 65 |>.put a0 |>.put a1
-    | .authBound a0 a1 a2 => out.push 66 |>.put a0 |>.put a1 |>.put a2
-    | .authPeerAuthority a0 a1 => out.push 67 |>.put a0 |>.put a1
-    | .authOriginPublication a0 a1 => out.push 68 |>.put a0 |>.put a1
-    | .authOriginAuthority a0 a1 => out.push 69 |>.put a0 |>.put a1
-    | .authOriginAuthorityIn a0 a1 a2 => out.push 70 |>.put a0 |>.put a1 |>.put a2
-    | .authLocalAuthority a0 => out.push 71 |>.put a0
-    | .authLocalSpaces => out.push 72
-    | .authLocalScope => out.push 73
-    | .authLocalScopeIn a0 => out.push 74 |>.put a0
-    | .authMaterializationScope a0 => out.push 75 |>.put a0
-    | .authMaterializationScopeIn a0 a1 => out.push 76 |>.put a0 |>.put a1
-    | .authMetadataPeer a0 a1 => out.push 77 |>.put a0 |>.put a1
-    | .authSocketAuthority a0 a1 => out.push 78 |>.put a0 |>.put a1
-    | .authSoleDnsHintSource a0 a1 a2 => out.push 79 |>.put a0 |>.put a1 |>.put a2
-    | .authHasDelegations => out.push 80
-    | .authExpireDns a0 => out.push 81 |>.put a0
+    | .acceptHead a0 a1 a2 => out.push 0 |>.put a0 |>.put a1 |>.put a2
+    | .promoteHead a0 a1 a2 => out.push 1 |>.put a0 |>.put a1 |>.put a2
+    | .materializeView a0 a1 a2 a3 => out.push 2 |>.put a0 |>.put a1 |>.put a2 |>.put a3
+    | .fetchPending a0 a1 a2 a3 a4 => out.push 3 |>.put a0 |>.put a1 |>.put a2 |>.put a3 |>.put a4
+    | .acquire a0 a1 a2 a3 => out.push 4 |>.put a0 |>.put a1 |>.put a2 |>.put a3
+    | .delete a0 a1 => out.push 5 |>.put a0 |>.put a1
+    | .unpin a0 a1 => out.push 6 |>.put a0 |>.put a1
+    | .expire a0 a1 => out.push 7 |>.put a0 |>.put a1
+    | .read a0 a1 => out.push 8 |>.put a0 |>.put a1
+    | .ingest a0 a1 a2 a3 => out.push 9 |>.put a0 |>.put a1 |>.put a2 |>.put a3
+    | .commitGroups a0 a1 a2 a3 a4 a5 => out.push 10 |>.put a0 |>.put a1 |>.put a2 |>.put a3 |>.put a4 |>.put a5
+    | .admitSize a0 a1 => out.push 11 |>.put a0 |>.put a1
+    | .trieGet a0 a1 => out.push 12 |>.put a0 |>.put a1
+    | .trieAdmit a0 => out.push 13 |>.put a0
+    | .trieVerify a0 a1 => out.push 14 |>.put a0 |>.put a1
+    | .trieInsert a0 a1 a2 => out.push 15 |>.put a0 |>.put a1 |>.put a2
+    | .trieRemove a0 a1 => out.push 16 |>.put a0 |>.put a1
+    | .pruneHistory a0 a1 => out.push 17 |>.put a0 |>.put a1
+    | .casMarkDurable a0 => out.push 18 |>.put a0
+    | .casAdoptDurable a0 a1 a2 => out.push 19 |>.put a0 |>.put a1 |>.put a2
+    | .casHealMissing a0 => out.push 20 |>.put a0
+    | .casReconcileScratch a0 => out.push 21 |>.put a0
+    | .casClearCache a0 => out.push 22 |>.put a0
+    | .casEncodeSlice a0 a1 => out.push 23 |>.put a0 |>.put a1
+    | .casEncodeProof a0 a1 a2 a3 => out.push 24 |>.put a0 |>.put a1 |>.put a2 |>.put a3
+    | .casWriteSlice a0 a1 a2 a3 a4 => out.push 25 |>.put a0 |>.put a1 |>.put a2 |>.put a3 |>.put a4
+    | .casWriteProof a0 a1 a2 a3 a4 a5 => out.push 26 |>.put a0 |>.put a1 |>.put a2 |>.put a3 |>.put a4 |>.put a5
+    | .casPromote a0 a1 a2 a3 a4 a5 => out.push 27 |>.put a0 |>.put a1 |>.put a2 |>.put a3 |>.put a4 |>.put a5
+    | .casTouch a0 => out.push 28 |>.put a0
+    | .casEvict a0 a1 => out.push 29 |>.put a0 |>.put a1
+    | .casGcContent a0 => out.push 30 |>.put a0
+    | .casGcOrphans a0 => out.push 31 |>.put a0
+    | .casBlob a0 => out.push 32 |>.put a0
+    | .casBlobs => out.push 33
+    | .casBlobCandidates => out.push 34
+    | .casPins a0 => out.push 35 |>.put a0
+    | .casPinnedBlobs => out.push 36
+    | .trieServeNodes a0 a1 a2 a3 a4 a5 => out.push 37 |>.put a0 |>.put a1 |>.put a2 |>.put a3 |>.put a4 |>.put a5
+    | .trieServeValues a0 a1 a2 a3 a4 a5 => out.push 38 |>.put a0 |>.put a1 |>.put a2 |>.put a3 |>.put a4 |>.put a5
+    | .trieResolve a0 a1 => out.push 39 |>.put a0 |>.put a1
+    | .trieCollect a0 a1 => out.push 40 |>.put a0 |>.put a1
+    | .trieMemoKey a0 a1 a2 a3 => out.push 41 |>.put a0 |>.put a1 |>.put a2 |>.put a3
+    | .trieScan a0 a1 a2 a3 => out.push 42 |>.put a0 |>.put a1 |>.put a2 |>.put a3
+    | .trieDiff a0 a1 => out.push 43 |>.put a0 |>.put a1
+    | .trieMaterialize a0 a1 a2 a3 => out.push 44 |>.put a0 |>.put a1 |>.put a2 |>.put a3
+    | .trieProve a0 a1 => out.push 45 |>.put a0 |>.put a1
+    | .trieVerifyProof a0 a1 a2 a3 => out.push 46 |>.put a0 |>.put a1 |>.put a2 |>.put a3
+    | .peerProbe a0 a1 a2 => out.push 47 |>.put a0 |>.put a1 |>.put a2
+    | .providerProbe a0 a1 => out.push 48 |>.put a0 |>.put a1
+    | .cloudEnsureCached a0 a1 => out.push 49 |>.put a0 |>.put a1
+    | .cloudEnsureRanges a0 a1 a2 => out.push 50 |>.put a0 |>.put a1 |>.put a2
+    | .cloudHydrate a0 a1 a2 => out.push 51 |>.put a0 |>.put a1 |>.put a2
+    | .cloudOutboard a0 a1 => out.push 52 |>.put a0 |>.put a1
+    | .trieComplete a0 a1 a2 a3 => out.push 53 |>.put a0 |>.put a1 |>.put a2 |>.put a3
+    | .planExchange a0 a1 a2 => out.push 54 |>.put a0 |>.put a1 |>.put a2
+    | .trieFetch a0 a1 a2 a3 a4 a5 a6 a7 a8 => out.push 55 |>.put a0 |>.put a1 |>.put a2 |>.put a3 |>.put a4 |>.put a5 |>.put a6 |>.put a7 |>.put a8
+    | .trieNormalize a0 => out.push 56 |>.put a0
+    | .casBlobIn a0 a1 => out.push 57 |>.put a0 |>.put a1
+    | .planContact a0 a1 a2 => out.push 58 |>.put a0 |>.put a1 |>.put a2
+    | .trieFirstOutside a0 a1 a2 => out.push 59 |>.put a0 |>.put a1 |>.put a2
+    | .originParse a0 => out.push 60 |>.put a0
+    | .originNamed a0 a1 => out.push 61 |>.put a0 |>.put a1
+    | .originNormalizeLabel a0 => out.push 62 |>.put a0
+    | .originNormalizeDomain a0 => out.push 63 |>.put a0
+    | .originCanonical a0 => out.push 64 |>.put a0
+    | .authBindings a0 a1 a2 => out.push 65 |>.put a0 |>.put a1 |>.put a2
+    | .authBindingStatuses a0 => out.push 66 |>.put a0
+    | .authTrustedKeys a0 => out.push 67 |>.put a0
+    | .authTrustedOrigins a0 => out.push 68 |>.put a0
+    | .authTrustedKey a0 a1 => out.push 69 |>.put a0 |>.put a1
+    | .authBound a0 a1 a2 => out.push 70 |>.put a0 |>.put a1 |>.put a2
+    | .authPeerAuthority a0 a1 => out.push 71 |>.put a0 |>.put a1
+    | .authOriginPublication a0 a1 => out.push 72 |>.put a0 |>.put a1
+    | .authOriginAuthority a0 a1 => out.push 73 |>.put a0 |>.put a1
+    | .authOriginAuthorityIn a0 a1 a2 => out.push 74 |>.put a0 |>.put a1 |>.put a2
+    | .authLocalAuthority a0 => out.push 75 |>.put a0
+    | .authLocalSpaces => out.push 76
+    | .authLocalScope => out.push 77
+    | .authLocalScopeIn a0 => out.push 78 |>.put a0
+    | .authMaterializationScope a0 => out.push 79 |>.put a0
+    | .authMaterializationScopeIn a0 a1 => out.push 80 |>.put a0 |>.put a1
+    | .authMetadataPeer a0 a1 => out.push 81 |>.put a0 |>.put a1
+    | .authSocketAuthority a0 a1 => out.push 82 |>.put a0 |>.put a1
+    | .authSoleDnsHintSource a0 a1 a2 => out.push 83 |>.put a0 |>.put a1 |>.put a2
+    | .authHasDelegations => out.push 84
+    | .authExpireDns a0 => out.push 85 |>.put a0
 
 instance : Decode Commands.Command where
   decode := do
     match ← readByte with
-    | 0 => return .acquire (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode)
-    | 1 => return .delete (← Decode.decode) (← Decode.decode)
-    | 2 => return .unpin (← Decode.decode) (← Decode.decode)
-    | 3 => return .expire (← Decode.decode) (← Decode.decode)
-    | 4 => return .read (← Decode.decode) (← Decode.decode)
-    | 5 => return .ingest (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode)
-    | 6 => return .commitGroups (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode)
-    | 7 => return .admitSize (← Decode.decode) (← Decode.decode)
-    | 8 => return .trieGet (← Decode.decode) (← Decode.decode)
-    | 9 => return .trieAdmit (← Decode.decode)
-    | 10 => return .trieVerify (← Decode.decode) (← Decode.decode)
-    | 11 => return .trieInsert (← Decode.decode) (← Decode.decode) (← Decode.decode)
-    | 12 => return .trieRemove (← Decode.decode) (← Decode.decode)
-    | 13 => return .pruneHistory (← Decode.decode) (← Decode.decode)
-    | 14 => return .casMarkDurable (← Decode.decode)
-    | 15 => return .casAdoptDurable (← Decode.decode) (← Decode.decode) (← Decode.decode)
-    | 16 => return .casHealMissing (← Decode.decode)
-    | 17 => return .casReconcileScratch (← Decode.decode)
-    | 18 => return .casClearCache (← Decode.decode)
-    | 19 => return .casEncodeSlice (← Decode.decode) (← Decode.decode)
-    | 20 => return .casEncodeProof (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode)
-    | 21 => return .casWriteSlice (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode)
-    | 22 => return .casWriteProof (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode)
-    | 23 => return .casPromote (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode)
-    | 24 => return .casTouch (← Decode.decode)
-    | 25 => return .casEvict (← Decode.decode) (← Decode.decode)
-    | 26 => return .casGcContent (← Decode.decode)
-    | 27 => return .casGcOrphans (← Decode.decode)
-    | 28 => return .casBlob (← Decode.decode)
-    | 29 => return .casBlobs
-    | 30 => return .casBlobCandidates
-    | 31 => return .casPins (← Decode.decode)
-    | 32 => return .casPinnedBlobs
-    | 33 => return .trieServeNodes (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode)
-    | 34 => return .trieServeValues (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode)
-    | 35 => return .trieResolve (← Decode.decode) (← Decode.decode)
-    | 36 => return .trieCollect (← Decode.decode) (← Decode.decode)
-    | 37 => return .trieMemoKey (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode)
-    | 38 => return .trieScan (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode)
-    | 39 => return .trieDiff (← Decode.decode) (← Decode.decode)
-    | 40 => return .trieMaterialize (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode)
-    | 41 => return .trieProve (← Decode.decode) (← Decode.decode)
-    | 42 => return .trieVerifyProof (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode)
-    | 43 => return .peerProbe (← Decode.decode) (← Decode.decode) (← Decode.decode)
-    | 44 => return .providerProbe (← Decode.decode) (← Decode.decode)
-    | 45 => return .cloudEnsureCached (← Decode.decode) (← Decode.decode)
-    | 46 => return .cloudEnsureRanges (← Decode.decode) (← Decode.decode) (← Decode.decode)
-    | 47 => return .cloudHydrate (← Decode.decode) (← Decode.decode) (← Decode.decode)
-    | 48 => return .cloudOutboard (← Decode.decode) (← Decode.decode)
-    | 49 => return .trieComplete (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode)
-    | 50 => return .planExchange (← Decode.decode) (← Decode.decode) (← Decode.decode)
-    | 51 => return .trieFetch (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode)
-    | 52 => return .trieNormalize (← Decode.decode)
-    | 53 => return .casBlobIn (← Decode.decode) (← Decode.decode)
-    | 54 => return .planContact (← Decode.decode) (← Decode.decode) (← Decode.decode)
-    | 55 => return .trieFirstOutside (← Decode.decode) (← Decode.decode) (← Decode.decode)
-    | 56 => return .originParse (← Decode.decode)
-    | 57 => return .originNamed (← Decode.decode) (← Decode.decode)
-    | 58 => return .originNormalizeLabel (← Decode.decode)
-    | 59 => return .originNormalizeDomain (← Decode.decode)
-    | 60 => return .originCanonical (← Decode.decode)
-    | 61 => return .authBindings (← Decode.decode) (← Decode.decode) (← Decode.decode)
-    | 62 => return .authBindingStatuses (← Decode.decode)
-    | 63 => return .authTrustedKeys (← Decode.decode)
-    | 64 => return .authTrustedOrigins (← Decode.decode)
-    | 65 => return .authTrustedKey (← Decode.decode) (← Decode.decode)
-    | 66 => return .authBound (← Decode.decode) (← Decode.decode) (← Decode.decode)
-    | 67 => return .authPeerAuthority (← Decode.decode) (← Decode.decode)
-    | 68 => return .authOriginPublication (← Decode.decode) (← Decode.decode)
-    | 69 => return .authOriginAuthority (← Decode.decode) (← Decode.decode)
-    | 70 => return .authOriginAuthorityIn (← Decode.decode) (← Decode.decode) (← Decode.decode)
-    | 71 => return .authLocalAuthority (← Decode.decode)
-    | 72 => return .authLocalSpaces
-    | 73 => return .authLocalScope
-    | 74 => return .authLocalScopeIn (← Decode.decode)
-    | 75 => return .authMaterializationScope (← Decode.decode)
-    | 76 => return .authMaterializationScopeIn (← Decode.decode) (← Decode.decode)
-    | 77 => return .authMetadataPeer (← Decode.decode) (← Decode.decode)
-    | 78 => return .authSocketAuthority (← Decode.decode) (← Decode.decode)
-    | 79 => return .authSoleDnsHintSource (← Decode.decode) (← Decode.decode) (← Decode.decode)
-    | 80 => return .authHasDelegations
-    | 81 => return .authExpireDns (← Decode.decode)
+    | 0 => return .acceptHead (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 1 => return .promoteHead (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 2 => return .materializeView (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 3 => return .fetchPending (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 4 => return .acquire (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 5 => return .delete (← Decode.decode) (← Decode.decode)
+    | 6 => return .unpin (← Decode.decode) (← Decode.decode)
+    | 7 => return .expire (← Decode.decode) (← Decode.decode)
+    | 8 => return .read (← Decode.decode) (← Decode.decode)
+    | 9 => return .ingest (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 10 => return .commitGroups (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 11 => return .admitSize (← Decode.decode) (← Decode.decode)
+    | 12 => return .trieGet (← Decode.decode) (← Decode.decode)
+    | 13 => return .trieAdmit (← Decode.decode)
+    | 14 => return .trieVerify (← Decode.decode) (← Decode.decode)
+    | 15 => return .trieInsert (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 16 => return .trieRemove (← Decode.decode) (← Decode.decode)
+    | 17 => return .pruneHistory (← Decode.decode) (← Decode.decode)
+    | 18 => return .casMarkDurable (← Decode.decode)
+    | 19 => return .casAdoptDurable (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 20 => return .casHealMissing (← Decode.decode)
+    | 21 => return .casReconcileScratch (← Decode.decode)
+    | 22 => return .casClearCache (← Decode.decode)
+    | 23 => return .casEncodeSlice (← Decode.decode) (← Decode.decode)
+    | 24 => return .casEncodeProof (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 25 => return .casWriteSlice (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 26 => return .casWriteProof (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 27 => return .casPromote (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 28 => return .casTouch (← Decode.decode)
+    | 29 => return .casEvict (← Decode.decode) (← Decode.decode)
+    | 30 => return .casGcContent (← Decode.decode)
+    | 31 => return .casGcOrphans (← Decode.decode)
+    | 32 => return .casBlob (← Decode.decode)
+    | 33 => return .casBlobs
+    | 34 => return .casBlobCandidates
+    | 35 => return .casPins (← Decode.decode)
+    | 36 => return .casPinnedBlobs
+    | 37 => return .trieServeNodes (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 38 => return .trieServeValues (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 39 => return .trieResolve (← Decode.decode) (← Decode.decode)
+    | 40 => return .trieCollect (← Decode.decode) (← Decode.decode)
+    | 41 => return .trieMemoKey (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 42 => return .trieScan (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 43 => return .trieDiff (← Decode.decode) (← Decode.decode)
+    | 44 => return .trieMaterialize (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 45 => return .trieProve (← Decode.decode) (← Decode.decode)
+    | 46 => return .trieVerifyProof (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 47 => return .peerProbe (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 48 => return .providerProbe (← Decode.decode) (← Decode.decode)
+    | 49 => return .cloudEnsureCached (← Decode.decode) (← Decode.decode)
+    | 50 => return .cloudEnsureRanges (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 51 => return .cloudHydrate (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 52 => return .cloudOutboard (← Decode.decode) (← Decode.decode)
+    | 53 => return .trieComplete (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 54 => return .planExchange (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 55 => return .trieFetch (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 56 => return .trieNormalize (← Decode.decode)
+    | 57 => return .casBlobIn (← Decode.decode) (← Decode.decode)
+    | 58 => return .planContact (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 59 => return .trieFirstOutside (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 60 => return .originParse (← Decode.decode)
+    | 61 => return .originNamed (← Decode.decode) (← Decode.decode)
+    | 62 => return .originNormalizeLabel (← Decode.decode)
+    | 63 => return .originNormalizeDomain (← Decode.decode)
+    | 64 => return .originCanonical (← Decode.decode)
+    | 65 => return .authBindings (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 66 => return .authBindingStatuses (← Decode.decode)
+    | 67 => return .authTrustedKeys (← Decode.decode)
+    | 68 => return .authTrustedOrigins (← Decode.decode)
+    | 69 => return .authTrustedKey (← Decode.decode) (← Decode.decode)
+    | 70 => return .authBound (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 71 => return .authPeerAuthority (← Decode.decode) (← Decode.decode)
+    | 72 => return .authOriginPublication (← Decode.decode) (← Decode.decode)
+    | 73 => return .authOriginAuthority (← Decode.decode) (← Decode.decode)
+    | 74 => return .authOriginAuthorityIn (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 75 => return .authLocalAuthority (← Decode.decode)
+    | 76 => return .authLocalSpaces
+    | 77 => return .authLocalScope
+    | 78 => return .authLocalScopeIn (← Decode.decode)
+    | 79 => return .authMaterializationScope (← Decode.decode)
+    | 80 => return .authMaterializationScopeIn (← Decode.decode) (← Decode.decode)
+    | 81 => return .authMetadataPeer (← Decode.decode) (← Decode.decode)
+    | 82 => return .authSocketAuthority (← Decode.decode) (← Decode.decode)
+    | 83 => return .authSoleDnsHintSource (← Decode.decode) (← Decode.decode) (← Decode.decode)
+    | 84 => return .authHasDelegations
+    | 85 => return .authExpireDns (← Decode.decode)
     | _ => throw ()
 
 end VerifiedCore

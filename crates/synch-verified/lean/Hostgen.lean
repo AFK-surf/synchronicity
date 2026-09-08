@@ -73,6 +73,7 @@ inductive Route where
 
 def algebras : List Name := [
   ``VerifiedCore.Host.Storage, ``VerifiedCore.Host.Crypto, ``VerifiedCore.Host.Access,
+  ``VerifiedCore.Host.Unicode,
   ``VerifiedCore.Host.FileIO, ``VerifiedCore.Host.Clock, ``VerifiedCore.Host.Output,
   ``VerifiedCore.Host.Construct, ``VerifiedCore.Host.Upsert, ``VerifiedCore.Host.Resources,
   ``VerifiedCore.Host.Lease, ``VerifiedCore.Host.SourceIO, ``VerifiedCore.Host.Digest,
@@ -91,6 +92,8 @@ def messages : List Name := [
   ``VerifiedCore.Cas.Codec.CellType, ``VerifiedCore.Cas.PinHolder, ``VerifiedCore.Cas.Input.Kind,
   ``VerifiedCore.Cas.Outcome, ``VerifiedCore.Origin.Error,
   ``VerifiedCore.Origin.Named, ``VerifiedCore.Origin.Parsed, ``VerifiedCore.Trie.LookupError,
+  ``VerifiedCore.Replication.Head, ``VerifiedCore.Replication.Acceptance,
+  ``VerifiedCore.Replication.Promotion,
   ``VerifiedCore.Trie.Value, ``VerifiedCore.Trie.Diff.Change, ``VerifiedCore.Trie.Proof.Proof,
   ``VerifiedCore.Trie.Refusal, ``VerifiedCore.Trie.Verdict, ``VerifiedCore.Trie.MutationError,
   ``VerifiedCore.Trie.Proof.VerifyError,
@@ -105,6 +108,8 @@ def messages : List Name := [
   ``VerifiedCore.Commands.TrieCollectDomainError, ``VerifiedCore.Commands.TrieWalkDomainError,
   ``VerifiedCore.Commands.TrieMissingDomainError,
   ``VerifiedCore.Commands.TrieFetchDomainError,
+  ``VerifiedCore.Commands.ReconcileDomainError, ``VerifiedCore.Commands.PromotionReport,
+  ``VerifiedCore.Commands.FetchReport,
   ``VerifiedCore.Trie.Serve.Scope,
   ``VerifiedCore.Authorization.Source, ``VerifiedCore.Authorization.Binding,
   ``VerifiedCore.Authorization.PublishScope, ``VerifiedCore.Authorization.PeerAuthority,
@@ -148,6 +153,8 @@ def tags : List (String × Nat) := [
   ("Storage.readBytes", 22), ("Storage.readInput", 23), ("Storage.readCounter", 24),
   ("Storage.removeFile", 25), ("Storage.existsRows", 26), ("Storage.scanRows", 28),
   ("Crypto.validateEd25519", 27),
+  ("Crypto.verifyEd25519", 89),
+  ("Unicode.isNfc", 90),
   ("Access.snapshot", 29), ("Access.update", 30), ("Access.copyRows", 31), ("Access.delete", 32),
   ("FileIO.open", 33), ("FileIO.readAt", 34), ("FileIO.close", 35), ("FileIO.transfer", 52),
   ("Clock.nowNs", 36), ("Output.append", 37),
@@ -175,6 +182,7 @@ def tags : List (String × Nat) := [
 def defaultRoute : String → Route
   | "Storage" | "Access" | "Upsert" => .storage
   | "Crypto" => .capability "crypto" "Crypto"
+  | "Unicode" => .capability "unicode" "Unicode"
   | "FileIO" => .capability "files" "FileIO"
   | "Clock" => .capability "clock" "Clock"
   | "Output" => .capability "output" "Output"
@@ -238,7 +246,7 @@ def traitExtras : String → String
   | _ => ""
 
 def traitOrder : List String :=
-  ["Storage", "Resources", "Crypto", "FileIO", "Clock", "Output", "Construct", "TemporaryFiles", "CacheIO",
+  ["Storage", "Resources", "Crypto", "Unicode", "FileIO", "Clock", "Output", "Construct", "TemporaryFiles", "CacheIO",
     "Lease", "SourceIO", "Digest", "ByteWrites", "Bao", "Sweep", "Memo", "Redaction", "Apply"]
 
 def baseTy : Name → Option Ty

@@ -31,7 +31,7 @@ abbrev WriteEffects := EffectSum Construct
   (EffectSum Upsert (EffectSum Resources (EffectSum Lease (EffectSum SourceIO
     (EffectSum Digest (EffectSum ByteWrites (EffectSum Bao (EffectSum Sweep
       (EffectSum Memo (EffectSum Redaction (EffectSum Apply
-        (EffectSum Peer (EffectSum Provider CacheIO)))))))))))))
+        (EffectSum Peer (EffectSum Provider (EffectSum CacheIO Unicode))))))))))))))
 abbrev NativeEffects := EffectSum Storage (EffectSum Crypto
   (EffectSum Access (EffectSum FileIO (EffectSum Clock (EffectSum Output WriteEffects)))))
 abbrev NativeState := Program NativeEffects (Reply ByteArray)

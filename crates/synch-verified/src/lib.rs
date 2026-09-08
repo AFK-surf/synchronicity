@@ -7,6 +7,8 @@
 /// projection entry points, external-wait requests/replies and conversions,
 /// and the `host_unexpected!` stubs for test doubles.
 #[macro_use]
+// Generated layouts mirror Lean products; public facades name complex tuples.
+#[allow(clippy::type_complexity)]
 mod generated {
     include!(concat!(env!("OUT_DIR"), "/generated.rs"));
 }
@@ -19,6 +21,7 @@ pub mod host;
 mod native;
 mod operation;
 pub mod origin;
+pub mod reconcile;
 pub mod replication;
 pub mod suspend;
 pub mod trie;

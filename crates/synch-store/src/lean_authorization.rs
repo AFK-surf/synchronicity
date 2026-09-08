@@ -64,6 +64,11 @@ impl Crypto {
 }
 
 impl synch_verified::host::Crypto for Crypto {
+    fn verify_ed25519(&mut self, _: &[u8], _: &[u8], _: &[u8]) -> Result<bool> {
+        Err(StoreError::invalid(
+            "authorization requested signature verification",
+        ))
+    }
     type Error = StoreError;
     fn validate_ed25519(&mut self, bytes: &[u8]) -> Result<bool> {
         let key = <&[u8; 32]>::try_from(bytes)
@@ -78,7 +83,7 @@ impl synch_verified::host::Crypto for Crypto {
     }
 }
 
-fn origin(value: &OriginId) -> native::Origin {
+pub(crate) fn origin(value: &OriginId) -> native::Origin {
     match value {
         OriginId::Key(key) => native::Origin::Key(key.as_bytes().to_vec()),
         OriginId::Named { domain, id } => native::Origin::Named(synch_verified::origin::Named {

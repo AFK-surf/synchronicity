@@ -475,7 +475,7 @@ impl Store {
     /// row is verified and bound, so nothing upstream rejects them, and
     /// `doctor`'s equivocation report costs the retained rows. What bounds the
     /// width is
-    /// [`Txn::trim_forks`], which *evicts* the lowest-ordered rows at a seq
+    /// Lean reconciliation, which *evicts* the lowest-ordered rows at a seq
     /// rather than refusing the head that would widen it — acceptance is the
     /// one thing convergence rests on and may never depend on how many roots
     /// happened to arrive first.
@@ -687,7 +687,7 @@ impl Store {
     /// only when every root at it is prunable — none of them current, all of
     /// them past the window — and the row that proves the origin moved past it
     /// waits for the fork rather than being taken ahead of them.
-    /// [`Txn::trim_forks`] bounds the width of a fork on the way in; this
+    /// Lean reconciliation bounds the width of a fork on the way in; this
     /// bounds how long one lives.
     ///
     /// Age is `recorded_at`: when *this node* took the row. `created_at` is
@@ -797,49 +797,6 @@ impl Txn<'_> {
     /// transaction. See [`Store::fork_width`].
     pub fn fork_width(&self, origin: &OriginId, seq: u64) -> Result<usize> {
         fork_width_in(self.conn(), origin, seq)
-    }
-
-    /// Bounds the retained fork at one seq to `keep` roots, evicting the
-    /// lowest-ordered ones, and reports how many rows went.
-    ///
-    /// A retention bound, never an acceptance rule. Same-seq forks are exempt
-    /// from `root_retention` until the origin publishes past the forked seq, so
-    /// an origin signing forever at one seq would otherwise buy permanent
-    /// growth on every peer. Refusing the incoming head instead is what the
-    /// acceptance rule may not do: which roots a peer saw first would then
-    /// decide which head it holds, and two honest peers fed the same set in
-    /// different orders would settle on different heads and refuse each other
-    /// forever. Evicting keeps the *greatest* `keep` roots at the seq, and
-    /// always leaves the two that prove the equivocation (§4.4) as long as
-    /// `keep >= 2`.
-    ///
-    /// A row a slot points at is never evicted: since v11 `heads` names a
-    /// `head_history` row and every head read joins the two, so a slot whose row
-    /// went would be a head that can no longer be read. Same guard, and for the
-    /// same reason, as [`Store::prune_history_before`]'s.
-    ///
-    /// That guard is also the one way the retained set is *not* identical on
-    /// every peer: it is the greatest `keep` roots plus whatever a slot still
-    /// names, and which roots reached a slot depends on the order they arrived
-    /// in. The deviation is bounded by the number of slots, so a peer retains at
-    /// most `keep + 2` roots at a seq and the retention bound holds. Nothing
-    /// reads across it — `head_floor` reads `heads`, never this table — so head
-    /// selection stays order-independent; what can differ between two peers is a
-    /// `doctor` fork line and one root's subtree staying in the GC mark set.
-    pub fn trim_forks(&self, origin: &OriginId, seq: u64, keep: usize) -> Result<usize> {
-        Ok(self.conn().execute(
-            "DELETE FROM head_history
-              WHERE origin_id = ?1 AND seq = ?2
-                AND root NOT IN (
-                      SELECT root FROM head_history
-                       WHERE origin_id = ?1 AND seq = ?2
-                       ORDER BY root DESC LIMIT ?3)
-                AND NOT EXISTS (
-                      SELECT 1 FROM heads h
-                       WHERE h.origin_id = ?1 AND h.seq = ?2
-                         AND h.root = head_history.root)",
-            params![origin.canonical(), seq as i64, keep as i64],
-        )?)
     }
 }
 

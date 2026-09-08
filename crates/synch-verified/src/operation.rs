@@ -655,6 +655,7 @@ impl<E> ByteStorage for NoBytes<E> {
 pub(crate) struct Capabilities<'a, E> {
     pub(crate) resources: Option<&'a mut dyn Resources<Error = E>>,
     pub(crate) crypto: Option<&'a mut dyn crate::host::Crypto<Error = E>>,
+    pub(crate) unicode: Option<&'a mut dyn crate::host::Unicode<Error = E>>,
     pub(crate) files: Option<&'a mut dyn FileIO<Error = E>>,
     pub(crate) clock: Option<&'a mut dyn Clock<Error = E>>,
     pub(crate) output: Option<&'a mut dyn crate::host::Output<Error = OperationError<E>>>,
@@ -678,6 +679,7 @@ impl<E> Default for Capabilities<'_, E> {
         Self {
             resources: None,
             crypto: None,
+            unicode: None,
             files: None,
             clock: None,
             output: None,
