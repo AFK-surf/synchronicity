@@ -187,14 +187,16 @@ database. Native SQLite/concurrent refinement remains a tested host contract, no
 a separately verified scheduler or database implementation. M3 imposes no fairness,
 successful-peer, ready-view or eventual-progress assumption.
 
-For M4, every execution prefix of the actual materializer preserves the committed
-database: its streamed file/provider/delegation and retention writes cannot commit
-themselves. The executed promotion finish stage publishes all staged rows together,
-or discards them on body failure; commit failure cannot become success, even if
-rollback also fails. These cover isolation and the commit boundary, not the whole
-promotion theorem. Deriving exact permitted-view readiness from completeness,
-proving the diff/materialized view and retention obligations correct, and composing
-the entire promotion remain open. Walk exhaustion is not an assumed exact view.
+For M4, [PromotionPublication](../specs/lean/Synchronicity/PromotionPublication.lean)
+proves that a successful invocation executes its preparation, completeness and
+authority checks, materialization and commit. `promote_flipped` derives these
+witnesses and proves commit installs the materializer's entire staged database.
+Every body prefix keeps the committed database unchanged. `promote_failure`
+establishes the same for any failed invocation, including faults in commit,
+rollback and post-rollback retirement. Successful refusal may retire its pending
+target. M4 remains open: exact permitted-view readiness, diff/materialized-view
+correctness and retention refinement still need proofs. Neither walk exhaustion
+nor successful materialization defines an exact view.
 
 Content histories require faithful metadata storage and a Bao decoder preserving
 previously verified bytes even after a partial write fails. Fresh-store/inline
