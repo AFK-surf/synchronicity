@@ -25,6 +25,7 @@ import VerifiedCore.Trie.Fetch
 import VerifiedCore.Host.Peer
 import VerifiedCore.Replication.Exchange
 import VerifiedCore.Replication.Contact
+import VerifiedCore.Replication.Types
 
 /-! The shapes that cross the command boundary: what a caller asks for and
 what a finished command reports. `hostgen` derives the codecs of every type
@@ -40,6 +41,12 @@ namespace VerifiedCore.Commands
 /-- Every command the host can start. The arguments are the command's whole
 input apart from the borrowed byte inputs (`Storage.readInput`) a run supplies. -/
 inductive Command where
+  | acceptHead (head : Replication.Head) (now : Int64) (keep : Nat)
+  | promoteHead (origin : Origin.Parsed) (now : Int64)
+      (refused : List (UInt64 × ByteArray × ByteArray))
+  | materializeView (tx : UInt64) (origin : Origin.Parsed) (oldRoot newRoot : ByteArray)
+  | fetchPending (origin : Origin.Parsed) (expected : Option (UInt64 × ByteArray))
+      (refused : List (UInt64 × ByteArray × ByteArray)) (maximum retryLimit : Nat)
   /-- Pin or take possession of an object for a holder. -/
   | acquire (root : ByteArray) (holder : String) (now : Int64) (possession : Bool)
   /-- Delete an object, or only collect it when unused since `before`. -/
@@ -329,6 +336,7 @@ inductive TrieWalkDomainError where
   | ceiling
   deriving BEq, DecidableEq
 
+
 /-- How a projection refuses: a malformed row, a column of the wrong class,
 or a column whose value is not a root or a holder. -/
 inductive ProjectDomainError where
@@ -396,6 +404,24 @@ structure Collected where
   nodes : UInt64
   values : UInt64
   roots : UInt64
+  deriving BEq, DecidableEq
+
+inductive ReconcileDomainError where
+  | history (error : HistoryDomainError)
+  | walk (error : TrieWalkDomainError)
+  | missing (error : TrieMissingDomainError)
+  | fetch (error : TrieFetchDomainError)
+  deriving BEq, DecidableEq
+
+structure PromotionReport where
+  promotion : Replication.Promotion
+  failure : Option ReconcileDomainError
+  refused : Option (UInt64 × ByteArray × ByteArray)
+  deriving BEq, DecidableEq
+
+structure FetchReport where
+  report : PromotionReport
+  abandoned : Bool
   deriving BEq, DecidableEq
 
 end VerifiedCore.Commands

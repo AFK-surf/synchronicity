@@ -65,3 +65,13 @@ import Synchronicity.CasInlineHistories
 import Synchronicity.TriePublicationRouting
 import Synchronicity.TrieScopeCheckProofs
 import Synchronicity.TrieInsertSemantics
+import Synchronicity.ReconciliationProofs
+import Synchronicity.ReconciliationTargets
+import Synchronicity.ReconciliationCommit
+import Synchronicity.ReconciliationGuards
+import Synchronicity.MaterializationPrivate
+import Synchronicity.ReconciliationAcceptance
+import Synchronicity.ReconciliationRejection
+import Synchronicity.ReconciliationFloor
+import Synchronicity.Goals.Mptsync.M3
+import Synchronicity.ReconciliationSafety

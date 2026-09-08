@@ -26,6 +26,8 @@ def request [Inject E Effects] (effect : E (Reply A)) : Action A := raise Error.
 /-- The requesting walk's row-presence reads belong to the batch snapshot.
 Its selections contain only equality predicates; no filtering is discarded. -/
 def inTransaction (tx : Transaction) : {A : Type} → Missing.Effects A → Effects A
+  | _, .right (.right (.isRedacted hash path)) => Inject.inject (Storage.existsRows tx "redacted_nodes"
+      ([("hash", .blob hash)] ++ (path.map (fun p => [("path", .blob p)])).getD []))
   | _, .right (.left (.snapshot selection columns)) =>
     if selection.likeAny.isEmpty && selection.notEquals.isEmpty then
       Inject.inject (Storage.scanRows tx selection.relation columns selection.equals)

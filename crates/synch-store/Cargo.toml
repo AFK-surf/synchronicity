@@ -12,6 +12,7 @@ authors.workspace = true
 test-utils = []
 
 [dependencies]
+unicode-normalization.workspace = true
 async-trait.workspace = true
 bao-tree.workspace = true
 blake3.workspace = true

@@ -6,15 +6,29 @@ use synch_verified::{
     history::{CellType, DomainError, Error},
 };
 
-struct Crypto;
+pub(crate) struct Crypto;
 impl synch_verified::host::Crypto for Crypto {
     type Error = StoreError;
     fn validate_ed25519(&mut self, bytes: &[u8]) -> Result<bool> {
         Ok(<&[u8; 32]>::try_from(bytes).is_ok_and(|key| NodeId::from_bytes(key).is_ok()))
     }
+    fn verify_ed25519(&mut self, key: &[u8], message: &[u8], signature: &[u8]) -> Result<bool> {
+        let Ok(key) = <&[u8; 32]>::try_from(key) else {
+            return Ok(false);
+        };
+        let Ok(key) = NodeId::from_bytes(key) else {
+            return Ok(false);
+        };
+        let Ok(signature) = <&[u8; 64]>::try_from(signature) else {
+            return Ok(false);
+        };
+        Ok(key
+            .verify(message, &iroh_base::Signature::from_bytes(signature))
+            .is_ok())
+    }
 }
 
-fn error(error: Error<StoreError>) -> StoreError {
+pub(crate) fn error(error: Error<StoreError>) -> StoreError {
     match error {
         Error::Operation(OperationError::Host(error)) => error,
         Error::Operation(_) | Error::Domain(DomainError::Malformed) => {
@@ -46,6 +60,9 @@ fn error(error: Error<StoreError>) -> StoreError {
                 "heads.sig" => "heads.sig",
                 "heads.signed_by" => "heads.signed_by",
                 "head_history.root" => "head_history.root",
+                "head_history.seq" => "head_history.seq",
+                "head_history.sig" => "head_history.sig",
+                "entries.content" => "entries.content",
                 _ => return StoreError::invalid("unknown Lean history column diagnostic"),
             };
             StoreError::column(column, reason)

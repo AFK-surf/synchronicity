@@ -83,16 +83,20 @@ instance : WireEffect Storage := ⟨Storage.request, Storage.reply⟩
 
 def Crypto.tag : Crypto A → UInt8
   | .validateEd25519 _ => 27
+  | .verifyEd25519 _ _ _ => 89
 
 def Crypto.name : Crypto A → String
   | .validateEd25519 _ => "validateEd25519"
+  | .verifyEd25519 _ _ _ => "verifyEd25519"
 
 def Crypto.request : Crypto A → ByteArray
   | .validateEd25519 a0 => header 27 |>.put a0
+  | .verifyEd25519 a0 a1 a2 => header 89 |>.put a0 |>.put a1 |>.put a2
 
 def Crypto.reply (effect : Crypto A) (input : ByteArray) : A :=
   match effect with
   | .validateEd25519 _ => decodeReply 27 Decode.decode input
+  | .verifyEd25519 _ _ _ => decodeReply 89 Decode.decode input
 
 instance : WireEffect Crypto := ⟨Crypto.request, Crypto.reply⟩
 
@@ -126,6 +130,21 @@ def Access.reply (effect : Access A) (input : ByteArray) : A :=
   | .delete _ _ => decodeReply 32 Decode.decode input
 
 instance : WireEffect Access := ⟨Access.request, Access.reply⟩
+
+def Unicode.tag : Unicode A → UInt8
+  | .isNfc _ => 90
+
+def Unicode.name : Unicode A → String
+  | .isNfc _ => "isNfc"
+
+def Unicode.request : Unicode A → ByteArray
+  | .isNfc a0 => header 90 |>.put a0
+
+def Unicode.reply (effect : Unicode A) (input : ByteArray) : A :=
+  match effect with
+  | .isNfc _ => decodeReply 90 Decode.decode input
+
+instance : WireEffect Unicode := ⟨Unicode.request, Unicode.reply⟩
 
 def FileIO.tag : FileIO A → UInt8
   | .open _ _ => 33

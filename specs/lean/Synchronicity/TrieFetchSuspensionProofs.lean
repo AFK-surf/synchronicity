@@ -113,7 +113,7 @@ private theorem inspection_closes_before_the_next_wait [Missing.WorkSet Missing.
         | left access =>
           cases access <;> simp only [Fetch.inTransaction]
           all_goals first | rfl | (split <;> rfl)
-        | right redaction => rfl
+        | right redaction => cases redaction <;> rfl
     · intro result
       exact NoWait.pure _
   · obtain ⟨frontier, result⟩ := result

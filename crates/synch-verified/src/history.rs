@@ -50,6 +50,7 @@ mod tests {
         keys: Vec<Vec<u8>>,
     }
     impl Crypto for Primitive {
+        host_unexpected!(verify_ed25519);
         type Error = &'static str;
         fn validate_ed25519(&mut self, bytes: &[u8]) -> Result<bool, Self::Error> {
             self.trace.borrow_mut().push("crypto");

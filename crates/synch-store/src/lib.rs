@@ -29,6 +29,7 @@ mod lean_ingest_streams;
 mod lean_project;
 mod lean_read;
 mod lean_receive;
+mod lean_reconcile;
 mod lean_resources;
 mod lean_serve;
 mod lean_storage;
@@ -60,6 +61,7 @@ pub use heads::{Equivocation, Slot};
 pub use proof::{Donor, Proven, ProvenSubtree};
 pub use replica::{ReplicaCoverage, WantRow};
 pub use sockets::SocketActivation;
+pub use synch_verified::reconcile::{Acceptance, Promotion};
 pub use unified::{Selection, Version, VersionPolicy, VersionSet};
 pub use uploads::{
     CompleteStart, Upload, UploadPart, UploadState, MAX_PART_NUMBER, MAX_PART_SIZE, MIN_PART_SIZE,

@@ -12,6 +12,20 @@ Not every helper needs a theorem; keep supporting lemmas when a selected guarant
 needs them. Migration, integration, tests and proof completion are distinct.
 The complete system promises, including mptsync eventual consistency, remain open.
 
+Proof organization must mirror the goal hierarchy in this document: user-facing
+P1–P8 goals and their specialized M1–M8 goals, not just implementation modules.
+Each goal has a named property and a corresponding top-level theorem expressing
+that guarantee, with an explicit link from this document to its proof entry point.
+Operation-level theorems and helpers support that entry point. Component proofs,
+including a conjunction that merely bundles them, do not by themselves complete
+a goal. Mark a goal complete only when its top-level theorem establishes the
+stated property for the relevant production executions under explicit assumptions.
+Use operation-independent domain invariants or transition relations, not lists of
+command-specific violations; prove actual operations refine the common property.
+Derive permissions from real reads or captured work, not an assumed safe outcome.
+Keep shared domain models outside `Goals`; operation proofs must not depend on
+goal modules. `Goals` contains the goal-level properties and top-level theorems.
+
 ## Architecture and ownership
 
 Lean owns **whole domain operations**; Rust provides facades and raw services.
@@ -68,14 +82,15 @@ promise to install every intermediate version during ongoing edits.
 
 ### mptsync goals
 
-These specialize the promises to the actual metadata-sync implementation. They
-are targets, not completed theorems.
+These specialize the promises to the actual metadata-sync implementation. M3 is
+checked under the raw-host and backed-slot contracts below; the other goals remain
+open as whole-system guarantees.
 
 | Goal | Property to establish |
 | --- | --- |
 | M1 | Once versions and permissions settle, devices eventually expose and retain the correct permitted views. |
 | M2 | Reordering or duplicating the same valid advertisements does not change the selected version. |
-| M3 | Delayed replies and obsolete work cannot overwrite or clear newer targets or accepted versions. |
+| [M3](../specs/lean/Synchronicity/Goals/Mptsync/M3.lean) | Delayed replies and obsolete work cannot overwrite or clear newer targets or accepted versions. |
 | M4 | A new file list replaces the old one only when ready; version, entries and retention obligations change atomically. |
 | M5 | Relays cannot forge changes or widen sharing; received, stored and served data remains tied to legitimate authority. |
 | M6 | Faulty or stalling peers/publishers do not permanently starve healthy syncing. |
@@ -105,8 +120,81 @@ convergence.
 | Fetch/serving | Production Lean. Actual rejection/rollback/storage coherence and no transaction across waits; position/response checks and native privacy/cancellation tests. | Productive Fetch progress and end-to-end authority/disclosure. Exhaustion does not prove completeness. |
 | CAS | Production Lean local content operations, coverage, retention/repair, durability, collection and projections. Scoped exact-read, unchanged-size transfer/replay, retention and saved-byte advertisement results. | Broader size-change/host failures and cloud/publication/source-hold composition. |
 | Cloud | Production Lean cache/range restoration, associated adoption, hydration and outboard caching; native content/recovery/cancellation tests. | Remaining discovery/upload/finalize/read/serve orchestration and composed proofs. |
-| Identity/authority | Production Lean origin APIs and whole authority/scope reads, including borrowed promotion transactions. Native expiry, grant, corruption and index tests. | Signed-record ingress, lifecycle policy and grant-to-publication/serving proofs. |
-| Replication | Production Lean history pruning, exchange/contact selection; checked order independence and bounded turns for fixed eligible inputs. Bounded TLA+ recovery checks. | Acceptance, pending transitions, promotion and real scheduling; M1–M8 composition remains open. |
+| Identity/authority | Production Lean origin APIs and whole authority/scope reads, including borrowed promotion transactions and materialized delegation updates. Native expiry, grant, corruption and index tests. | Remaining identity lifecycle policy and grant-to-publication/serving proofs. |
+| Replication | Production Lean signed-head acceptance, history/fork retention, pending-fetch lifecycle, promotion and streamed file/provider/delegation views with replica retention. M3 obsolete-work safety is checked across acceptance, promotion and suspended requesting/retirement. Exchange/contact selection has checked order independence and bounded turns for fixed eligible inputs. Bounded TLA+ recovery checks. | Advertisement observation, recovery/publication orchestration and real scheduling remain Rust. Exact-view/atomic-promotion proofs and the other mptsync goals remain open. |
+
+Reconciliation reads authority, completeness, slot pointers and derived-view policy
+in the promotion transaction. Failed materialization rolls it back before retiring
+only the judged version. Local metadata type failures remain retryable; structural
+and published-record refusals report a process-local memo key. Rust retains raw
+storage, cryptography, Unicode NFC checks, peer transport, notifications and memo
+storage. The pending-fetch command releases storage sessions across peer waits;
+native regressions cover cancellation, retained progress and retry. Migration and
+M3 safety do not establish exact views or eventual convergence.
+
+**M3: delayed replies and obsolete work cannot damage newer versions.** The proof
+entry point is [Goals/Mptsync/M3.lean](../specs/lean/Synchronicity/Goals/Mptsync/M3.lean):
+`Synchronicity.Goals.Mptsync.M3.Safety` is the property and `M3.safety` its top-level
+theorem. Every finite `Execution` refines the operation-independent
+[head transition relation](../specs/lean/Synchronicity/HeadTransition.lean):
+for every origin and both slots, keep the version, strictly advance it (sequence,
+then root), or consume exactly the captured **pending** version into absence.
+Complete cannot disappear or regress; capture never permits an older replacement.
+Timestamps are not version changes. Capture credentials come from the actual
+requester/retirement target or promotion's begin/preparation reads; successful
+Fetch settlement obtains them from fresh promotion, not the old request target.
+The concrete execution/refinement layer admits new and obsolete advertisements,
+promotion, arbitrary requester/retirement resumptions, selection, abandonment and
+every settlement result. Its constructors contain execution facts, not safety
+postconditions. All trace prefixes inherit the rule at typed, consistent slot
+boundaries with initially backed pointers. The theorem does not establish those
+storage contracts or verify the native scheduler.
+
+- Successful acceptance installs its candidate in committed pending rows and must
+  strictly exceed both initially backed complete/pending floors. A matching row
+  exists; every matching row has the candidate's sequence and root. An obsolete
+  advertisement preserves all committed heads on **every** outcome, including
+  metadata, host, commit and rollback failures. Any acceptance failure preserves
+  the entire committed database; even accepting a new pending version preserves
+  complete rows. Authorization, history recording/trimming and slot decoding have
+  checked snapshot/frame properties, not assumed policy answers.
+- The **whole promotion command**, including preparation, materialization, finish
+  and post-rollback retirement, keeps an initially backed complete version present
+  or replaces it only by a strictly newer sequence/root. Its candidate comes from
+  the pending slot in its own transaction snapshot. Readiness/authority checks and
+  materialization cannot substitute another head or commit independently.
+- Every residual requester and retirement program protects every row outside its
+  captured `(origin, pending, sequence, root)` key at every execution prefix, with
+  arbitrary replies, retries and injected failures. This includes a replacement
+  at the same sequence with another root. Each resumption may start from an
+  arbitrary new database: it need not retain the old selection snapshot. The
+  actual requester holds no transaction across any peer wait.
+- The actual outer Fetch is connected to these phases. Selection preserves heads;
+  cached refusals and failed/incomplete work only affect the captured target.
+  Successful requesting calls a **fresh promotion**, not publication of its old
+  captured head/scope. An execution changing a complete row must reach that fresh
+  promotion with the row still present; its final state is the promotion's final
+  state. Finite histories of reordered/duplicated obsolete advertisements and
+  suspended requesting/cleanup segments preserve newer rows.
+
+The version-floor contract requires a backing history row and agreement of the
+selected slot rows on sequence/root, as ordinary primary-key uniqueness ensures.
+The proof derives nonempty, pointer-correct reads from raw relational keys.
+Malformed records may fail, never successfully hide a backed floor. The reader's
+inner join omits orphan pointers; corrupt/orphan-pointer recovery is outside this
+contract. Transactions are exclusive, and each new transaction reads the current
+database. Native SQLite/concurrent refinement remains a tested host contract, not
+a separately verified scheduler or database implementation. M3 imposes no fairness,
+successful-peer, ready-view or eventual-progress assumption.
+
+For M4, every execution prefix of the actual materializer preserves the committed
+database: its streamed file/provider/delegation and retention writes cannot commit
+themselves. The executed promotion finish stage publishes all staged rows together,
+or discards them on body failure; commit failure cannot become success, even if
+rollback also fails. These cover isolation and the commit boundary, not the whole
+promotion theorem. Deriving exact permitted-view readiness from completeness,
+proving the diff/materialized view and retention obligations correct, and composing
+the entire promotion remain open. Walk exhaustion is not an assumed exact view.
 
 Content histories require faithful metadata storage and a Bao decoder preserving
 previously verified bytes even after a partial write fails. Fresh-store/inline
@@ -146,7 +234,7 @@ Proofs share raw database/file/resource semantics, including read-your-writes an
 rollback. Do not substitute operation-specific policy answers or assume the desired
 postcondition as an initial invariant.
 
-SQLite isolation, filesystems, provider acknowledgements, BLAKE3, Ed25519, the
+SQLite isolation, filesystems, provider acknowledgements, BLAKE3, Ed25519, Unicode NFC, the
 **whole Bao service**, Rust interpreters, native transport and Lean compiler/runtime
 are trusted contracts. Hash-sensitive results assume collision-freedom on relevant
 data, not global injectivity. Provider acknowledgements must represent real backing;

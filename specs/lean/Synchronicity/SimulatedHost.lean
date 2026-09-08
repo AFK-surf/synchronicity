@@ -83,6 +83,9 @@ structure State where
   hash : ByteArray → ByteArray := fun _ => ⟨Array.replicate 32 0⟩
   outboard : ByteArray → ByteArray := fun _ => ByteArray.empty
   validateKey : List UInt8 → Bool := fun _ => true
+  verifySignature : ByteArray → ByteArray → ByteArray → Bool := fun _ _ _ => false
+  /-- Primitive Unicode normalization predicate, as on the native boundary. -/
+  isNfc : String → Bool := fun _ => true
   /-- The Bao encodings are a trust parameter too: what the host would encode
   for exactly the groups it is asked for, and whether a proof walk fits. -/
   slice : ByteArray → UInt64 → Option ByteArray → List (UInt64 × UInt64) → ByteArray :=
@@ -376,6 +379,11 @@ def lease : Lease A → State → Result A
 
 def crypto : Crypto A → State → Result A
   | .validateEd25519 bytes, state => reply state "crypto" fun state => (.ok (state.validateKey bytes), state)
+  | .verifyEd25519 key message signature, state => reply state "verifySignature" fun state =>
+      (.ok (state.verifySignature key message signature), state)
+
+def unicode : Unicode A → State → Result A
+  | .isNfc text, state => reply state "unicode:nfc" fun state => (.ok (state.isNfc text), state)
 
 /-- The digest is the same trust parameter construction hashes with. -/
 def digest : Digest A → State → Result A
@@ -497,6 +505,7 @@ instance : Interpreter Construct := ⟨construct⟩
 instance : Interpreter Resources := ⟨resources⟩
 instance : Interpreter Lease := ⟨lease⟩
 instance : Interpreter Crypto := ⟨crypto⟩
+instance : Interpreter Unicode := ⟨unicode⟩
 instance : Interpreter Digest := ⟨digest⟩
 instance : Interpreter Bao := ⟨bao⟩
 instance : Interpreter Sweep := ⟨sweep⟩

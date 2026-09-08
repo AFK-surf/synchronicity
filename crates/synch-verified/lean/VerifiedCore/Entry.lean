@@ -20,6 +20,9 @@ import VerifiedCore.Trie.Diff
 import VerifiedCore.Trie.Proof
 import VerifiedCore.Trie.Complete
 import VerifiedCore.Replication.History
+import VerifiedCore.Replication.Reconcile
+import VerifiedCore.Replication.Promote
+import VerifiedCore.Replication.Fetch
 
 /-! The one native entry point. A command arrives as a packet, decoded with
 the generated codec of `Commands.Command`; it runs as a whole Lean operation
@@ -87,8 +90,8 @@ def reading : Except Cas.Read.Error UInt64 → Host.Reply ByteArray
       | .column column reason => .column column reason
       | .host _ | .protocol => .malformed) : Except _ UInt64)
 
-def retention : Replication.History.Result Nat → Host.Reply ByteArray
-  | .ok count => terminalOf (Except.ok count : Except HistoryDomainError Nat)
+def retention [Encode A] : Replication.History.Result A → Host.Reply ByteArray
+  | .ok count => terminalOf (Except.ok count : Except HistoryDomainError A)
   | .error (.host hostFailure) => .error hostFailure
   | .error error => terminalOf (Except.error (match error with
       | .malformed => HistoryDomainError.malformed
@@ -96,7 +99,12 @@ def retention : Replication.History.Result Nat → Host.Reply ByteArray
       | .invalidText bytes => .invalidText ⟨bytes.toArray⟩
       | .column column reason => .column column reason
       | .origin error => .origin error
-      | .host _ => .malformed) : Except _ Nat)
+      | .host _ => .malformed) : Except _ A)
+
+def promotion [Encode A] : Except Replication.Promote.Error A → Host.Reply ByteArray
+  | .ok result => terminalOf (Except.ok result : Except ReconcileDomainError A)
+  | .error (.host hostError) => .error hostError
+  | .error (.domain domainError) => terminalOf (Except.error domainError : Except ReconcileDomainError A)
 
 def authorizing [Encode A] : Except Authorization.Error A → Host.Reply ByteArray
   | .ok value => terminalOf (Except.ok value : Except AuthorizationDomainError A)
@@ -297,6 +305,14 @@ def dispatch : Command → Native
   | .trieRemove root keySize =>
     if root.size != 32 then malformedRoot else command (Trie.removeInput root keySize) mutation
   | .pruneHistory origin before => command (Replication.History.prune origin before) retention
+  | .acceptHead head now keep => command (Replication.Reconcile.accept head now keep) retention
+  | .promoteHead origin now refused => command (Replication.Promote.promote origin now refused) promotion
+  | .fetchPending origin expected refused maximum retryLimit =>
+    command (Replication.Fetch.fetch origin expected refused maximum retryLimit) promotion
+  | .materializeView tx origin oldRoot newRoot =>
+    command (Host.within (E := Replication.Materialize.Effects) (F := Replication.Promote.Effects)
+      Replication.Promote.materializeError
+      (Replication.Materialize.materialize tx origin oldRoot newRoot)) promotion
   | .casMarkDurable root =>
     if root.size != 32 then protocol else command (Cas.Durable.markDurable root) durable
   | .casAdoptDurable root size now =>
