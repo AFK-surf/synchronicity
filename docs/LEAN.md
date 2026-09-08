@@ -20,6 +20,9 @@ Operation-level theorems and helpers support that entry point. Component proofs,
 including a conjunction that merely bundles them, do not by themselves complete
 a goal. Mark a goal complete only when its top-level theorem establishes the
 stated property for the relevant production executions under explicit assumptions.
+Use operation-independent domain invariants or transition relations, not lists of
+command-specific violations; prove actual operations refine the common property.
+Derive permissions from real reads or captured work, not an assumed safe outcome.
 
 ## Architecture and ownership
 
@@ -130,15 +133,20 @@ M3 safety do not establish exact views or eventual convergence.
 **M3: delayed replies and obsolete work cannot damage newer versions.** The proof
 entry point is [Goals/Mptsync/M3.lean](../specs/lean/Synchronicity/Goals/Mptsync/M3.lean):
 `Synchronicity.Goals.Mptsync.M3.Safety` is the property and `M3.safety` its top-level
-theorem. Every finite `Execution` satisfies `Safety`: no observed transition
-violates version/target protection. Executions admit both new and obsolete
-advertisements, normal promotion, requesting/retirement resumptions, selection,
-cached abandonment and every Fetch settlement result. Execution constructors
-require actual production execution facts, not safe outcomes or stale-target
-filters. Violations describe raw heads changes, complete-version regression,
-noncaptured-target loss, or publication bypassing a fresh promotion from the
-actual clock-read state. All trace prefixes inherit safety. The trace models
-exclusive command/resumption boundaries, not the native scheduler itself.
+theorem. Every finite `Execution` refines the operation-independent
+[head transition relation](../specs/lean/Synchronicity/Goals/Mptsync/HeadTransition.lean):
+for every origin and both slots, keep the version, strictly advance it (sequence,
+then root), or consume exactly the captured **pending** version into absence.
+Complete cannot disappear or regress; capture never permits an older replacement.
+Timestamps are not version changes. Capture credentials come from the actual
+requester/retirement target or promotion's begin/preparation reads; successful
+Fetch settlement obtains them from fresh promotion, not the old request target.
+The concrete execution/refinement layer admits new and obsolete advertisements,
+promotion, arbitrary requester/retirement resumptions, selection, abandonment and
+every settlement result. Its constructors contain execution facts, not safety
+postconditions. All trace prefixes inherit the rule at typed, consistent slot
+boundaries with initially backed pointers. The theorem does not establish those
+storage contracts or verify the native scheduler.
 
 - Successful acceptance installs its candidate in committed pending rows and must
   strictly exceed both initially backed complete/pending floors. A matching row

@@ -15,7 +15,7 @@ private theorem equalCell_text_comm (value : Cell) (text : String) :
     equalCell (.text text) value = isCell value (.text text) := by
   cases value <;> simp [isCell, equalCell, BEq.beq, instBEqCell.beq, eq_comm]
 
-private theorem cell_assign_absent (row values : Fields) (column : String)
+theorem cell_assign_absent (row values : Fields) (column : String)
     (absent : ∀ field ∈ values, field.1 ≠ column) : cell (assign row values) column = cell row column := by
   have noneFound : values.find? (fun field => field.1 == column) = none := by
     apply List.find?_eq_none.mpr
@@ -55,7 +55,7 @@ private theorem assigned_points_to (head : Head) (slot : String) (received verif
       (column, conflictValue row (incoming head slot received verified) (.excluded column)))) head := by
   simp [updates, pointsTo, assign, conflictValue, incoming, Reconcile.headKey, cell]
 
-private theorem assigned_names (head : Head) (slot : String) (received verified : Int64)
+theorem assigned_names (head : Head) (slot : String) (received verified : Int64)
     (row : Fields) (origin otherSlot : String) :
     names (assign row ((updates slot).map fun column =>
       (column, conflictValue row (incoming head slot received verified) (.excluded column)))) origin otherSlot =

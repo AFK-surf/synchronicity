@@ -382,4 +382,12 @@ theorem fetch_complete_phases (row : Fields) (rowOrigin : String)
     exact selected_phases row origin refused maximum retryLimit pending old scope owner
       (complete_different row rowOrigin complete _)
 
+theorem effects_preserve_keys (predicate : List Cell → Prop) (row : Fields) (effect : Fetch.Effects A)
+    (safe : allowed row _ effect) : HeadInvariant.effectSafe (HeadKeyFrame.allKeys predicate) _ effect := by
+  intro state initial
+  cases effect with
+  | left effect => exact RetirementProtection.effects_preserve_keys predicate row effect safe state initial
+  | right effect =>
+    cases effect <;> apply HeadInvariant.reply_holds _ _ _ _ _ _ initial <;> intro s h <;> split <;> exact h
+
 end Synchronicity.FetchLifecycle

@@ -10,6 +10,8 @@ Read [docs/LEAN.md](docs/LEAN.md) before changing the Rust/Lean boundary or proo
 
 Organize the proof entry points to mirror the goal hierarchy in `docs/LEAN.md` (P1–P8 and their specialized M1–M8 goals). Each goal needs an explicitly named property and a corresponding top-level theorem whose statement expresses that user-facing guarantee. Link the goal in the document to its proof entry point; keep operation-level theorems and helper lemmas beneath that goal as supporting results. A collection of component proofs, or a conjunction merely bundling them, does not establish a completed goal: mark the goal complete only when its top-level theorem proves the stated property for the relevant production executions under explicit assumptions.
 
+Express goal properties as operation-independent domain invariants or transition relations, not a growing enumeration of command-specific violations. Prove that actual operations refine that common specification. Derive permissions (such as consuming a captured version) from actual reads or continuation provenance; do not assume the desired refinement in execution constructors.
+
 ## Build, Test, and Development Commands
 
 - `cargo build --release` builds workspace binaries into `target/release/`.

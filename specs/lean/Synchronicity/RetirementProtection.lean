@@ -5,8 +5,8 @@ namespace Synchronicity.RetirementProtection
 open VerifiedCore VerifiedCore.Host VerifiedCore.Replication SimulatedHost PrivateDatabase
 
 def allowed (row : Fields) (A : Type) : Promote.Effects A → Prop
-  | .left (.left effect) => ProtectedHead.storageAllowed row effect
-  | .left (.right (.right (.left effect))) => ProtectedHead.accessAllowed row effect
+  | .left (.left effect) => FetchHeadSafety.storageAllowed row effect
+  | .left (.right (.right (.left effect))) => FetchHeadSafety.accessAllowed row effect
   | _ => True
 
 theorem effects_retain (row : Fields) (effect : Promote.Effects A) (safe : allowed row _ effect)
@@ -15,13 +15,13 @@ theorem effects_retain (row : Fields) (effect : Promote.Effects A) (safe : allow
   cases effect with
   | left effect =>
     cases effect with
-    | left effect => exact ProtectedHead.storage_retains row effect safe state kept
+    | left effect => exact ProtectedHead.storage_retains row effect (FetchHeadSafety.storage_retention row effect safe) state kept
     | right effect =>
       cases effect with
       | left effect => cases effect <;> apply ProtectedHead.reply_retains _ _ _ _ _ _ kept <;> intro s h <;> exact h
       | right effect =>
         rcases effect with effect | effect
-        · exact ProtectedHead.access_retains row effect safe state kept
+        · exact ProtectedHead.access_retains row effect (FetchHeadSafety.access_retention row effect safe) state kept
         · rcases effect with effect | effect
           · cases effect <;> apply ProtectedHead.reply_retains _ _ _ _ _ _ kept <;> intro s h <;> exact h
           · rcases effect with effect | effect
@@ -55,5 +55,27 @@ theorem every_resumption_preserves (pending : Promote.Pending)
   exact (((retire_only row pending different).continuation reachable).invariant_prefix
     (ProtectedHead.retained row) path (effects_retain row)
     (ProtectedHead.initial row state closed present)).1
+
+theorem effects_preserve_keys (predicate : List Cell → Prop) (row : Fields) (effect : Promote.Effects A)
+    (safe : allowed row _ effect) : HeadInvariant.effectSafe (HeadKeyFrame.allKeys predicate) _ effect := by
+  intro state initial
+  cases effect with
+  | left effect =>
+    cases effect with
+    | left effect => exact HeadKeyFrame.storage_safe predicate effect (FetchHeadSafety.storage_keys row effect safe) state initial
+    | right effect =>
+      cases effect with
+      | left effect => cases effect <;> apply HeadInvariant.reply_holds _ _ _ _ _ _ initial <;> intro s h <;> exact h
+      | right effect =>
+        rcases effect with effect | effect
+        · exact HeadKeyFrame.access_safe predicate effect (FetchHeadSafety.access_keys row effect safe) state initial
+        · rcases effect with effect | effect
+          · cases effect <;> apply HeadInvariant.reply_holds _ _ _ _ _ _ initial <;> intro s h <;> exact h
+          · rcases effect with effect | effect
+            · cases effect; apply HeadInvariant.reply_holds _ _ _ _ _ _ initial; intro s h; exact h
+            · cases effect with
+              | left effect => cases effect; apply HeadInvariant.reply_holds _ _ _ _ _ _ initial; intro s h; exact h
+              | right effect => cases effect; apply HeadInvariant.reply_holds _ _ _ _ _ _ initial; intro s h; exact h
+  | right effect => cases effect <;> apply HeadInvariant.reply_holds _ _ _ _ _ _ initial <;> intro s h <;> exact h
 
 end Synchronicity.RetirementProtection
