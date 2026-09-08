@@ -1,7 +1,9 @@
 import Synchronicity.AcceptanceProtection
 import Synchronicity.FetchLifecycle
 
-/-! M3: obsolete work cannot damage newer selections or accepted versions.
+/-! Supporting reconciliation composition for `Goals/Mptsync/M3.lean`.
+The goal-level property and top-level theorem live there; the restricted stale
+history and Fetch decomposition below are supporting results, not its replacement.
 
 The observations are raw heads rows and the backed relational slot invariant,
 not an assumed decision of the reconciler. The main obligations are:

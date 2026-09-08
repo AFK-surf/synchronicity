@@ -198,6 +198,81 @@ theorem completed_fetch_rechecks (origin : Origin.Parsed) (refused : List (UInt6
   exact ⟨now, current, result, clockRead,
     OperationExecution.within_success promote_agrees id _ current final result publication, same.symm⟩
 
+/-- Any changed row after successful requesting is attributable to the fresh
+promotion starting immediately after the actual clock read. This includes
+pending rows and failure outcomes, not just successful promotion reports. -/
+theorem completed_settlement_changes_recheck (origin : Origin.Parsed)
+    (refused : List (UInt64 × ByteArray × ByteArray)) (target : Trie.Fetch.Target)
+    (key : UInt64 × ByteArray × ByteArray) (state : State) (row : Fields)
+    (present : row ∈ rows state.db "heads")
+    (lost : row ∉ rows (execute (settle origin refused target key (.ok true)) state).2.db "heads") :
+    ∃ now current,
+      execute (raise Promote.Error.host Clock.nowNs : Fetch.Action Int64) state = (.ok now, current) ∧
+      current.db = state.db ∧
+      (execute (Promote.promote origin now refused) current).2 =
+        (execute (settle origin refused target key (.ok true)) state).2 := by
+  have dbFrame : (execute (raise Promote.Error.host Clock.nowNs : Fetch.Action Int64) state).2.db = state.db := by
+    apply reply_preserves_db
+    intro s
+    rfl
+  unfold settle at lost ⊢
+  simp only [bind, ExceptT.bind, ExceptT.mk, execute_bind] at lost ⊢
+  generalize clockRead : execute (raise Promote.Error.host Clock.nowNs : Fetch.Action Int64) state = result at dbFrame lost ⊢
+  obtain ⟨result, current⟩ := result
+  cases result with
+  | error error =>
+    change row ∉ rows current.db "heads" at lost
+    rw [dbFrame] at lost
+    exact False.elim (lost present)
+  | ok now =>
+    refine ⟨now, current, rfl, dbFrame, ?_⟩
+    dsimp only [ExceptT.bindCont, ExceptT.run]
+    rw [execute_bind]
+    simp only [Fetch.lift]
+    rw [OperationExecution.within_eq promote_agrees]
+    generalize promoted : execute (Promote.promote origin now refused) current = result
+    obtain ⟨result, final⟩ := result
+    cases result <;> rfl
+
+/-- Complete-version safety of the entire successful-request settlement,
+including a failing clock, promotion preparation, commit or rollback. -/
+theorem completed_settlement_bound (origin : Origin.Parsed)
+    (refused : List (UInt64 × ByteArray × ByteArray)) (target : Trie.Fetch.Target)
+    (key : UInt64 × ByteArray × ByteArray) (state : State) (closed : state.pending = none)
+    (seq : Int64) (root : ByteArray)
+    (stored : ReconciliationRead.StoredFloor state.db (Origin.canonical origin) "complete" seq root) :
+    PromotionBound.good (Origin.canonical origin) ⟨seq.toUInt64, root⟩
+      (rows (execute (settle origin refused target key (.ok true)) state).2.db "heads") := by
+  have dbFrame : (execute (raise Promote.Error.host Clock.nowNs : Fetch.Action Int64) state).2.db = state.db := by
+    apply reply_preserves_db
+    intro s
+    rfl
+  have pendingFrame : (execute (raise Promote.Error.host Clock.nowNs : Fetch.Action Int64) state).2.pending = state.pending := by
+    apply ReconciliationReadOnly.reply_pending
+    intro s
+    rfl
+  unfold settle
+  simp only [bind, ExceptT.bind, ExceptT.mk, execute_bind]
+  generalize clockRead : execute (raise Promote.Error.host Clock.nowNs : Fetch.Action Int64) state = result at dbFrame pendingFrame ⊢
+  obtain ⟨result, current⟩ := result
+  cases result with
+  | error error =>
+    change PromotionBound.good _ _ (rows current.db "heads")
+    rw [dbFrame]
+    exact PromotionBound.stored_good state.db _ seq root stored
+  | ok now =>
+    have currentClosed : current.pending = none := pendingFrame.trans closed
+    have currentFloor : ReconciliationRead.StoredFloor current.db (Origin.canonical origin) "complete" seq root := by
+      rwa [dbFrame]
+    have bound := PromotionCommand.promote_preserves_complete_floor origin now refused current currentClosed seq root currentFloor
+    dsimp only [ExceptT.bindCont, ExceptT.run]
+    rw [execute_bind]
+    simp only [Fetch.lift]
+    rw [OperationExecution.within_eq promote_agrees]
+    generalize promoted : execute (Promote.promote origin now refused) current = result at bound ⊢
+    obtain ⟨result, final⟩ := result
+    cases result <;> exact bound
+
 /-- A certificate with just two kinds of work: effects that retain the row,
 and a terminal call of the real, fresh promotion command. It does not assume
 that a policy callback protects the row; the primitive certificate is checked

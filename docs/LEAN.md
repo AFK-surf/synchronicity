@@ -12,6 +12,15 @@ Not every helper needs a theorem; keep supporting lemmas when a selected guarant
 needs them. Migration, integration, tests and proof completion are distinct.
 The complete system promises, including mptsync eventual consistency, remain open.
 
+Proof organization must mirror the goal hierarchy in this document: user-facing
+P1–P8 goals and their specialized M1–M8 goals, not just implementation modules.
+Each goal has a named property and a corresponding top-level theorem expressing
+that guarantee, with an explicit link from this document to its proof entry point.
+Operation-level theorems and helpers support that entry point. Component proofs,
+including a conjunction that merely bundles them, do not by themselves complete
+a goal. Mark a goal complete only when its top-level theorem establishes the
+stated property for the relevant production executions under explicit assumptions.
+
 ## Architecture and ownership
 
 Lean owns **whole domain operations**; Rust provides facades and raw services.
@@ -76,7 +85,7 @@ open as whole-system guarantees.
 | --- | --- |
 | M1 | Once versions and permissions settle, devices eventually expose and retain the correct permitted views. |
 | M2 | Reordering or duplicating the same valid advertisements does not change the selected version. |
-| M3 | Delayed replies and obsolete work cannot overwrite or clear newer targets or accepted versions. |
+| [M3](../specs/lean/Synchronicity/Goals/Mptsync/M3.lean) | Delayed replies and obsolete work cannot overwrite or clear newer targets or accepted versions. |
 | M4 | A new file list replaces the old one only when ready; version, entries and retention obligations change atomically. |
 | M5 | Relays cannot forge changes or widen sharing; received, stored and served data remains tied to legitimate authority. |
 | M6 | Faulty or stalling peers/publishers do not permanently starve healthy syncing. |
@@ -119,7 +128,17 @@ native regressions cover cancellation, retained progress and retry. Migration an
 M3 safety do not establish exact views or eventual convergence.
 
 **M3: delayed replies and obsolete work cannot damage newer versions.** The proof
-entry point is `specs/lean/Synchronicity/ReconciliationSafety.lean`.
+entry point is [Goals/Mptsync/M3.lean](../specs/lean/Synchronicity/Goals/Mptsync/M3.lean):
+`Synchronicity.Goals.Mptsync.M3.Safety` is the property and `M3.safety` its top-level
+theorem. Every finite `Execution` satisfies `Safety`: no observed transition
+violates version/target protection. Executions admit both new and obsolete
+advertisements, normal promotion, requesting/retirement resumptions, selection,
+cached abandonment and every Fetch settlement result. Execution constructors
+require actual production execution facts, not safe outcomes or stale-target
+filters. Violations describe raw heads changes, complete-version regression,
+noncaptured-target loss, or publication bypassing a fresh promotion from the
+actual clock-read state. All trace prefixes inherit safety. The trace models
+exclusive command/resumption boundaries, not the native scheduler itself.
 
 - Successful acceptance installs its candidate in committed pending rows and must
   strictly exceed both initially backed complete/pending floors. A matching row

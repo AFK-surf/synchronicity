@@ -73,4 +73,4 @@ import Synchronicity.MaterializationPrivate
 import Synchronicity.ReconciliationAcceptance
 import Synchronicity.ReconciliationRejection
 import Synchronicity.ReconciliationFloor
-import Synchronicity.ReconciliationSafety
+import Synchronicity.Goals.Mptsync.M3

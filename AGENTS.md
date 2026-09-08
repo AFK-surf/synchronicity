@@ -8,6 +8,8 @@ This is a Rust 2021 workspace (minimum Rust 1.91). Libraries and binaries live i
 
 Read [docs/LEAN.md](docs/LEAN.md) before changing the Rust/Lean boundary or proof goals. It is the canonical overview of architecture, migration status, checked guarantees, trust assumptions and remaining work. Design high-level theorems around real system properties that matter to users and can be explained in plain words; prove helpers only when they support those properties. Keep implementation details and precise assumptions beside the code. Keep `docs/LEAN.md` human-readable, under 20KB and about overall system status, without PR-specific scope or history. Update it when ownership or proof coverage changes, and distinguish migrated code from proved guarantees.
 
+Organize the proof entry points to mirror the goal hierarchy in `docs/LEAN.md` (P1–P8 and their specialized M1–M8 goals). Each goal needs an explicitly named property and a corresponding top-level theorem whose statement expresses that user-facing guarantee. Link the goal in the document to its proof entry point; keep operation-level theorems and helper lemmas beneath that goal as supporting results. A collection of component proofs, or a conjunction merely bundling them, does not establish a completed goal: mark the goal complete only when its top-level theorem proves the stated property for the relevant production executions under explicit assumptions.
+
 ## Build, Test, and Development Commands
 
 - `cargo build --release` builds workspace binaries into `target/release/`.
