@@ -30,7 +30,8 @@ async fn startup_readopts_a_newer_own_head_retained_by_a_peer() {
     let _blocking = synch_core::BlockingScope::enter();
     let publisher = spawn("publisher").await;
     let witness = spawn("witness").await;
-    introduce(&[&publisher, &witness]);
+    let older_witness = spawn("older-witness").await;
+    introduce(&[&publisher, &witness, &older_witness]);
 
     publisher
         .node
@@ -59,10 +60,20 @@ async fn startup_readopts_a_newer_own_head_retained_by_a_peer() {
     let mut publisher = Node::open(synch_engine::NodeConfig::loopback(publisher_data.path()))
         .await
         .unwrap();
-    introduce_nodes(&[&publisher, &witness.node]);
+    introduce_nodes(&[&publisher, &witness.node, &older_witness.node]);
 
+    // Both witnesses retain heads newer than the restored database.
     std::fs::write(publisher_space.path().join("version.txt"), b"two").unwrap();
-    let second = publisher.scan_publish_push().await.unwrap().unwrap();
+    let second = publisher.scan_and_publish().unwrap().1.unwrap();
+    older_witness
+        .node
+        .sync_with_peer(&publisher.node_id())
+        .await
+        .unwrap();
+    // Only one witness learns the newest version; concurrent offers must
+    // recover that version regardless of which peer finishes first.
+    std::fs::write(publisher_space.path().join("version.txt"), b"three").unwrap();
+    let third = publisher.scan_and_publish().unwrap().1.unwrap();
     witness
         .node
         .sync_with_peer(&publisher.node_id())
@@ -74,7 +85,7 @@ async fn startup_readopts_a_newer_own_head_retained_by_a_peer() {
             .store()
             .complete_head(publisher.origin())
             .unwrap(),
-        Some(second.clone())
+        Some(third.clone())
     );
     let expected_entry = publisher
         .store()
@@ -96,11 +107,19 @@ async fn startup_readopts_a_newer_own_head_retained_by_a_peer() {
     publisher = Node::open(synch_engine::NodeConfig::loopback(publisher_data.path()))
         .await
         .unwrap();
-    introduce_nodes(&[&publisher, &witness.node]);
+    introduce_nodes(&[&publisher, &witness.node, &older_witness.node]);
+    assert_eq!(
+        older_witness
+            .node
+            .store()
+            .complete_head(publisher.origin())
+            .unwrap(),
+        Some(second)
+    );
     assert_eq!(publisher.own_head().unwrap(), Some(first));
 
     assert!(publisher.readopt_self_on_startup().await.unwrap());
-    assert_eq!(publisher.own_head().unwrap(), Some(second));
+    assert_eq!(publisher.own_head().unwrap(), Some(third));
     assert_eq!(
         publisher
             .store()
@@ -110,7 +129,7 @@ async fn startup_readopts_a_newer_own_head_retained_by_a_peer() {
         expected_entry
     );
 
-    shutdown(&[&publisher, &witness.node]).await;
+    shutdown(&[&publisher, &witness.node, &older_witness.node]).await;
 }
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
@@ -838,4 +857,88 @@ async fn a_pushed_head_is_followed_by_its_trie_without_waiting_for_the_interval(
     let _ = stop.send(());
     let _ = running.await;
     shutdown(&[&nas.node, &laptop.node]).await;
+}
+
+/// A connected peer that never answers must not hold up the other probes.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn startup_recovery_contacts_peers_before_other_exchanges_time_out() {
+    let _blocking = synch_core::BlockingScope::enter();
+    let node = spawn_with("recovering", |config| {
+        config.sync_round_budget = Duration::from_secs(5);
+    })
+    .await;
+    let (connected, mut connections) = tokio::sync::mpsc::unbounded_channel();
+    let mut endpoints = Vec::new();
+    let mut accepting = tokio::task::JoinSet::new();
+    for index in 0..3 {
+        let endpoint = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+            .secret_key(iroh_base::SecretKey::generate())
+            .relay_mode(iroh::endpoint::RelayMode::Disabled)
+            .clear_address_lookup()
+            .clear_ip_transports()
+            .bind_addr("127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap())
+            .unwrap()
+            .alpns(vec![synch_core::ALPN_MPT.to_vec()])
+            .bind()
+            .await
+            .unwrap();
+        let addr = iroh::EndpointAddr::from_parts(
+            endpoint.id(),
+            endpoint
+                .bound_sockets()
+                .into_iter()
+                .map(iroh::TransportAddr::Ip),
+        );
+        node.node
+            .store()
+            .put_binding(&common::binding(
+                &synch_core::OriginId::named(&format!("silent-{index}"), "cluster.example")
+                    .unwrap(),
+                &endpoint.id(),
+            ))
+            .unwrap();
+        node.node.remember_peer(&addr).unwrap();
+        let listening = endpoint.clone();
+        let connected = connected.clone();
+        accepting.spawn(async move {
+            let mut held = Vec::new();
+            while let Some(incoming) = listening.accept().await {
+                if let Ok(connection) = incoming.await {
+                    held.push(connection);
+                    connected.send(index).unwrap();
+                }
+            }
+        });
+        endpoints.push(endpoint);
+    }
+    drop(connected);
+    let recovering = node.node.clone();
+    let recovery = tokio::spawn(async move { recovering.readopt_self_on_startup().await });
+
+    // All three handshakes must complete before even the first exchange's
+    // deadline. A sequential implementation can only reach one peer here.
+    tokio::time::timeout(Duration::from_secs(3), async {
+        let mut reached = std::collections::BTreeSet::new();
+        while reached.len() < endpoints.len() {
+            reached.insert(connections.recv().await.unwrap());
+        }
+    })
+    .await
+    .expect("a silent peer must not prevent contacting the others");
+    assert!(
+        !recovery.is_finished(),
+        "recovery must await the outstanding exchanges"
+    );
+    assert!(!tokio::time::timeout(Duration::from_secs(10), recovery)
+        .await
+        .unwrap()
+        .unwrap()
+        .unwrap());
+
+    accepting.abort_all();
+    while accepting.join_next().await.is_some() {}
+    for endpoint in endpoints {
+        endpoint.close().await;
+    }
+    node.node.shutdown().await.unwrap();
 }

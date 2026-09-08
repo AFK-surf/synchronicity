@@ -32,6 +32,7 @@ use std::{
     time::{Duration, Instant},
 };
 
+use futures_util::{stream, StreamExt};
 use synch_core::{now_ns, Hash, NodeId, OriginId};
 use tokio::sync::mpsc::UnboundedSender;
 
@@ -39,6 +40,10 @@ use crate::{
     error::{EngineError, Result},
     node::Node,
 };
+
+// Bound simultaneous connections and trie fetches while allowing slow peers
+// to spend their existing deadlines concurrently.
+const STARTUP_RECOVERY_CONCURRENCY: usize = 8;
 
 /// How long `synch recover` collects peer summaries by default (§3.4).
 pub(crate) const DEFAULT_RECOVERY_QUIESCE: Duration = Duration::from_secs(3600);
@@ -211,38 +216,47 @@ impl Node {
         };
 
         let targets = self.dial_targets().await?;
-        tracing::info!(peers = targets.len(), exchange_budget_secs = self.config().sync_round_budget.as_secs(),
-            "startup own-head recovery: contacting peers sequentially; each dial has a 10s deadline");
-        for (index, (peer, addr)) in targets.into_iter().enumerate() {
-            let started = std::time::Instant::now();
-            tracing::info!(peer = %peer.fmt_short(), index = index + 1, "startup readoption: dialing peer");
-            let client = match self.net().connect_mpt(addr).await {
-                Ok(client) => client,
-                Err(error) => {
-                    tracing::info!(peer = %peer.fmt_short(), elapsed_secs = started.elapsed().as_secs_f64(), %error, "startup readoption peer unreachable");
-                    continue;
+        tracing::info!(peers = targets.len(), concurrency = STARTUP_RECOVERY_CONCURRENCY,
+            exchange_budget_secs = self.config().sync_round_budget.as_secs(),
+            "startup own-head recovery: contacting peers concurrently; each dial has a 10s deadline");
+        // These futures stay owned by startup: cancellation drops every pending
+        // dial/exchange, and cloud reconstruction waits for all peers to finish.
+        // Head offers and promotion already recheck ordering transactionally.
+        stream::iter(targets.into_iter().enumerate())
+            .for_each_concurrent(STARTUP_RECOVERY_CONCURRENCY, |(index, (peer, addr))| {
+                let held_keys = &held_keys;
+                async move {
+                    let started = std::time::Instant::now();
+                    tracing::info!(peer = %peer.fmt_short(), index = index + 1, "startup readoption: dialing peer");
+                    let client = match self.net().connect_mpt(addr).await {
+                        Ok(client) => client,
+                        Err(error) => {
+                            tracing::info!(peer = %peer.fmt_short(), elapsed_secs = started.elapsed().as_secs_f64(), %error, "startup readoption peer unreachable");
+                            return;
+                        }
+                    };
+                    tracing::info!(peer = %peer.fmt_short(), elapsed_secs = started.elapsed().as_secs_f64(), "startup readoption: exchanging history");
+                    match tokio::time::timeout(
+                        self.config().sync_round_budget,
+                        self.syncer().readopt_self_with(&client, held_keys),
+                    )
+                    .await
+                    {
+                        Ok(Ok(())) => {}
+                        Ok(Err(error)) => tracing::info!(
+                            peer = %peer.fmt_short(),
+                            %error,
+                            "startup readoption exchange failed"
+                        ),
+                        Err(_) => tracing::info!(
+                            peer = %peer.fmt_short(),
+                            "startup readoption exchange exceeded its sync budget"
+                        ),
+                    }
+                    tracing::info!(peer = %peer.fmt_short(), elapsed_secs = started.elapsed().as_secs_f64(), "startup readoption: peer finished");
                 }
-            };
-            tracing::info!(peer = %peer.fmt_short(), elapsed_secs = started.elapsed().as_secs_f64(), "startup readoption: exchanging history");
-            match tokio::time::timeout(
-                self.config().sync_round_budget,
-                self.syncer().readopt_self_with(&client, &held_keys),
-            )
-            .await
-            {
-                Ok(Ok(())) => {}
-                Ok(Err(error)) => tracing::info!(
-                    peer = %peer.fmt_short(),
-                    %error,
-                    "startup readoption exchange failed"
-                ),
-                Err(_) => tracing::info!(
-                    peer = %peer.fmt_short(),
-                    "startup readoption exchange exceeded its sync budget"
-                ),
-            }
-            tracing::info!(peer = %peer.fmt_short(), elapsed_secs = started.elapsed().as_secs_f64(), "startup readoption: peer finished");
-        }
+            })
+            .await;
 
         let after = {
             let node = self.clone();
