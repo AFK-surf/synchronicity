@@ -106,6 +106,36 @@ def originFault : ReconcileDomainError → Bool
   | .history (.columnType ..) | .history (.invalidText _) | .history .malformed => false
   | _ => true
 
+/-- A post-rollback verdict has no authority over a replacement target. -/
+def retire (pending : Pending) : Action Unit :=
+  transactionOver Inject.inject Error.host fun tx => do
+    let _ ← raw (.deleteRows tx "heads"
+      (Reconcile.headKey pending.head ++ [("slot", .text "pending")]))
+
+/-- Publish a successfully staged transaction, or roll it back before retiring
+only its captured target. Kept separate to state the commit-boundary guarantee
+over arbitrary staged rows, independently of the view-correctness proof. -/
+def finish (tx : Transaction) (pending : Option Pending)
+    (key : Option (UInt64 × ByteArray × ByteArray)) (result : Except Error Promotion) :
+    Action PromotionReport := do
+  match result with
+  | .ok promotion =>
+    match ← attempt (raw (.commit tx)) with
+    | .ok () => return ⟨promotion, none, none⟩
+    | .error error =>
+      let _ ← attempt (raw (.rollback tx))
+      throw error
+  | .error error =>
+    let _ ← attempt (raw (.rollback tx))
+    match error with
+    | .host _ => throw error
+    | .domain failure =>
+      if originFault failure then
+        if let some pending := pending then
+          retire pending
+          return ⟨.refused, some failure, key⟩
+      throw error
+
 def promote (origin : Origin.Parsed) (now : Int64) (refused : List (UInt64 × ByteArray × ByteArray)) :
     Action PromotionReport := do
   let tx ← raw .begin
@@ -129,24 +159,6 @@ def promote (origin : Origin.Parsed) (now : Int64) (refused : List (UInt64 × By
         clear tx origin
         return .refused
       body tx origin now pending old scope authority : Action Promotion)
-  match result with
-  | .ok promotion =>
-    match ← attempt (raw (.commit tx)) with
-    | .ok () => return ⟨promotion, none, none⟩
-    | .error error =>
-      let _ ← attempt (raw (.rollback tx))
-      throw error
-  | .error error =>
-    let _ ← attempt (raw (.rollback tx))
-    match error with
-    | .host _ => throw error
-    | .domain failure =>
-      if originFault failure then
-        if let some pending := pending then
-          transactionOver Inject.inject Error.host fun tx => do
-            let _ ← raw (.deleteRows tx "heads"
-              (Reconcile.headKey pending.head ++ [("slot", .text "pending")]))
-          return ⟨.refused, some failure, key⟩
-      throw error
+  finish tx pending key result
 
 end VerifiedCore.Replication.Promote

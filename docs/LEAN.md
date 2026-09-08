@@ -117,6 +117,20 @@ storage. The pending-fetch command releases storage sessions across peer waits;
 native regressions cover cancellation, retained progress and retry. These are
 implementation and integration guarantees, not a complete reconciliation theorem.
 
+Checked reconciliation components include exact-target abandonment, timestamp
+updates and post-rollback retirement on arbitrary current rows with successful
+storage, and the executed promotion body's no-downgrade guard. They do not yet
+compose all acceptance and suspended-work interleavings into M3.
+
+For M4, every execution prefix of the actual materializer preserves the committed
+database: its streamed file/provider/delegation and retention writes cannot commit
+themselves. The executed promotion finish stage publishes all staged rows together,
+or discards them on body failure; commit failure cannot become success, even if
+rollback also fails. These cover isolation and the commit boundary, not the whole
+promotion theorem. Deriving exact permitted-view readiness from completeness,
+proving the diff/materialized view and retention obligations correct, and composing
+the entire promotion remain open. Walk exhaustion is not an assumed exact view.
+
 Content histories require faithful metadata storage and a Bao decoder preserving
 previously verified bytes even after a partial write fails. Fresh-store/inline
 results have distinct initial-state contracts, not arbitrary corruption recovery.

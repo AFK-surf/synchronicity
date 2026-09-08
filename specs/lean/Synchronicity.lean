@@ -66,3 +66,7 @@ import Synchronicity.TriePublicationRouting
 import Synchronicity.TrieScopeCheckProofs
 import Synchronicity.TrieInsertSemantics
 import Synchronicity.ReconciliationProofs
+import Synchronicity.ReconciliationTargets
+import Synchronicity.ReconciliationCommit
+import Synchronicity.ReconciliationGuards
+import Synchronicity.MaterializationPrivate
