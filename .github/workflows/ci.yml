@@ -109,7 +109,9 @@ jobs:
   verified-core:
     name: statically linked Lean core (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    # Cold Windows builds finish both test steps near 30 minutes, before
+    # the separate release build and static-runtime inspection can complete.
+    timeout-minutes: ${{ matrix.os == 'windows-latest' && 45 || 30 }}
     strategy:
       fail-fast: false
       matrix:
