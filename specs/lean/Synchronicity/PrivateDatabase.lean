@@ -15,6 +15,13 @@ inductive Only {E : Type → Type} (allowed : (B : Type) → E B → Prop) {A : 
 
 variable {allowed : (B : Type) → E B → Prop}
 
+theorem Only.mono {target : (B : Type) → E B → Prop} {program : Program E A}
+    (safe : Only allowed program) (implies : ∀ {B} (effect : E B), allowed _ effect → target _ effect) :
+    Only target program := by
+  induction safe with
+  | done value => exact .done value
+  | request good rest ih => exact .request (implies _ good) ih
+
 theorem Only.bind {program : Program E A} {next : A → Program E B}
     (head : Only allowed program) (tail : ∀ value, Only allowed (next value)) :
     Only allowed (program.bind next) := by

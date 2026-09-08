@@ -72,3 +72,4 @@ import Synchronicity.ReconciliationGuards
 import Synchronicity.MaterializationPrivate
 import Synchronicity.ReconciliationAcceptance
 import Synchronicity.ReconciliationRejection
+import Synchronicity.ReconciliationFloor

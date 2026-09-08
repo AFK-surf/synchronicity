@@ -131,9 +131,15 @@ or `notNewer`) leaves every committed heads row unchanged after the whole comman
 although history retention may change. These acceptance results allow arbitrary
 injected host failures, deriving successful writes and commit from command success.
 History trimming preserves all staged heads and the transaction token even on failure.
-The slot reader's inner join omits orphan pointers. Deriving decoded floors from
-well-formed initial slot/history records, and composing acceptance with all
-suspended-work interleavings, remain open for M3.
+The slot reader's inner join omits orphan pointers. For an initially backed slot
+whose selected rows agree on sequence/root (as primary-key uniqueness guarantees),
+successful acceptance must strictly exceed that initial complete or pending version.
+The proof derives nonempty, pointer-correct reads from raw relational keys; authority
+reads preserve the private database and recording signatures retains prior history.
+Malformed records may cause failure, never successful absence of a backed floor.
+An obsolete advertisement that returns normally preserves every committed heads row.
+Composing all failure paths, promotion and suspended-work interleavings remains open
+for full M3; corrupt/orphan-pointer recovery is not covered by this slot invariant.
 
 For M4, every execution prefix of the actual materializer preserves the committed
 database: its streamed file/provider/delegation and retention writes cannot commit
