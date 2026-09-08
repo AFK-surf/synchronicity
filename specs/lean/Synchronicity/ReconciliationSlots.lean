@@ -44,7 +44,7 @@ def incoming (head : Head) (slot : String) (received verified : Int64) : Fields 
 def updates (slot : String) : List String :=
   ["seq", "root", "verified_at"] ++ if slot == "pending" then [] else ["received_at"]
 
-private theorem conflicts_iff_names (head : Head) (slot : String) (received verified : Int64)
+theorem conflicts_iff_names (head : Head) (slot : String) (received verified : Int64)
     (row : Fields) : conflict ["origin_id", "slot"] (incoming head slot received verified) row =
       names row (Origin.canonical head.origin) slot := by
   simp [conflict, incoming, Reconcile.headKey, cell, names, equals, equalCell_text_comm]

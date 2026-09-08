@@ -22,6 +22,15 @@ theorem Only.mono {target : (B : Type) → E B → Prop} {program : Program E A}
   | done value => exact .done value
   | request good rest ih => exact .request (implies _ good) ih
 
+theorem Only.invariant [Interpreter E] (invariant : State → Prop) {program : Program E A}
+    (safe : Only allowed program)
+    (effects : ∀ {B} (effect : E B), allowed _ effect → ∀ state, invariant state →
+      invariant (Interpreter.handle effect state).2)
+    (state : State) (initial : invariant state) : invariant (execute program state).2 := by
+  induction safe generalizing state with
+  | done _ => exact initial
+  | request good rest ih => exact ih _ _ (effects _ good state initial)
+
 theorem Only.bind {program : Program E A} {next : A → Program E B}
     (head : Only allowed program) (tail : ∀ value, Only allowed (next value)) :
     Only allowed (program.bind next) := by
@@ -70,6 +79,36 @@ theorem Only.mapM (items : List A) (f : A → OperationOver E ε B)
   induction items generalizing acc with
   | nil => exact .done _
   | cons item rest ih => exact (safe item).seq fun _ => ih _
+
+theorem Only.filterM (items : List A) (predicate : A → OperationOver E ε Bool)
+    (safe : ∀ item, Only allowed (predicate item).run) : Only allowed (items.filterM predicate).run := by
+  have loop (items acc : List A) : Only allowed (List.filterAuxM predicate items acc).run := by
+    induction items generalizing acc with
+    | nil => exact .done _
+    | cons item rest ih => exact (safe item).seq fun _ => ih _
+  exact (loop items []).seq fun _ => .done _
+
+theorem Only.transaction (inject : {B : Type} → Storage B → E B) (error : Failure → ε)
+    (body : Transaction → OperationOver E ε A)
+    (beginSafe : allowed _ (inject .begin))
+    (commitSafe : ∀ tx, allowed _ (inject (.commit tx)))
+    (rollbackSafe : ∀ tx, allowed _ (inject (.rollback tx)))
+    (safe : ∀ tx, Only allowed (body tx).run) :
+    Only allowed (transactionOver inject error body).run := by
+  unfold transactionOver
+  refine .request beginSafe fun result => ?_
+  cases result with
+  | error _ => exact .done _
+  | ok tx =>
+    apply (safe tx).bind
+    intro result
+    cases result with
+    | error _ => exact .request (rollbackSafe tx) fun _ => .done _
+    | ok _ =>
+      refine .request (commitSafe tx) fun result => ?_
+      cases result with
+      | ok _ => exact .done _
+      | error _ => exact .request (rollbackSafe tx) fun _ => .done _
 
 theorem Only.foldlM (items : List A) (f : B → A → OperationOver E ε B)
     (safe : ∀ b a, Only allowed (f b a).run) (initial : B) :
@@ -174,6 +213,33 @@ inductive Prefix {E : Type → Type} [Interpreter E] {A : Type} :
       (rest : Prefix (resume (Interpreter.handle effect state).1)
         (Interpreter.handle effect state).2 tail final) :
       Prefix (.request effect resume) state tail final
+
+/-- A residual continuation after any finite sequence of replies. No reply
+oracle or unchanged host state is assumed by this syntactic reachability. -/
+inductive Continuation {E : Type → Type} {A : Type} : Program E A → Program E A → Prop where
+  | refl (program : Program E A) : Continuation program program
+  | step {B : Type} (effect : E B) (resume : B → Program E A) (reply : B)
+      {tail : Program E A} (rest : Continuation (resume reply) tail) :
+      Continuation (.request effect resume) tail
+
+theorem Only.continuation {program tail : Program E A} (safe : Only allowed program)
+    (reachable : Continuation program tail) : Only allowed tail := by
+  induction reachable with
+  | refl => exact safe
+  | step effect resume reply rest ih =>
+    cases safe with
+    | request _ replies => exact ih (replies reply)
+
+theorem Only.invariant_prefix [Interpreter E] (invariant : State → Prop)
+    {program tail : Program E A} {state final : State}
+    (safe : Only allowed program) (path : Prefix program state tail final)
+    (effects : ∀ {B} (effect : E B), allowed _ effect → ∀ state, invariant state →
+      invariant (Interpreter.handle effect state).2) (initial : invariant state) : invariant final := by
+  induction path with
+  | refl => exact initial
+  | @step B effect resume state final tail rest ih =>
+    cases safe with
+    | request good replies => exact ih (replies _) (effects effect good state initial)
 
 theorem Only.preserves_prefix [Interpreter E] {program tail : Program E A} {state final : State}
     (safe : Only allowed program) (path : Prefix program state tail final)

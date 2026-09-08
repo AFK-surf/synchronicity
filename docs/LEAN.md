@@ -68,8 +68,9 @@ promise to install every intermediate version during ongoing edits.
 
 ### mptsync goals
 
-These specialize the promises to the actual metadata-sync implementation. They
-are targets, not completed theorems.
+These specialize the promises to the actual metadata-sync implementation. M3 is
+checked under the raw-host and backed-slot contracts below; the other goals remain
+open as whole-system guarantees.
 
 | Goal | Property to establish |
 | --- | --- |
@@ -106,7 +107,7 @@ convergence.
 | CAS | Production Lean local content operations, coverage, retention/repair, durability, collection and projections. Scoped exact-read, unchanged-size transfer/replay, retention and saved-byte advertisement results. | Broader size-change/host failures and cloud/publication/source-hold composition. |
 | Cloud | Production Lean cache/range restoration, associated adoption, hydration and outboard caching; native content/recovery/cancellation tests. | Remaining discovery/upload/finalize/read/serve orchestration and composed proofs. |
 | Identity/authority | Production Lean origin APIs and whole authority/scope reads, including borrowed promotion transactions and materialized delegation updates. Native expiry, grant, corruption and index tests. | Remaining identity lifecycle policy and grant-to-publication/serving proofs. |
-| Replication | Production Lean signed-head acceptance, history/fork retention, pending-fetch lifecycle, promotion and streamed file/provider/delegation views with replica retention. Signature rejection is proved to preserve storage; exchange/contact selection has checked order independence and bounded turns for fixed eligible inputs. Bounded TLA+ recovery checks. | Advertisement observation, recovery/publication orchestration and real scheduling remain Rust. Exact-view/atomic-promotion proofs and M1–M8 composition remain open. |
+| Replication | Production Lean signed-head acceptance, history/fork retention, pending-fetch lifecycle, promotion and streamed file/provider/delegation views with replica retention. M3 obsolete-work safety is checked across acceptance, promotion and suspended requesting/retirement. Exchange/contact selection has checked order independence and bounded turns for fixed eligible inputs. Bounded TLA+ recovery checks. | Advertisement observation, recovery/publication orchestration and real scheduling remain Rust. Exact-view/atomic-promotion proofs and the other mptsync goals remain open. |
 
 Reconciliation reads authority, completeness, slot pointers and derived-view policy
 in the promotion transaction. Failed materialization rolls it back before retiring
@@ -114,32 +115,48 @@ only the judged version. Local metadata type failures remain retryable; structur
 and published-record refusals report a process-local memo key. Rust retains raw
 storage, cryptography, Unicode NFC checks, peer transport, notifications and memo
 storage. The pending-fetch command releases storage sessions across peer waits;
-native regressions cover cancellation, retained progress and retry. These are
-implementation and integration guarantees, not a complete reconciliation theorem.
+native regressions cover cancellation, retained progress and retry. Migration and
+M3 safety do not establish exact views or eventual convergence.
 
-Checked reconciliation components include exact-target abandonment, timestamp
-updates and post-rollback retirement on arbitrary current rows with successful
-storage, and the executed promotion body's no-downgrade guard. When the full acceptance
-command returns `pending`, it is proved to install its candidate in committed pending
-rows, after history trimming and commit; a matching row exists, and every
-matching row has that candidate's sequence and root. Success also requires reading
-both complete/pending floors, beating every decoded floor and executing the slot
-write. Both reads and the pre-write state retain the initial committed heads table
-and the same transaction token: authorization, immutable history recording and slot
-decoding cannot change those heads. Any normal refusal (`badSignature`, `unbound`,
-or `notNewer`) leaves every committed heads row unchanged after the whole command,
-although history retention may change. These acceptance results allow arbitrary
-injected host failures, deriving successful writes and commit from command success.
-History trimming preserves all staged heads and the transaction token even on failure.
-The slot reader's inner join omits orphan pointers. For an initially backed slot
-whose selected rows agree on sequence/root (as primary-key uniqueness guarantees),
-successful acceptance must strictly exceed that initial complete or pending version.
-The proof derives nonempty, pointer-correct reads from raw relational keys; authority
-reads preserve the private database and recording signatures retains prior history.
-Malformed records may cause failure, never successful absence of a backed floor.
-An obsolete advertisement that returns normally preserves every committed heads row.
-Composing all failure paths, promotion and suspended-work interleavings remains open
-for full M3; corrupt/orphan-pointer recovery is not covered by this slot invariant.
+**M3: delayed replies and obsolete work cannot damage newer versions.** The proof
+entry point is `specs/lean/Synchronicity/ReconciliationSafety.lean`.
+
+- Successful acceptance installs its candidate in committed pending rows and must
+  strictly exceed both initially backed complete/pending floors. A matching row
+  exists; every matching row has the candidate's sequence and root. An obsolete
+  advertisement preserves all committed heads on **every** outcome, including
+  metadata, host, commit and rollback failures. Any acceptance failure preserves
+  the entire committed database; even accepting a new pending version preserves
+  complete rows. Authorization, history recording/trimming and slot decoding have
+  checked snapshot/frame properties, not assumed policy answers.
+- The **whole promotion command**, including preparation, materialization, finish
+  and post-rollback retirement, keeps an initially backed complete version present
+  or replaces it only by a strictly newer sequence/root. Its candidate comes from
+  the pending slot in its own transaction snapshot. Readiness/authority checks and
+  materialization cannot substitute another head or commit independently.
+- Every residual requester and retirement program protects every row outside its
+  captured `(origin, pending, sequence, root)` key at every execution prefix, with
+  arbitrary replies, retries and injected failures. This includes a replacement
+  at the same sequence with another root. Each resumption may start from an
+  arbitrary new database: it need not retain the old selection snapshot. The
+  actual requester holds no transaction across any peer wait.
+- The actual outer Fetch is connected to these phases. Selection preserves heads;
+  cached refusals and failed/incomplete work only affect the captured target.
+  Successful requesting calls a **fresh promotion**, not publication of its old
+  captured head/scope. An execution changing a complete row must reach that fresh
+  promotion with the row still present; its final state is the promotion's final
+  state. Finite histories of reordered/duplicated obsolete advertisements and
+  suspended requesting/cleanup segments preserve newer rows.
+
+The version-floor contract requires a backing history row and agreement of the
+selected slot rows on sequence/root, as ordinary primary-key uniqueness ensures.
+The proof derives nonempty, pointer-correct reads from raw relational keys.
+Malformed records may fail, never successfully hide a backed floor. The reader's
+inner join omits orphan pointers; corrupt/orphan-pointer recovery is outside this
+contract. Transactions are exclusive, and each new transaction reads the current
+database. Native SQLite/concurrent refinement remains a tested host contract, not
+a separately verified scheduler or database implementation. M3 imposes no fairness,
+successful-peer, ready-view or eventual-progress assumption.
 
 For M4, every execution prefix of the actual materializer preserves the committed
 database: its streamed file/provider/delegation and retention writes cannot commit

@@ -127,6 +127,35 @@ theorem liveForKey_only (tx : Transaction) (key : ByteArray) (now : Int64) :
   unfold Authorization.liveForKey
   exact (readBindings_only tx _).seq fun bindings => liveAmong_only tx bindings now
 
+theorem liveForOrigin_only (tx : Transaction) (origin : String) (now : Int64) :
+    Only allowed (Authorization.liveForOrigin tx origin now).run := by
+  unfold Authorization.liveForOrigin
+  exact (readBindings_only tx _).seq fun bindings => liveAmong_only tx bindings now
+
+theorem scope_only (tx : Transaction) (origin : Origin.Parsed) :
+    Only allowed (Authorization.materializationScopeIn tx origin).run := by
+  unfold Authorization.materializationScopeIn Authorization.ownOrigin
+  refine Only.seq ?_ fun own => ?_
+  · refine (config_only _ _).seq fun own => ?_
+    cases own with
+    | none => exact .done _
+    | some text => exact (originField_only _ text).seq fun _ => .done _
+  · split
+    · exact .done _
+    · unfold Authorization.localSpacesIn
+      exact ((config_only _ _).seq fun _ => .done _).seq fun _ => .done _
+
+theorem originAuthority_only (tx : Transaction) (origin : Origin.Parsed) (now : Int64) :
+    Only allowed (Authorization.originAuthorityIn tx origin now).run := by
+  unfold Authorization.originAuthorityIn
+  refine (trustInstant_only tx now).seq fun instant => ?_
+  refine (liveForOrigin_only tx _ instant).seq fun live => ?_
+  refine (config_only tx _).seq fun own => ?_
+  refine Only.seq ?_ fun _ => .done _
+  cases own with
+  | none => exact .done _
+  | some text => exact Only.map _ _ (originField_only _ text)
+
 theorem auth_only (operation : Authorization.Action A) (safe : Only allowed operation.run) :
     Only allowed (within Reconcile.authorizationError operation : History.Action A).run := by
   apply Only.within _ _ safe

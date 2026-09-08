@@ -1,19 +1,29 @@
 import VerifiedCore.Replication.Materialize
-import Synchronicity.PrivateDatabase
+import Synchronicity.ReconciliationFrame
 
 /-! Materialization must never publish its intermediate rows. Its callers own
 the transaction containing the version pointer and all derived obligations. -/
 namespace Synchronicity.MaterializationPrivate
 open VerifiedCore VerifiedCore.Host Replication SimulatedHost PrivateDatabase
 
+def storageFrame : Storage A → Prop := ReconciliationFrame.storageAllowed
+
+def accessFrame : Access A → Prop
+  | .update _ selection _ | .delete _ selection => selection.relation ≠ "heads"
+  | .copyRows _ target _ _ _ => target ≠ "heads"
+  | _ => True
+
 def allowed : (A : Type) → Materialize.Effects A → Prop
-  | _, .left e => storagePrivate e
+  | _, .left e => storageFrame e
+  | _, .right (.right (.left e)) => accessFrame e
   | _, .right _ => True
 
 theorem effects_preserve_db (effect : Materialize.Effects A) (safe : allowed _ effect) (state : State) :
     (Interpreter.handle effect state).2.db = state.db := by
   cases effect with
-  | left storage => exact storage_preserves_db storage safe state
+  | left storage =>
+    apply storage_preserves_db storage _ state
+    cases storage <;> first | contradiction | trivial
   | right effect =>
     rcases effect with effect | effect
     · cases effect <;> apply reply_preserves_db <;> intro s <;> rfl
@@ -33,11 +43,11 @@ abbrev Private (operation : Materialize.Action A) := Only allowed operation.run
 theorem pure_private (result : Except Materialize.Error A) :
     Private (ExceptT.mk (Program.pure result)) := .done _
 
-theorem raw_private (effect : Storage (Reply A)) (safe : storagePrivate effect) :
+theorem raw_private (effect : Storage (Reply A)) (safe : storageFrame effect) :
     Private (Materialize.raw effect) := Only.raise _ _ safe
 
 def authAllowed : (A : Type) → Authorization.Effects A → Prop
-  | _, .left e => storagePrivate e
+  | _, .left e => storageFrame e
   | _, .right _ => True
 
 theorem auth_private (operation : Authorization.Action A) (safe : Only authAllowed operation.run) :
@@ -76,26 +86,27 @@ theorem current_private (tx : Transaction) (fields : Fields) : Private (Material
     | (unfold Materialize.rootField; split)
     | split
 
-theorem write_private (tx : Transaction) (table : String) (key values : Fields) (preserve : Bool) :
-    Private (Materialize.write tx table key values preserve) := raw_private _ trivial
+theorem write_private (tx : Transaction) (table : String) (key values : Fields) (preserve : Bool)
+    (different : table ≠ "heads") :
+    Private (Materialize.write tx table key values preserve) := raw_private _ different
 
-theorem erase_private (tx : Transaction) (table : String) (key : Fields) :
+theorem erase_private (tx : Transaction) (table : String) (key : Fields) (different : table ≠ "heads") :
     Private (Materialize.erase tx table key) :=
-  (raw_private (.deleteRows tx table key) trivial).seq fun _ => .done _
+  (raw_private (.deleteRows tx table key) different).seq fun _ => .done _
 
-theorem update_private (tx : Transaction) (table : String) (key values : Fields) :
-    Private (Materialize.update tx table key values) := (Only.raise _ _ trivial).seq fun _ => .done _
+theorem update_private (tx : Transaction) (table : String) (key values : Fields) (different : table ≠ "heads") :
+    Private (Materialize.update tx table key values) := (Only.raise _ _ different).seq fun _ => .done _
 
 theorem wants_private (tx : Transaction) (target : Materialize.Target) (file : Replication.Records.File)
     (root : ByteArray) (now : Int64) : Private (Materialize.wants tx target file root now) := by
   unfold Materialize.wants
   repeat' first
     | exact .done _
-    | exact write_private ..
-    | exact erase_private ..
-    | (refine Only.seq (update_private ..) fun _ => ?_)
+    | (apply write_private; decide)
+    | (apply erase_private; decide)
+    | (refine Only.seq (update_private _ _ _ _ (by decide)) fun _ => ?_)
     | (refine Only.seq (raw_private _ trivial) fun _ => ?_)
-    | (refine Only.seq (write_private ..) fun _ => ?_)
+    | (refine Only.seq (write_private _ _ _ _ _ (by decide)) fun _ => ?_)
     | (refine Only.seq (pure_private _) fun _ => ?_)
     | (refine Only.seq (Only.map _ _ (pure_private _)) fun _ => ?_)
     | (dsimp only; split)
@@ -106,10 +117,10 @@ theorem release_private (tx : Transaction) (target : Materialize.Target) (root :
   unfold Materialize.release
   repeat' first
     | exact .done _
-    | exact update_private ..
+    | (apply update_private; decide)
     | (refine Only.seq (raw_private _ trivial) fun _ => ?_)
     | (refine Only.seq (auth_private _ (config_private _ _)) fun _ => ?_)
-    | (refine Only.seq (erase_private ..) fun _ => ?_)
+    | (refine Only.seq (erase_private _ _ _ (by decide)) fun _ => ?_)
     | (refine Only.seq (Only.foldlM _ _ ?_ _) fun _ => ?_)
     | (intro count row)
     | (refine Only.seq (pure_private _) fun _ => ?_)
@@ -123,13 +134,13 @@ theorem apply_private (tx : Transaction) (origin : String) (now releaseNow : Int
   repeat' first
     | exact .done _
     | exact release_private ..
-    | exact update_private ..
-    | exact erase_private ..
-    | exact write_private ..
+    | (apply update_private; decide)
+    | (apply erase_private; decide)
+    | (apply write_private; decide)
     | (refine Only.seq (current_private ..) fun _ => ?_)
-    | (refine Only.seq (write_private ..) fun _ => ?_)
+    | (refine Only.seq (write_private _ _ _ _ _ (by decide)) fun _ => ?_)
     | (refine Only.seq (wants_private ..) fun _ => ?_)
-    | (refine Only.seq (erase_private ..) fun _ => ?_)
+    | (refine Only.seq (erase_private _ _ _ (by decide)) fun _ => ?_)
     | (refine Only.seq (Only.raise _ _ trivial) fun _ => ?_)
     | (refine Only.seq (pure_private _) fun _ => ?_)
     | (dsimp only; split)
@@ -161,7 +172,7 @@ theorem scope_private (tx : Transaction) (origin : Origin.Parsed) :
       exact Only.seq (Only.seq (config_private _ _) fun _ => .done _) fun _ => .done _
 
 def diffAllowed : (A : Type) → Trie.Diff.Effects A → Prop
-  | _, .left e => storagePrivate e
+  | _, .left e => storageFrame e
   | _, .right _ => True
 
 open Trie.Walk in
@@ -290,5 +301,42 @@ theorem no_partial_view_visible (tx : Transaction) (origin : Origin.Parsed)
     (path : Prefix (Materialize.materialize tx origin oldRoot newRoot).run state continuation final) :
     final.db = state.db :=
   (materialize_private tx origin oldRoot newRoot).preserves_prefix path effects_preserve_db
+
+theorem access_preserves_heads (effect : Access A) (safe : accessFrame effect) (state : State) :
+    ReconciliationFrame.heads (access effect state).2 = ReconciliationFrame.heads state := by
+  cases effect <;> simp only [access]
+  all_goals apply ReconciliationFrame.reply_frame
+  all_goals intro s
+  all_goals first
+    | rfl
+    | (apply ReconciliationFrame.transaction_frame; intro db; first
+        | exact rows_setRows_other _ _ _ _ safe
+        | (simp only [copyRows, rows_setRows_other _ _ _ _ safe]))
+
+theorem effects_preserve_heads (effect : Materialize.Effects A) (safe : allowed _ effect) (state : State) :
+    ReconciliationFrame.heads (Interpreter.handle effect state).2 = ReconciliationFrame.heads state := by
+  cases effect with
+  | left effect => exact ReconciliationFrame.storage_frame effect safe state
+  | right effect =>
+    rcases effect with effect | effect
+    · cases effect <;> apply ReconciliationFrame.reply_frame <;> intro s <;> rfl
+    · rcases effect with effect | effect
+      · exact access_preserves_heads effect safe state
+      · rcases effect with effect | effect
+        · cases effect; apply ReconciliationFrame.reply_frame; intro s; rfl
+        · rcases effect with effect | effect
+          · cases effect; apply ReconciliationFrame.reply_frame; intro s; rfl
+          · rcases effect with effect | effect
+            · cases effect; apply ReconciliationFrame.reply_frame; intro s; rfl
+            · cases effect; apply ReconciliationFrame.reply_frame; intro s; rfl
+
+/-- Derived-view processing cannot alter the head pointer staged by promotion,
+even on failure or a stop in the middle of the streamed diff. -/
+theorem materialize_preserves_heads (tx : Transaction) (origin : Origin.Parsed)
+    (oldRoot newRoot : ByteArray) (state : State) :
+    ReconciliationFrame.heads (execute (Materialize.materialize tx origin oldRoot newRoot) state).2 =
+      ReconciliationFrame.heads state :=
+  (materialize_private tx origin oldRoot newRoot).preserves_observation ReconciliationFrame.heads _
+    effects_preserve_heads state
 
 end Synchronicity.MaterializationPrivate
