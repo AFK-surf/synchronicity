@@ -1,5 +1,4 @@
 import Synchronicity.MptsyncScheduleExecution
-import Synchronicity.Goals.Mptsync.M6
 import Synchronicity.StableAdvertisementProgress
 
 /-! The execution seam from bounded advertisement scheduling to an actual
@@ -91,10 +90,10 @@ theorem scheduled_acceptance
     (opportunity : AcceptanceOpportunity inputs states timeline valid origin latest) :
     ∃ occurrence, Nonempty
       (AcceptedLatestOnTimeline inputs states timeline valid origin latest occurrence) := by
-  have service := Goals.Mptsync.M6.inputs_service inputs
+  have service := inputs.latestDelivered
   obtain ⟨round, before, attempt, attempted, sameItem, delivered, contactBefore,
       peerAttempt, peerAttempted, samePeer, success⟩ :=
-    service.deliveredLatest opportunity.item opportunity.member
+    service opportunity.item opportunity.member
   have targetDelivered : OriginScheduleExecution.DeliveredLatest latest attempt := by
     rw [← opportunity.sameHead]
     exact delivered

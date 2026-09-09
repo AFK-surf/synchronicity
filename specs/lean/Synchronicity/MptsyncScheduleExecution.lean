@@ -54,4 +54,16 @@ structure StableScheduleInputs where
   pendingFit : ∀ item ∈ pendingItems, item.weight.toNat ≤ pendingMaximum
   enoughPendingRounds : (OriginSchedule.index pendingItems).toList.length ≤ pendingRounds
 
+/-- The raw scheduler inputs themselves entail delivery of every latest
+advertisement. Goal modules may package this fact, but operation composition
+depends only on this reusable execution theorem. -/
+theorem StableScheduleInputs.latestDelivered
+    (inputs : StableScheduleInputs) :
+    OriginScheduleExecution.LatestDeliveredOnUsableContact
+      inputs.contacts inputs.peer inputs.advertisements inputs.advertisementLink inputs.latest :=
+  OriginScheduleExecution.every_latest_is_delivered inputs.contacts inputs.peer
+    inputs.advertisements inputs.advertisementLink inputs.latest inputs.advertisementPayloads
+    inputs.advertisementDistinct inputs.advertisementsWithin inputs.advertisementsFit
+    inputs.enoughAdvertisementRounds
+
 end Synchronicity.MptsyncScheduleExecution
