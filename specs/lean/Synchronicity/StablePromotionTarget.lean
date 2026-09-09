@@ -182,7 +182,7 @@ theorem ready_pending_is_selected
 determine the later production promotion candidate. An older complete slot is
 allowed; production's actual strict-newer guard makes pending the selection. -/
 theorem ready_uses_delivered_latest
-    (delivered : StableAdvertisementProgress.DeliveredLatest valid origin latestHead heads)
+    (delivered : StableAdvertisementProgress.DeliveredLatest history latestHead heads)
     (accepted : ObservedAcceptanceFold (Origin.canonical origin) keep initial
       initialState initialView initialSlots heads final state view)
     (initialBound : initial ≤ rank latestHead)
@@ -201,7 +201,7 @@ theorem ready_uses_delivered_latest
 slot observation keeps the same stable maximum, the later fresh preparation
 still reads the delivered latest version from pending. -/
 theorem ready_uses_delivered_latest_after_frames
-    (delivered : StableAdvertisementProgress.DeliveredLatest valid origin latestHead heads)
+    (delivered : StableAdvertisementProgress.DeliveredLatest history latestHead heads)
     (accepted : ObservedAcceptanceFold (Origin.canonical origin) keep initial
       initialState initialView initialSlots heads final acceptedState acceptedView)
     (initialBound : initial ≤ rank latestHead)
@@ -226,7 +226,7 @@ production promotion then establishes the aligned scenario view. Completeness
 is still supplied through `Ready` here and is discharged from the actual
 completion walk by the higher acquisition composition. -/
 theorem actual_promotion_reaches
-    (delivered : StableAdvertisementProgress.DeliveredLatest valid origin latestHead heads)
+    (delivered : StableAdvertisementProgress.DeliveredLatest history latestHead heads)
     (accepted : ObservedAcceptanceFold (Origin.canonical origin) keep initial
       initialState initialView initialSlots heads final state view)
     (initialBound : initial ≤ rank latestHead)
@@ -284,7 +284,7 @@ advertisement fold and the promotion transaction.  The later slot observation
 is tied to the same stable maximum by M3, so no second acceptance or selected
 version premise is needed at promotion time. -/
 theorem actual_promotion_reaches_after_frames
-    (delivered : StableAdvertisementProgress.DeliveredLatest valid origin latestHead heads)
+    (delivered : StableAdvertisementProgress.DeliveredLatest history latestHead heads)
     (accepted : ObservedAcceptanceFold (Origin.canonical origin) keep initial
       initialState initialView initialSlots heads final acceptedState acceptedView)
     (initialBound : initial ≤ rank latestHead)

@@ -23,7 +23,8 @@ constructor instead records that earlier production command and independent
 metadata; the required baseline is transported through acceptance and retry. -/
 inductive PromotionInitialSource (services : MaterializedView.Services)
     (origin : Origin.Parsed)
-    (accepted : MptsyncAdvertisementWindow.AcceptedLatest valid origin latest heads)
+    {history : StableAdvertisementProgress.StableAuthorizedHistory origin}
+    (accepted : MptsyncAdvertisementWindow.AcceptedLatest origin history latest heads)
     (state : SimulatedHost.State) (world : TrieDiffCoverage.World) : Prop where
   | atPromotion
       (evidence : MptsyncPromotionHistory.InitialViewEvidence services origin state world) :
@@ -55,14 +56,16 @@ theorem PromotionInitialSource.initial
 
 /-- The actual promotion observation following one completed retry trace. -/
 structure PromotionWindow (services : MaterializedView.Services)
-    (origin : Origin.Parsed) (target : ViewTarget)
+    (origin : Origin.Parsed)
+    {history : StableAdvertisementProgress.StableAuthorizedHistory origin}
+    (target : ViewTarget)
     (timeline : Nat → SimulatedHost.State) (tailOffset retryStart : Nat)
     (trace : MptsyncStableTail.Trace)
     (schedule : MptsyncScheduleExecution.StableScheduleInputs)
     (advertisementTimeline : MptsyncAdvertisementWindow.AdvertisementTimeline schedule timeline)
     (occurrence : MptsyncAdvertisementWindow.AdvertisementOccurrence schedule)
     (accepted : MptsyncAdvertisementWindow.AcceptedLatestOnTimeline schedule timeline
-      advertisementTimeline valid origin target.head occurrence)
+      advertisementTimeline origin history target.head occurrence)
     (publisher : TrieProgramProofs.RawSnapshot)
     (requirements : FiniteRequirements publisher scope owner root)
     (retry : MptsyncRetryExecution.RetryExecution requirements) where
@@ -97,11 +100,12 @@ and Fetch, while every useful response remains tied to its real admission. -/
 structure StableRun (services : MaterializedView.Services)
     (origin : Origin.Parsed) (target : ViewTarget)
     (timeline : Nat → SimulatedHost.State) (tailOffset : Nat)
-    (trace : MptsyncStableTail.Trace) (valid : Head → Prop) where
+    (trace : MptsyncStableTail.Trace)
+    (history : StableAdvertisementProgress.StableAuthorizedHistory origin) where
   schedule : MptsyncScheduleExecution.StableScheduleInputs
   advertisementTimeline : MptsyncAdvertisementWindow.AdvertisementTimeline schedule timeline
   advertisement : MptsyncAdvertisementWindow.AcceptanceOpportunity
-    schedule timeline advertisementTimeline valid origin target.head
+    schedule timeline advertisementTimeline origin history target.head
   publisher : TrieProgramProofs.RawSnapshot
   scope : Serve.Scope
   owner : Option String
@@ -115,15 +119,15 @@ structure StableRun (services : MaterializedView.Services)
     (Origin.canonical origin) target.head.seq target.head.root requirements retry responseTimeline
   promote : ∀ {occurrence}
     (accepted : MptsyncAdvertisementWindow.AcceptedLatestOnTimeline schedule timeline
-      advertisementTimeline valid origin target.head occurrence),
+      advertisementTimeline origin history target.head occurrence),
     PermittedComplete publisher scope owner root (replicaOfState (retry.state retry.endAt)) →
     Nonempty (PromotionWindow services origin target timeline tailOffset retryStart trace
       schedule advertisementTimeline occurrence accepted publisher requirements retry)
 
 private theorem scheduled_accepted
-    (run : StableRun services origin target timeline tailOffset trace valid) :
+    (run : StableRun services origin target timeline tailOffset trace history) :
     ∃ occurrence, Nonempty (MptsyncAdvertisementWindow.AcceptedLatestOnTimeline
-      run.schedule timeline run.advertisementTimeline valid origin target.head occurrence) :=
+      run.schedule timeline run.advertisementTimeline origin history target.head occurrence) :=
   MptsyncAdvertisementWindow.scheduled_acceptance run.schedule run.advertisementTimeline
     run.advertisement
 
@@ -131,7 +135,7 @@ private theorem scheduled_accepted
 through actual scheduling, acceptance, authorized admissions, retry frames and
 promotion, then remains there under the actual reconciliation tail. -/
 theorem StableRun.converges
-    (run : StableRun services origin target timeline tailOffset trace valid)
+    (run : StableRun services origin target timeline tailOffset trace history)
     (tailObserved : ∀ n, trace.state n = timeline (tailOffset + n))
     (targetOrigin : target.head.origin = origin) :
     EventuallyAlways fun n => CorrectView services origin target (timeline n).db := by
@@ -224,7 +228,8 @@ origin-specific proof is anchored in those same observations. -/
 structure SystemExecution {Device : Type}
     (services : MaterializedView.Services) (scenario : Scenario Device)
     (databases : Nat → Device → Database) (coverage : FiniteCoverage scenario)
-    (valid : Origin.Parsed → Head → Prop) where
+    (history : (origin : Origin.Parsed) →
+      StableAdvertisementProgress.StableAuthorizedHistory origin) where
   timeline : Device → Nat → SimulatedHost.State
   tailTrace : Device → MptsyncStableTail.Trace
   tailOffset : Device → Nat
@@ -232,7 +237,7 @@ structure SystemExecution {Device : Type}
     (tailTrace device).state n = timeline device (tailOffset device + n)
   run : ∀ pair : Device × Origin.Parsed, pair ∈ coverage.pairs →
     StableRun services pair.2 (scenario.target pair.1 pair.2)
-      (timeline pair.1) (tailOffset pair.1) (tailTrace pair.1) (valid pair.2)
+      (timeline pair.1) (tailOffset pair.1) (tailTrace pair.1) (history pair.2)
   observed : ∀ device n, (timeline device n).db = databases n device
 
 end Synchronicity.MptsyncProductionConvergence

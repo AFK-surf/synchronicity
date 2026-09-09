@@ -33,7 +33,7 @@ results nor a pre-existing correct view or tail refinement. -/
 theorem eventual_convergence
     (coverage : FiniteCoverage scenario)
     (execution : MptsyncProductionConvergence.SystemExecution
-      services scenario databases coverage valid) :
+      services scenario databases coverage history) :
     EventuallyConverges services scenario databases := by
   apply finite_targets_converge services scenario databases coverage
   intro pair member

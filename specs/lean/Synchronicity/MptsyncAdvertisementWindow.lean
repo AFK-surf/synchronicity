@@ -10,7 +10,8 @@ open VerifiedCore VerifiedCore.Replication
 open AcceptanceProgress MptsyncConvergence
 
 /-- An actual acceptance fold over precisely one peer-observed Hello payload. -/
-structure AcceptedLatest (valid : Head → Prop) (origin : Origin.Parsed)
+structure AcceptedLatest (origin : Origin.Parsed)
+    (history : StableAdvertisementProgress.StableAuthorizedHistory origin)
     (latest : Head) (heads : List Head) where
   observedAt : Nat
   handledAt : Nat
@@ -23,7 +24,7 @@ structure AcceptedLatest (valid : Head → Prop) (origin : Origin.Parsed)
   initialView : HeadView
   acceptedView : HeadView
   initialSlots : StableSlots initialState (Origin.canonical origin) initial initialView
-  delivered : StableAdvertisementProgress.DeliveredLatest valid origin latest heads
+  delivered : StableAdvertisementProgress.DeliveredLatest history latest heads
   accepted : ObservedAcceptanceFold (Origin.canonical origin) keep initial
     initialState initialView initialSlots heads final acceptedState acceptedView
   initialBound : initial ≤ rank latest
@@ -63,9 +64,10 @@ structure AcceptedLatestOnTimeline
     (inputs : MptsyncScheduleExecution.StableScheduleInputs)
     (states : Nat → SimulatedHost.State)
     (timeline : AdvertisementTimeline inputs states)
-    (valid : Head → Prop) (origin : Origin.Parsed) (latest : Head)
+    (origin : Origin.Parsed)
+    (history : StableAdvertisementProgress.StableAuthorizedHistory origin) (latest : Head)
     (occurrence : AdvertisementOccurrence inputs) where
-  accepted : AcceptedLatest valid origin latest
+  accepted : AcceptedLatest origin history latest
     (OriginScheduleExecution.receivedHeads occurrence.attempt)
   recorded : timeline.occurrenceAt accepted.observedAt = some occurrence
   initialAt : accepted.initialState = states accepted.handledAt
@@ -74,22 +76,23 @@ structure AcceptedLatestOnTimeline
 payload delivered by its bounded production scheduler attempt. -/
 structure AcceptanceOpportunity (inputs : MptsyncScheduleExecution.StableScheduleInputs)
     (states : Nat → SimulatedHost.State) (timeline : AdvertisementTimeline inputs states)
-    (valid : Head → Prop) (origin : Origin.Parsed) (latest : Head) where
+    (origin : Origin.Parsed)
+    (history : StableAdvertisementProgress.StableAuthorizedHistory origin) (latest : Head) where
   item : OriginSchedule.Item
   member : item ∈ inputs.advertisementItems
   sameHead : inputs.latest item = latest
   accept : ∀ occurrence : AdvertisementOccurrence inputs,
     occurrence.item = item →
-    Nonempty (AcceptedLatestOnTimeline inputs states timeline valid origin latest occurrence)
+    Nonempty (AcceptedLatestOnTimeline inputs states timeline origin history latest occurrence)
 
 /-- M6's raw bounded service selects an attempt, and the external healthy-host
 contract executes acceptance over that very attempt's received head list. -/
 theorem scheduled_acceptance
     (inputs : MptsyncScheduleExecution.StableScheduleInputs)
     (timeline : AdvertisementTimeline inputs states)
-    (opportunity : AcceptanceOpportunity inputs states timeline valid origin latest) :
+    (opportunity : AcceptanceOpportunity inputs states timeline origin history latest) :
     ∃ occurrence, Nonempty
-      (AcceptedLatestOnTimeline inputs states timeline valid origin latest occurrence) := by
+      (AcceptedLatestOnTimeline inputs states timeline origin history latest occurrence) := by
   have service := inputs.latestDelivered
   obtain ⟨round, before, attempt, attempted, sameItem, delivered, contactBefore,
       peerAttempt, peerAttempted, samePeer, success⟩ :=

@@ -1,113 +1,148 @@
 import Synchronicity.AdvertisementSelection
-import Synchronicity.AcceptanceProgress
+import Synchronicity.MptsyncAdvertisementWindow
 
-/-! # M2 — advertisement order and duplication do not change selection
+/-! # M2 — one Hello operation is insensitive to order and duplication
 
-This goal observes the actual `Exchange.plan` inputs and result.  Pull origins
-are interpreted as their greatest remote advertised heads, and push positions
-are resolved back through the actual servable input.  Thus the property is
-about selected origins and versions, not incidental list positions.
-
-`ValidAdvertisement` is the native 32-byte root contract and does not assume an
-acceptance result.  The planner helper is followed by a top-level property for
-actual `Reconcile.accept` folds.  Each fold edge carries independent healthy
-signature/authorization/history/floor execution evidence; eventual delivery
-and promotion remain the responsibility of the later convergence goals.
+The goal-level execution below keeps the actual M6 occurrence, its exact wire
+payload, the production `Exchange.plan` call over that payload, and the actual
+`Reconcile.accept` fold together. Its constructors contain only operation
+inputs/results and execution equalities; semantic selection is the conclusion.
 -/
 namespace Synchronicity.Goals.Mptsync.M2
+open VerifiedCore VerifiedCore.Replication
 open VerifiedCore.Replication.Exchange
-open AdvertisementSelection
-open AcceptanceProgress
+open AdvertisementSelection AcceptanceProgress StableAdvertisementProgress
 
-/-- Reordering or duplicating the same valid planner inputs preserves the sets
-of greatest heads selected for pulling and concrete heads selected for pushing. -/
-def SelectionInvariant (ours ours' theirs theirs' served served' : List Advertised) : Prop :=
-  Equivalent theirs theirs' served served'
-    (plan ours theirs served) (plan ours' theirs' served')
+private def advertised (head : Head) : Advertised :=
+  ⟨Origin.canonical head.origin, head.seq, head.root⟩
 
-/-- **M2.** The production exchange planner's semantic selection is invariant
-under advertisement order and duplication at the checked native boundary. -/
-theorem selection_invariant
-    (localSet : SameValidAdvertisements ours ours')
-    (remote : SameValidAdvertisements theirs theirs')
-    (servable : SameValidAdvertisements served served')
-    (leftBound : served.length ≤ UInt64.size)
-    (rightBound : served'.length ≤ UInt64.size) :
-    SelectionInvariant ours ours' theirs theirs' served served' :=
-  plans_equivalent localSet remote servable leftBound rightBound
+private def advertisements (heads : List Head) : List Advertised :=
+  heads.map advertised
 
-/-- Actual handling counterpart of planner selection.  Both witnesses are
-finite chains of production `Reconcile.accept` executions whose positive and
-negative branches are obtained from healthy authorization/history/floor
-certificates. -/
-def HandlingInvariant (origin : String) (keep initial : Nat)
-    (left right : List VerifiedCore.Replication.Head)
-    (leftState rightState leftFinalState rightFinalState : SimulatedHost.State)
-    (leftInitialView rightInitialView leftFinalView rightFinalView : HeadView)
-    (leftStable : StableSlots leftState origin initial leftInitialView)
-    (rightStable : StableSlots rightState origin initial rightInitialView)
-    (leftFinal rightFinal : Nat)
-    (_leftRun : ObservedAcceptanceFold origin keep initial leftState leftInitialView leftStable
-      left leftFinal leftFinalState leftFinalView)
-    (_rightRun : ObservedAcceptanceFold origin keep initial rightState rightInitialView rightStable
-      right rightFinal rightFinalState rightFinalView) : Prop :=
-  AcceptanceExecution keep leftState left leftFinalState ∧
-    AcceptanceExecution keep rightState right rightFinalState ∧
-    leftFinal = rightFinal ∧
-    StableSlots leftFinalState origin leftFinal leftFinalView ∧
-    StableSlots rightFinalState origin rightFinal rightFinalView ∧
-    selectedVersion leftFinalView origin = selectedVersion rightFinalView origin
+private def sentHeads (attempt : OriginScheduleExecution.Attempt) : List Head :=
+  match attempt.payload with
+  | .advertisement sent _ => sent
+  | _ => []
 
-/-- M2's complete boundary: semantic planner choices and subsequent actual
-healthy acceptance handling are both insensitive to order and duplicates. -/
+/-- One actual Hello handling boundary. `planned` invokes production
+`Exchange.plan` on the exact sent/received payload of `occurrence`; `accepted`
+executes production acceptance on that same received list. `servable` is the
+separate native planner input resolved by returned push positions. -/
+structure HelloAcceptanceExecution
+    (inputs : MptsyncScheduleExecution.StableScheduleInputs)
+    (states : Nat → SimulatedHost.State)
+    (timeline : MptsyncAdvertisementWindow.AdvertisementTimeline inputs states)
+    (origin : Origin.Parsed) (history : StableAuthorizedHistory origin)
+    (latest : Head) where
+  occurrence : MptsyncAdvertisementWindow.AdvertisementOccurrence inputs
+  accepted : MptsyncAdvertisementWindow.AcceptedLatestOnTimeline inputs states timeline
+    origin history latest occurrence
+  servable : List Head
+  result : ExchangePlan
+  planned : result = plan (advertisements (sentHeads occurrence.attempt))
+    (advertisements (OriginScheduleExecution.receivedHeads occurrence.attempt))
+    (advertisements servable)
+
+/-- Two actual Hello operations differ only by ordering/duplication of the
+same fixed-width signed heads in each planner input. In particular, the
+received lists compared by the planner are exactly those consumed by the two
+acceptance folds. -/
+structure SameHelloAdvertisements
+    (left : HelloAcceptanceExecution leftInputs leftStates leftTimeline origin history latest)
+    (right : HelloAcceptanceExecution rightInputs rightStates rightTimeline origin history latest) :
+    Prop where
+  sent : SameValidSignedAdvertisements
+    (sentHeads left.occurrence.attempt) (sentHeads right.occurrence.attempt)
+  received : SameValidSignedAdvertisements
+    (OriginScheduleExecution.receivedHeads left.occurrence.attempt)
+    (OriginScheduleExecution.receivedHeads right.occurrence.attempt)
+  servable : SameValidSignedAdvertisements left.servable right.servable
+  leftBound : left.servable.length ≤ UInt64.size
+  rightBound : right.servable.length ≤ UInt64.size
+
+/-- The single user-visible outcome of a Hello operation: semantic pull/push
+choices plus the typed version left by handling its received payload. -/
+structure HelloOutcome where
+  pulls : Advertised → Prop
+  pushes : Advertised → Prop
+  selected : Option HeadVersion
+
+private theorem HelloOutcome.equal (left right : HelloOutcome)
+    (pulls : left.pulls = right.pulls) (pushes : left.pushes = right.pushes)
+    (selected : left.selected = right.selected) : left = right := by
+  cases left
+  cases right
+  simp_all
+
+private def HelloAcceptanceExecution.outcome
+    (execution : HelloAcceptanceExecution inputs states timeline origin history latest) :
+    HelloOutcome :=
+  { pulls := Pulls
+      (advertisements (OriginScheduleExecution.receivedHeads execution.occurrence.attempt))
+      execution.result
+    pushes := Pushes (advertisements execution.servable) execution.result
+    selected := selectedVersion execution.accepted.accepted.acceptedView
+      (Origin.canonical origin) }
+
+/-- **M2 property.** Two order/duplication variants of one stable Hello history
+have one equal operation outcome. This is not a conjunction of an unrelated
+planner theorem and an acceptance theorem: both observations come from each
+`HelloAcceptanceExecution`'s same occurrence and received payload. -/
 def OrderDuplicationInvariant
-    (ours ours' theirs theirs' served served' : List Advertised)
-    (origin : String) (keep initial : Nat)
-    (left right : List VerifiedCore.Replication.Head)
-    (leftState rightState leftFinalState rightFinalState : SimulatedHost.State)
-    (leftInitialView rightInitialView leftFinalView rightFinalView : HeadView)
-    (leftStable : StableSlots leftState origin initial leftInitialView)
-    (rightStable : StableSlots rightState origin initial rightInitialView)
-    (leftFinal rightFinal : Nat)
-    (leftRun : ObservedAcceptanceFold origin keep initial leftState leftInitialView leftStable
-      left leftFinal leftFinalState leftFinalView)
-    (rightRun : ObservedAcceptanceFold origin keep initial rightState rightInitialView rightStable
-      right rightFinal rightFinalState rightFinalView) : Prop :=
-  SelectionInvariant ours ours' theirs theirs' served served' ∧
-    HandlingInvariant origin keep initial left right leftState rightState
-      leftFinalState rightFinalState leftInitialView rightInitialView leftFinalView rightFinalView
-      leftStable rightStable leftFinal rightFinal leftRun rightRun
+    (left : HelloAcceptanceExecution leftInputs leftStates leftTimeline origin history latest)
+    (right : HelloAcceptanceExecution rightInputs rightStates rightTimeline origin history latest) :
+    Prop := left.outcome = right.outcome
 
-/-- **M2.** Reordering or duplicating the same valid advertisements changes
-neither the production exchange plan's semantic choices nor the stable latest
-version produced by actual healthy acceptance executions.  M3's common
-`HeadTransition` refinement for every fold edge is supplied by
-`newer_head_transition` and `obsolete_head_transition`. -/
+private theorem mapped_same_valid (same : SameValidSignedAdvertisements left right) :
+    SameValidAdvertisements (advertisements left) (advertisements right) := by
+  refine ⟨?_, ?_, ?_⟩
+  · intro head member
+    obtain ⟨source, sourceMember, rfl⟩ := List.mem_map.mp member
+    exact same.leftValid source sourceMember
+  · intro head member
+    obtain ⟨source, sourceMember, rfl⟩ := List.mem_map.mp member
+    exact same.rightValid source sourceMember
+  · intro head
+    constructor
+    · intro member
+      obtain ⟨source, sourceMember, rfl⟩ := List.mem_map.mp member
+      exact List.mem_map.mpr ⟨source, (same.same source).mp sourceMember, rfl⟩
+    · intro member
+      obtain ⟨source, sourceMember, rfl⟩ := List.mem_map.mp member
+      exact List.mem_map.mpr ⟨source, (same.same source).mpr sourceMember, rfl⟩
+
+/-- **M2.** Reordering or duplicating the exact signed heads carried by a
+production Hello changes neither `Exchange.plan`'s semantic choices nor the
+selected typed version after actual `Reconcile.accept` handling. The greatest
+head is relative to `StableAuthorizedHistory.Valid`, whose witnesses are raw
+signature, live-authorization and compatible-history executions and contain no
+delivery or selection premise. -/
 theorem order_duplication_invariant
-    (localSet : SameValidAdvertisements ours ours')
-    (remote : SameValidAdvertisements theirs theirs')
-    (servable : SameValidAdvertisements served served')
-    (handled : SameValidSignedAdvertisements left right)
-    (leftBound : served.length ≤ UInt64.size)
-    (rightBound : served'.length ≤ UInt64.size)
-    (leftStable : StableSlots leftState origin initial leftInitialView)
-    (rightStable : StableSlots rightState origin initial rightInitialView)
-    (leftRun : ObservedAcceptanceFold origin keep initial leftState leftInitialView leftStable
-      left leftFinal leftFinalState leftFinalView)
-    (rightRun : ObservedAcceptanceFold origin keep initial rightState rightInitialView rightStable
-      right rightFinal rightFinalState rightFinalView) :
-    OrderDuplicationInvariant ours ours' theirs theirs' served served' origin keep initial
-      left right leftState rightState leftFinalState rightFinalState
-      leftInitialView rightInitialView leftFinalView rightFinalView leftStable rightStable
-      leftFinal rightFinal leftRun rightRun := by
-  constructor
-  · exact selection_invariant localSet remote servable leftBound rightBound
-  · have sameFinal := actual_folds_same_latest handled.same leftRun.actual rightRun.actual
-    have leftObserved := leftRun.final_stable
-    have rightObserved := rightRun.final_stable
-    have rightAtLeft : StableSlots rightFinalState origin leftFinal rightFinalView := by
-      rwa [sameFinal]
-    exact ⟨leftRun.actual.execution, rightRun.actual.execution, sameFinal,
-      leftObserved, rightObserved, stable_slots_selected_equal leftObserved rightAtLeft⟩
+    (left : HelloAcceptanceExecution leftInputs leftStates leftTimeline origin history latest)
+    (right : HelloAcceptanceExecution rightInputs rightStates rightTimeline origin history latest)
+    (same : SameHelloAdvertisements left right) :
+    OrderDuplicationInvariant left right := by
+  have planSame : Equivalent
+      (advertisements (OriginScheduleExecution.receivedHeads left.occurrence.attempt))
+      (advertisements (OriginScheduleExecution.receivedHeads right.occurrence.attempt))
+      (advertisements left.servable) (advertisements right.servable)
+      left.result right.result := by
+    rw [left.planned, right.planned]
+    exact plans_equivalent (mapped_same_valid same.sent)
+      (mapped_same_valid same.received) (mapped_same_valid same.servable)
+      (by simpa [advertisements] using same.leftBound)
+      (by simpa [advertisements] using same.rightBound)
+  have leftSelected := actual_fold_selects_latest
+      left.accepted.accepted.delivered left.accepted.accepted.accepted
+        left.accepted.accepted.initialBound
+  have rightSelected := actual_fold_selects_latest
+      right.accepted.accepted.delivered right.accepted.accepted.accepted
+        right.accepted.accepted.initialBound
+  apply HelloOutcome.equal
+  · funext head
+    exact propext (planSame.1 head)
+  · funext head
+    exact propext (planSame.2 head)
+  · exact leftSelected.trans rightSelected.symm
 
 end Synchronicity.Goals.Mptsync.M2
