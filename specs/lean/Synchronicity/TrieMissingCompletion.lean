@@ -973,6 +973,50 @@ theorem settle_markers_accounted [WorkSet Visit V] [WorkSet ByteArray H]
         · exact ⟨witness, .inl earlier, witnessRequires⟩
       · exact ⟨witness, .inr (List.mem_append.mpr (.inl inDeferred)), witnessRequires⟩
 
+theorem skip_markers_accounted [WorkSet Visit V] [WorkSet ByteArray H]
+    (publisher : TrieProgramProofs.RawSnapshot) (context : Context)
+    (replica : Replica) (work : Work V H) (position : Position) (rest : List Position)
+    (pending : work.frontier.positions = position :: rest)
+    (settled : PositionSettled publisher context replica position)
+    (markers : MarkersAccounted publisher context replica work.frontier) :
+    MarkersAccounted publisher context replica
+      (commit context work position rest .skip).frontier := by
+  intro before marker suffix positions finish evidence required
+  change rest = before ++ marker :: suffix at positions
+  have oldPositions : work.frontier.positions =
+      (position :: before) ++ marker :: suffix := by rw [pending, positions]; rfl
+  rcases markers (position :: before) marker suffix oldPositions finish evidence required with
+    verified | ⟨witness, location, witnessRequires⟩
+  · exact .inl verified
+  · rcases location with inPrefix | inDeferred
+    · rcases List.mem_cons.mp inPrefix with same | earlier
+      · subst witness
+        exact .inl (settled evidence witnessRequires)
+      · exact .inr ⟨witness, .inl earlier, witnessRequires⟩
+    · exact .inr ⟨witness, .inr inDeferred, witnessRequires⟩
+
+theorem absent_markers_accounted [WorkSet Visit V] [WorkSet ByteArray H]
+    (publisher : TrieProgramProofs.RawSnapshot) (context : Context)
+    (replica : Replica) (work : Work V H) (position : Position) (rest : List Position)
+    (pending : work.frontier.positions = position :: rest)
+    (markers : MarkersAccounted publisher context replica work.frontier) :
+    MarkersAccounted publisher context replica
+      (commit context work position rest .absent).frontier := by
+  intro before marker suffix positions finish evidence required
+  change rest = before ++ marker :: suffix at positions
+  have oldPositions : work.frontier.positions =
+      (position :: before) ++ marker :: suffix := by rw [pending, positions]; rfl
+  rcases markers (position :: before) marker suffix oldPositions finish evidence required with
+    verified | ⟨witness, location, witnessRequires⟩
+  · exact .inl verified
+  · right
+    rcases location with inPrefix | inDeferred
+    · rcases List.mem_cons.mp inPrefix with same | earlier
+      · subst witness
+        exact ⟨position, .inr (by simp [commit]), witnessRequires⟩
+      · exact ⟨witness, .inl earlier, witnessRequires⟩
+    · exact ⟨witness, .inr (by simp [commit, inDeferred]), witnessRequires⟩
+
 private theorem pushChildren_keeps_stack (scope : Serve.Scope) (path : ByteArray)
     (children stack : List Position) (position : Position) (member : position ∈ stack) :
     position ∈ pushChildren scope path children stack := by
@@ -1002,6 +1046,65 @@ private theorem pushChildren_adds_child (scope : Serve.Scope) (path : ByteArray)
     · split
       · exact ih _ later
       · exact ih _ later
+
+private theorem pushChildren_append_stack (scope : Serve.Scope) (path : ByteArray)
+    (children stack : List Position) :
+    pushChildren scope path children stack =
+      pushChildren scope path children [] ++ stack := by
+  unfold pushChildren
+  induction children generalizing stack with
+  | nil => rfl
+  | cons child rest ih =>
+    simp only [List.foldl_cons]
+    split
+    · rw [ih ({ child with path := path ++ child.path } :: stack),
+        ih [{ child with path := path ++ child.path }]]
+      simp
+    · rw [ih stack, ih []]
+
+private theorem pushChildren_finish_false (scope : Serve.Scope) (path : ByteArray)
+    (children : List Position) (clear : ∀ child ∈ children, child.finish = false) :
+    ∀ child ∈ pushChildren scope path children [], child.finish = false := by
+  have preserves : ∀ (items stack : List Position),
+      (∀ child ∈ items, child.finish = false) →
+      (∀ child ∈ stack, child.finish = false) →
+      ∀ child ∈ pushChildren scope path items stack, child.finish = false := by
+    intro items
+    induction items with
+    | nil => intro stack itemsClear stackClear; exact stackClear
+    | cons head rest ih =>
+      intro stack itemsClear stackClear
+      simp only [pushChildren, List.foldl_cons]
+      split
+      · apply ih
+        · exact fun child member => itemsClear child (List.mem_cons_of_mem _ member)
+        · intro child member
+          rcases List.mem_cons.mp member with rfl | old
+          · exact itemsClear head (List.mem_cons_self ..)
+          · exact stackClear child old
+      · exact ih _ (fun child member => itemsClear child (List.mem_cons_of_mem _ member)) stackClear
+  exact preserves children [] clear (by simp)
+
+private theorem marker_after_false_prefix (front tail before suffix : List Position)
+    (marker : Position) (clear : ∀ position ∈ front, position.finish = false)
+    (positions : front ++ tail = before ++ marker :: suffix)
+    (finish : marker.finish = true) :
+    ∃ middle, before = front ++ middle ∧ tail = middle ++ marker :: suffix := by
+  rcases List.append_eq_append_iff.mp positions with aligned | overlaps
+  · obtain ⟨middle, beforeEq, tailEq⟩ := aligned
+    exact ⟨middle, beforeEq, tailEq⟩
+  · obtain ⟨overhang, frontEq, markerEq⟩ := overlaps
+    cases overhang with
+    | nil =>
+      simp only [List.append_nil] at frontEq markerEq
+      exact ⟨[], by simpa using frontEq.symm, by simpa using markerEq.symm⟩
+    | cons head rest =>
+      have headIn : head ∈ front := by rw [frontEq]; simp
+      have headClear := clear head headIn
+      have same : marker = head := by simpa using congrArg List.head? markerEq
+      rw [same] at finish
+      rw [headClear] at finish
+      contradiction
 
 /-- The successful production expansion discharges direct evidence with its
 actual reads and transfers recursive evidence to the exact pushed child.  If
@@ -1092,6 +1195,257 @@ theorem inspect_expand_transferred [WorkSet Visit V] [WorkSet ByteArray H]
         ({ position with finish := true } :: rest) child
       · simpa [childrenShape] using childMember
       · exact childAdmitted
+
+theorem inspect_expand_nil_transferred_to_front
+    [WorkSet Visit V] [WorkSet ByteArray H]
+    (publisher : TrieProgramProofs.RawSnapshot) (context : Context)
+    (work : Work V H) (position : Position) (children : List Position)
+    (pendingBranch : Option ByteArray) (routing : Bool)
+    (state final : SimulatedHost.State)
+    (authentic : TrieSnapshotProofs.RecordsIncluded
+      (replicaOfState state).records publisher)
+    (noRef : position.reference = none)
+    (ran : execute (inspect context work.frontier position) state =
+      (.ok (.expand children pendingBranch [] routing), final)) :
+    ∀ evidence, PositionRequires publisher context position evidence →
+      Verified (replicaOfState final) evidence ∨
+        ∃ child, child ∈ pushChildren context.scope position.path children [] ∧
+          PositionRequires publisher context child evidence := by
+  obtain ⟨raw, loaded, loadRun, loadedRun⟩ := inspect_expand_decompose
+    context work.frontier position state final children pendingBranch [] routing noRef ran
+  obtain ⟨prepared, valuesStarted, preparedRun, valuesRun,
+      preparedChildren, preparedPending, preparedRouting⟩ :=
+    inspectLoaded_decompose context work.frontier position raw loaded final
+      children pendingBranch [] routing loadedRun
+  obtain ⟨node, decodedState, decoded, decodedRun⟩ :=
+    prepareLoaded_decompose work.frontier position raw loaded valuesStarted prepared preparedRun
+  have preparedShape := prepareDecoded_no_reference_shape work.frontier position node
+    decodedState valuesStarted prepared noRef decodedRun
+  have childrenShape : children = pairedChildren none node :=
+    preparedChildren.symm.trans preparedShape.2
+  have replicaFinal : replicaOfState final = replicaOfState state := by
+    have preserved := inspect_preserves_replica context work.frontier position state
+    rw [congrArg Prod.snd ran] at preserved
+    exact preserved
+  have authenticFinal : TrieSnapshotProofs.RecordsIncluded
+      (replicaOfState final).records publisher := by simpa [replicaFinal] using authentic
+  have loadedPreserved := inspectLoaded_evidence_read context work.frontier position raw
+    |>.preserves_observation replicaOfState _ evidence_read_effect_preserves_replica loaded
+  change replicaOfState (execute (inspectLoaded context work.frontier position raw) loaded).2 =
+    replicaOfState loaded at loadedPreserved
+  rw [congrArg Prod.snd loadedRun] at loadedPreserved
+  have nodeVerified : Verified (replicaOfState final) (.node position.hash raw) := by
+    have atLoaded := loadOwned_some_has_node context.owner position.hash raw state loaded loadRun
+    simpa [loadedPreserved] using atLoaded
+  have publisherHeld : publisher nodeSpace position.hash = some raw :=
+    authenticFinal nodeSpace position.hash raw (.inl rfl) nodeVerified
+  have valuesRun' : execute (inspectValues context position node) valuesStarted =
+      (.ok [], final) := by simpa [preparedShape.1] using valuesRun
+  intro evidence required
+  rcases TrieMissingTransfer.needs_direct_or_child publisherHeld decoded required with
+    nodeEvidence | provenanceEvidence | valueEvidence | childEvidence
+  · subst evidence
+    exact .inl nodeVerified
+  · obtain ⟨origin, ownerEq, evidenceEq⟩ := provenanceEvidence
+    subst evidence
+    have ownedRun := loadRun
+    rw [ownerEq] at ownedRun
+    have provenanceAtLoaded := (loadOwned_some_verified origin position.hash raw state loaded
+      ownedRun).2
+    exact .inl (by simpa [loadedPreserved] using provenanceAtLoaded)
+  · obtain ⟨address, bytes, evidenceEq, member, heldValue, admitted⟩ := valueEvidence
+    subst evidence
+    obtain ⟨localBytes, localVerified⟩ :=
+      inspectValues_none_verified context position node valuesStarted final admitted valuesRun'
+        address member
+    have publisherLocal := authenticFinal valueSpace address localBytes (.inr rfl) localVerified
+    have sameBytes : localBytes = bytes := Option.some.inj (publisherLocal.symm.trans heldValue)
+    subst localBytes
+    exact .inl localVerified
+  · obtain ⟨child, childMember, below⟩ := childEvidence
+    let pushed : Position := { child with path := position.path ++ child.path }
+    have pushedRequires : PositionRequires publisher context pushed evidence := by
+      unfold PositionRequires
+      simpa [pushed, byteArray_toList_append] using below
+    have childAdmitted : context.scope.admitsPath
+        (position.path ++ child.path).toList = true := by
+      simpa [pushed] using needs_admitted_at pushedRequires
+    right
+    refine ⟨pushed, ?_, pushedRequires⟩
+    apply pushChildren_adds_child context.scope position.path children [] child
+    · simpa [childrenShape] using childMember
+    · exact childAdmitted
+
+/-- With no reference, an actual successful inspection is precisely a seen
+skip, an absent holder, or an expansion; `.boundary` is unreachable. -/
+theorem inspect_no_reference_result [WorkSet Visit V] [WorkSet ByteArray H]
+    (context : Context) (frontier : Frontier V H) (position : Position)
+    (state final : SimulatedHost.State) (checked : Checked)
+    (noRef : position.reference = none)
+    (ran : execute (inspect context frontier position) state = (.ok checked, final)) :
+    (checked = .skip ∧ WorkSet.contains frontier.seen
+      (visit context.scope position.hash position.path) = true) ∨
+    checked = .absent ∨ ∃ children pending absent routing,
+      checked = .expand children pending absent routing := by
+  have first := congrArg Prod.fst ran
+  have depth : ¬ position.path.size > Walk.maxDepthNibbles := by
+    intro tooDeep
+    unfold inspect at first
+    simp only [tooDeep, ↓reduceIte, throw] at first
+    contradiction
+  have refBeq : (position.reference == some position.hash) = false := by simp [noRef]
+  cases seen : WorkSet.contains frontier.seen
+      (visit context.scope position.hash position.path) with
+  | true =>
+    left
+    refine ⟨?_, rfl⟩
+    unfold inspect at ran
+    simp only [depth, refBeq, seen, Bool.false_eq_true, ↓reduceIte,
+      pure, ExceptT.pure, ExceptT.mk, execute, Prod.mk.injEq,
+      Except.ok.injEq] at ran
+    exact ran.1.symm
+  | false =>
+    let tail : Option ByteArray → Missing.Action Checked := fun loaded => match loaded with
+      | none => pure Checked.absent
+      | some raw => do
+        let expansion ← inspectLoaded context frontier position raw
+        return .expand expansion.children expansion.pendingBranch
+          expansion.absentValues expansion.routing
+    have wholeEq : execute (inspect context frontier position) state =
+        execute ((loadOwned context.owner position.hash >>= tail) :
+          Missing.Action Checked) state := by
+      unfold inspect
+      simp only [depth, refBeq, seen, Bool.false_eq_true, ↓reduceIte]
+      rfl
+    have sequenceRun : execute ((loadOwned context.owner position.hash >>= tail) :
+        Missing.Action Checked) state = (.ok checked, final) := wholeEq.symm.trans ran
+    obtain ⟨loaded, middle, loadRun, tailRun⟩ := TransactionSuccess.bind_success
+      (loadOwned context.owner position.hash) tail state final checked sequenceRun
+    cases loaded with
+    | none =>
+      right; left
+      simp [tail, pure, ExceptT.pure, ExceptT.mk, execute, Prod.mk.injEq,
+        Except.ok.injEq] at tailRun
+      exact tailRun.1.symm
+    | some raw =>
+      let finish : Expansion → Missing.Action Checked := fun expansion =>
+        pure (.expand expansion.children expansion.pendingBranch
+          expansion.absentValues expansion.routing)
+      have expansionTail : execute ((inspectLoaded context frontier position raw >>= finish) :
+          Missing.Action Checked) middle = (.ok checked, final) := by
+        simpa [tail, finish] using tailRun
+      obtain ⟨expansion, expanded, expansionRun, finishRun⟩ :=
+        TransactionSuccess.bind_success (inspectLoaded context frontier position raw)
+          finish middle final checked expansionTail
+      right; right
+      refine ⟨expansion.children, expansion.pendingBranch, expansion.absentValues,
+        expansion.routing, ?_⟩
+      simp [finish, pure, ExceptT.pure, ExceptT.mk, execute, Prod.mk.injEq,
+        Except.ok.injEq] at finishRun
+      exact finishRun.1.symm
+
+theorem expand_nonempty_markers_accounted [WorkSet Visit V] [WorkSet ByteArray H]
+    (publisher : TrieProgramProofs.RawSnapshot) (context : Context)
+    (replica : Replica) (work : Work V H) (position : Position) (rest children : List Position)
+    (pendingBranch : Option ByteArray) (first : ByteArray) (more : List ByteArray)
+    (routing : Bool) (pending : work.frontier.positions = position :: rest)
+    (childrenClear : ∀ child ∈ children, child.finish = false)
+    (markers : MarkersAccounted publisher context replica work.frontier) :
+    MarkersAccounted publisher context replica
+      (commit context work position rest
+        (.expand children pendingBranch (first :: more) routing)).frontier := by
+  let front := pushChildren context.scope position.path children []
+  have frontEq : pushChildren context.scope position.path children rest = front ++ rest :=
+    pushChildren_append_stack context.scope position.path children rest
+  have frontClear : ∀ child ∈ front, child.finish = false :=
+    pushChildren_finish_false context.scope position.path children childrenClear
+  intro before marker suffix positions finish evidence required
+  change pushChildren context.scope position.path children rest =
+      before ++ marker :: suffix at positions
+  rw [frontEq] at positions
+  obtain ⟨middle, beforeEq, restEq⟩ :=
+    marker_after_false_prefix front rest before suffix marker frontClear positions finish
+  have oldPositions : work.frontier.positions =
+      (position :: middle) ++ marker :: suffix := by rw [pending, restEq]; rfl
+  rcases markers (position :: middle) marker suffix oldPositions finish evidence required with
+    verified | ⟨witness, location, witnessRequires⟩
+  · exact .inl verified
+  · right
+    rcases location with inPrefix | inDeferred
+    · rcases List.mem_cons.mp inPrefix with same | earlier
+      · subst witness
+        exact ⟨position, .inr (by simp [commit]), witnessRequires⟩
+      · refine ⟨witness, .inl ?_, witnessRequires⟩
+        rw [beforeEq]
+        exact List.mem_append.mpr (.inr earlier)
+    · exact ⟨witness, .inr (by simp [commit, inDeferred]), witnessRequires⟩
+
+theorem expand_empty_markers_accounted [WorkSet Visit V] [WorkSet ByteArray H]
+    (publisher : TrieProgramProofs.RawSnapshot) (context : Context)
+    (replica : Replica) (work : Work V H) (position : Position) (rest children : List Position)
+    (pendingBranch : Option ByteArray) (routing : Bool)
+    (pending : work.frontier.positions = position :: rest)
+    (childrenClear : ∀ child ∈ children, child.finish = false)
+    (transferred : ∀ evidence, PositionRequires publisher context position evidence →
+      Verified replica evidence ∨
+        ∃ child, child ∈ pushChildren context.scope position.path children [] ∧
+          PositionRequires publisher context child evidence)
+    (markers : MarkersAccounted publisher context replica work.frontier) :
+    MarkersAccounted publisher context replica
+      (commit context work position rest
+        (.expand children pendingBranch [] routing)).frontier := by
+  let front := pushChildren context.scope position.path children []
+  let finishPosition : Position := { position with finish := true }
+  have frontEq : pushChildren context.scope position.path children (finishPosition :: rest) =
+      front ++ finishPosition :: rest :=
+    pushChildren_append_stack context.scope position.path children (finishPosition :: rest)
+  have frontClear : ∀ child ∈ front, child.finish = false :=
+    pushChildren_finish_false context.scope position.path children childrenClear
+  intro before marker suffix positions finish evidence required
+  change pushChildren context.scope position.path children (finishPosition :: rest) =
+      before ++ marker :: suffix at positions
+  rw [frontEq] at positions
+  obtain ⟨middle, beforeEq, restEq⟩ := marker_after_false_prefix
+    front (finishPosition :: rest) before suffix marker frontClear positions finish
+  cases middle with
+  | nil =>
+    have same : marker = finishPosition := by
+      simpa using (congrArg List.head? restEq).symm
+    subst marker
+    have originalRequires : PositionRequires publisher context position evidence := by
+      simpa [finishPosition, PositionRequires] using required
+    rcases transferred evidence originalRequires with verified | ⟨child, inFront, childRequires⟩
+    · exact .inl verified
+    · exact .inr ⟨child, .inl (by simpa [beforeEq] using inFront), childRequires⟩
+  | cons head middle =>
+    have splitEq : finishPosition :: rest = head :: (middle ++ marker :: suffix) := by
+      simpa using restEq
+    have headEq : head = finishPosition := (List.cons.inj splitEq).1.symm
+    have laterEq : rest = middle ++ marker :: suffix := (List.cons.inj splitEq).2
+    have oldPositions : work.frontier.positions =
+        (position :: middle) ++ marker :: suffix := by rw [pending, laterEq]; rfl
+    rcases markers (position :: middle) marker suffix oldPositions finish evidence required with
+      verified | ⟨witness, location, witnessRequires⟩
+    · exact .inl verified
+    · rcases location with inPrefix | inDeferred
+      · rcases List.mem_cons.mp inPrefix with same | earlier
+        · subst witness
+          rcases transferred evidence witnessRequires with
+            transferredVerified | ⟨child, inFront, childRequires⟩
+          · exact .inl transferredVerified
+          · right
+            refine ⟨child, .inl ?_, childRequires⟩
+            rw [beforeEq]
+            exact List.mem_append.mpr (.inl inFront)
+        · right
+          refine ⟨witness, .inl ?_, witnessRequires⟩
+          rw [beforeEq]
+          apply List.mem_append.mpr
+          right
+          rw [headEq]
+          exact List.mem_cons_of_mem _ earlier
+      · right
+        exact ⟨witness, .inr (by simpa [commit] using inDeferred), witnessRequires⟩
 
 /-- A skip is safe exactly when the skipped position has already been
 settled (by a sound reference or a semantically accounted prior visit).
@@ -1264,25 +1618,464 @@ theorem pairedChildren_none_have_no_references (node : Node) :
     subst child
     rfl
 
-/-- The remaining positive-walk obligation: successful `inspect`/`commit`
-steps must preserve semantic accounting.  This contract names that precise
-frontier proof boundary without assuming completion. -/
-def InspectRootAccounts (V H : Type) [WorkSet Visit V] [WorkSet ByteArray H]
-    (publisher : TrieProgramProofs.RawSnapshot)
-    (context : Context) (root : ByteArray) : Prop :=
-  ∀ (started walked : SimulatedHost.State) (frontier : Frontier V H) (batch : Batch),
-    execute (Complete.inspectRoot V H context root) started =
-      (.ok (frontier, .ok batch), walked) →
-    FrontierAccountsFor publisher context root (replicaOfState walked) frontier
+theorem pairedChildren_are_entering (node : Node) :
+    ∀ child ∈ pairedChildren none node, child.finish = false := by
+  intro child member
+  cases node with
+  | leaf suffix value => simp [pairedChildren] at member
+  | extension segment hash =>
+    simp only [pairedChildren, List.mem_cons, List.not_mem_nil, or_false] at member
+    subst child
+    rfl
+  | branch children value =>
+    simp only [pairedChildren] at member
+    rcases List.mem_filterMap.mp member with ⟨entry, inEntries, made⟩
+    rcases entry with ⟨candidate, index⟩
+    cases candidate <;> simp_all
+    subst child
+    rfl
+  | route children value =>
+    simp only [pairedChildren] at member
+    rcases List.mem_filterMap.mp member with ⟨entry, inEntries, made⟩
+    rcases entry with ⟨candidate, index⟩
+    cases candidate <;> simp_all
+    subst child
+    rfl
+
+theorem inspect_expand_children_shape [WorkSet Visit V] [WorkSet ByteArray H]
+    (context : Context) (frontier : Frontier V H) (position : Position)
+    (state final : SimulatedHost.State) (children : List Position)
+    (pending : Option ByteArray) (absent : List ByteArray) (routing : Bool)
+    (noRef : position.reference = none)
+    (ran : execute (inspect context frontier position) state =
+      (.ok (.expand children pending absent routing), final)) :
+    (∀ child ∈ children, child.reference = none) ∧
+      ∀ child ∈ children, child.finish = false := by
+  obtain ⟨raw, loaded, loadRun, loadedRun⟩ := inspect_expand_decompose
+    context frontier position state final children pending absent routing noRef ran
+  obtain ⟨prepared, valuesStarted, preparedRun, valuesRun,
+      preparedChildren, preparedPending, preparedRouting⟩ :=
+    inspectLoaded_decompose context frontier position raw loaded final
+      children pending absent routing loadedRun
+  obtain ⟨node, decodedState, decoded, decodedRun⟩ :=
+    prepareLoaded_decompose frontier position raw loaded valuesStarted prepared preparedRun
+  have shape := prepareDecoded_no_reference_shape frontier position node decodedState
+    valuesStarted prepared noRef decodedRun
+  have childrenShape : children = pairedChildren none node := preparedChildren.symm.trans shape.2
+  constructor
+  · intro child member
+    exact pairedChildren_none_have_no_references node child (by simpa [childrenShape] using member)
+  · intro child member
+    exact pairedChildren_are_entering node child (by simpa [childrenShape] using member)
+
+private theorem pushChildren_no_references (scope : Serve.Scope) (path : ByteArray)
+    (children stack : List Position)
+    (childrenClear : ∀ child ∈ children, child.reference = none)
+    (stackClear : ∀ position ∈ stack, position.reference = none) :
+    ∀ position ∈ pushChildren scope path children stack, position.reference = none := by
+  induction children generalizing stack with
+  | nil => exact stackClear
+  | cons child rest ih =>
+    simp only [pushChildren, List.foldl_cons]
+    split
+    · apply ih
+      · exact fun probe member => childrenClear probe (List.mem_cons_of_mem _ member)
+      · intro probe member
+        rcases List.mem_cons.mp member with rfl | old
+        · exact childrenClear child (List.mem_cons_self ..)
+        · exact stackClear probe old
+    · exact ih _ (fun probe member => childrenClear probe (List.mem_cons_of_mem _ member)) stackClear
+
+theorem settle_no_references [WorkSet Visit V] (context : Context) (work : Work V H)
+    (position : Position) (rest : List Position)
+    (pending : work.frontier.positions = position :: rest)
+    (clear : NoReferences work.frontier) :
+    NoReferences (settle context work position rest).frontier := by
+  have positionClear := clear.1 position (by rw [pending]; exact List.mem_cons_self ..)
+  have restClear : ∀ probe ∈ rest, probe.reference = none := fun probe member =>
+    clear.1 probe (by rw [pending]; exact List.mem_cons_of_mem _ member)
+  unfold settle
+  split
+  · exact ⟨restClear, clear.2⟩
+  · refine ⟨restClear, ?_⟩
+    intro probe member
+    rcases List.mem_append.mp member with old | last
+    · exact clear.2 probe old
+    · have same : probe = position := by simpa using last
+      subst probe
+      exact positionClear
+
+theorem commit_no_references [WorkSet Visit V] [WorkSet ByteArray H]
+    (context : Context) (work : Work V H) (position : Position) (rest : List Position)
+    (checked : Checked) (pending : work.frontier.positions = position :: rest)
+    (clear : NoReferences work.frontier)
+    (childrenClear : ∀ children pending absent routing, checked = .expand children pending absent routing →
+      ∀ child ∈ children, child.reference = none) :
+    NoReferences (commit context work position rest checked).frontier := by
+  have positionClear := clear.1 position (by rw [pending]; exact List.mem_cons_self ..)
+  have restClear : ∀ probe ∈ rest, probe.reference = none := fun probe member =>
+    clear.1 probe (by rw [pending]; exact List.mem_cons_of_mem _ member)
+  cases checked with
+  | skip | boundary => exact ⟨restClear, clear.2⟩
+  | absent =>
+    refine ⟨restClear, ?_⟩
+    intro probe member
+    rcases List.mem_cons.mp member with rfl | old
+    · exact positionClear
+    · exact clear.2 probe old
+  | expand children pendingBranch absent routing =>
+    have actualChildren := childrenClear children pendingBranch absent routing rfl
+    by_cases empty : absent.isEmpty
+    · simp only [commit, empty, ↓reduceIte]
+      constructor
+      · apply pushChildren_no_references context.scope position.path children
+        · exact actualChildren
+        · intro probe member
+          rcases List.mem_cons.mp member with rfl | old
+          · exact positionClear
+          · exact restClear probe old
+      · exact clear.2
+    · simp only [commit, empty]
+      constructor
+      · apply pushChildren_no_references context.scope position.path children
+        · exact actualChildren
+        · exact restClear
+      · intro probe member
+        rcases List.mem_cons.mp member with rfl | old
+        · exact positionClear
+        · exact clear.2 probe old
+
+/-- State-indexed invariant for the actual postorder requesting walk.  It
+records the immutable publisher relation together with every fact needed to
+justify a production skip or finish marker. -/
+structure WalkAccounts [WorkSet Visit V] (publisher : TrieProgramProofs.RawSnapshot)
+    (context : Context) (root : ByteArray) (state : SimulatedHost.State)
+    (work : Work V H) : Prop where
+  authentic : TrieSnapshotProofs.RecordsIncluded
+    (replicaOfState state).records publisher
+  accounted : FrontierAccountsFor publisher context root
+    (replicaOfState state) work.frontier
+  seenSettled : SeenSettled publisher context (replicaOfState state) work.frontier
+  markersAccounted : MarkersAccounted publisher context
+    (replicaOfState state) work.frontier
+  noReferences : NoReferences work.frontier
+
+private def SuccessfulAccounts (publisher : TrieProgramProofs.RawSnapshot)
+    (context : Context) (root : ByteArray) (state : SimulatedHost.State) :
+    BatchResult V H → Prop
+  | (frontier, .ok _) =>
+      FrontierAccountsFor publisher context root (replicaOfState state) frontier
+  | (_, .error _) => True
+
+private theorem batchStep_walk_accounts [WorkSet Visit V] [WorkSet ByteArray H]
+    [TrieMissingProofs.LawfulWorkSet Visit V]
+    (publisher : TrieProgramProofs.RawSnapshot) (context : Context)
+    (root : ByteArray) (maximum : Nat) (work : Work V H)
+    (state final : SimulatedHost.State) (result : Work V H ⊕ BatchResult V H)
+    (held : WalkAccounts publisher context root state work)
+    (ran : execute (batchStep context maximum work) state = (.ok result, final)) :
+    match result with
+    | .inl next => WalkAccounts publisher context root final next
+    | .inr answer => SuccessfulAccounts publisher context root final answer := by
+  unfold batchStep at ran
+  cases poisoned : work.frontier.fault with
+  | some fault =>
+    simp only [poisoned, pure, ExceptT.pure, ExceptT.mk, execute] at ran
+    cases ran
+    trivial
+  | none =>
+    simp only [poisoned] at ran
+    cases pending : work.frontier.positions with
+    | nil =>
+      simp only [pending, pure, ExceptT.pure, ExceptT.mk, execute] at ran
+      cases ran
+      exact held.accounted
+    | cons position rest =>
+      simp only [pending] at ran
+      split at ran
+      · cases ran
+        refine ⟨held.authentic,
+          settle_accounts_of_markers publisher context root (replicaOfState state)
+            work position rest pending ?_ held.accounted held.markersAccounted,
+          settle_seen_settled_of_markers publisher context (replicaOfState state)
+            work position rest pending ?_ held.seenSettled held.markersAccounted,
+          settle_markers_accounted publisher context (replicaOfState state)
+            work position rest pending ?_ held.markersAccounted,
+          settle_no_references context work position rest pending held.noReferences⟩
+        all_goals assumption
+      · simp only [ExceptT.mk, ExceptT.run, bind] at ran
+        split at ran
+        · cases ran
+          exact held.accounted
+        · rw [execute_bind] at ran
+          generalize execution : execute (inspect context work.frontier position) state = inspected at ran
+          obtain ⟨reply, after⟩ := inspected
+          cases reply with
+          | error error =>
+            cases ran
+            trivial
+          | ok checked =>
+            have inspected : execute (inspect context work.frontier position) state =
+                (.ok checked, after) := execution
+            have replicaEq : replicaOfState after = replicaOfState state := by
+              have preserved := inspect_preserves_replica context work.frontier position state
+              rw [congrArg Prod.snd inspected] at preserved
+              exact preserved
+            have included : EvidenceIncluded (replicaOfState state) (replicaOfState after) := by
+              rw [replicaEq]
+              exact EvidenceIncluded.refl _
+            have positionClear := held.noReferences.1 position (by
+              rw [pending]
+              exact List.mem_cons_self ..)
+            rcases inspect_no_reference_result context work.frontier position state after
+                checked positionClear inspected with
+              ⟨checkedEq, seen⟩ | checkedEq | ⟨children, pendingBranch, absent, routing, checkedEq⟩
+            · subst checked
+              cases ran
+              have settled : PositionSettled publisher context
+                  (replicaOfState final) position := by
+                rw [replicaEq]
+                exact held.seenSettled position seen
+              exact ⟨by simpa [replicaEq] using held.authentic,
+                skip_commit_accounts context work position rest pending
+                  (by simpa [replicaEq] using held.accounted) settled,
+                (by
+                  intro probe contained
+                  rw [replicaEq]
+                  apply held.seenSettled probe
+                  simpa [commit] using contained),
+                skip_markers_accounted publisher context (replicaOfState final)
+                  work position rest pending settled
+                  (by simpa [replicaEq] using held.markersAccounted),
+                commit_no_references context work position rest .skip pending
+                  held.noReferences (by
+                    intro children pendingBranch absent routing impossible
+                    cases impossible)⟩
+            · subst checked
+              cases ran
+              exact ⟨by simpa [replicaEq] using held.authentic,
+                absent_commit_accounts context work position rest pending
+                  (by simpa [replicaEq] using held.accounted),
+                (by
+                  intro probe contained
+                  rw [replicaEq]
+                  apply held.seenSettled probe
+                  simpa [commit] using contained),
+                absent_markers_accounted publisher context (replicaOfState final)
+                  work position rest pending
+                  (by simpa [replicaEq] using held.markersAccounted),
+                commit_no_references context work position rest .absent pending
+                  held.noReferences (by
+                    intro children pendingBranch absent routing impossible
+                    cases impossible)⟩
+            · subst checked
+              cases ran
+              have shape := inspect_expand_children_shape context work.frontier position
+                state final children pendingBranch absent routing positionClear inspected
+              have transferred := inspect_expand_transferred publisher context work position
+                rest children pendingBranch absent routing state final held.authentic
+                  positionClear inspected
+              have accounted := expand_commit_accounts context work position rest children
+                pendingBranch absent routing pending held.accounted included transferred
+              have markers : MarkersAccounted publisher context (replicaOfState final)
+                  (commit context work position rest
+                    (.expand children pendingBranch absent routing)).frontier := by
+                cases absent with
+                | nil =>
+                  exact expand_empty_markers_accounted publisher context
+                    (replicaOfState final) work position rest children pendingBranch routing
+                    pending shape.2
+                    (inspect_expand_nil_transferred_to_front publisher context work position
+                      children pendingBranch routing state final held.authentic positionClear inspected)
+                    (by simpa [replicaEq] using held.markersAccounted)
+                | cons first more =>
+                  exact expand_nonempty_markers_accounted publisher context
+                    (replicaOfState final) work position rest children pendingBranch first more
+                    routing pending shape.2 (by simpa [replicaEq] using held.markersAccounted)
+              exact ⟨by simpa [replicaEq] using held.authentic, accounted,
+                (by
+                  intro probe contained
+                  rw [replicaEq]
+                  apply held.seenSettled probe
+                  simpa [commit] using contained), markers,
+                commit_no_references context work position rest
+                  (.expand children pendingBranch absent routing) pending held.noReferences
+                  (by intro _ _ _ _ same; cases same; exact shape.1)⟩
+
+private theorem iterate_accounts [Interpreter E]
+    (body : S → Program E (Except ε (S ⊕ R))) (exhausted : ε)
+    (P : SimulatedHost.State → S → Prop)
+    (Q : SimulatedHost.State → R → Prop)
+    (kept : ∀ state start next final, P state start →
+      execute (body start) state = (.ok (.inl next), final) → P final next)
+    (stopped : ∀ state start answer final, P state start →
+      execute (body start) state = (.ok (.inr answer), final) → Q final answer)
+    (fuel : Nat) : ∀ (program : Program E (Except ε (S ⊕ R))) state,
+    (∀ next final, execute program state = (.ok (.inl next), final) → P final next) →
+    (∀ answer final, execute program state = (.ok (.inr answer), final) → Q final answer) →
+    ∀ answer final,
+      execute (Program.iterate body exhausted fuel program) state = (.ok answer, final) →
+      Q final answer := by
+  induction fuel with
+  | zero => intro program state _ _ answer final ran; cases ran
+  | succ fuel ih =>
+    intro program state keeps stops answer final ran
+    match program with
+    | .pure (.error error) => cases ran
+    | .pure (.ok (.inr result)) => cases ran; exact stops _ state rfl
+    | .pure (.ok (.inl next)) =>
+      exact ih (body next) state
+        (fun next' final => kept state next next' final (keeps next state rfl))
+        (fun result final => stopped state next result final (keeps next state rfl))
+        answer final ran
+    | .request effect resume =>
+      rw [execute_iterate_request] at ran
+      cases effectState : Interpreter.handle effect state with
+      | mk reply after =>
+        simp only [execute, effectState] at keeps stops
+        simp only [effectState] at ran
+        exact ih (resume reply) after keeps stops answer final ran
+
+theorem nextBatch_accounts [WorkSet Visit V] [WorkSet ByteArray H]
+    [TrieMissingProofs.LawfulWorkSet Visit V]
+    (publisher : TrieProgramProofs.RawSnapshot) (context : Context)
+    (root : ByteArray) (maximum : Nat) (state final : SimulatedHost.State)
+    (frontier : Frontier V H) (batch : Batch)
+    (authentic : TrieSnapshotProofs.RecordsIncluded
+      (replicaOfState state).records publisher)
+    (rooted : rootOf root = some root)
+    (admitted : context.scope.admitsPath [] = true)
+    (ran : execute (nextBatch context
+      (initial (V := V) (H := H) context none root) maximum) state =
+        (.ok (frontier, .ok batch), final)) :
+    FrontierAccountsFor publisher context root (replicaOfState final) frontier := by
+  let initialWork : Work V H :=
+    ⟨initial (V := V) (H := H) context none root, {}, WorkSet.empty ByteArray⟩
+  let P : SimulatedHost.State → Work V H → Prop :=
+    WalkAccounts publisher context root
+  let Q : SimulatedHost.State → BatchResult V H → Prop :=
+    SuccessfulAccounts publisher context root
+  have initialHeld : P state initialWork :=
+    ⟨authentic,
+      initial_accounts publisher context none root (replicaOfState state) rooted admitted,
+      initial_seen_settled publisher context root (replicaOfState state),
+      initial_markers_accounted publisher context root (replicaOfState state),
+      initial_no_references context root⟩
+  have keeps := fun (state : SimulatedHost.State) (work next : Work V H)
+      (final : SimulatedHost.State) held ran =>
+    batchStep_walk_accounts publisher context root maximum work state final (.inl next) held ran
+  have stops := fun (state : SimulatedHost.State) (work : Work V H)
+      (answer : BatchResult V H) (final : SimulatedHost.State) held ran =>
+    batchStep_walk_accounts publisher context root maximum work state final (.inr answer) held ran
+  unfold nextBatch OperationOver.iterate at ran
+  have result := iterate_accounts (fun work => (batchStep context maximum work).run)
+    Missing.Error.exhausted P Q keeps stops batchFuel _ state
+      (keeps state initialWork · · initialHeld)
+      (stops state initialWork · · initialHeld)
+      (frontier, .ok batch) final ran
+  exact result
+
+/-- Actual `Complete.inspectRoot` is the same requesting walk lifted into the
+larger completion effect algebra.  Its successful exhausted frontier is
+therefore accounted without an external walk-soundness premise. -/
+theorem inspectRoot_accounts [WorkSet Visit V] [WorkSet ByteArray H]
+    [TrieMissingProofs.LawfulWorkSet Visit V]
+    (publisher : TrieProgramProofs.RawSnapshot) (context : Context)
+    (root : ByteArray) (started walked : SimulatedHost.State)
+    (frontier : Frontier V H) (batch : Batch)
+    (authentic : TrieSnapshotProofs.RecordsIncluded
+      (replicaOfState started).records publisher)
+    (rooted : rootOf root = some root)
+    (admitted : context.scope.admitsPath [] = true)
+    (ran : execute (Complete.inspectRoot V H context root) started =
+      (.ok (frontier, .ok batch), walked)) :
+    FrontierAccountsFor publisher context root (replicaOfState walked) frontier := by
+  apply nextBatch_accounts publisher context root 1 started walked frontier batch
+    authentic rooted admitted
+  have lifted : execute (Complete.inspectRoot V H context root) started =
+      execute (nextBatch context (initial (V := V) (H := H) context none root) 1) started := by
+    unfold Complete.inspectRoot
+    exact SimulatedHost.execute_mapEffects Inject.inject
+      (fun effect state => by
+        cases effect with
+        | left storageEffect => rfl
+        | right other => cases other <;> rfl) _ _
+  rw [← lifted]
+  exact ran
 
 theorem inspectRoot_exhausted_complete
     [WorkSet Visit V] [WorkSet ByteArray H]
-    (sound : InspectRootAccounts V H publisher context root)
+    [TrieMissingProofs.LawfulWorkSet Visit V]
+    (authentic : TrieSnapshotProofs.RecordsIncluded
+      (replicaOfState started).records publisher)
+    (rooted : rootOf root = some root)
+    (admitted : context.scope.admitsPath [] = true)
     (ran : execute (Complete.inspectRoot V H context root) started =
       (.ok (frontier, .ok batch), walked))
     (exhausted : frontier.isExhausted = true) :
     PermittedComplete publisher context.scope context.owner root (replicaOfState walked) :=
-  exhausted_accounts_complete (sound started walked frontier batch ran) exhausted
+  exhausted_accounts_complete
+    (inspectRoot_accounts publisher context root started walked frontier batch
+      authentic rooted admitted ran) exhausted
+
+private def administrative (A : Type) : Complete.Effects A → Prop
+  | .left _ => False
+  | .right (.left _) => True
+  | .right (.right _) => True
+
+private theorem scopedKey_administrative (scope : Serve.Scope) (root : ByteArray) :
+    PrivateDatabase.Only administrative
+      (Memo.scopedKey (E := Complete.Effects) Missing.Error.host scope root).run := by
+  unfold Memo.scopedKey
+  cases scope.prefixes <;> simp only
+  · exact .done _
+  · exact PrivateDatabase.Only.raise _ _ trivial
+
+private theorem keyFor_administrative (context : Context) (root : ByteArray) :
+    PrivateDatabase.Only administrative
+      (Memo.keyFor (E := Complete.Effects) Missing.Error.host
+        context.scope root context.owner).run := by
+  unfold Memo.keyFor
+  refine (scopedKey_administrative context.scope root).seq fun narrowed => ?_
+  cases context.owner
+  · exact .done _
+  · exact PrivateDatabase.Only.raise _ _ trivial
+
+private theorem complete_memo_administrative (effect : Host.Memo (Reply A)) :
+    PrivateDatabase.Only administrative (Complete.memo effect).run :=
+  PrivateDatabase.Only.raise _ _ trivial
+
+private theorem administrative_effect_preserves_replica {A : Type}
+    (effect : Complete.Effects A) (safe : administrative A effect)
+    (state : SimulatedHost.State) :
+    replicaOfState (Interpreter.handle effect state).2 = replicaOfState state := by
+  cases effect with
+  | left missingEffect => contradiction
+  | right other =>
+    cases other with
+    | left digestEffect =>
+      cases digestEffect
+      change replicaOfState (SimulatedHost.digest (.blake3 _) state).2 = replicaOfState state
+      simp only [SimulatedHost.digest, reply]
+      split <;> rfl
+    | right memoEffect =>
+      cases memoEffect <;>
+        change replicaOfState (SimulatedHost.memo _ state).2 = replicaOfState state <;>
+        simp only [SimulatedHost.memo, reply] <;>
+        split <;> rfl
+
+theorem keyFor_preserves_replica (context : Context) (root : ByteArray)
+    (state : SimulatedHost.State) :
+    replicaOfState (execute (Memo.keyFor (E := Complete.Effects) Missing.Error.host
+      context.scope root context.owner) state).2 = replicaOfState state :=
+  (keyFor_administrative context root).preserves_observation replicaOfState _
+    administrative_effect_preserves_replica state
+
+theorem complete_memo_preserves_replica (effect : Host.Memo (Reply A))
+    (state : SimulatedHost.State) :
+    replicaOfState (execute (Complete.memo effect) state).2 = replicaOfState state :=
+  (complete_memo_administrative effect).preserves_observation replicaOfState _
+    administrative_effect_preserves_replica state
 
 /-- Meaning assigned by the host to retained memo certificates.  The key is
 the one actually computed by production `Memo.keyFor`; digest collisions and
@@ -1330,9 +2123,13 @@ theorem memo_certify_preserves_replica (key : ByteArray) (generation : UInt64)
     rfl
 
 theorem recheck_true_is_complete [WorkSet Visit V] [WorkSet ByteArray H]
+    [TrieMissingProofs.LawfulWorkSet Visit V]
     (publisher : TrieProgramProofs.RawSnapshot) (context : Context)
     (root key : ByteArray) (state final : SimulatedHost.State)
-    (walkSound : InspectRootAccounts V H publisher context root)
+    (authentic : TrieSnapshotProofs.RecordsIncluded
+      (replicaOfState state).records publisher)
+    (rooted : rootOf root = some root)
+    (admitted : context.scope.admitsPath [] = true)
     (ran : execute (Complete.recheck V H context root key) state = (.ok true, final)) :
     PermittedComplete publisher context.scope context.owner root (replicaOfState final) := by
   obtain ⟨generation, started, walked, frontier, batch, ticket, walk, exhausted, certified⟩ :=
@@ -1340,7 +2137,12 @@ theorem recheck_true_is_complete [WorkSet Visit V] [WorkSet ByteArray H]
       context root key state (congrArg Prod.fst ran)
   have completeAtWalk :
       PermittedComplete publisher context.scope context.owner root (replicaOfState walked) :=
-    inspectRoot_exhausted_complete walkSound walk exhausted
+    inspectRoot_exhausted_complete
+      (by
+        have preserved := complete_memo_preserves_replica (.generation) state
+        rw [congrArg Prod.snd ticket] at preserved
+        simpa [preserved] using authentic)
+      rooted admitted walk exhausted
   have execution := TrieCompleteProofs.recheck_after_walk context root key state started walked
     generation frontier batch ticket walk
   rw [exhausted] at execution
@@ -1376,10 +2178,14 @@ theorem isComplete_known_path_is_complete [WorkSet Visit V] [WorkSet ByteArray H
 justified by frontier accounting; the cached branch is justified by
 `MemoSound`, never by the Boolean cache answer alone. -/
 theorem isComplete_true_is_complete [WorkSet Visit V] [WorkSet ByteArray H]
+    [TrieMissingProofs.LawfulWorkSet Visit V]
     (publisher : TrieProgramProofs.RawSnapshot) (context : Context)
     (root : ByteArray) (state final : SimulatedHost.State)
     (memoSound : MemoSound publisher state)
-    (walkSound : InspectRootAccounts V H publisher context root)
+    (authentic : TrieSnapshotProofs.RecordsIncluded
+      (replicaOfState state).records publisher)
+    (rooted : rootOf root = some root)
+    (admitted : context.scope.admitsPath [] = true)
     (ran : execute (Complete.isComplete V H context root) state = (.ok true, final)) :
     PermittedComplete publisher context.scope context.owner root (replicaOfState final) := by
   have success : (execute (Complete.isComplete V H context root) state).1 = .ok true :=
@@ -1415,6 +2221,15 @@ theorem isComplete_true_is_complete [WorkSet Visit V] [WorkSet ByteArray H]
     simpa [retained.2] using completeAtKeyed
   | false =>
     simp only [tail, Bool.false_eq] at tailRun
-    exact recheck_true_is_complete publisher context root key checked final walkSound tailRun
+    have keyPreserved := keyFor_preserves_replica context root state
+    rw [congrArg Prod.snd keyRun] at keyPreserved
+    have memoPreserved := complete_memo_preserves_replica (.isKnown key) keyed
+    rw [congrArg Prod.snd knownRun] at memoPreserved
+    apply recheck_true_is_complete (V := V) (H := H)
+      publisher context root key checked final
+    · simpa [memoPreserved, keyPreserved] using authentic
+    · exact rooted
+    · exact admitted
+    · exact tailRun
 
 end Synchronicity.TrieMissingCompletion
