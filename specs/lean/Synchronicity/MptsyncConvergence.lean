@@ -104,6 +104,56 @@ theorem eventuallyAlways_of_reached_and_preserved
   obtain ⟨offset, rfl⟩ := Nat.exists_eq_add_of_le after
   exact steps offset
 
+theorem eventuallyAlways_and
+    (left : EventuallyAlways first) (right : EventuallyAlways second) :
+    EventuallyAlways fun now => first now ∧ second now := by
+  obtain ⟨leftStart, left⟩ := left
+  obtain ⟨rightStart, right⟩ := right
+  refine ⟨max leftStart rightStart, fun now after => ⟨?_, ?_⟩⟩
+  · exact left now (Nat.le_trans (Nat.le_max_left _ _) after)
+  · exact right now (Nat.le_trans (Nat.le_max_right _ _) after)
+
+/-- Finitely many independently converging observations have one common
+finite point after which they all remain true. -/
+theorem eventuallyAlways_all_list (items : List A) (property : A → Nat → Prop)
+    (each : ∀ item ∈ items, EventuallyAlways (property item)) :
+    EventuallyAlways fun now => ∀ item ∈ items, property item now := by
+  induction items with
+  | nil => exact ⟨0, fun _ _ item member => nomatch member⟩
+  | cons item rest ih =>
+    have head := each item (List.mem_cons_self ..)
+    have tail := ih fun value member => each value (List.mem_cons_of_mem item member)
+    obtain ⟨start, both⟩ := eventuallyAlways_and head tail
+    refine ⟨start, fun now after value member => ?_⟩
+    have held := both now after
+    rcases List.mem_cons.mp member with rfl | member
+    · exact held.1
+    · exact held.2 value member
+
+/-- A finite enumeration of every participant/origin obligation.  This is an
+input-size condition, not a convergence premise; extra pairs are harmless. -/
+structure FiniteCoverage (scenario : Scenario Device) where
+  pairs : List (Device × Origin.Parsed)
+  covers : ∀ device origin, scenario.participates device → scenario.includes origin →
+    (device, origin) ∈ pairs
+
+/-- Per-device/per-origin convergence lifts to one system-wide stabilization
+point when the participating obligation set is finite. -/
+theorem finite_targets_converge {Device : Type}
+    (services : MaterializedView.Services) (scenario : Scenario Device)
+    (trace : Nat → Device → Database)
+    (coverage : FiniteCoverage scenario)
+    (each : ∀ pair : Device × Origin.Parsed, pair ∈ coverage.pairs →
+      EventuallyAlways fun now =>
+        CorrectView services pair.2 (scenario.target pair.1 pair.2) (trace now pair.1)) :
+    Converges services scenario trace := by
+  obtain ⟨start, all⟩ := eventuallyAlways_all_list coverage.pairs
+    (fun pair now =>
+      CorrectView services pair.2 (scenario.target pair.1 pair.2) (trace now pair.1)) each
+  refine ⟨start, fun now after device member origin included => ?_⟩
+  have correct := all now after
+  exact correct (device, origin) (coverage.covers device origin member included)
+
 /-- Exact views of the same immutable root under the same permission predicate
 agree on every observable file record, even if the two databases contain
 different unrelated rows. -/
