@@ -3,7 +3,6 @@ import Synchronicity.ScheduledFetchAdmission
 import Synchronicity.MptsyncRetryExecution
 import Synchronicity.MptsyncPromotionHistory
 import Synchronicity.ReconciliationViewExecution
-import Synchronicity.Goals.Mptsync.M3
 import Synchronicity.ProductionTimeline
 
 /-! Composition of the actual stable-window executions used by M1.
@@ -40,12 +39,6 @@ structure PromotionWindow (services : MaterializedView.Services)
   acceptanceInitialAt : accepted.initialState = timeline accepted.handledAt
   handledBeforeRetry : accepted.handledAt ≤ retryStart
   acceptedAt : accepted.acceptedState = timeline retryStart
-  observations : List ReconciliationExecution.Observation
-  intervening : ReconciliationExecution.Execution accepted.acceptedState observations
-    (trace.state index)
-  laterView : HeadView
-  laterSlots : StableSlots (trace.state index) (Origin.canonical origin)
-    accepted.final laterView
   world : TrieDiffCoverage.World
   host : MptsyncPromotionHistory.HostContracts (trace.state index) world services
   initial : MptsyncPromotionHistory.InitialViewEvidence services origin
@@ -131,10 +124,15 @@ theorem StableRun.converges
     rw [run.retryAt run.retry.endAt (Nat.le_refl _), tailObserved, window.sameTime]
   have acceptedStart : accepted.acceptedState = run.retry.state 0 := by
     simpa only [Nat.add_zero, run.retryAt 0 (Nat.zero_le _)] using window.acceptedAt
-  have actualBetween : ReconciliationExecution.Execution (run.retry.state 0)
-      window.observations (run.retry.state run.retry.endAt) := by
-    simpa only [← acceptedStart, promotionState] using window.intervening
-  have _actualSafety := Goals.Mptsync.M3.safety actualBetween
+  have acceptedSlots : StableSlots (run.retry.state 0) (Origin.canonical origin)
+      accepted.final accepted.acceptedView := by
+    rw [← acceptedStart]
+    exact accepted.accepted.final_stable
+  have retrySlots := run.retry.stableSlotsAtEnd acceptedSlots
+  have laterSlots : StableSlots (trace.state window.index) (Origin.canonical origin)
+      accepted.final accepted.acceptedView := by
+    rw [← promotionState]
+    exact retrySlots
   have carriedToStart : EvidenceIncluded
       (replicaOfState (run.retry.state run.retry.endAt))
       (replicaOfState (trace.state window.index)) := by
@@ -151,7 +149,7 @@ theorem StableRun.converges
     run.publisher promotionRequirements promotionComplete carriedToPrepared window.reads
   have reachedFinal : CorrectView services origin target ready.final.db := by
     exact StablePromotionTarget.actual_promotion_reaches_after_frames accepted.delivered
-      accepted.accepted accepted.initialBound window.laterSlots ready
+      accepted.accepted accepted.initialBound laterSlots ready
       window.world services window.host.closed window.host.faithful window.host.normalization
       window.host.relational window.initial.initial target targetOrigin rfl
       window.targetSnapshot window.targetScope window.targetReplicas window.targetBefore

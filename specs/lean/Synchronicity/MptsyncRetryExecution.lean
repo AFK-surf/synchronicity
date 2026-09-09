@@ -3,6 +3,7 @@ import Synchronicity.TrieFetchSuspensionProofs
 import Synchronicity.ReconciliationExecution
 import Synchronicity.OriginScheduleExecution
 import Synchronicity.FetchPayloadFrame
+import Synchronicity.AcceptanceProgress
 
 /-! Production execution facts used to reason about mptsync retries.  This
 module deliberately lives outside `Goals`: cancellation, resumption, fresh
@@ -133,35 +134,77 @@ theorem cancellation_preserves_heads
     rows request.cancelled.db "heads" = rows suspended.db "heads" := by
   rw [show request.cancelled.db = suspended.db from abandon_db suspended]
 
-/-- An authorized admission changes only evidence tables, never public head
-slots.  This is derived from the actual `Fetch.admit` program certificate. -/
-theorem admission_preserves_heads
+theorem cancellation_preserves_history
+    (request : CancelledRequest target reference maximum retryLimit initial suspended) :
+    rows request.cancelled.db "head_history" = rows suspended.db "head_history" := by
+  rw [show request.cancelled.db = suspended.db from abandon_db suspended]
+
+theorem cancellation_preserves_entries
+    (request : CancelledRequest target reference maximum retryLimit initial suspended) :
+    rows request.cancelled.db "entries" = rows suspended.db "entries" := by
+  rw [show request.cancelled.db = suspended.db from abandon_db suspended]
+
+/-- An authorized admission preserves any relation distinct from its three
+evidence tables. This is derived from the actual `Fetch.admit` certificate. -/
+theorem admission_preserves_relation (relation : String)
+    (notNodes : Trie.nodeSpace ≠ relation) (notValues : Trie.valueSpace ≠ relation)
+    (notOrigins : "trie_node_origins" ≠ relation)
     (admission : Admission requirements before after) :
-    rows after.db "heads" = rows before.db "heads" := by
+    rows after.db relation = rows before.db relation := by
   refine Admission.rec (motive := fun _ before after _ =>
-    rows after.db "heads" = rows before.db "heads") ?_ ?_ admission
+    rows after.db relation = rows before.db relation) ?_ ?_ admission
   · intro root path hash raw origin serverInitial peerKey publisherOrigin reading
       authority response requirements target decodedNode receiver quiet idle targetOwner
       decoded valid nodesBackend valuesBackend freshNode freshOwner outstanding
     have held := (FetchPayloadFrame.admit_only (H := Std.HashSet ByteArray)
-      "heads" (by decide) (by decide) (by decide)
+      relation notNodes notValues notOrigins
       target false [(path, hash)] [(hash, raw)] []).invariant
-        (TableInvariant.Holds "heads" (rows receiver.db "heads"))
-        (FetchPayloadFrame.effects "heads" (rows receiver.db "heads"))
+        (TableInvariant.Holds relation (rows receiver.db relation))
+        (FetchPayloadFrame.effects relation (rows receiver.db relation))
         { receiver with output := [] }
-        (TableInvariant.closed "heads" { receiver with output := [] } (by simpa using idle))
+        (TableInvariant.closed relation { receiver with output := [] } (by simpa using idle))
     exact held.1
   · intro root path hash bytes owner serverInitial peerKey publisherOrigin reading
       authority response requirements target receiver quiet idle valid large bounded
       nodesBackend valuesBackend fresh outstanding
     have held := (FetchPayloadFrame.admit_only (H := Std.HashSet ByteArray)
-      "heads" (by decide) (by decide) (by decide)
+      relation notNodes notValues notOrigins
       target true [(path, hash)] [(hash, bytes)] []).invariant
-        (TableInvariant.Holds "heads" (rows receiver.db "heads"))
-        (FetchPayloadFrame.effects "heads" (rows receiver.db "heads"))
+        (TableInvariant.Holds relation (rows receiver.db relation))
+        (FetchPayloadFrame.effects relation (rows receiver.db relation))
         { receiver with output := [] }
-        (TableInvariant.closed "heads" { receiver with output := [] } (by simpa using idle))
+        (TableInvariant.closed relation { receiver with output := [] } (by simpa using idle))
     exact held.1
+
+theorem admission_preserves_heads
+    (admission : Admission requirements before after) :
+    rows after.db "heads" = rows before.db "heads" :=
+  admission_preserves_relation "heads" (by decide) (by decide) (by decide) admission
+
+theorem admission_preserves_history
+    (admission : Admission requirements before after) :
+    rows after.db "head_history" = rows before.db "head_history" :=
+  admission_preserves_relation "head_history" (by decide) (by decide) (by decide) admission
+
+theorem admission_preserves_entries
+    (admission : Admission requirements before after) :
+    rows after.db "entries" = rows before.db "entries" :=
+  admission_preserves_relation "entries" (by decide) (by decide) (by decide) admission
+
+def headKeys (db : SimulatedHost.Database) : List (List Cell) :=
+  (rows db "heads").map HeadKeyFrame.key
+
+theorem cancellation_preserves_headKeys
+    (request : CancelledRequest target reference maximum retryLimit initial suspended) :
+    headKeys request.cancelled.db = headKeys suspended.db := by
+  unfold headKeys
+  rw [cancellation_preserves_heads request]
+
+theorem admission_preserves_headKeys
+    (admission : Admission requirements before after) :
+    headKeys after.db = headKeys before.db := by
+  unfold headKeys
+  rw [admission_preserves_heads admission]
 
 /-- Evidence-relevant classification of one effect in the *same* actual
 requester prefix.  Read/wait/rollback effects expose equality of the replica;
@@ -173,7 +216,9 @@ inductive PrefixEvent
     SimulatedHost.State → SimulatedHost.State → Prop where
   | unchanged
       (sameReplica : replicaOfState after = replicaOfState before)
-      (sameHeads : rows after.db "heads" = rows before.db "heads") :
+      (sameHeadKeys : headKeys after.db = headKeys before.db)
+      (sameHistory : rows after.db "head_history" = rows before.db "head_history")
+      (sameEntries : rows after.db "entries" = rows before.db "entries") :
       PrefixEvent requirements effect before after
   | admitted (admission : Admission requirements before after) :
       PrefixEvent requirements effect before after
@@ -182,17 +227,31 @@ theorem PrefixEvent.persistent
     (event : PrefixEvent requirements effect before after) :
     EvidenceIncluded (replicaOfState before) (replicaOfState after) := by
   cases event with
-  | unchanged sameReplica _ =>
+  | unchanged sameReplica _ _ _ =>
       rw [sameReplica]
       exact EvidenceIncluded.refl _
   | admitted admission => exact admission.included
 
-theorem PrefixEvent.preserves_heads
+theorem PrefixEvent.preserves_headKeys
     (event : PrefixEvent requirements effect before after) :
-    rows after.db "heads" = rows before.db "heads" := by
+    headKeys after.db = headKeys before.db := by
   cases event with
-  | unchanged _ sameHeads => exact sameHeads
-  | admitted admission => exact admission_preserves_heads admission
+  | unchanged _ sameHeadKeys _ _ => exact sameHeadKeys
+  | admitted admission => exact admission_preserves_headKeys admission
+
+theorem PrefixEvent.preserves_history
+    (event : PrefixEvent requirements effect before after) :
+    rows after.db "head_history" = rows before.db "head_history" := by
+  cases event with
+  | unchanged _ _ sameHistory _ => exact sameHistory
+  | admitted admission => exact admission_preserves_history admission
+
+theorem PrefixEvent.preserves_entries
+    (event : PrefixEvent requirements effect before after) :
+    rows after.db "entries" = rows before.db "entries" := by
+  cases event with
+  | unchanged _ _ _ sameEntries => exact sameEntries
+  | admitted admission => exact admission_preserves_entries admission
 
 /-- A decomposition indexed by the actual `Prefix` proof.  Unlike the old
 parallel `CommittedFrames` witness, this cannot describe another state chain:
@@ -221,13 +280,29 @@ theorem PrefixEvents.persistent
   | refl => exact EvidenceIncluded.refl _
   | step event events ih => exact event.persistent.trans ih
 
-theorem PrefixEvents.preserves_heads
+theorem PrefixEvents.preserves_headKeys
     (ran : Prefix program before tail after)
     (events : PrefixEvents requirements ran) :
-    rows after.db "heads" = rows before.db "heads" := by
+    headKeys after.db = headKeys before.db := by
   induction events with
   | refl => rfl
-  | step event events ih => exact ih.trans event.preserves_heads
+  | step event events ih => exact ih.trans event.preserves_headKeys
+
+theorem PrefixEvents.preserves_history
+    (ran : Prefix program before tail after)
+    (events : PrefixEvents requirements ran) :
+    rows after.db "head_history" = rows before.db "head_history" := by
+  induction events with
+  | refl => rfl
+  | step event events ih => exact ih.trans event.preserves_history
+
+theorem PrefixEvents.preserves_entries
+    (ran : Prefix program before tail after)
+    (events : PrefixEvents requirements ran) :
+    rows after.db "entries" = rows before.db "entries" := by
+  induction events with
+  | refl => rfl
+  | step event events ih => exact ih.trans event.preserves_entries
 
 /-- Checkpoints include only committed authorized admissions or cancellation
 cleanup at an actual production peer wait. Resumption/restart evidence is
@@ -264,15 +339,35 @@ theorem RetryCheckpoint.persistent
   | restartedCancellation request restarted ran events =>
       exact (cancellation_preserves_evidence request).trans (events.persistent ran)
 
-theorem RetryCheckpoint.preserves_heads
+theorem RetryCheckpoint.preserves_headKeys
     (step : RetryCheckpoint requirements before after) :
-    rows after.db "heads" = rows before.db "heads" := by
+    headKeys after.db = headKeys before.db := by
   cases step with
-  | admitted admission => exact admission_preserves_heads admission
+  | admitted admission => exact admission_preserves_headKeys admission
   | resumedCancellation request resumed ran events =>
-      exact (events.preserves_heads ran).trans (cancellation_preserves_heads request)
+      exact (events.preserves_headKeys ran).trans (cancellation_preserves_headKeys request)
   | restartedCancellation request restarted ran events =>
-      exact (events.preserves_heads ran).trans (cancellation_preserves_heads request)
+      exact (events.preserves_headKeys ran).trans (cancellation_preserves_headKeys request)
+
+theorem RetryCheckpoint.preserves_history
+    (step : RetryCheckpoint requirements before after) :
+    rows after.db "head_history" = rows before.db "head_history" := by
+  cases step with
+  | admitted admission => exact admission_preserves_history admission
+  | resumedCancellation request resumed ran events =>
+      exact (events.preserves_history ran).trans (cancellation_preserves_history request)
+  | restartedCancellation request restarted ran events =>
+      exact (events.preserves_history ran).trans (cancellation_preserves_history request)
+
+theorem RetryCheckpoint.preserves_entries
+    (step : RetryCheckpoint requirements before after) :
+    rows after.db "entries" = rows before.db "entries" := by
+  cases step with
+  | admitted admission => exact admission_preserves_entries admission
+  | resumedCancellation request resumed ran events =>
+      exact (events.preserves_entries ran).trans (cancellation_preserves_entries request)
+  | restartedCancellation request restarted ran events =>
+      exact (events.preserves_entries ran).trans (cancellation_preserves_entries request)
 
 /-- A finite actual retry prefix.  `state` is extended stationarily after
 `endAt` only to reuse the generic liveness measure API; no requester step is
@@ -318,21 +413,141 @@ theorem RetryExecution.carried (execution : RetryExecution requirements) (finish
 
 /-- Public complete/pending rows are unchanged throughout any observed part of
 the finite retry prefix. -/
-theorem RetryExecution.headsFrom (execution : RetryExecution requirements)
+theorem RetryExecution.headKeysFrom (execution : RetryExecution requirements)
     (start span : Nat) (within : start + span ≤ execution.endAt) :
-    rows (execution.state (start + span)).db "heads" =
-      rows (execution.state start).db "heads" := by
+    headKeys (execution.state (start + span)).db =
+      headKeys (execution.state start).db := by
   induction span with
   | zero => rfl
   | succ span ih =>
     rw [Nat.add_succ]
-    exact (execution.step (start + span) (Nat.lt_of_succ_le within)).preserves_heads.trans
+    exact (execution.step (start + span) (Nat.lt_of_succ_le within)).preserves_headKeys.trans
       (ih (Nat.le_trans (Nat.le_succ (start + span)) within))
 
-theorem RetryExecution.headsAtEnd (execution : RetryExecution requirements) :
-    rows (execution.state execution.endAt).db "heads" =
-      rows (execution.state 0).db "heads" := by
-  simpa using execution.headsFrom 0 execution.endAt (by simp)
+theorem RetryExecution.headKeysAtEnd (execution : RetryExecution requirements) :
+    headKeys (execution.state execution.endAt).db =
+      headKeys (execution.state 0).db := by
+  simpa using execution.headKeysFrom 0 execution.endAt (by simp)
+
+theorem RetryExecution.historyFrom (execution : RetryExecution requirements)
+    (start span : Nat) (within : start + span ≤ execution.endAt) :
+    rows (execution.state (start + span)).db "head_history" =
+      rows (execution.state start).db "head_history" := by
+  induction span with
+  | zero => rfl
+  | succ span ih =>
+    rw [Nat.add_succ]
+    exact (execution.step (start + span) (Nat.lt_of_succ_le within)).preserves_history.trans
+      (ih (Nat.le_trans (Nat.le_succ (start + span)) within))
+
+theorem RetryExecution.historyAtEnd (execution : RetryExecution requirements) :
+    rows (execution.state execution.endAt).db "head_history" =
+      rows (execution.state 0).db "head_history" := by
+  simpa using execution.historyFrom 0 execution.endAt (by simp)
+
+theorem RetryExecution.entriesFrom (execution : RetryExecution requirements)
+    (start span : Nat) (within : start + span ≤ execution.endAt) :
+    rows (execution.state (start + span)).db "entries" =
+      rows (execution.state start).db "entries" := by
+  induction span with
+  | zero => rfl
+  | succ span ih =>
+    rw [Nat.add_succ]
+    exact (execution.step (start + span) (Nat.lt_of_succ_le within)).preserves_entries.trans
+      (ih (Nat.le_trans (Nat.le_succ (start + span)) within))
+
+theorem RetryExecution.entriesAtEnd (execution : RetryExecution requirements) :
+    rows (execution.state execution.endAt).db "entries" =
+      rows (execution.state 0).db "entries" := by
+  simpa using execution.entriesFrom 0 execution.endAt (by simp)
+
+private theorem selected_of_headKeys
+    (same : headKeys after = headKeys before)
+    (selected : HeadView.Selected before origin slot row) :
+    ∃ next, HeadView.Selected after origin slot next ∧
+      HeadKeyFrame.key next = HeadKeyFrame.key row := by
+  have member : HeadKeyFrame.key row ∈ headKeys before := by
+    exact List.mem_map.mpr ⟨row, selected.1, rfl⟩
+  rw [← same] at member
+  obtain ⟨next, nextMember, keyEq⟩ := List.mem_map.mp member
+  refine ⟨next, ⟨nextMember, ?_⟩, keyEq⟩
+  exact (HeadView.key_named keyEq).trans selected.2
+
+private theorem represents_of_headKeys
+    (same : headKeys after = headKeys before)
+    (represented : HeadView.Represents before view) :
+    HeadView.Represents after view := by
+  intro origin slot
+  have prior := represented origin slot
+  cases observed : view origin slot with
+  | none =>
+      simp only [observed] at prior
+      simp only
+      rintro ⟨row, selected⟩
+      obtain ⟨old, oldSelected, _⟩ := selected_of_headKeys same.symm selected
+      exact prior ⟨old, oldSelected⟩
+  | some version =>
+      simp only [observed] at prior
+      simp only
+      obtain ⟨old, oldSelected⟩ := prior.1
+      obtain ⟨next, nextSelected, keyEq⟩ := selected_of_headKeys same oldSelected
+      refine ⟨⟨next, nextSelected⟩, ?_⟩
+      intro row selected
+      obtain ⟨old, oldSelected, oldKey⟩ := selected_of_headKeys same.symm selected
+      exact HeadView.key_points oldKey.symm (prior.2 old oldSelected)
+
+private theorem correlated_of_headKey
+    (same : HeadKeyFrame.key after = HeadKeyFrame.key before) :
+    correlated after history
+      [("origin_id", "origin_id"), ("seq", "seq"), ("root", "root")] =
+    correlated before history
+      [("origin_id", "origin_id"), ("seq", "seq"), ("root", "root")] := by
+  obtain ⟨originEq, _, seqEq, rootEq⟩ := HeadView.key_fields same
+  simp [correlated, originEq, seqEq, rootEq]
+
+private theorem named_of_headKeys
+    (same : headKeys after = headKeys before)
+    (member : row ∈ rows before "heads")
+    (named : ReconciliationSlots.names row origin slot = true) :
+    ∃ next, next ∈ rows after "heads" ∧
+      ReconciliationSlots.names next origin slot = true ∧
+      HeadKeyFrame.key next = HeadKeyFrame.key row := by
+  have keyMember : HeadKeyFrame.key row ∈ headKeys before :=
+    List.mem_map.mpr ⟨row, member, rfl⟩
+  rw [← same] at keyMember
+  obtain ⟨next, nextMember, keyEq⟩ := List.mem_map.mp keyMember
+  exact ⟨next, nextMember, (HeadView.key_named keyEq).trans named, keyEq⟩
+
+private theorem storedFloor_of_tables
+    (sameHeads : headKeys after = headKeys before)
+    (sameHistory : rows after "head_history" = rows before "head_history")
+    (stored : ReconciliationRead.StoredFloor before origin slot seq root) :
+    ReconciliationRead.StoredFloor after origin slot seq root := by
+  refine ⟨?_, ?_⟩
+  · obtain ⟨row, member, named, history, historyMember, linked⟩ := stored.backed
+    obtain ⟨next, nextMember, nextNamed, keyEq⟩ :=
+      named_of_headKeys sameHeads member named
+    refine ⟨next, nextMember, nextNamed, history, ?_, ?_⟩
+    · rwa [sameHistory]
+    · rwa [correlated_of_headKey keyEq]
+  · intro row member named
+    obtain ⟨old, oldMember, oldNamed, keyEq⟩ :=
+      named_of_headKeys sameHeads.symm member named
+    have pointer := stored.pointer old oldMember oldNamed
+    obtain ⟨_, _, seqEq, rootEq⟩ := HeadView.key_fields keyEq
+    exact ⟨seqEq.symm.trans pointer.1, rootEq.symm.trans pointer.2⟩
+
+/-- The actual finite retry prefix transports the complete typed/backed slot
+observation from acceptance to the promotion boundary; it does not re-assume
+the selected maximum at promotion time. -/
+theorem RetryExecution.stableSlotsAtEnd (execution : RetryExecution requirements)
+    (stable : AcceptanceProgress.StableSlots (execution.state 0) origin latest view) :
+    AcceptanceProgress.StableSlots (execution.state execution.endAt) origin latest view := by
+  refine ⟨represents_of_headKeys execution.headKeysAtEnd stable.represents, ?_, stable.valid,
+    stable.maximum⟩
+  intro selectedOrigin slot version observed
+  exact storedFloor_of_tables execution.headKeysAtEnd execution.historyAtEnd
+    (stable.backed selectedOrigin slot version observed)
 
 /-- An actual bounded replication fetch returned its `abandoned` report.  In
 production this report is emitted only after the inner trie requester returns
