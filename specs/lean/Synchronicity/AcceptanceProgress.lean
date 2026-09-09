@@ -523,6 +523,24 @@ theorem versionRank_injective (left right : HeadVersion)
   cases right
   simp_all
 
+/-- Production's strict sequence/root order strictly increases the same
+fixed-width rank used by actual advertisement selection. -/
+theorem versionRank_lt_of_newer (old next : HeadVersion)
+    (oldValid : old.root.size = 32) (nextValid : next.root.size = 32)
+    (newer : next.Newer old) : versionRank old < versionRank next := by
+  have orderSpec : old.seq < next.seq ∨ old.seq = next.seq ∧
+      List.Lex (· < ·) old.root.data.toList next.root.data.toList := by
+    rcases newer with sequence | ⟨sequence, root⟩
+    · exact Or.inl sequence
+    · exact Or.inr ⟨sequence.symm, List.lex_lt.mpr root⟩
+  have compared := (ExchangeVersionProofs.version_order_is_sequence_then_root
+    (advertisedVersion old) (advertisedVersion next)
+    (by simpa [advertisedVersion] using oldValid)
+    (by simpa [advertisedVersion] using nextValid)).mpr (by
+      simpa [advertisedVersion] using orderSpec)
+  simpa [versionRank, advertisedVersion,
+    VerifiedCore.Replication.Exchange.version] using compared
+
 /-- The operation-independent sequence/root order used by `LatestValid`
 agrees with the production acceptance/exchange rank on native-width heads. -/
 theorem rank_le_of_version_order (candidate latest : Head)
