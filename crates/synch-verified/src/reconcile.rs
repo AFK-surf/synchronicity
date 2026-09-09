@@ -130,3 +130,22 @@ pub fn materialize<S: host::Storage>(
         },
     ))
 }
+
+/// Atomically change the node's read permission and invalidate every derived
+/// foreign view, completion claim and retry age established under the old one.
+pub fn change_scope<S: host::Storage>(
+    storage: &mut S,
+    crypto: &mut dyn host::Crypto<Error = S::Error>,
+    spaces: Option<Vec<String>>,
+    now: i64,
+) -> Result<bool, crate::history::Error<S::Error>> {
+    CommandError::finish(run(
+        storage,
+        Capabilities {
+            crypto: Some(crypto),
+            ..Capabilities::default()
+        },
+        &[],
+        &Command::AuthChangeScope { spaces, now },
+    ))
+}

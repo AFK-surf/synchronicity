@@ -265,8 +265,11 @@ type Dialed = std::sync::Mutex<HashMap<(NodeId, &'static [u8]), Connection>>;
 struct RefuseHeads;
 
 impl crate::HeadSink for RefuseHeads {
-    fn local_summaries(&self) -> Result<Vec<synch_core::HeadSummary>, NetError> {
-        Ok(Vec::new())
+    fn local_summaries(
+        &self,
+        _peer: synch_core::NodeId,
+    ) -> Result<(Vec<synch_core::HeadSummary>, Option<synch_core::OriginId>), NetError> {
+        Ok((Vec::new(), None))
     }
 
     fn observe_summaries_from(

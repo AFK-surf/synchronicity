@@ -21,7 +21,8 @@ inductive Event where
   | selection (origin : Origin.Parsed) (expected : Option (UInt64 × ByteArray))
   | abandonment (target : Trie.Fetch.Target)
   | settlement (origin : Origin.Parsed) (refused : List (UInt64 × ByteArray × ByteArray))
-      (target : Trie.Fetch.Target) (key : UInt64 × ByteArray × ByteArray) (result : Except Promote.Error Bool)
+      (scope : Trie.Serve.Scope) (target : Trie.Fetch.Target) (key : UInt64 × ByteArray × ByteArray)
+      (result : Except Promote.Error Bool)
 
 /-- Only execution facts belong here. In particular, no "safe", "newer",
 successful-result or target-mismatch premise is required to take a step. -/
@@ -51,10 +52,11 @@ inductive Step : Event → State → State → Prop where
       Step (.abandonment target) state
         (execute (within Fetch.fetchError (Trie.Fetch.abandon target) : Fetch.Action Unit) state).2
   | settlement (origin : Origin.Parsed) (refused : List (UInt64 × ByteArray × ByteArray))
-      (target : Trie.Fetch.Target) (key : UInt64 × ByteArray × ByteArray) (result : Except Promote.Error Bool)
+      (scope : Trie.Serve.Scope) (target : Trie.Fetch.Target) (key : UInt64 × ByteArray × ByteArray)
+      (result : Except Promote.Error Bool)
       (state : State) (closed : state.pending = none) :
-      Step (.settlement origin refused target key result) state
-        (execute (FetchLifecycle.settle origin refused target key result) state).2
+      Step (.settlement origin refused scope target key result) state
+        (execute (FetchLifecycle.settle origin refused scope target key result) state).2
 
 structure Observation where
   event : Event
@@ -78,7 +80,7 @@ def captures (event : Event) (state : State) : List CapturedHead :=
   | .promotion origin now _ => PromotionTransition.captures origin now state
   | .request target .. | .abandonment target => [TargetTransition.fetchKey target]
   | .retirement pending => [TargetTransition.pendingKey pending]
-  | .settlement origin _ target _ result => FetchTransition.captures origin target result state
+  | .settlement origin _ _ target _ result => FetchTransition.captures origin target result state
 
 /-- Every actual operation refines the same operation-independent relation. -/
 theorem Step.refines (step : Step event state final)
@@ -98,7 +100,7 @@ theorem Step.refines (step : Step event state final)
     exact FetchTransition.selection origin expected state closed before after
   | abandonment target state closed =>
     exact FetchTransition.abandonment target state closed before after
-  | settlement origin refused target key result state closed =>
-    exact FetchTransition.settlement origin refused target key result state closed before backed after
+  | settlement origin refused scope target key result state closed =>
+    exact FetchTransition.settlement origin refused scope target key result state closed before backed after
 
 end Synchronicity.ReconciliationExecution

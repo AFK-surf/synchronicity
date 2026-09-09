@@ -109,6 +109,104 @@ fn an_unheld_reference_never_hides_missing_shared_structure() {
 }
 
 #[test]
+fn shared_dag_descendants_stay_pending_until_the_shared_visit_is_settled() {
+    use synch_mpt::{Nibbles, TrieNode, ValueRef};
+
+    let leaf = TrieNode::Leaf {
+        key_rest: Nibbles::new(),
+        value: ValueRef::Inline(b"shared value".to_vec()),
+    };
+    let mut shared_children = [None; 16];
+    shared_children[2] = Some(leaf.hash());
+    let shared = TrieNode::Branch {
+        children: shared_children,
+        value: None,
+    };
+    let mut root_children = [None; 16];
+    root_children[0] = Some(shared.hash());
+    root_children[1] = Some(shared.hash());
+    let root_node = TrieNode::Branch {
+        children: root_children,
+        value: None,
+    };
+    let root = root_node.hash();
+
+    let dir = tempfile::tempdir().unwrap();
+    let destination = Store::open(dir.path()).unwrap();
+    destination.put_node(&root, &root_node.encode()).unwrap();
+    destination
+        .put_node(&shared.hash(), &shared.encode())
+        .unwrap();
+    let origin = OriginId::named("fixture", "example.test").unwrap();
+
+    // Stop at the first real peer suspension. Both absolute occurrences of
+    // the shared branch must still contribute their missing descendant. A
+    // preorder `seen` insertion used to prune the second occurrence here.
+    let mut observed_paths = Vec::new();
+    let cancelled = destination.fetch_trie(
+        root,
+        &origin,
+        1,
+        &Scope::full(),
+        None,
+        None,
+        64,
+        3,
+        |request| {
+            let PeerRequest::Nodes { wants, .. } = request else {
+                panic!("the fixture has only inline values")
+            };
+            observed_paths = wants.iter().map(|(path, _)| path.clone()).collect();
+            assert!(wants
+                .iter()
+                .all(|(_, hash)| hash.as_slice() == leaf.hash().as_bytes()));
+            None
+        },
+    );
+    assert!(cancelled.is_err());
+    observed_paths.sort();
+    assert_eq!(observed_paths, vec![vec![0, 2], vec![1, 2]]);
+    assert!(!Trie::new(&destination).is_complete(root).unwrap());
+    assert!(!destination.is_known_complete(&root).unwrap());
+
+    // One content-addressed response satisfies both retained positions. The
+    // completed walk must then expose both keys before it can certify root.
+    assert!(destination
+        .fetch_trie(
+            root,
+            &origin,
+            1,
+            &Scope::full(),
+            None,
+            None,
+            64,
+            3,
+            |request| {
+                let PeerRequest::Nodes { wants, .. } = request else {
+                    panic!("the fixture has only inline values")
+                };
+                assert!(wants
+                    .iter()
+                    .all(|(_, hash)| hash.as_slice() == leaf.hash().as_bytes()));
+                Some(PeerReply::Nodes {
+                    served: vec![(leaf.hash().as_bytes().to_vec(), leaf.encode())],
+                    missing: vec![],
+                    redacted: vec![],
+                })
+            },
+        )
+        .unwrap()
+        .unwrap());
+    assert!(Trie::new(&destination).is_complete(root).unwrap());
+    for key in [[0x02], [0x12]] {
+        assert_eq!(
+            Trie::new(&destination).get(root, &key).unwrap(),
+            Some(b"shared value".to_vec())
+        );
+    }
+}
+
+#[test]
 fn a_shared_missing_payload_is_requested_once_per_round_until_it_arrives() {
     let source = MemStore::new();
     let payload = vec![4; 300];

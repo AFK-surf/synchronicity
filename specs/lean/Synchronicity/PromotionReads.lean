@@ -200,6 +200,38 @@ theorem slot_origin (tx : Transaction) (origin : Origin.Parsed) (name : String)
       rfl
     · cases succeeded
 
+/-- A successful nonempty slot read comes from an actual selected raw heads
+row in the transaction snapshot. This is the converse direction needed when a
+later write must inherit an invariant from the pending row it read. -/
+theorem slot_selected (tx : Transaction) (origin : Origin.Parsed) (name : String)
+    (state : State) (db : Database) (opened : state.pending = some (tx, db))
+    (pending : Promote.Pending)
+    (succeeded : (execute (Promote.slot tx origin name) state).1 = .ok (some pending)) :
+    ∃ row ∈ rows db "heads",
+      ReconciliationSlots.names row (Origin.canonical origin) name = true := by
+  unfold Promote.slot at succeeded
+  obtain ⟨scan, middle, scanned, succeeded⟩ :=
+    TrieServePrivacyProofs.bind_ok _ _ _ _ succeeded
+  have queried := scan_rows tx db state opened origin name scan (congrArg Prod.fst scanned)
+  cases scanRows : scan.rows with
+  | nil =>
+      rw [scanRows] at succeeded
+      simp only at succeeded
+      split at succeeded <;> cases succeeded
+  | cons projected rest =>
+      have member : projected ∈ query db "heads" History.headColumns
+          [("origin_id", .text (Origin.canonical origin)), ("slot", .text name)] []
+            History.headJoin := by
+        rw [← queried, scanRows]
+        exact List.mem_cons_self
+      rw [ReconciliationRead.slot_query] at member
+      obtain ⟨joined, selected, rfl⟩ := List.mem_map.mp member
+      obtain ⟨joinedMember, named⟩ := List.mem_filter.mp selected
+      obtain ⟨row, rowMember, historyMember⟩ := List.mem_flatMap.mp joinedMember
+      obtain ⟨history, _, rfl⟩ := List.mem_map.mp historyMember
+      rw [ReconciliationRead.joined_names] at named
+      exact ⟨row, rowMember, named⟩
+
 theorem slot_floor (tx : Transaction) (origin : Origin.Parsed) (name : String)
     (state : State) (db : Database) (opened : state.pending = some (tx, db))
     (seq : Int64) (root : ByteArray)

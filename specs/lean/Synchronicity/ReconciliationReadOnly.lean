@@ -77,6 +77,19 @@ theorem originField_only (column text : String) :
   refine (parse_only Authorization.validateKey (fun _ => .request trivial fun _ => .done _) text).seq fun result => ?_
   cases result <;> exact .done _
 
+theorem ownOrigin_only (tx : Transaction) :
+    Only allowed (Authorization.ownOrigin tx).run := by
+  unfold Authorization.ownOrigin
+  refine (config_only tx _).seq fun own => ?_
+  cases own with
+  | none => exact .done _
+  | some text => exact (originField_only _ text).seq fun _ => .done _
+
+theorem localSpaces_only (tx : Transaction) :
+    Only allowed (Authorization.localSpacesIn tx).run := by
+  unfold Authorization.localSpacesIn
+  exact (config_only tx _).seq fun _ => .done _
+
 theorem keyField_only (column : String) (bytes : ByteArray) :
     Only allowed (Authorization.keyField column bytes).run := by
   unfold Authorization.keyField

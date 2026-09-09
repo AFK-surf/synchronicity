@@ -63,11 +63,11 @@ inductive StaleStep (row : Fields) : State → State → Prop where
       (state : State) (closed : state.pending = none) :
       StaleStep row state (execute (FetchLifecycle.select origin expected) state).2
   | settlement (origin : Origin.Parsed) (refused : List (UInt64 × ByteArray × ByteArray))
-      (target : Trie.Fetch.Target) (key : UInt64 × ByteArray × ByteArray)
+      (scope : Trie.Serve.Scope) (target : Trie.Fetch.Target) (key : UInt64 × ByteArray × ByteArray)
       (result : Except Promote.Error Bool) (notComplete : result ≠ .ok true)
       (state : State) (closed : state.pending = none)
       (different : equals row (Trie.Fetch.targetRows target) = false) :
-      StaleStep row state (execute (FetchLifecycle.settle origin refused target key result) state).2
+      StaleStep row state (execute (FetchLifecycle.settle origin refused scope target key result) state).2
 
 theorem StaleStep.retains (step : StaleStep row state final)
     (present : row ∈ rows state.db "heads") : row ∈ rows final.db "heads" := by
@@ -82,8 +82,8 @@ theorem StaleStep.retains (step : StaleStep row state final)
   | selection origin expected state closed =>
     exact ((FetchLifecycle.select_only row origin expected).invariant (ProtectedHead.retained row)
       (FetchLifecycle.effects_retain row) state (ProtectedHead.initial row state closed present)).1
-  | settlement origin refused target key result notComplete state closed different =>
-    exact ((FetchLifecycle.settle_without_publication row origin refused target key result notComplete different).invariant
+  | settlement origin refused scope target key result notComplete state closed different =>
+    exact ((FetchLifecycle.settle_without_publication row origin refused scope target key result notComplete different).invariant
       (ProtectedHead.retained row) (FetchLifecycle.effects_retain row) state
       (ProtectedHead.initial row state closed present)).1
 

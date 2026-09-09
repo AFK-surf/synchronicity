@@ -108,11 +108,13 @@ theorem batchStep_interrupted [WorkSet Visit V] [WorkSet ByteArray H] (context :
     (maximum : Nat) (work : Work V H) (position : Position) (rest : List Position)
     (state after : State) (error : Missing.Error)
     (healthy : work.frontier.fault = none) (pending : work.frontier.positions = position :: rest)
+    (entering : position.finish = false)
     (room : work.batch.size < maximum)
     (interrupted : execute (inspect context work.frontier position) state = (.error error, after)) :
     execute (batchStep context maximum work) state =
       (.ok (.inr (failed work.frontier error, .error error)), after) := by
-  simp only [batchStep, healthy, pending, Nat.not_le.mpr room, ↓reduceIte, ExceptT.mk,
+  simp only [batchStep, healthy, pending, entering, Bool.false_eq_true, Nat.not_le.mpr room,
+    ↓reduceIte, ExceptT.mk,
     ExceptT.run, bind, execute_bind, interrupted, pure, execute]
 
 /-- A terminal fault is returned before any host effect, regardless of
@@ -220,7 +222,15 @@ theorem commit_admitted [WorkSet Visit V] [WorkSet ByteArray H] (context : Conte
     · exact atPath
     · exact held.2.1 want old
   | expand children pendingBranch values routing =>
-    refine ⟨⟨pushChildren_admitted _ _ _ _ tail, ?_⟩, held.2.1,
+    have finishTail : PositionsAdmitted context.scope
+        (if values.isEmpty then { position with finish := true } :: rest else rest) := by
+      split
+      · intro child mem
+        rcases List.mem_cons.mp mem with rfl | old
+        · exact atPath
+        · exact tail child old
+      · exact tail
+    refine ⟨⟨pushChildren_admitted _ _ _ _ finishTail, ?_⟩, held.2.1,
       askValues_admitted _ _ _ _ _ atPath held.2.2⟩
     change PositionsAdmitted context.scope (if values.isEmpty then work.frontier.deferred
       else position :: work.frontier.deferred)
@@ -236,6 +246,25 @@ theorem finished_admitted (scope : Serve.Scope) (work : Work V H)
   subst batch
   exact ⟨fun want mem => held.2.1 want (List.mem_reverse.mp mem),
     fun want mem => held.2.2 want (List.mem_reverse.mp mem)⟩
+
+theorem settle_admitted [WorkSet Visit V] (context : Context) (work : Work V H)
+    (position : Position) (rest : List Position)
+    (held : WorkAdmitted context.scope work)
+    (pending : work.frontier.positions = position :: rest) :
+    WorkAdmitted context.scope (settle context work position rest) := by
+  have atPath := held.1.1 position (by rw [pending]; exact List.mem_cons_self ..)
+  have tail : PositionsAdmitted context.scope rest := fun child member =>
+    held.1.1 child (by rw [pending]; exact List.mem_cons_of_mem _ member)
+  unfold settle
+  split
+  · exact ⟨⟨tail, held.1.2⟩, held.2⟩
+  · refine ⟨⟨tail, ?_⟩, held.2⟩
+    intro child member
+    rcases List.mem_append.mp member with old | last
+    · exact held.1.2 child old
+    · have same : child = position := by simpa using last
+      rw [same]
+      exact atPath
 
 /-- Every successful step keeps its frontier and accumulated wants within
 scope, or returns an answer with the same property. This needs no assumptions
@@ -267,20 +296,25 @@ theorem batchStep_admitted [WorkSet Visit V] [WorkSet ByteArray H] (context : Co
       split at ran
       · have same := Except.ok.inj ran
         subst result
-        exact finished_admitted _ _ held
-      · simp only [ExceptT.mk, ExceptT.run, bind, execute_bind] at ran
-        generalize execution : execute (inspect context work.frontier position) state = inspected at ran
-        obtain ⟨reply, after⟩ := inspected
-        cases reply with
-        | error error =>
-          have same := Except.ok.inj ran
+        exact settle_admitted context work position rest held pending
+      · simp only [ExceptT.mk, ExceptT.run, bind] at ran
+        split at ran
+        · have same := Except.ok.inj ran
           subst result
-          refine ⟨?_, fun _ impossible => nomatch impossible⟩
-          cases error <;> exact held.1
-        | ok checked =>
-          have same := Except.ok.inj ran
-          subst result
-          exact commit_admitted context work position rest checked held pending
+          exact finished_admitted _ _ held
+        · rw [execute_bind] at ran
+          generalize execution : execute (inspect context work.frontier position) state = inspected at ran
+          obtain ⟨reply, after⟩ := inspected
+          cases reply with
+          | error error =>
+            have same := Except.ok.inj ran
+            subst result
+            refine ⟨?_, fun _ impossible => nomatch impossible⟩
+            cases error <;> exact held.1
+          | ok checked =>
+            have same := Except.ok.inj ran
+            subst result
+            exact commit_admitted context work position rest checked held pending
 
 /-- Every reported want is at a scope-admitted position, for any batch
 size and any host state. The returned frontier preserves that fact for
@@ -336,13 +370,15 @@ def summary (result : Except Missing.Error (BatchResult (List Visit) (List ByteA
 again on a resumed round, then exhaustion follows only after it arrives. -/
 theorem missing_value_repeats_until_it_arrives :
     let first := batchRun full initialFull 64 withoutValue
-    (summary first.1 == .ok (.ok ⟨[], [(bytes atLeafB, valueHash)], []⟩, false, [], [leafBHash])) ∧
+    (summary first.1 == .ok (.ok ⟨[], [(bytes atLeafB, valueHash)], []⟩, false, [],
+      [leafBHash, leafAHash, lowerHash, extHash, rootHash])) ∧
     (match first.1 with
       | .error _ => false
       | .ok (frontier, _) =>
         let retry := batchRun full (resume full frontier) 64 withoutValue
         let complete := batchRun full (resume full frontier) 64 withValue
-        summary retry.1 == .ok (.ok ⟨[], [(bytes atLeafB, valueHash)], []⟩, false, [], [leafBHash]) &&
+        summary retry.1 == .ok (.ok ⟨[], [(bytes atLeafB, valueHash)], []⟩, false, [],
+          [leafBHash, leafAHash, lowerHash, extHash, rootHash]) &&
         summary complete.1 == .ok (.ok {}, true, [], []) &&
         complete.2.trace == ["bytes:" ++ nodeSpace, "bytes:" ++ valueSpace]) = true := by
   decide +kernel
@@ -355,7 +391,26 @@ theorem shared_value_defers_every_holder :
           ((nodeSpace, leafAHash), encode (.leaf (bytes [0]) (.hash valueHash))),
           ((nodeSpace, leafBHash), encode (.leaf (bytes [1]) (.hash valueHash)))] }
     let first := batchRun full initialFull 64 state
-    summary first.1 == .ok (.ok ⟨[], [(bytes [2], valueHash)], []⟩, false, [], [leafAHash, leafBHash]) := by
+    summary first.1 == .ok (.ok ⟨[], [(bytes [2], valueHash)], []⟩, false, [],
+      [leafAHash, leafBHash, rootHash]) := by
+  decide +kernel
+
+/-- A shared DAG node reached at two distinct paths cannot enter `seen` after
+the first path discovers an unfinished payload.  Both holders remain
+retryable; the old preorder insertion skipped the second occurrence. -/
+theorem unfinished_shared_dag_visit_is_not_seen :
+    let state : State :=
+      { files := [
+          ((nodeSpace, rootHash),
+            encode (.branch (slots [(1, leafAHash), (2, leafAHash)]) none)),
+          ((nodeSpace, leafAHash), encode (.leaf (bytes [0]) (.hash valueHash)))] }
+    let first := batchRun full initialFull 64 state
+    (match first.1 with
+      | .error _ => false
+      | .ok (frontier, result) =>
+        result == .ok ⟨[], [(bytes [2], valueHash)], []⟩ &&
+        frontier.seen == [] &&
+        frontier.deferred.map Position.hash == [leafAHash, leafAHash, rootHash]) = true := by
   decide +kernel
 
 /-- A refused node remains missing on a grant's spine as well as inside it.
@@ -378,7 +433,8 @@ theorem a_held_boundary_is_expanded :
     let context : Context := ⟨onLeafB, none⟩
     let state := { withoutValue with redacted := [(rootHash, bytes [])] }
     summary (batchRun context (initial context none rootHash) 64 state).1 ==
-      .ok (.ok ⟨[], [(bytes atLeafB, valueHash)], []⟩, false, [], [leafBHash]) := by
+      .ok (.ok ⟨[], [(bytes atLeafB, valueHash)], []⟩, false, [],
+        [leafBHash, lowerHash, extHash, rootHash]) := by
   decide +kernel
 
 /-- A confined root needs provenance even when another origin supplied all
@@ -436,11 +492,11 @@ labels; a different extension label deliberately supplies no reference. -/
 theorem children_pair_only_at_the_same_position :
     (pairedChildren (some (.branch (slots [(1, leafAHash), (2, leafBHash)]) none))
       (.branch (slots [(1, extHash), (3, lowerHash)]) none) ==
-        [⟨some leafAHash, extHash, bytes [1]⟩, ⟨none, lowerHash, bytes [3]⟩]) ∧
+        [⟨some leafAHash, extHash, bytes [1], false⟩, ⟨none, lowerHash, bytes [3], false⟩]) ∧
     (pairedChildren (some (.extension (bytes [1, 2]) leafAHash))
-      (.extension (bytes [1, 2]) leafBHash) == [⟨some leafAHash, leafBHash, bytes [1, 2]⟩]) ∧
+      (.extension (bytes [1, 2]) leafBHash) == [⟨some leafAHash, leafBHash, bytes [1, 2], false⟩]) ∧
     (pairedChildren (some (.extension (bytes [1, 3]) leafAHash))
-      (.extension (bytes [1, 2]) leafBHash) == [⟨none, leafBHash, bytes [1, 2]⟩]) := by
+      (.extension (bytes [1, 2]) leafBHash) == [⟨none, leafBHash, bytes [1, 2], false⟩]) := by
   decide +kernel
 
 /-- A failed empty scan cannot stand for absence. A row already returned

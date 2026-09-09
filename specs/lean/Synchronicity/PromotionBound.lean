@@ -172,10 +172,16 @@ theorem body_only (origin : Origin.Parsed) (floor : History.Pointer) (tx : Trans
         · refine (putSlot_only origin floor tx pending.head sameOrigin newer pending.received now).seq fun _ => ?_
           refine (clear_only origin floor tx).seq fun _ => ?_
           exact (materialize_only origin floor tx previous.head.root pending.head.root).seq fun _ => .done _
-      cases authority.publication with
-      | untrusted => exact Only.seq (.done _) tail
-      | unrestricted => exact Only.seq (.done _) tail
-      | confined _ => exact (Only.map _ _ (reads_only _ _ _ (PromotionReads.scopeCheck_only tx _ _))).seq tail
+      have permission : Only (safe (Origin.canonical origin) floor)
+          (Promote.permitted tx pending authority).run := by
+        unfold Promote.permitted
+        cases authority.publication with
+        | untrusted => exact .done _
+        | unrestricted => exact .done _
+        | confined _ =>
+            exact Only.map _ _
+              (reads_only _ _ _ (PromotionReads.scopeCheck_only tx _ _))
+      exact permission.seq tail
 
 theorem retire_only (origin : String) (floor : History.Pointer) (pending : Promote.Pending) :
     Only (safe origin floor) (Promote.retire pending).run := by

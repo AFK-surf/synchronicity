@@ -17,10 +17,7 @@ open VerifiedCore VerifiedCore.Host VerifiedCore.Commands VerifiedCore.Replicati
 /-- The authority check executed after completeness, in the same transaction. -/
 def permitted (tx : Transaction) (pending : Promote.Pending)
     (authority : Authorization.OriginAuthority) : Promote.Action Bool :=
-  match authority.publication with
-  | .untrusted => pure false
-  | .unrestricted => pure true
-  | .confined _ => (·.isNone) <$> PromotionReads.scopeCheck tx pending.head.root authority.publicationKeys
+  Promote.permitted tx pending authority
 
 /-- Actual successful phases of the body. `complete` records the executable
 check's answer; it deliberately does not define the meaning of a ready view. -/
@@ -56,29 +53,22 @@ theorem body_published (tx : Transaction) (origin : Origin.Parsed) (now : Int64)
     | false => cases ran
     | true =>
       simp only [Bool.not_true, Bool.false_eq_true, ↓reduceIte] at ran
-      cases publication : authority.publication <;> simp only [publication] at ran
-      all_goals
-        obtain ⟨allowed, authorized, authorizedRun, ran⟩ := bind_success _ _ _ _ _ ran
-        cases allowed with
-        | false =>
-          obtain ⟨_, _, _, impossible⟩ := bind_success _ _ _ _ _ ran
-          cases impossible
-        | true =>
-          simp only [Bool.not_true, Bool.false_eq_true, ↓reduceIte] at ran
-          obtain ⟨_, written, writtenRun, ran⟩ := bind_success _ _ _ _ _ ran
-          obtain ⟨_, cleared, clearedRun, ran⟩ := bind_success _ _ _ _ _ ran
-          obtain ⟨count, staged, stagedRun, returned⟩ := bind_success _ _ _ _ _ ran
-          have same : staged = final := congrArg Prod.snd returned
-          subst staged
-          refine ⟨by simpa using newer, checked, authorized, written, cleared, count,
-            checkedRun, ?_, writtenRun, clearedRun, ?_⟩
-          · simp only [permitted, publication, PromotionReads.scopeCheck]
-            first
-            | exact authorizedRun
-            | apply Eq.trans _ authorizedRun
-              congr 8
-          · exact OperationExecution.within_success PromotionReads.materialize_agrees
-              Promote.materializeError _ _ _ _ stagedRun
+      obtain ⟨allowed, authorized, authorizedRun, ran⟩ := bind_success _ _ _ _ _ ran
+      cases allowed with
+      | false =>
+        obtain ⟨_, _, _, impossible⟩ := bind_success _ _ _ _ _ ran
+        cases impossible
+      | true =>
+        simp only [Bool.not_true, Bool.false_eq_true, ↓reduceIte] at ran
+        obtain ⟨_, written, writtenRun, ran⟩ := bind_success _ _ _ _ _ ran
+        obtain ⟨_, cleared, clearedRun, ran⟩ := bind_success _ _ _ _ _ ran
+        obtain ⟨count, staged, stagedRun, returned⟩ := bind_success _ _ _ _ _ ran
+        have same : staged = final := congrArg Prod.snd returned
+        subst staged
+        refine ⟨by simpa using newer, checked, authorized, written, cleared, count,
+          checkedRun, authorizedRun, writtenRun, clearedRun, ?_⟩
+        exact OperationExecution.within_success PromotionReads.materialize_agrees
+          Promote.materializeError _ _ _ _ stagedRun
 
 /-- All effects before the body's return leave the committed database intact,
 including the early complete-slot write and every retention update. -/

@@ -18,6 +18,15 @@ def originFault : ReconcileDomainError → Bool
   | .fetch (.nodeHash _) | .fetch (.valueHash _) | .fetch (.unsolicited ..) | .fetch .exhausted => false
   | e => Promote.originFault e
 
+/-- A suspended requester may resume after the node's read permission moved.
+Re-read the production materialization scope before any destructive settlement;
+the captured scope is evidence for fetching content-addressed bytes, not
+authority to retire work under a later permission. -/
+def scopeApplies (origin : Origin.Parsed) (captured : Trie.Serve.Scope) : Action Bool :=
+  lift (transactionOver Inject.inject Promote.Error.host fun tx => do
+    let current ← Promote.auth (Authorization.materializationScopeIn tx origin)
+    return current == captured)
+
 def fetch (origin : Origin.Parsed) (expected : Option (UInt64 × ByteArray))
     (refused : List (UInt64 × ByteArray × ByteArray)) (maximum retryLimit : Nat) : Action FetchReport := do
   let selected ← lift (transactionOver Inject.inject Promote.Error.host fun tx => do
@@ -35,19 +44,27 @@ def fetch (origin : Origin.Parsed) (expected : Option (UInt64 × ByteArray))
   let target : Trie.Fetch.Target := ⟨pending.head.root, Origin.canonical origin, pending.head.seq,
     ⟨scope, owner.map Origin.canonical⟩⟩
   if refused.contains key then
-    within fetchError (Trie.Fetch.abandon target)
-    return ⟨⟨.refused, none, none⟩, false⟩
+    if ← scopeApplies origin scope then
+      within fetchError (Trie.Fetch.abandon target)
+      return ⟨⟨.refused, none, none⟩, false⟩
+    return ⟨⟨.idle, none, none⟩, false⟩
   let result ← attempt (within fetchError (Trie.Fetch.fetch (Std.HashSet Trie.Missing.Visit)
     (Std.HashSet ByteArray) target reference maximum retryLimit))
   match result with
-  | .ok false => return ⟨⟨.idle, none, none⟩, true⟩
+  | .ok false =>
+    if ← scopeApplies origin scope then
+      within fetchError (Trie.Fetch.abandon target)
+      return ⟨⟨.idle, none, none⟩, true⟩
+    return ⟨⟨.idle, none, none⟩, false⟩
   | .ok true =>
     let now ← raise Promote.Error.host Clock.nowNs
     return ⟨← lift (Promote.promote origin now refused), false⟩
   | .error (.domain error) =>
     if originFault error then
-      within fetchError (Trie.Fetch.abandon target)
-      return ⟨⟨.refused, some error, some key⟩, false⟩
+      if ← scopeApplies origin scope then
+        within fetchError (Trie.Fetch.abandon target)
+        return ⟨⟨.refused, some error, some key⟩, false⟩
+      return ⟨⟨.idle, none, none⟩, false⟩
     throw (.domain error)
   | .error error => throw error
 

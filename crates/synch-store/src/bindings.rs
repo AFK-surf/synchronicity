@@ -3,7 +3,7 @@
 //! Every trust check and every head verification goes through here — nothing in
 //! the durable data model references a bare device key as an identity.
 
-use rusqlite::{params, OptionalExtension};
+use rusqlite::params;
 use synch_core::{NodeId, OriginId};
 use synch_mpt::Scope;
 
@@ -576,71 +576,15 @@ impl Store {
     /// what the new scope adds. This node's own origin is never touched: it
     /// built that trie and there is nobody to refetch it from.
     pub fn set_read_scope(&self, spaces: Option<&[String]>) -> Result<bool> {
-        let current = self.local_scope()?;
-        let next = spaces.map(|s| s.to_vec());
-        if current == next {
-            return Ok(false);
-        }
-        // All of it in one transaction, so a crash cannot leave the new scope
-        // beside the old scope's rows, its boundaries, or its heads.
-        self.transaction(|txn| {
-            match &next {
-                None => txn.clear_config("local_scope")?,
-                Some(spaces) => txn.set_config("local_scope", &encode_spaces(spaces))?,
-            }
-            // A boundary records where a walk *stopped*, which is a fact about
-            // a scope and not about a node: widen the grant and the same node
-            // stands at the same position, still marked as a boundary, so the
-            // walk skips a subtree this node is now entitled to and
-            // `is_complete_scoped` answers complete for a trie it does not
-            // hold. Dropped whole rather than re-keyed; one round re-learns any
-            // that still stand.
-            txn.clear_redacted()?;
-            let own: Option<String> = txn
-                .conn()
-                .query_row(
-                    "SELECT value FROM config WHERE key = 'self_origin_id'",
-                    [],
-                    |r| r.get(0),
-                )
-                .optional()?;
-            for stored in txn.all_heads(crate::heads::Slot::Complete)? {
-                let origin = &stored.head.origin;
-                if own.as_deref() == Some(origin.canonical().as_str()) {
-                    continue;
-                }
-                txn.delete_origin_entries(origin)?;
-                txn.delete_origin_providers(origin)?;
-                txn.delete_origin_delegations(origin)?;
-                // Back to pending rather than deleted: the head is still a
-                // signed statement this node verified, and demoting it is
-                // exactly the claim that changed — this node no longer holds
-                // the trie under it, because "holds it whole" is a question
-                // about a scope and the scope just moved.
-                //
-                // Unless the pending slot already holds something newer. A
-                // `put_head` replaces whatever is in the slot, so demoting
-                // over a newer pending head would drop that head to
-                // `head_history`, lower `head_floor` to the demoted one, and
-                // buy a fetch and a promotion for a root the next exchange
-                // re-adopts past. The newer head is the one this node wants
-                // to fill under the new scope; the demoted one is history.
-                let pending = txn.head(origin, crate::heads::Slot::Pending)?;
-                let outranked = pending
-                    .as_ref()
-                    .is_some_and(|p| !stored.head.supersedes(Some(&(p.head.seq, p.head.root))));
-                if !outranked {
-                    txn.put_head(
-                        crate::heads::Slot::Pending,
-                        &stored.head,
-                        stored.received_at,
-                        stored.verified_at,
-                    )?;
-                }
-                txn.clear_head(origin, crate::heads::Slot::Complete)?;
-            }
-            Ok(true)
-        })
+        self.set_read_scope_at(spaces, synch_core::now_ns())
+    }
+
+    /// Timestamped implementation of [`Store::set_read_scope`].  Maintenance
+    /// supplies the same clock reading it uses to age pending heads, so a head
+    /// demoted by this scope transition cannot be swept immediately using the
+    /// age it accumulated under the old scope.
+    fn set_read_scope_at(&self, spaces: Option<&[String]>, now: i64) -> Result<bool> {
+        crate::lean_authorization::change_scope(self, spaces, now)
     }
 
     /// Realigns the read scope with the live grant, and returns whether it
@@ -660,11 +604,13 @@ impl Store {
         match (self.local_scope()?, grant) {
             // A live grant is the authoritative scope: a grant materialized
             // since the last pass widens, one that shrank narrows.
-            (Some(spaces), Some(grant)) if spaces != grant => self.set_read_scope(Some(&grant)),
+            (Some(spaces), Some(grant)) if spaces != grant => {
+                self.set_read_scope_at(Some(&grant), now)
+            }
             // No grant left: a confined scope collapses to the empty one —
             // `m:self` and the `d:` namespace, no file data — not to `None`,
             // which would read as unrestricted.
-            (Some(spaces), None) if !spaces.is_empty() => self.set_read_scope(Some(&[])),
+            (Some(spaces), None) if !spaces.is_empty() => self.set_read_scope_at(Some(&[]), now),
             _ => Ok(false),
         }
     }
@@ -832,12 +778,23 @@ mod tests {
         store.put_head(Slot::Complete, &complete, 100, 100).unwrap();
         store.put_head(Slot::Pending, &pending, 200, 200).unwrap();
 
-        assert!(store.set_read_scope(Some(&["photos".to_string()])).unwrap());
+        assert!(store
+            .set_read_scope_at(Some(&["photos".to_string()]), at(20))
+            .unwrap());
         assert_eq!(store.complete_head(&origin()).unwrap(), None);
         assert_eq!(
             store.pending_head(&origin()).unwrap(),
             Some(pending),
             "the newer pending head survived the demotion"
+        );
+        assert_eq!(
+            store
+                .head(&origin(), Slot::Pending)
+                .unwrap()
+                .unwrap()
+                .received_at,
+            at(20),
+            "scope-invalidated pending work gets a fresh retry window"
         );
         assert_eq!(
             store.head_floor(&origin()).unwrap(),
@@ -851,10 +808,95 @@ mod tests {
             .clear_head_at(&origin(), Slot::Pending, 7, &Hash([7u8; 32]))
             .unwrap();
         assert!(store
-            .set_read_scope(Some(&["photos".to_string(), "finance".to_string()]))
+            .set_read_scope_at(Some(&["photos".to_string(), "finance".to_string()]), at(30),)
             .unwrap());
         assert_eq!(store.complete_head(&origin()).unwrap(), None);
         assert_eq!(store.pending_head(&origin()).unwrap(), Some(later));
+        assert_eq!(
+            store
+                .head(&origin(), Slot::Pending)
+                .unwrap()
+                .unwrap()
+                .received_at,
+            at(30),
+            "a newly demoted head is not born with its old complete-slot age"
+        );
+    }
+
+    #[test]
+    fn moving_the_scope_requeues_every_foreign_origin() {
+        use crate::heads::Slot;
+        use crate::testutil::origin_named;
+        use synch_core::{Hash, SignedHead};
+
+        let (_dir, store) = store();
+        let key = SecretKey::generate();
+        let first = origin_named("first");
+        let second = origin_named("second");
+        let first_complete = SignedHead::sign(&key, first.clone(), 5, Hash([5; 32]), 0);
+        let first_pending = SignedHead::sign(&key, first.clone(), 7, Hash([7; 32]), 0);
+        let second_complete = SignedHead::sign(&key, second.clone(), 9, Hash([9; 32]), 0);
+        store
+            .put_head(Slot::Complete, &first_complete, at(1), at(1))
+            .unwrap();
+        store
+            .put_head(Slot::Pending, &first_pending, at(2), at(2))
+            .unwrap();
+        store
+            .put_head(Slot::Complete, &second_complete, at(3), at(3))
+            .unwrap();
+
+        assert!(store
+            .set_read_scope_at(Some(&["photos".to_string()]), at(20))
+            .unwrap());
+
+        for (origin, expected) in [(&first, &first_pending), (&second, &second_complete)] {
+            assert_eq!(store.complete_head(origin).unwrap(), None);
+            assert_eq!(store.pending_head(origin).unwrap().as_ref(), Some(expected));
+            assert_eq!(
+                store
+                    .head(origin, Slot::Pending)
+                    .unwrap()
+                    .unwrap()
+                    .received_at,
+                at(20)
+            );
+        }
+    }
+
+    #[test]
+    fn malformed_scope_change_rolls_back_the_scope_and_demotions() {
+        let (_dir, store) = store();
+        store.set_read_scope(Some(&["photos".to_string()])).unwrap();
+        let before = store.local_scope().unwrap();
+        let origin = crate::testutil::origin_named("malformed");
+        let key = SecretKey::generate();
+        {
+            let conn = store.conn();
+            conn.execute_batch(
+                "CREATE TEMP TABLE heads (
+                   origin_id, slot, seq, root, received_at, verified_at);
+                 CREATE TEMP TABLE head_history (
+                   origin_id, seq, root, created_at, signed_by, sig, recorded_at);",
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO heads VALUES (?1, 'complete', 1, X'01', 0, 0)",
+                params![origin.canonical()],
+            )
+            .unwrap();
+            conn.execute(
+                "INSERT INTO head_history VALUES (?1, 1, X'01', 0, ?2, zeroblob(64), 0)",
+                params![origin.canonical(), key.public().as_bytes().to_vec()],
+            )
+            .unwrap();
+        }
+
+        assert!(store
+            .set_read_scope_at(Some(&["finance".to_string()]), at(30))
+            .is_err());
+        assert_eq!(store.local_scope().unwrap(), before);
+        assert!(store.conn().is_autocommit());
     }
 
     fn binding(origin: OriginId, key: NodeId, expires: Option<i64>) -> Binding {

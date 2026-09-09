@@ -36,6 +36,7 @@ import Synchronicity.CasCollectProofs
 import Synchronicity.CasProjectProofs
 import Synchronicity.TrieServeProofs
 import Synchronicity.TrieServePrivacyProofs
+import Synchronicity.TrieServeEvidence
 import Synchronicity.TrieMissingProofs
 import Synchronicity.TrieCompleteProofs
 import Synchronicity.TrieCollectProofs
@@ -44,6 +45,7 @@ import Synchronicity.TrieMerkleProofs
 import Synchronicity.SuspensionProofs
 import Synchronicity.ExchangeProofs
 import Synchronicity.ExchangeVersionProofs
+import Synchronicity.AdvertisementSelection
 import Synchronicity.TrieSnapshotProofs
 import Synchronicity.TrieRemoveSemantics
 import Synchronicity.CasReceivePromises
@@ -58,7 +60,14 @@ import Synchronicity.CasAdvertisementProofs
 import Synchronicity.TrieNormalizeProofs
 import Synchronicity.CasTransferHistories
 import Synchronicity.TrieFetchProofs
+import Synchronicity.TrieFetchCompletion
+import Synchronicity.TrieFetchAdmissionProgress
+import Synchronicity.AuthorizedFetchProgress
+import Synchronicity.ScheduledFetchAdmission
+import Synchronicity.TrieFetchConvergence
+import Synchronicity.ProgressLiveness
 import Synchronicity.ContactProofs
+import Synchronicity.ContactExecution
 import Synchronicity.TrieFetchSuspensionProofs
 
 import Synchronicity.CasInlineHistories
@@ -71,6 +80,11 @@ import Synchronicity.ReconciliationCommit
 import Synchronicity.ReconciliationGuards
 import Synchronicity.MaterializationPrivate
 import Synchronicity.ReconciliationAcceptance
+import Synchronicity.AcceptanceProgress
+import Synchronicity.OriginQueueSource
+import Synchronicity.GlobalReplicaPolicy
+import Synchronicity.StableHeadBounds
+import Synchronicity.StableAdvertisementProgress
 import Synchronicity.ReconciliationRejection
 import Synchronicity.ReconciliationFloor
 import Synchronicity.Goals.Mptsync.M3
@@ -85,3 +99,24 @@ import Synchronicity.MaterializationProviderApply
 import Synchronicity.MaterializationExactFiles
 import Synchronicity.MaterializationWholeRetention
 import Synchronicity.Goals.Mptsync.M4
+import Synchronicity.Goals.Mptsync.M2
+import Synchronicity.Goals.Mptsync.M6
+import Synchronicity.MptsyncConvergence
+import Synchronicity.MptsyncViewStability
+import Synchronicity.MptsyncScheduleExecution
+import Synchronicity.MptsyncRetryExecution
+import Synchronicity.TrieCompleteConverse
+import Synchronicity.StablePromotionTarget
+import Synchronicity.ScopeChangePromotionBaseline
+import Synchronicity.PromotionContinuationBaseline
+import Synchronicity.MptsyncPromotionHistory
+import Synchronicity.MptsyncAdvertisementWindow
+import Synchronicity.MptsyncPromotionScheduling
+import Synchronicity.ProductionTimeline
+import Synchronicity.MptsyncScopeChangeCarry
+import Synchronicity.MptsyncRefusalCache
+import Synchronicity.MptsyncViewCarry
+import Synchronicity.MptsyncProductionConvergence
+import Synchronicity.Goals.Mptsync.M7
+import Synchronicity.Goals.Mptsync.M8
+import Synchronicity.Goals.Mptsync.M1

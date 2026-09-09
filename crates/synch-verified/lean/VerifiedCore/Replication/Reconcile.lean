@@ -49,7 +49,7 @@ def putSlot (tx : Transaction) (slot : String) (head : Head) (received verified 
 
 /-- Unsigned sequence and bytewise root order, independent of arrival order. -/
 def newer (seq : UInt64) (root : ByteArray) (floor : Pointer) : Bool :=
-  seq > floor.seq || (seq == floor.seq && root.toList > floor.root.toList)
+  seq > floor.seq || (seq == floor.seq && root.data.toList > floor.root.data.toList)
 
 /-- The bounded greatest-root set never evicts a slot's backing signature.
 The exclusion is rechecked by each DELETE, not inferred from an earlier scan. -/

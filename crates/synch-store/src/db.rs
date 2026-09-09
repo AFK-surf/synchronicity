@@ -887,16 +887,6 @@ impl Txn<'_> {
         clear_config_in(self.conn(), key)
     }
 
-    /// Forgets every redaction boundary, inside the transaction.
-    ///
-    /// A boundary is a fact about a scope, not about a node, so the memo is
-    /// dropped whenever the scope moves — see [`Store::set_read_scope`],
-    /// which is the only thing that should call this.
-    pub(crate) fn clear_redacted(&self) -> Result<()> {
-        self.conn().execute("DELETE FROM redacted_nodes", [])?;
-        Ok(())
-    }
-
     /// Sets or clears the membership domain, inside the transaction.
     pub fn set_membership_domain(&self, domain: Option<&str>) -> Result<()> {
         match domain {

@@ -49,7 +49,7 @@ theorem conflicts_iff_names (head : Head) (slot : String) (received verified : I
       names row (Origin.canonical head.origin) slot := by
   simp [conflict, incoming, Reconcile.headKey, cell, names, equals, equalCell_text_comm]
 
-private theorem assigned_points_to (head : Head) (slot : String) (received verified : Int64)
+theorem assigned_points_to (head : Head) (slot : String) (received verified : Int64)
     (row : Fields) :
     pointsTo (assign row ((updates slot).map fun column =>
       (column, conflictValue row (incoming head slot received verified) (.excluded column)))) head := by

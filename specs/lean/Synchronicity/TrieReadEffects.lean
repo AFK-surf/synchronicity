@@ -37,6 +37,83 @@ theorem load_owned (owner : Option String) (hash : ByteArray) :
     · exact .done _
     · exact Only.raise _ _ trivial
 
+theorem value_absent (node : Node) (hash : ByteArray) :
+    Only missingRead (Missing.valueAbsent node hash).run := by
+  unfold Missing.valueAbsent
+  refine Only.seq (Only.raise _ _ trivial) fun answer => ?_
+  repeat' first | exact .done _ | split
+
+theorem inspect_values_aux (node : Node) (addresses : List ByteArray) :
+    Only missingRead (Missing.inspectValuesAux node addresses).run := by
+  induction addresses with
+  | nil => exact .done _
+  | cons address rest ih =>
+    simp only [Missing.inspectValuesAux]
+    refine Only.seq (value_absent node address) fun _ => ?_
+    refine Only.seq ih fun _ => .done _
+
+theorem inspect_values (context : Missing.Context) (position : Missing.Position) (node : Node) :
+    Only missingRead (Missing.inspectValues context position node).run := by
+  unfold Missing.inspectValues
+  split
+  · exact inspect_values_aux node node.valueHashes
+  · exact .done _
+
+set_option maxHeartbeats 2000000 in
+theorem inspect_pending_branch (node : Node) :
+    Only missingRead (Missing.inspectPendingBranch node).run := by
+  unfold Missing.inspectPendingBranch
+  repeat' first
+    | exact .done _
+    | (refine Only.seq (Only.raise _ _ trivial) fun _ => ?_)
+    | (refine Only.seq (.done _) fun _ => ?_)
+    | contradiction
+    | (dsimp only; split)
+    | split
+
+theorem inspect_reference (reference : Option ByteArray) :
+    Only missingRead (Missing.inspectReference reference).run := by
+  unfold Missing.inspectReference
+  repeat' first
+    | exact .done _
+    | (refine Only.seq (Only.raise _ _ trivial) fun _ => ?_)
+    | (refine Only.seq (.done _) fun _ => ?_)
+    | (dsimp only; split)
+    | split
+
+theorem validate_node_depth (position : Missing.Position) (node : Node) :
+    Only missingRead (Missing.validateNodeDepth position node).run := by
+  cases node with
+  | leaf suffix value => simp only [Missing.validateNodeDepth]; split <;> exact .done _
+  | extension | branch | route => exact .done _
+
+theorem prepare_decoded [Missing.WorkSet Missing.Visit V] [Missing.WorkSet ByteArray H]
+    (frontier : Missing.Frontier V H) (position : Missing.Position) (node : Node) :
+    Only missingRead (Missing.prepareDecoded frontier position node).run := by
+  unfold Missing.prepareDecoded
+  repeat' first
+    | exact .done _
+    | (refine Only.seq (inspect_pending_branch _) fun _ => ?_)
+    | (refine Only.seq (inspect_reference _) fun _ => ?_)
+    | (refine Only.seq (validate_node_depth _ _) fun _ => ?_)
+    | contradiction
+    | (dsimp only; split)
+    | split
+
+theorem prepare_loaded [Missing.WorkSet Missing.Visit V] [Missing.WorkSet ByteArray H]
+    (frontier : Missing.Frontier V H) (position : Missing.Position) (raw : ByteArray) :
+    Only missingRead (Missing.prepareLoaded frontier position raw).run := by
+  unfold Missing.prepareLoaded
+  refine Only.seq (.done _) fun node => prepare_decoded _ _ node
+
+theorem inspect_loaded [Missing.WorkSet Missing.Visit V] [Missing.WorkSet ByteArray H]
+    (context : Missing.Context) (frontier : Missing.Frontier V H)
+    (position : Missing.Position) (raw : ByteArray) :
+    Only missingRead (Missing.inspectLoaded context frontier position raw).run := by
+  unfold Missing.inspectLoaded
+  refine Only.seq (prepare_loaded _ _ _) fun prepared => ?_
+  refine Only.seq (inspect_values _ _ _) fun _ => .done _
+
 set_option maxHeartbeats 2000000 in
 theorem inspect [Missing.WorkSet Missing.Visit V] [Missing.WorkSet ByteArray H]
     (context : Missing.Context) (frontier : Missing.Frontier V H) (position : Missing.Position) :
@@ -45,10 +122,7 @@ theorem inspect [Missing.WorkSet Missing.Visit V] [Missing.WorkSet ByteArray H]
   repeat' first
     | exact .done _
     | (refine Only.seq (load_owned _ _) fun _ => ?_)
-    | (refine Only.seq (Only.raise _ _ trivial) fun _ => ?_)
-    | (refine Only.seq (.done _) fun _ => ?_)
-    | (refine Only.seq (Only.filterM _ _ ?_) fun _ => ?_)
-    | (intro hash)
+    | (refine Only.seq (inspect_loaded _ _ _ _) fun _ => ?_)
     | contradiction
     | (dsimp only; split)
     | split

@@ -91,10 +91,11 @@ theorem executed_frame (relation : String) (operation : Promote.Action A)
 theorem permitted_only (tx : Transaction) (pending : Promote.Pending) (authority : Authorization.OriginAuthority) :
     Only PromotionReads.allowed (PromotionPublication.permitted tx pending authority).run := by
   unfold PromotionPublication.permitted
-  split
-  · exact .done _
-  · exact .done _
-  · exact Only.map _ _ (PromotionReads.scopeCheck_only tx _ _)
+  unfold Promote.permitted
+  cases authority.publication with
+  | untrusted => exact .done _
+  | unrestricted => exact .done _
+  | confined _ => exact Only.map _ _ (PromotionReads.scopeCheck_only tx _ _)
 
 theorem published_inputs (tx : Transaction) (origin : Origin.Parsed) (now : Int64) (pending : Promote.Pending) (old : Option Promote.Pending)
     (scope : Trie.Serve.Scope) (authority : Authorization.OriginAuthority) (state final : State)

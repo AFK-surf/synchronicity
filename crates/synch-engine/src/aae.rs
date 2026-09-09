@@ -403,10 +403,13 @@ impl Node {
         // only thing that can drive the derived views away — this is the
         // same destructive move `adopt_scope` makes for a moved grant,
         // applied to the one that expired.
-        contained(
+        if contained(
             "collapsing a grantless read scope",
             self.store().collapse_grantless_scope(now),
-        );
+        ) == Some(true)
+        {
+            self.syncer().scope_changed();
+        }
         contained("expiring tombstones", self.expire_tombstones());
         // The catch-all for claims a replication sweep will not visit again:
         // a space removed with its pins kept still has releases that were

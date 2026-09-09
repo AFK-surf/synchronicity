@@ -116,6 +116,87 @@ private theorem load_owned_closed (owner : Option String) (hash : ByteArray) :
     · exact Closed.pure _
     · exact Closed.raise _ _ rfl
 
+private theorem value_absent_closed (node : Node) (hash : ByteArray) :
+    Closed missingGuard (Missing.valueAbsent node hash).run := by
+  unfold Missing.valueAbsent
+  refine Closed.seq (Closed.raise _ _ rfl) fun answer => ?_
+  repeat' first | exact Closed.pure _ | split
+
+private theorem inspect_values_aux_closed (node : Node) (addresses : List ByteArray) :
+    Closed missingGuard (Missing.inspectValuesAux node addresses).run := by
+  induction addresses with
+  | nil => exact Closed.pure _
+  | cons address rest ih =>
+    simp only [Missing.inspectValuesAux]
+    refine Closed.seq (value_absent_closed node address) fun _ => ?_
+    refine Closed.seq ih fun _ => Closed.pure _
+
+private theorem inspect_values_closed
+    (context : Missing.Context) (position : Missing.Position) (node : Node) :
+    Closed missingGuard (Missing.inspectValues context position node).run := by
+  unfold Missing.inspectValues
+  split
+  · exact inspect_values_aux_closed node node.valueHashes
+  · exact Closed.pure _
+
+set_option maxHeartbeats 2000000 in
+private theorem inspect_pending_branch_closed (node : Node) :
+    Closed missingGuard (Missing.inspectPendingBranch node).run := by
+  unfold Missing.inspectPendingBranch
+  repeat' first
+    | exact Closed.pure _
+    | (refine Closed.seq (Closed.raise _ _ rfl) fun _ => ?_)
+    | (refine Closed.seq (Closed.pure _) fun _ => ?_)
+    | contradiction
+    | (dsimp only; split)
+    | split
+
+private theorem inspect_reference_closed (reference : Option ByteArray) :
+    Closed missingGuard (Missing.inspectReference reference).run := by
+  unfold Missing.inspectReference
+  repeat' first
+    | exact Closed.pure _
+    | (refine Closed.seq (Closed.raise _ _ rfl) fun _ => ?_)
+    | (refine Closed.seq (Closed.pure _) fun _ => ?_)
+    | (dsimp only; split)
+    | split
+
+private theorem validate_node_depth_closed (position : Missing.Position) (node : Node) :
+    Closed missingGuard (Missing.validateNodeDepth position node).run := by
+  cases node with
+  | leaf suffix value => simp only [Missing.validateNodeDepth]; split <;> exact Closed.pure _
+  | extension | branch | route => exact Closed.pure _
+
+private theorem prepare_decoded_closed
+    [Missing.WorkSet Missing.Visit V] [Missing.WorkSet ByteArray H]
+    (frontier : Missing.Frontier V H) (position : Missing.Position) (node : Node) :
+    Closed missingGuard (Missing.prepareDecoded frontier position node).run := by
+  unfold Missing.prepareDecoded
+  repeat' first
+    | exact Closed.pure _
+    | (refine Closed.seq (inspect_pending_branch_closed _) fun _ => ?_)
+    | (refine Closed.seq (inspect_reference_closed _) fun _ => ?_)
+    | (refine Closed.seq (validate_node_depth_closed _ _) fun _ => ?_)
+    | contradiction
+    | (dsimp only; split)
+    | split
+
+private theorem prepare_loaded_closed
+    [Missing.WorkSet Missing.Visit V] [Missing.WorkSet ByteArray H]
+    (frontier : Missing.Frontier V H) (position : Missing.Position) (raw : ByteArray) :
+    Closed missingGuard (Missing.prepareLoaded frontier position raw).run := by
+  unfold Missing.prepareLoaded
+  refine Closed.seq (Closed.pure _) fun node => prepare_decoded_closed _ _ node
+
+private theorem inspect_loaded_closed
+    [Missing.WorkSet Missing.Visit V] [Missing.WorkSet ByteArray H]
+    (context : Missing.Context) (frontier : Missing.Frontier V H)
+    (position : Missing.Position) (raw : ByteArray) :
+    Closed missingGuard (Missing.inspectLoaded context frontier position raw).run := by
+  unfold Missing.inspectLoaded
+  refine Closed.seq (prepare_loaded_closed _ _ _) fun prepared => ?_
+  refine Closed.seq (inspect_values_closed _ _ _) fun _ => Closed.pure _
+
 set_option maxHeartbeats 2000000 in
 private theorem inspect_closed [Missing.WorkSet Missing.Visit V] [Missing.WorkSet ByteArray H]
     (context : Missing.Context) (frontier : Missing.Frontier V H) (position : Missing.Position) :
@@ -124,10 +205,7 @@ private theorem inspect_closed [Missing.WorkSet Missing.Visit V] [Missing.WorkSe
   repeat' first
     | exact Closed.pure _
     | (refine Closed.seq (load_owned_closed _ _) fun _ => ?_)
-    | (refine Closed.seq (Closed.raise _ _ rfl) fun _ => ?_)
-    | (refine Closed.seq (Closed.pure _) fun _ => ?_)
-    | (refine Closed.seq (Closed.filterM _ _ ?_) fun _ => ?_)
-    | (intro hash)
+    | (refine Closed.seq (inspect_loaded_closed _ _ _ _) fun _ => ?_)
     | contradiction
     | (dsimp only; split)
     | split

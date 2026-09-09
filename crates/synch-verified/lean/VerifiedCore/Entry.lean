@@ -425,11 +425,16 @@ def dispatch : Command → Native
   | .authSoleDnsHintSource key domain reading => command (Authorization.soleDnsHintSource key domain reading) authorizing
   | .authHasDelegations => command Authorization.hasDelegations authorizing
   | .authExpireDns reading => command (Authorization.expireDns reading) authorizing
+  | .authChangeScope spaces now => command (Replication.ScopeChange.change spaces now) retention
 
   | .planContact peers cursor maximum =>
     if peers.length > UInt64.size || !(peers.all (·.size == 32)) ||
         cursor.any (·.size != 32) || maximum == 0 || maximum > 256 then protocol
     else pure (terminalOf (Replication.Contact.plan peers cursor maximum.toNat))
+  | .planOrigins items cursor maximum =>
+    if items.length > UInt64.size || maximum == 0 || maximum > 4096 ||
+        !(items.all fun item => item.weight > 0 && item.weight ≤ maximum) then protocol
+    else pure (terminalOf (Replication.OriginSchedule.plan items cursor maximum.toNat))
   | .planExchange ours theirs servable =>
     if servable.length > UInt64.size ||
         !(ours ++ theirs ++ servable).all (·.root.size == 32) then protocol
