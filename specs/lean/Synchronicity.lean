@@ -82,6 +82,8 @@ import Synchronicity.MaterializationPrivate
 import Synchronicity.ReconciliationAcceptance
 import Synchronicity.AcceptanceProgress
 import Synchronicity.OriginQueueSource
+import Synchronicity.GlobalReplicaPolicy
+import Synchronicity.StableHeadBounds
 import Synchronicity.StableAdvertisementProgress
 import Synchronicity.ReconciliationRejection
 import Synchronicity.ReconciliationFloor

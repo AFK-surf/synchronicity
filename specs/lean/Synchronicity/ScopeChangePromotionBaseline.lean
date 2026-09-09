@@ -1,6 +1,7 @@
 import Synchronicity.ScopeChangeRefinement
 import Synchronicity.PromotionBaseline
 import Synchronicity.HeadView
+import Synchronicity.GlobalReplicaPolicy
 
 /-! Permission-change cleanup supplies the origin-local empty database facts
 needed by the next promotion.  Schema, immutable-snapshot and materialization
@@ -15,9 +16,16 @@ targets come from the shared `replicas` table, so this is deliberately not a
 claim about the cleaned origin's view. It is the initial-data obligation that
 unrelated retained rows already have their required hold or durable want. -/
 def GlobalRetentionInvariant (db : Database) : Prop :=
-  ∀ origin scope replicas,
-    MaterializationInputs.ReadPolicy db origin scope replicas →
-      MaterializedView.CurrentRequirements replicas db
+  ∃ replicas, GlobalReplicaPolicy.Holds db replicas ∧
+    MaterializedView.CurrentRequirements replicas db
+
+theorem GlobalRetentionInvariant.currentForRead
+    (invariant : GlobalRetentionInvariant db)
+    (read : MaterializationInputs.ReadPolicy db origin scope replicas) :
+    MaterializedView.CurrentRequirements replicas db := by
+  obtain ⟨canonical, policy, current⟩ := invariant
+  rw [policy.unique origin scope replicas read]
+  exact current
 
 /-- Stable metadata and host-service contracts not created by clearing one
 origin's scope-dependent state.  In particular, neither complete-slot nor
@@ -154,7 +162,7 @@ theorem clean_origin_baseline_of_absence
       noEntries := no_origin_entries entriesAbsent
       emptySnapshot := metadata.emptySnapshot
       policiesAgree := metadata.policiesAgree
-      current := metadata.globalRetention origin
+      current := fun _ _ read => metadata.globalRetention.currentForRead read
       unique := metadata.unique
       supported := metadata.supported }
 
@@ -168,7 +176,8 @@ theorem clean_origin_baseline
     PromotionBaseline.CleanOriginBaseline db origin world services := by
   rcases raw with ⟨⟨noComplete, _, noEntries, _, _⟩, _⟩
   refine ⟨metadata.schema, ?_, ?_, metadata.emptySnapshot, metadata.policiesAgree,
-    metadata.globalRetention origin, metadata.unique, metadata.supported⟩
+    (fun _ _ read => metadata.globalRetention.currentForRead read),
+      metadata.unique, metadata.supported⟩
   · rw [← originAligned]
     exact no_joined_slot_of_raw_empty db decision.complete.origin "complete" noComplete
   · rw [← originAligned]

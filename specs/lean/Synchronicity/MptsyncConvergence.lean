@@ -111,11 +111,14 @@ structure Scenario (Device : Type) where
   includes : Origin.Parsed → Prop
   latest : Origin.Parsed → HeadVersion
   snapshot : Origin.Parsed → RawSnapshot
+  replicaPolicy : Device → List Materialize.Target
   target : Device → Origin.Parsed → ViewTarget
   target_latest : ∀ device origin,
     ⟨(target device origin).head.seq, (target device origin).head.root⟩ = latest origin
   target_origin : ∀ device origin, (target device origin).head.origin = origin
   target_snapshot : ∀ device origin, (target device origin).snapshot = snapshot origin
+  target_replicas : ∀ device origin,
+    (target device origin).replicas = replicaPolicy device
 
 def CorrectDevice (services : MaterializedView.Services) (scenario : Scenario Device)
     (databases : Device → Database) (device : Device) : Prop :=

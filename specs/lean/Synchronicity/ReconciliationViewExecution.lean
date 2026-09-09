@@ -6,6 +6,7 @@ import Synchronicity.ForeignMaterializationFrame
 import Synchronicity.PromotionContinuationBaseline
 import Synchronicity.PromotionBaseline
 import Synchronicity.StableHeadBounds
+import Synchronicity.GlobalReplicaPolicy
 
 /-! Refinement of actual reconciliation operations to the stable public-view
 transition.  Execution witnesses remain in `ReconciliationExecution`; the
@@ -270,9 +271,7 @@ structure ForeignPromotionHost (origin foreign : Origin.Parsed) (target : ViewTa
   relational : ∀ relation, relation = Trie.nodeSpace ∨ relation = Trie.valueSpace →
     state.byteRelations.contains relation = true
   schema : MaterializationKeySchema.Schema state.db
-  replicas : ∀ scope actual,
-    MaterializationInputs.ReadPolicy state.db foreign scope actual →
-      actual = target.replicas
+  replicaPolicy : GlobalReplicaPolicy.Holds state.db target.replicas
   policiesAgree : ∀ scope actual,
     MaterializationInputs.ReadPolicy state.db foreign scope actual →
       MaterializationRequirementFrame.PoliciesAgree actual
@@ -310,7 +309,9 @@ theorem foreign_promotion_refines
       by_cases flipped : report.promotion = Promotion.flipped
       · have retention := ForeignMaterializationFrame.promote_flipped_retention foreign now
           refused target.replicas world state actualFinal report flipped ran
-          correct.2.2.2.1 host.schema host.replicas host.policiesAgree
+          correct.2.2.2.1 host.schema
+          (fun scope actual read => host.replicaPolicy.unique foreign scope actual read)
+          host.policiesAgree
           host.materializerFaithful
         have foreignFiles := ForeignMaterializationFrame.promote_flipped_files foreign now
           refused (Origin.canonical origin) host.different services world state actualFinal
