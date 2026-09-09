@@ -361,6 +361,9 @@ fn h_self_origin(
     out_str(scope, ptr, len, &origin)
 }
 
+/// The socket's **name**, not a path: one object may back several sockets,
+/// and this is what tells them apart (`docs/SOCKET-PROGRAMS.md` §4). The
+/// helper keeps its symbol so every compiled program still links.
 fn h_socket_path(
     scope: &HelperScope,
     ptr: u64,
@@ -369,8 +372,8 @@ fn h_socket_path(
     _: u64,
     _: u64,
 ) -> Result<u64, ()> {
-    let path = with(scope, |inner| inner.socket.qualified())?;
-    out_str(scope, ptr, len, &path)
+    let name = with(scope, |inner| inner.socket.to_string())?;
+    out_str(scope, ptr, len, &name)
 }
 
 fn h_peer_origin(
@@ -1073,7 +1076,7 @@ fn h_errno(scope: &HelperScope, handle: u64, _: u64, _: u64, _: u64, _: u64) -> 
 fn open_egress(inner: &Rc<Inner>, host: String, port: u16, literal: bool) -> i64 {
     if !inner.policy.egress_allowed(&host, port) {
         tracing::warn!(
-            socket = %inner.socket.qualified(),
+            socket = %inner.socket.as_str(),
             host,
             port,
             "socket egress refused: the armed program did not declare it"
@@ -1244,7 +1247,7 @@ fn h_ssh_start(
             crate::runtime::ssh::AuthContext {
                 throttle,
                 ip,
-                socket: inner.socket.qualified(),
+                socket: inner.socket.to_string(),
             },
         ));
         0
@@ -3190,7 +3193,7 @@ fn h_put_open(
     };
     if !capability.covers(&path) {
         tracing::warn!(
-            socket = %inner.socket.qualified(),
+            socket = %inner.socket.as_str(),
             path,
             prefix = capability.prefix,
             "socket tree write refused: the path is outside the armed prefix"
@@ -3218,7 +3221,7 @@ fn h_put_open(
                 .put_writers
                 .fetch_sub(1, std::sync::atomic::Ordering::Relaxed);
             tracing::warn!(
-                socket = %inner.socket.qualified(),
+                socket = %inner.socket.as_str(),
                 path,
                 "socket tree write refused: {e}"
             );
@@ -3423,7 +3426,7 @@ fn put_op(
         PutCommand::Delete => {
             if writer.capability.modes & synch_core::TREE_WRITE_DELETE == 0 {
                 tracing::warn!(
-                    socket = %inner.socket.qualified(),
+                    socket = %inner.socket.as_str(),
                     path = writer.path,
                     "socket tree delete refused: the armed grant carries no delete mode"
                 );
@@ -3439,7 +3442,7 @@ fn put_op(
             let writes = synch_core::TREE_WRITE_CREATE | synch_core::TREE_WRITE_REPLACE;
             if writer.capability.modes & writes == 0 {
                 tracing::warn!(
-                    socket = %inner.socket.qualified(),
+                    socket = %inner.socket.as_str(),
                     path = writer.path,
                     "socket tree commit refused: the armed grant is delete-only"
                 );

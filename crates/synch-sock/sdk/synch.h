@@ -244,6 +244,8 @@ extern sy_s64 sy_label_set(const char *key, sy_u64 key_len, const char *value,
 /* ---- identity: from the handshake, never from the payload --------------- */
 
 extern sy_s64 sy_self_origin(char *out, sy_u64 out_len);
+/* The name of the socket being served, so one object can back several
+ * sockets. A name, not a path: the program's own location is elsewhere. */
 extern sy_s64 sy_socket_path(char *out, sy_u64 out_len);
 extern sy_s64 sy_peer_origin(char *out, sy_u64 out_len);
 /* Writes the caller's raw 32-byte device key: the identity that survives an

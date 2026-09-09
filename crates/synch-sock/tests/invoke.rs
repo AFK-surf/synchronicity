@@ -1186,10 +1186,10 @@ async fn what_a_program_logs_is_kept_for_its_socket() {
         peer(None),
         vec![],
     );
-    invocation.socket = SocketId::new("code", "talkative.sock");
+    invocation.socket = SocketId::new("talkative");
     harness.pool.run(invocation).await.expect("the program ran");
 
-    let lines = registry.logs("code/talkative.sock");
+    let lines = registry.logs("talkative");
     assert_eq!(lines.len(), 2, "{lines:?}");
     assert_eq!(lines[0].text, "first line");
     assert_eq!(lines[1].text, "second line");

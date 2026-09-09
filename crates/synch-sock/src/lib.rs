@@ -318,15 +318,15 @@ pub enum HostError {
     /// No such path, or no such root.
     #[error("no such path")]
     NotFound,
-    /// The path resolves to something with no bytes — a directory, a tombstone,
-    /// a symlink — or to a socket, which `sy_open` refuses on purpose.
+    /// The path resolves to something with no bytes: a directory, a tombstone,
+    /// or a symlink.
     #[error("{0}")]
     NotReadable(String),
     /// The bytes could not be produced.
     #[error("{0}")]
     Unavailable(String),
-    /// A write refused by the engine's own gates: an activated socket path, a
-    /// mode the grant does not carry, an ignored path, a node in recovery.
+    /// A write refused by the engine's own gates: a mode the grant does not
+    /// carry, an ignored path, a node in recovery.
     #[error("{0}")]
     Denied(String),
     /// A conditional commit lost: the tree moved underneath it.
@@ -382,8 +382,11 @@ pub struct Admission {
     /// The ELF object to run — read from *this node's own* CAS.
     pub program: Arc<Vec<u8>>,
     /// Its content root: the snapshot this invocation runs, however the
-    /// path's content moves underneath it.
+    /// program path's content moves underneath it.
     pub program_root: Hash,
+    /// `<space>/<path>` of that program in the serving node's own tree, which
+    /// the `Opened` reply echoes so a caller can audit what it reached.
+    pub program_path: String,
     /// Which socket this is.
     pub socket: SocketId,
     /// Who is calling, as the handshake established it.
@@ -414,6 +417,7 @@ impl Admission {
             program: self.program,
             program_root: self.program_root,
             socket: self.socket,
+            program_path: self.program_path,
             peer: self.peer,
             policy: self.policy,
             meta: self.meta,
@@ -442,8 +446,10 @@ pub struct Invocation {
     /// The ELF object to run — read from *this node's own* CAS.
     pub program: Arc<Vec<u8>>,
     /// Its content root: the snapshot this invocation runs, however the
-    /// path's content moves underneath it.
+    /// program path's content moves underneath it.
     pub program_root: Hash,
+    /// `<space>/<path>` of that program in this node's own tree.
+    pub program_path: String,
     /// Which socket this is.
     pub socket: SocketId,
     /// Who is calling, as the handshake established it.

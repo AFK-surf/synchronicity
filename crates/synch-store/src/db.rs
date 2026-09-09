@@ -1894,6 +1894,57 @@ mod tests {
         assert!(store.blob(&root).unwrap().is_none());
     }
 
+    /// v29 keeps every socket's address, its program and its reachability: a
+    /// socket that was the path `code/git.sock` becomes a socket *named*
+    /// `code/git.sock` backed by the program at that path, scoped to the space
+    /// it sat in — so the delegates of `code` that could open it still can.
+    #[test]
+    fn v29_keeps_a_sockets_address_program_and_reach() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let conn = database_at(dir.path(), 28);
+            conn.execute(
+                "INSERT INTO socket_activations
+                   (space, path, config, max_streams, note, activated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    "code",
+                    "git.sock",
+                    "upstream=git.internal",
+                    32,
+                    "the gateway",
+                    7
+                ],
+            )
+            .unwrap();
+        }
+        let store = Store::open(dir.path()).unwrap();
+
+        let migrated = store
+            .socket_activation("code/git.sock")
+            .unwrap()
+            .expect("the old address is the new name");
+        assert_eq!(migrated.program(), "code/git.sock");
+        assert_eq!(
+            migrated.scope,
+            vec!["code".to_string()],
+            "a delegate of the space the socket sat in must still be able to open it"
+        );
+        assert!(migrated.admits(Some(&["code".to_string()])));
+        assert!(!migrated.admits(Some(&["docs".to_string()])));
+        assert_eq!(
+            migrated.config,
+            vec![("upstream".to_string(), "git.internal".to_string())]
+        );
+        assert_eq!(migrated.max_streams, Some(32));
+        assert_eq!(migrated.note, "the gateway");
+        assert_eq!(migrated.activated_at, 7);
+
+        // And the reverse lookup finds it from the program it now names.
+        let backed = store.activations_backed_by("code", "git.sock").unwrap();
+        assert_eq!(backed, vec![migrated]);
+    }
+
     /// A v2 database — the oldest layout still real — upgrades with its durable
     /// data intact, moves gateway configuration, and preserves old observations
     /// without inventing claimants for them.

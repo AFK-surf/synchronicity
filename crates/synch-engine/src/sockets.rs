@@ -1,12 +1,13 @@
-//! Sockets, from the engine's side (`docs/SOCKETS.md`).
+//! Sockets, from the engine's side (`docs/SOCKETS.md`,
+//! `docs/SOCKET-PROGRAMS.md`).
 //!
 //! Three things live here, and they are deliberately separate.
 //!
-//! **Resolution** answers "what would run, if anything?" — an activation check
-//! and a lookup in *this node's own* trie. It is the whole of the rule the
-//! design is built on, and it never consults the unified tree: connecting to a
-//! socket names an origin, and `newest` would otherwise let any member's
-//! `mtime_ns` decide whose program a connection lands on.
+//! **Resolution** answers "what would run, if anything?" — the activation for
+//! a name, then its program in *this node's own* trie. It is the whole of the
+//! rule the design is built on, and it never consults the unified tree:
+//! connecting to a socket names an origin, and `newest` would otherwise let
+//! any member's `mtime_ns` decide whose program a connection lands on.
 //!
 //! **Admission** turns that into an invocation: it adds the caller's identity
 //! as the handshake established it and the capabilities the program's own
@@ -33,77 +34,83 @@ use crate::{
     node::Node,
 };
 
-/// What a socket path resolves to right now.
+/// What a socket name resolves to right now.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Resolved {
-    /// The content root the tree currently names — the snapshot an invocation
-    /// admitted against it will run, however the path moves afterwards.
+    /// The content root the tree currently names for the program — the
+    /// snapshot an invocation admitted against it will run, however the
+    /// program path moves afterwards.
     pub root: Hash,
     /// Its size in bytes.
     pub size: u64,
-    /// The activation that makes the path a socket.
+    /// The activation that binds the name to that program.
     pub activation: SocketActivation,
 }
 
 impl Node {
-    /// Makes a path in one of this node's spaces a socket, until
-    /// [`Node::socket_deactivate`].
+    /// Binds a socket name to a program, until [`Node::socket_deactivate`].
     ///
-    /// From the next scan the path publishes as `EntryKind::Socket`, and every
-    /// later write to it — an editor save, an adoption, an S3 `PUT` — is an
-    /// intentional deployment: the new content serves as soon as it publishes,
-    /// under whatever its own manifest declares. That breadth is the grant, and
-    /// `synch socket activate` says so where it is asked for.
+    /// The program is an ordinary file at `<space>/<path>` in a source of this
+    /// node's, and every later write to it — an editor save, an adoption, an
+    /// S3 `PUT`, a program's own tree write — is an intentional deployment to
+    /// every socket that names it: the new content serves as soon as it
+    /// publishes, under whatever its own manifest declares. That breadth is
+    /// the grant, and `synch socket activate` says so where it is asked for.
     pub fn socket_activate(&self, row: &SocketActivation) -> Result<()> {
         let _authorization = self.socket_authorization_write();
-        let Some(space) = self.store().source(&row.space)? else {
+        let mut row = row.clone();
+        synch_core::validate_socket_name(&row.name)
+            .map_err(|e| EngineError::invalid(e.to_string()))?;
+        // A program is in this node's own tree, filesystem source or API
+        // source alike: nothing socket-shaped enters the tree any more, so a
+        // source with no scanner hosts a program as well as one with.
+        if self.store().source(&row.program_space)?.is_none() {
             return Err(EngineError::invalid(format!(
-                "`{}` is not a filesystem source",
-                row.space
-            )));
-        };
-        if space.local_path.is_none() {
-            return Err(EngineError::invalid(format!(
-                "source `{}` is API-only and has no scanner that can publish a socket",
-                row.space
+                "`{}` is not a source of this node's, so it can hold no program",
+                row.program_space
             )));
         }
-        let mut row = row.clone();
-        row.path = synch_core::normalize_path(&row.path)
+        row.program_path = synch_core::normalize_path(&row.program_path)
             .map_err(|e| EngineError::invalid(e.to_string()))?;
+        for space in &row.scope {
+            synch_core::validate_space(space)
+                .map_err(|e| EngineError::invalid(format!("invalid --scope: {e}")))?;
+        }
+        if !synch_core::display_text_is_safe(&row.note) {
+            return Err(EngineError::invalid(
+                "a note must be printable in an operator-facing line",
+            ));
+        }
         self.store().activate_socket(&row)?;
-        // Kind is part of the published entry even when the file's bytes and
-        // stat are unchanged. Invalidate the scanner cache so its next pass
-        // reaches the activation check instead of returning early.
-        self.store().remove_local_file(&row.space, &row.path)?;
         // A re-activation is a new bargain; a session table minted under the
         // old terms is not state the new terms agreed to inherit.
-        self.clear_socket_map(&row.qualified());
+        self.clear_socket_map(&row.name);
         Ok(())
     }
 
-    /// Every path this node has activated.
-    pub fn socket_ls(&self, space: Option<&str>) -> Result<Vec<SocketActivation>> {
-        Ok(match space {
-            Some(space) => self.store().socket_activations_in(space)?,
-            None => self.store().socket_activations()?,
-        })
+    /// Every socket this node has activated, ordered by name.
+    pub fn socket_ls(&self) -> Result<Vec<SocketActivation>> {
+        Ok(self.store().socket_activations()?)
     }
 
-    /// Removes an activation.
+    /// Every socket one program path backs.
+    ///
+    /// The dependents `synch socket activate` prints and the deployment
+    /// fan-out walks (`docs/SOCKET-PROGRAMS.md` §4).
+    pub fn sockets_backed_by(&self, space: &str, path: &str) -> Result<Vec<SocketActivation>> {
+        Ok(self.store().activations_backed_by(space, path)?)
+    }
+
+    /// Removes an activation by name.
     ///
     /// Admission refuses immediately — the write side of the authorization
-    /// gate excludes in-flight admissions — and the next scan republishes the
-    /// path as an ordinary file, because the kind comes from the activation
-    /// and there is no longer one. Invocations already running keep their
-    /// snapshot and finish.
-    pub fn socket_deactivate(&self, space: &str, path: &str) -> Result<bool> {
+    /// gate excludes in-flight admissions — and the program file is untouched:
+    /// nothing about it was ever socket-shaped. Invocations already running
+    /// keep their snapshot and finish.
+    pub fn socket_deactivate(&self, name: &str) -> Result<bool> {
         let _authorization = self.socket_authorization_write();
-        let out = self.store().deactivate_socket(space, path)?;
-        if out {
-            self.store().remove_local_file(space, path)?;
-        }
-        self.clear_socket_map(&format!("{space}/{path}"));
+        let out = self.store().deactivate_socket(name)?;
+        self.clear_socket_map(name);
         Ok(out)
     }
 
@@ -117,29 +124,78 @@ impl Node {
             .map_err(|e| EngineError::invalid(e.to_string()))
     }
 
-    /// Resolves a socket path in **this node's own** trie.
+    /// Resolves a socket name: its activation, then its program in **this
+    /// node's own** trie.
     ///
-    /// `Ok(None)` means the path is not activated, this node publishes no
-    /// entry there, or publishes one that is not a socket. The distinctions
-    /// are drawn by the caller, which has a refusal code for each.
-    pub fn resolve_socket(&self, space: &str, path: &str) -> Result<Option<Resolved>> {
-        let Some(activation) = self.store().socket_activation(space, path)? else {
+    /// `Ok(None)` means there is no socket of that name here, or its program
+    /// path has no live entry with content. The distinctions are drawn by
+    /// [`Node::resolve_socket_program`], which the caller uses when it has a
+    /// refusal code for each.
+    pub fn resolve_socket(&self, name: &str) -> Result<Option<Resolved>> {
+        let Some(activation) = self.store().socket_activation(name)? else {
             return Ok(None);
         };
-        let Some(entry) = self.store().entry(self.origin(), space, path)? else {
-            return Ok(None);
+        Ok(self.resolve_socket_program(&activation)?.ok())
+    }
+
+    /// The program one activation names, or why it cannot serve.
+    ///
+    /// A live entry with content — `File`, or the historical `Socket` from a
+    /// build that still emitted it. A directory or a symlink at the program
+    /// path is told apart from nothing at all, because the caller says
+    /// different things about them.
+    pub fn resolve_socket_program(
+        &self,
+        activation: &SocketActivation,
+    ) -> Result<std::result::Result<Resolved, RefuseCode>> {
+        let entry = self.store().entry(
+            self.origin(),
+            &activation.program_space,
+            &activation.program_path,
+        )?;
+        let Some(entry) = entry.filter(|entry| entry.kind != EntryKind::Tombstone) else {
+            return Ok(Err(RefuseCode::NoSuchPath));
         };
-        if entry.kind != EntryKind::Socket {
-            return Ok(None);
-        }
         let Some(root) = entry.content else {
-            return Ok(None);
+            return Ok(Err(RefuseCode::NotASocket));
         };
-        Ok(Some(Resolved {
+        Ok(Ok(Resolved {
             root,
             size: entry.size,
-            activation,
+            activation: activation.clone(),
         }))
+    }
+
+    /// The sockets a caller with these read rights may open, as
+    /// [`SockRequest::List`](synch_core::SockRequest::List) answers it
+    /// (`docs/SOCKET-PROGRAMS.md` §5).
+    ///
+    /// `delegated` is `None` for a rooted member and the delegated spaces for
+    /// a delegate — the same scope rule `Open` applies, so a socket a caller
+    /// could not open is a socket it is not shown. An activation whose program
+    /// is not published here lists with [`Hash::EMPTY`], which is how
+    /// `synch socket ls <origin>:` prints it as unpublished.
+    pub fn socket_list_for(
+        &self,
+        delegated: Option<&[String]>,
+    ) -> Result<Vec<synch_core::SockEntry>> {
+        let mut out = Vec::new();
+        for activation in self.store().socket_activations()? {
+            if !activation.admits(delegated) {
+                continue;
+            }
+            let program = match self.resolve_socket_program(&activation)? {
+                Ok(resolved) => resolved.root,
+                Err(_) => Hash::EMPTY,
+            };
+            out.push(synch_core::SockEntry {
+                name: activation.name,
+                program,
+                program_path: format!("{}/{}", activation.program_space, activation.program_path),
+                note: activation.note,
+            });
+        }
+        Ok(out)
     }
 
     /// Reads a socket's ELF object out of this node's own CAS, sharing the
@@ -213,7 +269,7 @@ impl Node {
     ///
     /// Every refusal here is a distinct code, because the caller can act on the
     /// difference: `ProgramInvalid` is the operator's to fix by deploying,
-    /// `SpaceNotDelegated` is the caller's, and `NoSuchPath` means look again.
+    /// `OutOfScope` is the caller's, and `NoSuchPath` means look again.
     pub(crate) async fn admit_socket(
         &self,
         peer: NodeId,
@@ -256,41 +312,46 @@ impl Node {
                 "no live binding for that device key".into(),
             ));
         };
-        if let Some(spaces) = &scope {
-            if !spaces.contains(&open.space) {
-                return Err((
-                    RefuseCode::SpaceNotDelegated,
-                    format!("`{}` is not one of your delegated spaces", open.space),
-                ));
-            }
-        }
 
+        // The activation first, then the scope it carries, then the program.
+        // Scope sits exactly where the delegated-space check sat: after
+        // `socketAuthority` says who the caller is, and before anything is
+        // read from the CAS.
         let node = self.clone();
-        let (space, path) = (open.space.clone(), open.path.clone());
-        let resolved = crate::blocking::offload(move || {
-            let resolved = node.resolve_socket(&space, &path)?;
-            let ordinary = if resolved.is_none() {
-                node.store().entry(node.origin(), &space, &path)?.is_some()
-            } else {
-                false
+        let name = open.socket.clone();
+        let found = crate::blocking::offload(move || {
+            let Some(activation) = node.store().socket_activation(&name)? else {
+                return Ok(None);
             };
-            Ok((resolved, ordinary))
+            let program = node.resolve_socket_program(&activation)?;
+            Ok(Some((activation, program)))
         })
         .await
         .map_err(|e| (RefuseCode::NoSuchPath, e.to_string()))?;
-        let resolved = match resolved {
-            (Some(resolved), _) => resolved,
-            (None, ordinary) => {
-                // Told apart so the caller learns something: a path this node
-                // publishes as an ordinary file is a different mistake from a
-                // path it publishes nothing for.
-                let code = if ordinary {
-                    RefuseCode::NotASocket
-                } else {
-                    RefuseCode::NoSuchPath
-                };
-                return Err((code, format!("{}/{}", open.space, open.path)));
-            }
+        let Some((activation, program)) = found else {
+            return Err((
+                RefuseCode::NoSuchPath,
+                format!("no socket named `{}` here", open.socket),
+            ));
+        };
+        if !activation.admits(scope.as_deref()) {
+            return Err((
+                RefuseCode::OutOfScope,
+                format!(
+                    "`{}` is open to members{}, and none of your delegated spaces is among them",
+                    open.socket,
+                    match activation.scope.as_slice() {
+                        [] => String::new(),
+                        spaces => format!(" and delegates of {}", spaces.join(", ")),
+                    }
+                ),
+            ));
+        }
+        let resolved = match program {
+            Ok(resolved) => resolved,
+            // The program path, not the socket name: what is wrong is where
+            // the bytes are meant to be, and deploying them is the remedy.
+            Err(code) => return Err((code, activation.program())),
         };
 
         // The program's bytes and manifest come before the registry slot: the
@@ -324,11 +385,11 @@ impl Node {
         // Activation and deactivation take the write side of this gate, so
         // either this admission becomes in-flight first or the deactivation
         // wins and this request is refused.
-        let qualified = format!("{}/{}", open.space, open.path);
+        let name = open.socket.clone();
         let node = self.clone();
-        let (space, path) = (open.space.clone(), open.path.clone());
+        let checked_name = name.clone();
         let checked_root = resolved.root;
-        let qualified_for_slot = qualified.clone();
+        let name_for_slot = name.clone();
         let peer_name = origin.canonical();
         // The store read and the registry reservation are one blocking-pool
         // closure so the authorization read guard spans both; there is no
@@ -342,19 +403,20 @@ impl Node {
         // against its cap.
         let prepared = crate::blocking::offload(move || {
             let _authorization = node.socket_authorization_read();
-            let current = match node.resolve_socket(&space, &path)? {
+            let current = match node.resolve_socket(&checked_name)? {
                 Some(current) => current,
                 None => {
                     return Ok(Err((
                         RefuseCode::NotActivated,
-                        "the socket was deactivated or republished during admission".into(),
+                        "the socket was deactivated or its program withdrawn during admission"
+                            .into(),
                     )))
                 }
             };
             if current.root != checked_root {
                 return Ok(Err((
                     RefuseCode::NotActivated,
-                    "the socket's content was replaced during admission; connect again to \
+                    "the program's content was replaced during admission; connect again to \
                      reach the new program"
                         .into(),
                 )));
@@ -379,7 +441,7 @@ impl Node {
             // starts, so a caller cannot open idle streams past the cap.
             let Some(slot) = node.reserve_socket_slot(
                 id,
-                &qualified_for_slot,
+                &name_for_slot,
                 &peer_name,
                 peer,
                 checked_root,
@@ -388,8 +450,7 @@ impl Node {
                 return Ok(Err((
                     RefuseCode::Busy,
                     format!(
-                        "{qualified_for_slot} is at its limit of {max_streams} concurrent \
-                         invocations"
+                        "{name_for_slot} is at its limit of {max_streams} concurrent invocations"
                     ),
                 )));
             };
@@ -403,7 +464,8 @@ impl Node {
         Ok(Admission {
             program,
             program_root: resolved.root,
-            socket: SocketId::new(&open.space, &open.path),
+            program_path: resolved.activation.program(),
+            socket: SocketId::new(&name),
             peer: PeerIdentity {
                 origin,
                 device_key: peer,
@@ -417,7 +479,7 @@ impl Node {
             host: Arc::new(TreeHost {
                 node: self.clone(),
                 own_origin: self.origin().clone(),
-                socket: qualified,
+                socket: name,
                 invocation: id,
                 peer: peer_label,
             }),
@@ -455,16 +517,16 @@ impl Node {
         };
         // The pool records every outcome against the socket's fault history.
         // Nothing is deactivated for it — activation is the operator's
-        // statement about the path, not a judgement about these bytes — but a
-        // program faulting for most of its callers is worth one loud line an
-        // operator will find. Deploying a fixed object is the remedy, and it
-        // clears the window.
-        if pool.should_quarantine(&socket.qualified(), program_root) {
+        // statement about the program path, not a judgement about these bytes
+        // — but a program faulting for most of its callers is worth one loud
+        // line an operator will find. Deploying a fixed object is the remedy,
+        // and it clears the window.
+        if pool.should_quarantine(socket.as_str(), program_root) {
             tracing::error!(
-                socket = socket.qualified(),
+                socket = socket.as_str(),
                 program = %program_root,
                 "socket program faulted on most of its recent invocations, from more than \
-                 one caller; it stays activated — deploy a fixed program to this path"
+                 one caller; it stays activated — deploy a fixed program to its program path"
             );
         }
         status
@@ -484,9 +546,9 @@ impl Node {
     }
 
     /// What one socket's programs have written recently.
-    pub fn socket_log(&self, space: &str, path: &str) -> Vec<synch_sock::LogLine> {
+    pub fn socket_log(&self, name: &str) -> Vec<synch_sock::LogLine> {
         match self.socket_workers() {
-            Some(pool) => pool.logs(&format!("{space}/{path}")),
+            Some(pool) => pool.logs(name),
             None => Vec::new(),
         }
     }
@@ -499,14 +561,12 @@ impl Node {
 /// Writes go through [`SocketHost::put_open`] and exist only behind an armed
 /// tree-write declaration (`docs/TREE-WRITES.md`): the runtime checks the
 /// grant before this host is asked, and this host re-takes the engine's own
-/// durable gates — the declared-socket refusal, `.syncignore`, recovery —
-/// at open and again at commit.
+/// durable gates — `.syncignore`, recovery — at open and again at commit.
 #[derive(Debug)]
 struct TreeHost {
     node: Node,
     own_origin: OriginId,
-    /// `<space>/<path>` of the socket being served, for the tree-write audit
-    /// log.
+    /// The name of the socket being served, for the tree-write audit log.
     socket: String,
     /// The invocation id, likewise.
     invocation: u64,
@@ -1317,6 +1377,34 @@ impl synch_net::sock::SocketService for SocketDispatch {
         node.admit_socket(peer, addr, stream_index, open).await
     }
 
+    async fn list(&self, peer: NodeId) -> Vec<synch_core::SockEntry> {
+        let Some(node) = self.node() else {
+            return Vec::new();
+        };
+        // Listing needs no runtime and takes no slot: a node that cannot serve
+        // sockets can still say which ones it has. A caller with no live
+        // binding, or a store that will not answer, is shown nothing rather
+        // than told why — the accept gate already refused anyone unknown, and
+        // a `List` has no refusal frame of its own.
+        let outcome = crate::blocking::offload(move || {
+            let Some((_, delegated)) = node
+                .store()
+                .socket_scope_for_key(&peer, synch_core::now_ns())?
+            else {
+                return Ok(Vec::new());
+            };
+            node.socket_list_for(delegated.as_deref())
+        })
+        .await;
+        match outcome {
+            Ok(sockets) => sockets,
+            Err(e) => {
+                tracing::warn!(peer = %peer.fmt_short(), "socket List failed: {e}");
+                Vec::new()
+            }
+        }
+    }
+
     async fn run(
         &self,
         admission: Admission,
@@ -1689,21 +1777,35 @@ impl ProgramBytesCache {
 }
 
 impl Node {
-    /// Notes a deployment: the scanner republished an activated socket path
-    /// with new content (`docs/SOCKETS.md` §3).
+    /// Notes a deployment: a path some activation names as its program was
+    /// republished with new content (`docs/SOCKET-PROGRAMS.md` §4).
     ///
-    /// Nothing about the activation changes — that is the model — but the
+    /// Nothing about any activation changes — that is the model — but the
     /// per-socket map does not survive the program it was minted by: a session
     /// table the old bytes built is not state the new bytes agreed to inherit.
-    /// Invocations already running keep the snapshot they were admitted with;
-    /// the next admission serves the new root.
-    pub(crate) fn socket_content_deployed(&self, space: &str, path: &str, root: &Hash) {
-        self.clear_socket_map(&format!("{space}/{path}"));
-        tracing::info!(
-            socket = format!("{space}/{path}"),
-            root = %root,
-            "socket content deployed; new connections serve the new program"
-        );
+    /// One object backing three sockets moves all three and clears all three
+    /// maps, and says so once per socket. Invocations already running keep the
+    /// snapshot they were admitted with; the next admission serves the new
+    /// root.
+    ///
+    /// Called only where content actually changed, so an unchanged rescan
+    /// costs no lookup at all.
+    pub(crate) fn program_content_deployed(
+        &self,
+        space: &str,
+        path: &str,
+        root: &Hash,
+    ) -> Result<()> {
+        for activation in self.store().activations_backed_by(space, path)? {
+            self.clear_socket_map(&activation.name);
+            tracing::info!(
+                socket = activation.name,
+                program = format!("{space}/{path}"),
+                root = %root,
+                "program deployed; new connections to this socket serve the new program"
+            );
+        }
+        Ok(())
     }
 
     /// Reads an object out of the local CAS synchronously.
@@ -1732,9 +1834,9 @@ impl Node {
     /// Opens a socket on a node (`docs/SOCKETS.md` §4), including this one.
     ///
     /// The connecting side of the design, and it executes nothing: it names a
-    /// path, and everything that decides what runs is state the callee already
-    /// holds. That is why this half works on platforms where the runtime does
-    /// not exist at all.
+    /// socket, and everything that decides what runs is state the callee
+    /// already holds. That is why this half works on platforms where the
+    /// runtime does not exist at all.
     ///
     /// One QUIC connection per call rather than a reused session: a socket
     /// stream's lifetime is the caller's, and sharing a connection between two
@@ -1742,11 +1844,10 @@ impl Node {
     pub async fn connect_socket(
         &self,
         origin: &OriginId,
-        space: &str,
-        path: &str,
+        socket: &str,
         meta: Vec<(String, String)>,
     ) -> Result<SocketConnection> {
-        let open = SockOpen::new(origin.clone(), space, path, meta);
+        let open = SockOpen::new(origin.clone(), socket, meta);
         open.validate()
             .map_err(|e| EngineError::invalid(e.to_string()))?;
 
@@ -1756,12 +1857,13 @@ impl Node {
                 .await
                 .map_err(|(code, message)| {
                     EngineError::invalid(format!(
-                        "{} refused {space}/{path}: {}: {message}",
+                        "{} refused {socket}: {}: {message}",
                         origin.canonical(),
                         code.as_str()
                     ))
                 })?;
             let program = admission.program_root;
+            let program_path = admission.program_path.clone();
             let invocation = admission.id;
             let (caller, guest) = tokio::io::duplex(self.socket_limits().ring_bytes);
             let node = self.clone();
@@ -1778,6 +1880,7 @@ impl Node {
             });
             return Ok(SocketConnection::Local {
                 program,
+                program_path,
                 invocation,
                 stream: LocalStream {
                     inner: caller,
@@ -1829,13 +1932,57 @@ impl Node {
                     stream,
                 }),
                 Err(refused) => Err(EngineError::invalid(format!(
-                    "{} refused {space}/{path}: {refused}",
+                    "{} refused {socket}: {refused}",
                     origin.canonical()
                 ))),
             };
         }
         Err(last.unwrap_or_else(|| {
             EngineError::not_found(format!("could not reach {}", origin.canonical()))
+        }))
+    }
+
+    /// The sockets a node will let this caller open
+    /// (`docs/SOCKET-PROGRAMS.md` §5), including this one.
+    ///
+    /// The discovery `synch ls` used to give for free, now that nothing
+    /// socket-shaped is in the tree to be listed. It needs no runtime on
+    /// either side.
+    pub async fn list_sockets(&self, origin: &OriginId) -> Result<Vec<synch_core::SockEntry>> {
+        if origin == self.origin() {
+            let node = self.clone();
+            // Ourselves: a rooted member of our own node, so every socket.
+            return crate::blocking::offload(move || node.socket_list_for(None)).await;
+        }
+
+        let node = self.clone();
+        let remote = origin.clone();
+        let keys = crate::blocking::offload(move || {
+            Ok(node
+                .store()
+                .keys_for_origin(&remote, synch_core::now_ns())?)
+        })
+        .await?;
+        let mut last: Option<EngineError> = None;
+        for key in keys {
+            let addr = self
+                .peer_addr_off_runtime(&key)
+                .await?
+                .unwrap_or_else(|| iroh::EndpointAddr::new(key));
+            let client = match self.net().connect_sock(addr).await {
+                Ok(client) => client,
+                Err(e) => {
+                    last = Some(EngineError::Net(e));
+                    continue;
+                }
+            };
+            return client.list().await.map_err(EngineError::Net);
+        }
+        Err(last.unwrap_or_else(|| {
+            EngineError::not_found(format!(
+                "no live binding for {} — this node does not know its device key",
+                origin.canonical()
+            ))
         }))
     }
 }
@@ -1921,6 +2068,8 @@ pub enum SocketConnection {
     Local {
         /// The content root actually running.
         program: Hash,
+        /// `<space>/<path>` of the program the socket names.
+        program_path: String,
         /// The callee's invocation id.
         invocation: u64,
         /// Opaque bytes in both directions. Dropping it ends the invocation.
@@ -2066,7 +2215,12 @@ mod tests {
                 &origin,
                 "media",
                 "git.sock",
-                &FileEntry::socket(3, 0, Hash::new(b"sock"), 4),
+                // The historical socket kind, as a record an older build
+                // published still carries it.
+                &FileEntry {
+                    kind: EntryKind::Socket,
+                    ..FileEntry::file(3, 0, Hash::new(b"sock"), 4)
+                },
             )
             .unwrap();
         store

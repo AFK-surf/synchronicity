@@ -39,6 +39,19 @@ pub fn kind_name(kind: synch_core::EntryKind) -> &'static str {
     }
 }
 
+/// Who a socket's scope admits, as `activate` and `ls -l` say it
+/// (`docs/SOCKET-PROGRAMS.md` §2.2).
+///
+/// A rooted member always may, so every scope reads as "members" plus
+/// whichever spaces' delegates were named; an empty scope is members alone,
+/// which is the default and the narrower grant.
+pub(crate) fn socket_scope(scope: &[String]) -> String {
+    match scope {
+        [] => "members only".to_string(),
+        spaces => format!("members, and delegates of {}", spaces.join(", ")),
+    }
+}
+
 /// The mark a divergent path carries in a listing: the number of versions it
 /// holds (§8, §14).
 ///

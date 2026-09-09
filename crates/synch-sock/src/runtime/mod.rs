@@ -1015,7 +1015,7 @@ async fn run_job(
                 Ok(value) => SockStatus::Ok(value),
                 Err(e) => {
                     tracing::warn!(
-                        socket = %inner.socket.qualified(),
+                        socket = %inner.socket.as_str(),
                         invocation = inner.id,
                         "socket program faulted: {e}"
                     );

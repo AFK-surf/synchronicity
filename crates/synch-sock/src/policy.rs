@@ -30,27 +30,30 @@ pub const NOBODY: [u8; 32] = [
     0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66, 0x66,
 ];
 
-/// Which socket an invocation is serving.
+/// Which socket an invocation is serving: its name on the node serving it
+/// (`docs/SOCKET-PROGRAMS.md` §2).
+///
+/// Not a path and not in any space. The registry, the concurrency cap, the
+/// fault window, the log tail and the map are all keyed by it, which is what
+/// makes two sockets on one program as separate as two sockets on two.
 #[derive(Debug, Clone, PartialEq, Eq)]
-pub struct SocketId {
-    /// The space it lives in.
-    pub space: String,
-    /// Its path within that space.
-    pub path: String,
-}
+pub struct SocketId(String);
 
 impl SocketId {
-    /// Builds one.
-    pub fn new(space: impl Into<String>, path: impl Into<String>) -> Self {
-        SocketId {
-            space: space.into(),
-            path: path.into(),
-        }
+    /// Builds one from a socket name.
+    pub fn new(name: impl Into<String>) -> Self {
+        SocketId(name.into())
     }
 
-    /// `<space>/<path>`, as every command and log line names a socket.
-    pub fn qualified(&self) -> String {
-        format!("{}/{}", self.space, self.path)
+    /// The name, as every command and log line spells it.
+    pub fn as_str(&self) -> &str {
+        &self.0
+    }
+}
+
+impl std::fmt::Display for SocketId {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str(&self.0)
     }
 }
 

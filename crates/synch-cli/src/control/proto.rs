@@ -57,7 +57,13 @@ pub use pb::{
 /// path-based activation (`SocketActivate`/`SocketDeactivate`): a removal and
 /// an addition of calls, so a daemon on either side of the change must not be
 /// spoken to by a client on the other.
-pub const CONTROL_VERSION: u32 = 5;
+///
+/// v6 makes a socket a *name* rather than a path
+/// (`docs/SOCKET-PROGRAMS.md` §7.1): every socket call's `target` changes
+/// meaning without changing type, and `SocketActivate` grows the program it
+/// binds. A client and a daemon on different sides of that would misaddress a
+/// socket rather than fail, so they must refuse each other instead.
+pub const CONTROL_VERSION: u32 = 6;
 
 /// How many payload bytes one chunk carries.
 ///

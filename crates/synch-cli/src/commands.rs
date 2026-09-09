@@ -960,31 +960,40 @@ fn to_command(cli: &Cli) -> Result<Cmd> {
 
         Command::Socket { command } => match command {
             SocketCommand::Activate {
-                target,
+                name,
+                program,
+                scope,
                 config,
                 max_streams,
                 note,
             } => Cmd::SocketActivate(pb::SocketActivate {
-                target: target.clone(),
+                target: name.clone(),
+                program: program.clone(),
+                scope: scope.clone(),
                 config: config.clone(),
                 max_streams: max_streams.unwrap_or(0),
                 note: note.clone().unwrap_or_default(),
             }),
-            SocketCommand::Deactivate { target } => Cmd::SocketDeactivate(pb::SocketDeactivate {
-                target: target.clone(),
+            SocketCommand::Deactivate { name } => Cmd::SocketDeactivate(pb::SocketDeactivate {
+                target: name.clone(),
             }),
-            SocketCommand::Ls { space, long } => Cmd::SocketLs(pb::SocketLs {
-                space: space.clone().unwrap_or_default(),
+            SocketCommand::Ls { origin, long } => Cmd::SocketLs(pb::SocketLs {
+                // A trailing `:` is how `<origin>:` is spelled where a path
+                // would follow; accepted with or without it.
+                origin: origin
+                    .as_deref()
+                    .map(|origin| origin.trim_end_matches(':').to_string())
+                    .unwrap_or_default(),
                 long: *long,
             }),
-            SocketCommand::Ps { target } => Cmd::SocketPs(pb::SocketPs {
-                target: target.clone().unwrap_or_default(),
+            SocketCommand::Ps { name } => Cmd::SocketPs(pb::SocketPs {
+                target: name.clone().unwrap_or_default(),
             }),
             SocketCommand::Kill { invocation } => Cmd::SocketKill(pb::SocketKill {
                 invocation: *invocation,
             }),
-            SocketCommand::Log { target } => Cmd::SocketLog(pb::SocketLog {
-                target: target.clone(),
+            SocketCommand::Log { name } => Cmd::SocketLog(pb::SocketLog {
+                target: name.clone(),
             }),
             SocketCommand::Sdk => Cmd::SocketSdk(pb::SocketSdk {}),
             // Compiling and inspecting are local work with no node in them,

@@ -112,27 +112,6 @@ impl Context {
         )))
     }
 
-    /// The space to send for a request that named none.
-    ///
-    /// An omitted space means *every* space to the daemon, which is the one
-    /// thing `--space` exists to prevent: the filter it builds is `None`, and
-    /// the answer covers the whole node. So an unconfined server keeps the
-    /// wildcard, a server confined to exactly one space fills it in, and one
-    /// confined to several asks which — the daemon's filter names a single
-    /// space, and there is no way to say "these three" that does not also say
-    /// "and the rest".
-    fn scoped_default(&self) -> Result<String, ToolError> {
-        match self.options.spaces.as_slice() {
-            [] => Ok(String::new()),
-            [only] => Ok(only.clone()),
-            several => Err(ToolError::execution(format!(
-                "this server is confined to more than one space, and a request \
-                 naming none would reach every space on the node; name one of: {}",
-                several.join(", ")
-            ))),
-        }
-    }
-
     /// Refuses an operation that has no space to be confined to.
     ///
     /// Some commands take no space at all and act on everything the node
@@ -690,18 +669,18 @@ fn build_catalog() -> Vec<Tool> {
         Tool {
             name: "synch_socket_list",
             title: "List sockets",
-            description: "Every path this node has activated as a socket: whether its \
-                          current content is published and serves, what that content's \
-                          manifest declares, and its stream cap. A socket is a path whose \
-                          content is an eBPF program this node runs for peers that \
-                          connect to it."
+            description: "Every socket this node has activated: the program behind each \
+                          name, whether that program is published and serves, what its \
+                          manifest declares, and its stream cap. A socket is a name of \
+                          this node's own, bound to an eBPF program in its tree, which it \
+                          runs for peers that connect to it."
                 .into(),
             tier: Tier::Read,
             input: json!({
                 "type": "object",
                 "properties": {
-                    "space": { "type": "string", "description": "Only this space." },
-                    "long": { "type": "boolean", "description": "Include the armed root, declaration and policy." },
+                    "origin": { "type": "string", "description": "A peer, to ask which of its sockets this node may open. Omitted, this node's own." },
+                    "long": { "type": "boolean", "description": "Include the program path, its root, the declaration, the scope and the policy." },
                 },
                 "additionalProperties": false,
             }),
@@ -717,8 +696,7 @@ fn build_catalog() -> Vec<Tool> {
             input: json!({
                 "type": "object",
                 "properties": {
-                    "space": { "type": "string" },
-                    "path": { "type": "string" },
+                    "name": { "type": "string", "description": "Only this socket. Omitted, every socket on the node." },
                 },
                 "additionalProperties": false,
             }),
@@ -732,10 +710,9 @@ fn build_catalog() -> Vec<Tool> {
             input: json!({
                 "type": "object",
                 "properties": {
-                    "space": { "type": "string" },
-                    "path": { "type": "string" },
+                    "name": { "type": "string", "description": "The socket's name." },
                 },
-                "required": ["space", "path"],
+                "required": ["name"],
                 "additionalProperties": false,
             }),
             output: None,
@@ -757,7 +734,7 @@ fn build_catalog() -> Vec<Tool> {
             description: "Compiles C source to the eBPF object a socket is made of, and \
                           returns it base64-encoded. Nothing is written or published: \
                           inspect it with synch_socket_inspect, then write the bytes to \
-                          an activated path with synch_write to deploy them. synch.h is \
+                          a program path with synch_write to deploy them. synch.h is \
                           included automatically."
                 .into(),
             tier: Tier::Read,
@@ -826,9 +803,8 @@ fn build_catalog() -> Vec<Tool> {
             input: json!({
                 "type": "object",
                 "properties": {
-                    "origin": { "type": "string", "description": "The node serving the socket. Required — a socket is served by whoever published it." },
-                    "space": { "type": "string" },
-                    "path": { "type": "string" },
+                    "origin": { "type": "string", "description": "The node serving the socket. Required — a socket name means something only on the node that activated it." },
+                    "name": { "type": "string", "description": "The socket's name on that node." },
                     "text": { "type": "string", "description": "Input to send, as text." },
                     "base64": { "type": "string", "description": "Input to send, as base64 bytes." },
                     "meta": {
@@ -838,7 +814,7 @@ fn build_catalog() -> Vec<Tool> {
                     },
                     "timeout_ms": { "type": "integer", "minimum": 1, "description": "Give up after this long, default 30000, maximum 300000." },
                 },
-                "required": ["origin", "space", "path"],
+                "required": ["origin", "name"],
                 "additionalProperties": false,
             }),
             output: Some(json!({
@@ -993,21 +969,27 @@ fn build_catalog() -> Vec<Tool> {
         },
         Tool {
             name: "synch_socket_activate",
-            title: "Activate a socket path",
-            description: "Makes a path in one of this node's spaces a socket until \
-                          synch_socket_deactivate. From the next scan the path publishes \
-                          as a socket, and every later write to it — synch_write, \
-                          adoption, an S3 PUT — is an intentional deployment: the new \
-                          content serves immediately under its own manifest. Activate a \
-                          path only when every channel that can write it is meant as a \
-                          deployment channel."
+            title: "Activate a socket",
+            description: "Binds a socket name on this node to a program — an ordinary \
+                          file in one of its spaces — until synch_socket_deactivate. \
+                          Every later write to that program, by synch_write, adoption or \
+                          an S3 PUT, is an intentional deployment to every socket that \
+                          names it: the new content serves immediately under its own \
+                          manifest. Activate only programs whose every writer is meant as \
+                          a deployer."
                 .into(),
             tier: Tier::Write,
             input: json!({
                 "type": "object",
                 "properties": {
-                    "space": { "type": "string" },
-                    "path": { "type": "string" },
+                    "name": { "type": "string", "description": "The socket's name on this node; `/` may group names." },
+                    "program_space": { "type": "string", "description": "The space the program file lives in." },
+                    "program_path": { "type": "string", "description": "The program's path within that space." },
+                    "scope": {
+                        "type": "array",
+                        "description": "Spaces whose delegates may open this socket. Empty admits rooted members only.",
+                        "items": { "type": "string" },
+                    },
                     "config": {
                         "type": "object",
                         "description": "Configuration the program reads with sy_config_get.",
@@ -1016,26 +998,25 @@ fn build_catalog() -> Vec<Tool> {
                     "max_streams": { "type": "integer", "minimum": 1, "description": "A concurrency cap for this socket." },
                     "note": { "type": "string" },
                 },
-                "required": ["space", "path"],
+                "required": ["name", "program_space", "program_path"],
                 "additionalProperties": false,
             }),
             output: None,
         },
         Tool {
             name: "synch_socket_deactivate",
-            title: "Deactivate a socket path",
-            description: "Stops a path being a socket: connections refuse immediately, \
-                          running invocations finish on their snapshot, and the next \
-                          scan republishes the path as an ordinary file."
+            title: "Deactivate a socket",
+            description: "Releases a socket name: connections refuse immediately, running \
+                          invocations finish on their snapshot, and the program file is \
+                          untouched."
                 .into(),
             tier: Tier::Write,
             input: json!({
                 "type": "object",
                 "properties": {
-                    "space": { "type": "string" },
-                    "path": { "type": "string" },
+                    "name": { "type": "string", "description": "The socket's name." },
                 },
-                "required": ["space", "path"],
+                "required": ["name"],
                 "additionalProperties": false,
             }),
             output: None,
@@ -1125,7 +1106,7 @@ pub(crate) async fn call(
         }
         "synch_socket_activate" => socket_activate(ctx, args, reporter).await,
         "synch_socket_deactivate" => {
-            socket_target(ctx, args, reporter, |target| {
+            socket_by_name(ctx, args, reporter, |target| {
                 Cmd::SocketDeactivate(pb::SocketDeactivate { target })
             })
             .await
@@ -1510,35 +1491,18 @@ async fn socket_list(
     args: &Value,
     reporter: &Reporter,
 ) -> Result<Outcome, ToolError> {
-    let space = match opt_str(args, "space")?.filter(|s| !s.is_empty()) {
-        Some(space) => {
-            ctx.scope(space)?;
-            space.to_string()
-        }
-        // An empty space is the daemon's wildcard, so a confined server has to
-        // put its own space there rather than pass the omission through.
-        None => ctx.scoped_default()?,
-    };
+    // A socket is a name in a namespace of its own, so a listing names every
+    // socket on the node and there is no space to narrow it to.
+    ctx.whole_node("synch_socket_list")?;
+    let origin = opt_str(args, "origin")?.unwrap_or_default().to_string();
     let long = opt_bool(args, "long")?;
-    rendered(ctx, Cmd::SocketLs(pb::SocketLs { space, long }), reporter).await
+    rendered(ctx, Cmd::SocketLs(pb::SocketLs { origin, long }), reporter).await
 }
 
 /// `synch_socket_ps`.
 async fn socket_ps(ctx: &Context, args: &Value, reporter: &Reporter) -> Result<Outcome, ToolError> {
-    let target = match opt_str(args, "space")?.filter(|s| !s.is_empty()) {
-        Some(space) => {
-            ctx.scope(space)?;
-            reference(space, need_str(args, "path")?, None)?
-        }
-        // The daemon filters invocations by an exact `space/path`, so there is
-        // no narrowing to a space alone: either this names one socket or it
-        // answers for every space on the node, and the second is not something
-        // a confined server may do.
-        None => {
-            ctx.whole_node("synch_socket_ps without a space")?;
-            String::new()
-        }
-    };
+    ctx.whole_node("synch_socket_ps")?;
+    let target = opt_str(args, "name")?.unwrap_or_default().to_string();
     rendered(ctx, Cmd::SocketPs(pb::SocketPs { target }), reporter).await
 }
 
@@ -1548,22 +1512,26 @@ async fn socket_log(
     args: &Value,
     reporter: &Reporter,
 ) -> Result<Outcome, ToolError> {
-    socket_target(ctx, args, reporter, |target| {
+    socket_by_name(ctx, args, reporter, |target| {
         Cmd::SocketLog(pb::SocketLog { target })
     })
     .await
 }
 
-/// The shape every `<space>/<path>` socket command shares.
-async fn socket_target(
+/// The shape every name-addressed socket command shares.
+///
+/// There is no space to confine to: a socket name is in a namespace of this
+/// node's own, and the program behind it may live in any space, so a server
+/// under `--space` is refused rather than allowed to step around its own
+/// confinement.
+async fn socket_by_name(
     ctx: &Context,
     args: &Value,
     reporter: &Reporter,
     build: impl Fn(String) -> Cmd,
 ) -> Result<Outcome, ToolError> {
-    let space = need_str(args, "space")?;
-    ctx.scope(space)?;
-    let target = reference(space, need_str(args, "path")?, None)?;
+    ctx.whole_node("a socket command")?;
+    let target = need_str(args, "name")?.to_string();
     rendered(ctx, build(target), reporter).await
 }
 
@@ -1612,6 +1580,27 @@ async fn socket_build(args: &Value) -> Result<Outcome, ToolError> {
             "size": object.len(),
         }),
     ))
+}
+
+/// Reads a `["a", "b"]` argument, refusing anything but strings.
+fn string_list(args: &Value, name: &str) -> Result<Vec<String>, ToolError> {
+    let list = match args.get(name) {
+        None | Some(Value::Null) => return Ok(Vec::new()),
+        Some(Value::Array(list)) => list,
+        Some(_) => {
+            return Err(ToolError::execution(format!(
+                "{name} must be an array of strings"
+            )))
+        }
+    };
+    list.iter()
+        .map(|value| match value {
+            Value::String(value) => Ok(value.clone()),
+            _ => Err(ToolError::execution(format!(
+                "every entry of {name} must be a string"
+            ))),
+        })
+        .collect()
 }
 
 /// Reads a `{"k": "v"}` argument into pairs, in a stable order.
@@ -1715,9 +1704,12 @@ async fn socket_activate(
     args: &Value,
     reporter: &Reporter,
 ) -> Result<Outcome, ToolError> {
-    let space = need_str(args, "space")?;
-    ctx.scope(space)?;
-    let target = reference(space, need_str(args, "path")?, None)?;
+    // The program is what lives in a space, so that is what confinement is
+    // about: a server confined to `code` may bind a name to a program in
+    // `code`, and to nothing else.
+    let program_space = need_str(args, "program_space")?;
+    ctx.scope(program_space)?;
+    let program = reference(program_space, need_str(args, "program_path")?, None)?;
     let config = string_map(args, "config")?
         .into_iter()
         .map(|(key, value)| format!("{key}={value}"))
@@ -1730,7 +1722,9 @@ async fn socket_activate(
     rendered(
         ctx,
         Cmd::SocketActivate(pb::SocketActivate {
-            target,
+            target: need_str(args, "name")?.to_string(),
+            program,
+            scope: string_list(args, "scope")?,
             config,
             max_streams,
             note: opt_str(args, "note")?.unwrap_or_default().to_string(),
@@ -1743,12 +1737,11 @@ async fn socket_activate(
 /// `synch_socket_connect` — one invocation, driven to its close.
 async fn connect(ctx: &Context, args: &Value) -> Result<Outcome, ToolError> {
     let origin = need_str(args, "origin")?;
-    let space = need_str(args, "space")?;
-    // The `--space` filter names the spaces this process may touch, wherever
-    // they live: a socket on a peer is still addressed by space, and letting
-    // one through would make the filter a local-only fiction.
-    ctx.scope(space)?;
-    let reference = reference(space, need_str(args, "path")?, Some(origin))?;
+    // A socket is in no space, on this node or any other, so there is nothing
+    // for the `--space` filter to narrow: a confined server is refused rather
+    // than allowed to reach past its own confinement.
+    ctx.whole_node("synch_socket_connect")?;
+    let reference = format!("{origin}:{}", need_str(args, "name")?);
     let input = payload(args)?;
     let meta: Vec<pb::MetaPair> = string_map(args, "meta")?
         .into_iter()

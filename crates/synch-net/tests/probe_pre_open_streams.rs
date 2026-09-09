@@ -95,7 +95,8 @@ impl SocketService for InstantService {
         Ok(Admission {
             program: Arc::new(Vec::new()),
             program_root: synch_core::Hash::EMPTY,
-            socket: SocketId::new(&open.space, &open.path),
+            program_path: "code/hold.o".into(),
+            socket: SocketId::new(&open.socket),
             peer: PeerIdentity {
                 origin: synch_core::OriginId::Key(peer),
                 device_key: peer,
@@ -110,6 +111,10 @@ impl SocketService for InstantService {
             id: 7,
             slot: None,
         })
+    }
+
+    async fn list(&self, _peer: synch_core::NodeId) -> Vec<synch_core::SockEntry> {
+        Vec::new()
     }
 
     async fn run(
@@ -224,12 +229,11 @@ async fn half_open_streams_are_dropped_after_the_handshake_timeout() {
     // A complete Open on a fresh stream is still answered: the cap and the
     // timeout never touch admitted invocations.
     let (mut send, mut recv) = connection.open_bi().await.expect("a fresh bi-stream opens");
-    let open = SockOpen::new(
+    let open = synch_core::SockRequest::Open(SockOpen::new(
         synch_core::OriginId::Key(server.id()),
-        "code",
-        "hold.sock",
+        "hold",
         vec![],
-    );
+    ));
     synch_net::frame::write_frame(&mut send, &open)
         .await
         .unwrap();
@@ -287,12 +291,11 @@ async fn connection_closure_signals_the_invocation() {
         .await
         .expect("the socket ALPN connection opens");
     let (mut send, mut recv) = connection.open_bi().await.expect("a bi-stream opens");
-    let open = SockOpen::new(
+    let open = synch_core::SockRequest::Open(SockOpen::new(
         synch_core::OriginId::Key(server.id()),
-        "code",
-        "hold.sock",
+        "hold",
         vec![],
-    );
+    ));
     synch_net::frame::write_frame(&mut send, &open)
         .await
         .unwrap();

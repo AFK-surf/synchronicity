@@ -400,25 +400,23 @@ impl Node {
             .and_then(|e| e.content);
         // `prev` records one-step lineage so a UI can tell "adopted theirs on
         // top of X" from "changed independently" (§8).
-        // The kind comes from a *local* declaration, never from a peer
-        // (`docs/SOCKETS.md` §2.2). That is what makes `synch adopt path` of
-        // someone's socket adopt its bytes and not its socket-ness: this node
-        // publishes what it has declared, and it has declared nothing about a
-        // path it merely received.
-        let activated_socket = self.store().is_activated_socket(space_id, rel)?;
-        let mut entry = if activated_socket {
-            FileEntry::socket(size, mtime_ns, content, seq)
-        } else {
-            FileEntry::file(size, mtime_ns, content, seq)
-        };
+        //
+        // Every file publishes as a file. The scanner used to consult the
+        // activation table here to choose `EntryKind::Socket`; nothing
+        // socket-shaped enters the tree any more, and a program is an ordinary
+        // file that some activation happens to name
+        // (`docs/SOCKET-PROGRAMS.md` §3).
+        let mut entry = FileEntry::file(size, mtime_ns, content, seq);
         entry.prev = previous.filter(|p| *p != content);
         entry.unix_mode = unix_mode(&metadata);
 
-        // A content change under an activated path is a deployment: it
-        // publishes like any other change, and the only thing that resets is
-        // the per-socket map the old program minted.
-        if activated_socket && previous.is_some_and(|p| p != content) {
-            self.socket_content_deployed(space_id, rel, &content);
+        // A content change at a path some activation names as its program is
+        // a deployment to every socket that names it: it publishes like any
+        // other change, and the only thing that resets is each dependent
+        // socket's map, which the old program minted. The lookup is reached
+        // only when the content actually moved.
+        if previous.is_some_and(|p| p != content) {
+            self.program_content_deployed(space_id, rel, &content)?;
         }
 
         report.staged.push(StagedChange::record(
@@ -958,6 +956,10 @@ impl Node {
         debug_assert_eq!(ingested.size, size);
         let (node, space) = (self.clone(), space_id.to_string());
         crate::blocking::offload(move || {
+            let previous = node
+                .store()
+                .entry(node.origin(), &space, &normalized)?
+                .and_then(|entry| entry.content);
             node.stage_api_reference(
                 &space,
                 &normalized,
@@ -966,6 +968,12 @@ impl Node {
                 mtime_ns,
                 unix_mode,
             )?;
+            // The API-source half of the deployment fan-out: a commit at a
+            // path some activation names as its program moves every socket
+            // that names it (`docs/SOCKET-PROGRAMS.md` §4).
+            if previous.is_some_and(|previous| previous != ingested.root) {
+                node.program_content_deployed(&space, &normalized, &ingested.root)?;
+            }
             Ok((ingested.root, ingested.size))
         })
         .await

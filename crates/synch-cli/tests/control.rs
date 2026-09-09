@@ -2313,18 +2313,20 @@ async fn the_trust_configuration_and_the_resolver_state_are_reported() {
 
 // ---- sockets (`docs/SOCKETS.md`) -------------------------------------------
 
-fn socket_activate(target: &str) -> Command {
+fn socket_activate(name: &str, program: &str) -> Command {
     Command::SocketActivate(pb::SocketActivate {
-        target: target.into(),
+        target: name.into(),
+        program: program.into(),
+        scope: vec![],
         config: vec![],
         max_streams: 32,
         note: String::new(),
     })
 }
 
-fn socket_ls(space: &str, long: bool) -> Command {
+fn socket_ls(long: bool) -> Command {
     Command::SocketLs(pb::SocketLs {
-        space: space.into(),
+        origin: String::new(),
         long,
     })
 }
@@ -2350,12 +2352,13 @@ async fn the_control_socket_can_invoke_this_nodes_own_socket() {
         &[],
     )
     .unwrap();
-    std::fs::write(space.path().join("echo.sock"), elf).unwrap();
+    std::fs::write(space.path().join("echo.o"), elf).unwrap();
     daemon
         .node
         .socket_activate(&synch_store::SocketActivation::new(
+            "echo",
             "code",
-            "echo.sock",
+            "echo.o",
             synch_core::now_ns(),
         ))
         .unwrap();
@@ -2364,7 +2367,7 @@ async fn the_control_socket_can_invoke_this_nodes_own_socket() {
     let (requests, rx) = tokio::sync::mpsc::channel(4);
     for kind in [
         pb::connect_request::Kind::Open(pb::ConnectOpen {
-            reference: format!("{}:code/echo.sock", daemon.node.origin().canonical()),
+            reference: format!("{}:echo", daemon.node.origin().canonical()),
             meta: Vec::new(),
         }),
         pb::connect_request::Kind::Data(b"through control".to_vec()),
@@ -2409,28 +2412,74 @@ async fn a_socket_is_activated_listed_and_deactivated() {
     )
     .await;
 
-    let out = lines(dir.path(), socket_activate("code/git.sock")).await;
-    assert!(out.contains("activated code/git.sock"), "{out}");
+    let out = lines(dir.path(), socket_activate("git", "code/bin/gateway.o")).await;
+    assert!(out.contains("activated git"), "{out}");
+    assert!(out.contains("code/bin/gateway.o"), "{out}");
     assert!(
-        out.contains("deployment"),
+        out.contains("open to: members only"),
+        "the scope is the grant and it has to be named where it is made: {out}"
+    );
+    assert!(
+        out.contains("deployment to: git"),
+        "the dependents are the point of the line: {out}"
+    );
+    assert!(
+        out.contains("mean as a deployer"),
         "the breadth of the grant has to be named where it is made: {out}"
     );
 
-    // Activated but not published: the scanner has not run, so there is
-    // nothing to serve yet, and the listing says so.
-    let out = lines(dir.path(), socket_ls("", true)).await;
-    assert!(out.contains("code/git.sock"), "{out}");
+    // A second socket on one program: the grant now names both, which is the
+    // moment the operator should see the blast radius grow.
+    let out = lines(
+        dir.path(),
+        Command::SocketActivate(pb::SocketActivate {
+            target: "docs/git".into(),
+            program: "code/bin/gateway.o".into(),
+            scope: vec!["docs".into()],
+            config: vec![],
+            max_streams: 0,
+            note: String::new(),
+        }),
+    )
+    .await;
+    assert!(
+        out.contains("open to: members, and delegates of docs"),
+        "{out}"
+    );
+    assert!(out.contains("deployment to: docs/git, git"), "{out}");
+
+    // Activated but the program is not published: the scanner has not run, so
+    // there is nothing to serve yet, and the listing says so.
+    let out = lines(dir.path(), socket_ls(true)).await;
+    assert!(out.contains("git"), "{out}");
     assert!(out.contains("unpublished"), "{out}");
+    assert!(out.contains("program  code/bin/gateway.o"), "{out}");
+    assert!(
+        out.contains("open to  members, and delegates of docs"),
+        "{out}"
+    );
+    assert!(
+        out.contains("also     git"),
+        "`ls -l` names the other sockets one program backs: {out}"
+    );
 
     let out = lines(
         dir.path(),
         Command::SocketDeactivate(pb::SocketDeactivate {
-            target: "code/git.sock".into(),
+            target: "git".into(),
         }),
     )
     .await;
-    assert!(out.contains("deactivated"), "{out}");
-    assert!(lines(dir.path(), socket_ls("", false))
+    assert!(out.contains("deactivated git"), "{out}");
+    assert!(out.contains("program file is untouched"), "{out}");
+    lines(
+        dir.path(),
+        Command::SocketDeactivate(pb::SocketDeactivate {
+            target: "docs/git".into(),
+        }),
+    )
+    .await;
+    assert!(lines(dir.path(), socket_ls(false))
         .await
         .contains("no sockets activated"),);
 
@@ -2439,7 +2488,7 @@ async fn a_socket_is_activated_listed_and_deactivated() {
         failure(
             dir.path(),
             Command::SocketDeactivate(pb::SocketDeactivate {
-                target: "code/git.sock".into(),
+                target: "git".into(),
             })
         )
         .await,
@@ -2449,29 +2498,82 @@ async fn a_socket_is_activated_listed_and_deactivated() {
     daemon.shutdown().await;
 }
 
+/// `synch socket ls <origin>:` is the wire `List` (`docs/SOCKET-PROGRAMS.md`
+/// §5) — the discovery `synch ls` used to give for free, now that nothing
+/// socket-shaped is in the tree to be listed. Asked of this node's own origin
+/// it answers locally, which is the case a single daemon can check.
 #[tokio::test]
-async fn a_socket_target_must_name_this_nodes_own_space_and_path() {
+async fn a_remote_listing_names_the_sockets_a_caller_may_open() {
     let dir = tempfile::tempdir().unwrap();
+    let space = tempfile::tempdir().unwrap();
     let daemon = Daemon::start(dir.path()).await;
+    lines(
+        dir.path(),
+        source_add("code", space.path().to_str().unwrap()),
+    )
+    .await;
+    std::fs::write(space.path().join("gateway.o"), b"\x7fELF").unwrap();
+    lines(dir.path(), socket_activate("git", "code/gateway.o")).await;
+    daemon.node.scan_and_publish().unwrap();
 
-    // An origin-qualified target is refused: a socket is activated on the node
-    // that publishes it, so naming somebody else's tree here is a mistake
-    // worth saying out loud rather than quietly dropping.
+    let out = lines(
+        dir.path(),
+        Command::SocketLs(pb::SocketLs {
+            origin: daemon.node.origin().canonical(),
+            long: true,
+        }),
+    )
+    .await;
+    assert!(out.contains("git"), "{out}");
+    assert!(
+        out.contains("program  code/gateway.o"),
+        "the reply names where the program lives, which is the audit a tree entry \
+         used to give for free: {out}"
+    );
+
     assert_eq!(
         failure(
             dir.path(),
-            socket_activate("nas@cluster.example:code/git.sock")
+            Command::SocketLs(pb::SocketLs {
+                origin: "not an origin".into(),
+                long: false,
+            })
         )
         .await,
         ErrorCode::Invalid
     );
+    daemon.shutdown().await;
+}
+
+#[tokio::test]
+async fn a_socket_is_named_here_and_its_program_is_a_path_here() {
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = Daemon::start(dir.path()).await;
+
+    // An origin-qualified name is refused: a socket is activated on the node
+    // that serves it, so naming somebody else's namespace here is a mistake
+    // worth saying out loud rather than quietly dropping.
     assert_eq!(
-        failure(dir.path(), socket_activate("nopathhere")).await,
+        failure(
+            dir.path(),
+            socket_activate("nas@cluster.example:git", "code/gateway.o")
+        )
+        .await,
         ErrorCode::Invalid
     );
-    // A space this node does not index has nothing to activate in.
+    // The name grammar is the tree path grammar without a space in front.
     assert_eq!(
-        failure(dir.path(), socket_activate("absent/git.sock")).await,
+        failure(dir.path(), socket_activate("../git", "code/gateway.o")).await,
+        ErrorCode::Invalid
+    );
+    // A program is `<space>/<path>`, always.
+    assert_eq!(
+        failure(dir.path(), socket_activate("git", "nopathhere")).await,
+        ErrorCode::Invalid
+    );
+    // A space this node is not a source of can hold no program.
+    assert_eq!(
+        failure(dir.path(), socket_activate("git", "absent/gateway.o")).await,
         ErrorCode::Invalid
     );
 
@@ -2503,7 +2605,7 @@ async fn the_live_surface_answers_when_nothing_is_running() {
         source_add("code", space.path().to_str().unwrap()),
     )
     .await;
-    lines(dir.path(), socket_activate("code/git.sock")).await;
+    lines(dir.path(), socket_activate("git", "code/gateway.o")).await;
 
     // An empty answer is an answer, and saying so beats printing nothing and
     // leaving an operator wondering whether the command worked.
@@ -2519,7 +2621,7 @@ async fn the_live_surface_answers_when_nothing_is_running() {
     let out = lines(
         dir.path(),
         Command::SocketLog(pb::SocketLog {
-            target: "code/git.sock".into(),
+            target: "git".into(),
         }),
     )
     .await;
@@ -2535,12 +2637,12 @@ async fn the_live_surface_answers_when_nothing_is_running() {
         ErrorCode::NotFound
     );
 
-    // `ps` for one socket takes the same target shape everything else does.
+    // `ps` for one socket takes the same bare name everything else does.
     assert_eq!(
         failure(
             dir.path(),
             Command::SocketPs(pb::SocketPs {
-                target: "nas@cluster.example:code/git.sock".into(),
+                target: "nas@cluster.example:git".into(),
             })
         )
         .await,

@@ -187,7 +187,7 @@ async fn whoami_reports_the_handshake_and_labels_the_caller_s_own_claims() {
     assert!(text.contains("peer-kind:    member"), "{text}");
     assert!(text.contains("reads `code`: yes"), "{text}");
     assert!(text.contains("this-node:    nas@cluster.example"), "{text}");
-    assert!(text.contains("this-socket:  code/test.sock"), "{text}");
+    assert!(text.contains("this-socket:  test"), "{text}");
     // The device key, hex-encoded: 64 characters and no `sy_peer_device_key`
     // shortcut through the caller's own text.
     assert!(
@@ -588,7 +588,7 @@ async fn terminal_upstream_does_not_spin_a_backpressured_proxy() {
         vec![],
     );
     let id = invocation.id;
-    let socket = invocation.socket.qualified();
+    let socket = invocation.socket.as_str().to_string();
     let peer_name = invocation.peer.origin.to_string();
     invocation.slot = registry.reserve(
         id,
