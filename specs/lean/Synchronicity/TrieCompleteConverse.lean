@@ -441,4 +441,89 @@ theorem finite_promotion_complete_execution
   ⟨(TrieFetchCompletion.finite_measure_eq_zero_iff_complete requirements).mp complete,
     bodyReady_completeExecution_of_opportunity tx scope authority pending state ready⟩
 
+/-- All independent positive promotion phases, replacing only the old opaque
+`BodyReady.completeExecution` field with primitive memo replies and a finite
+transaction-lifted trie walk. -/
+structure ReadyOpportunity (origin : Origin.Parsed) (now : Int64)
+    (refused : List (UInt64 × ByteArray × ByteArray)) (state : SimulatedHost.State) where
+  tx : Transaction
+  opened : SimulatedHost.State
+  prepared : SimulatedHost.State
+  scope : Serve.Scope
+  replicas : List Replication.Materialize.Target
+  authority : Authorization.OriginAuthority
+  pending : Replication.Promote.Pending
+  old : Option Replication.Promote.Pending
+  began : execute (Replication.Promote.raw .begin) state = (.ok tx, opened)
+  preparation : execute (PromotionCommand.prepare tx origin now) opened =
+    (.ok (scope, authority, some pending, old), prepared)
+  policy : MaterializationInputs.ReadPolicy state.db origin scope replicas
+  policyUnique : ∀ actualScope actualReplicas,
+    MaterializationInputs.ReadPolicy state.db origin actualScope actualReplicas →
+      actualScope = scope ∧ actualReplicas = replicas
+  notRefused : (pending.head.seq, pending.head.root,
+    old.map (·.head.root) |>.getD Trie.emptyRoot) ∉ refused
+  newer : old.any (fun old => !Replication.Reconcile.newer
+    pending.head.seq pending.head.root ⟨old.head.seq, old.head.root⟩) = false
+  completion : PromotionFreshOpportunity tx
+    ⟨scope, authority.provenance.map Origin.canonical⟩ pending.head.root prepared
+  authorized : SimulatedHost.State
+  written : SimulatedHost.State
+  cleared : SimulatedHost.State
+  staged : SimulatedHost.State
+  count : UInt64
+  permittedExecution :
+    execute (PromotionPublication.permitted tx pending authority) completion.final =
+      (.ok true, authorized)
+  writeExecution : execute (Replication.Promote.history
+    (Replication.Reconcile.putSlot tx "complete" pending.head pending.received now)) authorized =
+      (.ok (), written)
+  clearExecution : execute (Replication.Promote.clear tx origin) written = (.ok (), cleared)
+  materializeExecution : execute (Replication.Materialize.materialize tx origin
+    (old.map (·.head.root) |>.getD Trie.emptyRoot) pending.head.root) cleared =
+      (.ok count, staged)
+  final : SimulatedHost.State
+  committed : execute (Replication.Promote.raw (.commit tx)) staged = (.ok (), final)
+
+def ReadyOpportunity.bodyReady
+    (ready : ReadyOpportunity origin now refused state) :
+    PromotionProgress.BodyReady ready.tx origin now ready.pending ready.old
+      ready.scope ready.authority ready.prepared where
+  newer := ready.newer
+  checked := ready.completion.final
+  authorized := ready.authorized
+  written := ready.written
+  cleared := ready.cleared
+  staged := ready.staged
+  count := ready.count
+  completeExecution := bodyReady_completeExecution_of_opportunity ready.tx ready.scope
+    ready.authority ready.pending ready.prepared ready.completion
+  permittedExecution := ready.permittedExecution
+  writeExecution := ready.writeExecution
+  clearExecution := ready.clearExecution
+  materializeExecution := ready.materializeExecution
+
+/-- Constructor consumed directly by M1: actual begin/prepare, finite
+completeness host opportunity, publication/materialization phases and commit
+produce the existing positive `PromotionProgress.Ready` witness. -/
+def ready_of_opportunity
+    (ready : ReadyOpportunity origin now refused state) :
+    PromotionProgress.Ready origin now refused state where
+  tx := ready.tx
+  opened := ready.opened
+  prepared := ready.prepared
+  scope := ready.scope
+  replicas := ready.replicas
+  authority := ready.authority
+  pending := ready.pending
+  old := ready.old
+  began := ready.began
+  preparation := ready.preparation
+  policy := ready.policy
+  policyUnique := ready.policyUnique
+  notRefused := ready.notRefused
+  body := ready.bodyReady
+  final := ready.final
+  committed := ready.committed
+
 end Synchronicity.TrieCompleteConverse
