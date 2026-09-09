@@ -144,8 +144,7 @@ theorem pulled_head_is_newer_than_local (ours theirs servable : List Advertised)
   rcases publicOrder with sequence | ⟨sequence, root⟩
   · exact Or.inl sequence
   · exact Or.inr ⟨sequence.symm, by
-      rw [byteArray_toList_eq, byteArray_toList_eq]
-      exact root⟩
+      simpa using root⟩
 
 /-- The returned integer positions denote exactly the servable heads which
 beat the peer's greatest advertisement for their origin. -/
@@ -185,8 +184,7 @@ theorem pushed_head_is_newer_than_remote (ours theirs servable : List Advertised
   rcases publicOrder with sequence | ⟨sequence, root⟩
   · exact Or.inl sequence
   · exact Or.inr ⟨sequence.symm, by
-      rw [byteArray_toList_eq, byteArray_toList_eq]
-      exact root⟩
+      simpa using root⟩
 
 /-- The semantic result of the production planner depends only on the sets of
 valid local, remote and servable advertisements. -/
