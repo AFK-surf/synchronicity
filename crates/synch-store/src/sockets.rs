@@ -147,19 +147,6 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
-    /// Whether any activation names this path as its program.
-    pub fn is_program_path(&self, space: &str, path: &str) -> Result<bool> {
-        Ok(self
-            .conn()
-            .query_row(
-                "SELECT 1 FROM socket_activations WHERE program_space = ?1 AND program_path = ?2",
-                params![space, path],
-                |_| Ok(()),
-            )
-            .optional()?
-            .is_some())
-    }
-
     /// Removes an activation by name. Admission refuses it immediately; the
     /// program file is untouched.
     pub fn deactivate_socket(&self, name: &str) -> Result<bool> {
@@ -350,8 +337,6 @@ mod tests {
             ["docs/git", "git", "hg"],
             "the reverse lookup must name every dependent of one program"
         );
-        assert!(store.is_program_path("code", "bin/gateway.o").unwrap());
-        assert!(!store.is_program_path("code", "bin/absent.o").unwrap());
         assert!(store
             .activations_backed_by("code", "bin")
             .unwrap()

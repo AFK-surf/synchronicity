@@ -99,9 +99,12 @@ socket_activations (
 ```
 
 `SocketActivation` becomes `{ name, program_space, program_path, scope,
-config, max_streams, note, activated_at }`. Beside the forward lookups the
-store gains `activations_backed_by(space, path)` — for the deployment
-fan-out and the tree-write gate — and `is_program_path(space, path)`.
+config, max_streams, note, activated_at }`, and an index on
+`(program_space, program_path)` answers the reverse lookup. Beside the forward
+lookups the store gains `activations_backed_by(space, path)`, for the
+deployment fan-out and for the dependents `activate` and `ls -l` print. The
+draft also asked for `is_program_path(space, path)`, for the tree-write gate;
+§6 removes that gate, so the predicate has no caller and is not built.
 
 A program path must be in a source of this node's, filesystem or API, and
 must publish as a file to serve; a tombstone or nothing at all makes every
