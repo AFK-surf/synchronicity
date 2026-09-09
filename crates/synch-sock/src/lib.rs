@@ -352,8 +352,6 @@ pub enum HostEntryKind {
     Symlink,
     /// A deleted tree row.
     Tombstone,
-    /// An executable socket entry.
-    Socket,
 }
 
 /// What a program learns about an object it opened.

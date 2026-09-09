@@ -690,8 +690,7 @@ JSON values.
 `sy_put_commit_if` and `sy_put_delete` publish file versions and tombstones
 into this node's own trie, behind a `"tree_writes"` grant in the manifest
 (§7.9). A committed write is an ordinary local publish through the same
-ingest path an S3 `PUT` takes; an activated socket path is never writable. The
-whole design — why the write declaration is enforceable where the read one
+ingest path an S3 `PUT` takes. The whole design — why the write declaration is enforceable where the read one
 (§7.6) was decorative, the writer lifecycle, the commit conditions, and the
 bounds — is **[docs/TREE-WRITES.md](TREE-WRITES.md)**.
 

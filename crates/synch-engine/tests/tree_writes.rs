@@ -138,24 +138,62 @@ async fn a_socket_write_publishes_this_nodes_own_version() {
     node.shutdown().await.unwrap();
 }
 
+/// A program's write to an activated path is a deployment, like every other
+/// write to it (`docs/SOCKET-PROGRAMS.md` §6). The refusal
+/// `docs/TREE-WRITES.md` §2 used to carry is gone with no replacement: a
+/// tree-write grant is one more channel the operator accepted when it
+/// activated the path, and it is shown the grant rather than told no.
 #[tokio::test]
-async fn an_activated_socket_path_is_never_writable() {
+async fn a_programs_write_to_an_activated_path_is_a_deployment() {
     const SELF_WRITE: &str = r#"
 #include <synch.h>
 
 SY_MANIFEST("{\"manifest\":1,\"tree_writes\":[{\"id\":1,\"prefix\":\"code\",\"allow\":[\"create\",\"replace\",\"delete\"]}]}");
 
 SY_ENTRY sy_s64 entry(void) {
-  /* The whole space is granted, and the socket's own path is still refused:
-     writing an ELF over an activated socket path would be remote code
-     persistence in two moves. */
-  return sy_put_open(1, SY_STR("code/self.sock")) == SY_EPERM ? 0 : 1;
+  sy_s64 w = sy_put_open(1, SY_STR("code/deployed.sock"));
+  if (w < 0) return w;
+  /* Split so C's greedy \x escape stops before the E. */
+  if (sy_put_write(w, "\x7f" "ELF the next program", 21) != 21) return 100;
+  sy_u8 root[32];
+  sy_s64 rc;
+  while ((rc = sy_put_commit(w, root)) == SY_EAGAIN) {
+    struct sy_pollfd fd = { w, SY_POLL_IN, 0 };
+    if (sy_poll(&fd, 1, 10000) <= 0) return 101;
+  }
+  return rc;
 }
 "#;
     let (_data, space, node) = node_with_space().await;
-    install(&node, space.path(), "self.sock", SELF_WRITE).await;
-    let (status, _) = drive(&node, "self.sock", b"").await;
-    assert_eq!(status, SockStatus::Ok(0));
+    // `deployed.sock` is an activated path of its own, and `writer.sock` is a
+    // second socket whose tree-write grant covers it.
+    write(space.path(), "deployed.sock", b"\x7fELF the first program");
+    node.socket_activate(&SocketActivation::new(
+        "code",
+        "deployed.sock",
+        synch_core::now_ns(),
+    ))
+    .unwrap();
+    install(&node, space.path(), "writer.sock", SELF_WRITE).await;
+
+    let (status, _) = drive(&node, "writer.sock", b"").await;
+    assert_eq!(status, SockStatus::Ok(0), "the write was refused");
+
+    let deployed = Hash::new(b"\x7fELF the next program");
+    let entry = node
+        .store()
+        .entry(node.origin(), "code", "deployed.sock")
+        .unwrap()
+        .expect("the activated path still has a version");
+    assert_eq!(entry.content, Some(deployed));
+    assert_eq!(
+        node.resolve_socket("code", "deployed.sock")
+            .unwrap()
+            .unwrap()
+            .root,
+        deployed,
+        "the socket serves what the program's own write deployed"
+    );
     node.shutdown().await.unwrap();
 }
 

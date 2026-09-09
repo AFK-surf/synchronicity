@@ -656,9 +656,9 @@ impl SocketHost for TreeHost {
     /// The SFTP backend answers `STAT`/`READDIR` with it, so a directory has
     /// to be told apart from a path that does not exist — and the local
     /// scanner publishes no `Dir` rows, so a directory is a prefix with
-    /// entries under it rather than a row of its own. A socket refuses like
-    /// `open` refuses one: the kind says what would serve, not what the
-    /// neighbour's code is.
+    /// entries under it rather than a row of its own. An `EntryKind::Socket`
+    /// row from a build that still emitted one is a file with content, which
+    /// is all it ever was on disk (`docs/SOCKET-PROGRAMS.md` §3).
     fn entry_kind(
         &self,
         origin: Option<&str>,
@@ -677,21 +677,12 @@ impl SocketHost for TreeHost {
             .entry(&origin, space, rest)
             .map_err(|e| HostError::Unavailable(e.to_string()))?;
         match entry {
-            Some(row) => {
-                if row.kind == EntryKind::Socket {
-                    return Err(HostError::NotReadable(
-                        "that path is a socket; a socket does not read out its neighbours' code"
-                            .into(),
-                    ));
-                }
-                Ok(match row.kind {
-                    EntryKind::File => synch_sock::HostEntryKind::File,
-                    EntryKind::Dir => synch_sock::HostEntryKind::Directory,
-                    EntryKind::Symlink => synch_sock::HostEntryKind::Symlink,
-                    EntryKind::Tombstone => synch_sock::HostEntryKind::Tombstone,
-                    EntryKind::Socket => synch_sock::HostEntryKind::Socket,
-                })
-            }
+            Some(row) => Ok(match row.kind {
+                EntryKind::File | EntryKind::Socket => synch_sock::HostEntryKind::File,
+                EntryKind::Dir => synch_sock::HostEntryKind::Directory,
+                EntryKind::Symlink => synch_sock::HostEntryKind::Symlink,
+                EntryKind::Tombstone => synch_sock::HostEntryKind::Tombstone,
+            }),
             // No row of its own: the path is a directory only if something is
             // published under it, and one row's existence check is enough.
             None => {
@@ -732,7 +723,6 @@ impl SocketHost for TreeHost {
         {
             return Err(HostError::NotFound);
         }
-        refuse_socket_path(&self.node, space, &rest)?;
         self.node
             .ensure_adoptable(space, &rest)
             .map_err(write_refusal)?;
@@ -750,26 +740,6 @@ impl SocketHost for TreeHost {
                 self.socket, self.invocation, self.peer
             ),
         }))
-    }
-}
-
-/// An activated path is never writable through a program
-/// (`docs/TREE-WRITES.md` §2).
-///
-/// This is the rule that keeps tree-write grants and activation composable:
-/// without it, a socket whose manifest writes a prefix containing an
-/// activated path is remote code persistence in two moves (write the ELF,
-/// invoke it). With it, code reaches executability only over write channels
-/// outside the socket runtime — channels the operator accepted as deployment
-/// channels when activating the path.
-fn refuse_socket_path(node: &Node, space: &str, path: &str) -> std::result::Result<(), HostError> {
-    match node.store().is_activated_socket(space, path) {
-        Ok(true) => Err(HostError::Denied(format!(
-            "{space}/{path} is an activated socket, and sockets are never writable through a \
-             program"
-        ))),
-        Ok(false) => Ok(()),
-        Err(e) => Err(HostError::Io(e.to_string())),
     }
 }
 
@@ -796,9 +766,6 @@ fn evaluate_put_condition(
     modes: u32,
     expected: PutCondition,
 ) -> std::result::Result<(), HostError> {
-    // Re-taken inside the lock: a socket declaration may have arrived at this
-    // path since the writer opened.
-    refuse_socket_path(node, space, path)?;
     let entry = node
         .store()
         .entry(node.origin(), space, path)
@@ -919,7 +886,6 @@ fn evaluate_delete_condition(
     path: &str,
     expected: PutCondition,
 ) -> std::result::Result<(), HostError> {
-    refuse_socket_path(node, space, path)?;
     let entry = node
         .store()
         .entry(node.origin(), space, path)
@@ -990,10 +956,10 @@ impl Node {
     /// embedder (`docs/CLOUD-WRITES.md` §7 (e)).
     ///
     /// The same gates the socket runtime's writer takes at open — the space
-    /// must be a source of this node's, the path normalizes, an activated
-    /// socket path is refused, and the node must be able to publish — with
-    /// every mode granted: the caller is the host, not a program under a
-    /// manifest. `via` names the caller in the commit's log line.
+    /// must be a source of this node's, the path normalizes, and the node must
+    /// be able to publish — with every mode granted: the caller is the host,
+    /// not a program under a manifest. `via` names the caller in the commit's
+    /// log line.
     pub fn open_tree_write(&self, space: &str, path: &str, via: &str) -> Result<TreeWriter> {
         let rest = crate::scanner::normalized_adoption_path(path)?;
         if self.store().source(space)?.is_none() {
@@ -1001,7 +967,6 @@ impl Node {
                 "space {space} is not a source here"
             )));
         }
-        refuse_socket_path(self, space, &rest).map_err(|e| EngineError::invalid(e.to_string()))?;
         self.ensure_adoptable(space, &rest)?;
         Ok(TreeWriter {
             node: self.clone(),
@@ -2143,11 +2108,12 @@ mod tests {
             host.entry_kind(None, "media/old.txt").unwrap(),
             synch_sock::HostEntryKind::Tombstone
         );
-        // A socket refuses like open() refuses one.
-        assert!(matches!(
-            host.entry_kind(None, "media/git.sock"),
-            Err(HostError::NotReadable(_))
-        ));
+        // An `EntryKind::Socket` row from a build that still emitted one is a
+        // file with content, which is all it ever was on disk.
+        assert_eq!(
+            host.entry_kind(None, "media/git.sock").unwrap(),
+            synch_sock::HostEntryKind::File
+        );
 
         // The local scanner publishes no Dir rows, so once the row is gone
         // the path is still a directory as long as entries exist under it...
