@@ -1296,18 +1296,25 @@ mod tests {
                     |request| {
                         Some(match request {
                             PeerRequest::Nodes { wants, .. } => PeerReply::Nodes {
+                                // The production responder judges every requested
+                                // position but sends each addressed payload once.
+                                // A DAG can name one missing node at multiple
+                                // positions in the same batch, especially while
+                                // postorder settlement keeps both visits live.
                                 served: wants
                                     .iter()
-                                    .map(|(_, hash)| {
-                                        (
-                                            hash.clone(),
-                                            synch_mpt::NodeStore::get_node(
-                                                store.as_ref(),
-                                                &Hash::from_slice(hash).unwrap(),
+                                    .scan(std::collections::HashSet::new(), |seen, (_, hash)| {
+                                        seen.insert(hash.clone()).then(|| {
+                                            (
+                                                hash.clone(),
+                                                synch_mpt::NodeStore::get_node(
+                                                    store.as_ref(),
+                                                    &Hash::from_slice(hash).unwrap(),
+                                                )
+                                                .unwrap()
+                                                .unwrap(),
                                             )
-                                            .unwrap()
-                                            .unwrap(),
-                                        )
+                                        })
                                     })
                                     .collect(),
                                 missing: vec![],
