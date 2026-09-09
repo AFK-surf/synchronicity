@@ -6,6 +6,7 @@ import Synchronicity.ScopeChangePromotionBaseline
 import Synchronicity.ScopeChangeRefinement
 import Synchronicity.ScheduledFetchAdmission
 import Synchronicity.ProductionTimeline
+import Synchronicity.MptsyncViewCarry
 
 /-! Actual finite promotion history before the stable convergence window.
 
@@ -116,10 +117,15 @@ inductive EstablishedView (services : MaterializedView.Services)
       (aligned : TargetAlignment target state world opportunity) :
       EstablishedView services origin opportunity.raw.final target
   | continued
-      (previous : EstablishedView services origin state previousTarget)
+      (previous : EstablishedView services origin prior previousTarget)
+      (acceptance : AcceptanceProgress.ObservedAcceptanceFold
+        (Origin.canonical origin) keep initial prior initialView initialSlots
+          heads final accepted acceptedView)
+      (opportunity : ProductionPromotionOpportunity origin now refused state)
+      (acceptedStart : accepted = opportunity.retry.state 0)
+      (promotionState : opportunity.retry.state opportunity.retry.endAt = state)
       (metadata : PromotionContinuationBaseline.MetadataContracts
         state.db origin previousTarget world services)
-      (opportunity : ProductionPromotionOpportunity origin now refused state)
       (host : HostContracts state world services)
       (aligned : TargetAlignment target state world opportunity) :
       EstablishedView services origin opportunity.raw.final target
@@ -140,9 +146,11 @@ theorem EstablishedView.correct
         originAligned metadata
       exact correct_of_opportunity opportunity _ _ host
         (PromotionBaseline.initial_origin baseline) _ aligned
-  | continued previous metadata opportunity host aligned ih =>
+  | continued previous acceptance opportunity acceptedStart promotionState metadata host aligned ih =>
+      have carried := MptsyncViewCarry.correct_after_acceptance_and_retry ih
+        acceptance opportunity.retry acceptedStart promotionState
       exact correct_of_opportunity opportunity _ _ host
-        (PromotionContinuationBaseline.initial_of_correct ih metadata) _ aligned
+        (PromotionContinuationBaseline.initial_of_correct carried metadata) _ aligned
 
 /-- A derived historical view supplies the next production promotion's
 initial-view premise through raw metadata stability. -/
