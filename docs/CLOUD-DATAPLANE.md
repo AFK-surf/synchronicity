@@ -712,8 +712,8 @@ costs one dependency, and rediscovering them costs correctness we would
 only find out we lacked from a customer's lost database.
 
 The stream lives under `db/<org>/<network>/`, in whatever layout the
-library writes — LTX files by compaction level, with its own snapshot and
-compaction policy. This design does not specify that layout and must not:
+library writes — LTX files by compaction level. This design does not specify
+that layout and must not:
 it is the library's, and pinning our own description of it here is how a
 document starts lying after an upgrade.
 
@@ -735,11 +735,23 @@ document starts lying after an upgrade.
   capture is real SQLite work and belongs off the async workers, and
   commands are served one at a time, so a final ship can never interleave
   with a tick.
+- **Compaction**: a separate per-tenant loop runs the library's additive
+  compactor at its default level intervals (30 seconds, 5 minutes, 1 hour),
+  with an initial pass at startup. Each level publishes at most one merged
+  object per pass, reading at most 256 source objects and 64 MiB. Source
+  objects remain intact; this reduces restore downloads without deleting
+  history. Errors retry on the next interval and do not delay WAL shipping
+  or other tenants. Drain waits for an active pass before retiring storage.
 - **Restore**: on provisioning, before any init, at `TXID(0)` — meaning
-  "whatever is latest". A plan that comes back unsatisfiable at that TXID
-  can only mean the prefix holds no LTX files at all, so the library's
-  `TxNotAvailable` and `NoSnapshots` are read as *empty stream* and
-  nothing else; every other failure stays a failure and parks the tenant.
+  "whatever is latest". Each restore downloads up to eight segments
+  concurrently with its own permits, so a slow tenant cannot occupy another
+  tenant's download slots. Merge and filesystem work run on the blocking
+  pool; the existing restore/open limit bounds simultaneous restores.
+  Logs identify the directory at startup, every 30 seconds while pending,
+  and at completion with planning, download and apply timings.
+  An unsatisfiable plan is checked against a fresh listing: only a prefix
+  with no LTX files is an *empty stream*. A nonempty, broken chain or any
+  other failure stays a failure and parks that tenant.
   That distinction is load-bearing: "there is nothing here" initializes a
   new identity, "I could not tell" must not.
 - **The stream is authoritative, not the disk**: a database found in a

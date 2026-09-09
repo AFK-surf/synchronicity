@@ -47,6 +47,7 @@ tracing.workspace = true
 tracing-subscriber.workspace = true
 
 [dev-dependencies]
+async-trait.workspace = true
 # The simulated signed zone the end-to-end test resolves against, which is
 # how a hosted tenant is named without standing up a real control plane's
 # DNSSEC signer.

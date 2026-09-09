@@ -313,6 +313,7 @@ impl Tenant {
         // opens with the same call for the same reason.
         node.readopt_self_on_startup().await?;
 
+        let compaction_client = config.db_client(&self.network.org, &self.network.network)?;
         let replicator = Replicator::start(
             &node.store().db_path(),
             config.db_client(&self.network.org, &self.network.network)?,
@@ -322,6 +323,11 @@ impl Tenant {
 
         self.spawn_loops(&node, config, resolver);
         self.spawn_replication(replicator, dbrepl::DEFAULT_INTERVAL, metrics);
+        self.loops.push(tokio::spawn(dbrepl::run_compaction(
+            compaction_client,
+            self.network.key(),
+            self.shutdown.subscribe(),
+        )));
 
         // Publishes this node's own trie once, now that re-adoption has
         // settled what its head should be.

@@ -43,6 +43,7 @@
 //! and it is the whole of engine change (d) in §7.3.
 
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::Duration;
 
 use celld_ltx::{Db, Replica, ReplicaClient};
@@ -55,6 +56,74 @@ use crate::error::{DpError, Result};
 /// One second, which bounds what an ungraceful kill can lose — the same
 /// asynchrony Litestream accepts, and the number §5.3 quotes.
 pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(1);
+
+/// Independent permits per restore: a slow tenant cannot consume another
+/// tenant's download capacity. The reconciler separately bounds the number
+/// of active restores by the pod's blocking-pool capacity.
+const RESTORE_DOWNLOADS: usize = 8;
+
+/// Runs additive compaction independently of the WAL shipper. An in-flight
+/// pass finishes before shutdown, so retirement cannot race an object write.
+pub(crate) async fn run_compaction(
+    client: DbClient,
+    tenant: String,
+    stop: tokio::sync::broadcast::Receiver<()>,
+) {
+    match client {
+        DbClient::Objects(client) => compact_loop(*client, tenant, stop).await,
+        DbClient::Files(client) => compact_loop(client, tenant, stop).await,
+    }
+}
+
+async fn compact_loop<C: ReplicaClient>(
+    client: C,
+    tenant: String,
+    mut stop: tokio::sync::broadcast::Receiver<()>,
+) {
+    let levels = &celld_ltx::compaction_level::DEFAULT_COMPACTION_LEVELS[1..];
+    let mut due = vec![tokio::time::Instant::now(); levels.len()];
+    let mut ticker = tokio::time::interval(levels[0].interval);
+    ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    loop {
+        tokio::select! {
+            biased;
+            _ = stop.recv() => return,
+            _ = ticker.tick() => {
+                for (level, due) in levels.iter().zip(&mut due) {
+                    if tokio::time::Instant::now() < *due {
+                        continue;
+                    }
+                    match compact_level(&client, level.level).await {
+                        Ok(Some(output)) => tracing::info!(%tenant, level = level.level,
+                            ?output, "compacted tenant database replica"),
+                        Ok(None) => {}
+                        Err(error) => tracing::warn!(%tenant, level = level.level,
+                            %error, "tenant database compaction failed; will retry"),
+                    }
+                    *due = tokio::time::Instant::now() + level.interval;
+                    // Finish a publication already started, but don't start
+                    // another level once the tenant has begun draining.
+                    match stop.try_recv() {
+                        Err(tokio::sync::broadcast::error::TryRecvError::Empty) => {}
+                        _ => return,
+                    }
+                }
+            }
+        }
+    }
+}
+
+async fn compact_level<C: ReplicaClient>(
+    client: &C,
+    level: i32,
+) -> celld_ltx::Result<Option<celld_ltx::replica_compactor::CompactionOutput>> {
+    // Source objects stay intact. The library validates continuity, merges
+    // off the async workers, and publishes one immutable destination object.
+    celld_ltx::replica_compactor::ReplicaCompactor::new(client)
+        .with_limits(256, 64 * 1024 * 1024)
+        .compact(level)
+        .await
+}
 
 /// Where a tenant's database stream is written.
 ///
@@ -381,6 +450,10 @@ async fn stream_is_empty_with<C: ReplicaClient>(client: &C) -> Result<bool> {
 /// and it is deliberately distinguishable from an error: "there is nothing
 /// here" and "I could not tell" must not lead to the same action, because one
 /// of them silently replaces an identity.
+///
+/// Once started, await completion before releasing the directory's lifecycle
+/// lock: blocking merge/write work cannot be cancelled. The reconciler gathers
+/// started provisioning jobs on shutdown for this reason.
 pub async fn restore(client: DbClient, data_dir: &Path) -> Result<bool> {
     match client {
         DbClient::Objects(client) => restore_with(*client, data_dir).await,
@@ -389,16 +462,46 @@ pub async fn restore(client: DbClient, data_dir: &Path) -> Result<bool> {
 }
 
 /// [`restore`] once the client's type is known.
-async fn restore_with<C: ReplicaClient>(client: C, data_dir: &Path) -> Result<bool> {
+async fn restore_with<C: ReplicaClient + 'static>(client: C, data_dir: &Path) -> Result<bool> {
+    let data_dir = data_dir.to_path_buf();
+    let dir = data_dir.clone();
+    let started = std::time::Instant::now();
+    tracing::info!(dir = %dir.display(), downloads = RESTORE_DOWNLOADS, "restoring tenant database");
+    // The library merges the downloaded segments and fsyncs synchronously.
+    // Keep that work off the async workers that supervise other tenants.
+    // Like other blocking directory work, this must be awaited to completion;
+    // the reconciler owns started provisions as non-cancellable jobs.
+    let mut restored = tokio::task::spawn_blocking(move || {
+        tokio::runtime::Handle::current().block_on(restore_inner(client, &data_dir))
+    });
+    loop {
+        tokio::select! {
+            result = &mut restored => return result.map_err(engine)?,
+            _ = tokio::time::sleep(Duration::from_secs(30)) => {
+                tracing::info!(dir = %dir.display(), elapsed_secs = started.elapsed().as_secs(),
+                    "tenant database restore still in progress");
+            }
+        }
+    }
+}
+
+async fn restore_inner<C: ReplicaClient>(client: C, data_dir: &Path) -> Result<bool> {
     std::fs::create_dir_all(data_dir)
         .map_err(|error| DpError::io("creating the tenant data directory", error))?;
     let db_path = data_dir.join(synch_store::DB_FILE);
     // The free function rather than `Replica::restore`: that one takes `&self`
     // on a type holding a SQLite connection, so its future is not `Send` and
     // could not be awaited from a spawned task.
-    match celld_ltx::restore(&client, &db_path, celld_ltx::TXID(0)).await {
+    match celld_ltx::replica::restore_timed_with_download_slots(
+        &client,
+        &db_path,
+        celld_ltx::TXID(0),
+        Arc::new(tokio::sync::Semaphore::new(RESTORE_DOWNLOADS)),
+    )
+    .await
+    {
         Ok(stats) => {
-            tracing::info!(?stats, "restored a tenant database from its replica stream");
+            tracing::info!(dir = %data_dir.display(), ?stats, "restored a tenant database from its replica stream");
             Ok(true)
         }
         // Not "this error means empty": *ask*. See `stream_is_empty` for the
@@ -513,6 +616,267 @@ mod tests {
                 .unwrap()
         };
         assert_eq!(value.as_deref(), Some("shipped"));
+    }
+
+    /// Holds every download until the test releases it, then fails that tenant.
+    struct BlockedClient {
+        files: FileReplicaClient,
+        entered: mpsc::UnboundedSender<()>,
+        release: Arc<tokio::sync::Semaphore>,
+    }
+
+    // Release blocking restore workers even when a regression assertion fails.
+    struct CloseGate(Arc<tokio::sync::Semaphore>);
+
+    impl Drop for CloseGate {
+        fn drop(&mut self) {
+            self.0.close();
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ReplicaClient for BlockedClient {
+        async fn ltx_files(
+            &self,
+            level: i32,
+            seek: celld_ltx::TXID,
+        ) -> celld_ltx::Result<Vec<celld_ltx::FileInfo>> {
+            self.files.ltx_files(level, seek).await
+        }
+
+        async fn open_ltx_file(
+            &self,
+            _: i32,
+            _: celld_ltx::TXID,
+            _: celld_ltx::TXID,
+        ) -> celld_ltx::Result<Vec<u8>> {
+            self.entered.send(()).unwrap();
+            if let Ok(permit) = self.release.acquire().await {
+                permit.forget();
+            }
+            Err(celld_ltx::Error::Other(
+                "injected tenant download failure".into(),
+            ))
+        }
+
+        async fn write_ltx_file(
+            &self,
+            _: i32,
+            _: celld_ltx::TXID,
+            _: celld_ltx::TXID,
+            _: &[u8],
+        ) -> celld_ltx::Result<celld_ltx::FileInfo> {
+            unreachable!("restore only reads")
+        }
+
+        async fn delete_ltx_files(&self, _: &[celld_ltx::FileInfo]) -> celld_ltx::Result<()> {
+            unreachable!("restore only reads")
+        }
+
+        async fn delete_all(&self) -> celld_ltx::Result<()> {
+            unreachable!("restore only reads")
+        }
+    }
+
+    async fn ship_value(store: &Arc<synch_store::Store>, replicator: &mut Replicator, value: &str) {
+        let store = store.clone();
+        let value = value.to_string();
+        synch_core::offload(move || store.set_config("dbrepl.probe", &value))
+            .await
+            .unwrap();
+        replicator.flush().await.unwrap();
+    }
+
+    async fn restored_value(dir: &Path) -> Option<String> {
+        let store = open_store(dir).await;
+        synch_core::offload(move || store.config("dbrepl.probe"))
+            .await
+            .unwrap()
+    }
+
+    // One async worker: restoring must also leave the supervisor responsive.
+    #[tokio::test]
+    async fn parallel_downloads_are_bounded_and_a_stalled_tenant_does_not_block_another() {
+        let source = tempfile::tempdir().unwrap();
+        let remote = tempfile::tempdir().unwrap();
+        let store = open_store(source.path()).await;
+        let mut replicator = Replicator::start(&store.db_path(), client(remote.path()), "source")
+            .await
+            .unwrap();
+        for value in 0..RESTORE_DOWNLOADS + 4 {
+            ship_value(&store, &mut replicator, &value.to_string()).await;
+        }
+        replicator.close().await.unwrap();
+
+        let blocked_dir = tempfile::tempdir().unwrap();
+        let output = blocked_dir.path().to_path_buf();
+        let (entered, mut downloads) = mpsc::unbounded_channel();
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let _cleanup = CloseGate(release.clone());
+        let blocked = BlockedClient {
+            files: FileReplicaClient::new(remote.path().to_string_lossy().to_string()),
+            entered,
+            release: release.clone(),
+        };
+        let slow = tokio::spawn(async move { restore_with(blocked, &output).await });
+        // Serial downloads cannot reach this point while the first is held.
+        for _ in 0..RESTORE_DOWNLOADS {
+            tokio::time::timeout(Duration::from_secs(5), downloads.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        assert!(
+            tokio::time::timeout(Duration::from_millis(50), downloads.recv())
+                .await
+                .is_err(),
+            "a tenant exceeded its download limit"
+        );
+
+        let healthy_dir = tempfile::tempdir().unwrap();
+        assert!(tokio::time::timeout(
+            Duration::from_secs(5),
+            restore(client(remote.path()), healthy_dir.path())
+        )
+        .await
+        .unwrap()
+        .unwrap());
+        assert_eq!(
+            restored_value(healthy_dir.path()).await,
+            Some((RESTORE_DOWNLOADS + 3).to_string())
+        );
+        assert!(!slow.is_finished(), "the other tenant is still stalled");
+
+        release.add_permits(RESTORE_DOWNLOADS);
+        let error = tokio::time::timeout(Duration::from_secs(5), slow)
+            .await
+            .unwrap()
+            .unwrap()
+            .unwrap_err();
+        assert!(error
+            .to_string()
+            .contains("injected tenant download failure"));
+        assert!(!blocked_dir.path().join(synch_store::DB_FILE).exists());
+    }
+
+    #[tokio::test]
+    async fn stalled_compaction_does_not_block_shipping_and_drain_waits_for_the_pass() {
+        let source = tempfile::tempdir().unwrap();
+        let remote = tempfile::tempdir().unwrap();
+        let store = open_store(source.path()).await;
+        let mut replicator = Replicator::start(&store.db_path(), client(remote.path()), "source")
+            .await
+            .unwrap();
+        ship_value(&store, &mut replicator, "before compaction").await;
+        let (entered, mut downloads) = mpsc::unbounded_channel();
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let _cleanup = CloseGate(release.clone());
+        let blocked = BlockedClient {
+            files: FileReplicaClient::new(remote.path().to_string_lossy().to_string()),
+            entered,
+            release: release.clone(),
+        };
+        let (stop, stopped) = tokio::sync::broadcast::channel(1);
+        let running = tokio::spawn(compact_loop(blocked, "source".into(), stopped));
+        tokio::time::timeout(Duration::from_secs(5), downloads.recv())
+            .await
+            .unwrap()
+            .unwrap();
+        tokio::time::timeout(
+            Duration::from_secs(5),
+            ship_value(&store, &mut replicator, "while compaction stalled"),
+        )
+        .await
+        .unwrap();
+        let restored = tempfile::tempdir().unwrap();
+        assert!(restore(client(remote.path()), restored.path())
+            .await
+            .unwrap());
+        assert_eq!(
+            restored_value(restored.path()).await.as_deref(),
+            Some("while compaction stalled")
+        );
+        stop.send(()).unwrap();
+        assert!(
+            !running.is_finished(),
+            "drain must gather the active pass before storage retirement"
+        );
+        release.add_permits(1);
+        tokio::time::timeout(Duration::from_secs(5), running)
+            .await
+            .unwrap()
+            .unwrap();
+        replicator.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn compaction_loop_preserves_sources_and_restore_includes_newer_uncompacted_writes() {
+        let source = tempfile::tempdir().unwrap();
+        let remote = tempfile::tempdir().unwrap();
+        let store = open_store(source.path()).await;
+        let mut replicator = Replicator::start(&store.db_path(), client(remote.path()), "source")
+            .await
+            .unwrap();
+        for value in ["first", "second", "third"] {
+            ship_value(&store, &mut replicator, value).await;
+        }
+        let files = FileReplicaClient::new(remote.path().to_string_lossy().to_string());
+        let sources = files.ltx_files(0, celld_ltx::TXID(0)).await.unwrap();
+        assert!(sources.len() >= 3);
+        let (stop, stopped) = tokio::sync::broadcast::channel(1);
+        let running = tokio::spawn(run_compaction(
+            client(remote.path()),
+            "source".into(),
+            stopped,
+        ));
+        tokio::time::timeout(Duration::from_secs(5), async {
+            loop {
+                if !files
+                    .ltx_files(3, celld_ltx::TXID(0))
+                    .await
+                    .unwrap()
+                    .is_empty()
+                {
+                    break;
+                }
+                tokio::task::yield_now().await;
+            }
+        })
+        .await
+        .unwrap();
+        stop.send(()).unwrap();
+        tokio::time::timeout(Duration::from_secs(5), running)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            files.ltx_files(0, celld_ltx::TXID(0)).await.unwrap().len(),
+            sources.len()
+        );
+        assert!(
+            compact_level(&files, 1).await.unwrap().is_none(),
+            "repeating compaction has no new prefix to publish"
+        );
+        let plan = celld_ltx::replica::calc_restore_plan(&files, celld_ltx::TXID(0))
+            .await
+            .unwrap();
+        assert_eq!(plan.len(), 1, "restore uses the merged prefix");
+        assert_eq!(plan[0].level, 3);
+
+        ship_value(&store, &mut replicator, "after compaction").await;
+        replicator.close().await.unwrap();
+        let restored = tempfile::tempdir().unwrap();
+        assert!(restore(client(remote.path()), restored.path())
+            .await
+            .unwrap());
+        assert_eq!(
+            restored_value(restored.path()).await.as_deref(),
+            Some("after compaction")
+        );
+        assert!(
+            compact_level(&files, 1).await.unwrap().is_some(),
+            "a later pass picks up the new tail"
+        );
     }
 
     /// Ticking is what the service does forever, so a second tick with nothing

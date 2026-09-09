@@ -5899,6 +5899,7 @@ dependencies = [
 name = "synch-dp"
 version = "0.1.10"
 dependencies = [
+ "async-trait",
  "axum",
  "blake3",
  "celld-ltx",
