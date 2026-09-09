@@ -93,6 +93,50 @@ theorem prepare_pending_floor (tx : Transaction) (origin : Origin.Parsed) (now :
   cases same
   exact ⟨current, rfl, currentSeq, currentRoot⟩
 
+/-- A pending candidate returned by preparation was selected from an actual raw
+pending row in the transaction's initial database. -/
+theorem prepare_pending_selected (tx : Transaction) (origin : Origin.Parsed) (now : Int64)
+    (state final : State) (db : Database) (opened : state.pending = some (tx, db))
+    (scope : Trie.Serve.Scope) (authority : Authorization.OriginAuthority)
+    (pending old : Option Promote.Pending)
+    (executed : execute (prepare tx origin now) state =
+      (.ok (scope, authority, pending, old), final)) :
+    ∀ current, pending = some current →
+      ∃ row ∈ rows db "heads",
+        ReconciliationSlots.names row (Origin.canonical origin) "pending" = true := by
+  unfold prepare at executed
+  obtain ⟨scopeRead, scopeState, readScope, executed⟩ :=
+    bind_success _ _ _ _ _ executed
+  have scopeFrame := PromotionReads.executed_pending _
+    (PromotionReads.auth_only _ (ReconciliationReadOnly.scope_only tx origin)) _ _ _ readScope
+  obtain ⟨authorityRead, authorized, readAuthority, executed⟩ :=
+    bind_success _ _ _ _ _ executed
+  have authorityFrame := PromotionReads.executed_pending _
+    (PromotionReads.auth_only _ (ReconciliationReadOnly.originAuthority_only tx origin now))
+      _ _ _ readAuthority
+  obtain ⟨pendingRead, selected, readPending, executed⟩ :=
+    bind_success _ _ _ _ _ executed
+  have snapshot : authorized.pending = some (tx, db) := by
+    rw [authorityFrame, scopeFrame, opened]
+  cases pendingRead with
+  | none =>
+      have same : (scopeRead, authorityRead, none, none) =
+          (scope, authority, pending, old) :=
+        Except.ok.inj (congrArg Prod.fst executed)
+      cases same
+      intro current impossible
+      cases impossible
+  | some candidate =>
+      obtain ⟨oldRead, _, _, returned⟩ := bind_success _ _ _ _ _ executed
+      have same : (scopeRead, authorityRead, some candidate, oldRead) =
+          (scope, authority, pending, old) :=
+        Except.ok.inj (congrArg Prod.fst returned)
+      cases same
+      intro current selectedCurrent
+      cases Option.some.inj selectedCurrent
+      exact PromotionReads.slot_selected tx origin "pending" authorized db snapshot candidate
+        (congrArg Prod.fst readPending)
+
 theorem attempt_eq (operation : Promote.Action A) (state : State) :
     execute (Promote.attempt operation).run state = (.ok (execute operation state).1, (execute operation state).2) := by
   change execute (operation.run.bind (fun result => .pure (.ok result : Except Promote.Error (Except Promote.Error A)))) state = _

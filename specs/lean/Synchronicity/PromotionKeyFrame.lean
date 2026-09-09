@@ -26,7 +26,8 @@ theorem retire_only (predicate : List Cell → Prop) (pending : Promote.Pending)
   exact Only.seq (Only.raise _ _ (HeadKeyFrame.storage_safe predicate _ trivial)) fun _ => .done _
 
 theorem upsert_complete (predicate : List Cell → Prop) (head : Head) (received verified : Int64)
-    (accepts : ∀ row, ReconciliationSlots.names row (Origin.canonical head.origin) "complete" = true → predicate (HeadKeyFrame.key row))
+    (accepts : ∀ row, ReconciliationSlots.names row (Origin.canonical head.origin) "complete" = true →
+      ReconciliationSlots.pointsTo row head → predicate (HeadKeyFrame.key row))
     (table : List Fields) (initial : HeadKeyFrame.allKeys predicate table) :
     HeadKeyFrame.allKeys predicate (upsertRows table (ReconciliationSlots.incoming head "complete" received verified)
       ["origin_id", "slot"] ((ReconciliationSlots.updates "complete").map fun column => (column, .excluded column))) := by
@@ -38,9 +39,11 @@ theorem upsert_complete (predicate : List Cell → Prop) (head : Head) (received
     · rename_i conflict
       subst row
       apply accepts
-      simp only [List.map_map, Function.comp_def]
-      rw [ReconciliationSlots.assigned_names]
-      exact (ReconciliationSlots.conflicts_iff_names head "complete" received verified old) ▸ conflict
+      · simp only [List.map_map, Function.comp_def]
+        rw [ReconciliationSlots.assigned_names]
+        exact (ReconciliationSlots.conflicts_iff_names head "complete" received verified old) ▸ conflict
+      · simpa only [List.map_map, Function.comp_def] using
+          ReconciliationSlots.assigned_points_to head "complete" received verified old
     · subst row
       exact initial old priorMember
   · rcases List.mem_append.mp member with old | new
@@ -48,10 +51,12 @@ theorem upsert_complete (predicate : List Cell → Prop) (head : Head) (received
     · have same := List.mem_singleton.mp new
       subst row
       apply accepts
-      simp [ReconciliationSlots.names, ReconciliationSlots.incoming, Reconcile.headKey, equals, cell, equalCell]
+      · simp [ReconciliationSlots.names, ReconciliationSlots.incoming, Reconcile.headKey, equals, cell, equalCell]
+      · simp [ReconciliationSlots.pointsTo, ReconciliationSlots.incoming, Reconcile.headKey, cell]
 
 theorem write_only (predicate : List Cell → Prop) (tx : Transaction) (head : Head) (received verified : Int64)
-    (accepts : ∀ row, ReconciliationSlots.names row (Origin.canonical head.origin) "complete" = true → predicate (HeadKeyFrame.key row)) :
+    (accepts : ∀ row, ReconciliationSlots.names row (Origin.canonical head.origin) "complete" = true →
+      ReconciliationSlots.pointsTo row head → predicate (HeadKeyFrame.key row)) :
     Only (safe predicate) (Promote.history (Reconcile.putSlot tx "complete" head received verified)).run := by
   unfold Promote.history Reconcile.putSlot
   apply Only.within (allowed := fun A effect => HeadInvariant.effectSafe (E := History.Effects) (HeadKeyFrame.allKeys predicate) A effect)
@@ -86,13 +91,16 @@ theorem materialize_only (predicate : List Cell → Prop) (tx : Transaction) (or
 theorem publish_only (predicate : List Cell → Prop) (tx : Transaction) (origin : Origin.Parsed) (now : Int64)
     (refused : List (UInt64 × ByteArray × ByteArray)) (scope : Trie.Serve.Scope) (authority : Authorization.OriginAuthority)
     (pending old : Option Promote.Pending) (sameOrigin : ∀ candidate, pending = some candidate → candidate.head.origin = origin)
-    (accepts : ∀ row, ReconciliationSlots.names row (Origin.canonical origin) "complete" = true → predicate (HeadKeyFrame.key row)) :
+    (accepts : ∀ candidate, pending = some candidate → ∀ row,
+      ReconciliationSlots.names row (Origin.canonical origin) "complete" = true →
+      ReconciliationSlots.pointsTo row candidate.head → predicate (HeadKeyFrame.key row)) :
     Only (safe predicate) (PromotionExecution.publish tx origin now refused (scope, authority, pending, old)).run := by
   apply PromotionCertificates.publish_only _ _ _ _ _ _ _ _ _ (clear_only predicate tx origin)
   · intro candidate selected
     apply PromotionCertificates.body_only _ _ _ _ _ _ _ _ (clear_only predicate tx origin) (read_only predicate)
     · apply write_only
-      rwa [sameOrigin candidate selected]
+      intro row named points
+      exact accepts candidate selected row (by rwa [sameOrigin candidate selected] at named) points
     · exact materialize_only predicate tx origin _ _
   · intro key result
     exact PromotionCertificates.finish_only _ tx pending key result
@@ -115,7 +123,7 @@ theorem no_other_new_keys (origin : Origin.Parsed) (now : Int64) (refused : List
     obtain ⟨tx, opened, ready, ⟨scope, authority, pending, old⟩, began, read, snapshot, committed⟩ := prepared
     have sameOrigin := PromotionExecution.prepare_origin tx origin now opened ready scope authority pending old read
     have allowed := publish_only predicate tx origin now refused scope authority pending old sameOrigin
-      (fun row complete => Or.inr ⟨row, rfl, complete⟩)
+      (fun candidate selected row complete _ => Or.inr ⟨row, rfl, complete⟩)
     have initial : HeadInvariant.holds (HeadKeyFrame.allKeys predicate) ready := by
       constructor
       · rw [committed]

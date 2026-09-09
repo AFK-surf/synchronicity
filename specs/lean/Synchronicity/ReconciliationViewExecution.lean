@@ -5,6 +5,7 @@ import Synchronicity.ReconciliationPayloadFrame
 import Synchronicity.ForeignMaterializationFrame
 import Synchronicity.PromotionContinuationBaseline
 import Synchronicity.PromotionBaseline
+import Synchronicity.StableHeadBounds
 
 /-! Refinement of actual reconciliation operations to the stable public-view
 transition.  Execution witnesses remain in `ReconciliationExecution`; the
@@ -25,17 +26,36 @@ def StableSelection (origin : Origin.Parsed) (target : ViewTarget) (db : Databas
   ∀ head, head.origin = origin → AtomicFileView.Installed db head →
     head.seq = target.head.seq ∧ head.root = target.head.root
 
-/-- Raw stable-window facts for the two production head slots. Unlike
-`AcceptanceProgress.StableSlots`, this input does not assume that the observed
-maximum already equals the target. It records only representation/backing,
-native validity, and the independently stable upper bound on actual slots. -/
-structure StableSlotInputs (state : State) (origin : String) (latest : Nat)
-    (view : HeadView) : Prop where
+/-- A raw decoding observation of the two production head slots.  It contains
+no version bound; bounds are transported from one initial observation through
+the actual event sequence. -/
+structure SlotObservation (state : State) (origin : String) (view : HeadView) : Prop where
   represents : HeadView.Represents state.db view
   backed : HeadView.Backed state.db view
   valid : ∀ slot version, view origin slot = some version → version.root.size = 32
+
+def SlotBound (origin : String) (latest : Nat) (view : HeadView) : Prop :=
+  ∀ slot version, view origin slot = some version →
+    AcceptanceProgress.versionRank version ≤ latest
+
+/-- The initial stable-window observation and its independently justified
+version bound. Later bounds are derived, not supplied state by state. -/
+structure StableSlotInputs (state : State) (origin : String) (latest : Nat)
+    (view : HeadView) : Prop extends SlotObservation state origin view where
   upperBound : ∀ slot version, view origin slot = some version →
     AcceptanceProgress.versionRank version ≤ latest
+
+theorem StableSlotInputs.bound
+    (inputs : StableSlotInputs state origin latest view) : SlotBound origin latest view :=
+  inputs.upperBound
+
+theorem StableSlotInputs.observation
+    (inputs : StableSlotInputs state origin latest view) : SlotObservation state origin view :=
+  inputs.toSlotObservation
+
+theorem StableSlotInputs.of (observation : SlotObservation state origin view)
+    (bound : SlotBound origin latest view) : StableSlotInputs state origin latest view :=
+  { observation with upperBound := bound }
 
 theorem installed_view (represented : HeadView.Represents db view)
     (installed : AtomicFileView.Installed db head) :
@@ -82,11 +102,12 @@ theorem stable_slots_of_installed
 
 /-- M3 plus fixed-width validity and the stable upper bound on actual observed
 slots preserves the installed target. No maximum equality is assumed. -/
-theorem installed_after_step (step : Step event state final)
+theorem installed_after_bound (step : Step event state final)
     (origin : Origin.Parsed) (target : ViewTarget)
     (beforeView afterView : HeadView)
-    (before : StableSlotInputs state (Origin.canonical origin) latest beforeView)
-    (after : StableSlotInputs final (Origin.canonical origin) latest afterView)
+    (before : SlotObservation state (Origin.canonical origin) beforeView)
+    (after : SlotObservation final (Origin.canonical origin) afterView)
+    (afterBound : SlotBound (Origin.canonical origin) latest afterView)
     (sameOrigin : target.head.origin = origin)
     (installed : AtomicFileView.Installed state.db target.head)
     (targetLatest : AcceptanceProgress.versionRank
@@ -116,9 +137,41 @@ theorem installed_after_step (step : Step event state final)
     have nextValid := after.valid .complete next observed
     have grew := AcceptanceProgress.versionRank_lt_of_newer version next oldValid nextValid newer
     have bounded : AcceptanceProgress.versionRank next ≤ latest :=
-      after.upperBound .complete next observed
+      afterBound .complete next observed
     rw [targetLatest] at grew
     exact False.elim (Nat.not_lt_of_ge bounded grew)
+
+theorem installed_after_bounded_step (step : Step event state final)
+    (origin : Origin.Parsed) (target : ViewTarget)
+    (beforeView afterView : HeadView)
+    (before : SlotObservation state (Origin.canonical origin) beforeView)
+    (after : SlotObservation final (Origin.canonical origin) afterView)
+    (beforeBound : SlotBound (Origin.canonical origin) latest beforeView)
+    (eventBound : StableHeadBounds.EventBound event (Origin.canonical origin) latest)
+    (sameOrigin : target.head.origin = origin)
+    (installed : AtomicFileView.Installed state.db target.head)
+    (targetLatest : AcceptanceProgress.versionRank
+      ⟨target.head.seq, target.head.root⟩ = latest) :
+    AtomicFileView.Installed final.db target.head := by
+  have afterBound : SlotBound (Origin.canonical origin) latest afterView :=
+    StableHeadBounds.to_view after.represents
+      (StableHeadBounds.step step (Origin.canonical origin) latest beforeView before.represents
+        before.backed eventBound (StableHeadBounds.of_view before.represents beforeBound))
+  exact installed_after_bound step origin target beforeView afterView before after afterBound
+    sameOrigin installed targetLatest
+
+theorem installed_after_step (step : Step event state final)
+    (origin : Origin.Parsed) (target : ViewTarget)
+    (beforeView afterView : HeadView)
+    (before : StableSlotInputs state (Origin.canonical origin) latest beforeView)
+    (after : StableSlotInputs final (Origin.canonical origin) latest afterView)
+    (sameOrigin : target.head.origin = origin)
+    (installed : AtomicFileView.Installed state.db target.head)
+    (targetLatest : AcceptanceProgress.versionRank
+      ⟨target.head.seq, target.head.root⟩ = latest) :
+    AtomicFileView.Installed final.db target.head := by
+  exact installed_after_bound step origin target beforeView afterView before.observation
+    after.observation after.bound sameOrigin installed targetLatest
 
 theorem stable_selection_of_installed
     (represented : HeadView.Represents db view)
@@ -421,9 +474,9 @@ theorem foreign_completed_settlement_refines
           simpa only [currentDb] using installed) currentCorrect targetLatest
       simpa only [finalState, currentDb] using promoted
 
-/-- Stable-tail evidence is stated over actual raw observations. It contains
-slot representation/backing/validity, an upper bound on observed versions and
-host facts; never `Refines` or any origin's `CorrectView`. -/
+/-- Stable-tail evidence is stated over actual raw observations. One initial
+slot bound is transported through the trace; only actual advertised heads are
+required to be no newer than the stable authorized history. -/
 structure StableFacts (trace : MptsyncStableTail.Trace)
     (services : MaterializedView.Services) (origin : Origin.Parsed)
     (target : ViewTarget) (latest : Nat) (views : Nat → HeadView)
@@ -431,8 +484,14 @@ structure StableFacts (trace : MptsyncStableTail.Trace)
   targetOrigin : target.head.origin = origin
   targetLatest : AcceptanceProgress.versionRank
     ⟨target.head.seq, target.head.root⟩ = latest
-  slots : ∀ n, stableFrom ≤ n → StableSlotInputs (trace.state n)
-    (Origin.canonical origin) latest (views n)
+  initial : StableSlotInputs (trace.state stableFrom)
+    (Origin.canonical origin) latest (views stableFrom)
+  observations : ∀ n, stableFrom ≤ n → SlotObservation (trace.state n)
+    (Origin.canonical origin) (views n)
+  advertisementBound : ∀ n head now keep,
+    stableFrom ≤ n → trace.event n = .advertisement head now keep →
+      Origin.canonical head.origin = Origin.canonical origin →
+        AcceptanceProgress.rank head ≤ latest
   promotionHost : ∀ n now refused,
     stableFrom ≤ n → trace.event n = .promotion origin now refused →
       PromotionHost origin target world services (trace.state n)
@@ -465,8 +524,9 @@ structure StableStepFacts (event : ReconciliationExecution.Event)
   targetOrigin : target.head.origin = origin
   targetLatest : AcceptanceProgress.versionRank
     ⟨target.head.seq, target.head.root⟩ = latest
-  before : StableSlotInputs state (Origin.canonical origin) latest beforeView
-  after : StableSlotInputs final (Origin.canonical origin) latest afterView
+  before : SlotObservation state (Origin.canonical origin) beforeView
+  after : SlotObservation final (Origin.canonical origin) afterView
+  eventBound : StableHeadBounds.EventBound event (Origin.canonical origin) latest
   promotionHost : ∀ now refused, event = .promotion origin now refused →
     PromotionHost origin target world services state
   foreignPromotion : ∀ promoted now refused,
@@ -490,17 +550,28 @@ and its raw stable facts. -/
 theorem stable_actual_step_refines
     (actual : ReconciliationExecution.Step event state final)
     (facts : StableStepFacts event state final services origin target latest world)
+    (beforeBound : SlotBound (Origin.canonical origin) latest facts.beforeView)
     (correct : CorrectView services origin target state.db) :
     MptsyncStableTail.Refines services origin target state.db final.db ∧
+      StableSlotInputs final (Origin.canonical origin) latest facts.afterView ∧
       AcceptanceProgress.StableSlots final (Origin.canonical origin) latest facts.afterView := by
+  have afterBound : SlotBound (Origin.canonical origin) latest facts.afterView :=
+    StableHeadBounds.to_view facts.after.represents
+      (StableHeadBounds.step actual (Origin.canonical origin) latest facts.beforeView
+        facts.before.represents facts.before.backed facts.eventBound
+        (StableHeadBounds.of_view facts.before.represents beforeBound))
+  let before : StableSlotInputs state (Origin.canonical origin) latest facts.beforeView :=
+    StableSlotInputs.of facts.before beforeBound
+  let after : StableSlotInputs final (Origin.canonical origin) latest facts.afterView :=
+    StableSlotInputs.of facts.after afterBound
   have installedNext := installed_after_step actual origin target facts.beforeView facts.afterView
-    facts.before facts.after facts.targetOrigin correct.2.1 facts.targetLatest
-  have nextSlots := stable_slots_of_installed facts.after target facts.targetOrigin installedNext
+    before after facts.targetOrigin correct.2.1 facts.targetLatest
+  have nextSlots := stable_slots_of_installed after target facts.targetOrigin installedNext
     facts.targetLatest
   have refinement : MptsyncStableTail.Refines services origin target state.db final.db := by
     have payload (nonPublishing : ReconciliationPayloadFrame.NonPublishing event) :=
       payload_step_refines actual origin target services facts.beforeView facts.afterView
-        facts.before facts.after facts.targetOrigin correct.2.1 facts.targetLatest
+        before after facts.targetOrigin correct.2.1 facts.targetLatest
         (ReconciliationPayloadFrame.step_payload actual nonPublishing)
     cases event with
     | advertisement => exact payload trivial
@@ -515,11 +586,11 @@ theorem stable_actual_step_refines
         exact promotion_refines actual target world services host.snapshot host.closed host.faithful
           host.normalization host.relational
           (PromotionContinuationBaseline.initial_of_correct correct host.metadata) host.policy
-          facts.beforeView facts.afterView facts.before facts.after facts.targetOrigin correct.2.1
+          facts.beforeView facts.afterView before after facts.targetOrigin correct.2.1
           facts.targetLatest
       · exact foreign_promotion_refines actual origin target world services
           (facts.foreignPromotion promoted now refused rfl same)
-          facts.beforeView facts.afterView facts.before facts.after
+          facts.beforeView facts.afterView before after
           facts.targetOrigin correct.2.1 correct facts.targetLatest
     | settlement settled refused scope fetchTarget key result =>
       cases result with
@@ -532,13 +603,45 @@ theorem stable_actual_step_refines
           · subst settled
             exact completed_settlement_refines actual target world services
               (facts.settlementHost refused scope fetchTarget key rfl)
-              facts.beforeView facts.afterView facts.before facts.after
+              facts.beforeView facts.afterView before after
               facts.targetOrigin correct.2.1 correct facts.targetLatest
           · exact foreign_completed_settlement_refines actual origin target world services
               (facts.foreignSettlement settled refused scope fetchTarget key rfl same)
-              facts.beforeView facts.afterView facts.before facts.after
+              facts.beforeView facts.afterView before after
               facts.targetOrigin correct.2.1 correct facts.targetLatest
-  exact ⟨refinement, nextSlots⟩
+  exact ⟨refinement, after, nextSlots⟩
+
+private theorem StableFacts.eventBoundAt
+    (facts : StableFacts trace services origin target latest views world stableFrom)
+    (n : Nat) (stable : stableFrom ≤ n) :
+    StableHeadBounds.EventBound (trace.event n) (Origin.canonical origin) latest := by
+  cases eventEq : trace.event n with
+  | advertisement head now keep =>
+      exact facts.advertisementBound n head now keep stable eventEq
+  | promotion | request | retirement | selection | abandonment | settlement => trivial
+
+private theorem StableFacts.boundAt
+    (facts : StableFacts trace services origin target latest views world stableFrom) :
+    ∀ n, stableFrom ≤ n → SlotBound (Origin.canonical origin) latest (views n) := by
+  have offsets : ∀ offset,
+      SlotBound (Origin.canonical origin) latest (views (stableFrom + offset)) := by
+    intro offset
+    induction offset with
+    | zero => simpa using facts.initial.bound
+    | succ offset bounded =>
+        have baseLe : stableFrom ≤ stableFrom + offset := Nat.le_add_right _ _
+        have next : stableFrom ≤ stableFrom + offset + 1 :=
+          Nat.le_trans baseLe (Nat.le_succ _)
+        have before := facts.observations (stableFrom + offset) baseLe
+        have after := facts.observations (stableFrom + offset + 1) next
+        exact StableHeadBounds.to_view after.represents
+          (StableHeadBounds.step (trace.step (stableFrom + offset))
+            (Origin.canonical origin) latest (views (stableFrom + offset))
+            before.represents before.backed (facts.eventBoundAt _ baseLe)
+            (StableHeadBounds.of_view before.represents bounded))
+  intro n after
+  obtain ⟨offset, rfl⟩ := Nat.exists_eq_add_of_le after
+  exact offsets offset
 
 private theorem stable_step_refines
     (trace : MptsyncStableTail.Trace) (services : MaterializedView.Services)
@@ -559,8 +662,9 @@ private theorem stable_step_refines
       afterView := views (n + 1)
       targetOrigin := facts.targetOrigin
       targetLatest := facts.targetLatest
-      before := facts.slots n stable
-      after := facts.slots (n + 1) stableNext
+      before := facts.observations n stable
+      after := facts.observations (n + 1) stableNext
+      eventBound := facts.eventBoundAt n stable
       promotionHost := fun now refused event => facts.promotionHost n now refused stable event
       foreignPromotion := fun promoted now refused event different =>
         facts.foreignPromotion n promoted now refused stable event different
@@ -568,7 +672,9 @@ private theorem stable_step_refines
         facts.settlementHost n refused scope fetchTarget key stable event
       foreignSettlement := fun settled refused scope fetchTarget key event different =>
         facts.foreignSettlement n settled refused scope fetchTarget key stable event different }
-  exact stable_actual_step_refines (trace.step n) stepFacts correct
+  have refined := stable_actual_step_refines (trace.step n) stepFacts
+    (facts.boundAt n stable) correct
+  exact ⟨refined.1, refined.2.2⟩
 
 private theorem correct_from (trace : MptsyncStableTail.Trace)
     (services : MaterializedView.Services) (origin : Origin.Parsed) (target : ViewTarget)

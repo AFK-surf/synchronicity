@@ -13,31 +13,62 @@ namespace Synchronicity.MptsyncViewCarry
 open VerifiedCore VerifiedCore.Host VerifiedCore.Replication
 open SimulatedHost AcceptanceProgress MptsyncConvergence
 
-/-- A finite prefix of actual reconciliation commands between an established
-promotion and the next Hello handler. Each edge carries only raw slot and host
-contracts for `stable_actual_step_refines`; no edge stores refinement,
-correctness, readiness, or an initial-view conclusion. -/
-inductive StablePrefix (services : MaterializedView.Services)
+/-- A finite, view-indexed prefix.  Its first slot bound is supplied once;
+subsequent bounds are outputs of the preceding actual event. -/
+inductive StableSteps (services : MaterializedView.Services)
     (origin : Origin.Parsed) (target : ViewTarget) (latest : Nat)
-    (world : TrieDiffCoverage.World) : State → State → Prop where
-  | nil (state : State) : StablePrefix services origin target latest world state state
+    (world : TrieDiffCoverage.World) : State → HeadView → State → HeadView → Prop where
+  | nil (state : State) (view : HeadView) :
+      StableSteps services origin target latest world state view state view
   | cons
       (actual : ReconciliationExecution.Step event state next)
       (facts : ReconciliationViewExecution.StableStepFacts event state next
         services origin target latest world)
-      (rest : StablePrefix services origin target latest world next final) :
-      StablePrefix services origin target latest world state final
+      (beforeView : facts.beforeView = view)
+      (rest : StableSteps services origin target latest world next facts.afterView final finalView) :
+      StableSteps services origin target latest world state view final finalView
+
+/-- A finite production prefix carries one initial typed/backed/bounded
+observation. It does not store any later upper bound, refinement, or correctness
+claim. -/
+structure StablePrefix (services : MaterializedView.Services)
+    (origin : Origin.Parsed) (target : ViewTarget) (latest : Nat)
+    (world : TrieDiffCoverage.World) (state final : State) where
+  initialView : HeadView
+  finalView : HeadView
+  initial : ReconciliationViewExecution.StableSlotInputs state
+    (Origin.canonical origin) latest initialView
+  steps : StableSteps services origin target latest world state initialView final finalView
+
+private theorem StableSteps.execution
+    (run : StableSteps services origin target latest world state view final finalView) :
+    ∃ observations, ReconciliationExecution.Execution state observations final := by
+  induction run with
+  | nil => exact ⟨[], .nil _⟩
+  | @cons event state next view final finalView actual facts beforeView rest ih =>
+      obtain ⟨observations, execution⟩ := ih
+      exact ⟨⟨event, state, next⟩ :: observations, .cons actual execution⟩
 
 /-- Erasing the raw stable contracts leaves precisely a finite production
 `ReconciliationExecution.Execution`. -/
 theorem StablePrefix.execution
     (run : StablePrefix services origin target latest world state final) :
-    ∃ observations, ReconciliationExecution.Execution state observations final := by
+    ∃ observations, ReconciliationExecution.Execution state observations final :=
+  run.steps.execution
+
+private theorem StableSteps.preserves
+    (run : StableSteps services origin target latest world state view final finalView)
+    (inputs : ReconciliationViewExecution.StableSlotInputs state
+      (Origin.canonical origin) latest view)
+    (correct : CorrectView services origin target state.db) :
+    CorrectView services origin target final.db := by
   induction run with
-  | nil => exact ⟨[], .nil _⟩
-  | @cons event state next final actual facts rest ih =>
-      obtain ⟨observations, execution⟩ := ih
-      exact ⟨⟨event, state, next⟩ :: observations, .cons actual execution⟩
+  | nil => exact correct
+  | cons actual facts beforeView rest ih =>
+      cases beforeView
+      have refined := ReconciliationViewExecution.stable_actual_step_refines
+        actual facts inputs.bound correct
+      exact ih refined.2.1 (MptsyncStableTail.refines_preserves refined.1 correct)
 
 /-- An established public view survives every finite actual reconciliation
 prefix whose per-step stability/host contracts are supplied independently. -/
@@ -45,12 +76,7 @@ theorem StablePrefix.preserves
     (run : StablePrefix services origin target latest world state final)
     (correct : CorrectView services origin target state.db) :
     CorrectView services origin target final.db := by
-  induction run with
-  | nil => exact correct
-  | cons actual facts rest ih =>
-      have refined := ReconciliationViewExecution.stable_actual_step_refines
-        actual facts correct
-      exact ih (MptsyncStableTail.refines_preserves refined.1 correct)
+  exact run.steps.preserves run.initial correct
 
 private theorem installed_of_observed
     (represented : HeadView.Represents db view)
