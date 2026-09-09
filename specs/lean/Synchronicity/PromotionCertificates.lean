@@ -33,11 +33,14 @@ theorem body_only (allowed : (A : Type) → Promote.Effects A → Prop)
         split
         · exact clear.seq fun _ => .done _
         · exact write.seq fun _ => clear.seq fun _ => materialize.seq fun _ => .done _
-      cases authority.publication with
-      | untrusted => exact tail false
-      | unrestricted => exact tail true
-      | confined _ =>
-        exact (Only.map _ _ (read _ (PromotionReads.scopeCheck_only _ _ _))).seq tail
+      have permission : Only allowed (Promote.permitted tx pending authority).run := by
+        unfold Promote.permitted
+        cases authority.publication with
+        | untrusted => exact .done _
+        | unrestricted => exact .done _
+        | confined _ =>
+            exact Only.map _ _ (read _ (PromotionReads.scopeCheck_only _ _ _))
+      exact permission.seq tail
 
 theorem finish_only (allowed : (A : Type) → Promote.Effects A → Prop)
     (tx : Transaction) (pending : Option Promote.Pending) (key : Option (UInt64 × ByteArray × ByteArray))

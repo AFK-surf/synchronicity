@@ -71,6 +71,21 @@ def inTransaction (tx : Transaction) : {A : Type} → Trie.Complete.Effects A �
     else Inject.inject (Access.snapshot selection columns)
   | _, effect => Inject.inject effect
 
+/-- The production publication-authority check.  Naming this phase makes its
+successful execution available to progress proofs without changing the host or
+Rust command boundary. -/
+abbrev permitted (tx : Transaction) (pending : Pending)
+    (authority : Authorization.OriginAuthority) : Action Bool :=
+  match authority.publication with
+  | .untrusted => pure false
+  | .unrestricted => pure true
+  | .confined _ =>
+    (·.isNone) <$> within walkError (ExceptT.mk
+      ((Trie.ScopeCheck.firstOutside pending.head.root authority.publicationKeys).run.mapEffects
+        (fun {A} (effect : Trie.Walk.Effects A) => match effect with
+          | .left e => Inject.inject e
+          | .right e => Inject.inject (Materialize.redactionIn tx e)) : Program Materialize.Effects _))
+
 def body (tx : Transaction) (origin : Origin.Parsed) (now : Int64) (pending : Pending)
     (old : Option Pending) (scope : Trie.Serve.Scope) (authority : Authorization.OriginAuthority) : Action Promotion := do
   if old.any (fun old => !Reconcile.newer pending.head.seq pending.head.root ⟨old.head.seq, old.head.root⟩) then
@@ -81,15 +96,7 @@ def body (tx : Transaction) (origin : Origin.Parsed) (now : Int64) (pending : Pe
       ⟨scope, authority.provenance.map Origin.canonical⟩ pending.head.root).run.mapEffects (inTransaction tx)
       |> fun program => Except.mapError missingError <$> program)
   if !(← complete) then return .waiting
-  let allowed ← match authority.publication with
-    | .untrusted => pure false
-    | .unrestricted => pure true
-    | .confined _ =>
-      (·.isNone) <$> within walkError (ExceptT.mk
-        ((Trie.ScopeCheck.firstOutside pending.head.root authority.publicationKeys).run.mapEffects
-          (fun {A} (effect : Trie.Walk.Effects A) => match effect with
-            | .left e => Inject.inject e
-            | .right e => Inject.inject (Materialize.redactionIn tx e)) : Program Materialize.Effects _))
+  let allowed ← permitted tx pending authority
   if !allowed then
     clear tx origin
     return .refused

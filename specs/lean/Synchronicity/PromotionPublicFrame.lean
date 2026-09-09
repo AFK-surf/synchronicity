@@ -139,21 +139,20 @@ theorem body_no_flip (publicOrigin : String) (tx : Transaction) (origin : Origin
       exact same ▸ checkedFrame
     | true =>
       simp only [Bool.not_true, Bool.false_eq_true, ↓reduceIte] at ran
-      cases publication : authority.publication <;> simp only [publication] at ran
-      all_goals
-        obtain ⟨allowed, authorized, authorizedRun, ran⟩ := TransactionSuccess.bind_success _ _ _ _ _ ran
-        have authorizedFrame : pendingView publicOrigin authorized = pendingView publicOrigin checked := by
-          first
-          | exact congrArg (fun result => pendingView publicOrigin result.2) authorizedRun.symm
-          | exact read_frame publicOrigin _ (Only.map _ _ (PromotionReads.scopeCheck_only tx _ _)) checked authorized allowed authorizedRun
-        cases allowed with
-        | false =>
-          exact (clear_return_frame publicOrigin tx origin _ _ authorized final ran).trans (authorizedFrame.trans checkedFrame)
-        | true =>
-          simp only [Bool.not_true, Bool.false_eq_true, ↓reduceIte] at ran
-          obtain ⟨_, _, _, ran⟩ := TransactionSuccess.bind_success _ _ _ _ _ ran
-          obtain ⟨_, _, _, ran⟩ := TransactionSuccess.bind_success _ _ _ _ _ ran
-          obtain ⟨_, _, _, returned⟩ := TransactionSuccess.bind_success _ _ _ _ _ ran
-          exact False.elim (notFlipped (Except.ok.inj (congrArg Prod.fst returned)).symm)
+      obtain ⟨allowed, authorized, authorizedRun, ran⟩ :=
+        TransactionSuccess.bind_success _ _ _ _ _ ran
+      have authorizedFrame : pendingView publicOrigin authorized = pendingView publicOrigin checked :=
+        read_frame publicOrigin _ (PromotionViewFrame.permitted_only tx pending authority)
+          checked authorized allowed authorizedRun
+      cases allowed with
+      | false =>
+        exact (clear_return_frame publicOrigin tx origin _ _ authorized final ran).trans
+          (authorizedFrame.trans checkedFrame)
+      | true =>
+        simp only [Bool.not_true, Bool.false_eq_true, ↓reduceIte] at ran
+        obtain ⟨_, _, _, ran⟩ := TransactionSuccess.bind_success _ _ _ _ _ ran
+        obtain ⟨_, _, _, ran⟩ := TransactionSuccess.bind_success _ _ _ _ _ ran
+        obtain ⟨_, _, _, returned⟩ := TransactionSuccess.bind_success _ _ _ _ _ ran
+        exact False.elim (notFlipped (Except.ok.inj (congrArg Prod.fst returned)).symm)
 
 end Synchronicity.PromotionPublicFrame
