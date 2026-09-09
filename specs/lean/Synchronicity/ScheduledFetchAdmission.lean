@@ -178,48 +178,68 @@ theorem pendingFetchOpportunities
     inputs.peer inputs.pending inputs.pendingLink inputs.pendingTarget inputs.pendingPayloads
     inputs.pendingDistinct inputs.pendingWithin inputs.pendingFit inputs.enoughPendingRounds
 
-/-- A fresh scheduling window opened after one particular deficit observation.
-The handler is invoked only with the exact attempt selected by the raw M6
-opportunity. It must return an independently justified target-indexed
-admission at or after this window's runtime observation. -/
+/-- One completed production scheduler occurrence. `serial` distinguishes two
+runtime occurrences even when their stable queues and observations happen to
+be extensionally equal. -/
+structure ScheduleOccurrence where
+  serial : Nat
+  inputs : MptsyncScheduleExecution.StableScheduleInputs
+
+/-- Scheduler observations and receiver states share this production time
+axis. `noReuse` prevents one finite occurrence from being moved to arbitrarily
+many later indices; equal scheduler inputs may recur only as separately
+recorded occurrences. -/
+structure ProductionScheduleTimeline (states : Nat → State) where
+  occurrenceAt : Nat → Option ScheduleOccurrence
+  noReuse : ∀ {left right leftOccurrence rightOccurrence},
+    occurrenceAt left = some leftOccurrence →
+    occurrenceAt right = some rightOccurrence →
+    leftOccurrence.serial = rightOccurrence.serial → left = right
+
+/-- A fresh scheduling window recorded after one particular deficit
+observation on the same production timeline. The exact selected attempt is
+admitted from the receiver state at that scheduler occurrence, not from an
+arbitrarily old deficit snapshot. -/
 structure ResponseWindow (deficitAt : Nat) (finalOrigin : String)
     (finalSeq : UInt64) (finalRoot : ByteArray)
     (requirements : FiniteRequirements publisher scope owner root)
-    (states : Nat → State) where
+    (states : Nat → State) (timeline : ProductionScheduleTimeline states) where
   observedAt : Nat
   afterDeficit : deficitAt < observedAt
-  inputs : MptsyncScheduleExecution.StableScheduleInputs
+  occurrence : ScheduleOccurrence
+  recorded : timeline.occurrenceAt observedAt = some occurrence
   item : OriginSchedule.Item
-  member : item ∈ inputs.pendingItems
+  member : item ∈ occurrence.inputs.pendingItems
   admit : ∀ round attempt,
-    round < inputs.pendingRounds →
-    attempt ∈ (inputs.pending.observation round).attempts →
+    round < occurrence.inputs.pendingRounds →
+    attempt ∈ (occurrence.inputs.pending.observation round).attempts →
     attempt.item = item →
-    OriginScheduleExecution.FetchOpportunity (inputs.pendingTarget item) attempt →
-    inputs.pendingLink.contactRound round < inputs.peerRounds →
+    OriginScheduleExecution.FetchOpportunity (occurrence.inputs.pendingTarget item) attempt →
+    occurrence.inputs.pendingLink.contactRound round < occurrence.inputs.peerRounds →
     ∀ peerAttempt,
-      peerAttempt ∈ (inputs.contacts.observation
-        (inputs.pendingLink.contactRound round)).attempts →
-      peerAttempt.peer = inputs.peer → peerAttempt.outcome = .success →
+      peerAttempt ∈ (occurrence.inputs.contacts.observation
+        (occurrence.inputs.pendingLink.contactRound round)).attempts →
+      peerAttempt.peer = occurrence.inputs.peer → peerAttempt.outcome = .success →
       ∃ later, observedAt ≤ later ∧
         ∃ actualTarget,
-          FinalTargetAligned (inputs.pendingTarget item) actualTarget
+          FinalTargetAligned (occurrence.inputs.pendingTarget item) actualTarget
             finalOrigin finalSeq finalRoot scope owner root ∧
-          AdmissionFor actualTarget requirements (states deficitAt) (states later)
+          AdmissionFor actualTarget requirements (states observedAt) (states later)
 
 /-- The raw schedule and exact-attempt handler in one fresh window produce
 one later ordinary authorized admission. -/
 theorem ResponseWindow.responds
-    (window : ResponseWindow deficitAt finalOrigin finalSeq finalRoot requirements states) :
-    ∃ later, deficitAt < later ∧ Admission requirements (states deficitAt) (states later) := by
-  have opportunities := pendingFetchOpportunities window.inputs
+    (window : ResponseWindow deficitAt finalOrigin finalSeq finalRoot requirements states timeline) :
+    ∃ observed later, deficitAt < observed ∧ observed ≤ later ∧
+      Admission requirements (states observed) (states later) := by
+  have opportunities := pendingFetchOpportunities window.occurrence.inputs
   obtain ⟨round, before, attempt, attempted, sameItem, opportunity, contactBefore,
       peerAttempt, peerAttempted, samePeer, success⟩ :=
     opportunities window.item window.member
   obtain ⟨later, afterWindow, actualTarget, aligned, admission⟩ :=
     window.admit round attempt before attempted sameItem opportunity contactBefore
       peerAttempt peerAttempted samePeer success
-  exact ⟨later, Nat.lt_of_lt_of_le window.afterDeficit afterWindow, admission.admission⟩
+  exact ⟨window.observedAt, later, window.afterDeficit, afterWindow, admission.admission⟩
 
 /-- An actual retry-limit exit is connected to the next raw pending-origin
 schedule window. The abandoned report itself supplies no admission. -/
@@ -227,53 +247,64 @@ structure AfterRetryLimitWindow
     {origin : Origin.Parsed}
     (exit : MptsyncRetryExecution.RetryLimitExit origin expected refused
       fetchMaximum retryLimit before after)
-    (inputs : MptsyncScheduleExecution.StableScheduleInputs)
-    (item : OriginSchedule.Item)
-    (requeued : MptsyncRetryExecution.RequeuedAfterLimit exit inputs.contacts inputs.peer
-      inputs.pending inputs.pendingLink inputs.pendingTarget item)
     (exitAt : Nat) (finalOrigin : String) (finalSeq : UInt64) (finalRoot : ByteArray)
     (requirements : FiniteRequirements publisher scope owner root)
-    (states : Nat → State) where
+    (states : Nat → State) (timeline : ProductionScheduleTimeline states) where
+  startedAt : Nat
+  startedBeforeExit : startedAt < exitAt
+  startState : states startedAt = before
   exitState : states exitAt = after
   observedAt : Nat
   afterExit : exitAt < observedAt
+  occurrence : ScheduleOccurrence
+  recorded : timeline.occurrenceAt observedAt = some occurrence
+  item : OriginSchedule.Item
+  requeued : MptsyncRetryExecution.RequeuedAfterLimit exit occurrence.inputs.contacts
+    occurrence.inputs.peer occurrence.inputs.pending occurrence.inputs.pendingLink
+      occurrence.inputs.pendingTarget item
   finalOriginMatchesExit : finalOrigin = Origin.canonical origin
-  sequence : (inputs.pendingTarget item).pointer.seq = finalSeq
-  targetRoot : (inputs.pendingTarget item).pointer.root = finalRoot
+  sequence : (occurrence.inputs.pendingTarget item).pointer.seq = finalSeq
+  targetRoot : (occurrence.inputs.pendingTarget item).pointer.root = finalRoot
   admit : ∀ round attempt,
-    round < inputs.pendingRounds →
-    attempt ∈ (inputs.pending.observation round).attempts →
+    round < occurrence.inputs.pendingRounds →
+    attempt ∈ (occurrence.inputs.pending.observation round).attempts →
     attempt.item = item →
-    OriginScheduleExecution.FetchOpportunity (inputs.pendingTarget item) attempt →
-    inputs.pendingLink.contactRound round < inputs.peerRounds →
+    OriginScheduleExecution.FetchOpportunity (occurrence.inputs.pendingTarget item) attempt →
+    occurrence.inputs.pendingLink.contactRound round < occurrence.inputs.peerRounds →
     ∀ peerAttempt,
-      peerAttempt ∈ (inputs.contacts.observation
-        (inputs.pendingLink.contactRound round)).attempts →
-      peerAttempt.peer = inputs.peer → peerAttempt.outcome = .success →
+      peerAttempt ∈ (occurrence.inputs.contacts.observation
+        (occurrence.inputs.pendingLink.contactRound round)).attempts →
+      peerAttempt.peer = occurrence.inputs.peer → peerAttempt.outcome = .success →
       ∃ later, observedAt ≤ later ∧
         ∃ actualTarget,
-          TargetAligned (inputs.pendingTarget item) actualTarget scope owner root ∧
-          AdmissionFor actualTarget requirements (states exitAt) (states later)
+          TargetAligned (occurrence.inputs.pendingTarget item) actualTarget scope owner root ∧
+          AdmissionFor actualTarget requirements (states observedAt) (states later)
 
-def AfterRetryLimitWindow.next
-    (window : AfterRetryLimitWindow exit inputs item requeued exitAt finalOrigin finalSeq finalRoot
-      requirements states) :
-    ResponseWindow exitAt finalOrigin finalSeq finalRoot requirements states where
-  observedAt := window.observedAt
-  afterDeficit := window.afterExit
-  inputs := inputs
-  item := item
-  member := requeued.member
-  admit := by
-    intro round attempt before attempted same opportunity contactBefore peerAttempt
-      peerAttempted samePeer success
-    obtain ⟨later, afterWindow, actualTarget, aligned, admission⟩ :=
-      window.admit round attempt before attempted same opportunity contactBefore peerAttempt
-        peerAttempted samePeer success
-    refine ⟨later, afterWindow, actualTarget, ?_, admission⟩
+theorem AfterRetryLimitWindow.responds
+    {publisher : TrieProgramProofs.RawSnapshot} {scope : Serve.Scope}
+    {owner : Option String} {root : ByteArray}
+    {requirements : FiniteRequirements publisher scope owner root}
+    {states : Nat → State} {timeline : ProductionScheduleTimeline states}
+    (window : AfterRetryLimitWindow exit exitAt finalOrigin finalSeq finalRoot
+      requirements states timeline) :
+    ∃ observed later, exitAt < observed ∧ observed ≤ later ∧
+      Admission requirements (states observed) (states later) := by
+  -- Consume the opportunity attached to this exact retry-limit requeue rather
+  -- than deriving an interchangeable opportunity from the raw inputs again.
+  obtain ⟨round, before, attempt, attempted, sameItem, opportunity, contactBefore,
+      peerAttempt, peerAttempted, samePeer, success⟩ :=
+    window.requeued.opportunities window.item window.requeued.member
+  obtain ⟨later, afterWindow, actualTarget, aligned, admission⟩ :=
+    window.admit round attempt before attempted sameItem opportunity contactBefore
+      peerAttempt peerAttempted samePeer success
+  have finalAligned : FinalTargetAligned
+      (window.occurrence.inputs.pendingTarget window.item) actualTarget
+      finalOrigin finalSeq finalRoot scope owner root := by
     refine ⟨?_, window.sequence, window.targetRoot, aligned⟩
-    exact ((inputs.pendingPayloads.sameOrigin item requeued.member).trans
-      requeued.sameOrigin).trans window.finalOriginMatchesExit.symm
+    exact ((window.occurrence.inputs.pendingPayloads.sameOrigin window.item
+      window.requeued.member).trans window.requeued.sameOrigin).trans
+        window.finalOriginMatchesExit.symm
+  exact ⟨window.observedAt, later, window.afterExit, afterWindow, admission.admission⟩
 
 /-- One fresh response source is either an ordinary newly queued raw window,
 or the next raw window causally attached to an actual retry-limit exit and
@@ -281,36 +312,27 @@ requeue observation. -/
 inductive ResponseOpportunity (deficitAt : Nat) (finalOrigin : String)
     (finalSeq : UInt64) (finalRoot : ByteArray)
     (requirements : FiniteRequirements publisher scope owner root)
-    (states : Nat → State) where
-  | fresh (window : ResponseWindow deficitAt finalOrigin finalSeq finalRoot requirements states)
+    (states : Nat → State) (timeline : ProductionScheduleTimeline states) where
+  | fresh (window : ResponseWindow deficitAt finalOrigin finalSeq finalRoot requirements states
+      timeline)
   | afterRetry
       {origin : Origin.Parsed} {expected : Option (UInt64 × ByteArray)}
       {refused : List (UInt64 × ByteArray × ByteArray)} {fetchMaximum retryLimit : Nat}
       {before after : State}
       (exit : MptsyncRetryExecution.RetryLimitExit origin expected refused
         fetchMaximum retryLimit before after)
-      (inputs : MptsyncScheduleExecution.StableScheduleInputs)
-      (item : OriginSchedule.Item)
-      (requeued : MptsyncRetryExecution.RequeuedAfterLimit exit inputs.contacts inputs.peer
-        inputs.pending inputs.pendingLink inputs.pendingTarget item)
-      (window : AfterRetryLimitWindow exit inputs item requeued deficitAt finalOrigin finalSeq
-        finalRoot requirements states) :
-      ResponseOpportunity deficitAt finalOrigin finalSeq finalRoot requirements states
-
-def ResponseOpportunity.window
-    (opportunity : ResponseOpportunity deficitAt finalOrigin finalSeq finalRoot
-      requirements states) :
-    ResponseWindow deficitAt finalOrigin finalSeq finalRoot requirements states :=
-  match opportunity with
-  | .fresh window => window
-  | .afterRetry _ _ _ _ window => window.next
+      (window : AfterRetryLimitWindow exit deficitAt finalOrigin finalSeq finalRoot
+        requirements states timeline) :
+      ResponseOpportunity deficitAt finalOrigin finalSeq finalRoot requirements states timeline
 
 theorem ResponseOpportunity.responds
     (opportunity : ResponseOpportunity deficitAt finalOrigin finalSeq finalRoot
-      requirements states) :
-    ∃ later, deficitAt < later ∧
-      Admission requirements (states deficitAt) (states later) :=
-  opportunity.window.responds
+      requirements states timeline) :
+    ∃ observed later, deficitAt < observed ∧ observed ≤ later ∧
+      Admission requirements (states observed) (states later) := by
+  cases opportunity with
+  | fresh window => exact window.responds
+  | afterRetry exit window => exact window.responds
 
 /-- Every deficit observation is followed by its own later raw scheduling
 window. A single finite window cannot satisfy all future observations because
@@ -318,18 +340,78 @@ each witness carries an `observedAt` strictly after its indexed deficit. -/
 def ScheduledSufficientResponses (finalOrigin : String) (finalSeq : UInt64)
     (finalRoot : ByteArray)
     (requirements : FiniteRequirements publisher scope owner root)
-    (states : Nat → State) : Prop :=
+    (states : Nat → State) (timeline : ProductionScheduleTimeline states) : Prop :=
   ∀ now, 0 < missingEvidence requirements.items (replicaOfState (states now)) →
-    Nonempty (ResponseOpportunity now finalOrigin finalSeq finalRoot requirements states)
+    Nonempty (ResponseOpportunity now finalOrigin finalSeq finalRoot requirements states timeline)
 
-/-- Per-deficit raw M6 windows and their exact-attempt handlers discharge the
-ordinary response premise used by finite Fetch convergence. -/
-theorem sufficientResponses
+private theorem included_between
+    (persistent : TrieFetchConvergence.PersistentEvidence (replicaOfState ∘ states))
+    (before after : Nat) (ordered : before ≤ after) :
+    EvidenceIncluded (replicaOfState (states before)) (replicaOfState (states after)) := by
+  obtain ⟨span, rfl⟩ := Nat.exists_eq_add_of_le ordered
+  induction span with
+  | zero => exact EvidenceIncluded.refl _
+  | succ span ih =>
+      rw [Nat.add_succ]
+      exact (ih (Nat.le_add_right before span)).trans (persistent (before + span))
+
+/-- Per-deficit production-timeline windows and their exact-attempt handlers
+discharge the strict progress premise. Persistence bridges the deficit
+observation to the later state from which the actual admission runs. -/
+theorem productiveAdmissions
     (scheduled : ScheduledSufficientResponses finalOrigin finalSeq finalRoot
-      requirements states) :
-    SufficientResponses requirements states := by
+      requirements states timeline)
+    (persistent : TrieFetchConvergence.PersistentEvidence (replicaOfState ∘ states)) :
+    TrieFetchConvergence.ProductiveAdmissions requirements (replicaOfState ∘ states) := by
   intro now missing
   obtain ⟨opportunity⟩ := scheduled now missing
-  exact opportunity.responds
+  obtain ⟨observed, later, afterDeficit, afterWindow, admission⟩ := opportunity.responds
+  refine ⟨later, Nat.lt_of_lt_of_le afterDeficit afterWindow, ?_⟩
+  exact Nat.lt_of_lt_of_le admission.strict
+    (missingEvidence_mono requirements.items
+      (included_between persistent now observed (Nat.le_of_lt afterDeficit)))
+
+/-- If an actual retry trace is stationary after its finite boundary, the
+per-deficit scheduler contract forces that boundary to be complete. A positive
+boundary deficit would require a strictly productive admission between two
+states that stationarity identifies with the same boundary state. -/
+theorem completeAtStationaryBoundary
+    {publisher : TrieProgramProofs.RawSnapshot} {scope : Serve.Scope}
+    {owner : Option String} {root : ByteArray}
+    {requirements : FiniteRequirements publisher scope owner root}
+    {states : Nat → State} {timeline : ProductionScheduleTimeline states}
+    (scheduled : ScheduledSufficientResponses finalOrigin finalSeq finalRoot
+      requirements states timeline)
+    (boundary : Nat)
+    (stationary : ∀ now, boundary ≤ now → states now = states boundary) :
+    PermittedComplete publisher scope owner root (replicaOfState (states boundary)) := by
+  apply (TrieFetchCompletion.finite_measure_eq_zero_iff_complete requirements).mp
+  apply Nat.eq_zero_of_not_pos
+  intro positive
+  obtain ⟨opportunity⟩ := scheduled boundary positive
+  obtain ⟨observed, later, afterBoundary, afterWindow, admission⟩ := opportunity.responds
+  have observedState := stationary observed (Nat.le_of_lt afterBoundary)
+  have laterState := stationary later
+    (Nat.le_trans (Nat.le_of_lt afterBoundary) afterWindow)
+  have strict := admission.strict
+  rw [observedState, laterState] at strict
+  exact (Nat.lt_irrefl _ strict)
+
+/-- Direct convergence API used by M1 after the timeline-indexed scheduler
+bridge replaces the older same-state `SufficientResponses` adapter. -/
+theorem scheduledResponsesConverge
+    {publisher : TrieProgramProofs.RawSnapshot} {scope : Serve.Scope}
+    {owner : Option String} {root : ByteArray}
+    {requirements : FiniteRequirements publisher scope owner root}
+    {states : Nat → State} {timeline : ProductionScheduleTimeline states}
+    (scheduled : ScheduledSufficientResponses finalOrigin finalSeq finalRoot
+      requirements states timeline)
+    (persistent : TrieFetchConvergence.PersistentEvidence (replicaOfState ∘ states))
+    (start : Nat) :
+    ∃ finish, start ≤ finish ∧ ∀ now, finish ≤ now →
+      PermittedComplete publisher scope owner root (replicaOfState (states now)) := by
+  simpa only [Function.comp_apply] using
+    TrieFetchConvergence.finite_fetch_converges requirements (replicaOfState ∘ states)
+      persistent (productiveAdmissions scheduled persistent) start
 
 end Synchronicity.ScheduledFetchAdmission
