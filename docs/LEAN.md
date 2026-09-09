@@ -8,24 +8,16 @@ in the [verified crate README](../crates/synch-verified/README.md) and
 be explained in plain words.** Define observations independently of the algorithm:
 “the walk finished” is not a complete file list, and an availability flag is not
 readable content. Prove the actual executed operation establishes that meaning.
-Not every helper needs a theorem; keep supporting lemmas when a selected guarantee
-needs them. Migration, integration, tests and proof completion are distinct.
+Migration, integration, tests and proof completion are distinct.
 The mptsync convergence theorem is checked under the explicit stable-run contracts
 below; broader P1–P8 coverage and the full authorization goal remain incomplete.
 
-Proof organization must mirror the goal hierarchy in this document: user-facing
-P1–P8 goals and their specialized M1–M8 goals, not just implementation modules.
-Each goal has a named property and a corresponding top-level theorem expressing
-that guarantee, with an explicit link from this document to its proof entry point.
-Operation-level theorems and helpers support that entry point. Component proofs,
-including a conjunction that merely bundles them, do not by themselves complete
-a goal. Mark a goal complete only when its top-level theorem establishes the
-stated property for the relevant production executions under explicit assumptions.
-Use operation-independent domain invariants or transition relations, not lists of
-command-specific violations; prove actual operations refine the common property.
-Derive permissions from real reads or captured work, not an assumed safe outcome.
-Keep shared domain models outside `Goals`; operation proofs must not depend on
-goal modules. `Goals` contains the goal-level properties and top-level theorems.
+Proof organization mirrors user-facing P1–P8 and specialized M1–M8. Each checked
+goal has a linked named property and top theorem over relevant production
+executions and explicit assumptions; a component bundle is not completion.
+Specifications are operation-independent invariants or transitions, refined by
+actual operations. Permissions come from real reads or captured work. Shared
+models stay outside `Goals`, and operation modules never import goal modules.
 
 ## Architecture and ownership
 
@@ -97,39 +89,47 @@ promise to install every intermediate version during ongoing edits.
 **M1 composition.** The shared execution theorem is
 [`MptsyncProductionConvergence.StableRun.converges`](../specs/lean/Synchronicity/MptsyncProductionConvergence.lean);
 `M1.eventual_convergence` lifts a finite list of participant/origin runs to one
-system stabilization point. `StableRun` contains raw scheduler/contact and Hello
-acceptance observations, finite requirements, a retry execution, authorized
-admissions and a later primitive promotion opportunity. All origins on one device
-share one production timeline and stable reconciliation tail; acceptance, retry
-and promotion endpoints are tied to that timeline. It assumes no Fetch, Complete
-or promotion result, `Ready`, `CorrectView` or tail refinement.
+system stabilization point. `StableRun` contains raw scheduler/Hello observations,
+finite requirements, authorized admissions and a finite retry prefix. Each device
+has one timeline, command registry and stable tail. After completion, a factual
+maintenance wake, pending bulk snapshot and exact direct promotion invocation are
+separate from the healthy primitive opportunity for that invocation. No Fetch,
+Complete or promotion result, `Ready`, `CorrectView` or refinement is assumed.
 
-The chain is: M6 selects the latest advertisement and pending origin;
+The finite stable publisher history defines validity through actual signature,
+authority and history-read certificates; M6 delivers its greatest member. Then
 [`MptsyncAdvertisementWindow`](../specs/lean/Synchronicity/MptsyncAdvertisementWindow.lean)
 ties its payload to `Reconcile.accept`;
+[`OriginQueueSource`](../specs/lean/Synchronicity/OriginQueueSource.lean) derives
+advertisement and retry queues from native complete/pending bulk snapshots;
 [`ScheduledFetchAdmission`](../specs/lean/Synchronicity/ScheduledFetchAdmission.lean)
 ties useful responses to authority-checked `Fetch.admit` bytes and deficit decrease;
 M7 preserves committed evidence across retries;
 [`TrieCompleteConverse`](../specs/lean/Synchronicity/TrieCompleteConverse.lean)
-uses semantic permitted completeness and bounded actual transaction-lifted reads
-to prove walk exhaustion and then production completion; M4 installs the
-aligned exact view; and
+uses semantic completeness and bounded raw reads—not a stored successor or
+terminal result—to prove walk exhaustion and completion; M4 installs the view; and
 [`ReconciliationViewExecution.stable_tail`](../specs/lean/Synchronicity/ReconciliationViewExecution.lean)
-proves later reconciliation preserves it. Scope reset and promotion history derive
-the initial view rather than assuming it anew.
+proves later reconciliation preserves it. A single initial head bound is transported
+through actual events; later bounds are not assumed per state. Promotion history
+carries each derived view through actual prefixes, acceptance, retry and the stable
+maintenance wait. Scope reset carries cleared complete/entry facts and refusal
+projection through the same path before rebuilding the initial view.
 
-This conditional theorem requires stable versions/policies, finite supported
-metadata and coverage, retained authorized sources, usable contact windows, and a
-scheduled authorized admission while a deficit remains. The host must later supply
-one bounded healthy promotion window: successful certification, authority,
-materialization and commit. Hashing, signatures, Unicode, SQLite and transport are
-contracts. Partition, infinite cancellation, source loss, permanent I/O failure,
-continuing publication and external recovery are excluded. M1 neither proves these
-availability premises nor completes M5.
+This conditional theorem requires stable versions and a device-wide decoded replica
+policy, finite supported metadata/coverage, retained authorized sources, usable
+contact windows, stable maintenance waits, and healthy primitive opportunities.
+Native `all_heads` decoding and `nativeServable` are explicit Rust boundary seams;
+Lean constrains their slot/history meaning but does not prove that decoder here.
+SQLite, filesystem, cryptographic, wire/codec and materializer contracts also apply.
+Partition, infinite cancellation, source loss, permanent I/O failure, continuing
+publication and external recovery are excluded. M1 does not prove those premises
+or complete M5.
 
-**M2 and M3 selection safety.** M2 checks both the production exchange planner
-and healthy acceptance chains: order and duplicates preserve the final typed/backed
-maximum. M3 makes each finite reconciliation execution keep a head, strictly
+**M2 and M3 selection safety.** M2 binds one scheduler Hello occurrence, its exact
+wire payload, `Exchange.plan` and the acceptance fold into one outcome; order and
+duplicates preserve its semantic pull/push choices and selected typed version.
+The validity set is a finite complete stable publisher history, not an arbitrary
+predicate or a delivery premise. M3 makes each finite execution keep a head, strictly
 advance it, or consume exactly captured pending work. Complete cannot regress or
 disappear. Credentials come from actual captured work or fresh promotion reads;
 failures and obsolete acceptance preserve heads and other rows. Backing history,
@@ -153,15 +153,15 @@ contact and wire observations are consumed; connectivity supplies neither
 authority nor a promised response.
 
 **M7 retry progress.** Actual admitted responses and cancellation/resumption or
-fresh-restart checkpoints form the retry execution. Cancellation at a peer wait
-holds no transaction and preserves committed evidence.
-`ScheduledSufficientResponses` is the liveness seam: for every still-positive
-deficit, a strictly later M6-linked attempt must carry an authorized,
-target-aligned response whose `Fetch.admit` commits evidence. A retry-limit exit
-can supply that attempt only through actual outer requeue and reselection. These
-facts derive the abstract productive-admission condition. A later finite
-completion opportunity reuses accumulated evidence. Infinite cancellation is
-excluded.
+fresh-restart checkpoints form one finite retry prefix ending before promotion.
+Cancellation at a peer wait holds no transaction; each exact prefix preserves
+committed evidence, head keys/history and materialized entries.
+`BoundedScheduledResponses` reserves a finite strictly ordered list of non-reused
+M6-linked turns, one per initial missing item. Whenever a deficit remains, that
+exact retry checkpoint must be an authorized, target-aligned `Fetch.admit` which
+strictly decreases it. Evidence monotonicity and finite induction derive zero at
+the retry boundary. Retry-limit exits count only through actual outer requeue and
+reselection. Infinite cancellation is excluded.
 
 **M8 permission changes.** The production `ScopeChange` command reads the actual
 old scope and typed heads, atomically clears old complete and derived state, and
@@ -170,7 +170,10 @@ host/commit failure is atomic. Enlargement, narrowing, expiry and revocation can
 reuse old completion/refusal credentials or suspended work. A stable opportunity
 restores current-scope readiness; M7/M1 and M4 supply Fetch and materialization.
 [`ScopeChangePromotionBaseline`](../specs/lean/Synchronicity/ScopeChangePromotionBaseline.lean)
-derives an empty baseline from cleanup plus schema/snapshot/policy contracts.
+derives cleanup absence facts; `MptsyncScopeChangeCarry` transports them through
+acceptance/retry before rebuilding the baseline. `MptsyncRefusalCache` connects
+the durable change to the process-memory clear seam; a native test checks that the
+same head disappears from the actual Fetch/promotion refusal projection.
 
 **M5 remains open.** Checked components validate signatures and origin bindings,
 read serving authority in production transactions, constrain scoped responses by
@@ -183,7 +186,7 @@ yet covers every identity lifecycle, relay, disclosure, publication and recovery
 
 | Area | Implemented and checked | Still open |
 | --- | --- | --- |
-| Trie | Production Lean ingress, lookup/mutation, scan/diff, completeness, collection, Merkle proofs, normalization and scope check. Proofs cover scoped lookup, retention, routing, entries and exact diff streams. | General exact edits/listings, legitimate caller grants and exact completion. |
+| Trie | Production Lean ingress, lookup/mutation, scan/diff, completeness, collection, Merkle proofs, normalization and scope check. Proofs cover scoped lookup, retention, routing, entries, exact diffs and stable-run permitted completion. | General exact edits/listings and legitimate caller grants beyond that execution. |
 | Fetch/serving | Production Lean. Actual rejection/rollback/storage coherence and no transaction across waits; position/response checks; scheduled authorized admissions strictly reduce finite deficits; retry checkpoints retain evidence. | Availability of sufficient responses remains an M1/M7 premise; full end-to-end authority/disclosure is M5. Exhaustion alone does not prove completeness. |
 | CAS | Production Lean content operations, coverage, retention/repair, durability, collection and projections. Scoped exact-read, transfer/replay, retention and advertisement results. | Broader size-change/host failures and cloud/publication/source-hold composition. |
 | Cloud | Production Lean cache/range restoration, associated adoption, hydration and outboard caching; native content/recovery/cancellation tests. | Remaining discovery/upload/finalize/read/serve orchestration and composed proofs. |
@@ -210,18 +213,17 @@ instead of certifying an empty shared view. Older compressed nodes can place
 private data above shared descendants, preventing legitimate scoped completion.
 
 New publications use routing nodes with addressed payloads and child commitments
-above permission boundaries, retaining compression inside suitable subtrees. This
-permits authenticated absence without revealing private values. Normalization
-preserves entries; its routing/serving proof still requires compatible grants.
-The stable-run theorem covers completion/promotion; legacy republishing and the
-actual builder path remain outside it.
+above permission boundaries, permitting authenticated absence without revealing
+private values. The stable-run theorem begins after the selected version has a
+servable format. Legacy republishing and the builder/recovery execution that creates
+that later signed version are explicitly outside its stable suffix.
 
 **Protocol version 4 requires communicating peers to upgrade together.** Hello
 rejects older peers. Old signed roots remain readable and cannot be rewritten by
 relays; restricted legacy views lacking absence evidence remain incomplete.
 Publishers republish preserved entries under a later signature through the normal
-publication/recovery path without requiring a file edit. Eventual consistency
-must include that upgrade path.
+publication/recovery path without requiring a file edit; M1 consumes that result
+as its stable latest history but does not prove the preceding builder execution.
 
 Native Lean is mandatory, including public origin APIs: Linux GNU, macOS
 x86-64/arm64 and Windows gnullvm use the pinned runtime and checked ABI. OpenBSD
@@ -257,10 +259,9 @@ or prevent authorized publishers from redistributing known data.
 3. Discharge more M1 availability/host contracts through real orchestration.
 4. Extend content results through cloud and retention/publication paths.
 
-Migrate only whole operations needed for those properties. Diagnostics, exact
-traces, LRU behavior and cost can remain tests. Do not require universal proofs
-of every helper, root uniqueness or removal of all garbage, or weaken a user
-property to make its proof convenient.
+Migrate whole operations needed by these properties; diagnostics, exact traces,
+LRU behavior and cost may remain tests. Do not weaken a user property to make its
+proof convenient.
 
 ## Validation and completion gates
 
@@ -281,7 +282,5 @@ cargo clippy --workspace --all-targets -- -D warnings
 cargo test --workspace
 ```
 
-Recheck accepted proofs with the standalone kernel and audit axioms using the CI
-procedure. Reject `sorryAx` and native-evaluation shortcuts. Run relevant adversarial,
-cancellation, cloud/emulator and recovery checks, shipped feature configurations
-and supported platform CI. Local success alone is not cross-platform readiness.
+Recheck with the standalone kernel and audit axioms; reject `sorryAx` and native
+evaluation shortcuts. Run relevant fault/cancellation/recovery and platform CI.
