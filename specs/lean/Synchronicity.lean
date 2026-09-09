@@ -108,6 +108,7 @@ import Synchronicity.ScopeChangePromotionBaseline
 import Synchronicity.PromotionContinuationBaseline
 import Synchronicity.MptsyncPromotionHistory
 import Synchronicity.MptsyncAdvertisementWindow
+import Synchronicity.ProductionTimeline
 import Synchronicity.MptsyncProductionConvergence
 import Synchronicity.Goals.Mptsync.M7
 import Synchronicity.Goals.Mptsync.M8

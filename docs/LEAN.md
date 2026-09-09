@@ -99,8 +99,10 @@ promise to install every intermediate version during ongoing edits.
 `M1.eventual_convergence` lifts a finite list of participant/origin runs to one
 system stabilization point. `StableRun` contains raw scheduler/contact and Hello
 acceptance observations, finite requirements, a retry execution, authorized
-admissions and a later primitive promotion opportunity. It assumes no Fetch,
-Complete or promotion result, `Ready`, `CorrectView` or tail refinement.
+admissions and a later primitive promotion opportunity. All origins on one device
+share one production timeline and stable reconciliation tail; acceptance, retry
+and promotion endpoints are tied to that timeline. It assumes no Fetch, Complete
+or promotion result, `Ready`, `CorrectView` or tail refinement.
 
 The chain is: M6 selects the latest advertisement and pending origin;
 [`MptsyncAdvertisementWindow`](../specs/lean/Synchronicity/MptsyncAdvertisementWindow.lean)
@@ -109,7 +111,8 @@ ties its payload to `Reconcile.accept`;
 ties useful responses to authority-checked `Fetch.admit` bytes and deficit decrease;
 M7 preserves committed evidence across retries;
 [`TrieCompleteConverse`](../specs/lean/Synchronicity/TrieCompleteConverse.lean)
-turns bounded primitive replies into production completion; M4 installs the
+uses semantic permitted completeness and bounded actual transaction-lifted reads
+to prove walk exhaustion and then production completion; M4 installs the
 aligned exact view; and
 [`ReconciliationViewExecution.stable_tail`](../specs/lean/Synchronicity/ReconciliationViewExecution.lean)
 proves later reconciliation preserves it. Scope reset and promotion history derive
@@ -152,11 +155,13 @@ authority nor a promised response.
 **M7 retry progress.** Actual admitted responses and cancellation/resumption or
 fresh-restart checkpoints form the retry execution. Cancellation at a peer wait
 holds no transaction and preserves committed evidence.
-`ScheduledSufficientResponses` is the liveness seam: while a finite deficit remains,
-a later M6-linked attempt must carry an authorized, target-aligned response whose
-`Fetch.admit` commits evidence. It derives the abstract productive-admission
-condition. A later finite completion opportunity reuses accumulated evidence.
-Infinite cancellation is excluded.
+`ScheduledSufficientResponses` is the liveness seam: for every still-positive
+deficit, a strictly later M6-linked attempt must carry an authorized,
+target-aligned response whose `Fetch.admit` commits evidence. A retry-limit exit
+can supply that attempt only through actual outer requeue and reselection. These
+facts derive the abstract productive-admission condition. A later finite
+completion opportunity reuses accumulated evidence. Infinite cancellation is
+excluded.
 
 **M8 permission changes.** The production `ScopeChange` command reads the actual
 old scope and typed heads, atomically clears old complete and derived state, and
