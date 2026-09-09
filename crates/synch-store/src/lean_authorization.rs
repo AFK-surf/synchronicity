@@ -6,7 +6,7 @@ use std::collections::HashMap;
 use rusqlite::Connection;
 use synch_core::{origin::OriginParseError, NodeId, OriginId};
 use synch_mpt::Scope;
-use synch_verified::{authorization as native, cas::OperationError};
+use synch_verified::{authorization as native, cas::OperationError, reconcile as replication};
 
 use crate::{
     lean_storage::SqliteStorage, Binding, BindingSource, PublishScope, Result, Store, StoreError,
@@ -314,6 +314,18 @@ pub(crate) fn local_scope_on(conn: &Connection, borrowed: bool) -> Result<Scope>
     }
     .map_err(error)?;
     Ok(Scope::from_verified(answer))
+}
+
+pub(crate) fn change_scope(store: &Store, spaces: Option<&[String]>, now: i64) -> Result<bool> {
+    store.with_connection_scope(|conn| {
+        replication::change_scope(
+            &mut SqliteStorage::new(conn),
+            &mut Crypto::default(),
+            spaces.map(<[String]>::to_vec),
+            now,
+        )
+        .map_err(crate::lean_history::error)
+    })
 }
 
 pub(crate) fn materialization_scope_on(

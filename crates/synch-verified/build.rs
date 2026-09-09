@@ -81,6 +81,7 @@ fn main() {
         "Replication/Records",
         "Replication/Reconcile",
         "Replication/Materialize",
+        "Replication/ScopeChange",
         "Commands",
         "Commands/Generated",
         "Replication/Promote",

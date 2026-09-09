@@ -25,6 +25,7 @@ import VerifiedCore.Trie.Fetch
 import VerifiedCore.Host.Peer
 import VerifiedCore.Replication.Exchange
 import VerifiedCore.Replication.Contact
+import VerifiedCore.Replication.ScopeChange
 import VerifiedCore.Replication.Types
 
 /-! The shapes that cross the command boundary: what a caller asks for and
@@ -221,6 +222,9 @@ inductive Command where
   | authSoleDnsHintSource (key : ByteArray) (domain : String) (reading : Int64)
   | authHasDelegations
   | authExpireDns (reading : Int64)
+  /-- Atomically replace the local read scope and invalidate all derived
+  foreign views and completion claims made under the prior permission. -/
+  | authChangeScope (spaces : Option (List String)) (now : Int64)
 
 
 inductive AuthorizationDomainError where

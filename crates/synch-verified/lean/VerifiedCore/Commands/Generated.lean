@@ -991,6 +991,7 @@ instance : Encode Commands.Command where
     | .authSoleDnsHintSource a0 a1 a2 => out.push 83 |>.put a0 |>.put a1 |>.put a2
     | .authHasDelegations => out.push 84
     | .authExpireDns a0 => out.push 85 |>.put a0
+    | .authChangeScope a0 a1 => out.push 86 |>.put a0 |>.put a1
 
 instance : Decode Commands.Command where
   decode := do
@@ -1081,6 +1082,7 @@ instance : Decode Commands.Command where
     | 83 => return .authSoleDnsHintSource (← Decode.decode) (← Decode.decode) (← Decode.decode)
     | 84 => return .authHasDelegations
     | 85 => return .authExpireDns (← Decode.decode)
+    | 86 => return .authChangeScope (← Decode.decode) (← Decode.decode)
     | _ => throw ()
 
 end VerifiedCore

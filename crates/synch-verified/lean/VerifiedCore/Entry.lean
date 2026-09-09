@@ -425,6 +425,7 @@ def dispatch : Command → Native
   | .authSoleDnsHintSource key domain reading => command (Authorization.soleDnsHintSource key domain reading) authorizing
   | .authHasDelegations => command Authorization.hasDelegations authorizing
   | .authExpireDns reading => command (Authorization.expireDns reading) authorizing
+  | .authChangeScope spaces now => command (Replication.ScopeChange.change spaces now) retention
 
   | .planContact peers cursor maximum =>
     if peers.length > UInt64.size || !(peers.all (·.size == 32)) ||
