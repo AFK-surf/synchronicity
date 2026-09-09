@@ -2,6 +2,7 @@ import Synchronicity.PromotionProgress
 import Synchronicity.AcceptanceProgress
 import Synchronicity.ReconciliationFloor
 import Synchronicity.StableAdvertisementProgress
+import Synchronicity.MptsyncConvergence
 
 /-! Connect the version selected by stable advertisement handling to the
 candidate read by a later production promotion.  Selection is observed in the
@@ -10,6 +11,16 @@ pending-slot read in its own transaction. -/
 namespace Synchronicity.StablePromotionTarget
 open VerifiedCore VerifiedCore.Host VerifiedCore.Replication
   SimulatedHost AcceptanceProgress
+open MptsyncConvergence
+
+/-- The public target established by one healthy production promotion. -/
+def targetFor (state : State) (world : TrieDiffCoverage.World)
+    (ready : PromotionProgress.Ready origin now refused state) : ViewTarget :=
+  { head := ready.pending.head
+    snapshot := world.snapshot
+    scope := ready.scope
+    replicas := ready.replicas
+    before := state.db }
 
 /-- If the complete slot is absent, an actual selected version is exactly the
 pending slot.  This is a raw-view consequence, not an assumed promotion target. -/
@@ -56,5 +67,64 @@ theorem ready_uses_delivered_latest
     delivered accepted initialBound
   have pending := pending_of_selected_without_complete complete selected
   exact ready_uses_observed_pending ready accepted.final_stable pending
+
+/-- Actual delivery and acceptance determine the pending candidate; healthy
+production promotion then establishes the aligned scenario view. Completeness
+is still supplied through `Ready` here and is discharged from the actual
+completion walk by the higher acquisition composition. -/
+theorem actual_promotion_reaches
+    (delivered : StableAdvertisementProgress.DeliveredLatest valid origin latestHead heads)
+    (accepted : ObservedAcceptanceFold (Origin.canonical origin) keep initial
+      initialState initialView initialSlots heads final state view)
+    (initialBound : initial ≤ rank latestHead)
+    (complete : view (Origin.canonical origin) .complete = none)
+    (ready : PromotionProgress.Ready origin now refused state)
+    (world : TrieDiffCoverage.World) (services : MaterializedView.Services)
+    (closed : state.pending = none)
+    (faithful : TrieDiffCoverage.Faithful world state)
+    (normalization : state.isNfc = services.nfc)
+    (relational : ∀ relation, relation = Trie.nodeSpace ∨ relation = Trie.valueSpace →
+      state.byteRelations.contains relation = true)
+    (initialViewReady : PromotionInitialView.Initial state.db origin world services)
+    (target : ViewTarget)
+    (targetOrigin : target.head.origin = origin)
+    (targetVersion : (⟨target.head.seq, target.head.root⟩ : HeadVersion) =
+      ⟨latestHead.seq, latestHead.root⟩)
+    (targetSnapshot : target.snapshot = world.snapshot)
+    (targetScope : target.scope = ready.scope)
+    (targetReplicas : target.replicas = ready.replicas)
+    (targetBefore : target.before = state.db) :
+    CorrectView services origin target ready.final.db := by
+  have used := ready_uses_delivered_latest delivered accepted initialBound complete ready
+  have candidateVersion : (⟨ready.pending.head.seq, ready.pending.head.root⟩ : HeadVersion) =
+      ⟨latestHead.seq, latestHead.root⟩ := by
+    have pairs : (ready.pending.head.seq, ready.pending.head.root) =
+        (latestHead.seq, latestHead.root) := by
+      apply Prod.ext
+      · exact used.1
+      · exact used.2
+    exact congrArg (fun pair : UInt64 × ByteArray =>
+      (⟨pair.1, pair.2⟩ : HeadVersion)) pairs
+  obtain ⟨pendingOrigin, _, installed, files, current, forever⟩ :=
+    PromotionProgress.promotes_ready_view ready world services closed faithful normalization
+      relational initialViewReady
+  let actual := targetFor state world ready
+  have actualCorrect : CorrectView services origin actual ready.final.db := by
+    refine ⟨pendingOrigin, installed, ?_, current, forever⟩
+    change SnapshotViewProgress.ExactFiles services world.snapshot ready.pending.head.root
+      (fun key => ready.scope.admitsKeyPath (Trie.keyNibbles key) = true)
+      ready.final.db (Origin.canonical origin)
+    exact files
+  apply correctView_of_same_target (actual := actual) _ actualCorrect
+  exact
+    { origin := by simpa [actual, targetFor] using targetOrigin.trans pendingOrigin.symm
+      version := by
+        change (⟨target.head.seq, target.head.root⟩ : HeadVersion) =
+          ⟨ready.pending.head.seq, ready.pending.head.root⟩
+        exact targetVersion.trans candidateVersion.symm
+      snapshot := by simpa [actual, targetFor] using targetSnapshot
+      scope := by simpa [actual, targetFor] using targetScope
+      replicas := by simpa [actual, targetFor] using targetReplicas
+      before := by simpa [actual, targetFor] using targetBefore }
 
 end Synchronicity.StablePromotionTarget
