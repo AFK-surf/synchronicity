@@ -49,6 +49,18 @@ structure ViewTarget where
 def ViewTarget.allowed (target : ViewTarget) (key : ByteArray) : Prop :=
   target.scope.admitsKeyPath (Trie.keyNibbles key) = true
 
+/-- Two target records describe the same public view even when their signed
+head envelopes differ. Only origin, sequence/root, immutable snapshot, policy
+and the obligation baseline affect `CorrectView`. -/
+structure SameViewTarget (left right : ViewTarget) : Prop where
+  origin : left.head.origin = right.head.origin
+  version : (⟨left.head.seq, left.head.root⟩ : HeadVersion) =
+    ⟨right.head.seq, right.head.root⟩
+  snapshot : left.snapshot = right.snapshot
+  scope : left.scope = right.scope
+  replicas : left.replicas = right.replicas
+  before : left.before = right.before
+
 /-- One device exposes exactly its permitted file list for the selected
 version and keeps the corresponding current/forever acquisition duties.
 Completeness here is metadata completeness, not downloaded file content. -/
@@ -60,6 +72,35 @@ def CorrectView (services : MaterializedView.Services) (origin : Origin.Parsed)
     target.allowed db (Origin.canonical origin) ∧
   MaterializedView.CurrentRequirements target.replicas db ∧
   MaterializedView.ForeverRequirements target.replicas target.before db
+
+theorem correctView_of_same_target (same : SameViewTarget target actual)
+    (correct : CorrectView services origin actual db) :
+    CorrectView services origin target db := by
+  have seq : target.head.seq = actual.head.seq := by
+    simpa using congrArg HeadVersion.seq same.version
+  have root : target.head.root = actual.head.root := by
+    simpa using congrArg HeadVersion.root same.version
+  have installed : AtomicFileView.Installed db target.head := by
+    constructor
+    · simpa only [same.origin] using correct.2.1.1
+    · intro row member named
+      have actualNamed : equals row
+          [("origin_id", .text (Origin.canonical actual.head.origin)),
+            ("slot", .text "complete")] = true := by
+        simpa only [same.origin] using named
+      have points := correct.2.1.2 row member actualNamed
+      simpa only [seq, root] using points
+  refine ⟨by simpa only [same.origin] using correct.1, installed, ?_, ?_, ?_⟩
+  · change SnapshotViewProgress.ExactFiles services target.snapshot target.head.root
+      (fun key => target.scope.admitsKeyPath (Trie.keyNibbles key) = true)
+      db (Origin.canonical origin)
+    have exactFiles := correct.2.2.1
+    change SnapshotViewProgress.ExactFiles services actual.snapshot actual.head.root
+      (fun key => actual.scope.admitsKeyPath (Trie.keyNibbles key) = true)
+      db (Origin.canonical origin) at exactFiles
+    simpa only [same.snapshot, root, same.scope] using exactFiles
+  · simpa only [same.replicas] using correct.2.2.2.1
+  · simpa only [same.replicas, same.before] using correct.2.2.2.2
 
 /-- A settled system target. Every participant selects the same public
 sequence/root version for an origin, while the signed head carrying that
