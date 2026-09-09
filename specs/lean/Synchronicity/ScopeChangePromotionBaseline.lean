@@ -10,6 +10,15 @@ namespace Synchronicity.ScopeChangePromotionBaseline
 open VerifiedCore VerifiedCore.Host VerifiedCore.Replication
   SimulatedHost ScopeChangeRefinement
 
+/-- Device-wide acquisition invariant at a raw database observation. Replica
+targets come from the shared `replicas` table, so this is deliberately not a
+claim about the cleaned origin's view. It is the initial-data obligation that
+unrelated retained rows already have their required hold or durable want. -/
+def GlobalRetentionInvariant (db : Database) : Prop :=
+  ∀ origin scope replicas,
+    MaterializationInputs.ReadPolicy db origin scope replicas →
+      MaterializedView.CurrentRequirements replicas db
+
 /-- Stable metadata and host-service contracts not created by clearing one
 origin's scope-dependent state.  In particular, neither complete-slot nor
 entry absence is assumed here. -/
@@ -21,9 +30,7 @@ structure MetadataContracts (db : Database) (origin : Origin.Parsed)
   policiesAgree : ∀ scope replicas,
     MaterializationInputs.ReadPolicy db origin scope replicas →
       MaterializationRequirementFrame.PoliciesAgree replicas
-  current : ∀ scope replicas,
-    MaterializationInputs.ReadPolicy db origin scope replicas →
-      MaterializedView.CurrentRequirements replicas db
+  globalRetention : GlobalRetentionInvariant db
   unique : ∀ newRoot,
     MaterializedView.UniqueAddresses services
       (SnapshotViewProgress.Relevant world.snapshot Trie.emptyRoot newRoot)
@@ -147,7 +154,7 @@ theorem clean_origin_baseline_of_absence
       noEntries := no_origin_entries entriesAbsent
       emptySnapshot := metadata.emptySnapshot
       policiesAgree := metadata.policiesAgree
-      current := metadata.current
+      current := metadata.globalRetention origin
       unique := metadata.unique
       supported := metadata.supported }
 
@@ -161,7 +168,7 @@ theorem clean_origin_baseline
     PromotionBaseline.CleanOriginBaseline db origin world services := by
   rcases raw with ⟨⟨noComplete, _, noEntries, _, _⟩, _⟩
   refine ⟨metadata.schema, ?_, ?_, metadata.emptySnapshot, metadata.policiesAgree,
-    metadata.current, metadata.unique, metadata.supported⟩
+    metadata.globalRetention origin, metadata.unique, metadata.supported⟩
   · rw [← originAligned]
     exact no_joined_slot_of_raw_empty db decision.complete.origin "complete" noComplete
   · rw [← originAligned]
