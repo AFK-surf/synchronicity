@@ -1,4 +1,4 @@
-import Synchronicity.ScopeChangeRefinement
+import Synchronicity.MptsyncRefusalCache
 
 /-! # M8 — changed permissions invalidate old conclusions and can rebuild
 
@@ -35,8 +35,12 @@ credentials. A stable pending target can recover the credential/readiness
 premise required by the fixed-scope proofs; this is not an eventual Fetch or
 promotion claim. -/
 def ApplicableChangedPermissions (spaces : Option (List String)) (now : Int64)
-    (rawAfter : SimulatedHost.State)
-    (decision : VerifiedCore.Replication.ScopeChange.Demotion) : Prop :=
+    (rawBefore rawAfter : SimulatedHost.State)
+    (report : VerifiedCore.Replication.ScopeChange.ChangeReport)
+    (decision : VerifiedCore.Replication.ScopeChange.Demotion)
+    (cacheBefore cacheAfter : MptsyncRefusalCache.Cache) : Prop :=
+  MptsyncRefusalCache.InvalidatesOldVerdicts spaces now rawBefore rawAfter report
+      cacheBefore cacheAfter ∧
   ∃ source : ScopeChangeRefinement.DecisionSource spaces decision,
     ScopeChangeRefinement.RawInvalidated decision now rawAfter.db ∧
     ∀ generation refusals trace final,
@@ -61,10 +65,14 @@ suspended work cannot authorize the changed scope; the best known signed target
 is retained/requeued, and a stable usable opportunity rebuilds under the now
 current permission. -/
 theorem applicable_changed_permissions
-    (production : ScopeChangeRefinement.Successful spaces now rawBefore rawAfter report)
+    (observed : MptsyncRefusalCache.ScopeResetObservation spaces now
+      rawBefore rawAfter report cacheBefore cacheAfter)
     (quiet : rawBefore.faults = [])
     (reported : decision ∈ report.demotions) :
-    ApplicableChangedPermissions spaces now rawAfter decision := by
+    ApplicableChangedPermissions spaces now rawBefore rawAfter report decision
+      cacheBefore cacheAfter := by
+  refine ⟨MptsyncRefusalCache.scope_reset_invalidates_old_verdicts observed, ?_⟩
+  let production := observed.durable
   obtain ⟨source, rawInvalidated⟩ :=
     ScopeChangeRefinement.successful_change_raw production quiet reported
   refine ⟨source, rawInvalidated, ?_⟩
