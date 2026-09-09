@@ -871,7 +871,11 @@ mod tests {
             "the newer pending head survived the demotion"
         );
         assert_eq!(
-            store.head(&origin(), Slot::Pending).unwrap().unwrap().received_at,
+            store
+                .head(&origin(), Slot::Pending)
+                .unwrap()
+                .unwrap()
+                .received_at,
             at(20),
             "scope-invalidated pending work gets a fresh retry window"
         );
@@ -887,15 +891,16 @@ mod tests {
             .clear_head_at(&origin(), Slot::Pending, 7, &Hash([7u8; 32]))
             .unwrap();
         assert!(store
-            .set_read_scope_at(
-                Some(&["photos".to_string(), "finance".to_string()]),
-                at(30),
-            )
+            .set_read_scope_at(Some(&["photos".to_string(), "finance".to_string()]), at(30),)
             .unwrap());
         assert_eq!(store.complete_head(&origin()).unwrap(), None);
         assert_eq!(store.pending_head(&origin()).unwrap(), Some(later));
         assert_eq!(
-            store.head(&origin(), Slot::Pending).unwrap().unwrap().received_at,
+            store
+                .head(&origin(), Slot::Pending)
+                .unwrap()
+                .unwrap()
+                .received_at,
             at(30),
             "a newly demoted head is not born with its old complete-slot age"
         );

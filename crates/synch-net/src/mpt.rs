@@ -35,8 +35,11 @@ use crate::{
 /// The methods are synchronous and are called from the blocking pool: each one
 /// walks a trie or opens a transaction.
 pub trait HeadSink: Send + Sync + std::fmt::Debug + 'static {
-    /// The head summaries this node advertises in `Hello` (§5.1).
-    fn local_summaries(&self) -> Result<Vec<HeadSummary>, NetError>;
+    /// The head summaries this node advertises to `peer` in `Hello` (§5.1).
+    ///
+    /// The peer identity lets an oversized summary set be paged independently
+    /// per remote rather than phase-locking one global cursor to contact order.
+    fn local_summaries(&self, peer: NodeId) -> Result<Vec<HeadSummary>, NetError>;
 
     /// Records what a peer advertised for this node's own origin (§3.4).
     fn observe_summaries_from(
@@ -215,7 +218,7 @@ impl MptProtocol {
                 let store = self.store().clone();
                 let (ours, scope) = crate::blocking::offload(move || {
                     sink.observe_summaries_from(peer, &heads, now_ns())?;
-                    let summaries = sink.local_summaries()?;
+                    let summaries = sink.local_summaries(peer)?;
                     // What this node will serve that peer, so a delegated one
                     // can learn the scope it is about to walk under (§5.5).
                     // The three-valued shape is the declaration, not a
@@ -810,7 +813,7 @@ mod tests {
     }
 
     impl HeadSink for Picky {
-        fn local_summaries(&self) -> Result<Vec<HeadSummary>, NetError> {
+        fn local_summaries(&self, _peer: NodeId) -> Result<Vec<HeadSummary>, NetError> {
             Ok(Vec::new())
         }
 
@@ -1051,7 +1054,7 @@ mod tests {
     }
 
     impl HeadSink for Counting {
-        fn local_summaries(&self) -> Result<Vec<HeadSummary>, NetError> {
+        fn local_summaries(&self, _peer: NodeId) -> Result<Vec<HeadSummary>, NetError> {
             use std::sync::atomic::Ordering;
             let now = self.now.fetch_add(1, Ordering::SeqCst) + 1;
             self.peak.fetch_max(now, Ordering::SeqCst);
