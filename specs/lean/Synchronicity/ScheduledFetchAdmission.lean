@@ -292,7 +292,8 @@ structure AfterRetryLimitWindow
         (occurrence.inputs.pendingLink.contactRound round)).attempts →
       peerAttempt.peer = occurrence.inputs.peer → peerAttempt.outcome = .success →
       ∃ actualTarget,
-        TargetAligned (occurrence.inputs.pendingTarget item) actualTarget scope owner root ∧
+        TargetAligned (occurrence.inputs.pendingTarget
+          (OriginQueueSource.pendingItem finalOrigin)) actualTarget scope owner root ∧
         ∃ admission : AdmissionFor actualTarget requirements (execution.state turn)
             (execution.state (turn + 1)),
           execution.step turn withinRetry =
