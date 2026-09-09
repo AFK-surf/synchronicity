@@ -62,6 +62,7 @@ import Synchronicity.CasTransferHistories
 import Synchronicity.TrieFetchProofs
 import Synchronicity.TrieFetchCompletion
 import Synchronicity.TrieFetchAdmissionProgress
+import Synchronicity.TrieFetchConvergence
 import Synchronicity.ProgressLiveness
 import Synchronicity.ContactProofs
 import Synchronicity.ContactExecution
