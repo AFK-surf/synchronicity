@@ -15,7 +15,7 @@ def ReferenceEntry (store : RawSnapshot) : Option ByteArray → Path → ByteArr
   | none, _, _ => False
   | some hash, key, bytes => GraphValue store hash key bytes
 
-private theorem read_result (state : State) (space : String) (hash : ByteArray)
+theorem read_result (state : State) (space : String) (hash : ByteArray)
     (value : Option ByteArray) (after : State)
     (ran : execute (Walk.storage (E := Diff.Effects) (.readBytes space hash)) state =
       (.ok value, after)) : readByteObject state space hash = .ok value := by

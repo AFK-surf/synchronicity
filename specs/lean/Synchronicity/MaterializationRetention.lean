@@ -20,6 +20,23 @@ def Required (db : Database) (root : ByteArray) (holder : String) : Prop :=
     cell row "release_after" = .null) ∨
   CasHealingPromises.hasKey (rows db "content_want") (root, holder)
 
+/-- No existing live responsibility is lost, independent of the operation
+or whether it is represented by a hold or an acquisition request. -/
+def Retains (before after : Database) : Prop :=
+  ∀ root holder, Required before root holder → Required after root holder
+
+theorem Retains.refl (db : Database) : Retains db db := fun _ _ h => h
+
+theorem Retains.trans (first : Retains before middle) (second : Retains middle after) : Retains before after :=
+  fun root holder h => second root holder (first root holder h)
+
+theorem rows_retain (pins : ∀ row ∈ rows before "pins", row ∈ rows after "pins")
+    (wants : ∀ row ∈ rows before "content_want", row ∈ rows after "content_want") : Retains before after := by
+  intro root holder requirement
+  rcases requirement with ⟨row, member, key, live⟩ | ⟨row, member, key⟩
+  · exact Or.inl ⟨row, pins row member, key, live⟩
+  · exact Or.inr ⟨row, wants row member, key⟩
+
 /-- Forever retention does not cancel an acquisition or schedule any hold
 for release, even if no file currently refers to the content. -/
 theorem forever_unchanged (tx : Transaction) (target : Materialize.Target)

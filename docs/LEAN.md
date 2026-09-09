@@ -191,15 +191,15 @@ For M4, [PromotionPublication](../specs/lean/Synchronicity/PromotionPublication.
 connects promotion to its checks, materialization and whole staged commit.
 Body prefixes and failed invocations preserve committed rows;
 successful refusal may retire pending work.
-[Diff semantics](../specs/lean/Synchronicity/TrieDiffSemantics.lean) prove exact
-payload comparison and position changes under explicit hash contracts.
-[Cursor semantics](../specs/lean/Synchronicity/TrieCursorSemantics.lean) connect
-actual reads to snapshot entries and justify shared-child pruning/enumeration.
-[Retention](../specs/lean/Synchronicity/MaterializationRetention.lean) protects
-referenced/forever-held content and establishes acquisition requests.
-M4 remains open: stream coverage, exact views, retention refinement and goal-level
-composition are unproved. Neither walk exhaustion
-nor successful materialization defines an exact view.
+[Diff soundness](../specs/lean/Synchronicity/TrieDiffSoundness.lean) and coverage
+prove that the successful structural stream contains exactly the permitted
+changed keys under finite-image hash contracts and faithful reads.
+[Exact file views](../specs/lean/Synchronicity/MaterializationExactFiles.lean)
+prove SQL replaces the exact old list with the new permitted list under fixed
+scope/normalization and canonical bounded keys.
+[Whole-stream retention](../specs/lean/Synchronicity/MaterializationWholeRetention.lean)
+preserves current and forever obligations under consistent replica policies.
+M4 still needs publication composition; success is not readiness.
 
 Content histories require faithful metadata storage and a Bao decoder preserving
 previously verified bytes even after a partial write fails. Fresh-store/inline
