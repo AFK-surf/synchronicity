@@ -19,9 +19,7 @@ inductive WalkOpportunity [Interpreter E]
     (body : Work V H → Program E (Except Missing.Error (Work V H ⊕ BatchResult V H))) :
     Nat → Program E (Except Missing.Error (Work V H ⊕ BatchResult V H)) →
       SimulatedHost.State → Frontier V H → Batch → SimulatedHost.State → Prop where
-  | stopped (state : SimulatedHost.State) (frontier : Frontier V H) (batch : Batch)
-      (positions : frontier.positions = []) (deferred : frontier.deferred = [])
-      (healthy : frontier.fault = none) :
+  | stopped (state : SimulatedHost.State) (frontier : Frontier V H) (batch : Batch) :
       WalkOpportunity body 1 (.pure (.ok (.inr (frontier, .ok batch))))
         state frontier batch state
   | continued (next : Work V H) (state : SimulatedHost.State)
@@ -44,7 +42,7 @@ theorem WalkOpportunity.execute {body : Work V H →
     execute (Program.iterate body Missing.Error.exhausted fuel program) state =
       (.ok (frontier, .ok batch), final) := by
   induction plan generalizing fuel with
-  | stopped state frontier batch positions deferred healthy =>
+  | stopped state frontier batch =>
     cases fuel with
     | zero => omega
     | succ fuel => rfl
@@ -60,17 +58,6 @@ theorem WalkOpportunity.execute {body : Work V H →
     | succ fuel =>
       rw [SimulatedHost.execute_iterate_request, handled]
       exact ih (Nat.le_of_succ_le_succ fits)
-
-theorem WalkOpportunity.exhausted {body : Work V H →
-    Program E (Except Missing.Error (Work V H ⊕ BatchResult V H))}
-    [Interpreter E]
-    (plan : WalkOpportunity body steps program state frontier batch final) :
-    frontier.isExhausted = true := by
-  induction plan with
-  | stopped state frontier batch positions deferred healthy =>
-    simp [Frontier.isExhausted, positions, deferred, healthy]
-  | continued next state plan ih => exact ih
-  | requested effect resume state after reply handled plan ih => exact ih
 
 abbrev MissingWalkOpportunity [WorkSet Visit V] [WorkSet ByteArray H]
     (context : Context) (root : ByteArray) (steps : Nat)
@@ -113,64 +100,6 @@ theorem inspectRoot_exec_of_opportunity [WorkSet Visit V] [WorkSet ByteArray H]
           | left storageEffect => rfl
           | right other => cases other <;> rfl) _ _
     _ = (.ok (frontier, .ok batch), final) := missingRun
-
-/-- Concrete successful replies for the administrative phases surrounding a
-fresh walk.  The certificate exposes the digest/memo replies and the finite
-primitive walk opportunity; it does not assume the result of `isComplete`. -/
-structure FreshOpportunity [WorkSet Visit V] [WorkSet ByteArray H]
-    (context : Context) (root : ByteArray) (state : SimulatedHost.State) where
-  quiet : state.faults = []
-  key : ByteArray
-  keyed : SimulatedHost.State
-  checked : SimulatedHost.State
-  generation : UInt64
-  started : SimulatedHost.State
-  walked : SimulatedHost.State
-  final : SimulatedHost.State
-  steps : Nat
-  frontier : Frontier V H
-  batch : Batch
-  keyRun : execute (Memo.keyFor (E := Complete.Effects) Missing.Error.host
-    context.scope root context.owner) state = (.ok key, keyed)
-  unknownRun : execute (Complete.memo (.isKnown key)) keyed = (.ok false, checked)
-  generationRun : execute (Complete.memo .generation) checked = (.ok generation, started)
-  walk : MissingWalkOpportunity context root steps started frontier batch walked
-  withinFuel : steps ≤ batchFuel
-  certifyRun : execute (Complete.memo (.certify key generation)) walked = (.ok true, final)
-
-/-- Finite actual host opportunity implies the positive production result.
-No premise is an `isComplete` result or a renamed productivity assertion. -/
-theorem isComplete_exec_of_fresh_opportunity [WorkSet Visit V] [WorkSet ByteArray H]
-    (context : Context) (root : ByteArray) (state : SimulatedHost.State)
-    (ready : FreshOpportunity (V := V) (H := H) context root state) :
-    execute (Complete.isComplete V H context root) state = (.ok true, ready.final) := by
-  have walkRun := inspectRoot_exec_of_opportunity context root ready.steps
-    ready.started ready.walked ready.frontier ready.batch ready.walk ready.withinFuel
-  have exhausted := ready.walk.exhausted
-  have rechecked := TrieCompleteProofs.recheck_after_walk context root ready.key
-    ready.checked ready.started ready.walked ready.generation ready.frontier ready.batch
-    ready.generationRun walkRun
-  rw [exhausted, ready.certifyRun] at rechecked
-  unfold Complete.isComplete
-  simp only [bind, ExceptT.bind, ExceptT.bindCont, ExceptT.mk, execute_bind]
-  rw [ready.keyRun]
-  simp only
-  rw [execute_bind, ready.unknownRun]
-  exact rechecked
-
-/-- The finite semantic measure and the finite actual host opportunity meet at
-the production API: all requirements are semantically present and the real
-fresh check returns true. -/
-theorem finite_complete_executes [WorkSet Visit V] [WorkSet ByteArray H]
-    (publisher : TrieProgramProofs.RawSnapshot) (context : Context)
-    (root : ByteArray) (state : SimulatedHost.State)
-    (requirements : FiniteRequirements publisher context.scope context.owner root)
-    (complete : missingEvidence requirements.items (replicaOfState state) = 0)
-    (ready : FreshOpportunity (V := V) (H := H) context root state) :
-    PermittedComplete publisher context.scope context.owner root (replicaOfState state) ∧
-      execute (Complete.isComplete V H context root) state = (.ok true, ready.final) :=
-  ⟨(TrieFetchCompletion.finite_measure_eq_zero_iff_complete requirements).mp complete,
-    isComplete_exec_of_fresh_opportunity context root state ready⟩
 
 private theorem mapEffects_iterate
     {E F : Type → Type}
@@ -285,6 +214,223 @@ theorem promotion_inspectRoot_exec_of_opportunity
   rw [lifted]
   exact ran
 
+/-- Every local obligation represented by a production position is also an
+obligation of the selected root.  This is the forward structural invariant
+needed by the positive walk; unlike frontier accounting it rules out a
+spurious missing request once the root is semantically complete. -/
+def PositionInherited (publisher : TrieProgramProofs.RawSnapshot)
+    (context : Context) (root : ByteArray) (position : Position) : Prop :=
+  ∀ evidence, TrieMissingCompletion.PositionRequires publisher context position evidence →
+    Needs publisher context.scope context.owner root [] evidence
+
+def FrontierInherited (publisher : TrieProgramProofs.RawSnapshot)
+    (context : Context) (root : ByteArray) (frontier : Frontier V H) : Prop :=
+  (∀ position ∈ frontier.positions, PositionInherited publisher context root position) ∧
+    ∀ position ∈ frontier.deferred, PositionInherited publisher context root position
+
+/-- Operational state maintained while semantic completion rules out every
+missing-node/value branch.  Empty batch/deferred fields are consequences to
+preserve, not a terminal result supplied by an opportunity. -/
+def CompleteWork (publisher : TrieProgramProofs.RawSnapshot)
+    (context : Context) (root : ByteArray) (work : Work V H) : Prop :=
+  work.frontier.fault = none ∧ work.frontier.deferred = [] ∧
+    work.batch = {} ∧ FrontierInherited publisher context root work.frontier
+
+theorem initial_completeWork [WorkSet Visit V] [WorkSet ByteArray H]
+    (publisher : TrieProgramProofs.RawSnapshot) (context : Context) (root : ByteArray)
+    (rooted : rootOf root = some root) (admitted : context.scope.admitsPath [] = true) :
+    CompleteWork publisher context root
+      ⟨initial (V := V) (H := H) context none root, {}, WorkSet.empty ByteArray⟩ := by
+  refine ⟨rfl, rfl, rfl, ?_⟩
+  constructor
+  · intro position member evidence required
+    simp only [initial, rooted, admitted, ↓reduceIte, List.mem_cons,
+      List.not_mem_nil, or_false] at member
+    subst position
+    simpa [TrieMissingCompletion.PositionRequires] using required
+  · intro position member
+    simp [initial] at member
+
+/-- Healthy transaction-lifted raw reads for one fully present position.
+The contract is deliberately local: it says neither that the whole walk
+terminates nor that its final frontier is exhausted.  Its returned shape is
+the production `inspect`/`commit` step, and it is available only after the
+semantic proof establishes that the inspected position is settled. -/
+structure PromotionReadOpportunity (publisher : TrieProgramProofs.RawSnapshot)
+    (tx : Transaction) (context : Context) (root : ByteArray) : Prop where
+  inspect : ∀ (state : SimulatedHost.State)
+      (work : Work (Std.HashSet Visit) (Std.HashSet ByteArray))
+      (position : Position) (rest : List Position),
+    work.frontier.positions = position :: rest →
+    position.finish = false →
+    CompleteWork publisher context root work →
+    TrieMissingCompletion.PositionSettled publisher context
+      (replicaOfState state) position →
+    ∃ checked after,
+      execute ((Missing.inspect context work.frontier position).run.mapEffects
+        (promoteMissing tx)) state = (.ok checked, after) ∧
+      replicaOfState after = replicaOfState state ∧
+      ((checked = .skip ∧
+          CompleteWork publisher context root (commit context work position rest checked)) ∨
+        ∃ children pending routing,
+          checked = .expand children pending [] routing ∧
+          CompleteWork publisher context root (commit context work position rest checked))
+
+private theorem promotion_batchStep_complete
+    (publisher : TrieProgramProofs.RawSnapshot) (tx : Transaction)
+    (context : Context) (root : ByteArray)
+    (reads : PromotionReadOpportunity publisher tx context root)
+    {state final : SimulatedHost.State}
+    {work : Work (Std.HashSet Visit) (Std.HashSet ByteArray)}
+    {result : Work (Std.HashSet Visit) (Std.HashSet ByteArray) ⊕
+      BatchResult (Std.HashSet Visit) (Std.HashSet ByteArray)}
+    (complete : PermittedComplete publisher context.scope context.owner root
+      (replicaOfState state))
+    (good : CompleteWork publisher context root work)
+    (ran : execute ((batchStep context 1 work).run.mapEffects (promoteMissing tx)) state =
+      (.ok result, final)) :
+    match result with
+    | .inl next => CompleteWork publisher context root next ∧
+        PermittedComplete publisher context.scope context.owner root
+          (replicaOfState final)
+    | .inr (frontier, .ok _batch) => frontier.isExhausted = true
+    | .inr (_, .error _) => False := by
+  unfold batchStep at ran
+  simp only [good.1] at ran
+  cases pending : work.frontier.positions with
+  | nil =>
+    simp only [pending, pure, ExceptT.pure, ExceptT.mk, ExceptT.run,
+      Program.mapEffects, execute, Except.ok.injEq, Prod.mk.injEq] at ran
+    rcases ran with ⟨rfl, rfl⟩
+    simp [finished, Frontier.isExhausted, pending, good.2.1, good.1]
+  | cons position rest =>
+    simp only [pending] at ran
+    cases finish : position.finish with
+    | true =>
+      simp only [finish, ↓reduceIte, pure, ExceptT.pure, ExceptT.mk,
+        ExceptT.run, Program.mapEffects, execute, Except.ok.injEq,
+        Prod.mk.injEq] at ran
+      rcases ran with ⟨rfl, rfl⟩
+      refine ⟨?_, complete⟩
+      unfold CompleteWork at good ⊢
+      rw [settle, good.2.1]
+      simp only [List.isEmpty_nil, ↓reduceIte]
+      refine ⟨good.1, good.2.1, good.2.2.1, ?_⟩
+      constructor
+      · exact fun probe member => good.2.2.2.1 probe (by
+          rw [pending]
+          exact List.mem_cons_of_mem _ member)
+      · exact good.2.2.2.2
+    | false =>
+      have noBatch : (work.batch.size ≥ 1) = false := by
+        rw [good.2.2.1]
+        decide
+      simp only [finish, Bool.false_eq_true, noBatch, ↓reduceIte] at ran
+      have inherited := good.2.2.2.1 position (by rw [pending]; simp)
+      have settled : TrieMissingCompletion.PositionSettled publisher context
+          (replicaOfState state) position := fun evidence required =>
+        complete evidence (inherited evidence required)
+      obtain ⟨checked, after, inspected, replicaEq, shape⟩ :=
+        reads.inspect state work position rest pending finish good settled
+      simp only [ExceptT.run] at inspected
+      simp only [ExceptT.mk, ExceptT.run, bind] at ran
+      rw [mapEffects_bind, SimulatedHost.execute_bind, inspected] at ran
+      have completeAfter : PermittedComplete publisher context.scope context.owner root
+          (replicaOfState after) := by simpa [replicaEq] using complete
+      cases ran
+      rcases shape with ⟨rfl, kept⟩ | ⟨children, pendingBranch, routing, rfl, kept⟩
+      · exact ⟨kept, completeAfter⟩
+      · exact ⟨kept, completeAfter⟩
+
+private theorem iterate_complete [Interpreter E]
+    (body : S → Program E (Except ε (S ⊕ R))) (exhausted : ε)
+    (P : SimulatedHost.State → S → Prop)
+    (Q : SimulatedHost.State → R → Prop)
+    (kept : ∀ state start next final, P state start →
+      execute (body start) state = (.ok (.inl next), final) → P final next)
+    (stopped : ∀ state start answer final, P state start →
+      execute (body start) state = (.ok (.inr answer), final) → Q final answer)
+    (fuel : Nat) : ∀ (program : Program E (Except ε (S ⊕ R))) state,
+    (∀ next final, execute program state = (.ok (.inl next), final) → P final next) →
+    (∀ answer final, execute program state = (.ok (.inr answer), final) → Q final answer) →
+    ∀ answer final,
+      execute (Program.iterate body exhausted fuel program) state = (.ok answer, final) →
+      Q final answer := by
+  induction fuel with
+  | zero => intro program state _ _ answer final ran; cases ran
+  | succ fuel ih =>
+    intro program state keeps stops answer final ran
+    match program with
+    | .pure (.error error) => cases ran
+    | .pure (.ok (.inr result)) => cases ran; exact stops _ state rfl
+    | .pure (.ok (.inl next)) =>
+      exact ih (body next) state
+        (fun next' final => kept state next next' final (keeps next state rfl))
+        (fun result final => stopped state next result final (keeps next state rfl))
+        answer final ran
+    | .request effect resume =>
+      rw [execute_iterate_request] at ran
+      cases effectState : Interpreter.handle effect state with
+      | mk reply after =>
+        simp only [execute, effectState] at keeps stops
+        simp only [effectState] at ran
+        exact ih (resume reply) after keeps stops answer final ran
+
+/-- Semantic completion turns a finite sequence of primitive production read
+replies into an exhausted frontier.  Exhaustion is proved here; it is not a
+field of the opportunity. -/
+theorem promotion_walk_exhausted_of_complete
+    (publisher : TrieProgramProofs.RawSnapshot) (tx : Transaction)
+    (context : Context) (root : ByteArray) (steps : Nat)
+    (state final : SimulatedHost.State)
+    (frontier : Frontier (Std.HashSet Visit) (Std.HashSet ByteArray))
+    (batch : Batch)
+    (rooted : rootOf root = some root)
+    (admitted : context.scope.admitsPath [] = true)
+    (reads : PromotionReadOpportunity publisher tx context root)
+    (complete : PermittedComplete publisher context.scope context.owner root
+      (replicaOfState state))
+    (plan : PromotionWalkOpportunity tx context root steps state frontier batch final)
+    (fits : steps ≤ batchFuel) :
+    frontier.isExhausted = true := by
+  let initialWork : Work (Std.HashSet Visit) (Std.HashSet ByteArray) :=
+    ⟨initial context none root, {}, WorkSet.empty ByteArray⟩
+  let P : SimulatedHost.State → Work (Std.HashSet Visit) (Std.HashSet ByteArray) → Prop :=
+    fun observed work => CompleteWork publisher context root work ∧
+      PermittedComplete publisher context.scope context.owner root
+        (replicaOfState observed)
+  let Q : SimulatedHost.State →
+      BatchResult (Std.HashSet Visit) (Std.HashSet ByteArray) → Prop :=
+    fun _ answer => match answer with
+      | (frontier, .ok _) => frontier.isExhausted = true
+      | (_, .error _) => False
+  have initialHeld : P state initialWork :=
+    ⟨initial_completeWork publisher context root rooted admitted, complete⟩
+  have keeps : ∀ observed work next after, P observed work →
+      execute ((batchStep context 1 work).run.mapEffects (promoteMissing tx)) observed =
+        (.ok (.inl next), after) → P after next := by
+    intro observed work next after held ran
+    exact promotion_batchStep_complete publisher tx context root reads held.2 held.1 ran
+  have stops : ∀ observed work answer after, P observed work →
+      execute ((batchStep context 1 work).run.mapEffects (promoteMissing tx)) observed =
+        (.ok (.inr answer), after) → Q after answer := by
+    intro observed work answer after held ran
+    rcases answer with ⟨answerFrontier, answerBatch⟩
+    cases answerBatch with
+    | error error =>
+        exact promotion_batchStep_complete publisher tx context root reads held.2 held.1 ran
+    | ok answerBatch =>
+        exact promotion_batchStep_complete publisher tx context root reads held.2 held.1 ran
+  unfold PromotionWalkOpportunity at plan
+  have ran := plan.execute fits
+  exact iterate_complete
+    (fun work => (batchStep context 1 work).run.mapEffects (promoteMissing tx))
+    Missing.Error.exhausted P Q keeps stops
+    batchFuel _ state
+    (fun next after ran => keeps state initialWork next after initialHeld ran)
+    (fun answer after ran => stops state initialWork answer after initialHeld ran)
+    (frontier, .ok batch) final ran
+
 /-- Transaction-lifted counterpart of `FreshOpportunity`, matching the exact
 effect map in `PromotionReads.complete`.  Every field is a primitive phase or
 finite walk reply, never the result of the enclosing completeness call. -/
@@ -302,6 +448,9 @@ structure PromotionFreshOpportunity
   steps : Nat
   frontier : Frontier (Std.HashSet Visit) (Std.HashSet ByteArray)
   batch : Batch
+  rooted : rootOf root = some root
+  admitted : context.scope.admitsPath [] = true
+  startedReplica : replicaOfState started = replicaOfState state
   keyRun : execute ((Memo.keyFor (E := Complete.Effects) Missing.Error.host
     context.scope root context.owner).run.mapEffects
       (Replication.Promote.inTransaction tx)) state = (.ok key, keyed)
@@ -315,15 +464,24 @@ structure PromotionFreshOpportunity
     (Replication.Promote.inTransaction tx)) walked = (.ok true, final)
 
 theorem promotion_isComplete_mapped_exec
+    (publisher : TrieProgramProofs.RawSnapshot)
     (tx : Transaction) (context : Context) (root : ByteArray)
     (state : SimulatedHost.State)
+    (reads : PromotionReadOpportunity publisher tx context root)
+    (complete : PermittedComplete publisher context.scope context.owner root
+      (replicaOfState state))
     (ready : PromotionFreshOpportunity tx context root state) :
     execute ((Complete.isComplete (Std.HashSet Visit) (Std.HashSet ByteArray)
       context root).run.mapEffects (Replication.Promote.inTransaction tx)) state =
         (.ok true, ready.final) := by
   have walkRun := promotion_inspectRoot_exec_of_opportunity tx context root ready.steps
     ready.started ready.walked ready.frontier ready.batch ready.walk ready.withinFuel
-  have exhausted := ready.walk.exhausted
+  have completeStarted : PermittedComplete publisher context.scope context.owner root
+      (replicaOfState ready.started) := by
+    simpa only [ready.startedReplica] using complete
+  have exhausted := promotion_walk_exhausted_of_complete publisher tx context root
+    ready.steps ready.started ready.walked ready.frontier ready.batch ready.rooted
+      ready.admitted reads completeStarted ready.walk ready.withinFuel
   let afterWalk : Frontier (Std.HashSet Visit) (Std.HashSet ByteArray) ×
       Except Missing.Error Batch → Complete.Action Bool := fun answer =>
     match answer.2 with
@@ -382,11 +540,16 @@ theorem promotion_isComplete_mapped_exec
 `completeExecution` field, constructed from primitive transaction-lifted host
 replies and finite walk fuel. -/
 theorem promotion_complete_exec_of_opportunity
+    (publisher : TrieProgramProofs.RawSnapshot)
     (tx : Transaction) (context : Context) (root : ByteArray)
     (state : SimulatedHost.State)
+    (reads : PromotionReadOpportunity publisher tx context root)
+    (complete : PermittedComplete publisher context.scope context.owner root
+      (replicaOfState state))
     (ready : PromotionFreshOpportunity tx context root state) :
     execute (PromotionReads.complete tx context root) state = (.ok true, ready.final) := by
-  have completed := promotion_isComplete_mapped_exec tx context root state ready
+  have completed := promotion_isComplete_mapped_exec publisher tx context root state
+    reads complete ready
   unfold PromotionReads.complete
   change execute (Program.bind
     ((Complete.isComplete (Std.HashSet Visit) (Std.HashSet ByteArray)
@@ -396,9 +559,15 @@ theorem promotion_complete_exec_of_opportunity
   rfl
 
 theorem bodyReady_completeExecution_of_opportunity
+    (publisher : TrieProgramProofs.RawSnapshot)
     (tx : Transaction) (scope : Serve.Scope)
     (authority : Authorization.OriginAuthority)
     (pending : Replication.Promote.Pending) (state : SimulatedHost.State)
+    (reads : PromotionReadOpportunity publisher tx
+      ⟨scope, authority.provenance.map Origin.canonical⟩ pending.head.root)
+    (complete : PermittedComplete publisher scope
+      (authority.provenance.map Origin.canonical) pending.head.root
+      (replicaOfState state))
     (ready : PromotionFreshOpportunity tx
       ⟨scope, authority.provenance.map Origin.canonical⟩
       pending.head.root state) :
@@ -407,8 +576,9 @@ theorem bodyReady_completeExecution_of_opportunity
       pending.head.root).run.mapEffects (Replication.Promote.inTransaction tx)
       |> fun program => Except.mapError Replication.Promote.missingError <$> program)) state =
         (.ok true, ready.final) := by
-  have completed := promotion_isComplete_mapped_exec tx
-    ⟨scope, authority.provenance.map Origin.canonical⟩ pending.head.root state ready
+  have completed := promotion_isComplete_mapped_exec publisher tx
+    ⟨scope, authority.provenance.map Origin.canonical⟩ pending.head.root state
+      reads complete ready
   change execute (Program.bind
     ((Complete.isComplete (Std.HashSet Visit) (Std.HashSet ByteArray)
       ⟨scope, authority.provenance.map Origin.canonical⟩
@@ -427,6 +597,8 @@ theorem finite_promotion_complete_execution
     (requirements : FiniteRequirements publisher scope
       (authority.provenance.map Origin.canonical) pending.head.root)
     (complete : missingEvidence requirements.items (replicaOfState state) = 0)
+    (reads : PromotionReadOpportunity publisher tx
+      ⟨scope, authority.provenance.map Origin.canonical⟩ pending.head.root)
     (ready : PromotionFreshOpportunity tx
       ⟨scope, authority.provenance.map Origin.canonical⟩
       pending.head.root state) :
@@ -439,12 +611,14 @@ theorem finite_promotion_complete_execution
         |> fun program => Except.mapError Replication.Promote.missingError <$> program)) state =
           (.ok true, ready.final) :=
   ⟨(TrieFetchCompletion.finite_measure_eq_zero_iff_complete requirements).mp complete,
-    bodyReady_completeExecution_of_opportunity tx scope authority pending state ready⟩
+    bodyReady_completeExecution_of_opportunity publisher tx scope authority pending state
+      reads ((TrieFetchCompletion.finite_measure_eq_zero_iff_complete requirements).mp complete)
+      ready⟩
 
 /-- All independent positive promotion phases, replacing only the old opaque
 `BodyReady.completeExecution` field with primitive memo replies and a finite
 transaction-lifted trie walk. -/
-structure ReadyOpportunity (origin : Origin.Parsed) (now : Int64)
+structure PromotionOpportunity (origin : Origin.Parsed) (now : Int64)
     (refused : List (UInt64 × ByteArray × ByteArray)) (state : SimulatedHost.State) where
   tx : Transaction
   opened : SimulatedHost.State
@@ -485,8 +659,15 @@ structure ReadyOpportunity (origin : Origin.Parsed) (now : Int64)
   final : SimulatedHost.State
   committed : execute (Replication.Promote.raw (.commit tx)) staged = (.ok (), final)
 
-def ReadyOpportunity.bodyReady
-    (ready : ReadyOpportunity origin now refused state) :
+def PromotionOpportunity.bodyReady
+    (ready : PromotionOpportunity origin now refused state)
+    (publisher : TrieProgramProofs.RawSnapshot)
+    (reads : PromotionReadOpportunity publisher ready.tx
+      ⟨ready.scope, ready.authority.provenance.map Origin.canonical⟩
+      ready.pending.head.root)
+    (complete : PermittedComplete publisher ready.scope
+      (ready.authority.provenance.map Origin.canonical) ready.pending.head.root
+      (replicaOfState ready.prepared)) :
     PromotionProgress.BodyReady ready.tx origin now ready.pending ready.old
       ready.scope ready.authority ready.prepared where
   newer := ready.newer
@@ -496,8 +677,8 @@ def ReadyOpportunity.bodyReady
   cleared := ready.cleared
   staged := ready.staged
   count := ready.count
-  completeExecution := bodyReady_completeExecution_of_opportunity ready.tx ready.scope
-    ready.authority ready.pending ready.prepared ready.completion
+  completeExecution := bodyReady_completeExecution_of_opportunity publisher ready.tx ready.scope
+    ready.authority ready.pending ready.prepared reads complete ready.completion
   permittedExecution := ready.permittedExecution
   writeExecution := ready.writeExecution
   clearExecution := ready.clearExecution
@@ -507,7 +688,14 @@ def ReadyOpportunity.bodyReady
 completeness host opportunity, publication/materialization phases and commit
 produce the existing positive `PromotionProgress.Ready` witness. -/
 def ready_of_opportunity
-    (ready : ReadyOpportunity origin now refused state) :
+    (ready : PromotionOpportunity origin now refused state)
+    (publisher : TrieProgramProofs.RawSnapshot)
+    (reads : PromotionReadOpportunity publisher ready.tx
+      ⟨ready.scope, ready.authority.provenance.map Origin.canonical⟩
+      ready.pending.head.root)
+    (complete : PermittedComplete publisher ready.scope
+      (ready.authority.provenance.map Origin.canonical) ready.pending.head.root
+      (replicaOfState ready.prepared)) :
     PromotionProgress.Ready origin now refused state where
   tx := ready.tx
   opened := ready.opened
@@ -522,22 +710,46 @@ def ready_of_opportunity
   policy := ready.policy
   policyUnique := ready.policyUnique
   notRefused := ready.notRefused
-  body := ready.bodyReady
+  body := ready.bodyReady publisher reads complete
   final := ready.final
   committed := ready.committed
+
+/-- A historical promotion opportunity paired with the semantic completion
+and local read contract that make its production completion phase positive.
+Keeping these witnesses beside the raw opportunity prevents historical view
+proofs from rebuilding `Ready` from host replies alone. -/
+structure CompletedPromotionOpportunity (origin : Origin.Parsed) (now : Int64)
+    (refused : List (UInt64 × ByteArray × ByteArray))
+    (state : SimulatedHost.State) where
+  raw : PromotionOpportunity origin now refused state
+  publisher : TrieProgramProofs.RawSnapshot
+  reads : PromotionReadOpportunity publisher raw.tx
+    ⟨raw.scope, raw.authority.provenance.map Origin.canonical⟩ raw.pending.head.root
+  complete : PermittedComplete publisher raw.scope
+    (raw.authority.provenance.map Origin.canonical) raw.pending.head.root
+    (replicaOfState raw.prepared)
+
+def CompletedPromotionOpportunity.ready
+    (opportunity : CompletedPromotionOpportunity origin now refused state) :
+    PromotionProgress.Ready origin now refused state :=
+  ready_of_opportunity opportunity.raw opportunity.publisher opportunity.reads
+    opportunity.complete
 
 /-- Fetch convergence and the later promotion attempt are joined by durable
 evidence inclusion.  Semantic completion at an earlier committed observation
 therefore supplies the zero deficit used to build the exact production
 completeness execution inside `PromotionProgress.Ready`. -/
 def ready_of_semantic_completion
-    (ready : ReadyOpportunity origin now refused state)
+    (ready : PromotionOpportunity origin now refused state)
     (publisher : TrieProgramProofs.RawSnapshot)
     (requirements : FiniteRequirements publisher ready.scope
       (ready.authority.provenance.map Origin.canonical) ready.pending.head.root)
     (complete : PermittedComplete publisher ready.scope
       (ready.authority.provenance.map Origin.canonical) ready.pending.head.root before)
-    (carried : EvidenceIncluded before (replicaOfState ready.prepared)) :
+    (carried : EvidenceIncluded before (replicaOfState ready.prepared))
+    (reads : PromotionReadOpportunity publisher ready.tx
+      ⟨ready.scope, ready.authority.provenance.map Origin.canonical⟩
+      ready.pending.head.root) :
     PromotionProgress.Ready origin now refused state := by
   have preparedComplete : PermittedComplete publisher ready.scope
       (ready.authority.provenance.map Origin.canonical) ready.pending.head.root
@@ -546,7 +758,7 @@ def ready_of_semantic_completion
   have zero : missingEvidence requirements.items (replicaOfState ready.prepared) = 0 :=
     (TrieFetchCompletion.finite_measure_eq_zero_iff_complete requirements).mpr preparedComplete
   have completed := (finite_promotion_complete_execution publisher ready.tx ready.scope
-    ready.authority ready.pending ready.prepared requirements zero ready.completion).2
+    ready.authority ready.pending ready.prepared requirements zero reads ready.completion).2
   let body : PromotionProgress.BodyReady ready.tx origin now ready.pending ready.old
       ready.scope ready.authority ready.prepared :=
     { newer := ready.newer

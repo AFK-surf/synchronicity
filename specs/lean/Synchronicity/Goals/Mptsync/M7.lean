@@ -39,15 +39,17 @@ theorem actual_retries_accumulate_and_reuse
     (completeOpportunity : ∀ now,
       PermittedComplete publisher scope owner root
         (replicaOfState (execution.state now)) →
-      ∃ tx, Nonempty
-        (PromotionFreshOpportunity tx ⟨scope, owner⟩ root (execution.state now))) :
+      ∃ tx, PromotionReadOpportunity publisher tx ⟨scope, owner⟩ root ∧
+        Nonempty (PromotionFreshOpportunity tx ⟨scope, owner⟩ root
+          (execution.state now))) :
     EventuallyReusesCommittedEvidence requirements execution := by
   intro start
   obtain ⟨finish, after, complete⟩ := sufficient_responses_converge requirements
     execution.state execution.persistentEvidence responses start
-  obtain ⟨tx, ⟨ready⟩⟩ := completeOpportunity finish (complete finish (Nat.le_refl _))
+  obtain ⟨tx, reads, ⟨ready⟩⟩ :=
+    completeOpportunity finish (complete finish (Nat.le_refl _))
   exact ⟨finish, after, complete finish (Nat.le_refl _), tx, ready.final,
-    promotion_complete_exec_of_opportunity tx ⟨scope, owner⟩ root
-      (execution.state finish) ready⟩
+    promotion_complete_exec_of_opportunity publisher tx ⟨scope, owner⟩ root
+      (execution.state finish) reads (complete finish (Nat.le_refl _)) ready⟩
 
 end Synchronicity.Goals.Mptsync.M7

@@ -128,6 +128,25 @@ theorem cancellation_preserves_evidence
   rw [cancellation_preserves_replica request]
   exact EvidenceIncluded.refl _
 
+/-- The committed portion of a resumed or restarted requester prefix.  Each
+nontrivial frame is an actual authorized `Fetch.admit` execution, rather than
+an assumed evidence-inclusion edge.  Read/wait-only suffixes are represented
+by ending the checkpoint at the last committed frame. -/
+inductive CommittedFrames
+    (requirements : FiniteRequirements publisher scope owner root) :
+    SimulatedHost.State → SimulatedHost.State → Prop where
+  | same (state : SimulatedHost.State) : CommittedFrames requirements state state
+  | admitted (admission : Admission requirements before middle)
+      (rest : CommittedFrames requirements middle after) :
+      CommittedFrames requirements before after
+
+theorem CommittedFrames.persistent
+    (frames : CommittedFrames requirements before after) :
+    EvidenceIncluded (replicaOfState before) (replicaOfState after) := by
+  induction frames with
+  | same => exact EvidenceIncluded.refl _
+  | admitted admission rest ih => exact admission.included.trans ih
+
 /-- Checkpoints include only committed authorized admissions or cancellation
 cleanup at an actual production peer wait. Resumption/restart evidence is
 carried by the cancellation constructor, while checkpoints deliberately omit
@@ -139,20 +158,24 @@ inductive RetryCheckpoint
       RetryCheckpoint requirements before after
   | resumedCancellation
       (request : CancelledRequest target reference maximum retryLimit initial before)
-      (resumed : ResumedContinuation request) :
-      RetryCheckpoint requirements before request.cancelled
+      (resumed : ResumedContinuation request)
+      (committed : CommittedFrames requirements request.cancelled resumed.final) :
+      RetryCheckpoint requirements before resumed.final
   | restartedCancellation
       (request : CancelledRequest target reference maximum retryLimit initial before)
-      (restarted : RestartedRequest request) :
-      RetryCheckpoint requirements before request.cancelled
+      (restarted : RestartedRequest request)
+      (committed : CommittedFrames requirements request.cancelled restarted.final) :
+      RetryCheckpoint requirements before restarted.final
 
 theorem RetryCheckpoint.persistent
     (step : RetryCheckpoint requirements before after) :
     EvidenceIncluded (replicaOfState before) (replicaOfState after) := by
   cases step with
   | admitted admission => exact admission.included
-  | resumedCancellation request resumed => exact cancellation_preserves_evidence request
-  | restartedCancellation request restarted => exact cancellation_preserves_evidence request
+  | resumedCancellation request resumed committed =>
+      exact (cancellation_preserves_evidence request).trans committed.persistent
+  | restartedCancellation request restarted committed =>
+      exact (cancellation_preserves_evidence request).trans committed.persistent
 
 /-- A linked finite-or-infinite observation trace of actual committed
 admissions and actual cancelled/resumed requester prefixes. -/

@@ -29,19 +29,19 @@ structure HostContracts (state : State) (world : TrieDiffCoverage.World)
 actual promotion opportunity. -/
 def TargetAlignment (target : ViewTarget) (state : State)
     (world : TrieDiffCoverage.World)
-    (opportunity : ReadyOpportunity origin now refused state) : Prop :=
+    (opportunity : CompletedPromotionOpportunity origin now refused state) : Prop :=
   SameViewTarget target
-    (StablePromotionTarget.targetFor state world (ready_of_opportunity opportunity))
+    (StablePromotionTarget.targetFor state world opportunity.ready)
 
 theorem correct_of_opportunity
-    (opportunity : ReadyOpportunity origin now refused state)
+    (opportunity : CompletedPromotionOpportunity origin now refused state)
     (world : TrieDiffCoverage.World) (services : MaterializedView.Services)
     (host : HostContracts state world services)
     (initial : PromotionInitialView.Initial state.db origin world services)
     (target : ViewTarget)
     (aligned : TargetAlignment target state world opportunity) :
-    CorrectView services origin target opportunity.final.db := by
-  let ready := ready_of_opportunity opportunity
+    CorrectView services origin target opportunity.raw.final.db := by
+  let ready := opportunity.ready
   obtain ⟨pendingOrigin, _, installed, files, current, forever⟩ :=
     PromotionProgress.promotes_ready_view ready world services host.closed host.faithful
       host.normalization host.relational initial
@@ -61,10 +61,10 @@ inductive EstablishedView (services : MaterializedView.Services)
     (origin : Origin.Parsed) : State → ViewTarget → Prop where
   | clean
       (baseline : PromotionBaseline.CleanOriginBaseline state.db origin world services)
-      (opportunity : ReadyOpportunity origin now refused state)
+      (opportunity : CompletedPromotionOpportunity origin now refused state)
       (host : HostContracts state world services)
       (aligned : TargetAlignment target state world opportunity) :
-      EstablishedView services origin opportunity.final target
+      EstablishedView services origin opportunity.raw.final target
   | changed
       (production : ScopeChangeRefinement.Successful spaces changedAt before state report)
       (quiet : before.faults = [])
@@ -72,18 +72,18 @@ inductive EstablishedView (services : MaterializedView.Services)
       (originAligned : decision.complete.origin = Origin.canonical origin)
       (metadata : ScopeChangePromotionBaseline.MetadataContracts
         state.db origin world services)
-      (opportunity : ReadyOpportunity origin now refused state)
+      (opportunity : CompletedPromotionOpportunity origin now refused state)
       (host : HostContracts state world services)
       (aligned : TargetAlignment target state world opportunity) :
-      EstablishedView services origin opportunity.final target
+      EstablishedView services origin opportunity.raw.final target
   | continued
       (previous : EstablishedView services origin state previousTarget)
       (metadata : PromotionContinuationBaseline.MetadataContracts
         state.db origin previousTarget world services)
-      (opportunity : ReadyOpportunity origin now refused state)
+      (opportunity : CompletedPromotionOpportunity origin now refused state)
       (host : HostContracts state world services)
       (aligned : TargetAlignment target state world opportunity) :
-      EstablishedView services origin opportunity.final target
+      EstablishedView services origin opportunity.raw.final target
 
 /-- Every historical chain ends in the correct view and therefore supplies
 the old-view invariant needed by a subsequent version. -/
