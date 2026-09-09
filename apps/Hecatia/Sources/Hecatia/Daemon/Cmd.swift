@@ -1,9 +1,9 @@
 import Foundation
 
-/// Builders for 44 of the 54 subcommands `Run` carries.
+/// Builders for 45 of the 54 subcommands `Run` carries.
 ///
 /// Fewer builders than subcommands, and the gap is exact rather than
-/// accidental: `ls` and the nine `socket` commands are registered in
+/// accidental: `ls`, `source ls`, and the seven `socket` commands are registered in
 /// ``Operations`` and surfaced nowhere, so building one would be a call site
 /// that does not exist — which `Scripts/audit-coverage.sh` reports as an
 /// unreachable builder, not as coverage.
@@ -102,6 +102,12 @@ enum Cmd {
   }
   static func sourceRm(id: String) -> Command {
     make { $0.sourceRm = .with { $0.space = id } }
+  }
+  static func sourceRelink(id: String, path: String) -> Command {
+    make { $0.sourceRelink = .with { $0.space = id; $0.path = path } }
+  }
+  static func sourceDetach(id: String) -> Command {
+    make { $0.sourceDetach = .with { $0.space = id } }
   }
 
   // Replicas

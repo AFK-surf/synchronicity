@@ -11,6 +11,10 @@ enum SampleData {
     Space(id: "notes", localPath: "/Users/me/Documents/notes"),
     Space(id: "family photos", localPath: "/Volumes/Big/Family Photos"),
     Space(
+      id: "renamed folder", localPath: "/Users/me/Documents/Before Rename",
+      sourceUnavailable: true,
+      sourceError: "/Users/me/Documents/Before Rename is unavailable: No such file or directory"),
+    Space(
       id: "archive", localPath: "/Users/me/Archive",
       replicationSummary: "current retention · grace 7d · 4096 B held · 2 wanted",
       replicate: .current),

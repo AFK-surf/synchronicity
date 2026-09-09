@@ -892,6 +892,13 @@ fn to_command(cli: &Cli) -> Result<Cmd> {
             SourceCommand::Scan { space } => Cmd::SourceScan(pb::SourceScan {
                 space: space.clone().unwrap_or_default(),
             }),
+            SourceCommand::Relink { space, path } => Cmd::SourceRelink(pb::SourceRelink {
+                space: space.clone(),
+                path: absolute(path)?,
+            }),
+            SourceCommand::Detach { space } => Cmd::SourceDetach(pb::SourceDetach {
+                space: space.clone(),
+            }),
             SourceCommand::Rm { space } => Cmd::SourceRm(pb::SourceRm {
                 space: space.clone(),
             }),

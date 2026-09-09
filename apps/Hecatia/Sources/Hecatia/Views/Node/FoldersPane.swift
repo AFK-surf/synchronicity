@@ -38,11 +38,34 @@ struct SpacesPane: View {
               .disabled(selected?.isSource != true || !node.advancedUnlocked)
             Spacer()
             Button("Adopt From the Cluster…") { adopting = selected }
-              .disabled(selected?.hasFilesystemSource != true)
+              .disabled(
+                selected?.hasFilesystemSource != true || selected?.isSourceUnavailable == true)
           }
           // Directly under the bar it unlocks, rather than at the foot of the
           // page: － is the control it governs.
           AdvancedToggle()
+        }
+
+        if let selected, selected.isSourceUnavailable {
+          SettingsSection {
+            HStack(alignment: .top, spacing: Theme.Space.m) {
+              Image(systemName: "exclamationmark.triangle.fill")
+                .foregroundStyle(Theme.warning)
+              VStack(alignment: .leading, spacing: Theme.Space.tiny) {
+                Text("Local folder unavailable").font(.headline)
+                Text("The original location \(selected.localPath ?? "—") cannot be found. Scanning and local writes are paused; the cloud space and existing published files are unchanged.")
+                  .font(.callout).foregroundStyle(Theme.muted)
+                  .textSelection(.enabled)
+                if let error = selected.sourceError {
+                  Text(error).font(Theme.Font.mono(.caption)).foregroundStyle(Theme.muted)
+                    .textSelection(.enabled)
+                }
+              }
+              Spacer()
+              Button("Locate…") { locate(selected) }
+              Button("Disconnect Folder…") { requestDetach(selected) }
+            }
+          }
         }
 
         if let selected {
@@ -91,6 +114,11 @@ struct SpacesPane: View {
 
   private func path(_ space: Space) -> some View {
     HStack(spacing: Theme.Space.snug) {
+      if space.isSourceUnavailable {
+        Image(systemName: "exclamationmark.triangle.fill")
+          .foregroundStyle(Theme.warning)
+          .accessibilityLabel("Local folder unavailable")
+      }
       Text(space.pathLabel)
         .font(Theme.Font.mono(.subheadline))
         .foregroundStyle(space.isRemoteOnly ? Theme.muted : Color.primary)
@@ -101,9 +129,13 @@ struct SpacesPane: View {
         .textSelection(.enabled)
       // A API source has no directory, so there is nothing to reveal and
       // the button is not drawn rather than drawn dead.
-      if let localPath = space.localPath {
+      if space.isSourceUnavailable {
+        Button("Locate…") { locate(space) }
+          .buttonStyle(.borderless)
+          .help("Locate the renamed or moved folder")
+      } else if space.localPath != nil {
         Button {
-          NSWorkspace.shared.selectFile(nil, inFileViewerRootedAtPath: localPath)
+          node.revealSource(space)
         } label: { Image(systemName: "arrow.up.forward.app").imageScale(.small).glyphButton() }
         .accessibilityLabel("Reveal \(space.id) in Finder")
         .buttonStyle(.plain).foregroundStyle(Theme.muted)
@@ -151,6 +183,34 @@ struct SpacesPane: View {
       }
     )
   }
+
+  private func locate(_ space: Space) {
+    let panel = NSOpenPanel()
+    panel.title = "Locate “\(space.id)”"
+    panel.message = "Choose the renamed or moved folder that belongs to this space."
+    panel.prompt = "Reconnect"
+    panel.canChooseFiles = false
+    panel.canChooseDirectories = true
+    panel.allowsMultipleSelection = false
+    if panel.runModal() == .OK, let url = panel.url {
+      node.enqueue { await node.relinkSource(id: space.id, path: url.path) }
+    }
+  }
+
+  private func requestDetach(_ space: Space) {
+    let id = space.id
+    confirmation = ConfirmationRequest(
+      title: "Disconnect the local folder from “\(id)”?",
+      consequence: "This Mac stops scanning and writing the missing folder. The cloud space and every entry already published in it stay unchanged; this source remains available through APIs.",
+      verb: "Disconnect Folder",
+      gate: Operations.require("source.detach").gate,
+      commandLine: "synch source detach \(Shell.quote(id))",
+      isDestructive: false,
+      perform: {
+        node.enqueue { await node.detachSource(id: id) }
+      }
+    )
+  }
 }
 
 #if DEBUG
@@ -182,5 +242,11 @@ struct SpacesPane: View {
   return SpacesPane(confirmation: .constant(nil), selection: "notes")
     .environment(store)
     .frame(width: 760, height: 560)
+}
+
+#Preview("Local folder unavailable") {
+  SpacesPane(confirmation: .constant(nil), selection: "renamed folder")
+    .environment(NodeStore.preview())
+    .frame(width: 760, height: 620)
 }
 #endif

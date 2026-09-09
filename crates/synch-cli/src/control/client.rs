@@ -340,6 +340,8 @@ impl Client {
                 held_bytes: space.held_bytes,
                 wanted: space.wanted,
                 checkout_path: space.checkout_path,
+                source_state: space.source_state,
+                source_error: space.source_error,
             });
         }
         Ok(out)
@@ -722,6 +724,10 @@ pub struct SpaceInfo {
     pub wanted: Option<u64>,
     /// The replica's newest checkout, when configured.
     pub checkout_path: Option<String>,
+    /// The protobuf `SourceState` numeric value.
+    pub source_state: i32,
+    /// Why a configured filesystem source is unavailable.
+    pub source_error: Option<String>,
 }
 
 /// What a delete left behind.

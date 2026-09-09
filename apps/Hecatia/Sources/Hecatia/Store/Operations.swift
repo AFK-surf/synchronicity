@@ -1,7 +1,7 @@
 import Foundation
 
-/// Every operation the control service exposes: 14 typed rpcs and the 54
-/// subcommands `Run` carries, all 68 accounted for.
+/// Every operation the control service exposes: 15 typed rpcs and the 54
+/// subcommands `Run` carries, all 69 accounted for.
 ///
 /// `OperationsTests` asserts the count and that nothing is listed twice, so a
 /// missing placement is a failing test rather than a review question.
@@ -76,6 +76,8 @@ enum Operations {
     .init("source.ls", "—", "synch source ls [<id>]", surface: .notSurfaced,
           omission: "The typed ListSpaces call supplies the same role records without parsing text."),
     .init("source.add", "Publish a Source…", "synch source add <id> <path>", gate: .consequence, surface: .files, dirties: [.spaces, .status, .listing]),
+    .init("source.relink", "Locate Source Folder…", "synch source relink <id> <path>", gate: .consequence, surface: .files, dirties: [.spaces, .status]),
+    .init("source.detach", "Disconnect Local Folder…", "synch source detach <id>", gate: .confirm, surface: .node, dirties: [.spaces, .status]),
     .init("source.rm", "Stop Publishing…", "synch source rm <id>", gate: .typed, surface: .node, dirties: [.spaces, .status, .listing]),
     .init("source.scan", "Scan Sources Now", "synch source scan [<id>]", surface: .files, dirties: [.listing, .status]),
     .init("replica.ls", "Replicas", "synch replica ls [<id>]", surface: .node, provides: [.spaces, .replication]),
