@@ -6,10 +6,9 @@ import Synchronicity.ReconciliationFailure
 must follow the actual preparation, completeness check, authority check and
 materializer, and installs the materializer's entire staged database.
 
-This is a supporting theorem, not M4: a successful completeness check still
-needs its semantic coverage theorem, and the materializer still needs its
-exact permitted-view and retention refinement. No such conclusions are assumed
-here. Arbitrary host faults are admitted; success witnesses are derived.
+This is execution evidence, not a readiness definition. PromotionAtomicView
+composes it with exact permitted-view and retention refinement for M4.
+Arbitrary host faults are admitted; success witnesses are derived.
 -/
 namespace Synchronicity.PromotionPublication
 open VerifiedCore VerifiedCore.Host VerifiedCore.Commands VerifiedCore.Replication
@@ -111,7 +110,7 @@ theorem body_prefix_private (tx : Transaction) (origin : Origin.Parsed) (now : I
     final.db = state.db :=
   (body_private tx origin now pending old scope authority).preserves_prefix path (fun _ good => good)
 
-private theorem attempted (operation : Promote.Action A) (state final : State)
+theorem attempted (operation : Promote.Action A) (state final : State)
     (result : Except Promote.Error A)
     (ran : execute (Promote.attempt operation) state = (.ok result, final)) :
     execute operation state = (result, final) := by
@@ -239,11 +238,11 @@ theorem promote_flipped (origin : Origin.Parsed) (now : Int64)
         change (execute (Promote.body tx origin now pending old scope authority) ready).2.db = ready.db at privateBody
         simpa only [bodyRun, readyDb] using privateBody
 
-private theorem rollback_private (tx : Transaction) (state : State) :
+theorem rollback_private (tx : Transaction) (state : State) :
     (execute (Promote.raw (.rollback tx)) state).2.db = state.db :=
   storage_preserves_db (.rollback tx) trivial state
 
-private theorem after_attempt (operation : Promote.Action A)
+theorem after_attempt (operation : Promote.Action A)
     (next : Except Promote.Error A → Promote.Action B)
     (state final : State) (answer : Except Promote.Error B)
     (ran : execute (Promote.attempt operation >>= next : Promote.Action B) state = (answer, final)) :
@@ -272,7 +271,7 @@ private theorem failed_bind (operation : Promote.Action A) (next : A → Promote
     exact Prod.ext (congrArg Except.error same) after
   | ok value => exact .inr ⟨value, middle, rfl, ran⟩
 
-private theorem retire_failure (pending : Promote.Pending) (state : State)
+theorem retire_failure (pending : Promote.Pending) (state : State)
     (failure : Promote.Error)
     (ran : (execute (Promote.retire pending) state).1 = .error failure) :
     (execute (Promote.retire pending) state).2.db = state.db := by

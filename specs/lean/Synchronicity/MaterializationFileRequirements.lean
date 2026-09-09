@@ -11,7 +11,7 @@ open MaterializationRequirementFrame MaterializationTableFrame
 
 def Staged (replicas : List Materialize.Target) (db : Database) (target : Option Materialize.Target)
     (content : Option ByteArray) : Prop :=
-  ∀ replica ∈ replicas, ∀ row ∈ rows db "entries", cell row "space" = .text replica.space →
+  ∀ replica ∈ replicas, ∀ row ∈ rows db "entries", isCell (cell row "space") (.text replica.space) = true →
     ∀ root, cell row "content" = .blob root → Required db root replica.holder ∨
       ∃ selected, target = some selected ∧ content = some root ∧ replica.holder = selected.holder
 
@@ -70,8 +70,7 @@ theorem write_staged (replicas : List Materialize.Target) (db : Database) (origi
     have sameSpace : replica.space = space := by
       simp only [key, Address.key, equals, List.all_cons, List.all_nil, Bool.and_true, Bool.and_eq_true] at selected
       have selectedSpace := selected.2.1
-      rw [rowSpace] at selectedSpace
-      exact RelationalFields.text_match_unique (.text replica.space) replica.space space (by simp [isCell, equalCell]) selectedSpace
+      exact RelationalFields.text_match_unique (cell row "space") replica.space space rowSpace selectedSpace
     obtain ⟨target, found, sameHolder⟩ := replica_selected replicas space replica member sameSpace
     exact Or.inr ⟨target, found, selected_content row file schema samePayload root content, sameHolder⟩
   · have outside : equals row (key origin space path) = false := Bool.eq_false_iff.mpr selected

@@ -62,7 +62,7 @@ theorem wants_current (tx : Transaction) (target : Materialize.Target) (file : R
     (root : ByteArray) (now : Int64) (replicas : List Materialize.Target)
     (state final : State) (db : Database) (opened : state.pending = some (tx, db))
     (schema : MaterializationKeySchema.Schema db)
-    (needed : ∀ replica ∈ replicas, ∀ row ∈ rows db "entries", cell row "space" = .text replica.space →
+    (needed : ∀ replica ∈ replicas, ∀ row ∈ rows db "entries", isCell (cell row "space") (.text replica.space) = true →
       ∀ content, cell row "content" = .blob content →
         Required db content replica.holder ∨ (content, replica.holder) = (root, target.holder))
     (ran : execute (Materialize.wants tx target file root now) state = (.ok (), final)) :

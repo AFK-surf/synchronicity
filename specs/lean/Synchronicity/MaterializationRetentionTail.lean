@@ -75,7 +75,7 @@ theorem retain_preserves (tx : Transaction) (now releaseNow : Int64) (target : O
         simpa only [content] using ran
       obtain ⟨result, acquired, wantsRun, restRun⟩ := bind_success _ _ _ _ _ sequence
       cases result
-      have needed : ∀ replica ∈ replicas, ∀ row ∈ rows db "entries", cell row "space" = .text replica.space →
+      have needed : ∀ replica ∈ replicas, ∀ row ∈ rows db "entries", isCell (cell row "space") (.text replica.space) = true →
           ∀ requiredRoot, cell row "content" = .blob requiredRoot →
             Required db requiredRoot replica.holder ∨ (requiredRoot, replica.holder) = (root, target.holder) := by
         intro replica member row present space requiredRoot named

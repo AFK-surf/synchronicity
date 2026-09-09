@@ -80,7 +80,7 @@ def ReplacesRecord (before after : Database) (origin : String) (address : Addres
 /-- Current file references need a live hold or a persistent acquisition
 request. Download completion itself is not a requirement of metadata sync. -/
 def CurrentRequirements (replicas : List Materialize.Target) (db : Database) : Prop :=
-  ∀ target ∈ replicas, ∀ row ∈ rows db "entries", cell row "space" = .text target.space →
+  ∀ target ∈ replicas, ∀ row ∈ rows db "entries", isCell (cell row "space") (.text target.space) = true →
     ∀ root, cell row "content" = .blob root → MaterializationRetention.Required db root target.holder
 
 /-- Historical forever requirements cannot disappear when entries change. -/

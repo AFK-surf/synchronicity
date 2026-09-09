@@ -84,3 +84,4 @@ import Synchronicity.MaterializationFileApply
 import Synchronicity.MaterializationProviderApply
 import Synchronicity.MaterializationExactFiles
 import Synchronicity.MaterializationWholeRetention
+import Synchronicity.Goals.Mptsync.M4
