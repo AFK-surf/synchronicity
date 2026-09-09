@@ -526,4 +526,57 @@ def ready_of_opportunity
   final := ready.final
   committed := ready.committed
 
+/-- Fetch convergence and the later promotion attempt are joined by durable
+evidence inclusion.  Semantic completion at an earlier committed observation
+therefore supplies the zero deficit used to build the exact production
+completeness execution inside `PromotionProgress.Ready`. -/
+def ready_of_semantic_completion
+    (ready : ReadyOpportunity origin now refused state)
+    (publisher : TrieProgramProofs.RawSnapshot)
+    (requirements : FiniteRequirements publisher ready.scope
+      (ready.authority.provenance.map Origin.canonical) ready.pending.head.root)
+    (complete : PermittedComplete publisher ready.scope
+      (ready.authority.provenance.map Origin.canonical) ready.pending.head.root before)
+    (carried : EvidenceIncluded before (replicaOfState ready.prepared)) :
+    PromotionProgress.Ready origin now refused state := by
+  have preparedComplete : PermittedComplete publisher ready.scope
+      (ready.authority.provenance.map Origin.canonical) ready.pending.head.root
+      (replicaOfState ready.prepared) :=
+    TrieFetchCompletion.completion_mono complete carried
+  have zero : missingEvidence requirements.items (replicaOfState ready.prepared) = 0 :=
+    (TrieFetchCompletion.finite_measure_eq_zero_iff_complete requirements).mpr preparedComplete
+  have completed := (finite_promotion_complete_execution publisher ready.tx ready.scope
+    ready.authority ready.pending ready.prepared requirements zero ready.completion).2
+  let body : PromotionProgress.BodyReady ready.tx origin now ready.pending ready.old
+      ready.scope ready.authority ready.prepared :=
+    { newer := ready.newer
+      checked := ready.completion.final
+      authorized := ready.authorized
+      written := ready.written
+      cleared := ready.cleared
+      staged := ready.staged
+      count := ready.count
+      completeExecution := completed
+      permittedExecution := ready.permittedExecution
+      writeExecution := ready.writeExecution
+      clearExecution := ready.clearExecution
+      materializeExecution := ready.materializeExecution }
+  exact
+    { tx := ready.tx
+      opened := ready.opened
+      prepared := ready.prepared
+      scope := ready.scope
+      replicas := ready.replicas
+      authority := ready.authority
+      pending := ready.pending
+      old := ready.old
+      began := ready.began
+      preparation := ready.preparation
+      policy := ready.policy
+      policyUnique := ready.policyUnique
+      notRefused := ready.notRefused
+      body := body
+      final := ready.final
+      committed := ready.committed }
+
 end Synchronicity.TrieCompleteConverse
