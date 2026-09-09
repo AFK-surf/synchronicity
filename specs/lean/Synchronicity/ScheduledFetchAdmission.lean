@@ -1,6 +1,7 @@
 import Synchronicity.AuthorizedFetchProgress
 import Synchronicity.OriginScheduleExecution
 import Synchronicity.MptsyncScheduleExecution
+import Synchronicity.MptsyncRetryExecution
 
 /-! The production origin scheduler records only wire-level Fetch opportunity
 metadata.  This module states the additional, explicit bridge needed to relate
@@ -220,6 +221,97 @@ theorem ResponseWindow.responds
       peerAttempt peerAttempted samePeer success
   exact ⟨later, Nat.lt_of_lt_of_le window.afterDeficit afterWindow, admission.admission⟩
 
+/-- An actual retry-limit exit is connected to the next raw pending-origin
+schedule window. The abandoned report itself supplies no admission. -/
+structure AfterRetryLimitWindow
+    {origin : Origin.Parsed}
+    (exit : MptsyncRetryExecution.RetryLimitExit origin expected refused
+      fetchMaximum retryLimit before after)
+    (inputs : MptsyncScheduleExecution.StableScheduleInputs)
+    (item : OriginSchedule.Item)
+    (requeued : MptsyncRetryExecution.RequeuedAfterLimit exit inputs.contacts inputs.peer
+      inputs.pending inputs.pendingLink inputs.pendingTarget item)
+    (exitAt : Nat) (finalOrigin : String) (finalSeq : UInt64) (finalRoot : ByteArray)
+    (requirements : FiniteRequirements publisher scope owner root)
+    (states : Nat → State) where
+  exitState : states exitAt = after
+  observedAt : Nat
+  afterExit : exitAt < observedAt
+  finalOriginMatchesExit : finalOrigin = Origin.canonical origin
+  sequence : (inputs.pendingTarget item).pointer.seq = finalSeq
+  targetRoot : (inputs.pendingTarget item).pointer.root = finalRoot
+  admit : ∀ round attempt,
+    round < inputs.pendingRounds →
+    attempt ∈ (inputs.pending.observation round).attempts →
+    attempt.item = item →
+    OriginScheduleExecution.FetchOpportunity (inputs.pendingTarget item) attempt →
+    inputs.pendingLink.contactRound round < inputs.peerRounds →
+    ∀ peerAttempt,
+      peerAttempt ∈ (inputs.contacts.observation
+        (inputs.pendingLink.contactRound round)).attempts →
+      peerAttempt.peer = inputs.peer → peerAttempt.outcome = .success →
+      ∃ later, observedAt ≤ later ∧
+        ∃ actualTarget,
+          TargetAligned (inputs.pendingTarget item) actualTarget scope owner root ∧
+          AdmissionFor actualTarget requirements (states exitAt) (states later)
+
+def AfterRetryLimitWindow.next
+    (window : AfterRetryLimitWindow exit inputs item requeued exitAt finalOrigin finalSeq finalRoot
+      requirements states) :
+    ResponseWindow exitAt finalOrigin finalSeq finalRoot requirements states where
+  observedAt := window.observedAt
+  afterDeficit := window.afterExit
+  inputs := inputs
+  item := item
+  member := requeued.member
+  admit := by
+    intro round attempt before attempted same opportunity contactBefore peerAttempt
+      peerAttempted samePeer success
+    obtain ⟨later, afterWindow, actualTarget, aligned, admission⟩ :=
+      window.admit round attempt before attempted same opportunity contactBefore peerAttempt
+        peerAttempted samePeer success
+    refine ⟨later, afterWindow, actualTarget, ?_, admission⟩
+    refine ⟨?_, window.sequence, window.targetRoot, aligned⟩
+    exact ((inputs.pendingPayloads.sameOrigin item requeued.member).trans
+      requeued.sameOrigin).trans window.finalOriginMatchesExit.symm
+
+/-- One fresh response source is either an ordinary newly queued raw window,
+or the next raw window causally attached to an actual retry-limit exit and
+requeue observation. -/
+inductive ResponseOpportunity (deficitAt : Nat) (finalOrigin : String)
+    (finalSeq : UInt64) (finalRoot : ByteArray)
+    (requirements : FiniteRequirements publisher scope owner root)
+    (states : Nat → State) where
+  | fresh (window : ResponseWindow deficitAt finalOrigin finalSeq finalRoot requirements states)
+  | afterRetry
+      {origin : Origin.Parsed} {expected : Option (UInt64 × ByteArray)}
+      {refused : List (UInt64 × ByteArray × ByteArray)} {fetchMaximum retryLimit : Nat}
+      {before after : State}
+      (exit : MptsyncRetryExecution.RetryLimitExit origin expected refused
+        fetchMaximum retryLimit before after)
+      (inputs : MptsyncScheduleExecution.StableScheduleInputs)
+      (item : OriginSchedule.Item)
+      (requeued : MptsyncRetryExecution.RequeuedAfterLimit exit inputs.contacts inputs.peer
+        inputs.pending inputs.pendingLink inputs.pendingTarget item)
+      (window : AfterRetryLimitWindow exit inputs item requeued deficitAt finalOrigin finalSeq
+        finalRoot requirements states) :
+      ResponseOpportunity deficitAt finalOrigin finalSeq finalRoot requirements states
+
+def ResponseOpportunity.window
+    (opportunity : ResponseOpportunity deficitAt finalOrigin finalSeq finalRoot
+      requirements states) :
+    ResponseWindow deficitAt finalOrigin finalSeq finalRoot requirements states :=
+  match opportunity with
+  | .fresh window => window
+  | .afterRetry _ _ _ _ window => window.next
+
+theorem ResponseOpportunity.responds
+    (opportunity : ResponseOpportunity deficitAt finalOrigin finalSeq finalRoot
+      requirements states) :
+    ∃ later, deficitAt < later ∧
+      Admission requirements (states deficitAt) (states later) :=
+  opportunity.window.responds
+
 /-- Every deficit observation is followed by its own later raw scheduling
 window. A single finite window cannot satisfy all future observations because
 each witness carries an `observedAt` strictly after its indexed deficit. -/
@@ -228,7 +320,7 @@ def ScheduledSufficientResponses (finalOrigin : String) (finalSeq : UInt64)
     (requirements : FiniteRequirements publisher scope owner root)
     (states : Nat → State) : Prop :=
   ∀ now, 0 < missingEvidence requirements.items (replicaOfState (states now)) →
-    Nonempty (ResponseWindow now finalOrigin finalSeq finalRoot requirements states)
+    Nonempty (ResponseOpportunity now finalOrigin finalSeq finalRoot requirements states)
 
 /-- Per-deficit raw M6 windows and their exact-attempt handlers discharge the
 ordinary response premise used by finite Fetch convergence. -/
@@ -237,7 +329,7 @@ theorem sufficientResponses
       requirements states) :
     SufficientResponses requirements states := by
   intro now missing
-  obtain ⟨window⟩ := scheduled now missing
-  exact window.responds
+  obtain ⟨opportunity⟩ := scheduled now missing
+  exact opportunity.responds
 
 end Synchronicity.ScheduledFetchAdmission
