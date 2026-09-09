@@ -756,20 +756,3 @@ start: a credential that quietly does nothing is a lie. See
 
 Day-2 operations (replicas, key ceremony, backups) live in
 `ops/RUNBOOK.md`.
-
-### Cue provisioning account linking
-
-The shared-secret-authenticated Cue provisioning endpoint trusts Cue to assert
-the Workspace owner's email. If the configured hub OIDC subject is not yet
-bound, provisioning links it to the existing user with that exact email, or
-creates a user when no account matches. It does not replace an existing subject
-binding, change the existing user's profile, or merge two user records.
-The identity and Workspace membership writes stay in the provisioning transaction.
-
-This trust applies only to the Cue service integration. Ordinary custom-OIDC
-login still requires explicit linking; an org-controlled issuer cannot claim
-an existing account just by presenting its email. Protect the provisioning
-secret accordingly: its holder can bind Cue identities to existing accounts.
-After an operator releases this behavior, rerun Cue's bounded Workspace
-backfill to retry previously rejected same-email owners, then reopen Cue Drive
-to enroll the desktop device.
