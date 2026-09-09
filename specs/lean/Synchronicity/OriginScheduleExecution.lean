@@ -160,6 +160,15 @@ def DeliveredLatest (latest : VerifiedCore.Replication.Head) (attempt : Attempt)
   | .advertisement _ received => latest ∈ received
   | _ => False
 
+def receivedHeads (attempt : Attempt) : List VerifiedCore.Replication.Head :=
+  match attempt.payload with
+  | .advertisement _ received => received
+  | _ => []
+
+theorem DeliveredLatest.member (delivered : DeliveredLatest latest attempt) :
+    latest ∈ receivedHeads attempt := by
+  cases payload : attempt.payload <;> simp_all [DeliveredLatest, receivedHeads]
+
 def FetchOpportunity (target : Target) (attempt : Attempt) : Prop :=
   match attempt.payload with
   | .pendingFetch request responses =>
