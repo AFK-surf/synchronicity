@@ -319,7 +319,7 @@ cloud data plane's write tunnel, which opens one through the public
   parent dirfd pinned, API sources staging in the daemon's scratch, both
   behind `Adoption`'s single choke point.
 - write: `Adoption::write` on the blocking pool.
-- commit: under the node's tree-write lock, the condition (§5.3) and the
+- commit: under the node's tree-write lock, the condition (§5.3) is
   re-checked; then `Adoption::commit` (fsync + rename);
   then API source → `commit_api_file` (CAS ingest,
   `stage_api_reference` with `prev` and the `b:` ad) plus a
