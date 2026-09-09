@@ -42,6 +42,55 @@ structure BoundedService
   pendingFetchOpportunity : OriginScheduleExecution.PendingFetchOpportunities
     contacts peer pending pendingLink pendingTarget
 
+/-- The factual stable-window inputs consumed by M6.  This record packages
+executions and their runtime observations, not any scheduler-service result:
+callers retain the raw contact trace, origin traces, wire payloads and finite
+bounds from which `service` derives `BoundedService`. -/
+structure StableScheduleInputs where
+  eligible : List ByteArray
+  peerMaximum : Nat
+  peerDeadline : Nat
+  peerRounds : Nat
+  contacts : ContactExecution.Execution eligible peerMaximum peerDeadline peerRounds
+  healthy : ByteArray → Prop
+  peer : ByteArray
+  peerWidth : ∀ candidate ∈ eligible, candidate.size = 32
+  peersWithin : eligible.length ≤ UInt64.size
+  peerMaximumPositive : 0 < peerMaximum
+  enoughPeerRounds : (Contact.index eligible).toList.length ≤ peerRounds * peerMaximum
+  peerMember : peer ∈ eligible
+  peerHealthy : healthy peer
+  advertisementItems : List OriginSchedule.Item
+  advertisementMaximum : Nat
+  advertisementDeadline : Nat
+  advertisementRounds : Nat
+  advertisements : OriginScheduleExecution.Execution .advertisement
+    advertisementItems advertisementMaximum advertisementDeadline advertisementRounds
+  advertisementLink : OriginScheduleExecution.LinkedToContact contacts peer advertisements
+  latest : OriginSchedule.Item → Head
+  advertisementPayloads : OriginScheduleExecution.AdvertisementPayloads advertisements latest
+  advertisementDistinct : ∀ left ∈ advertisementItems, ∀ right ∈ advertisementItems,
+    OriginSchedule.key left.origin = OriginSchedule.key right.origin → left = right
+  advertisementsWithin : advertisementItems.length ≤ UInt64.size
+  advertisementsFit : ∀ item ∈ advertisementItems,
+    item.weight.toNat ≤ advertisementMaximum
+  enoughAdvertisementRounds :
+    (OriginSchedule.index advertisementItems).toList.length ≤ advertisementRounds
+  pendingItems : List OriginSchedule.Item
+  pendingMaximum : Nat
+  pendingDeadline : Nat
+  pendingRounds : Nat
+  pending : OriginScheduleExecution.Execution .pendingFetch
+    pendingItems pendingMaximum pendingDeadline pendingRounds
+  pendingLink : OriginScheduleExecution.LinkedToContact contacts peer pending
+  pendingTarget : OriginSchedule.Item → OriginScheduleExecution.Target
+  pendingPayloads : OriginScheduleExecution.PendingPayloads pending pendingTarget
+  pendingDistinct : ∀ left ∈ pendingItems, ∀ right ∈ pendingItems,
+    OriginSchedule.key left.origin = OriginSchedule.key right.origin → left = right
+  pendingWithin : pendingItems.length ≤ UInt64.size
+  pendingFit : ∀ item ∈ pendingItems, item.weight.toNat ≤ pendingMaximum
+  enoughPendingRounds : (OriginSchedule.index pendingItems).toList.length ≤ pendingRounds
+
 /-- **M6 (stable finite sets).** Actual production contact, summary-page and
 pending-origin decisions provide bounded attempts to every healthy task. A
 stalling earlier peer/origin may fail or time out, but cannot consume another
@@ -92,5 +141,21 @@ theorem bounded_service
   · exact OriginScheduleExecution.every_pending_has_a_fetch_opportunity contacts peer pending
       pendingLink pendingTarget pendingPayloads pendingDistinct pendingWithin pendingFit
       enoughPendingRounds
+
+/-- Raw stable-window observations entail the M6 service property.  In
+particular, this projection cannot be constructed from a `BoundedService`:
+the record above requires the production executions and wire observations
+that `bounded_service` consumes. -/
+theorem StableScheduleInputs.service (inputs : StableScheduleInputs) :
+    BoundedService inputs.healthy inputs.contacts inputs.peer inputs.advertisements
+      inputs.advertisementLink inputs.latest inputs.pending inputs.pendingLink
+      inputs.pendingTarget := by
+  exact bounded_service inputs.contacts inputs.peerWidth inputs.peersWithin
+    inputs.peerMaximumPositive inputs.enoughPeerRounds inputs.healthy inputs.peerMember
+    inputs.peerHealthy inputs.advertisements inputs.advertisementLink inputs.latest
+    inputs.advertisementPayloads inputs.advertisementDistinct inputs.advertisementsWithin
+    inputs.advertisementsFit inputs.enoughAdvertisementRounds inputs.pending inputs.pendingLink
+    inputs.pendingTarget inputs.pendingPayloads inputs.pendingDistinct inputs.pendingWithin
+    inputs.pendingFit inputs.enoughPendingRounds
 
 end Synchronicity.Goals.Mptsync.M6
