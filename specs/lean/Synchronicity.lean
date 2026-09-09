@@ -44,6 +44,7 @@ import Synchronicity.TrieMerkleProofs
 import Synchronicity.SuspensionProofs
 import Synchronicity.ExchangeProofs
 import Synchronicity.ExchangeVersionProofs
+import Synchronicity.AdvertisementSelection
 import Synchronicity.TrieSnapshotProofs
 import Synchronicity.TrieRemoveSemantics
 import Synchronicity.CasReceivePromises
@@ -85,3 +86,5 @@ import Synchronicity.MaterializationProviderApply
 import Synchronicity.MaterializationExactFiles
 import Synchronicity.MaterializationWholeRetention
 import Synchronicity.Goals.Mptsync.M4
+import Synchronicity.Goals.Mptsync.M2
+import Synchronicity.MptsyncConvergence
