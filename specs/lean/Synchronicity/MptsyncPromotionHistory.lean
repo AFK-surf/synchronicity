@@ -4,6 +4,8 @@ import Synchronicity.PromotionBaseline
 import Synchronicity.PromotionContinuationBaseline
 import Synchronicity.ScopeChangePromotionBaseline
 import Synchronicity.ScopeChangeRefinement
+import Synchronicity.ScheduledFetchAdmission
+import Synchronicity.ProductionTimeline
 
 /-! Actual finite promotion history before the stable convergence window.
 
@@ -15,6 +17,7 @@ does not assume a correct old directory independently at every version.
 namespace Synchronicity.MptsyncPromotionHistory
 open VerifiedCore VerifiedCore.Host VerifiedCore.Trie VerifiedCore.Replication
 open SimulatedHost TrieCompleteConverse MptsyncConvergence
+  TrieFetchCompletion TrieFetchAdmissionProgress
 
 /-- Host and materializer facts independent of whether promotion succeeds. -/
 structure HostContracts (state : State) (world : TrieDiffCoverage.World)
@@ -25,16 +28,52 @@ structure HostContracts (state : State) (world : TrieDiffCoverage.World)
   relational : ∀ relation, relation = Trie.nodeSpace ∨ relation = Trie.valueSpace →
     state.byteRelations.contains relation = true
 
+/-- A historical promotion is justified by the same finite production chain
+as the final stable promotion: bounded scheduled admissions in one actual
+retry prefix, followed by raw promotion reads and phases. It stores neither a
+semantic completion result nor `Ready`. -/
+structure ProductionPromotionOpportunity (origin : Origin.Parsed) (now : Int64)
+    (refused : List (UInt64 × ByteArray × ByteArray))
+    (state : SimulatedHost.State) where
+  raw : PromotionOpportunity origin now refused state
+  publisher : TrieProgramProofs.RawSnapshot
+  requirements : FiniteRequirements publisher raw.scope
+    (raw.authority.provenance.map Origin.canonical) raw.pending.head.root
+  retry : MptsyncRetryExecution.RetryExecution requirements
+  responseTimeline : ScheduledFetchAdmission.ProductionScheduleTimeline retry.state
+  responses : ScheduledFetchAdmission.BoundedScheduledResponses
+    (Origin.canonical origin) raw.pending.head.seq raw.pending.head.root
+      requirements retry responseTimeline
+  atPromotion : retry.state retry.endAt = state
+  reads : PromotionReadOpportunity publisher raw.tx
+    ⟨raw.scope, raw.authority.provenance.map Origin.canonical⟩ raw.pending.head.root
+
+def ProductionPromotionOpportunity.ready
+    (opportunity : ProductionPromotionOpportunity origin now refused state) :
+    PromotionProgress.Ready origin now refused state := by
+  have complete := ScheduledFetchAdmission.completeAtEnd opportunity.responses
+  have carriedToStart : EvidenceIncluded
+      (replicaOfState (opportunity.retry.state opportunity.retry.endAt))
+      (replicaOfState state) := by
+    rw [opportunity.atPromotion]
+    exact EvidenceIncluded.refl _
+  have carriedToPrepared := carriedToStart.trans
+    (ProductionTimeline.promotion_prepare_includes state opportunity.raw.opened
+      opportunity.raw.prepared opportunity.raw.tx origin now _ opportunity.raw.began
+      opportunity.raw.preparation)
+  exact ready_of_semantic_completion opportunity.raw opportunity.publisher
+    opportunity.requirements complete carriedToPrepared opportunity.reads
+
 /-- Factual identification of a public target with the candidate read by an
 actual promotion opportunity. -/
 def TargetAlignment (target : ViewTarget) (state : State)
     (world : TrieDiffCoverage.World)
-    (opportunity : CompletedPromotionOpportunity origin now refused state) : Prop :=
+    (opportunity : ProductionPromotionOpportunity origin now refused state) : Prop :=
   SameViewTarget target
     (StablePromotionTarget.targetFor state world opportunity.ready)
 
 theorem correct_of_opportunity
-    (opportunity : CompletedPromotionOpportunity origin now refused state)
+    (opportunity : ProductionPromotionOpportunity origin now refused state)
     (world : TrieDiffCoverage.World) (services : MaterializedView.Services)
     (host : HostContracts state world services)
     (initial : PromotionInitialView.Initial state.db origin world services)
@@ -61,7 +100,7 @@ inductive EstablishedView (services : MaterializedView.Services)
     (origin : Origin.Parsed) : State → ViewTarget → Prop where
   | clean
       (baseline : PromotionBaseline.CleanOriginBaseline state.db origin world services)
-      (opportunity : CompletedPromotionOpportunity origin now refused state)
+      (opportunity : ProductionPromotionOpportunity origin now refused state)
       (host : HostContracts state world services)
       (aligned : TargetAlignment target state world opportunity) :
       EstablishedView services origin opportunity.raw.final target
@@ -72,7 +111,7 @@ inductive EstablishedView (services : MaterializedView.Services)
       (originAligned : decision.complete.origin = Origin.canonical origin)
       (metadata : ScopeChangePromotionBaseline.MetadataContracts
         state.db origin world services)
-      (opportunity : CompletedPromotionOpportunity origin now refused state)
+      (opportunity : ProductionPromotionOpportunity origin now refused state)
       (host : HostContracts state world services)
       (aligned : TargetAlignment target state world opportunity) :
       EstablishedView services origin opportunity.raw.final target
@@ -80,7 +119,7 @@ inductive EstablishedView (services : MaterializedView.Services)
       (previous : EstablishedView services origin state previousTarget)
       (metadata : PromotionContinuationBaseline.MetadataContracts
         state.db origin previousTarget world services)
-      (opportunity : CompletedPromotionOpportunity origin now refused state)
+      (opportunity : ProductionPromotionOpportunity origin now refused state)
       (host : HostContracts state world services)
       (aligned : TargetAlignment target state world opportunity) :
       EstablishedView services origin opportunity.raw.final target

@@ -1073,27 +1073,6 @@ def ready_of_opportunity
   final := ready.final
   committed := ready.committed
 
-/-- A historical promotion opportunity paired with the semantic completion
-and local read contract that make its production completion phase positive.
-Keeping these witnesses beside the raw opportunity prevents historical view
-proofs from rebuilding `Ready` from host replies alone. -/
-structure CompletedPromotionOpportunity (origin : Origin.Parsed) (now : Int64)
-    (refused : List (UInt64 × ByteArray × ByteArray))
-    (state : SimulatedHost.State) where
-  raw : PromotionOpportunity origin now refused state
-  publisher : TrieProgramProofs.RawSnapshot
-  reads : PromotionReadOpportunity publisher raw.tx
-    ⟨raw.scope, raw.authority.provenance.map Origin.canonical⟩ raw.pending.head.root
-  complete : PermittedComplete publisher raw.scope
-    (raw.authority.provenance.map Origin.canonical) raw.pending.head.root
-    (replicaOfState raw.prepared)
-
-def CompletedPromotionOpportunity.ready
-    (opportunity : CompletedPromotionOpportunity origin now refused state) :
-    PromotionProgress.Ready origin now refused state :=
-  ready_of_opportunity opportunity.raw opportunity.publisher opportunity.reads
-    opportunity.complete
-
 /-- Fetch convergence and the later promotion attempt are joined by durable
 evidence inclusion.  Semantic completion at an earlier committed observation
 therefore supplies the zero deficit used to build the exact production
