@@ -337,6 +337,17 @@ impl Syncer {
         }
     }
 
+    /// The scope-independent verdict projection passed to Fetch/promotion.
+    fn refusals_for(&self, origin: &OriginId) -> Vec<(u64, Hash, Hash)> {
+        self.refused
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .iter()
+            .filter(|key| &key.0 == origin)
+            .map(|key| (key.1, key.2, key.3))
+            .collect()
+    }
+
     /// Remembers that this promotion failed on the origin's own data.
     ///
     /// In memory rather than in the schema: the verdict is about what *this
@@ -684,14 +695,7 @@ impl Syncer {
     /// permanently refused, whatever happened to be in the slot, and left the
     /// head that actually failed unrecorded.
     pub fn try_promote(&self, origin: &OriginId, now: i64) -> Result<Promotion> {
-        let refused = self
-            .refused
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .iter()
-            .filter(|key| &key.0 == origin)
-            .map(|key| (key.1, key.2, key.3))
-            .collect();
+        let refused = self.refusals_for(origin);
         let promoted = self
             .store
             .promote_head(origin, now, refused, |seq, root, old| {
@@ -762,14 +766,7 @@ impl Syncer {
         origin: &OriginId,
         expected: Option<(u64, Hash)>,
     ) -> Result<FetchOutcome> {
-        let refused = self
-            .refused
-            .lock()
-            .unwrap_or_else(std::sync::PoisonError::into_inner)
-            .iter()
-            .filter(|key| &key.0 == origin)
-            .map(|key| (key.1, key.2, key.3))
-            .collect();
+        let refused = self.refusals_for(origin);
         // Lean retains the whole requesting walk on one blocking worker. Only
         // owned requests and replies cross to the runtime; no continuation,
         // database session or connection guard crosses a network wait.
@@ -2031,15 +2028,23 @@ mod tests {
     }
 
     #[test]
-    fn changing_scope_forgets_process_local_refusal_verdicts() {
+    fn changing_scope_removes_old_verdict_from_the_promotion_projection() {
         let (_dir, store, _key, origin) = setup();
-        let syncer = Syncer::new(store);
-        syncer.refuse((origin, 7, Hash::new(b"new"), Hash::new(b"old")));
-        assert_eq!(syncer.refused.lock().unwrap().len(), 1);
+        let syncer = Syncer::new(store.clone());
+        let verdict = (origin.clone(), 7, Hash::new(b"new"), Hash::new(b"old"));
+        syncer.refuse(verdict.clone());
+        assert_eq!(
+            syncer.refusals_for(&origin),
+            vec![(verdict.1, verdict.2, verdict.3)]
+        );
 
+        // This is the same ordering as the changed branch in `adopt_scope`:
+        // the durable command commits first, then the runtime callback clears
+        // decisions which did not include that command's scope in their key.
+        assert!(store.set_read_scope(Some(&["photos".to_string()])).unwrap());
         syncer.scope_changed();
 
-        assert!(syncer.refused.lock().unwrap().is_empty());
+        assert!(syncer.refusals_for(&origin).is_empty());
     }
 
     #[test]

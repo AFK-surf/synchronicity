@@ -110,6 +110,7 @@ import Synchronicity.MptsyncPromotionHistory
 import Synchronicity.MptsyncAdvertisementWindow
 import Synchronicity.ProductionTimeline
 import Synchronicity.MptsyncScopeChangeCarry
+import Synchronicity.MptsyncRefusalCache
 import Synchronicity.MptsyncProductionConvergence
 import Synchronicity.Goals.Mptsync.M7
 import Synchronicity.Goals.Mptsync.M8
