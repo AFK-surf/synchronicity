@@ -12,44 +12,38 @@ open TrieFetchCompletion TrieFetchAdmissionProgress
 open AuthorizedFetchProgress TrieCompleteConverse
 open MptsyncRetryExecution
 
-/-- User-facing M7 property: after any finite number of real cancellation /
-resumption or fresh-restart checkpoints, sufficiently many actual authorized
-admissions reach semantic completion, and a bounded healthy production
-promotion check reuses that committed evidence. -/
+/-- User-facing M7 property: the declared finite cancellation/resumption or
+fresh-restart prefix ends in semantic completion, and a bounded healthy
+production promotion check reuses that committed evidence. -/
 def EventuallyReusesCommittedEvidence
     (requirements : FiniteRequirements publisher scope owner root)
     (execution : RetryExecution requirements) : Prop :=
-  ∀ start, ∃ finish, start ≤ finish ∧
-    PermittedComplete publisher scope owner root
-      (replicaOfState (execution.state finish)) ∧
+  PermittedComplete publisher scope owner root
+      (replicaOfState (execution.state execution.endAt)) ∧
     ∃ tx final,
       execute (PromotionReads.complete tx ⟨scope, owner⟩ root)
-        (execution.state finish) = (.ok true, final)
+        (execution.state execution.endAt) = (.ok true, final)
 
 /-- M7. Actual cancel/resume/restart executions preserve every committed
-evidence fact.  Actual authorized admissions discharge the finite deficit;
-the later production completeness execution therefore reuses, rather than
-merely retains, the accumulated bytes. Permanent cancellation is excluded
-only by the explicit `SufficientResponses` and completion-opportunity premises.
+evidence fact. Bounded response observations place every required scheduling
+and authorized-admission opportunity inside that exact finite prefix; the
+later production completeness execution therefore reuses, rather than merely
+retains, the accumulated bytes. Permanent cancellation is excluded only by
+that bounded response contract and the completion-opportunity premise.
 -/
 theorem actual_retries_accumulate_and_reuse
     (requirements : FiniteRequirements publisher scope owner root)
     (execution : RetryExecution requirements)
-    (responses : SufficientResponses requirements execution.state)
-    (completeOpportunity : ∀ now,
-      PermittedComplete publisher scope owner root
-        (replicaOfState (execution.state now)) →
+    (responses : BoundedResponses requirements execution)
+    (completeOpportunity :
       ∃ tx, PromotionReadOpportunity publisher tx ⟨scope, owner⟩ root ∧
         Nonempty (PromotionFreshOpportunity tx ⟨scope, owner⟩ root
-          (execution.state now))) :
+          (execution.state execution.endAt))) :
     EventuallyReusesCommittedEvidence requirements execution := by
-  intro start
-  obtain ⟨finish, after, complete⟩ := sufficient_responses_converge requirements
-    execution.state execution.persistentEvidence responses start
-  obtain ⟨tx, reads, ⟨ready⟩⟩ :=
-    completeOpportunity finish (complete finish (Nat.le_refl _))
-  exact ⟨finish, after, complete finish (Nat.le_refl _), tx, ready.final,
+  have complete := responses.completeAtEnd
+  obtain ⟨tx, reads, ⟨ready⟩⟩ := completeOpportunity
+  exact ⟨complete, tx, ready.final,
     promotion_complete_exec_of_opportunity publisher tx ⟨scope, owner⟩ root
-      (execution.state finish) reads (complete finish (Nat.le_refl _)) ready⟩
+      (execution.state execution.endAt) reads complete ready⟩
 
 end Synchronicity.Goals.Mptsync.M7

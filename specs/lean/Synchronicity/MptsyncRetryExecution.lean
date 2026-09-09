@@ -369,34 +369,26 @@ theorem RetryCheckpoint.preserves_entries
   | restartedCancellation request restarted ran events =>
       exact (events.preserves_entries ran).trans (cancellation_preserves_entries request)
 
-/-- A finite actual retry prefix.  `state` is extended stationarily after
-`endAt` only to reuse the generic liveness measure API; no requester step is
-claimed after that boundary, so a following promotion may use the same public
-production timeline without also being classified as a retry checkpoint. -/
+/-- A finite actual retry prefix.  Every adjacent state before `endAt` is an
+observed requester checkpoint; the structure deliberately says nothing about
+states after that boundary. -/
 structure RetryExecution
     (requirements : FiniteRequirements publisher scope owner root) where
   state : Nat → SimulatedHost.State
   endAt : Nat
   step : ∀ now, now < endAt → RetryCheckpoint requirements (state now) (state (now + 1))
-  stationary : ∀ now, endAt ≤ now → state now = state endAt
 
-theorem RetryExecution.persistentEvidence
-    (execution : RetryExecution requirements) :
-    TrieFetchConvergence.PersistentEvidence (replicaOfState ∘ execution.state) := by
-  intro now
-  by_cases active : now < execution.endAt
-  · exact (execution.step now active).persistent
-  · have atNow := execution.stationary now (Nat.le_of_not_gt active)
-    have atNext := execution.stationary (now + 1)
-      (Nat.le_trans (Nat.le_of_not_gt active) (Nat.le_succ now))
-    simp only [Function.comp_apply]
-    rw [atNow, atNext]
-    exact EvidenceIncluded.refl _
+theorem RetryExecution.persistentWithin
+    (execution : RetryExecution requirements) (now : Nat) (active : now < execution.endAt) :
+    EvidenceIncluded (replicaOfState (execution.state now))
+      (replicaOfState (execution.state (now + 1))) :=
+  (execution.step now active).persistent
 
 /-- Every fact committed at the beginning of a finite retry prefix is still
 available at the end. This is the direct `EvidenceIncluded` API consumed by
 promotion after retry. -/
-theorem RetryExecution.carriedFrom (execution : RetryExecution requirements) (start span : Nat) :
+theorem RetryExecution.carriedFrom (execution : RetryExecution requirements) (start span : Nat)
+    (within : start + span ≤ execution.endAt) :
     EvidenceIncluded (replicaOfState (execution.state start))
       (replicaOfState (execution.state (start + span))) := by
   induction span with
@@ -404,12 +396,56 @@ theorem RetryExecution.carriedFrom (execution : RetryExecution requirements) (st
     simpa using EvidenceIncluded.refl (replicaOfState (execution.state start))
   | succ span ih =>
     rw [Nat.add_succ]
-    exact ih.trans (execution.persistentEvidence (start + span))
+    have earlier : start + span ≤ execution.endAt :=
+      Nat.le_trans (Nat.le_succ (start + span)) (by simpa only [Nat.add_succ] using within)
+    have active : start + span < execution.endAt :=
+      Nat.lt_of_succ_le (by simpa only [Nat.add_succ] using within)
+    exact (ih earlier).trans (execution.persistentWithin (start + span) active)
 
-theorem RetryExecution.carried (execution : RetryExecution requirements) (finish : Nat) :
+theorem RetryExecution.carried (execution : RetryExecution requirements) (finish : Nat)
+    (within : finish ≤ execution.endAt) :
     EvidenceIncluded (replicaOfState (execution.state 0))
       (replicaOfState (execution.state finish)) := by
-  simpa using execution.carriedFrom 0 finish
+  simpa using execution.carriedFrom 0 finish (by simpa using within)
+
+/-- One scheduled response is the admitted constructor of this exact adjacent
+checkpoint, not merely another operation with extensionally equal endpoints. -/
+structure AdmissionCheckpoint
+    (requirements : FiniteRequirements publisher scope owner root)
+    (execution : RetryExecution requirements) (now : Nat) : Prop where
+  active : now < execution.endAt
+  admission : Admission requirements (execution.state now) (execution.state (now + 1))
+  exactStep : execution.step now active = RetryCheckpoint.admitted admission
+
+/-- Every positive deficit observed through the finite boundary has a later
+actual authorized admission at one adjacent checkpoint of that same finite
+retry prefix.  This is a bounded execution contract: it contains neither a
+zero measure nor a semantic completion conclusion. `endAt` is the external
+finite service-coverage deadline: if a deficit remained there, the contract
+would require its later admitted checkpoint to still lie before that deadline. -/
+def BoundedResponses
+    (requirements : FiniteRequirements publisher scope owner root)
+    (execution : RetryExecution requirements) : Prop :=
+  ∀ now, now ≤ execution.endAt →
+    0 < missingEvidence requirements.items (replicaOfState (execution.state now)) →
+    ∃ observed, now < observed ∧ AdmissionCheckpoint requirements execution observed
+
+/-- A finite retry boundary covered by bounded actual response opportunities
+cannot retain a positive deficit. -/
+theorem BoundedResponses.completeAtEnd
+    {publisher : TrieProgramProofs.RawSnapshot} {scope : Serve.Scope}
+    {owner : Option String} {root : ByteArray}
+    {requirements : FiniteRequirements publisher scope owner root}
+    {execution : RetryExecution requirements}
+    (responses : BoundedResponses requirements execution) :
+    PermittedComplete publisher scope owner root
+      (replicaOfState (execution.state execution.endAt)) := by
+  apply (finite_measure_eq_zero_iff_complete requirements).mp
+  apply Nat.eq_zero_of_not_pos
+  intro positive
+  obtain ⟨observed, after, checkpoint⟩ :=
+    responses execution.endAt (Nat.le_refl _) positive
+  exact (Nat.not_lt_of_ge (Nat.le_of_lt after)) checkpoint.active
 
 /-- Public complete/pending rows are unchanged throughout any observed part of
 the finite retry prefix. -/
