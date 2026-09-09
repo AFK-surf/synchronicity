@@ -4,6 +4,7 @@ import Synchronicity.MptsyncRetryExecution
 import Synchronicity.MptsyncPromotionHistory
 import Synchronicity.ReconciliationViewExecution
 import Synchronicity.ProductionTimeline
+import Synchronicity.MptsyncScopeChangeCarry
 
 /-! Composition of the actual stable-window executions used by M1.
 
@@ -15,6 +16,42 @@ namespace Synchronicity.MptsyncProductionConvergence
 open VerifiedCore VerifiedCore.Host VerifiedCore.Trie VerifiedCore.Replication
 open SimulatedHost TrieFetchCompletion TrieFetchAdmissionProgress
 open MptsyncConvergence AcceptanceProgress
+
+/-- The old-view baseline for the final stable promotion. In the ordinary
+case it is already established at promotion time. After a scope change, the
+constructor instead records that earlier production command and independent
+metadata; the required baseline is transported through acceptance and retry. -/
+inductive PromotionInitialSource (services : MaterializedView.Services)
+    (origin : Origin.Parsed)
+    (accepted : MptsyncAdvertisementWindow.AcceptedLatest valid origin latest heads)
+    (state : SimulatedHost.State) (world : TrieDiffCoverage.World) : Prop where
+  | atPromotion
+      (evidence : MptsyncPromotionHistory.InitialViewEvidence services origin state world) :
+      PromotionInitialSource services origin accepted state world
+  | afterScopeChange
+      (production : ScopeChangeRefinement.Successful spaces changedAt before
+        accepted.initialState report)
+      (quiet : before.faults = [])
+      (reported : decision ∈ report.demotions)
+      (originAligned : decision.complete.origin = Origin.canonical origin)
+      (metadata : ScopeChangePromotionBaseline.MetadataContracts
+        state.db origin world services) :
+      PromotionInitialSource services origin accepted state world
+
+theorem PromotionInitialSource.initial
+    (source : PromotionInitialSource services origin accepted state world)
+    (retry : MptsyncRetryExecution.RetryExecution requirements)
+    (acceptedStart : accepted.acceptedState = retry.state 0)
+    (promotionState : retry.state retry.endAt = state)
+    (laterSlots : StableSlots state (Origin.canonical origin)
+      accepted.final accepted.acceptedView) :
+    PromotionInitialView.Initial state.db origin world services := by
+  cases source with
+  | atPromotion evidence => exact evidence.initial
+  | afterScopeChange production quiet reported originAligned metadata =>
+      exact MptsyncScopeChangeCarry.initial_after_acceptance_and_retry
+        production quiet reported originAligned accepted.accepted retry acceptedStart
+          promotionState laterSlots metadata
 
 /-- The actual promotion observation following one completed retry trace. -/
 structure PromotionWindow (services : MaterializedView.Services)
@@ -41,8 +78,7 @@ structure PromotionWindow (services : MaterializedView.Services)
   acceptedAt : accepted.acceptedState = timeline retryStart
   world : TrieDiffCoverage.World
   host : MptsyncPromotionHistory.HostContracts (trace.state index) world services
-  initial : MptsyncPromotionHistory.InitialViewEvidence services origin
-    (trace.state index) world
+  initial : PromotionInitialSource services origin accepted (trace.state index) world
   targetSnapshot : target.snapshot = world.snapshot
   targetScope : target.scope = opportunity.scope
   targetReplicas : target.replicas = opportunity.replicas
@@ -148,10 +184,12 @@ theorem StableRun.converges
   let ready := TrieCompleteConverse.ready_of_semantic_completion window.opportunity
     run.publisher promotionRequirements promotionComplete carriedToPrepared window.reads
   have reachedFinal : CorrectView services origin target ready.final.db := by
+    have initialViewReady := window.initial.initial run.retry acceptedStart
+      promotionState laterSlots
     exact StablePromotionTarget.actual_promotion_reaches_after_frames accepted.delivered
       accepted.accepted accepted.initialBound laterSlots ready
       window.world services window.host.closed window.host.faithful window.host.normalization
-      window.host.relational window.initial.initial target targetOrigin rfl
+      window.host.relational initialViewReady target targetOrigin rfl
       window.targetSnapshot window.targetScope window.targetReplicas window.targetBefore
   have actualStep : ReconciliationExecution.Step (.promotion origin window.now window.refused)
       (trace.state window.index) (trace.state (window.index + 1)) := by
