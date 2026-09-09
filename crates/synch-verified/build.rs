@@ -72,6 +72,7 @@ fn main() {
         "Replication/History",
         "Replication/Exchange",
         "Replication/Contact",
+        "Replication/OriginSchedule",
         "Authorization/Model",
         "Authorization/Read",
         "Authorization/Projection",

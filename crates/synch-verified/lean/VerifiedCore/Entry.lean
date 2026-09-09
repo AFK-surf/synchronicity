@@ -431,6 +431,10 @@ def dispatch : Command → Native
     if peers.length > UInt64.size || !(peers.all (·.size == 32)) ||
         cursor.any (·.size != 32) || maximum == 0 || maximum > 256 then protocol
     else pure (terminalOf (Replication.Contact.plan peers cursor maximum.toNat))
+  | .planOrigins items cursor maximum =>
+    if items.length > UInt64.size || maximum == 0 || maximum > 4096 ||
+        !(items.all fun item => item.weight > 0 && item.weight ≤ maximum) then protocol
+    else pure (terminalOf (Replication.OriginSchedule.plan items cursor maximum.toNat))
   | .planExchange ours theirs servable =>
     if servable.length > UInt64.size ||
         !(ours ++ theirs ++ servable).all (·.root.size == 32) then protocol

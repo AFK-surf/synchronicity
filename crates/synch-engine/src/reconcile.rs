@@ -68,6 +68,9 @@ pub const MAX_UNPRODUCTIVE_ROUNDS: u32 = 3;
 /// turn. Trie admission commits each verified batch, so a large honest origin
 /// accumulates progress across these slices.
 const PENDING_FETCH_BUDGET: Duration = Duration::from_secs(5);
+/// Pending origins admitted to one peer exchange. Combined with the per-origin
+/// budget this leaves the outer peer deadline room to finish and persist turns.
+const PENDING_ORIGIN_FANOUT: usize = 4;
 
 /// What a promotion attempt concluded.
 ///
@@ -222,6 +225,9 @@ const MAX_REFUSED_HEADS: usize = 1024;
 /// those on the blocking pool — the exchange itself then needs no store at all.
 struct Advertisement {
     summaries: Vec<HeadSummary>,
+    /// Reserved cursor for this page. Persisted only after the Hello attempt
+    /// returns; cancellation before then leaves the peer's old cursor intact.
+    cursor: Option<OriginId>,
     declared: DeclaredScope,
     servable: Vec<SignedHead>,
 }
@@ -235,12 +241,12 @@ struct Advertisement {
 /// lowest-sorting prefix forever.
 fn page_summaries(
     summaries: Vec<HeadSummary>,
-    cursor: &mut Option<OriginId>,
+    cursor: Option<&OriginId>,
     maximum: usize,
-) -> Vec<HeadSummary> {
+) -> Result<(Vec<HeadSummary>, Option<OriginId>)> {
     debug_assert!(maximum >= 2);
     if summaries.len() <= maximum {
-        return summaries;
+        return Ok((summaries, None));
     }
 
     let mut groups: Vec<Vec<HeadSummary>> = Vec::new();
@@ -250,55 +256,71 @@ fn page_summaries(
             _ => groups.push(vec![summary]),
         }
     }
-    let start = cursor
-        .as_ref()
-        .and_then(|last| groups.iter().position(|group| group[0].origin > *last))
-        .unwrap_or(0);
+    let plan = synch_verified::replication::plan_origins(
+        groups
+            .iter()
+            .map(|group| synch_verified::replication::OriginItem {
+                origin: group[0].origin.canonical(),
+                weight: group.len() as u64,
+            })
+            .collect(),
+        cursor.map(OriginId::canonical),
+        maximum as u64,
+    )
+    .map_err(|error| EngineError::Record(error.to_string()))?;
     let mut selected = Vec::with_capacity(maximum);
-    for offset in 0..groups.len() {
-        let group = &groups[(start + offset) % groups.len()];
-        if selected.len() + group.len() > maximum {
-            break;
-        }
+    for position in plan.positions {
+        let group = groups
+            .get(position as usize)
+            .ok_or_else(|| EngineError::Record("invalid Lean origin position".into()))?;
         selected.extend(group.iter().cloned());
     }
-    if let Some(last) = selected.last() {
-        *cursor = Some(last.origin.clone());
-    }
-    selected
+    let next = selected.last().map(|last| last.origin.clone());
+    Ok((selected, next))
 }
 
-/// Applies [`page_summaries`] to one peer's independently completed position.
+/// Plans from one peer's independently completed position without advancing it.
 fn page_summaries_for_peer(
     summaries: Vec<HeadSummary>,
-    cursors: &mut HashMap<NodeId, OriginId>,
+    cursors: &HashMap<NodeId, OriginId>,
     peer: NodeId,
     maximum: usize,
-) -> Vec<HeadSummary> {
-    let mut cursor = cursors.get(&peer).cloned();
-    let selected = page_summaries(summaries, &mut cursor, maximum);
-    if let Some(cursor) = cursor {
-        cursors.insert(peer, cursor);
-    }
-    selected
+) -> Result<(Vec<HeadSummary>, Option<OriginId>)> {
+    page_summaries(summaries, cursors.get(&peer), maximum)
 }
 
 /// Starts after the last completed pending attempt while retaining the store's
 /// stable origin order. The caller advances the cursor only after an attempt
 /// has returned or reached its local slice deadline.
 fn rotate_pending<T>(
-    mut pending: Vec<T>,
+    pending: Vec<T>,
     cursor: Option<&OriginId>,
+    maximum: usize,
     origin: impl Fn(&T) -> &OriginId,
-) -> Vec<T> {
-    if let Some(last) = cursor {
-        let start = pending
+) -> Result<Vec<T>> {
+    let plan = synch_verified::replication::plan_origins(
+        pending
             .iter()
-            .position(|stored| origin(stored) > last)
-            .unwrap_or(0);
-        pending.rotate_left(start);
+            .map(|item| synch_verified::replication::OriginItem {
+                origin: origin(item).canonical(),
+                weight: 1,
+            })
+            .collect(),
+        cursor.map(OriginId::canonical),
+        maximum as u64,
+    )
+    .map_err(|error| EngineError::Record(error.to_string()))?;
+    let mut pending = pending.into_iter().map(Some).collect::<Vec<_>>();
+    let mut selected = Vec::with_capacity(plan.positions.len());
+    for position in plan.positions {
+        selected.push(
+            pending
+                .get_mut(position as usize)
+                .and_then(Option::take)
+                .ok_or_else(|| EngineError::Record("invalid Lean origin position".into()))?,
+        );
     }
-    pending
+    Ok(selected)
 }
 
 impl Syncer {
@@ -397,7 +419,7 @@ impl Syncer {
     pub fn local_summaries(&self) -> Result<Vec<HeadSummary>> {
         let mut out = self.all_local_summaries()?;
         if out.len() > synch_core::MAX_HEADS_PER_MESSAGE {
-            out = page_summaries(out, &mut None, synch_core::MAX_HEADS_PER_MESSAGE);
+            (out, _) = page_summaries(out, None, synch_core::MAX_HEADS_PER_MESSAGE)?;
         }
         Ok(out)
     }
@@ -406,11 +428,11 @@ impl Syncer {
     ///
     /// Cursors are peer-keyed: combining one global advertisement cursor with
     /// the independently rotating contact scheduler can phase-lock a peer to a
-    /// strict subset of pages. Constructing this page is the attempted Hello;
-    /// a cancelled later exchange may skip it once, but cyclic paging revisits
-    /// it and cannot permanently hide an origin.
-    fn local_summaries_for(&self, peer: NodeId) -> Result<Vec<HeadSummary>> {
+    /// strict subset of pages. Planning reserves the next cursor but does not
+    /// persist it; the caller does so only after its Hello attempt returns.
+    fn local_summaries_for(&self, peer: NodeId) -> Result<(Vec<HeadSummary>, Option<OriginId>)> {
         let mut out = self.all_local_summaries()?;
+        let mut next = None;
         if out.len() > synch_core::MAX_HEADS_PER_MESSAGE {
             tracing::warn!(
                 summaries = out.len(),
@@ -418,14 +440,25 @@ impl Syncer {
                 peer = %peer.fmt_short(),
                 "more origins than one Hello can carry: advertising this peer's next origin page"
             );
-            let mut cursors = self
+            let cursors = self
                 .advertisement_cursors
                 .lock()
                 .unwrap_or_else(std::sync::PoisonError::into_inner);
-            out =
-                page_summaries_for_peer(out, &mut cursors, peer, synch_core::MAX_HEADS_PER_MESSAGE);
+            (out, next) =
+                page_summaries_for_peer(out, &cursors, peer, synch_core::MAX_HEADS_PER_MESSAGE)?;
         }
-        Ok(out)
+        Ok((out, next))
+    }
+
+    /// Persists a reserved advertisement cursor after the corresponding Hello
+    /// attempt completed. A dropped future never calls this method.
+    fn summaries_attempted(&self, peer: NodeId, cursor: Option<OriginId>) {
+        if let Some(cursor) = cursor {
+            self.advertisement_cursors
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+                .insert(peer, cursor);
+        }
     }
 
     /// All summary slots before applying the wire cap.
@@ -476,7 +509,8 @@ impl Syncer {
         }
         out.sort_by(|a, b| {
             a.origin
-                .cmp(&b.origin)
+                .canonical()
+                .cmp(&b.origin.canonical())
                 .then(a.order_key().cmp(&b.order_key()))
         });
         Ok(out)
@@ -844,11 +878,14 @@ impl Syncer {
     /// peers say its origin had got without adopting anything.
     pub(crate) async fn observe_with(&self, client: &MptClient) -> Result<Vec<HeadSummary>> {
         let ours = self.summaries_off_runtime(client.remote_id()).await?;
-        let exchange = client
+        let peer = client.remote_id();
+        let attempted = client
             .head_exchange(ours.summaries, ours.declared, |_theirs| {
                 (Vec::new(), Vec::new())
             })
-            .await?;
+            .await;
+        self.summaries_attempted(peer, ours.cursor);
+        let exchange = attempted?;
         let syncer = self.clone();
         let peer = client.remote_id();
         let summaries = exchange.summaries.clone();
@@ -872,6 +909,7 @@ impl Syncer {
     ) -> Result<()> {
         let Advertisement {
             summaries: ours,
+            cursor,
             declared,
             ..
         } = self.advertisement_off_runtime(client.remote_id()).await?;
@@ -885,7 +923,8 @@ impl Syncer {
             .await?
         };
         let wanted = own.clone();
-        let exchange = client
+        let peer = client.remote_id();
+        let attempted = client
             .head_exchange(ours, declared, move |summaries| {
                 let peer_has_own = summaries.iter().any(|summary| summary.origin == wanted);
                 (
@@ -893,7 +932,9 @@ impl Syncer {
                     peer_has_own.then_some(wanted.clone()).into_iter().collect(),
                 )
             })
-            .await?;
+            .await;
+        self.summaries_attempted(peer, cursor);
+        let exchange = attempted?;
 
         {
             let syncer = self.clone();
@@ -945,8 +986,10 @@ impl Syncer {
     async fn summaries_off_runtime(&self, peer: synch_core::NodeId) -> Result<Advertisement> {
         let syncer = self.clone();
         crate::blocking::offload(move || {
+            let (summaries, cursor) = syncer.local_summaries_for(peer)?;
             Ok(Advertisement {
-                summaries: syncer.local_summaries_for(peer)?,
+                summaries,
+                cursor,
                 declared: syncer.declared_scope(peer)?,
                 servable: Vec::new(),
             })
@@ -962,7 +1005,7 @@ impl Syncer {
     async fn advertisement_off_runtime(&self, peer: synch_core::NodeId) -> Result<Advertisement> {
         let syncer = self.clone();
         crate::blocking::offload(move || {
-            let summaries = syncer.local_summaries_for(peer)?;
+            let (summaries, cursor) = syncer.local_summaries_for(peer)?;
             let declared = syncer.declared_scope(peer)?;
             // Filtered by the summaries this same exchange carries, not by the
             // complete slot: a head is worth pushing only if this node can
@@ -986,6 +1029,7 @@ impl Syncer {
                 .collect();
             Ok(Advertisement {
                 summaries,
+                cursor,
                 declared,
                 servable,
             })
@@ -1178,12 +1222,14 @@ impl Syncer {
         // the blocking pool. The decision below needs only those heads (§10).
         let Advertisement {
             summaries: ours,
+            cursor,
             declared,
             servable,
         } = self.advertisement_off_runtime(client.remote_id()).await?;
 
         let mut report = SyncReport::default();
         let mut planning_failure = None;
+        let peer = client.remote_id();
         let exchange = client
             .head_exchange(ours.clone(), declared, |theirs| {
                 match exchange_plan(&ours, theirs, &servable) {
@@ -1195,6 +1241,7 @@ impl Syncer {
                 }
             })
             .await;
+        self.summaries_attempted(peer, cursor);
         if let Some(error) = planning_failure {
             return Err(error);
         }
@@ -1274,9 +1321,12 @@ impl Syncer {
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
             .clone();
-        for stored in rotate_pending(pending_heads, completed.as_ref(), |stored| {
-            &stored.head.origin
-        }) {
+        for stored in rotate_pending(
+            pending_heads,
+            completed.as_ref(),
+            PENDING_ORIGIN_FANOUT,
+            |stored| &stored.head.origin,
+        )? {
             let pending = stored.head;
             if !serves_trie(
                 &theirs.summaries,
@@ -1284,6 +1334,15 @@ impl Syncer {
                 pending.seq,
                 pending.root.0,
             ) {
+                // The origin received a completed scheduling turn even though
+                // this peer cannot serve it. Retaining the cursor here would
+                // let an unavailable prefix occupy every later round and hide
+                // an origin this same peer can serve.
+                *self
+                    .pending_cursor
+                    .lock()
+                    .unwrap_or_else(std::sync::PoisonError::into_inner) =
+                    Some(pending.origin.clone());
                 continue;
             }
             let attempted = tokio::time::timeout(
@@ -1434,8 +1493,20 @@ fn fetch_domain_error(error: synch_verified::trie::TrieFetchDomainError) -> Engi
 /// `Notify` being threaded through the endpoint constructor to connect two
 /// syncers that never knew about each other.
 impl HeadSink for Syncer {
-    fn local_summaries(&self, peer: NodeId) -> std::result::Result<Vec<HeadSummary>, NetError> {
+    fn local_summaries(
+        &self,
+        peer: NodeId,
+    ) -> std::result::Result<(Vec<HeadSummary>, Option<OriginId>), NetError> {
         self.local_summaries_for(peer).map_err(to_net)
+    }
+
+    fn summaries_attempted(
+        &self,
+        peer: NodeId,
+        cursor: Option<OriginId>,
+    ) -> std::result::Result<(), NetError> {
+        Syncer::summaries_attempted(self, peer, cursor);
+        Ok(())
     }
 
     fn observe_summaries_from(
@@ -1856,25 +1927,23 @@ mod tests {
                 ]
             })
             .collect::<Vec<_>>();
-        // Match the production ordering rather than relying on construction
-        // order: OriginId orders named origins by domain and then member id.
+        // Match the canonical text ordering consumed by the verified planner
+        // rather than relying on construction order.
         let mut summaries = summaries;
         summaries.sort_by(|a, b| {
             a.origin
-                .cmp(&b.origin)
+                .canonical()
+                .cmp(&b.origin.canonical())
                 .then(a.order_key().cmp(&b.order_key()))
         });
-        let mut cursor = None;
-        let first = page_summaries(
+        let (first, cursor) =
+            page_summaries(summaries.clone(), None, synch_core::MAX_HEADS_PER_MESSAGE).unwrap();
+        let (second, _) = page_summaries(
             summaries.clone(),
-            &mut cursor,
+            cursor.as_ref(),
             synch_core::MAX_HEADS_PER_MESSAGE,
-        );
-        let second = page_summaries(
-            summaries.clone(),
-            &mut cursor,
-            synch_core::MAX_HEADS_PER_MESSAGE,
-        );
+        )
+        .unwrap();
 
         assert_eq!(first.len(), synch_core::MAX_HEADS_PER_MESSAGE);
         assert_eq!(second.len(), synch_core::MAX_HEADS_PER_MESSAGE);
@@ -1894,24 +1963,36 @@ mod tests {
         let peer_a = SecretKey::generate().public();
         let peer_b = SecretKey::generate().public();
         let mut cursors = HashMap::new();
-        let first_a = page_summaries_for_peer(
+        let (first_a, reserved_a) = page_summaries_for_peer(
             summaries.clone(),
-            &mut cursors,
+            &cursors,
             peer_a,
             synch_core::MAX_HEADS_PER_MESSAGE,
-        );
-        let second_a = page_summaries_for_peer(
+        )
+        .unwrap();
+        let (cancelled_a, _) = page_summaries_for_peer(
             summaries.clone(),
-            &mut cursors,
+            &cursors,
             peer_a,
             synch_core::MAX_HEADS_PER_MESSAGE,
-        );
-        let first_b = page_summaries_for_peer(
+        )
+        .unwrap();
+        assert_eq!(first_a, cancelled_a, "cancellation retains the old cursor");
+        cursors.insert(peer_a, reserved_a.unwrap());
+        let (second_a, _) = page_summaries_for_peer(
+            summaries.clone(),
+            &cursors,
+            peer_a,
+            synch_core::MAX_HEADS_PER_MESSAGE,
+        )
+        .unwrap();
+        let (first_b, _) = page_summaries_for_peer(
             summaries,
-            &mut cursors,
+            &cursors,
             peer_b,
             synch_core::MAX_HEADS_PER_MESSAGE,
-        );
+        )
+        .unwrap();
         assert_eq!(first_a, first_b, "a new peer starts on its own first page");
         assert_ne!(
             first_a, second_a,
@@ -1933,11 +2014,11 @@ mod tests {
         // does not update this cursor and therefore retries the in-flight item.
         let a = pending[0].origin.clone();
         assert_eq!(
-            rotate_pending(pending.clone(), None, |head| &head.origin)[0].origin,
+            rotate_pending(pending.clone(), None, 3, |head| &head.origin).unwrap()[0].origin,
             a,
             "fixed ordering makes the stalled prefix lead every fresh pass"
         );
-        let rotated = rotate_pending(pending, Some(&a), |head| &head.origin);
+        let rotated = rotate_pending(pending, Some(&a), 3, |head| &head.origin).unwrap();
         assert_eq!(
             rotated[0].origin,
             OriginId::named("b", "x.example").unwrap()
@@ -1947,6 +2028,18 @@ mod tests {
             OriginId::named("c", "x.example").unwrap()
         );
         assert_eq!(rotated[2].origin, a);
+    }
+
+    #[test]
+    fn changing_scope_forgets_process_local_refusal_verdicts() {
+        let (_dir, store, _key, origin) = setup();
+        let syncer = Syncer::new(store);
+        syncer.refuse((origin, 7, Hash::new(b"new"), Hash::new(b"old")));
+        assert_eq!(syncer.refused.lock().unwrap().len(), 1);
+
+        syncer.scope_changed();
+
+        assert!(syncer.refused.lock().unwrap().is_empty());
     }
 
     #[test]

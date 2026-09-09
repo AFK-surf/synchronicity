@@ -1,7 +1,9 @@
 //! Whole metadata exchange planning, executed by the mandatory Lean core.
 use crate::operation::{self, terminal, Command};
 
-pub use crate::generated::{Advertised, ContactPlan, ExchangePlan};
+pub use crate::generated::{
+    Advertised, ContactPlan, ExchangePlan, Item as OriginItem, Plan as OriginPlan,
+};
 pub use crate::operation::OperationError;
 
 /// Select servable heads to push and origins to request. Summary order,
@@ -31,6 +33,22 @@ pub fn plan_contact(
 ) -> Result<ContactPlan, OperationError<std::convert::Infallible>> {
     let bytes = operation::run_pure(&Command::PlanContact {
         peers,
+        cursor,
+        maximum,
+    })?;
+    terminal(&bytes).map_err(|()| OperationError::Protocol)
+}
+
+/// Select whole origin groups after the completed cursor without exceeding
+/// the record/work budget. Callers commit the cursor only after attempting the
+/// selected batch.
+pub fn plan_origins(
+    items: Vec<OriginItem>,
+    cursor: Option<String>,
+    maximum: u64,
+) -> Result<OriginPlan, OperationError<std::convert::Infallible>> {
+    let bytes = operation::run_pure(&Command::PlanOrigins {
+        items,
         cursor,
         maximum,
     })?;

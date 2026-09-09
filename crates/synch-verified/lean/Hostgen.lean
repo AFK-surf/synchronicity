@@ -89,6 +89,8 @@ def messages : List Name := [
   ``VerifiedCore.Replication.Exchange.Advertised,
   ``VerifiedCore.Replication.Exchange.ExchangePlan,
   ``VerifiedCore.Replication.Contact.ContactPlan,
+  ``VerifiedCore.Replication.OriginSchedule.Item,
+  ``VerifiedCore.Replication.OriginSchedule.Plan,
   ``VerifiedCore.Cas.Codec.CellType, ``VerifiedCore.Cas.PinHolder, ``VerifiedCore.Cas.Input.Kind,
   ``VerifiedCore.Cas.Outcome, ``VerifiedCore.Origin.Error,
   ``VerifiedCore.Origin.Named, ``VerifiedCore.Origin.Parsed, ``VerifiedCore.Trie.LookupError,

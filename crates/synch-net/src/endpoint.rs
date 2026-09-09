@@ -268,8 +268,8 @@ impl crate::HeadSink for RefuseHeads {
     fn local_summaries(
         &self,
         _peer: synch_core::NodeId,
-    ) -> Result<Vec<synch_core::HeadSummary>, NetError> {
-        Ok(Vec::new())
+    ) -> Result<(Vec<synch_core::HeadSummary>, Option<synch_core::OriginId>), NetError> {
+        Ok((Vec::new(), None))
     }
 
     fn observe_summaries_from(

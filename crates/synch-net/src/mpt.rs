@@ -39,7 +39,21 @@ pub trait HeadSink: Send + Sync + std::fmt::Debug + 'static {
     ///
     /// The peer identity lets an oversized summary set be paged independently
     /// per remote rather than phase-locking one global cursor to contact order.
-    fn local_summaries(&self, peer: NodeId) -> Result<Vec<HeadSummary>, NetError>;
+    fn local_summaries(
+        &self,
+        peer: NodeId,
+    ) -> Result<(Vec<HeadSummary>, Option<OriginId>), NetError>;
+
+    /// Records the cursor of a summary page only after its `Hello` frame was
+    /// written. Dropping a cancelled response before that point must retain
+    /// the old cursor so an unseen page is not counted as attempted.
+    fn summaries_attempted(
+        &self,
+        _peer: NodeId,
+        _cursor: Option<OriginId>,
+    ) -> Result<(), NetError> {
+        Ok(())
+    }
 
     /// Records what a peer advertised for this node's own origin (§3.4).
     fn observe_summaries_from(
@@ -216,9 +230,9 @@ impl MptProtocol {
                 // pair runs on the blocking pool (§5.1).
                 let sink = self.heads.clone();
                 let store = self.store().clone();
-                let (ours, scope) = crate::blocking::offload(move || {
+                let (ours, cursor, scope) = crate::blocking::offload(move || {
                     sink.observe_summaries_from(peer, &heads, now_ns())?;
-                    let summaries = sink.local_summaries(peer)?;
+                    let (summaries, cursor) = sink.local_summaries(peer)?;
                     // What this node will serve that peer, so a delegated one
                     // can learn the scope it is about to walk under (§5.5).
                     // The three-valued shape is the declaration, not a
@@ -234,7 +248,7 @@ impl MptProtocol {
                             DeclaredScope::Confined(spaces)
                         }
                     };
-                    Ok((summaries, scope))
+                    Ok((summaries, cursor, scope))
                 })
                 .await?;
                 write_frame(
@@ -246,6 +260,8 @@ impl MptProtocol {
                     },
                 )
                 .await?;
+                let sink = self.heads.clone();
+                crate::blocking::offload(move || sink.summaries_attempted(peer, cursor)).await?;
 
                 // The peer pushes what it has that we lack, then asks for what
                 // we have that it lacks.
@@ -813,8 +829,11 @@ mod tests {
     }
 
     impl HeadSink for Picky {
-        fn local_summaries(&self, _peer: NodeId) -> Result<Vec<HeadSummary>, NetError> {
-            Ok(Vec::new())
+        fn local_summaries(
+            &self,
+            _peer: NodeId,
+        ) -> Result<(Vec<HeadSummary>, Option<OriginId>), NetError> {
+            Ok((Vec::new(), None))
         }
 
         fn observe_summaries_from(
@@ -1054,7 +1073,10 @@ mod tests {
     }
 
     impl HeadSink for Counting {
-        fn local_summaries(&self, _peer: NodeId) -> Result<Vec<HeadSummary>, NetError> {
+        fn local_summaries(
+            &self,
+            _peer: NodeId,
+        ) -> Result<(Vec<HeadSummary>, Option<OriginId>), NetError> {
             use std::sync::atomic::Ordering;
             let now = self.now.fetch_add(1, Ordering::SeqCst) + 1;
             self.peak.fetch_max(now, Ordering::SeqCst);
@@ -1062,7 +1084,7 @@ mod tests {
             // machine, and short enough not to slow the suite down.
             std::thread::sleep(std::time::Duration::from_millis(150));
             self.now.fetch_sub(1, Ordering::SeqCst);
-            Ok(Vec::new())
+            Ok((Vec::new(), None))
         }
 
         fn observe_summaries_from(

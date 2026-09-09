@@ -25,6 +25,7 @@ import VerifiedCore.Trie.Fetch
 import VerifiedCore.Host.Peer
 import VerifiedCore.Replication.Exchange
 import VerifiedCore.Replication.Contact
+import VerifiedCore.Replication.OriginSchedule
 import VerifiedCore.Replication.ScopeChange
 import VerifiedCore.Replication.Types
 
@@ -190,6 +191,8 @@ inductive Command where
   | casBlobIn (tx : UInt64) (root : ByteArray)
   /-- Select the next bounded batch of eligible peers in cyclic order. -/
   | planContact (peers : List ByteArray) (cursor : Option ByteArray) (maximum : UInt64)
+  | planOrigins (items : List Replication.OriginSchedule.Item)
+      (cursor : Option String) (maximum : UInt64)
 
   /-- Check that a confined publisher introduces no entries outside its grant. -/
   | trieFirstOutside (root : ByteArray) (prefixes : Option (List ByteArray)) (exact : List ByteArray)
