@@ -69,6 +69,29 @@ theorem ready_uses_delivered_latest
   have pending := pending_of_selected_without_complete complete selected
   exact ready_uses_observed_pending ready accepted.final_stable pending
 
+/-- Fetch/retry work may separate acceptance from promotion. If M3's actual
+slot observation keeps the same stable maximum, the later fresh preparation
+still reads the delivered latest version from pending. -/
+theorem ready_uses_delivered_latest_after_frames
+    (delivered : StableAdvertisementProgress.DeliveredLatest valid origin latestHead heads)
+    (accepted : ObservedAcceptanceFold (Origin.canonical origin) keep initial
+      initialState initialView initialSlots heads final acceptedState acceptedView)
+    (initialBound : initial ≤ rank latestHead)
+    (laterSlots : StableSlots state (Origin.canonical origin) final view)
+    (complete : view (Origin.canonical origin) .complete = none)
+    (ready : PromotionProgress.Ready origin now refused state) :
+    ready.pending.head.seq = latestHead.seq ∧
+      ready.pending.head.root = latestHead.root := by
+  have selected := StableAdvertisementProgress.actual_fold_selects_latest
+    delivered accepted initialBound
+  have sameSelection := stable_slots_selected_equal accepted.final_stable laterSlots
+  have laterSelected : selectedVersion view (Origin.canonical origin) =
+      some (⟨latestHead.seq, latestHead.root⟩ : HeadVersion) := by
+    rw [← sameSelection]
+    exact selected
+  have pending := pending_of_selected_without_complete complete laterSelected
+  exact ready_uses_observed_pending ready laterSlots pending
+
 /-- Actual delivery and acceptance determine the pending candidate; healthy
 production promotion then establishes the aligned scenario view. Completeness
 is still supplied through `Ready` here and is discharged from the actual
