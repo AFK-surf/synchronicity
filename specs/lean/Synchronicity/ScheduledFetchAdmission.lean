@@ -196,20 +196,17 @@ structure ProductionScheduleTimeline (states : Nat → State) where
     occurrenceAt right = some rightOccurrence →
     leftOccurrence.serial = rightOccurrence.serial → left = right
 
-/-- A fresh scheduling window recorded after one particular deficit
-observation on the same production timeline. The exact selected attempt is
-admitted from the receiver state at that scheduler occurrence, not from an
-arbitrarily old deficit snapshot. -/
-structure ResponseWindow (deficitAt : Nat) (finalOrigin : String)
+/-- A fresh scheduling window recorded at one reserved progress turn on the
+same production timeline. The exact selected attempt is admitted by the exact
+retry checkpoint at that turn. -/
+structure ResponseWindow (turn : Nat) (finalOrigin : String)
     (finalSeq : UInt64) (finalRoot : ByteArray)
     (requirements : FiniteRequirements publisher scope owner root)
     (execution : MptsyncRetryExecution.RetryExecution requirements)
     (timeline : ProductionScheduleTimeline execution.state) where
-  observedAt : Nat
-  afterDeficit : deficitAt < observedAt
-  withinRetry : observedAt < execution.endAt
+  withinRetry : turn < execution.endAt
   occurrence : ScheduleOccurrence
-  recorded : timeline.occurrenceAt observedAt = some occurrence
+  recorded : timeline.occurrenceAt turn = some occurrence
   item : OriginSchedule.Item
   member : item ∈ occurrence.inputs.pendingItems
   admit : ∀ round attempt,
@@ -225,18 +222,17 @@ structure ResponseWindow (deficitAt : Nat) (finalOrigin : String)
       ∃ actualTarget,
         FinalTargetAligned (occurrence.inputs.pendingTarget item) actualTarget
           finalOrigin finalSeq finalRoot scope owner root ∧
-        ∃ admission : AdmissionFor actualTarget requirements (execution.state observedAt)
-            (execution.state (observedAt + 1)),
-          execution.step observedAt withinRetry =
+        ∃ admission : AdmissionFor actualTarget requirements (execution.state turn)
+            (execution.state (turn + 1)),
+          execution.step turn withinRetry =
             MptsyncRetryExecution.RetryCheckpoint.admitted admission.admission
 
-/-- The raw schedule and exact-attempt handler in one fresh window produce
-one later ordinary authorized admission. -/
-theorem ResponseWindow.responds
-    (window : ResponseWindow deficitAt finalOrigin finalSeq finalRoot requirements
+/-- The raw schedule and exact-attempt handler in one fresh window identify
+the admitted constructor of that same retry turn. -/
+theorem ResponseWindow.checkpoint
+    (window : ResponseWindow turn finalOrigin finalSeq finalRoot requirements
       execution timeline) :
-    ∃ observed, deficitAt < observed ∧
-      MptsyncRetryExecution.AdmissionCheckpoint requirements execution observed := by
+    MptsyncRetryExecution.AdmissionCheckpoint requirements execution turn := by
   have opportunities := pendingFetchOpportunities window.occurrence.inputs
   obtain ⟨round, before, attempt, attempted, sameItem, opportunity, contactBefore,
       peerAttempt, peerAttempted, samePeer, success⟩ :=
@@ -244,8 +240,7 @@ theorem ResponseWindow.responds
   obtain ⟨actualTarget, aligned, admission, exactStep⟩ :=
     window.admit round attempt before attempted sameItem opportunity contactBefore
       peerAttempt peerAttempted samePeer success
-  exact ⟨window.observedAt, window.afterDeficit,
-    ⟨window.withinRetry, admission.admission, exactStep⟩⟩
+  exact ⟨window.withinRetry, admission.admission, exactStep⟩
 
 /-- An actual retry-limit exit is connected to the next raw pending-origin
 schedule window. The abandoned report itself supplies no admission. -/
@@ -253,7 +248,7 @@ structure AfterRetryLimitWindow
     {origin : Origin.Parsed}
     (exit : MptsyncRetryExecution.RetryLimitExit origin expected refused
       fetchMaximum retryLimit before after)
-    (exitAt : Nat) (finalOrigin : String) (finalSeq : UInt64) (finalRoot : ByteArray)
+    (exitAt turn : Nat) (finalOrigin : String) (finalSeq : UInt64) (finalRoot : ByteArray)
     (requirements : FiniteRequirements publisher scope owner root)
     (execution : MptsyncRetryExecution.RetryExecution requirements)
     (timeline : ProductionScheduleTimeline execution.state) where
@@ -261,11 +256,10 @@ structure AfterRetryLimitWindow
   startedBeforeExit : startedAt < exitAt
   startState : execution.state startedAt = before
   exitState : execution.state exitAt = after
-  observedAt : Nat
-  afterExit : exitAt < observedAt
-  withinRetry : observedAt < execution.endAt
+  afterExit : exitAt < turn
+  withinRetry : turn < execution.endAt
   occurrence : ScheduleOccurrence
-  recorded : timeline.occurrenceAt observedAt = some occurrence
+  recorded : timeline.occurrenceAt turn = some occurrence
   item : OriginSchedule.Item
   requeued : MptsyncRetryExecution.RequeuedAfterLimit exit occurrence.inputs.contacts
     occurrence.inputs.peer occurrence.inputs.pending occurrence.inputs.pendingLink
@@ -285,21 +279,20 @@ structure AfterRetryLimitWindow
       peerAttempt.peer = occurrence.inputs.peer → peerAttempt.outcome = .success →
       ∃ actualTarget,
         TargetAligned (occurrence.inputs.pendingTarget item) actualTarget scope owner root ∧
-        ∃ admission : AdmissionFor actualTarget requirements (execution.state observedAt)
-            (execution.state (observedAt + 1)),
-          execution.step observedAt withinRetry =
+        ∃ admission : AdmissionFor actualTarget requirements (execution.state turn)
+            (execution.state (turn + 1)),
+          execution.step turn withinRetry =
             MptsyncRetryExecution.RetryCheckpoint.admitted admission.admission
 
-theorem AfterRetryLimitWindow.responds
+theorem AfterRetryLimitWindow.checkpoint
     {publisher : TrieProgramProofs.RawSnapshot} {scope : Serve.Scope}
     {owner : Option String} {root : ByteArray}
     {requirements : FiniteRequirements publisher scope owner root}
     {execution : MptsyncRetryExecution.RetryExecution requirements}
     {timeline : ProductionScheduleTimeline execution.state}
-    (window : AfterRetryLimitWindow exit exitAt finalOrigin finalSeq finalRoot
+    (window : AfterRetryLimitWindow exit exitAt turn finalOrigin finalSeq finalRoot
       requirements execution timeline) :
-    ∃ observed, exitAt < observed ∧
-      MptsyncRetryExecution.AdmissionCheckpoint requirements execution observed := by
+    MptsyncRetryExecution.AdmissionCheckpoint requirements execution turn := by
   -- Consume the opportunity attached to this exact retry-limit requeue rather
   -- than deriving an interchangeable opportunity from the raw inputs again.
   obtain ⟨round, before, attempt, attempted, sameItem, opportunity, contactBefore,
@@ -315,18 +308,17 @@ theorem AfterRetryLimitWindow.responds
     exact ((window.occurrence.inputs.pendingPayloads.sameOrigin window.item
       window.requeued.member).trans window.requeued.sameOrigin).trans
         window.finalOriginMatchesExit.symm
-  exact ⟨window.observedAt, window.afterExit,
-    ⟨window.withinRetry, admission.admission, exactStep⟩⟩
+  exact ⟨window.withinRetry, admission.admission, exactStep⟩
 
 /-- One fresh response source is either an ordinary newly queued raw window,
 or the next raw window causally attached to an actual retry-limit exit and
 requeue observation. -/
-inductive ResponseOpportunity (deficitAt : Nat) (finalOrigin : String)
+inductive ResponseOpportunity (turn : Nat) (finalOrigin : String)
     (finalSeq : UInt64) (finalRoot : ByteArray)
     (requirements : FiniteRequirements publisher scope owner root)
     (execution : MptsyncRetryExecution.RetryExecution requirements)
     (timeline : ProductionScheduleTimeline execution.state) where
-  | fresh (window : ResponseWindow deficitAt finalOrigin finalSeq finalRoot requirements execution
+  | fresh (window : ResponseWindow turn finalOrigin finalSeq finalRoot requirements execution
       timeline)
   | afterRetry
       {origin : Origin.Parsed} {expected : Option (UInt64 × ByteArray)}
@@ -334,41 +326,52 @@ inductive ResponseOpportunity (deficitAt : Nat) (finalOrigin : String)
       {before after : State}
       (exit : MptsyncRetryExecution.RetryLimitExit origin expected refused
         fetchMaximum retryLimit before after)
-      (window : AfterRetryLimitWindow exit deficitAt finalOrigin finalSeq finalRoot
+      (window : AfterRetryLimitWindow exit exitAt turn finalOrigin finalSeq finalRoot
         requirements execution timeline) :
-      ResponseOpportunity deficitAt finalOrigin finalSeq finalRoot requirements execution timeline
+      ResponseOpportunity turn finalOrigin finalSeq finalRoot requirements execution timeline
 
-theorem ResponseOpportunity.responds
-    (opportunity : ResponseOpportunity deficitAt finalOrigin finalSeq finalRoot
+theorem ResponseOpportunity.checkpoint
+    (opportunity : ResponseOpportunity turn finalOrigin finalSeq finalRoot
       requirements execution timeline) :
-    ∃ observed, deficitAt < observed ∧
-      MptsyncRetryExecution.AdmissionCheckpoint requirements execution observed := by
+    MptsyncRetryExecution.AdmissionCheckpoint requirements execution turn := by
   cases opportunity with
-  | fresh window => exact window.responds
-  | afterRetry exit window => exact window.responds
+  | fresh window => exact window.checkpoint
+  | afterRetry exit window => exact window.checkpoint
 
-/-- Every positive deficit through the declared retry boundary is followed by
-its own later scheduler occurrence and adjacent authorized admission inside
-that same actual finite prefix.  The contract contains no completion or zero
-measure conclusion. -/
-def BoundedScheduledResponses (finalOrigin : String) (finalSeq : UInt64)
+/-- A finite ordered list of reserved scheduler turns, one per unit of the
+initial semantic deficit. Whenever work remains at a reserved turn, the raw
+pending scheduler occurrence and handler select the admitted constructor of
+that exact retry checkpoint. The structure stores no terminal zero or
+completion conclusion. -/
+structure BoundedScheduledResponses (finalOrigin : String) (finalSeq : UInt64)
     (finalRoot : ByteArray)
     (requirements : FiniteRequirements publisher scope owner root)
     (execution : MptsyncRetryExecution.RetryExecution requirements)
-    (timeline : ProductionScheduleTimeline execution.state) : Prop :=
-  ∀ now, now ≤ execution.endAt →
-    0 < missingEvidence requirements.items (replicaOfState (execution.state now)) →
-    Nonempty (ResponseOpportunity now finalOrigin finalSeq finalRoot requirements execution timeline)
+    (timeline : ProductionScheduleTimeline execution.state) where
+  turns : List Nat
+  count : turns.length =
+    missingEvidence requirements.items (replicaOfState (execution.state 0))
+  ordered : turns.Pairwise (fun left right => left < right)
+  within : ∀ turn ∈ turns, turn < execution.endAt
+  responds : ∀ turn ∈ turns,
+    0 < missingEvidence requirements.items (replicaOfState (execution.state turn)) →
+      Nonempty (ResponseOpportunity turn finalOrigin finalSeq finalRoot
+        requirements execution timeline)
 
 /-- The scheduler payload/handler observations refine the generic bounded
 admission contract over the exact same retry states and indices. -/
-theorem boundedResponses
+def BoundedScheduledResponses.boundedResponses
     (scheduled : BoundedScheduledResponses finalOrigin finalSeq finalRoot
       requirements execution timeline) :
     MptsyncRetryExecution.BoundedResponses requirements execution := by
-  intro now throughEnd missing
-  obtain ⟨opportunity⟩ := scheduled now throughEnd missing
-  exact opportunity.responds
+  exact
+    { turns := scheduled.turns
+      count := scheduled.count
+      ordered := scheduled.ordered
+      within := scheduled.within
+      responds := fun turn member missing =>
+        let ⟨opportunity⟩ := scheduled.responds turn member missing
+        opportunity.checkpoint }
 
 /-- Finite, timeline-indexed scheduler responses establish completion at the
 actual retry boundary without an infinite trace or stationary extension. -/
@@ -382,6 +385,6 @@ theorem completeAtEnd
       requirements execution timeline) :
     PermittedComplete publisher scope owner root
       (replicaOfState (execution.state execution.endAt)) :=
-  (boundedResponses scheduled).completeAtEnd
+  scheduled.boundedResponses.completeAtEnd
 
 end Synchronicity.ScheduledFetchAdmission

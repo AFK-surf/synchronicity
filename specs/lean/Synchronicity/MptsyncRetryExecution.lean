@@ -144,6 +144,16 @@ theorem cancellation_preserves_entries
     rows request.cancelled.db "entries" = rows suspended.db "entries" := by
   rw [show request.cancelled.db = suspended.db from abandon_db suspended]
 
+theorem cancellation_preserves_pins
+    (request : CancelledRequest target reference maximum retryLimit initial suspended) :
+    rows request.cancelled.db "pins" = rows suspended.db "pins" := by
+  rw [show request.cancelled.db = suspended.db from abandon_db suspended]
+
+theorem cancellation_preserves_contentWant
+    (request : CancelledRequest target reference maximum retryLimit initial suspended) :
+    rows request.cancelled.db "content_want" = rows suspended.db "content_want" := by
+  rw [show request.cancelled.db = suspended.db from abandon_db suspended]
+
 /-- An authorized admission preserves any relation distinct from its three
 evidence tables. This is derived from the actual `Fetch.admit` certificate. -/
 theorem admission_preserves_relation (relation : String)
@@ -191,6 +201,16 @@ theorem admission_preserves_entries
     rows after.db "entries" = rows before.db "entries" :=
   admission_preserves_relation "entries" (by decide) (by decide) (by decide) admission
 
+theorem admission_preserves_pins
+    (admission : Admission requirements before after) :
+    rows after.db "pins" = rows before.db "pins" :=
+  admission_preserves_relation "pins" (by decide) (by decide) (by decide) admission
+
+theorem admission_preserves_contentWant
+    (admission : Admission requirements before after) :
+    rows after.db "content_want" = rows before.db "content_want" :=
+  admission_preserves_relation "content_want" (by decide) (by decide) (by decide) admission
+
 def headKeys (db : SimulatedHost.Database) : List (List Cell) :=
   (rows db "heads").map HeadKeyFrame.key
 
@@ -218,7 +238,9 @@ inductive PrefixEvent
       (sameReplica : replicaOfState after = replicaOfState before)
       (sameHeadKeys : headKeys after.db = headKeys before.db)
       (sameHistory : rows after.db "head_history" = rows before.db "head_history")
-      (sameEntries : rows after.db "entries" = rows before.db "entries") :
+      (sameEntries : rows after.db "entries" = rows before.db "entries")
+      (samePins : rows after.db "pins" = rows before.db "pins")
+      (sameContentWant : rows after.db "content_want" = rows before.db "content_want") :
       PrefixEvent requirements effect before after
   | admitted (admission : Admission requirements before after) :
       PrefixEvent requirements effect before after
@@ -227,7 +249,7 @@ theorem PrefixEvent.persistent
     (event : PrefixEvent requirements effect before after) :
     EvidenceIncluded (replicaOfState before) (replicaOfState after) := by
   cases event with
-  | unchanged sameReplica _ _ _ =>
+  | unchanged sameReplica _ _ _ _ _ =>
       rw [sameReplica]
       exact EvidenceIncluded.refl _
   | admitted admission => exact admission.included
@@ -236,22 +258,36 @@ theorem PrefixEvent.preserves_headKeys
     (event : PrefixEvent requirements effect before after) :
     headKeys after.db = headKeys before.db := by
   cases event with
-  | unchanged _ sameHeadKeys _ _ => exact sameHeadKeys
+  | unchanged _ sameHeadKeys _ _ _ _ => exact sameHeadKeys
   | admitted admission => exact admission_preserves_headKeys admission
 
 theorem PrefixEvent.preserves_history
     (event : PrefixEvent requirements effect before after) :
     rows after.db "head_history" = rows before.db "head_history" := by
   cases event with
-  | unchanged _ _ sameHistory _ => exact sameHistory
+  | unchanged _ _ sameHistory _ _ _ => exact sameHistory
   | admitted admission => exact admission_preserves_history admission
 
 theorem PrefixEvent.preserves_entries
     (event : PrefixEvent requirements effect before after) :
     rows after.db "entries" = rows before.db "entries" := by
   cases event with
-  | unchanged _ _ _ sameEntries => exact sameEntries
+  | unchanged _ _ _ sameEntries _ _ => exact sameEntries
   | admitted admission => exact admission_preserves_entries admission
+
+theorem PrefixEvent.preserves_pins
+    (event : PrefixEvent requirements effect before after) :
+    rows after.db "pins" = rows before.db "pins" := by
+  cases event with
+  | unchanged _ _ _ _ samePins _ => exact samePins
+  | admitted admission => exact admission_preserves_pins admission
+
+theorem PrefixEvent.preserves_contentWant
+    (event : PrefixEvent requirements effect before after) :
+    rows after.db "content_want" = rows before.db "content_want" := by
+  cases event with
+  | unchanged _ _ _ _ _ sameContentWant => exact sameContentWant
+  | admitted admission => exact admission_preserves_contentWant admission
 
 /-- A decomposition indexed by the actual `Prefix` proof.  Unlike the old
 parallel `CommittedFrames` witness, this cannot describe another state chain:
@@ -304,13 +340,29 @@ theorem PrefixEvents.preserves_entries
   | refl => rfl
   | step event events ih => exact ih.trans event.preserves_entries
 
+theorem PrefixEvents.preserves_pins
+    (ran : Prefix program before tail after)
+    (events : PrefixEvents requirements ran) :
+    rows after.db "pins" = rows before.db "pins" := by
+  induction events with
+  | refl => rfl
+  | step event events ih => exact ih.trans event.preserves_pins
+
+theorem PrefixEvents.preserves_contentWant
+    (ran : Prefix program before tail after)
+    (events : PrefixEvents requirements ran) :
+    rows after.db "content_want" = rows before.db "content_want" := by
+  induction events with
+  | refl => rfl
+  | step event events ih => exact ih.trans event.preserves_contentWant
+
 /-- Checkpoints include only committed authorized admissions or cancellation
 cleanup at an actual production peer wait. Resumption/restart evidence is
 carried by the cancellation constructor, while checkpoints deliberately omit
 private transaction states. -/
 inductive RetryCheckpoint
     (requirements : FiniteRequirements publisher scope owner root) :
-    SimulatedHost.State → SimulatedHost.State → Prop where
+    SimulatedHost.State → SimulatedHost.State → Type 1 where
   | admitted (admission : Admission requirements before after) :
       RetryCheckpoint requirements before after
   | resumedCancellation
@@ -369,6 +421,27 @@ theorem RetryCheckpoint.preserves_entries
   | restartedCancellation request restarted ran events =>
       exact (events.preserves_entries ran).trans (cancellation_preserves_entries request)
 
+theorem RetryCheckpoint.preserves_pins
+    (step : RetryCheckpoint requirements before after) :
+    rows after.db "pins" = rows before.db "pins" := by
+  cases step with
+  | admitted admission => exact admission_preserves_pins admission
+  | resumedCancellation request resumed ran events =>
+      exact (events.preserves_pins ran).trans (cancellation_preserves_pins request)
+  | restartedCancellation request restarted ran events =>
+      exact (events.preserves_pins ran).trans (cancellation_preserves_pins request)
+
+theorem RetryCheckpoint.preserves_contentWant
+    (step : RetryCheckpoint requirements before after) :
+    rows after.db "content_want" = rows before.db "content_want" := by
+  cases step with
+  | admitted admission => exact admission_preserves_contentWant admission
+  | resumedCancellation request resumed ran events =>
+      exact (events.preserves_contentWant ran).trans (cancellation_preserves_contentWant request)
+  | restartedCancellation request restarted ran events =>
+      exact (events.preserves_contentWant ran).trans
+        (cancellation_preserves_contentWant request)
+
 /-- A finite actual retry prefix.  Every adjacent state before `endAt` is an
 observed requester checkpoint; the structure deliberately says nothing about
 states after that boundary. -/
@@ -417,18 +490,81 @@ structure AdmissionCheckpoint
   admission : Admission requirements (execution.state now) (execution.state (now + 1))
   exactStep : execution.step now active = RetryCheckpoint.admitted admission
 
-/-- Every positive deficit observed through the finite boundary has a later
-actual authorized admission at one adjacent checkpoint of that same finite
-retry prefix.  This is a bounded execution contract: it contains neither a
-zero measure nor a semantic completion conclusion. `endAt` is the external
-finite service-coverage deadline: if a deficit remained there, the contract
-would require its later admitted checkpoint to still lie before that deadline. -/
-def BoundedResponses
+/-- A finite, time-ordered set of actual progress turns. Its cardinality is
+the initial finite deficit. At each turn, an outstanding deficit must select
+the admitted constructor of that exact retry checkpoint; after the measure has
+already reached zero, the remaining reserved turns need no response. -/
+structure BoundedResponses
     (requirements : FiniteRequirements publisher scope owner root)
-    (execution : RetryExecution requirements) : Prop :=
-  ∀ now, now ≤ execution.endAt →
-    0 < missingEvidence requirements.items (replicaOfState (execution.state now)) →
-    ∃ observed, now < observed ∧ AdmissionCheckpoint requirements execution observed
+    (execution : RetryExecution requirements) where
+  turns : List Nat
+  count : turns.length =
+    missingEvidence requirements.items (replicaOfState (execution.state 0))
+  ordered : turns.Pairwise (fun left right => left < right)
+  within : ∀ turn ∈ turns, turn < execution.endAt
+  responds : ∀ turn ∈ turns,
+    0 < missingEvidence requirements.items (replicaOfState (execution.state turn)) →
+      AdmissionCheckpoint requirements execution turn
+
+private theorem RetryExecution.missing_mono
+    (execution : RetryExecution requirements) (before after : Nat)
+    (ordered : before ≤ after) (within : after ≤ execution.endAt) :
+    missingEvidence requirements.items (replicaOfState (execution.state after)) ≤
+      missingEvidence requirements.items (replicaOfState (execution.state before)) := by
+  obtain ⟨span, rfl⟩ := Nat.exists_eq_add_of_le ordered
+  exact missingEvidence_mono requirements.items (execution.carriedFrom before span within)
+
+private theorem BoundedResponses.turns_bound
+    (execution : RetryExecution requirements) (turns : List Nat)
+    (ordered : turns.Pairwise (fun left right => left < right))
+    (within : ∀ turn ∈ turns, turn < execution.endAt)
+    (responds : ∀ turn ∈ turns,
+      0 < missingEvidence requirements.items (replicaOfState (execution.state turn)) →
+        AdmissionCheckpoint requirements execution turn)
+    (start : Nat) (startWithin : start ≤ execution.endAt)
+    (afterStart : ∀ turn ∈ turns, start ≤ turn) :
+    missingEvidence requirements.items
+        (replicaOfState (execution.state execution.endAt)) = 0 ∨
+      missingEvidence requirements.items
+          (replicaOfState (execution.state execution.endAt)) + turns.length ≤
+        missingEvidence requirements.items (replicaOfState (execution.state start)) := by
+  induction turns generalizing start with
+  | nil =>
+      exact Or.inr (by
+        simpa using execution.missing_mono start execution.endAt startWithin
+          (Nat.le_refl _))
+  | cons turn rest ih =>
+      obtain ⟨afterTurn, orderedRest⟩ := List.pairwise_cons.mp ordered
+      have turnMember : turn ∈ turn :: rest := by simp only [List.mem_cons, true_or]
+      have turnWithin : turn < execution.endAt := within turn turnMember
+      have startBeforeTurn : start ≤ turn := afterStart turn turnMember
+      by_cases empty : missingEvidence requirements.items
+          (replicaOfState (execution.state turn)) = 0
+      · have finalBound := execution.missing_mono turn execution.endAt
+          (Nat.le_of_lt turnWithin) (Nat.le_refl _)
+        rw [empty] at finalBound
+        exact Or.inl (Nat.eq_zero_of_le_zero finalBound)
+      · have positive : 0 < missingEvidence requirements.items
+            (replicaOfState (execution.state turn)) := Nat.zero_lt_of_ne_zero empty
+        have checkpoint := responds turn turnMember positive
+        have strict := checkpoint.admission.strict
+        have tailWithin : ∀ next ∈ rest, next < execution.endAt := by
+          intro next member
+          exact within next (by simp only [List.mem_cons, member, or_true])
+        have tailAfter : ∀ next ∈ rest, turn + 1 ≤ next := by
+          intro next member
+          exact Nat.succ_le_of_lt (afterTurn next member)
+        have tail := ih orderedRest tailWithin
+          (fun next member => responds next (by simp only [List.mem_cons, member, or_true]))
+          (turn + 1) (Nat.succ_le_of_lt checkpoint.active) tailAfter
+        cases tail with
+        | inl complete => exact Or.inl complete
+        | inr bounded =>
+            exact Or.inr (by
+              have beforeTurn := execution.missing_mono start turn startBeforeTurn
+                (Nat.le_of_lt turnWithin)
+              simp only [List.length_cons]
+              omega)
 
 /-- A finite retry boundary covered by bounded actual response opportunities
 cannot retain a positive deficit. -/
@@ -441,11 +577,14 @@ theorem BoundedResponses.completeAtEnd
     PermittedComplete publisher scope owner root
       (replicaOfState (execution.state execution.endAt)) := by
   apply (finite_measure_eq_zero_iff_complete requirements).mp
-  apply Nat.eq_zero_of_not_pos
-  intro positive
-  obtain ⟨observed, after, checkpoint⟩ :=
-    responses execution.endAt (Nat.le_refl _) positive
-  exact (Nat.not_lt_of_ge (Nat.le_of_lt after)) checkpoint.active
+  have bounded := BoundedResponses.turns_bound execution responses.turns responses.ordered
+    responses.within responses.responds 0 (Nat.zero_le _)
+      (fun _ _ => Nat.zero_le _)
+  cases bounded with
+  | inl complete => exact complete
+  | inr bound =>
+      rw [responses.count] at bound
+      omega
 
 /-- Public complete/pending rows are unchanged throughout any observed part of
 the finite retry prefix. -/
@@ -496,6 +635,50 @@ theorem RetryExecution.entriesAtEnd (execution : RetryExecution requirements) :
     rows (execution.state execution.endAt).db "entries" =
       rows (execution.state 0).db "entries" := by
   simpa using execution.entriesFrom 0 execution.endAt (by simp)
+
+theorem RetryExecution.pinsFrom (execution : RetryExecution requirements)
+    (start span : Nat) (within : start + span ≤ execution.endAt) :
+    rows (execution.state (start + span)).db "pins" =
+      rows (execution.state start).db "pins" := by
+  induction span with
+  | zero => rfl
+  | succ span ih =>
+    rw [Nat.add_succ]
+    exact (execution.step (start + span) (Nat.lt_of_succ_le within)).preserves_pins.trans
+      (ih (Nat.le_trans (Nat.le_succ (start + span)) within))
+
+theorem RetryExecution.pinsAtEnd (execution : RetryExecution requirements) :
+    rows (execution.state execution.endAt).db "pins" =
+      rows (execution.state 0).db "pins" := by
+  simpa using execution.pinsFrom 0 execution.endAt (by simp)
+
+theorem RetryExecution.contentWantFrom (execution : RetryExecution requirements)
+    (start span : Nat) (within : start + span ≤ execution.endAt) :
+    rows (execution.state (start + span)).db "content_want" =
+      rows (execution.state start).db "content_want" := by
+  induction span with
+  | zero => rfl
+  | succ span ih =>
+    rw [Nat.add_succ]
+    exact
+      (execution.step (start + span) (Nat.lt_of_succ_le within)).preserves_contentWant.trans
+        (ih (Nat.le_trans (Nat.le_succ (start + span)) within))
+
+theorem RetryExecution.contentWantAtEnd (execution : RetryExecution requirements) :
+    rows (execution.state execution.endAt).db "content_want" =
+      rows (execution.state 0).db "content_want" := by
+  simpa using execution.contentWantFrom 0 execution.endAt (by simp)
+
+/-- The public payload relations needed to carry a prior installed view to a
+later-version promotion are unchanged by the same finite retry execution. -/
+theorem RetryExecution.payloadAtEnd (execution : RetryExecution requirements) :
+    rows (execution.state execution.endAt).db "entries" =
+        rows (execution.state 0).db "entries" ∧
+      rows (execution.state execution.endAt).db "pins" =
+        rows (execution.state 0).db "pins" ∧
+      rows (execution.state execution.endAt).db "content_want" =
+        rows (execution.state 0).db "content_want" :=
+  ⟨execution.entriesAtEnd, execution.pinsAtEnd, execution.contentWantAtEnd⟩
 
 private theorem selected_of_headKeys
     (same : headKeys after = headKeys before)
