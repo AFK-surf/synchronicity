@@ -42,6 +42,24 @@ def Cache.forOrigin (cache : Cache) (origin : String) :
   cache.refused.filterMap fun verdict =>
     if verdict.origin = origin then some (verdict.seq, verdict.root, verdict.oldRoot) else none
 
+inductive CommandKind where
+  | fetch
+  | promote
+
+/-- Exact process-memory snapshot supplied to one verified command call. The
+kind is documentary but prevents a proof from silently treating a Fetch's
+captured vector as a later promotion's freshly loaded vector. -/
+structure CommandProjection (kind : CommandKind) (cache : Cache)
+    (origin : Origin.Parsed)
+    (actual : List (UInt64 × ByteArray × ByteArray)) : Prop where
+  exact : actual = cache.forOrigin (Origin.canonical origin)
+
+/-- Only the target origin's projection needs to remain unchanged between a
+scope callback and its later fresh command. Other origins may add verdicts or
+the bounded process cache may be compacted in the meantime. -/
+def OriginProjectionCarry (origin : Origin.Parsed) (before after : Cache) : Prop :=
+  after.forOrigin (Origin.canonical origin) = before.forOrigin (Origin.canonical origin)
+
 /-- A changed durable scope command followed by the production runtime
 callback. The durable execution is fully verified; `callbackCleared` is the
 explicit seam for process memory, which is outside `SimulatedHost.State`. -/
@@ -88,5 +106,13 @@ theorem scope_reset_clears_command_projection
     cacheAfter.forOrigin origin = [] := by
   rw [observed.callbackCleared]
   rfl
+
+theorem carried_scope_reset_projection
+    (observed : ScopeResetObservation spaces now before after report cacheBefore cacheReset)
+    (carry : OriginProjectionCarry origin cacheReset cacheAtCall)
+    (projection : CommandProjection kind cacheAtCall origin actual) :
+    actual = [] := by
+  rw [projection.exact, carry]
+  exact scope_reset_clears_command_projection observed (Origin.canonical origin)
 
 end Synchronicity.MptsyncRefusalCache
