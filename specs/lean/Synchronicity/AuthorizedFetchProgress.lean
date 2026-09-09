@@ -180,6 +180,23 @@ theorem Admission.strict
     exact (usable_value_admission_strict authority response requirements target receiver
       quiet idle valid large bounded nodesBackend valuesBackend fresh outstanding).2
 
+theorem Admission.included
+    (admission : Admission requirements before after) :
+    EvidenceIncluded (replicaOfState before) (replicaOfState after) := by
+  refine Admission.rec (motive := fun _ before after _ =>
+    EvidenceIncluded (replicaOfState before) (replicaOfState after)) ?_ ?_ admission
+  · intro root path hash raw origin serverInitial peerKey publisherOrigin reading
+      authority response requirements target decodedNode receiver quiet idle targetOwner
+      decoded valid nodesBackend valuesBackend freshNode freshOwner outstanding
+    exact (admitted_single_owned_node_includes_evidence target origin path hash raw
+      decodedNode receiver quiet idle targetOwner decoded valid nodesBackend valuesBackend
+      freshNode freshOwner).2.1
+  · intro root path hash bytes owner serverInitial peerKey publisherOrigin reading
+      authority response requirements target receiver quiet idle valid large bounded
+      nodesBackend valuesBackend fresh outstanding
+    exact (admitted_single_value_includes_evidence target path hash bytes receiver quiet idle
+      valid large bounded nodesBackend valuesBackend fresh).2.1
+
 /-- Every remaining deficit is eventually followed by one concrete authorized
 `Fetch.admit` transition in the observed runtime state trace. -/
 def SufficientResponses
