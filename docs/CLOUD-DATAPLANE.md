@@ -77,6 +77,13 @@ docs/REPLICATION.md, `CP README` is control-plane/README.md.
 
 The tenant contract, end to end:
 
+Cue-managed networks also enable hosting and file browsing through the
+shared-secret-authenticated Workspace provisioning endpoint. Each initialization
+or backfill forces both switches on, including a previous administrative disable.
+The same transaction cancels pending collection and preserves existing placement.
+Like the dashboard enable path, it passes the widening transparency gate.
+An empty fleet leaves hosting enabled but unassigned, not ready to serve.
+
 1. An org admin enables **cloud hosting** for a network in the dashboard (or
    `PUT /api/orgs/:slug/networks/:net/cloud-hosting/enabled`, admin-gated,
    mirroring the browse toggle). Default off.

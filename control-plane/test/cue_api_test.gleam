@@ -631,3 +631,140 @@ pub fn enroll_invalid_nk_is_rejected_test() {
   assert string.contains(simulate.read_body(resp), "invalid_nk")
   assert count(env, "SELECT count(*) FROM devices", []) == 0
 }
+
+pub fn provisioning_enables_cloud_features_and_places_new_network_test() {
+  let env =
+    setup_seeded(fn(conn) {
+      let assert Ok(_) =
+        sqlite.exec(
+          conn,
+          "INSERT INTO data_planes (id, created_at) VALUES ('dp-cue', 0)",
+          [],
+        )
+      Nil
+    })
+  let resp =
+    put(
+      env,
+      "wsp_cloud",
+      Some(secret),
+      body("Cloud", "usr_cloud", "cloud@cue.test"),
+    )
+  assert resp.status == 200
+  assert count(
+      env,
+      "SELECT count(*) FROM networks WHERE browse_enabled = 1 AND cloud_hosted = 1 AND cloud_dp_id = 'dp-cue'",
+      [],
+    )
+    == 1
+}
+
+pub fn backfill_reenables_features_preserves_placement_and_cancels_collection_test() {
+  let env =
+    setup_seeded(fn(conn) {
+      let assert Ok(_) =
+        sqlite.exec(
+          conn,
+          "INSERT INTO data_planes (id, created_at) VALUES ('dp-cue', 0)",
+          [],
+        )
+      Nil
+    })
+  let payload = body("Cloud", "usr_cloud", "cloud@cue.test")
+  assert put(env, "wsp_cloud", Some(secret), payload).status == 200
+  let assert Ok(conn) = db.open_primary(env.db_path)
+  // Represent a previously provisioned network whose admin disabled both flags.
+  let assert Ok(_) =
+    sqlite.exec(
+      conn,
+      "UPDATE networks SET browse_enabled = 0, cloud_hosted = 0, cloud_dp_id = 'dp-cue'",
+      [],
+    )
+  let assert Ok(_) =
+    sqlite.exec(
+      conn,
+      "INSERT INTO cloud_collect_queue (org_slug, network_name, disabled_at, dp_id) SELECT o.slug, n.name, 0, 'dp-cue' FROM networks n JOIN orgs o ON o.id = n.org_id",
+      [],
+    )
+  let assert Ok(_) =
+    sqlite.exec(
+      conn,
+      "INSERT INTO data_planes (id, created_at) VALUES ('dp-empty', 0)",
+      [],
+    )
+  sqlite.close(conn)
+  assert put(env, "wsp_cloud", Some(secret), payload).status == 200
+  assert put(env, "wsp_cloud", Some(secret), payload).status == 200
+  assert count(
+      env,
+      "SELECT count(*) FROM networks WHERE browse_enabled = 1 AND cloud_hosted = 1 AND cloud_dp_id = 'dp-cue'",
+      [],
+    )
+    == 1
+  assert count(env, "SELECT count(*) FROM cloud_collect_queue", []) == 0
+  assert count(env, "SELECT count(*) FROM cue_workspace_orgs", []) == 1
+}
+
+pub fn provisioning_without_fleet_enables_flags_but_does_not_invent_placement_test() {
+  let env = setup()
+  assert put(
+      env,
+      "wsp_cloud",
+      Some(secret),
+      body("Cloud", "usr_cloud", "cloud@cue.test"),
+    ).status
+    == 200
+  assert count(
+      env,
+      "SELECT count(*) FROM networks WHERE browse_enabled = 1 AND cloud_hosted = 1 AND cloud_dp_id IS NULL",
+      [],
+    )
+    == 1
+}
+
+pub fn rejected_backfill_rolls_back_flags_placement_and_collection_test() {
+  let env =
+    setup_seeded(fn(conn) {
+      let assert Ok(_) =
+        sqlite.exec(
+          conn,
+          "INSERT INTO data_planes (id, created_at) VALUES ('dp-cue', 0)",
+          [],
+        )
+      Nil
+    })
+  let payload = body("Cloud", "usr_cloud", "cloud@cue.test")
+  assert put(env, "wsp_cloud", Some(secret), payload).status == 200
+  let assert Ok(conn) = db.open_primary(env.db_path)
+  let assert Ok(_) =
+    sqlite.exec(
+      conn,
+      "UPDATE networks SET browse_enabled = 0, cloud_hosted = 0, cloud_dp_id = NULL",
+      [],
+    )
+  let assert Ok(_) =
+    sqlite.exec(
+      conn,
+      "INSERT INTO cloud_collect_queue (org_slug, network_name, disabled_at, dp_id) SELECT o.slug, n.name, 0, 'dp-cue' FROM networks n JOIN orgs o ON o.id = n.org_id",
+      [],
+    )
+  sqlite.close(conn)
+  let assert router.Writable(auth) = env.ctx.api
+  let blocked_auth =
+    auth_api.AuthContext(..auth, publish_in_tx: fn(_, _, _, _) {
+      Error(publish.NoRekorRecord(1))
+    })
+  let blocked =
+    Env(
+      ..env,
+      ctx: router.Context(..env.ctx, api: router.Writable(blocked_auth)),
+    )
+  assert put(blocked, "wsp_cloud", Some(secret), payload).status == 409
+  assert count(
+      env,
+      "SELECT count(*) FROM networks WHERE browse_enabled = 0 AND cloud_hosted = 0 AND cloud_dp_id IS NULL",
+      [],
+    )
+    == 1
+  assert count(env, "SELECT count(*) FROM cloud_collect_queue", []) == 1
+}

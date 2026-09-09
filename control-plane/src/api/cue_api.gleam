@@ -11,23 +11,20 @@
 //// identity anchors to; the org and network are created per Workspace and the
 //// role is the owner's own.
 ////
-//// Idempotent by `cue_workspace_id` (unique in `cue_workspace_orgs`): a
-//// repeat, a concurrent duplicate, or a retry converges on the one org. The
-//// create path publishes the zone (a network is zone data); the ordinary reuse
-//// path only backfills the owner's identity/membership and never republishes.
-//// A duplicate that raced the create path rechecks after acquiring the writer
-//// transaction and may perform one no-op republish rather than return a false
-//// conflict.
+//// Idempotent by workspace mapping. Every call enforces Cue's managed-network
+//// policy: browsing and cloud hosting are on, even after an admin disabled
+//// them. Creation and reuse both publish through the widening gate in one
+//// transaction; a retry also cancels pending collection and preserves placement.
 //// The paired remote/local retry lifecycle is modeled in the Cue repository at
 //// `tla/cue_synchronicity/WorkspaceProvisioning.tla`.
 
 import api/auth_api.{type AuthContext, with_db}
 import api/common.{
-  body_decoder, constraint_response, db_error, ok_json, transaction,
-  zone_mutation,
+  body_decoder, constraint_response, db_error, ok_json, zone_mutation,
 }
 import api/middleware.{Bearer, error_json, now_unix, presented}
 import auth/principal
+import cloud/dataplane
 import config.{type CueProvisioning}
 import dns/name
 import gleam/dynamic/decode
@@ -86,13 +83,7 @@ pub fn provision_workspace(
             case hub_provider_exists(conn, cfg) {
               Error(response) -> response
               Ok(Nil) ->
-                case find_workspace_org(conn, cue_workspace_id) {
-                  Error(response) -> response
-                  Ok(Some(#(org_id, network_id))) ->
-                    reuse(conn, cfg, org_id, network_id, owner)
-                  Ok(None) ->
-                    create(conn, ctx, cfg, cue_workspace_id, ws_name, owner)
-                }
+                converge(conn, ctx, cfg, cue_workspace_id, ws_name, owner)
             }
           })
       }
@@ -100,32 +91,9 @@ pub fn provision_workspace(
   }
 }
 
-/// The reuse path: the Workspace already has an org. Only ensure the owner's
-/// identity and membership are present (an earlier call whose identity write
-/// is being retried), never touching the zone.
-fn reuse(
-  conn: Connection,
-  cfg: CueProvisioning,
-  org_id: String,
-  network_id: String,
-  owner: Owner,
-) -> Response {
-  case
-    transaction(conn, fn() {
-      use sync_user_id <- result.try(ensure_owner(conn, cfg, org_id, owner))
-      Ok(provisioned(org_id, network_id, sync_user_id, False))
-    })
-  {
-    Ok(payload) -> ok_json(json.object([#("result", payload)]))
-    Error(response) -> response
-  }
-}
-
-/// The create path: mint the org + default network + owner identity +
-/// membership + the workspace mapping, and publish the zone in one
-/// transaction (a network is zone data). `zone_mutation` returns
-/// `{ok, soa_serial, result}`; the caller reads `result`.
-fn create(
+/// Create or refresh a Cue-managed network under the same writer lock and
+/// transparency gate. The caller reads the nested result in either case.
+fn converge(
   conn: Connection,
   ctx: AuthContext,
   cfg: CueProvisioning,
@@ -138,13 +106,12 @@ fn create(
   let who = principal.Principal("cue:provisioning", principal.Cookie(""))
 
   zone_mutation(conn, ctx, who, publish.Widening, fn() {
-    // The fast-path lookup happens before the transaction. Recheck after the
-    // SQLite writer lock is held: another request may have committed the one
-    // mapping while this request waited to enter `zone_mutation`.
+    // Resolve the mapping under the writer lock, including concurrent creates.
     case find_workspace_org(conn, cue_workspace_id) {
       Error(response) -> Error(response)
       Ok(Some(#(org_id, network_id))) -> {
         use sync_user_id <- result.try(ensure_owner(conn, cfg, org_id, owner))
+        use _ <- result.try(enable_cloud_features(conn, network_id))
         Ok(provisioned(org_id, network_id, sync_user_id, False))
       }
       Ok(None) -> {
@@ -161,10 +128,42 @@ fn create(
           network_id,
         ))
 
+        use _ <- result.try(enable_cloud_features(conn, network_id))
         Ok(provisioned(org_id, network_id, sync_user_id, True))
       }
     }
   })
+}
+
+/// Match cloud-hosting enable semantics: cancel collection before placement,
+/// retaining an existing data-plane assignment. An empty fleet leaves the
+/// enabled network unassigned; it does not make the provisioning call fail.
+fn enable_cloud_features(
+  conn: Connection,
+  network_id: String,
+) -> Result(Nil, Response) {
+  let work = {
+    use _ <- result.try(
+      sqlite.exec(
+        conn,
+        "UPDATE networks SET browse_enabled = 1, cloud_hosted = 1 WHERE id = ?",
+        [Text(network_id)],
+      ),
+    )
+    use _ <- result.try(
+      sqlite.exec(
+        conn,
+        "DELETE FROM cloud_collect_queue
+       WHERE (org_slug, network_name) IN
+         (SELECT o.slug, n.name FROM networks n JOIN orgs o ON o.id = n.org_id
+          WHERE n.id = ?)",
+        [Text(network_id)],
+      ),
+    )
+    use _ <- result.try(dataplane.place(conn, network_id, now_unix()))
+    Ok(Nil)
+  }
+  result.map_error(work, constraint_response)
 }
 
 /// The provisioning secret, compared in constant time (SHA-256 of each side).
