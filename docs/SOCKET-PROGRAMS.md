@@ -1,26 +1,39 @@
 # Sockets by name — a socket namespace apart from spaces
 
-Status: **proposed**. Nothing here is built. It supersedes `docs/SOCKETS.md`
-§2 and §3 and amends §4, §9, §10 and §11, and `docs/TREE-WRITES.md` §2; each
-place this changes is named in §11 below. Where it repeats a rule from those
-documents it does so to say the rule survives.
+Status: **implemented**. Everything here describes the built thing: the socket
+namespace and its grammar, the activation table and its `v29` rewrite, the
+scope check, the deployment fan-out, the `SockRequest`/`List` frames, and the
+command surface. It supersedes `docs/SOCKETS.md` §2 and §3 and amends §4, §9,
+§10 and §11, and `docs/TREE-WRITES.md` §2; each place it changed is named in
+§11 below, and each of those documents has been corrected to describe the
+built thing. Where it repeats a rule from them it does so to say the rule
+survives.
 
-Today a socket *is* a file: `synch socket activate code/git.sock` says that the
-bytes at `code/git.sock` are a program, and the path is at once the program's
-location, the socket's name, and — because it sits under `f:code/` — the
-socket's authorization boundary. One object serving two sockets means two
+Where the built thing settled a detail differently from this proposal, the
+text says so at that point. Three such places: `List` answers with an entry
+per in-scope activation whether or not its program is published, the
+unpublished ones carrying the empty root (§5); an entry at a program path that
+carries no content — a directory, a symlink — is refused `NotASocket` rather
+than `NoSuchPath`, which is reserved for nothing being there at all (§4); and
+`SpaceNotDelegated` is documented as retired rather than merely unused, since
+nothing can emit it again without moving postcard's variant numbering.
+
+A socket *was* a file: `synch socket activate code/git.sock` said that the
+bytes at `code/git.sock` were a program, and the path was at once the
+program's location, the socket's name, and — because it sat under `f:code/` —
+the socket's authorization boundary. One object serving two sockets meant two
 copies of the ELF at two paths, each activated and deployed separately, and
 `sy_socket_path`, which the host API grew "so one object can back several
-sockets" (SOCKETS.md §7.2), is reachable only by duplicating the thing it
+sockets" (SOCKETS.md §7.2), was reachable only by duplicating the thing it
 exists to share.
 
-This proposal separates the three things that path was doing.
+This design separates the three things that path was doing.
 
 - A **program** is an ordinary file in this node's tree holding an eBPF
   object. It lives in a space, is published, replicated and materialized
   exactly as any file is, and is the thing every write channel deploys.
 - A **socket** is a *name* in a namespace of its own — not a path, not in any
-  space, not in the tree. An activation binds the name to a program path and
+  space, and not in the tree. An activation binds the name to a program path and
   carries the socket's own configuration, stream cap, scope, map and
   statistics. Many sockets may name one program.
 - **Who may open a socket** is stated on the activation, not inferred from
@@ -91,10 +104,12 @@ store gains `activations_backed_by(space, path)` — for the deployment
 fan-out and the tree-write gate — and `is_program_path(space, path)`.
 
 A program path must be in a source of this node's, filesystem or API, and
-must publish as a file to serve; a directory, a symlink, a tombstone or
-nothing at all makes every socket it backs `unpublished` in `ls` and refused
-at admission, without touching the activation. Activating before the first
-deploy is the ordinary order today and stays so.
+must publish as a file to serve; a tombstone or nothing at all makes every
+socket it backs `unpublished` in `ls` and refused `NoSuchPath` at admission,
+and a directory or a symlink there is refused `NotASocket` — an entry that
+exists and cannot be a program is a different mistake from no entry at all.
+Neither touches the activation. Activating before the first deploy is the
+ordinary order and stays so.
 
 Bounds: 256 activations per node, replacing the 64-per-space bound, which
 has no space to count in. Sockets per program is bounded by it.
@@ -102,12 +117,11 @@ has no space to count in. Sockets per program is bounded by it.
 ### 2.2 Scope: who may open
 
 Space delegation (DESIGN.md §3.5) is the only grant a delegate holds, and it
-is about *reading spaces*. Today a delegate of `code` may open `code/git.sock`
-by position: the socket is in the space. With sockets out of spaces, that
+is about *reading spaces*. A delegate of `code` used to open `code/git.sock`
+by position: the socket was in the space. With sockets out of spaces, that
 implication has to be written down, and it is written on the activation.
 
-- A **rooted member** may open any socket, as today it may open one in any
-  space.
+- A **rooted member** may open any socket, as it may read any space.
 - A **delegate** may open a socket only if one of its delegated spaces is in
   the socket's `scope`. An activation with an empty scope is **members
   only**, and that is the default: offering a socket to delegates is a
@@ -229,7 +243,10 @@ struct SockEntry { name: String, program: Hash, program_path: String, note: Stri
   bounded by the activation bound, and `synch socket ls <origin>:` prints
   it. It needs no runtime — a node that cannot serve sockets can still say
   which ones it has — and no new authorization: it applies the same scope
-  rule `Open` does.
+  rule `Open` does. An in-scope socket whose program is not published lists
+  with the empty root, which prints as `unpublished`: the built thing shows
+  the activation rather than hiding it, because "the socket exists and its
+  program does not" is what the caller needs to hear.
 - **`program_path` in `Opened::Ok`** restores the audit the tree entry gave:
   a caller that can read the program's space can `synch cat` the path and
   compare roots. A caller that cannot still gets the root, as today.
@@ -413,7 +430,10 @@ self-backed in all but name.
 
 ## 12. Implementation order
 
-Each step leaves the tree building and every existing test passing.
+Each step leaves the tree building and every existing test passing. Steps 1,
+3, 4 and 5 landed as one commit: the rename runs through the store, the
+engine, the wire and the command surface at once, and there is no intermediate
+between them that compiles.
 
 1. **Store.** The new table shape, the `v29` rewrite with its log line,
    `SocketActivation`, `activations_backed_by`, `is_program_path`,

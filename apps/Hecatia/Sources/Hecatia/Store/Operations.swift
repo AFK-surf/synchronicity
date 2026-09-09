@@ -45,7 +45,7 @@ enum Operations {
     // these and the daemon bridges it to a QUIC stream. Listed so the registry
     // keeps counting the daemon rather than counting itself; see the `socket`
     // block in `run` for why none of the surface exists yet.
-    .init("rpc.openSocket", "—", "synch socket connect <origin>:<space>/<path>", surface: .notSurfaced,
+    .init("rpc.openSocket", "—", "synch socket connect <origin>:<name>", surface: .notSurfaced,
           omission: "A bidirectional byte pipe carrying somebody else's protocol; this app has no terminal, no listener and nothing to pipe it to."),
   ]
 
@@ -126,11 +126,11 @@ enum Operations {
     .init("control-plane.disable", "Stop remote browsing", "synch control-plane disable", gate: .confirm, surface: .node, dirties: [.cloud]),
     // Sockets (oneof 51…55, 68…69), none of them surfaced.
     //
-    // v3 publishes a socket as an entry of its own kind at a path the operator
-    // activated, and runs its current content for a peer that connects. That
-    // is a whole surface — a manifest to show, an activated/unavailable state,
-    // a list of running invocations, a log — and this app has not one piece
-    // of it. They
+    // v3 binds a socket name to a program — an ordinary file the operator
+    // deployed — and runs that program's current content for a peer that
+    // connects to the name. That is a whole surface — a manifest to show, an
+    // activated/unavailable state, a scope, a list of running invocations, a
+    // log — and this app has not one piece of it. They
     // are listed anyway, because the registry is the count the daemon is
     // checked against: leaving an operation out is not neutrality. A new
     // operation once stayed invisible for three releases.
@@ -142,19 +142,19 @@ enum Operations {
     // `CoverageTests.everyMutationInvalidatesSomething` exempts `.notSurfaced`
     // for exactly that reason, and the exemption ends the moment one gets a
     // button.
-    .init("socket.activate", "—", "synch socket activate <space>/<path>", surface: .notSurfaced,
-          omission: "Makes a path an executable socket — every later write to it deploys immediately, which is an authoring decision the CLI walks an operator through and a Files pane should not offer as a click."),
-    .init("socket.deactivate", "—", "synch socket deactivate <space>/<path>", surface: .notSurfaced,
-          omission: "Stops a path serving; the browser can name a socket row now but offers it only `rpc.delete`, which is a different question from retiring a published program."),
-    .init("socket.ls", "—", "synch socket ls [<space>]", surface: .notSurfaced,
-          omission: "The sockets of a space, with no pane to list them in and no Topic for them to fill."),
+    .init("socket.activate", "—", "synch socket activate <name> --program <space>/<path>", surface: .notSurfaced,
+          omission: "Binds a name to a program — every later write to that program deploys immediately to every socket that names it, which is an authoring decision the CLI walks an operator through and a Files pane should not offer as a click."),
+    .init("socket.deactivate", "—", "synch socket deactivate <name>", surface: .notSurfaced,
+          omission: "Releases a socket name; the browser can name the program file but offers it only `rpc.delete`, which is a different question from retiring a socket."),
+    .init("socket.ls", "—", "synch socket ls [<origin>:]", surface: .notSurfaced,
+          omission: "This node's sockets, or a peer's, with no pane to list them in and no Topic for them to fill."),
     .init("socket.sdk", "—", "synch socket sdk", surface: .notSurfaced,
           omission: "Prints the C header a socket program is compiled against, which belongs to a toolchain and not to a Mac app."),
-    .init("socket.ps", "—", "synch socket ps [<space>/<path>]", surface: .notSurfaced,
+    .init("socket.ps", "—", "synch socket ps [<name>]", surface: .notSurfaced,
           omission: "Invocations running on another node; Activity shows this app's own transfers and has no vocabulary for someone else's processes."),
     .init("socket.kill", "—", "synch socket kill <invocation>", surface: .notSurfaced,
           omission: "Ends one invocation named by an id only `socket ps` prints, and `socket ps` is not surfaced either."),
-    .init("socket.log", "—", "synch socket log <space>/<path>", surface: .notSurfaced,
+    .init("socket.log", "—", "synch socket log <name>", surface: .notSurfaced,
           omission: "The program's own output, with no log view to put it in."),
   ]
 

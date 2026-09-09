@@ -562,20 +562,27 @@ arrive `aws-chunked` are unframed and their trailing checksum verified, so a
 client that checksums while it streams is actually checked rather than taken at
 its word. Read-only buckets reject every mutation before consuming its body.
 
-Expose a program instead of a file. A **socket** is a file in this node's
-published tree whose content is an eBPF ELF object; a peer that connects to it
-runs it *here*, one invocation per incoming stream, under
+Expose a program instead of a file. A **program** is an ordinary file in this
+node's published tree whose content is an eBPF ELF object; a **socket** is a
+*name* of this node's own, bound to one, and a peer that connects to that name
+runs the program *here*, one invocation per incoming stream, under
 [async-ebpf](https://github.com/losfair/async-ebpf):
 
 ```sh
-synch socket build git.c -o code/git.sock      # C in, eBPF out; nothing to install
-synch socket build git.c --clang -o git.o       # optimized; needs clang + llc on PATH
-synch socket inspect code/git.sock             # stateless: root, manifest, load check
-synch socket activate code/git.sock            # the path is a socket until deactivated
-synch source scan                              # publish it as kind=Socket
-synch socket ls -l                             # published root, manifest, validity
+synch socket build git.c -o gateway.o          # C in, eBPF out; nothing to install
+synch socket build git.c --clang -o gateway.o  # optimized; needs clang + llc on PATH
+synch socket inspect gateway.o                 # stateless: root, manifest, load check
+cp gateway.o ~/code/bin/                       # deploy it like any other file
+synch socket activate git --program code/bin/gateway.o
+synch socket activate docs/git --program code/bin/gateway.o --scope docs
+synch source scan                              # publish the program
+synch socket ls -l                             # program, root, manifest, scope, policy
 synch socket sdk > synch.h                     # the header a program is built against
 ```
+
+Many sockets may name one program, each with its own `--config`, its own
+stream cap and its own map, and each `--scope` says whose delegates may open
+it — without one, a socket is open to rooted members only.
 
 On supported builds the compiler is in the binary — a build of
 [tinycc](https://github.com/losfair/tinycc) that targets eBPF — so writing a
@@ -587,24 +594,26 @@ code. Six worked examples are in
 [`crates/synch-sock/examples/`](crates/synch-sock/examples/), and the test
 suite runs every one of them.
 
-From the other side, `synch socket connect` is a byte pump and nothing else — it names
-a path, and everything that decides what runs is state the named node already
-holds:
+From the other side, `synch socket connect` is a byte pump and nothing else — it
+names a socket, and everything that decides what runs is state the named node
+already holds:
 
 ```sh
-synch socket connect nas@cluster.example.com:code/git.sock
-synch socket connect nas@cluster.example.com:code/git.sock --listen 127.0.0.1:9418
+synch socket ls nas@cluster.example.com:                  # what it will let you open
+synch socket connect nas@cluster.example.com:git
+synch socket connect nas@cluster.example.com:git --listen 127.0.0.1:9418
 ```
 
 **A node executes only eBPF that is present in its own published tree, at a
 path it activated.** So the connecting side ships no code, needs no runtime,
-and works anywhere — while adopting somebody's socket with `synch adopt path`
-adopts its bytes and not its socket-ness, because the entry kind comes from a
-local activation and is never taken from a peer. What a program may reach is
+and works anywhere — while adopting somebody's program with `synch adopt path`
+adopts its bytes and nothing else, because an activation is local operator
+state and is never taken from a peer. What a program may reach is
 declared as data in the object itself — a JSON manifest in a non-executable
 ELF section — so `synch socket inspect` answers "what would this deployment
-do?" without running anything, and every write to an activated path is an
-intentional deployment that serves immediately under its own manifest.
+do?" without running anything, and every write to a program path is an
+intentional deployment, to every socket that names it, serving immediately
+under its own manifest.
 Serving needs Linux or macOS on x86-64 or arm64, which is where
 async-ebpf runs. See [docs/SOCKETS.md](docs/SOCKETS.md).
 

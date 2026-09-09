@@ -17,8 +17,8 @@ own origin trie: the same act as saving a file into a filesystem-source director
 through the same ingest-and-publish path they all share. The caller supplies
 bytes and a verified identity. It still never supplies code, and it still never
 publishes anything: the program decides what is written, and the program is
-whatever content the operator's activated path currently holds — inspectable,
-and deployed on purpose.
+whatever content the operator's activated program path currently holds —
+inspectable, and deployed on purpose.
 
 ## 1. The non-goal, and why it is revisited
 
@@ -60,7 +60,7 @@ that surface:
    not decoration.
 3. **The caller still ships bytes, not decisions.** Which paths can be written,
    under what conditions, with whose input, is the program's logic — and every
-   change to it is a deployment the operator made to an activated path.
+   change to it is a deployment the operator made to a program path.
 
 What membership grants a caller therefore grows by exactly one clause: a member
 may *invoke programs at paths the callee activated*, and such a program may,
@@ -173,7 +173,7 @@ $ synch socket inspect drop-box.o
 ```
 
 A widened prefix is a changed root is a new deployment, visible in `synch
-socket ls -l` the moment the scanner publishes it — and activating a path
+socket ls -l` the moment the scanner publishes it — and activating a program
 whose future contents may declare writes is exactly the breadth the
 `synch socket activate` warning names. `synch socket ls -l` lists tree-write
 lines beside egress, and every commit is logged: socket, invocation, peer
@@ -465,7 +465,7 @@ All applied in the change that built this:
   engine seam under a same-id tree-write declaration; open handles stage
   random-access writes and close conditionally publishes their version.
 - **`DESIGN.md` §12** — the membership-capability sentence extends: invoking a
-  activated socket may, where its manifest declares a tree-write prefix, cause the
+  socket may, where its manifest declares a tree-write prefix, cause the
   callee to publish new versions of its own view. Mitigations in place: the
   prefix and modes are data in the object the operator deployed, the version
   model scopes every write to the callee's own origin, and divergence remains

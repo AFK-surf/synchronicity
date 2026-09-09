@@ -1,22 +1,28 @@
 # Sockets
 
-Status: **implemented**. Everything here describes the built thing: the record
-kind, the activation table, the manifest, the `sync/sock/1` protocol, the host
-API and its runtime, the scanner's publishing rule, the live-invocation
-registry, the embedded compiler, and the command surface. The one thing named
-here and not built is `synch doctor` reporting on sockets — the same facts are
-in `synch socket ls -l` and `synch socket ps`, and each place below says so.
+Status: **implemented**. Everything here describes the built thing: the socket
+namespace, the activation table, the manifest, the `sync/sock/1` protocol, the
+host API and its runtime, the live-invocation registry, the embedded compiler,
+and the command surface. The one thing named here and not built is `synch
+doctor` reporting on sockets — the same facts are in `synch socket ls -l` and
+`synch socket ps`, and each place below says so.
 
 Checked against the tree it landed in. Where the built thing differs from an
 earlier draft of this design, this document has been corrected to describe the
 built thing, and says so at each point.
 
-A **socket** is a file in a node's published tree whose content is an eBPF ELF
-object. A peer runs `synch socket connect nas:code/git.sock`; the connection lands on
-`nas`, which resolves that path *in its own trie*, loads the object from *its
-own* CAS, and runs it under [async-ebpf][ae] — one invocation per incoming
-stream. The caller supplies bytes and a verified identity. It never supplies
-code.
+A **program** is an ordinary file in a node's published tree whose content is
+an eBPF ELF object. A **socket** is a *name* in that node's own namespace,
+bound to a program by a local activation. A peer runs `synch socket connect
+nas:git`; the connection lands on `nas`, which resolves that name *in its own
+activation table*, loads the program it names from *its own* CAS, and runs it
+under [async-ebpf][ae] — one invocation per incoming stream. The caller
+supplies bytes and a verified identity. It never supplies code.
+
+Many sockets may name one program, and each carries its own configuration,
+stream cap, scope, map and statistics. `docs/SOCKET-PROGRAMS.md` is the design
+that separated the three things one path used to do; §2 and §3 below are its
+account, and each later section says where it amends this one.
 
 The publisher may call its own socket with the same command. That path uses an
 in-memory stream because iroh does not dial its own endpoint, but it still goes
@@ -61,79 +67,70 @@ It also buys portability where it matters. this project enables async-ebpf on Li
 on x86-64 and arm64. Serving sockets is gated to those targets.
 `synch socket connect` is not, because it executes nothing.
 
-## 2. What a socket is in the tree
+## 2. What a socket is, and what the tree publishes
 
-A socket is not a new namespace. It is a fifth `EntryKind` under the existing
-`f:` prefix, so it inherits versioning, divergence, replication, delegation
-scoping and materialization from the file model without a line of new plumbing.
+A socket is a **name**, and the grammar is the tree path grammar without the
+space in front of it: non-empty, at most 256 bytes, display-safe
+(`display_text_is_safe`), normalized by `normalize_path`. So `/` may group
+names — `git`, `docs/git`, `ci/intake` — and `..`, empty components, a leading
+`/` and control characters are refused. Names are unique per node and mean
+nothing to any other node: `nas:git` and `laptop:git` are unrelated.
 
-```rust
-enum EntryKind {
-    File, Dir, Symlink, Tombstone,
-    Socket,   // content is an eBPF ELF object; size and content root as for File
-}
-```
+The path-shaped grammar is what made the migration invisible: every socket
+that used to be the path `code/git.sock` is now a socket *named*
+`code/git.sock`, and `synch socket connect nas:code/git.sock` keeps working
+with the same spelling and a new meaning.
 
-`FileEntry` is otherwise **unchanged**, and that is a deliberate retreat from an
-earlier draft of this design, which carried a `socket: Option<SocketMeta>` field
-holding a protocol hint and a one-line description.
+The tree publishes **nothing new, and one thing less**. A program is an
+ordinary file under `f:<space>/<path>`, and it inherits versioning,
+divergence, replication, delegation scoping and materialization from the file
+model without a line of new plumbing. `EntryKind::Socket` stays in the enum so
+that records old builds published still decode — postcard numbers variants by
+position — but this node never emits it, and every reader treats it as a file
+with content. `synch ls` therefore no longer marks sockets, because there are
+none in the tree to mark; discovery moved to the protocol's `List` (§4).
 
-The retreat is forced by how records are decoded. `postcard::from_bytes`
-ignores *trailing* bytes — which is exactly why the `v` stamp exists (§4.2:
-"a future record with a field appended decodes cleanly *as the current shape*")
-— but it cannot invent missing ones. A field appended to `FileEntry` is
-therefore readable by old builds and **unreadable by new ones**, because every
-record already in every trie in the cluster is one field short of what the new
-decoder demands. Carrying it would have meant a hand-written codec whose arity
-depends on a field inside the record it is decoding, for the sake of a
-description string.
+### 2.1 Why a socket is not in the tree at all
 
-So the entry kind carries the whole of the published claim, and the protocol
-hint and description are local operator state that `synch socket ls` prints.
-Discovery still works — `synch ls` marks sockets from the kind alone — and the
-encoding of every non-socket record is byte-for-byte what it was.
+DESIGN.md §4.1 states the constraint that decided the earlier shape: *the
+redaction boundary falls on key prefixes*. A socket published under a new `s:`
+prefix would need its own projection rule in §5.5, its own delegation test, a
+GC and blob-scope rule for the root it carries, and a materialization rule for
+replicas that have nowhere to put it. Under `f:<space>/<path>` none of that
+was needed — the answer was already written — which is why a socket lived
+there.
 
-A `Socket` entry is otherwise an ordinary file entry: `content` is the ELF's
-BLAKE3 root — a content identifier, never an authorization pin — `size` is its
-length, and `chunking` is
-the default.
+What that bought, though, was authorization *by position*: a delegate of
+`code` could open `code/git.sock` because the socket sat in `code`. Position
+is the wrong thing to derive a grant from, and it is the reason one gateway
+object could not serve two spaces without two copies of itself. So the socket
+left the tree entirely and the grant is written down instead (§3.2). The
+argument above survives as the argument against `s:`: everything a published
+socket would need exists to publish something whose only readers are callers,
+and callers are better served by `List`.
 
-### 2.1 Why it lives under `f:`
+### 2.2 Programs are adoptable bytes; activations are not
 
-DESIGN.md §4.1 states the constraint that decides this: *the redaction boundary
-falls on key prefixes*. A socket published under a new `s:` prefix would need
-its own projection rule in §5.5, its own delegation test, and its own answer to
-"what does a delegate of `photos` see?". Under `f:<space>/<path>` the answer is
-already written: a delegate of `code` sees the sockets in `code` and nothing
-else, by position, with no new code. That is the same argument §4.1 makes for
-keeping `m:space/<id>` an exact key rather than a prefix, and it is decisive.
+A program's bytes are an ordinary file's, so adopting them is adopting a file:
 
-### 2.2 Kind is an assertion, and it is not adoptable
-
-The kind of an entry is what *this* origin says about *its own* copy — like
-`unix_mode`, and unlike content. It comes from a local activation (`synch
-socket activate`, §3), never from a peer. So:
-
-- `synch adopt path nas:code/git.sock` fetches the ELF bytes and writes them into the
-  local space. The next scan publishes them as `EntryKind::File`, because this
-  node never activated that path. **Adopting a socket adopts its bytes, not
-  its socket-ness** — and certainly not its executability. (Adopting onto a
-  path this node *has* activated is the other case, and it is deliberate: an
-  activated path's writers are deployment channels, §3.)
-- `synch adopt tree`, `synch replica sync` and the S3 gateway behave identically: a
-  `Socket` entry materializes as a regular file containing the ELF, which is
-  exactly what it is on the publisher's disk too.
-- A path where `nas` publishes `Socket` and `laptop` publishes `File` over the
-  same bytes is *divergent*, not unanimous. That needs a small amendment to §8's
-  version-identity rule (§11).
+- `synch adopt path nas:code/bin/gateway.o` fetches the ELF and writes it into
+  the local space. It publishes as `EntryKind::File`, as it does on the
+  publisher. **Adopting a program adopts its bytes, and nothing else** — not
+  its executability, which is an activation this node has not made. (Adopting
+  onto a path this node *has* activated a socket over is the other case, and
+  it is deliberate: a program path's writers are deployment channels, §3.)
+- `synch adopt tree`, `synch replica sync` and the S3 gateway behave
+  identically: a program materializes as a regular file containing the ELF,
+  which is exactly what it is on the publisher's disk too.
+- An activation is local operator state. It is never published, never
+  replicated, and never derived from a peer's trie.
 
 ### 2.3 Selection does not apply
 
 Reading a bare `<space>/<path>` picks a version by policy — `newest`,
-`origin=`, `strict` (§8). **Connecting to one does not.** `synch socket connect`
-requires an origin-qualified path, always, and the node resolves it in that
-origin's trie only. There is no "the socket at `code/git.sock`"; there is only
-"nas's socket".
+`origin=`, `strict` (§8). **Connecting to a socket does not.** `synch socket
+connect` requires an origin-qualified name, always, and the callee resolves it
+in its own table and its own trie.
 
 `newest` would otherwise let any member's `mtime_ns` decide whose program a
 connection lands on, and §12 already names member-supplied `mtime_ns` as the
@@ -150,31 +147,33 @@ threat model:
 - your editor, which is the intended path;
 - `synch adopt path`, which adopts a peer's bytes;
 - `synch adopt tree --replace`, which does the same in bulk;
-- an S3 gateway `PUT`, which writes into a filesystem-source directory over the network.
+- an S3 gateway `PUT`, which writes into a filesystem-source directory over the network;
+- a socket program's own `sy_put_*` write, where a manifest declares a
+  tree-write grant covering the path (`docs/TREE-WRITES.md`).
 
 Every one of these is an existing, sanctioned way to change what this node
 publishes. So publication is not, and must not be, the gate. **Activation**
-is: `synch socket activate code/git.sock` records that this path, in this
-space, is a socket. That is what makes the scanner publish `kind: Socket`,
-and it is what admission checks before anything runs. It is local state,
-never adopted from a peer, and never replicated.
+is: `synch socket activate git --program code/bin/gateway.o` binds the name
+`git` to the program at that path. That is what admission checks before
+anything runs. It is local state, never adopted from a peer, and never
+replicated.
 
-Activation is a statement about the *path*, never about a content root.
-While the path is activated, **every write to it is an intentional
-deployment**: the new content serves as soon as the scanner publishes it,
-under whatever its own manifest declares (§3.1), until `synch socket
-deactivate`. That breadth is the grant, and the command says so at the moment
-it is asked for: activating a path pre-approves every future write through
-every channel above — adoption and a read-write S3 key included. Activate a
-path only when everything that can write it is something you mean as a
-deployment channel; content roots remain content identifiers everywhere
-content is handled — CAS integrity, replication, caching, and the snapshot a
-running invocation keeps — but no root is ever an authorization pin.
+Activation is a statement about the *program path*, never about a content
+root. While a socket names it, **every write to that path is an intentional
+deployment**: the new content serves as soon as it publishes, under whatever
+its own manifest declares (§3.1), until `synch socket deactivate`. That
+breadth is the grant, and the command says so at the moment it is asked for —
+naming the path, every socket the write would move, and which activated
+program's manifest carries a tree-write grant over it. Activate a program only
+when everything that can write it is something you mean as a deployment
+channel; content roots remain content identifiers everywhere content is
+handled — CAS integrity, replication, caching, and the snapshot a running
+invocation keeps — but no root is ever an authorization pin.
 
-A deployment landing changes what the *next* admission runs. Invocations
-already running keep the snapshot they were admitted with, and the per-socket
-map (§6) is cleared: a session table the old program minted is not state the
-new one agreed to inherit.
+A deployment landing changes what the *next* admission runs, for every socket
+the program backs. Invocations already running keep the snapshot they were
+admitted with, and each dependent per-socket map (§6) is cleared: a session
+table the old program minted is not state the new one agreed to inherit.
 
 ### 3.1 The manifest is what makes a deployment reviewable
 
@@ -207,12 +206,38 @@ touches no database, no scanner, no daemon state, and publishes nothing.
 Egress with no declaration is denied. Reading the tree is not among the
 declared capabilities and never was denied by one (§7.6). Because the
 manifest is compiled into the object, editing it changes the content root:
-what an activated path serves is always exactly what its current bytes
+what a socket serves is always exactly what its program's current bytes
 declare, and `synch socket ls -l` shows that declaration from the same parse
 admission uses. An update whose manifest does not parse — or whose program
 does not load — keeps the path activated and published and refuses every
 connection with a message naming the defect; deploying a fixed object is the
 whole remedy.
+
+### 3.2 Scope: who may open a socket
+
+Space delegation (DESIGN.md §3.5) is the only grant a delegate holds, and it
+is about *reading spaces*. With sockets out of the tree, "may this delegate
+open this socket?" can no longer be answered by position, so it is written on
+the activation.
+
+- A **rooted member** may open any socket, as it may read any space.
+- A **delegate** may open a socket only if one of its delegated spaces is in
+  the socket's `scope`. An activation with an empty scope is **members only**,
+  and that is the default: offering a socket to delegates is a broader grant
+  than offering it to members, so it is asked for by name, with `--scope`.
+- Inside the program, `sy_peer_has_space` and the rest of the identity family
+  keep answering from the handshake, and remain the way to write rules finer
+  than scope.
+
+The refusal a delegate outside the scope gets is `RefuseCode::OutOfScope`, and
+`List` did not show it the socket in the first place.
+
+Scope is authorization only. It does not put the socket in the space, does not
+publish the program's root into it, and does not let the delegate read the
+program's bytes unless the program's own space is delegated to it — which it
+does not need to be, because the connecting side executes nothing (§1). That
+is the one place this is *tighter* than copying an ELF into a delegated space:
+the bytes of a program in `tools` stay in `tools`.
 
 ## 4. The wire — `sync/sock/1`
 
@@ -221,25 +246,34 @@ endpoint and gated by the same accept check. One QUIC connection per (caller,
 callee) pair; one bidirectional stream per invocation.
 
 ```rust
-// caller → callee, one length-framed postcard header per bi-stream, then raw bytes
-struct Open {
+// caller → callee, one length-framed postcard frame per bi-stream, then raw bytes
+enum SockRequest {
+    Open(SockOpen),              // run a socket; the stream becomes the invocation's
+    List,                        // the sockets this caller may open
+}
+
+struct SockOpen {
     v: u8,
     origin: OriginId,            // must be the callee's own; a mismatch is refused,
                                  // so a relayed or replayed Open cannot be redirected
-    space: String,
-    path: String,
+    socket: String,              // the name, in the callee's own namespace
     meta: Vec<(String, String)>, // <= 16 pairs, <= 4 KiB total — untrusted, caller-chosen
 }
 
 // callee → caller, one header frame in reply, then raw bytes
-enum Opened {
-    Ok { program: Hash, invocation: u64 },   // the root actually running — auditable
+enum SockOpened {
+    Ok { program: Hash, program_path: String, invocation: u64 },
     Refused { code: RefuseCode, message: String },
 }
+
+// callee → caller, the answer to List, and the whole of that stream
+struct SockListed { sockets: Vec<SockEntry> }
+struct SockEntry { name: String, program: Hash, program_path: String, note: String }
 
 enum RefuseCode {
     NoSuchPath, NotASocket, NotActivated, Unauthorized, SpaceNotDelegated,
     Busy, ProgramInvalid, Unsupported,       // Unsupported = callee has no runtime
+    OutOfScope,                              // a delegate outside the socket's scope
 }
 
 // callee → caller, one uni-stream per connection, opened at connection setup;
@@ -247,6 +281,30 @@ enum RefuseCode {
 struct Closed { stream_id: u64, status: Status }
 enum Status { Ok(i64), Fault(FaultKind), Killed, Shutdown, Deadline }
 ```
+
+Three things here are `docs/SOCKET-PROGRAMS.md` §5, made in place: the ALPN is
+still `sync/sock/1` and `SOCK_PROTO_VERSION` is still 1.
+
+- **`List`** is the discovery `synch ls` used to give for free. It returns the
+  activations whose scope admits the caller (every one, for a member), bounded
+  by the activation bound (§10), and `synch socket ls <origin>:` prints it. It
+  needs no runtime — a node that cannot serve sockets can still say which ones
+  it has — and no new authorization: it applies the same scope rule `Open`
+  does. A socket whose program is not published lists with the empty root, and
+  prints as `unpublished`.
+- **`program_path` in `Opened::Ok`** restores the audit the tree entry gave: a
+  caller that can read the program's space can `synch cat` the path and
+  compare roots. A caller that cannot still gets the root.
+- **`SpaceNotDelegated`** is retired with the space-shaped address it belonged
+  to. It stays in the enum so postcard's variant numbering does not move under
+  peers that still decode it; `OutOfScope`, appended, is what a delegate is
+  told now.
+
+An old caller's `Open` does not decode as a `SockRequest` and is refused at the
+frame layer, as any malformed frame is; an old callee cannot decode a new one
+and refuses likewise. Neither side misaddresses anything: the failure is at the
+handshake, before any policy runs, and §11's rollout order — **upgrade, then
+activate** — is the one that applies.
 
 ### 4.1 Why the payload is unframed and the status is out of band
 
@@ -268,10 +326,9 @@ with the same shape and no new mechanism.
 
 - **Accept** — unchanged. A connection is refused unless the device key is
   bound to a trusted origin.
-- **Open** — the named space must be one the caller may read: every space for a
-  rooted member, the delegated list for a delegate (§3.5). A delegate that
-  connects to a socket outside its list gets `SpaceNotDelegated`, which is the
-  same answer §5.5 gives it for the metadata.
+- **Open** — the socket's own scope decides (§3.2): a rooted member may open
+  any socket, and a delegate one whose scope names a space it holds. A
+  delegate outside it gets `OutOfScope`, and `List` did not show it the socket.
 - **Inside the program** — `sy_peer_origin()`, `sy_peer_info()` and
   `sy_peer_has_space()` read the *handshake's* identity, never the payload's. A
   socket that wants finer rules than membership writes them itself, over facts
@@ -452,7 +509,7 @@ serverless node the daemon's environment holds cloud credentials.
 | Helper | What it does |
 | --- | --- |
 | `sy_self_origin(out, len)` | This node's own origin id. |
-| `sy_socket_path(out, len)` | `space/path` of the socket being served, so one object can back several sockets. |
+| `sy_socket_path(out, len)` | The **name** of the socket being served, so one object can back several sockets. The helper keeps its symbol; what it returns is a name, not a path. |
 | `sy_peer_origin(out, len)` | The caller's origin. Bound by iroh's mutual authentication, not asserted by the caller. |
 | `sy_peer_device_key(out32)` | The caller's raw 32-byte device key — stable across origin renames. |
 | `sy_peer_info()` | The whole authenticated identity as one JSON handle: `{"origin", "device_key" (hex), "kind" ("member" \| "delegate"), "addr", "stream_index"}`. |
@@ -550,16 +607,17 @@ activates,
 and by membership and delegation on the way in (§3.2, §3.5) — not by a
 per-program list of paths its own code may read.
 
-Socket entries are readable like any other file. Their bytes are not secret —
-any member fetches them out of the tree — and what executes on this node is
-decided by the activation table, not by who can read an ELF.
+Programs are readable like any other file, because that is all they are. Their
+bytes are not secret — any member fetches them out of the tree — and what
+executes on this node is decided by the activation table, not by who can read
+an ELF.
 
 | Helper | What it does |
 | --- | --- |
 | `sy_open(path, len)` | Opens `space/path` **in this node's own trie** — the same scope the program came from. |
 | `sy_open_from(origin, olen, path, plen)` | Another origin's version. Needs no declaration; §8's mtime-trust caveat is why it is not the default. |
 | `sy_open_root(root32)` | By content root — how a superseded version is read, mirroring `synch cat --root`. |
-| `sy_stat(obj)` | The object's metadata as a JSON handle: `{"size", "mtime_ns", "mode", "kind" ("file" \| "dir" \| "symlink" \| "tombstone" \| "socket"), "root" (hex)}`. |
+| `sy_stat(obj)` | The object's metadata as a JSON handle: `{"size", "mtime_ns", "mode", "kind" ("file" \| "dir" \| "symlink" \| "tombstone" \| "socket"), "root" (hex)}`. This node never publishes `"socket"` any more; a record from an older build still reports it. |
 | `sy_pread(obj, buf, len, off)` | Verified range read. Bytes in the CAS return immediately; bytes that must be fetched return `SY_EAGAIN` and the handle becomes pollable — a cold read is an ordinary poll wait, not a hidden stall. |
 | `sy_list_open(prefix, len)` | A cursor over `f:<space>/<prefix>`, which the trie's prefix compression makes cheap (§4.1). |
 | `sy_list_next(cur, out, len)` | Next entry name; `0` at the end. |
@@ -690,7 +748,8 @@ JSON values.
 `sy_put_commit_if` and `sy_put_delete` publish file versions and tombstones
 into this node's own trie, behind a `"tree_writes"` grant in the manifest
 (§7.9). A committed write is an ordinary local publish through the same
-ingest path an S3 `PUT` takes. The whole design — why the write declaration is enforceable where the read one
+ingest path an S3 `PUT` takes — including a write to a program path, which is
+a deployment like any other write to it. The whole design — why the write declaration is enforceable where the read one
 (§7.6) was decorative, the writer lifecycle, the commit conditions, and the
 bounds — is **[docs/TREE-WRITES.md](TREE-WRITES.md)**.
 
@@ -819,33 +878,60 @@ place the program sleeps.
 ```
 synch socket inspect <file>                           statelessly describe an eBPF
                                                       object: root, manifest, load check
-synch socket activate <space>/<path>                  make the path a socket until
-                 [--config k=v]… [--max-streams <n>]  deactivated: the next scan
-                 [--note <text>]                      publishes it as kind=Socket, and
-                                                      every later write is a deployment
-synch socket deactivate <space>/<path>                republish as an ordinary file;
-                                                      admission refuses immediately
-synch socket ls [<space>] [-l]                        mine: published root, manifest
-                                                      declaration, validity, policy
-synch socket ps [<space>/<path>]                      live invocations: peer, age, bytes,
+synch socket activate <name>                          bind a name to a program until
+        --program <space>/<path>                      deactivated; every write to the
+        [--scope <space>]…                            program deploys it; --scope admits
+        [--config k=v]… [--max-streams <n>]           that space's delegates (default:
+        [--note <text>]                               members only)
+synch socket deactivate <name>                        connections refuse now; the
+                                                      program file is untouched
+synch socket ls [-l]                                  this node's sockets: program, root,
+                                                      manifest, scope, policy
+synch socket ls <origin>: [-l]                        a peer's sockets this caller may
+                                                      open (the wire List, §4)
+synch socket ps [<name>]                              live invocations: peer, age, bytes,
                                                       handles, labels, counters
 synch socket kill <invocation>                        end one; the stream closes Killed
-synch socket log <space>/<path>                       what its sy_log calls said
+synch socket log <name>                               what its sy_log calls said
 synch socket sdk                                      print the C SDK header, from the
                                                       build that defines the ABI
 synch socket build <file.c> [-o <file.o>]             compile C to the eBPF object a
                    [-D NAME[=VALUE]]… [--clang]       socket is made of; --clang uses
                                                       optimized system clang/llc
 
-synch socket connect <origin>:<space>/<path>                 stdio by default: stdin → stream,
+synch socket connect <origin>:<name>                  stdio by default: stdin → stream,
               [--meta k=v]…                           stream → stdout, exit code from
               [--listen <addr:port>] [--once]         Closed{status}
 ```
 
-`synch socket ls -l` prints, per socket, what the tree currently names and
-what that content's manifest declares — the same parse admission uses — so an
-update whose manifest does not parse is visible as `activated, unavailable`
-with the parse error, rather than only as connection failures.
+`--program` is required — a socket with nothing behind it is not a thing an
+operator asks for by accident — and takes a fully qualified `<space>/<path>`,
+as every other command spells a location. The space may be a filesystem source
+or an API source: a program needs no scanner, only a way into this node's own
+tree. `activate` prints the grant it is making, and names the path the
+deploying writes land on:
+
+```
+$ synch socket activate docs/git --program code/bin/gateway.o --scope docs
+activated docs/git ← code/bin/gateway.o
+open to: members, and delegates of docs
+every write to code/bin/gateway.o is a deployment to: docs/git, git, hg
+that includes adoption, S3 writes, `synch put`, and the tree-write grant of socket ci/intake (prefix code/bin)
+activate only programs whose every writer you mean as a deployer
+```
+
+The tree-write line appears only when an activated program's manifest carries
+a grant covering the program path (`docs/TREE-WRITES.md` §2), and is computed
+from the same manifest parse `ls -l` uses.
+
+The list of dependents is the point: the third activation of a program is the
+moment its blast radius became three sockets, and the operator should see that
+where they asked for it. `synch socket ls -l` shows, per socket, the program
+path, the root the tree currently names, the declaration from that root's
+manifest, the scope, the policy, and the other sockets the same program backs
+— so an update whose manifest does not parse is visible as `activated,
+unavailable` with the parse error, rather than only as connection failures.
+`synch socket inspect` is untouched: stateless, one file, no table.
 
 `synch socket ps` reads the registry, which is what `kill` pulls, what the
 concurrency cap counts, and what `log` keeps a tail in. It holds nothing
@@ -907,7 +993,7 @@ own.
 | Bound | Default | Note |
 | --- | --- | --- |
 | Concurrent invocations per socket | 64 | Intersected with the manifest's and the activation's `max_streams`. Over it: `Refused{Busy}`. |
-| Concurrent invocations per daemon | `workers × 64` | The pool-wide bound, taken as an admission token and given back when the invocation ends or the admission is dropped. Enforced atomically by the registry's `reserve`, so concurrent opens across different sockets cannot walk past it; over it: `Refused{Busy}`. It is a daemon-protection bound, not a quota — one caller who can reach every activated socket in the cluster must not be able to fill every worker's queue. |
+| Concurrent invocations per daemon | `workers × 64` | The pool-wide bound, taken as an admission token and given back when the invocation ends or the admission is dropped. Enforced atomically by the registry's `reserve`, so concurrent opens across different sockets cannot walk past it; over it: `Refused{Busy}`. It is a daemon-protection bound, not a quota — one caller who can reach every socket in the cluster must not be able to fill every worker's queue. |
 | Socket workers per daemon | `min(4, cores)` | Dedicated threads; sockets never run on the sync runtime's threads. |
 | Handles per invocation | 256 | Including `SY_SELF`. Also the `sy_poll` array cap (`limits.rs`, and §7.5 and the SDK header agree). Deliberately larger than any one resource's own bound; the bounds below are what stop spare slots becoming host memory or OS children. |
 | Open endpoints per invocation | 32 | Including `SY_SELF` — the pre-256 table size, kept for everything ring-bearing. A per-role budget can be given back while its endpoint still holds rings (a closed process handle leaves its stdio endpoints, a wire-closed channel leaves the guest's fd, an ended egress task returns its permit), so endpoints are counted where they enter the table; over it, the opening helper returns `SY_ELIMIT`. |
@@ -926,9 +1012,10 @@ own.
 | Endpoints draining at once | 8 | The outbound cap again, applied to the ones the guest has closed. A closed endpoint keeps its socket and its tx ring until it drains, so an invocation can hold up to twice the outbound limit of them; past this, the oldest is dropped where it stands rather than accumulating rings. |
 | Socket map | 4096 keys / 1 MiB | Per socket. Expired entries are reclaimed; a full map fails `sy_map_set` rather than evicting live state. |
 | Guest duration inputs | `u32::MAX` ms (~49.7 days) | Rate-limit windows and map TTLs are clamped, not refused: the memory-only map cannot honestly promise longer, and the clamp keeps every host-side duration computation in range — `Duration::as_nanos` must not truncate into a zero window width, and `Instant + Duration` must not overflow. |
-| `Open` frame | 9 KiB | Derived, not chosen: `MAX_KEY_LEN` (4 KiB, the §12 trie-key bound) + 4 KiB of metadata across ≤ 16 pairs + 1 KiB for the origin, the space and postcard's varints. A cap below what a legal frame carries would be a wedge — the resolver is deterministic, so an over-cap `Open` is over it on every retry. |
+| Request frame | 9 KiB | Derived, not chosen: `MAX_KEY_LEN` (4 KiB, the §12 trie-key bound) + 4 KiB of metadata across ≤ 16 pairs + 1 KiB for the origin and postcard's varints. A cap below what a legal frame carries would be a wedge — the resolver is deterministic, so an over-cap `Open` is over it on every retry. The 256-byte socket name it now carries is far inside the bound the path it replaced needed. |
+| `List` reply frame | derived | One entry per activation at the bound above, each carrying a name, a tree path, a note and a root. Bounded by the activation bound rather than by a cap of its own to keep in step. |
 | `Open` handshake | 120 s, 8 per connection | The shared accept path's per-stream timeout and per-connection in-flight cap, applied to the one phase of a socket stream that has no runtime of its own: a stream that never finishes its `Open` is not an invocation, and without a bound it would own a task and a buffer for as long as the peer keeps the connection. The bound ends the moment the `Open` is admitted — a socket that proxies is supposed to be long-lived, and its concurrency bound is the effective `max_streams`, not this. |
-| Activated sockets per space | 64 | An activation is operator state; this is a sanity bound, not a quota. |
+| Activated sockets per node | 256 | An activation is operator state; this is a sanity bound, not a quota. It replaces a 64-per-space bound that had no space left to count in, and it is also what bounds a `List` reply. |
 | Tree-write declarations per program | 16 | Like the other per-family declaration caps (`docs/TREE-WRITES.md` §8). |
 | Open tree writers per invocation | 4 | Each holds a 256 KiB staging buffer and, engine-side, a staging file; counted as their own role, like endpoints, not charged to the footprint. Over: `sy_put_open` returns `SY_ELIMIT`. |
 | Tree-writer staging buffer | 256 KiB | Full is backpressure: `SY_EAGAIN`, poll `SY_POLL_OUT`. |
@@ -943,7 +1030,10 @@ own.
 | Memory fault or trap | clean FIN | `Closed{Fault}`, exit 70. async-ebpf's SIGSEGV handler contains it: the invocation dies, the worker does not. |
 | Faults on ≥ 8 of the last 16 invocations, from ≥ 2 different callers | — | One loud error in the daemon's log naming the program root. Nothing is deactivated for it — activation is the operator's statement about the path, not a judgement about these bytes, and the remedy is deploying a fixed program, which also clears the window. Faults are attributed to the caller whose invocation faulted, and the breadth is the point: any input-triggered bug in a program is a contained fault, and a caller who finds one can repeat it, so a window that counted faults alone would let whoever reached the socket first fill the log for everyone. A program that is genuinely broken faults for whoever asks. |
 | Manifest invalid, no stream entrypoint, or JIT/link failure | refused | `Refused{ProgramInvalid}` naming the defect. The manifest parse and a stream-entrypoint check run at every admission; `synch socket inspect` runs the same checks plus an eager load before anything is deployed, because async-ebpf compiles functions lazily and a bad function would otherwise surface mid-stream. The path stays activated and published: deploying a fixed object is the remedy. |
-| Bytes changed under an activated socket | served | A deployment: the next admission runs the new root, in-flight invocations keep their snapshot, and the per-socket map clears. A replacement landing *during* one admission refuses it `Refused{NotActivated}`; the retry lands on the new program. |
+| Bytes changed at a program path | served | A deployment to every socket that names it: each one's next admission runs the new root, in-flight invocations keep their snapshot, and every dependent map clears. A replacement landing *during* one admission refuses it `Refused{NotActivated}`; the retry lands on the new program. |
+| Program path has no live file entry | refused | Every socket it backs: `unpublished` in `ls`, `Refused{NoSuchPath}` naming the program path. Deploying the object is the remedy; the activation is untouched. |
+| A delegate opens a socket outside its scope | refused | `Refused{OutOfScope}`. `List` did not show it. |
+| The space of a program is removed | — | `remove_source` deletes the activations its programs backed: a socket whose program has no source behind it can never serve. |
 | Egress to an undeclared destination | stays open | `SY_EPERM` from `sy_tcp_connect`. The host logs it once per socket per hour. |
 | Daemon shutdown | clean FIN | `Closed{Shutdown}` for every live invocation, inside the SIGTERM budget §9 already allows for. |
 | Preemption watcher failed | refused | That worker refuses new runs — async-ebpf checks this itself rather than risk a guest that cannot be interrupted. Surfacing the degraded worker count in `synch doctor` is not built. |
@@ -951,31 +1041,27 @@ own.
 
 ## 11. What this changes in the existing design
 
-- **§8, version identity.** Today identity is the content root for regular files
-  and `(kind, target)` for content-less kinds. A `Socket` has content, so
-  `nas`'s socket and `laptop`'s plain file over the same ELF would collapse into
-  one unanimous version. Identity becomes `(kind-class, content root)`, where
-  `Socket` is its own class. Two origins agree about a socket only if they agree
-  that it *is* one.
-- **§4.2, schema.** One new `EntryKind` discriminant, and nothing else:
-  `RECORD_VERSION` stays at 1 and every existing record encodes to the same
-  bytes it did before (§2). Postcard is not self-describing, so a node too old
-  to know the discriminant fails to decode that record — which §12 already
-  scopes correctly ("a record this node cannot apply fails its own origin and no
-  other"), but it does mean one socket entry stalls the publisher's whole head
-  on old peers. That is unavoidable for any new kind and is the reason the
-  rollout order is: upgrade, then activate.
-- **§4.1, redaction boundary.** The new record type is checked against the prefix
-  rule, as §4.1 requires. It passes without a new rule because it is not a new
-  record type: it is a field on `f:`, entirely inside the space prefix a
-  delegation already projects.
-- **§12, a new capability to name.** Membership currently grants read access and
-  publish rights. It now also grants the ability to *invoke* programs at paths
-  the callee has activated. The security section should say that plainly,
-  alongside the mitigations: the callee chose every activated path, the caller
-  supplies no code, and every capability is declared in the object itself.
-  `synch socket ls -l` lists every activated socket and what its current
-  content declares; surfacing the same in `synch doctor` is not built.
+- **§8, version identity.** *Historical.* When a socket was its own entry kind,
+  identity became `(kind-class, content root)` so that `nas`'s socket and
+  `laptop`'s plain file over the same ELF did not collapse into one unanimous
+  version. Nothing emits `Socket` any more, so the distinction is moot; the
+  rule is harmless and stays for old records.
+- **§4.2, schema.** One `EntryKind` discriminant, added once and now
+  historical: `RECORD_VERSION` stays at 1 and every record encodes to the same
+  bytes it did before. Postcard is not self-describing, so a node too old to
+  know the discriminant fails to decode such a record — which §12 already
+  scopes correctly ("a record this node cannot apply fails its own origin and
+  no other").
+- **§4.1, redaction boundary.** Nothing new is published: a program is a file
+  under `f:`, entirely inside the space prefix a delegation already projects,
+  and a socket is not in the trie at all.
+- **§12, a new capability to name.** Membership currently grants read access
+  and publish rights. It now also grants the ability to *invoke* programs the
+  callee has activated a socket over. The security section should say that
+  plainly, alongside the mitigations: the callee chose every activation and
+  every scope, the caller supplies no code, and every capability is declared
+  in the object itself. `synch socket ls -l` lists every socket, the program
+  behind it and what that program declares.
 - **§11, crate layout.** A new `synch-sock` crate holds the helper table, the
   endpoint and reactor machinery, the program cache and the manifest reader; it
   depends on `async-ebpf` and is gated to the platforms that crate supports.
@@ -983,10 +1069,11 @@ own.
   gains the `sync/sock/1` protocol handler beside the two it already mounts. The
   engine crate stays embeddable — a library user gets sockets by enabling a
   feature, not by taking a dependency it cannot build.
-- **§10, schema.** One table: `socket_activations` (space, path, config,
-  max streams, note, activated_at). Local operator state, never published or
-  replicated. The map store is memory-only and deliberately absent from
-  SQLite.
+- **§10, schema.** One table: `socket_activations` (name, program space and
+  path, scope, config, max streams, note, activated_at), indexed by program so
+  a deployment can find every socket it moves. Local operator state, never
+  published or replicated. The map store is memory-only and deliberately
+  absent from SQLite.
 
 ## 12. Non-goals, and what comes after
 
@@ -1014,13 +1101,14 @@ Worth building next:
   overhead.
 - **`synch socket forward`** — a daemon-hosted listener with a lifecycle, for
   the case `synch socket connect --listen` is currently standing in for.
-- **`sy_synch_connect(origin, path)`** — a socket calling another node's socket
-  over iroh rather than TCP, so a composition of sockets stays inside the
-  authenticated fabric instead of falling back to the network underneath it.
+- **`sy_synch_connect(origin, socket)`** — a socket calling another node's
+  socket over iroh rather than TCP, so a composition of sockets stays inside
+  the authenticated fabric instead of falling back to the network underneath
+  it.
 - **Signed activation records.** Activation is local state today. An operator
-  with many nodes would rather activate a path once and have every node honour
-  it, which is a delegation-shaped problem and should reuse §3.5 rather than
-  invent a second grant format.
+  with many nodes would rather activate a socket once and have every node
+  honour it, which is a delegation-shaped problem and should reuse §3.5 rather
+  than invent a second grant format.
 - **A Rust SDK** beside the C header, following zeroserve's lead — the helper
   surface is small enough that safe wrappers around the handle table are a
   weekend, and a `#![no_std]` guest with real types is a better place to write
