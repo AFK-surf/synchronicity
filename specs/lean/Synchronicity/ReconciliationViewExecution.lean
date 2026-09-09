@@ -204,31 +204,9 @@ structure PromotionHost (origin : Origin.Parsed) (target : ViewTarget)
     state.db origin target world services
   policy : StablePolicy origin target state.db
 
-/-- Device-level history available before a production promotion of an
-origin. A first use is justified by raw per-origin cleanup; every continuation
-is justified by a previously established correct view plus stable metadata.
-Neither constructor assumes `PromotionInitialView.Initial`. -/
-inductive PromotionHistory (db : Database) (origin : Origin.Parsed)
-    (world : TrieDiffCoverage.World) (services : MaterializedView.Services) : Prop where
-  | clean (baseline : PromotionBaseline.CleanOriginBaseline db origin world services) :
-      PromotionHistory db origin world services
-  | continued (previous : ViewTarget)
-      (correct : CorrectView services origin previous db)
-      (metadata : PromotionContinuationBaseline.MetadataContracts
-        db origin previous world services) :
-      PromotionHistory db origin world services
-
-theorem PromotionHistory.initial
-    (history : PromotionHistory db origin world services) :
-    PromotionInitialView.Initial db origin world services := by
-  cases history with
-  | clean baseline => exact PromotionBaseline.initial_origin baseline
-  | continued previous correct metadata =>
-      exact PromotionContinuationBaseline.initial_of_correct correct metadata
-
 /-- Host contracts for an interleaved promotion of another origin. Successful
-and non-successful branches are discovered by analyzing the actual command;
-this structure contains no `Ready` or promotion-result witness. -/
+and non-successful branches are discovered by analyzing the actual command.
+They contain no correctness or completion premise for the foreign origin. -/
 structure ForeignPromotionHost (origin foreign : Origin.Parsed) (target : ViewTarget)
     (world : TrieDiffCoverage.World) (services : MaterializedView.Services)
     (state : State) : Prop where
@@ -238,9 +216,13 @@ structure ForeignPromotionHost (origin foreign : Origin.Parsed) (target : ViewTa
   normalization : state.isNfc = services.nfc
   relational : ∀ relation, relation = Trie.nodeSpace ∨ relation = Trie.valueSpace →
     state.byteRelations.contains relation = true
+  schema : MaterializationKeySchema.Schema state.db
   replicas : ∀ scope actual,
     MaterializationInputs.ReadPolicy state.db foreign scope actual →
       actual = target.replicas
+  policiesAgree : ∀ scope actual,
+    MaterializationInputs.ReadPolicy state.db foreign scope actual →
+      MaterializationRequirementFrame.PoliciesAgree actual
   materializerNfc : ∀ tx oldRoot newRoot cleared staged count,
     execute (Materialize.materialize tx foreign oldRoot newRoot) cleared =
       (.ok count, staged) → cleared.isNfc = services.nfc
@@ -253,12 +235,12 @@ theorem foreign_promotion_refines
     (origin : Origin.Parsed) (target : ViewTarget) (world : TrieDiffCoverage.World)
     (services : MaterializedView.Services)
     (host : ForeignPromotionHost origin foreign target world services state)
-    (history : PromotionHistory state.db foreign world services)
     (beforeView afterView : HeadView)
     (before : StableSlotInputs state (Origin.canonical origin) latest beforeView)
     (after : StableSlotInputs final (Origin.canonical origin) latest afterView)
     (sameOrigin : target.head.origin = origin)
     (installed : AtomicFileView.Installed state.db target.head)
+    (correct : CorrectView services origin target state.db)
     (targetLatest : AcceptanceProgress.versionRank
       ⟨target.head.seq, target.head.root⟩ = latest) :
     MptsyncStableTail.Refines services origin target state.db final.db := by
@@ -273,19 +255,17 @@ theorem foreign_promotion_refines
         (PromotionPublication.promote_failure foreign now refused state actualFinal failure ran))
     | ok report =>
       by_cases flipped : report.promotion = Promotion.flipped
-      · obtain ⟨scope, replicas, head, headOrigin, policy, headInstalled, files,
-            current, forever⟩ :=
-          PromotionCommittedView.promote_ready foreign now refused state actualFinal report
-            world services host.closed host.faithful host.normalization host.relational
-            history.initial flipped ran
-        have replicaSame := host.replicas scope replicas policy
+      · have retention := ForeignMaterializationFrame.promote_flipped_retention foreign now
+          refused target.replicas world state actualFinal report flipped ran
+          correct.2.2.2.1 host.schema host.replicas host.policiesAgree
+          host.materializerFaithful
         have foreignFiles := ForeignMaterializationFrame.promote_flipped_files foreign now
           refused (Origin.canonical origin) host.different services world state actualFinal
           report flipped ran host.materializerNfc host.materializerFaithful
         refine Or.inr (Or.inr (Or.inr ⟨⟨?_, ?_, ?_⟩, ?_⟩))
         · exact foreignFiles
-        · simpa only [replicaSame] using current
-        · simpa only [replicaSame] using forever
+        · exact retention.1
+        · exact retention.2
         · simpa only [ran] using installedAfter
       · exact Or.inl (PromotionNonpublication.promote_no_flip_for
           (Origin.canonical origin) foreign now refused state actualFinal report flipped ran)
@@ -369,7 +349,6 @@ theorem foreign_completed_settlement_refines
     (step : Step (.settlement foreign refused scope fetchTarget key (.ok true)) state final)
     (origin : Origin.Parsed) (target : ViewTarget) (world : TrieDiffCoverage.World)
     (services : MaterializedView.Services)
-    (history : PromotionHistory state.db foreign world services)
     (host : ∀ clockNow current,
       execute (raise Promote.Error.host Clock.nowNs : Fetch.Action Int64) state =
         (.ok clockNow, current) →
@@ -379,6 +358,7 @@ theorem foreign_completed_settlement_refines
     (after : StableSlotInputs final (Origin.canonical origin) latest afterView)
     (sameOrigin : target.head.origin = origin)
     (installed : AtomicFileView.Installed state.db target.head)
+    (correct : CorrectView services origin target state.db)
     (targetLatest : AcceptanceProgress.versionRank
       ⟨target.head.seq, target.head.root⟩ = latest) :
     MptsyncStableTail.Refines services origin target state.db final.db := by
@@ -407,8 +387,8 @@ theorem foreign_completed_settlement_refines
       exact Or.inl (by rw [finalDb])
     | ok clockNow =>
       have currentDb : current.db = state.db := by simpa using dbFrame
-      have currentHistory : PromotionHistory current.db foreign world services := by
-        simpa only [currentDb] using history
+      have currentCorrect : CorrectView services origin target current.db := by
+        simpa only [currentDb] using correct
       have finalState :
           (execute (FetchLifecycle.settle foreign refused scope fetchTarget key (.ok true)) state).2 =
             (execute (Promote.promote foreign clockNow refused) current).2 := by
@@ -437,14 +417,13 @@ theorem foreign_completed_settlement_refines
         exact after
       have promoted := foreign_promotion_refines
         (Step.promotion foreign clockNow refused current facts.closed) origin target world services
-        facts currentHistory beforeView afterView currentSlots promotedSlots sameOrigin (by
-          simpa only [currentDb] using installed) targetLatest
+        facts beforeView afterView currentSlots promotedSlots sameOrigin (by
+          simpa only [currentDb] using installed) currentCorrect targetLatest
       simpa only [finalState, currentDb] using promoted
 
 /-- Stable-tail evidence is stated over actual raw observations. It contains
-slot representation/backing/validity, an upper bound on observed versions, a
-shared per-origin promotion history, and host facts; never `Refines` or the
-tracked origin's `CorrectView`. -/
+slot representation/backing/validity, an upper bound on observed versions and
+host facts; never `Refines` or any origin's `CorrectView`. -/
 structure StableFacts (trace : MptsyncStableTail.Trace)
     (services : MaterializedView.Services) (origin : Origin.Parsed)
     (target : ViewTarget) (latest : Nat) (views : Nat → HeadView)
@@ -454,8 +433,6 @@ structure StableFacts (trace : MptsyncStableTail.Trace)
     ⟨target.head.seq, target.head.root⟩ = latest
   slots : ∀ n, stableFrom ≤ n → StableSlotInputs (trace.state n)
     (Origin.canonical origin) latest (views n)
-  history : ∀ n, stableFrom ≤ n → ∀ tracked, tracked ≠ origin →
-    PromotionHistory (trace.state n).db tracked world services
   promotionHost : ∀ n now refused,
     stableFrom ≤ n → trace.event n = .promotion origin now refused →
       PromotionHost origin target world services (trace.state n)
@@ -520,9 +497,8 @@ private theorem stable_step_refines
           facts.targetLatest
       · exact foreign_promotion_refines actual origin target world services
           (facts.foreignPromotion n promoted now refused stable eventEq same)
-          (facts.history n stable promoted same)
           (views n) (views (n + 1)) (facts.slots n stable) (facts.slots (n + 1) stableNext)
-          facts.targetOrigin correct.2.1 facts.targetLatest
+          facts.targetOrigin correct.2.1 correct facts.targetLatest
     | settlement settled refused scope fetchTarget key result =>
       cases result with
       | error _ => exact payload trivial
@@ -537,10 +513,9 @@ private theorem stable_step_refines
               (views n) (views (n + 1)) (facts.slots n stable) (facts.slots (n + 1) stableNext)
               facts.targetOrigin correct.2.1 correct facts.targetLatest
           · exact foreign_completed_settlement_refines actual origin target world services
-              (facts.history n stable settled same)
               (facts.foreignSettlement n settled refused scope fetchTarget key stable eventEq same)
               (views n) (views (n + 1)) (facts.slots n stable) (facts.slots (n + 1) stableNext)
-              facts.targetOrigin correct.2.1 facts.targetLatest
+              facts.targetOrigin correct.2.1 correct facts.targetLatest
   exact ⟨refinement, nextSlots⟩
 
 private theorem correct_from (trace : MptsyncStableTail.Trace)

@@ -1,6 +1,7 @@
 import Synchronicity.MaterializationExactFiles
 import Synchronicity.MaterializationInputs
 import Synchronicity.PromotionProgress
+import Synchronicity.MptsyncViewStability
 
 /-! Production materialization is keyed by canonical origin. Applying a
 foreign origin's file delta cannot change any observed file row of this
@@ -163,6 +164,10 @@ private theorem published_materializer_inputs
     ∃ cleared count clearedDb,
       cleared.pending = some (tx, clearedDb) ∧
       rows clearedDb "entries" = rows baseline.db "entries" ∧
+      rows clearedDb "pins" = rows baseline.db "pins" ∧
+      rows clearedDb "content_want" = rows baseline.db "content_want" ∧
+      rows clearedDb "config" = rows baseline.db "config" ∧
+      rows clearedDb "replicas" = rows baseline.db "replicas" ∧
       execute (Materialize.materialize tx foreign
         (old.map (·.head.root) |>.getD Trie.emptyRoot) pending.head.root) cleared =
         (.ok count, staged) := by
@@ -183,7 +188,23 @@ private theorem published_materializer_inputs
   have entries : rows clearedDb "entries" = rows baseline.db "entries" := by
     simpa only [MaterializationTableFrame.view, clearedTx, preparedSnapshot,
       Option.map_some, Option.some.injEq, Prod.mk.injEq, true_and] using entriesFrame
-  exact ⟨cleared, count, clearedDb, clearedTx, entries, streamed⟩
+  have pins : rows clearedDb "pins" = rows baseline.db "pins" := by
+    simpa only [MaterializationTableFrame.view, clearedTx, preparedSnapshot,
+      Option.map_some, Option.some.injEq, Prod.mk.injEq, true_and] using
+        frames "pins" (by decide) (by decide)
+  have wants : rows clearedDb "content_want" = rows baseline.db "content_want" := by
+    simpa only [MaterializationTableFrame.view, clearedTx, preparedSnapshot,
+      Option.map_some, Option.some.injEq, Prod.mk.injEq, true_and] using
+        frames "content_want" (by decide) (by decide)
+  have config : rows clearedDb "config" = rows baseline.db "config" := by
+    simpa only [MaterializationTableFrame.view, clearedTx, preparedSnapshot,
+      Option.map_some, Option.some.injEq, Prod.mk.injEq, true_and] using
+        frames "config" (by decide) (by decide)
+  have replicas : rows clearedDb "replicas" = rows baseline.db "replicas" := by
+    simpa only [MaterializationTableFrame.view, clearedTx, preparedSnapshot,
+      Option.map_some, Option.some.injEq, Prod.mk.injEq, true_and] using
+        frames "replicas" (by decide) (by decide)
+  exact ⟨cleared, count, clearedDb, clearedTx, entries, pins, wants, config, replicas, streamed⟩
 
 private theorem ready_materializer_inputs
     (ready : PromotionProgress.Ready foreign now refused state) :
@@ -204,8 +225,10 @@ private theorem ready_materializer_inputs
   have published := PromotionPublication.body_published ready.tx foreign now ready.pending
     ready.old ready.scope ready.authority ready.prepared ready.body.staged
     (PromotionProgress.body_executes ready.body)
-  exact published_materializer_inputs ready.tx foreign now ready.pending ready.old ready.scope
-    ready.authority state ready.prepared ready.body.staged preparedSnapshot published
+  obtain ⟨cleared, count, clearedDb, opened, entries, _, _, _, _, streamed⟩ :=
+    published_materializer_inputs ready.tx foreign now ready.pending ready.old ready.scope
+      ready.authority state ready.prepared ready.body.staged preparedSnapshot published
+  exact ⟨cleared, count, clearedDb, opened, entries, streamed⟩
 
 private theorem materialize_then_commit_files
     (tx : Transaction) (foreign : Origin.Parsed) (oldRoot newRoot : ByteArray)
@@ -258,7 +281,7 @@ theorem promote_flipped_files (foreign : Origin.Parsed) (now : Int64)
   obtain ⟨tx, opened, ready, scope, authority, pending, old, staged, db,
       began, prepared, readyTx, readyDb, published, stagedDb, stagedTx, finalDb, committed⟩ :=
     PromotionPublication.promote_flipped foreign now refused state final report flipped ran
-  obtain ⟨cleared, count, clearedDb, clearedTx, entries, streamed⟩ :=
+  obtain ⟨cleared, count, clearedDb, clearedTx, entries, _, _, _, _, streamed⟩ :=
     published_materializer_inputs tx foreign now pending old scope authority state ready staged
       readyTx published
   let oldRoot := old.map (·.head.root) |>.getD Trie.emptyRoot
@@ -268,6 +291,93 @@ theorem promote_flipped_files (foreign : Origin.Parsed) (now : Int64)
     (materializerNfc tx oldRoot newRoot cleared staged count (by simpa [oldRoot, newRoot]))
     (materializerFaithful tx oldRoot newRoot cleared staged count (by simpa [oldRoot, newRoot]))
     (by simpa [oldRoot, newRoot]) committed
+
+/-- A flipped foreign promotion preserves the already-correct participant's
+retention duties from the actual materializer run. Unlike the foreign origin's
+exact-view theorem, this needs no old-view correctness for that foreign origin. -/
+theorem promote_flipped_retention (foreign : Origin.Parsed) (now : Int64)
+    (refused : List (UInt64 × ByteArray × ByteArray))
+    (replicas : List Materialize.Target) (world : World)
+    (state final : State) (report : VerifiedCore.Commands.PromotionReport)
+    (flipped : report.promotion = Promotion.flipped)
+    (ran : execute (Promote.promote foreign now refused) state = (.ok report, final))
+    (current : CurrentRequirements replicas state.db)
+    (schema : MaterializationKeySchema.Schema state.db)
+    (replicaPolicy : ∀ scope actual,
+      MaterializationInputs.ReadPolicy state.db foreign scope actual → actual = replicas)
+    (policyAgreement : ∀ scope actual,
+      MaterializationInputs.ReadPolicy state.db foreign scope actual →
+        MaterializationRequirementFrame.PoliciesAgree actual)
+    (materializerFaithful : ∀ tx oldRoot newRoot cleared staged count,
+      execute (Materialize.materialize tx foreign oldRoot newRoot) cleared =
+        (.ok count, staged) → Faithful world cleared) :
+    CurrentRequirements replicas final.db ∧
+      ForeverRequirements replicas state.db final.db := by
+  obtain ⟨tx, opened, ready, scope, authority, pending, old, staged, committedDb,
+      began, prepared, readyTx, readyDb, published, stagedDb, stagedTx, finalDb, committed⟩ :=
+    PromotionPublication.promote_flipped foreign now refused state final report flipped ran
+  obtain ⟨cleared, count, clearedDb, clearedTx, entries, pins, wants, config,
+      replicaRows, streamed⟩ :=
+    published_materializer_inputs tx foreign now pending old scope authority state ready staged
+      readyTx published
+  let oldRoot := old.map (·.head.root) |>.getD Trie.emptyRoot
+  let newRoot := pending.head.root
+  obtain ⟨actualScope, preparedAt, actualReplicas, releaseNow, materializer,
+      policyRead, observed, runDiff⟩ :=
+    MaterializationInputs.materialize_inputs tx foreign oldRoot newRoot cleared staged count
+      (by simpa [oldRoot, newRoot] using streamed)
+  have readPolicy : MaterializationInputs.ReadPolicy state.db foreign
+      actualScope actualReplicas := by
+    refine ⟨tx, cleared, materializer, preparedAt, releaseNow, clearedDb,
+      clearedTx, config, replicaRows, policyRead⟩
+  have sameReplicas := replicaPolicy actualScope actualReplicas readPolicy
+  have agreed := policyAgreement actualScope actualReplicas readPolicy
+  have clearedCurrent : CurrentRequirements replicas clearedDb := by
+    have requirements := MaterializationWholeRetention.tables_preserve replicas state.db
+      state.db clearedDb entries pins wants ⟨current, fun _ _ _ _ held => held⟩
+    exact requirements.1
+  have clearedSchema : MaterializationKeySchema.Schema clearedDb := by
+    simpa only [MaterializationKeySchema.Schema, pins, wants] using schema
+  have materializerTx : materializer.pending = some (tx, clearedDb) := by
+    have samePending := congrArg State.pending observed
+    simpa only [MaterializationInputs.observation, clearedTx] using samePending
+  have materializerFaithful' : Faithful world materializer := by
+    have source := materializerFaithful tx oldRoot newRoot cleared staged count
+      (by simpa [oldRoot, newRoot] using streamed)
+    have observationBytes (observedState : State) :
+        readableBytes (MaterializationInputs.observation observedState) =
+          readableBytes observedState := rfl
+    have observationHash (observedState : State) :
+        (MaterializationInputs.observation observedState).hash = observedState.hash := rfl
+    have sameBytes : readableBytes materializer = readableBytes cleared :=
+      (observationBytes materializer).symm.trans
+        ((congrArg readableBytes observed).trans (observationBytes cleared))
+    have sameHash : materializer.hash = cleared.hash :=
+      (observationHash materializer).symm.trans
+        ((congrArg State.hash observed).trans (observationHash cleared))
+    exact ⟨by rw [sameBytes]; exact source.1, sameHash.trans source.2⟩
+  have retention := MaterializationWholeRetention.materialize_requirements tx
+    (Origin.canonical foreign) world actualScope oldRoot newRoot preparedAt releaseNow
+      actualReplicas (by simpa only [sameReplicas] using agreed) materializer staged count
+      clearedDb materializerTx materializerFaithful' clearedSchema
+      (by simpa only [sameReplicas] using clearedCurrent) runDiff
+  obtain ⟨after, afterTx, afterSchema, afterCurrent, afterForever⟩ := retention
+  have sameAfter : after = committedDb := congrArg Prod.snd
+    (Option.some.inj (afterTx.symm.trans stagedTx))
+  subst after
+  have finalCurrent : CurrentRequirements actualReplicas final.db := by
+    simpa only [finalDb] using afterCurrent
+  have finalForever : ForeverRequirements actualReplicas clearedDb final.db := by
+    simpa only [finalDb] using afterForever
+  have initialForever : ForeverRequirements replicas state.db clearedDb := by
+    intro target member permanent root required
+    exact MaterializationRetention.rows_retain
+      (fun _ present => pins.symm ▸ present)
+      (fun _ present => wants.symm ▸ present) root target.holder required
+  constructor
+  · simpa only [sameReplicas] using finalCurrent
+  · apply MptsyncViewStability.forever_trans initialForever
+    simpa only [sameReplicas] using finalForever
 
 /-- A healthy actual foreign promotion preserves this origin's observed file
 rows. The only environmental inputs are the same readable-snapshot/NFC facts
