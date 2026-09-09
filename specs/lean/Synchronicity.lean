@@ -61,6 +61,7 @@ import Synchronicity.CasTransferHistories
 import Synchronicity.TrieFetchProofs
 import Synchronicity.TrieFetchCompletion
 import Synchronicity.ContactProofs
+import Synchronicity.ContactExecution
 import Synchronicity.TrieFetchSuspensionProofs
 
 import Synchronicity.CasInlineHistories
@@ -88,4 +89,5 @@ import Synchronicity.MaterializationExactFiles
 import Synchronicity.MaterializationWholeRetention
 import Synchronicity.Goals.Mptsync.M4
 import Synchronicity.Goals.Mptsync.M2
+import Synchronicity.Goals.Mptsync.M6
 import Synchronicity.MptsyncConvergence
