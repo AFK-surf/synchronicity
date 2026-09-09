@@ -111,6 +111,7 @@ import Synchronicity.ScopeChangePromotionBaseline
 import Synchronicity.PromotionContinuationBaseline
 import Synchronicity.MptsyncPromotionHistory
 import Synchronicity.MptsyncAdvertisementWindow
+import Synchronicity.MptsyncPromotionScheduling
 import Synchronicity.ProductionTimeline
 import Synchronicity.MptsyncScopeChangeCarry
 import Synchronicity.MptsyncRefusalCache
