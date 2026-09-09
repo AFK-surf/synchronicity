@@ -844,6 +844,46 @@ private theorem latestRank_bounded (initial bound : Nat) (heads : List Head) :
       · rintro ⟨initialBound, headBound, tailBound⟩
         exact ⟨⟨initialBound, headBound⟩, tailBound⟩
 
+/-- If the stable greatest valid head was actually delivered, folding the
+production acceptance order reaches exactly its rank.  The upper bound is
+normally obtained from `LatestValid`; membership is the separate delivery
+obligation discharged by advertisement scheduling. -/
+theorem latestRank_eq_rank_of_member
+    (initialBound : initial ≤ rank latest)
+    (delivered : latest ∈ heads)
+    (greatest : ∀ head ∈ heads, rank head ≤ rank latest) :
+    latestRank initial heads = rank latest := by
+  apply Nat.le_antisymm
+  · exact (latestRank_bounded initial (rank latest) heads).mpr
+      ⟨initialBound, greatest⟩
+  · exact (latestRank_bounded initial (latestRank initial heads) heads).mp
+      (Nat.le_refl _)|>.2 latest delivered
+
+/-- Actual raw complete/pending observations therefore select the delivered
+greatest head itself, not merely the same numeric rank. -/
+theorem ObservedAcceptanceFold.selects_delivered_latest
+    (run : ObservedAcceptanceFold origin keep initial state view stable
+      heads final finalState finalView)
+    (initialBound : initial ≤ rank latest)
+    (delivered : latest ∈ heads)
+    (greatest : ∀ head ∈ heads, rank head ≤ rank latest)
+    (latestValid : latest.root.size = 32) :
+    selectedVersion finalView origin = some (⟨latest.seq, latest.root⟩ : HeadVersion) := by
+  have selectedRank : optionRank (selectedVersion finalView origin) = rank latest := by
+    rw [selectedVersion_rank, run.final_stable.maximum, run.actual.final_rank,
+      latestRank_eq_rank_of_member initialBound delivered greatest]
+  cases selectedEq : selectedVersion finalView origin with
+  | none =>
+      rw [selectedEq] at selectedRank
+      simp [optionRank, rank] at selectedRank
+      omega
+  | some selected =>
+      apply congrArg some
+      apply versionRank_injective selected ⟨latest.seq, latest.root⟩
+      · exact run.final_stable.selected_valid selectedEq
+      · exact latestValid
+      · simpa [selectedEq, optionRank, rank, versionRank] using selectedRank
+
 /-- Membership, not ordering or multiplicity, determines the semantic latest
 rank.  This is the fold counterpart of planner selection invariance. -/
 theorem latestRank_eq_of_same (same : ∀ head, head ∈ left ↔ head ∈ right) :
