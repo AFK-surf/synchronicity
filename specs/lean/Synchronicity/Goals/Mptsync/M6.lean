@@ -1,4 +1,4 @@
-import Synchronicity.OriginScheduleExecution
+import Synchronicity.MptsyncScheduleExecution
 
 /-! # M6 — failed work does not starve healthy peer/origin tasks
 
@@ -15,6 +15,7 @@ successful contact observations, not an assumed Fetch or promotion result.
 -/
 namespace Synchronicity.Goals.Mptsync.M6
 open VerifiedCore.Replication
+open MptsyncScheduleExecution
 
 /-- User-facing scheduler service: every healthy peer is contacted, and every
 stable advertised and pending origin is attempted during a factual usable
@@ -41,55 +42,6 @@ structure BoundedService
     contacts peer pending pendingLink
   pendingFetchOpportunity : OriginScheduleExecution.PendingFetchOpportunities
     contacts peer pending pendingLink pendingTarget
-
-/-- The factual stable-window inputs consumed by M6.  This record packages
-executions and their runtime observations, not any scheduler-service result:
-callers retain the raw contact trace, origin traces, wire payloads and finite
-bounds from which `service` derives `BoundedService`. -/
-structure StableScheduleInputs where
-  eligible : List ByteArray
-  peerMaximum : Nat
-  peerDeadline : Nat
-  peerRounds : Nat
-  contacts : ContactExecution.Execution eligible peerMaximum peerDeadline peerRounds
-  healthy : ByteArray → Prop
-  peer : ByteArray
-  peerWidth : ∀ candidate ∈ eligible, candidate.size = 32
-  peersWithin : eligible.length ≤ UInt64.size
-  peerMaximumPositive : 0 < peerMaximum
-  enoughPeerRounds : (Contact.index eligible).toList.length ≤ peerRounds * peerMaximum
-  peerMember : peer ∈ eligible
-  peerHealthy : healthy peer
-  advertisementItems : List OriginSchedule.Item
-  advertisementMaximum : Nat
-  advertisementDeadline : Nat
-  advertisementRounds : Nat
-  advertisements : OriginScheduleExecution.Execution .advertisement
-    advertisementItems advertisementMaximum advertisementDeadline advertisementRounds
-  advertisementLink : OriginScheduleExecution.LinkedToContact contacts peer advertisements
-  latest : OriginSchedule.Item → Head
-  advertisementPayloads : OriginScheduleExecution.AdvertisementPayloads advertisements latest
-  advertisementDistinct : ∀ left ∈ advertisementItems, ∀ right ∈ advertisementItems,
-    OriginSchedule.key left.origin = OriginSchedule.key right.origin → left = right
-  advertisementsWithin : advertisementItems.length ≤ UInt64.size
-  advertisementsFit : ∀ item ∈ advertisementItems,
-    item.weight.toNat ≤ advertisementMaximum
-  enoughAdvertisementRounds :
-    (OriginSchedule.index advertisementItems).toList.length ≤ advertisementRounds
-  pendingItems : List OriginSchedule.Item
-  pendingMaximum : Nat
-  pendingDeadline : Nat
-  pendingRounds : Nat
-  pending : OriginScheduleExecution.Execution .pendingFetch
-    pendingItems pendingMaximum pendingDeadline pendingRounds
-  pendingLink : OriginScheduleExecution.LinkedToContact contacts peer pending
-  pendingTarget : OriginSchedule.Item → OriginScheduleExecution.Target
-  pendingPayloads : OriginScheduleExecution.PendingPayloads pending pendingTarget
-  pendingDistinct : ∀ left ∈ pendingItems, ∀ right ∈ pendingItems,
-    OriginSchedule.key left.origin = OriginSchedule.key right.origin → left = right
-  pendingWithin : pendingItems.length ≤ UInt64.size
-  pendingFit : ∀ item ∈ pendingItems, item.weight.toNat ≤ pendingMaximum
-  enoughPendingRounds : (OriginSchedule.index pendingItems).toList.length ≤ pendingRounds
 
 /-- **M6 (stable finite sets).** Actual production contact, summary-page and
 pending-origin decisions provide bounded attempts to every healthy task. A
@@ -144,9 +96,9 @@ theorem bounded_service
 
 /-- Raw stable-window observations entail the M6 service property.  In
 particular, this projection cannot be constructed from a `BoundedService`:
-the record above requires the production executions and wire observations
+the shared input record requires the production executions and wire observations
 that `bounded_service` consumes. -/
-theorem StableScheduleInputs.service (inputs : StableScheduleInputs) :
+theorem inputs_service (inputs : StableScheduleInputs) :
     BoundedService inputs.healthy inputs.contacts inputs.peer inputs.advertisements
       inputs.advertisementLink inputs.latest inputs.pending inputs.pendingLink
       inputs.pendingTarget := by
