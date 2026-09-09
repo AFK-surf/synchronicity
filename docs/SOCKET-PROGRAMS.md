@@ -193,12 +193,14 @@ still one head and there is nothing that can lag it. A program path that
 vanishes is tombstoned as any file is; its sockets resolve to nothing until
 it comes back.
 
-## 5. The wire — `sync/sock/2`
+## 5. The wire — `sync/sock/1`, changed in place
 
 Addressing a socket by `space` and `path` is the one thing the current
-`Open` cannot express, so the protocol moves: ALPN `sync/sock/2`,
-`SOCK_PROTO_VERSION` 2, the same connection and stream shape, and three
-changes to the frames.
+`Open` cannot express, so the frames change. The ALPN stays `sync/sock/1`
+and `SOCK_PROTO_VERSION` stays 1: this is experimental software, and a
+version bump would buy a cleaner refusal for a peer that is going to be
+upgraded anyway. The connection and stream shape are the same; three frames
+change.
 
 ```rust
 enum SockRequest {                 // one per bi-stream, in place of a bare Open
@@ -235,35 +237,39 @@ struct SockEntry { name: String, program: Hash, program_path: String, note: Stri
   by the same 4 KiB the path was, and the space it replaces was inside the
   1 KiB slack.
 
-A node on v2 does not mount v1 and refuses a v1 dial at ALPN negotiation,
-which the CLI reports as "this node speaks sync/sock/2; upgrade". SOCKETS.md
-§11 already sets the rollout order for a change peers cannot decode:
-**upgrade, then activate**. The connecting side is a byte pump with no
-runtime, so upgrading it is the cheap half; and because the migration keeps
-every old spelling meaningful (§8), the first thing an upgraded caller types
-is the thing it typed yesterday.
+An old caller's `Open` does not decode as a `SockRequest` and is refused at
+the frame layer, as any malformed frame is; an old callee cannot decode a
+new one and refuses likewise. Neither side misaddresses anything: the failure
+is at the handshake, before any policy runs. SOCKETS.md §11 already sets the
+rollout order for a change peers cannot decode — **upgrade, then activate**
+— and the connecting side is a byte pump with no runtime, so upgrading it is
+the cheap half. Because the migration keeps every old spelling meaningful
+(§8), the first thing an upgraded caller types is the thing it typed
+yesterday.
 
-## 6. Program paths are never writable through a program
+## 6. A write is a write
 
-`docs/TREE-WRITES.md` §2 states the rule that keeps tree-write grants and
-activation composable: an activated path is never writable through the
-`sy_put_*` family or a writable SFTP handle, because otherwise a program with
-a grant over a prefix containing a socket is remote code persistence in two
-moves — write the ELF, invoke it. The ELF now lives at the program path, so
-the rule moves with it:
+`docs/TREE-WRITES.md` §2 refuses `sy_put_*` and writable-SFTP writes to an
+activated socket path, and the engine enforces it in `refuse_socket_path` at
+writer open and again at commit. This design **removes that refusal and adds
+no replacement**. A program-initiated write to a program path is treated
+exactly as a user-initiated one: an ordinary local publish through the same
+ingest path, and — because the path is activated — a deployment.
 
-> A path that is the program path of any activation is refused by
-> `refuse_socket_path` (renamed `refuse_program_path`), at writer open and
-> again under the tree-write lock at commit and delete.
+That is the activation model applied without exception. SOCKETS.md §3
+enumerates the channels that write into a node's own tree and says the
+operator accepts every one of them as a deployment channel when activating a
+path. A program holding a tree-write grant over a prefix is one more such
+channel, declared in a manifest the operator inspected before deploying it,
+and it is not more or less trusted than an S3 key with write access to the
+same prefix. What differs is only that the operator can be told about it:
+`activate` and `ls -l` list which activated programs carry a grant covering
+the program path, beside the other dependents (§7).
 
-It is the one security-relevant change and it is a refusal moving, not a new
-mechanism. `synch adopt path`, `synch put` and an S3 `PUT` onto a program
-path remain sanctioned deployment channels the operator accepted at
-activation, which says so (§7). Reading a program path is unrestricted, as
-reading a socket entry is today (SOCKETS.md §7.6): the bytes are not secret,
-and what executes is decided by the activation table. The SFTP backend's
-`entry_kind` refusal — "a socket does not read out its neighbours' code" —
-has nothing left to refuse and is removed.
+Reading a program path is unrestricted, as reading a socket entry is today
+(SOCKETS.md §7.6). The SFTP backend's `entry_kind` refusal — "a socket does
+not read out its neighbours' code" — has nothing left to refuse and is
+removed.
 
 ## 7. Command surface
 
@@ -293,8 +299,13 @@ $ synch socket activate docs/git --program code/bin/gateway.o --scope docs
 activated docs/git ← code/bin/gateway.o
 open to: members, and delegates of docs
 every write to code/bin/gateway.o is a deployment to: git, hg, docs/git
-that includes adoption, S3 writes and `synch put` — activate only programs whose every writer you mean as a deployer
+that includes adoption, S3 writes, `synch put`, and the tree-write grant of socket ci/intake (prefix code/bin)
+activate only programs whose every writer you mean as a deployer
 ```
+
+The tree-write line appears only when an activated program's manifest
+carries a grant covering the program path (§6), and is computed from the
+same manifest parse `ls -l` uses.
 
 The list of dependents is the point: the third activation of a program is
 the moment its blast radius became three sockets, and the operator should see
@@ -346,9 +357,9 @@ self-backed in all but name.
 | Program content is not a valid program | As today, per socket: activated, every connection `Refused{ProgramInvalid}` naming the defect. One bad deploy is *N* unavailable sockets and `ls` shows all of them with the same reason. |
 | Program replaced | Every dependent socket serves the new root from its next admission; every dependent map clears; one log line per socket. |
 | Delegate opens a socket outside its scope | `Refused{OutOfScope}`. `List` did not show it. |
-| Tree write or SFTP write to a program path | `SY_EPERM` / `HostError::Denied`, at open and at commit (§6). |
+| Tree write or SFTP write to a program path | A deployment, like any other write to it (§6). |
 | Space of the program removed | `remove_source` deletes the activations it backed, as it deletes a space's activations today. |
-| v1 caller dials a v2 node | ALPN refused; the CLI says which version the node speaks. |
+| An un-upgraded peer on either side | The `Open` does not decode; refused at the frame layer before any policy runs. |
 | Activations per node | 256. |
 | `List` reply | At most the activation bound; a bounded frame. |
 
@@ -371,11 +382,15 @@ self-backed in all but name.
   wrong for the motivating case — one gateway in `tools` serving `code` and
   `docs` delegates — and wrong as a grant: moving a file must not silently
   widen who may run it.
-- **Keeping `sync/sock/1` mounted with `space/path` joined into a name.**
-  Would let an un-upgraded caller reach a migrated socket. Rejected: the
-  protocol's stance is refuse, not negotiate, the caller side is the cheap
-  half to upgrade, and a compatibility shim on the code-execution ALPN is
-  the wrong place to spend the exception.
+- **A `sync/sock/2` ALPN beside the old one.** Would turn the handshake
+  failure into a named refusal. Not worth a second mount and a version
+  field for a protocol nobody depends on yet; the frame change is made in
+  place.
+- **Refusing program-initiated writes to program paths.** The rule
+  TREE-WRITES.md §2 applies to socket paths, moved to programs. Rejected:
+  it would make one write channel special among the several the activation
+  already accepts, and the operator is better served by being shown the
+  grant than by having it silently refused.
 
 ## 11. What this changes in the existing documents
 
@@ -385,12 +400,13 @@ self-backed in all but name.
   bytes; activations are not". §2.3 stands.
 - **SOCKETS.md §3.** Activation names a program path and a scope; the
   threat-model enumeration of writers applies to program paths.
-- **SOCKETS.md §4.** `sync/sock/2`, `SockRequest`, `List`, `OutOfScope`,
-  `program_path` in `Opened`.
+- **SOCKETS.md §4.** `SockRequest`, `List`, `OutOfScope`, `program_path` in
+  `Opened`; same ALPN and version.
 - **SOCKETS.md §9 and §10.** The command surface and the table above.
 - **SOCKETS.md §11.** The schema, and the version-identity amendment marked
   historical.
-- **TREE-WRITES.md §2.** The refusal covers program paths (§6).
+- **TREE-WRITES.md §2.** The activated-path refusal is removed; a program's
+  write to a program path is a deployment (§6).
 - **README.md, the control-plane skill, the Hecatia client.** Examples and
   reference parsing move to `<origin>:<name>`.
 - **LEAN.md.** No change.
@@ -403,8 +419,9 @@ Each step leaves the tree building and every existing test passing.
    `SocketActivation`, `activations_backed_by`, `is_program_path`,
    `remove_source`. Store tests: migration preserves address, program and
    scope; reverse lookups.
-2. **Tree-write gate.** `refuse_program_path`. Engine test: a grant over the
-   program's prefix cannot write the program.
+2. **Tree writes.** Remove `refuse_socket_path` and its call sites; the
+   tree-write test that asserted the refusal becomes one asserting that a
+   program's write to a program path deploys it.
 3. **Engine.** `socket_activate` validating name and program; `resolve_socket`
    by name; scope in `admit_socket`; deployment fan-out in `index_file` and
    `commit_api_file`; the scanner stops emitting `Socket`. Engine tests: one
@@ -413,8 +430,8 @@ Each step leaves the tree building and every existing test passing.
    three maps; a delegate in scope opens, one out of scope is refused
    `OutOfScope`, a member opens either; a program in an undelegated space
    serves a delegate in scope without exposing its bytes.
-4. **Wire.** `sync/sock/2`, `SockRequest`, `List`, the `Opened` field; the
-   net tests' fixtures move to names.
+4. **Wire.** `SockRequest`, `List`, the `Opened` field, in place under
+   `sync/sock/1`; the net tests' fixtures move to names.
 5. **Control and CLI.** Proto shapes, `CONTROL_VERSION` 6, reference parsing,
    `ls` local and remote, the printed grant, MCP tools. CLI test for the
    grant and for `ls <origin>:`.
