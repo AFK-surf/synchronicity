@@ -168,54 +168,34 @@ structure PromotionHost (origin : Origin.Parsed) (target : ViewTarget)
     state.db origin target world services
   policy : StablePolicy origin target state.db
 
-/-- Factual host certificate for an interleaved promotion of another origin.
-It packages the production readiness phases and their environmental contracts;
-it does not assume a frame, refinement, or correct public view. -/
-structure ForeignPromotionHost (origin foreign : Origin.Parsed) (now : Int64)
-    (refused : List (UInt64 × ByteArray × ByteArray)) (target : ViewTarget)
+/-- Host contracts for an interleaved promotion of another origin. Successful
+and non-successful branches are discovered by analyzing the actual command;
+this structure contains no `Ready` or promotion-result witness. -/
+structure ForeignPromotionHost (origin foreign : Origin.Parsed) (target : ViewTarget)
     (world : TrieDiffCoverage.World) (services : MaterializedView.Services)
-    (state : State) where
-  ready : PromotionProgress.Ready foreign now refused state
+    (state : State) : Prop where
   different : Origin.canonical origin ≠ Origin.canonical foreign
-  replicas : ready.replicas = target.replicas
   closed : state.pending = none
   faithful : TrieDiffCoverage.Faithful world state
   normalization : state.isNfc = services.nfc
   relational : ∀ relation, relation = Trie.nodeSpace ∨ relation = Trie.valueSpace →
     state.byteRelations.contains relation = true
   initial : PromotionInitialView.Initial state.db foreign world services
-  materializerNfc : ∀ cleared count,
-    execute (Materialize.materialize ready.tx foreign
-      (ready.old.map (·.head.root) |>.getD Trie.emptyRoot) ready.pending.head.root) cleared =
-      (.ok count, ready.body.staged) → cleared.isNfc = services.nfc
-  materializerFaithful : ∀ cleared count,
-    execute (Materialize.materialize ready.tx foreign
-      (ready.old.map (·.head.root) |>.getD Trie.emptyRoot) ready.pending.head.root) cleared =
-      (.ok count, ready.body.staged) → TrieDiffCoverage.Faithful world cleared
-
-/-- Actual foreign promotion phases imply the cross-origin frame used by the
-stable public-view transition. -/
-theorem foreign_promotion_frame
-    (host : ForeignPromotionHost origin foreign now refused target world services state) :
-    MptsyncStableTail.ForeignFrame origin target state.db
-      (execute (Promote.promote foreign now refused) state).2.db := by
-  have finalState : (execute (Promote.promote foreign now refused) state).2 = host.ready.final := by
-    simpa using congrArg Prod.snd (PromotionProgress.promotes host.ready)
-  rw [finalState]
-  obtain ⟨_, _, _, _, current, forever⟩ :=
-    PromotionProgress.promotes_ready_view host.ready world services host.closed
-    host.faithful host.normalization host.relational host.initial
-  have files := ForeignMaterializationFrame.ready_files host.ready (Origin.canonical origin)
-    host.different services world host.materializerNfc host.materializerFaithful
-  refine ⟨files, ?_, ?_⟩
-  · simpa only [← host.replicas] using current
-  · simpa only [← host.replicas] using forever
+  replicas : ∀ scope actual,
+    MaterializationInputs.ReadPolicy state.db foreign scope actual →
+      actual = target.replicas
+  materializerNfc : ∀ tx oldRoot newRoot cleared staged count,
+    execute (Materialize.materialize tx foreign oldRoot newRoot) cleared =
+      (.ok count, staged) → cleared.isNfc = services.nfc
+  materializerFaithful : ∀ tx oldRoot newRoot cleared staged count,
+    execute (Materialize.materialize tx foreign oldRoot newRoot) cleared =
+      (.ok count, staged) → TrieDiffCoverage.Faithful world cleared
 
 theorem foreign_promotion_refines
     (step : Step (.promotion foreign now refused) state final)
     (origin : Origin.Parsed) (target : ViewTarget) (world : TrieDiffCoverage.World)
     (services : MaterializedView.Services)
-    (host : ForeignPromotionHost origin foreign now refused target world services state)
+    (host : ForeignPromotionHost origin foreign target world services state)
     (beforeView afterView : HeadView)
     (before : AcceptanceProgress.StableSlots state (Origin.canonical origin) latest beforeView)
     (after : AcceptanceProgress.StableSlots final (Origin.canonical origin) latest afterView)
@@ -226,9 +206,31 @@ theorem foreign_promotion_refines
     MptsyncStableTail.Refines services origin target state.db final.db := by
   have installedAfter := installed_after_step step origin target beforeView afterView
     before after sameOrigin installed targetLatest
-  cases step with
-  | promotion =>
-    exact Or.inr (Or.inr (Or.inr ⟨foreign_promotion_frame host, installedAfter⟩))
+  cases step
+  cases ran : execute (Promote.promote foreign now refused) state with
+  | mk answer actualFinal =>
+    cases answer with
+    | error failure =>
+      exact Or.inl (congrArg (AtomicFileView.projection (Origin.canonical origin))
+        (PromotionPublication.promote_failure foreign now refused state actualFinal failure ran))
+    | ok report =>
+      by_cases flipped : report.promotion = Promotion.flipped
+      · obtain ⟨scope, replicas, head, headOrigin, policy, headInstalled, files,
+            current, forever⟩ :=
+          PromotionCommittedView.promote_ready foreign now refused state actualFinal report
+            world services host.closed host.faithful host.normalization host.relational
+            host.initial flipped ran
+        have replicaSame := host.replicas scope replicas policy
+        have foreignFiles := ForeignMaterializationFrame.promote_flipped_files foreign now
+          refused (Origin.canonical origin) host.different services world state actualFinal
+          report flipped ran host.materializerNfc host.materializerFaithful
+        refine Or.inr (Or.inr (Or.inr ⟨⟨?_, ?_, ?_⟩, ?_⟩))
+        · exact foreignFiles
+        · simpa only [replicaSame] using current
+        · simpa only [replicaSame] using forever
+        · simpa only [ran] using installedAfter
+      · exact Or.inl (PromotionNonpublication.promote_no_flip_for
+          (Origin.canonical origin) foreign now refused state actualFinal report flipped ran)
 
 /-- The `.ok true` settlement branch is not treated as a frame: after the
 actual clock read it executes a fresh `Promote.promote`. M4's contracts are
@@ -312,7 +314,7 @@ theorem foreign_completed_settlement_refines
     (host : ∀ clockNow current,
       execute (raise Promote.Error.host Clock.nowNs : Fetch.Action Int64) state =
         (.ok clockNow, current) →
-          ForeignPromotionHost origin foreign clockNow refused target world services current)
+          ForeignPromotionHost origin foreign target world services current)
     (beforeView afterView : HeadView)
     (before : AcceptanceProgress.StableSlots state (Origin.canonical origin) latest beforeView)
     (after : AcceptanceProgress.StableSlots final (Origin.canonical origin) latest afterView)
@@ -359,10 +361,24 @@ theorem foreign_completed_settlement_refines
         generalize execute (Promote.promote foreign clockNow refused) current = promoted
         obtain ⟨answer, after⟩ := promoted
         cases answer <;> rfl
-      have frame := foreign_promotion_frame (host clockNow current rfl)
-      exact Or.inr (Or.inr (Or.inr ⟨by
-        rw [finalState, ← currentDb]
-        exact frame, installedAfter⟩))
+      have facts := host clockNow current rfl
+      have currentSlots : AcceptanceProgress.StableSlots current
+          (Origin.canonical origin) latest beforeView := by
+        exact
+          { represents := by simpa only [currentDb] using before.represents
+            backed := by simpa only [currentDb] using before.backed
+            valid := before.valid
+            maximum := before.maximum }
+      have promotedSlots : AcceptanceProgress.StableSlots
+          (execute (Promote.promote foreign clockNow refused) current).2
+          (Origin.canonical origin) latest afterView := by
+        rw [← finalState]
+        exact after
+      have promoted := foreign_promotion_refines
+        (Step.promotion foreign clockNow refused current facts.closed) origin target world services
+        facts beforeView afterView currentSlots promotedSlots sameOrigin (by
+          simpa only [currentDb] using installed) targetLatest
+      simpa only [finalState, currentDb] using promoted
 
 /-- Stable-tail evidence is stated over actual raw observations. It contains
 slot representations/maxima and host facts, never `Refines` or `CorrectView`. -/
@@ -380,7 +396,7 @@ structure StableFacts (trace : MptsyncStableTail.Trace)
       PromotionHost origin target world services (trace.state n)
   foreignPromotion : ∀ n promoted now refused,
     stableFrom ≤ n → trace.event n = .promotion promoted now refused → promoted ≠ origin →
-      ForeignPromotionHost origin promoted now refused target world services (trace.state n)
+      ForeignPromotionHost origin promoted target world services (trace.state n)
   settlementHost : ∀ n refused scope fetchTarget key,
     stableFrom ≤ n →
     trace.event n = .settlement origin refused scope fetchTarget key (.ok true) →
@@ -393,7 +409,7 @@ structure StableFacts (trace : MptsyncStableTail.Trace)
       settled ≠ origin → ∀ clockNow current,
         execute (raise Promote.Error.host Clock.nowNs : Fetch.Action Int64) (trace.state n) =
           (.ok clockNow, current) →
-            ForeignPromotionHost origin settled clockNow refused target world services current
+            ForeignPromotionHost origin settled target world services current
 
 private theorem stable_step_refines
     (trace : MptsyncStableTail.Trace) (services : MaterializedView.Services)

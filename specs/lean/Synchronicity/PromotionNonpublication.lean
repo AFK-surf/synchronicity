@@ -123,11 +123,11 @@ theorem publish_no_flip (publicOrigin : String) (tx : Transaction) (origin : Ori
     rw [bodyRun] at frame
     exact unchanged.trans (congrArg (projection publicOrigin) frame)
 
-theorem promote_no_flip (origin : Origin.Parsed) (now : Int64)
+theorem promote_no_flip_for (publicOrigin : String) (origin : Origin.Parsed) (now : Int64)
     (refused : List (UInt64 × ByteArray × ByteArray)) (state final : State) (report : PromotionReport)
     (notFlipped : report.promotion ≠ .flipped)
     (ran : execute (Promote.promote origin now refused) state = (.ok report, final)) :
-    projection (Origin.canonical origin) final.db = projection (Origin.canonical origin) state.db := by
+    projection publicOrigin final.db = projection publicOrigin state.db := by
   rw [PromotionExecution.decomposes] at ran
   obtain ⟨tx, opened, began, ran⟩ := bind_success _ _ _ _ _ ran
   obtain ⟨preparation, ready, preparedRun, ran⟩ := PromotionPublication.after_attempt _ _ _ _ _ ran
@@ -148,8 +148,17 @@ theorem promote_no_flip (origin : Origin.Parsed) (now : Int64)
       have frame := (PromotionCommand.prepare_only tx origin now).preserves_db _ PromotionReads.effects_db opened
       change (execute (PromotionCommand.prepare tx origin now) opened).2.db = opened.db at frame
       simpa only [preparedRun, openedDb] using frame
-    have same := publish_no_flip (Origin.canonical origin) tx origin now refused prepared ready final report state.db
+    have same := publish_no_flip publicOrigin tx origin now refused prepared ready final report state.db
       (readFrame.trans snapshot) (by rw [readyDb]) notFlipped ran
-    exact same.trans (congrArg (projection (Origin.canonical origin)) readyDb)
+    exact same.trans (congrArg (projection publicOrigin) readyDb)
+
+theorem promote_no_flip (origin : Origin.Parsed) (now : Int64)
+    (refused : List (UInt64 × ByteArray × ByteArray)) (state final : State)
+    (report : PromotionReport) (notFlipped : report.promotion ≠ .flipped)
+    (ran : execute (Promote.promote origin now refused) state = (.ok report, final)) :
+    projection (Origin.canonical origin) final.db =
+      projection (Origin.canonical origin) state.db :=
+  promote_no_flip_for (Origin.canonical origin) origin now refused state final report
+    notFlipped ran
 
 end Synchronicity.PromotionNonpublication

@@ -152,6 +152,39 @@ theorem materialize_files (tx : Transaction) (observedOrigin : String)
   exact run_diff_files tx observedOrigin (Origin.canonical foreign) different services world scope
     oldRoot newRoot now releaseNow replicas ready final count db readyTx readyNfc readyFaithful streamed
 
+private theorem published_materializer_inputs
+    (tx : Transaction) (foreign : Origin.Parsed) (now : Int64)
+    (pending : Promote.Pending) (old : Option Promote.Pending)
+    (scope : Trie.Serve.Scope) (authority : Authorization.OriginAuthority)
+    (baseline ready staged : State)
+    (preparedSnapshot : ready.pending = some (tx, baseline.db))
+    (published : PromotionPublication.BodyPublished tx foreign now pending old
+      scope authority ready staged) :
+    ∃ cleared count clearedDb,
+      cleared.pending = some (tx, clearedDb) ∧
+      rows clearedDb "entries" = rows baseline.db "entries" ∧
+      execute (Materialize.materialize tx foreign
+        (old.map (·.head.root) |>.getD Trie.emptyRoot) pending.head.root) cleared =
+        (.ok count, staged) := by
+  obtain ⟨cleared, count, frames, streamed⟩ :=
+    PromotionViewFrame.published_inputs tx foreign now pending old scope authority ready staged
+      published
+  have entriesFrame := frames "entries" (by decide) (by decide)
+  obtain ⟨clearedDb, clearedTx⟩ : ∃ db, cleared.pending = some (tx, db) := by
+    cases current : cleared.pending with
+    | none => simp [MaterializationTableFrame.view, current, preparedSnapshot] at entriesFrame
+    | some pair =>
+      rcases pair with ⟨actualTx, db⟩
+      have same : actualTx = tx := congrArg Prod.fst (Option.some.inj (by
+        simpa only [MaterializationTableFrame.view, current, preparedSnapshot,
+          Option.map_some] using entriesFrame))
+      subst actualTx
+      exact ⟨db, rfl⟩
+  have entries : rows clearedDb "entries" = rows baseline.db "entries" := by
+    simpa only [MaterializationTableFrame.view, clearedTx, preparedSnapshot,
+      Option.map_some, Option.some.injEq, Prod.mk.injEq, true_and] using entriesFrame
+  exact ⟨cleared, count, clearedDb, clearedTx, entries, streamed⟩
+
 private theorem ready_materializer_inputs
     (ready : PromotionProgress.Ready foreign now refused state) :
     ∃ cleared count clearedDb,
@@ -171,24 +204,8 @@ private theorem ready_materializer_inputs
   have published := PromotionPublication.body_published ready.tx foreign now ready.pending
     ready.old ready.scope ready.authority ready.prepared ready.body.staged
     (PromotionProgress.body_executes ready.body)
-  obtain ⟨cleared, count, frames, streamed⟩ :=
-    PromotionViewFrame.published_inputs ready.tx foreign now ready.pending ready.old
-      ready.scope ready.authority ready.prepared ready.body.staged published
-  have entriesFrame := frames "entries" (by decide) (by decide)
-  obtain ⟨clearedDb, clearedTx⟩ : ∃ db, cleared.pending = some (ready.tx, db) := by
-    cases current : cleared.pending with
-    | none => simp [MaterializationTableFrame.view, current, preparedSnapshot] at entriesFrame
-    | some pair =>
-      rcases pair with ⟨tx, db⟩
-      have same : tx = ready.tx := congrArg Prod.fst (Option.some.inj (by
-        simpa only [MaterializationTableFrame.view, current, preparedSnapshot,
-          Option.map_some] using entriesFrame))
-      subst tx
-      exact ⟨db, rfl⟩
-  have entries : rows clearedDb "entries" = rows state.db "entries" := by
-    simpa only [MaterializationTableFrame.view, clearedTx, preparedSnapshot,
-      Option.map_some, Option.some.injEq, Prod.mk.injEq, true_and] using entriesFrame
-  exact ⟨cleared, count, clearedDb, clearedTx, entries, streamed⟩
+  exact published_materializer_inputs ready.tx foreign now ready.pending ready.old ready.scope
+    ready.authority state ready.prepared ready.body.staged preparedSnapshot published
 
 private theorem materialize_then_commit_files
     (tx : Transaction) (foreign : Origin.Parsed) (oldRoot newRoot : ByteArray)
@@ -220,6 +237,37 @@ private theorem materialize_then_commit_files
   rw [← sameDb] at finalDb
   rw [finalDb]
   exact stagedFiles
+
+/-- A flipped report is analyzed from the actual `Promote.promote` execution.
+The foreign file frame is derived from its extracted materializer and commit;
+callers do not provide a `PromotionProgress.Ready` witness. -/
+theorem promote_flipped_files (foreign : Origin.Parsed) (now : Int64)
+    (refused : List (UInt64 × ByteArray × ByteArray))
+    (observedOrigin : String) (different : observedOrigin ≠ Origin.canonical foreign)
+    (services : Services) (world : World) (state final : State)
+    (report : VerifiedCore.Commands.PromotionReport)
+    (flipped : report.promotion = Promotion.flipped)
+    (ran : execute (Promote.promote foreign now refused) state = (.ok report, final))
+    (materializerNfc : ∀ tx oldRoot newRoot cleared staged count,
+      execute (Materialize.materialize tx foreign oldRoot newRoot) cleared =
+        (.ok count, staged) → cleared.isNfc = services.nfc)
+    (materializerFaithful : ∀ tx oldRoot newRoot cleared staged count,
+      execute (Materialize.materialize tx foreign oldRoot newRoot) cleared =
+        (.ok count, staged) → Faithful world cleared) :
+    Files observedOrigin state.db final.db := by
+  obtain ⟨tx, opened, ready, scope, authority, pending, old, staged, db,
+      began, prepared, readyTx, readyDb, published, stagedDb, stagedTx, finalDb, committed⟩ :=
+    PromotionPublication.promote_flipped foreign now refused state final report flipped ran
+  obtain ⟨cleared, count, clearedDb, clearedTx, entries, streamed⟩ :=
+    published_materializer_inputs tx foreign now pending old scope authority state ready staged
+      readyTx published
+  let oldRoot := old.map (·.head.root) |>.getD Trie.emptyRoot
+  let newRoot := pending.head.root
+  exact materialize_then_commit_files tx foreign oldRoot newRoot observedOrigin different
+    services world state.db cleared staged final count clearedDb clearedTx entries
+    (materializerNfc tx oldRoot newRoot cleared staged count (by simpa [oldRoot, newRoot]))
+    (materializerFaithful tx oldRoot newRoot cleared staged count (by simpa [oldRoot, newRoot]))
+    (by simpa [oldRoot, newRoot]) committed
 
 /-- A healthy actual foreign promotion preserves this origin's observed file
 rows. The only environmental inputs are the same readable-snapshot/NFC facts
