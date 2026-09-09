@@ -61,16 +61,18 @@ def CorrectView (services : MaterializedView.Services) (origin : Origin.Parsed)
   MaterializedView.CurrentRequirements target.replicas db ∧
   MaterializedView.ForeverRequirements target.replicas target.before db
 
-/-- A settled system target.  Every participant selects the same latest head
-for an origin, while its scope and retention policy may differ by device. -/
+/-- A settled system target. Every participant selects the same public
+sequence/root version for an origin, while the signed head carrying that
+version, its scope and retention policy may differ by device. Signatures and
+receipt metadata are not part of the user-visible version identity. -/
 structure Scenario (Device : Type) where
   participates : Device → Prop
   includes : Origin.Parsed → Prop
-  latest : Origin.Parsed → Head
+  latest : Origin.Parsed → HeadVersion
   target : Device → Origin.Parsed → ViewTarget
   target_latest : ∀ device origin,
-    (target device origin).head = latest origin
-  latest_origin : ∀ origin, (latest origin).origin = origin
+    ⟨(target device origin).head.seq, (target device origin).head.root⟩ = latest origin
+  target_origin : ∀ device origin, (target device origin).head.origin = origin
 
 def CorrectDevice (services : MaterializedView.Services) (scenario : Scenario Device)
     (databases : Device → Database) (device : Device) : Prop :=
@@ -166,19 +168,24 @@ theorem equal_permissions_have_equal_file_views
   intro space path values
   rw [left space path values, right space path values]
 
-/-- Correct participants always install the scenario's one common latest
-version.  Permissions affect projection, not version selection. -/
+/-- Correct participants always install signed heads carrying the scenario's
+one common latest sequence/root. Permissions affect projection, not version
+selection. -/
 theorem correct_devices_select_the_same_version
     (correct : CorrectSystem services scenario databases)
     (leftMember : scenario.participates left)
     (rightMember : scenario.participates right)
     (included : scenario.includes origin) :
-    AtomicFileView.Installed (databases left) (scenario.latest origin) ∧
-      AtomicFileView.Installed (databases right) (scenario.latest origin) := by
+    AtomicFileView.Installed (databases left) (scenario.target left origin).head ∧
+      AtomicFileView.Installed (databases right) (scenario.target right origin).head ∧
+      ⟨(scenario.target left origin).head.seq,
+        (scenario.target left origin).head.root⟩ = scenario.latest origin ∧
+      ⟨(scenario.target right origin).head.seq,
+        (scenario.target right origin).head.root⟩ = scenario.latest origin := by
   have leftCorrect := correct left leftMember origin included
   have rightCorrect := correct right rightMember origin included
-  exact ⟨by simpa [scenario.target_latest left origin] using leftCorrect.2.1,
-    by simpa [scenario.target_latest right origin] using rightCorrect.2.1⟩
+  exact ⟨leftCorrect.2.1, rightCorrect.2.1,
+    scenario.target_latest left origin, scenario.target_latest right origin⟩
 
 /-- When two correct participants have the same permission scope, their
 observable file directories agree exactly. -/
@@ -198,15 +205,18 @@ theorem correct_devices_with_equal_scopes_agree
           (.file space path) values := by
   have leftCorrect := correct left leftMember origin included
   have rightCorrect := correct right rightMember origin included
-  have sameHead := (scenario.target_latest left origin).trans
+  have sameVersion := (scenario.target_latest left origin).trans
     (scenario.target_latest right origin).symm
+  have sameRoot : (scenario.target left origin).head.root =
+      (scenario.target right origin).head.root := by
+    simpa using congrArg HeadVersion.root sameVersion
   have leftExact := leftCorrect.2.2.1
   have rightExact := rightCorrect.2.2.1
   change SnapshotViewProgress.ExactFiles services (scenario.target right origin).snapshot
     (scenario.target right origin).head.root
     (fun key => (scenario.target right origin).scope.admitsKeyPath (Trie.keyNibbles key) = true)
     (databases right) (Origin.canonical origin) at rightExact
-  rw [← sameScope, ← sameSnapshot, ← sameHead] at rightExact
+  rw [← sameScope, ← sameSnapshot, ← sameRoot] at rightExact
   exact equal_permissions_have_equal_file_views leftExact rightExact
 
 end Synchronicity.MptsyncConvergence
