@@ -304,8 +304,10 @@ fn insert_mapping(
 }
 
 /// Ensures the owner's OIDC identity (under the hub provider) and their
-/// membership of the org, returning the Synchronicity user id. Never merges on
-/// email: an email owned by a different user is a 409 for an explicit link.
+/// membership of the org, returning the Synchronicity user id. The shared-secret
+/// authenticated Cue service is trusted to assert its owner's email: an unbound
+/// Cue identity reuses the existing account for that email. Existing subject
+/// bindings take precedence; ordinary custom-OIDC login stays explicit-link only.
 fn ensure_owner(
   conn: Connection,
   cfg: CueProvisioning,
@@ -328,13 +330,16 @@ fn ensure_identity(
     Ok(None) ->
       case user_id_for_email(conn, owner.email) {
         Error(response) -> Error(response)
-        Ok(Some(_)) ->
-          Error(error_json(
-            409,
-            "explicit_link_required",
-            "a synchronicity user with this email already exists and is not "
-              <> "linked to this cue identity",
+        Ok(Some(user_id)) -> {
+          use _ <- result.try(insert_identity(
+            conn,
+            id.new(),
+            user_id,
+            cfg,
+            owner.subject,
           ))
+          Ok(user_id)
+        }
         Ok(None) -> {
           let user_id = id.new()
           let identity_id = id.new()

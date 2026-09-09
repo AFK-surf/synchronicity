@@ -239,7 +239,7 @@ pub fn same_owner_two_workspaces_reuses_identity_test() {
   assert count(env, "SELECT count(*) FROM org_members", []) == 2
 }
 
-pub fn email_conflict_requires_explicit_link_test() {
+pub fn trusted_cue_email_links_existing_account_idempotently_test() {
   let env =
     setup_seeded(fn(conn) {
       let assert Ok(_) =
@@ -250,17 +250,75 @@ pub fn email_conflict_requires_explicit_link_test() {
         )
       Nil
     })
-  // A workspace whose owner's email belongs to a different, unlinked user.
+  // The trusted Cue request binds its identity to the existing account.
   let resp =
     put(env, "wsp_d", Some(secret), body("D", "usr_dave", "dave@cue.test"))
-  assert resp.status == 409
-  assert string.contains(simulate.read_body(resp), "explicit_link_required")
-  // Nothing partial: no workspace org, no identity for the subject.
-  assert count(env, "SELECT count(*) FROM cue_workspace_orgs", []) == 0
+  assert resp.status == 200
+  let retry =
+    put(env, "wsp_d", Some(secret), body("D", "usr_dave", "dave@cue.test"))
+  assert retry.status == 200
+  assert count(env, "SELECT count(*) FROM cue_workspace_orgs", []) == 1
+  assert count(env, "SELECT count(*) FROM users WHERE email = ?", [
+      sqlite.Text("dave@cue.test"),
+    ])
+    == 1
+  assert count(
+      env,
+      "SELECT count(*) FROM auth_identities WHERE subject = ? AND user_id = ? AND oidc_provider_id = ?",
+      [
+        sqlite.Text("usr_dave"),
+        sqlite.Text("seed-dave"),
+        sqlite.Text(hub_provider),
+      ],
+    )
+    == 1
+  assert count(env, "SELECT count(*) FROM org_members WHERE user_id = ?", [
+      sqlite.Text("seed-dave"),
+    ])
+    == 1
+  // A later email change must not move the already-bound Cue subject.
+  let changed_email =
+    put(env, "wsp_d", Some(secret), body("D", "usr_dave", "changed@cue.test"))
+  assert changed_email.status == 200
+  assert count(
+      env,
+      "SELECT count(*) FROM auth_identities WHERE subject = ? AND user_id = ?",
+      [
+        sqlite.Text("usr_dave"),
+        sqlite.Text("seed-dave"),
+      ],
+    )
+    == 1
+  assert count(env, "SELECT count(*) FROM users WHERE email = ?", [
+      sqlite.Text("changed@cue.test"),
+    ])
+    == 0
+}
+
+pub fn untrusted_cue_request_cannot_link_existing_account_test() {
+  let env =
+    setup_seeded(fn(conn) {
+      let assert Ok(_) =
+        sqlite.exec(
+          conn,
+          "INSERT INTO users VALUES ('seed-dave', 'dave@cue.test', 'D', 0)",
+          [],
+        )
+      Nil
+    })
+  let resp =
+    put(
+      env,
+      "wsp_d",
+      Some("wrong-secret"),
+      body("D", "usr_dave", "dave@cue.test"),
+    )
+  assert resp.status == 401
   assert count(env, "SELECT count(*) FROM auth_identities WHERE subject = ?", [
       sqlite.Text("usr_dave"),
     ])
     == 0
+  assert count(env, "SELECT count(*) FROM cue_workspace_orgs", []) == 0
 }
 
 pub fn wrong_secret_is_unauthenticated_test() {
