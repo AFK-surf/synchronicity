@@ -1,9 +1,11 @@
 //! The `sync/sock/1` wire schema (`docs/SOCKETS.md` §4).
 //!
 //! One QUIC connection per (caller, callee) pair; one bidirectional stream per
-//! invocation. Each stream opens with a length-framed [`SockOpen`], is answered
-//! with a length-framed [`SockOpened`], and then carries **opaque bytes with no
-//! framing at all** in both directions until FIN.
+//! request. Each stream opens with a length-framed [`SockRequest`]. An
+//! [`Open`](SockRequest::Open) is answered with a length-framed [`SockOpened`]
+//! and the stream then carries **opaque bytes with no framing at all** in both
+//! directions until FIN; a [`List`](SockRequest::List) is answered with one
+//! [`SockListed`] and nothing more.
 //!
 //! The payload is unframed deliberately. A trailer carrying the invocation's
 //! exit status would put a length prefix on every proxied byte for the sake of
@@ -33,14 +35,16 @@ pub(crate) const MAX_OPEN_META_PAIRS: usize = 16;
 /// The most bytes [`SockOpen::meta`] may occupy, keys and values summed.
 pub(crate) const MAX_OPEN_META_BYTES: usize = 4096;
 
-/// The largest accepted `Open` frame, in bytes (`docs/SOCKETS.md` §10).
+/// The largest accepted [`SockRequest`] frame, in bytes (`docs/SOCKETS.md`
+/// §10).
 ///
 /// Derived rather than chosen, for the reason
 /// [`MAX_BATCH_PATH_BYTES`](crate::MAX_BATCH_PATH_BYTES) is: a cap below what a
 /// legal frame can carry is a wedge, not a guard. The resolver is deterministic,
 /// so an over-cap `Open` is over it on every retry and the caller can never
 /// reach that socket at all. The slack covers the origin (a named one carries a
-/// name and a domain), the space, and postcard's length varints.
+/// name and a domain) and postcard's length varints; the socket name it now
+/// carries is far inside the tree-key bound the path it replaced needed.
 ///
 /// Enforced by the framing layer *before* the decode, so nothing inside this
 /// module ever sees an allocation it did not bound.
@@ -49,21 +53,90 @@ pub const MAX_OPEN_FRAME_LEN: usize = crate::MAX_KEY_LEN + MAX_OPEN_META_BYTES +
 /// The most bytes a [`SockOpened::Refused`] message may carry.
 pub(crate) const MAX_REFUSE_MESSAGE_LEN: usize = 512;
 
+/// The most sockets one node may activate (`docs/SOCKET-PROGRAMS.md` §2.1).
+///
+/// A sanity bound rather than a quota: an activation is operator state, and it
+/// replaces the old per-space bound, which had no space left to count in now
+/// that a socket is a name of its own. It is also what bounds a `List` reply.
+pub const MAX_SOCKETS_PER_NODE: usize = 256;
+
+/// The most bytes a socket name may occupy (`docs/SOCKET-PROGRAMS.md` §2).
+pub const MAX_SOCKET_NAME_BYTES: usize = 256;
+
+/// Why a string is not a socket name.
+#[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
+pub enum SocketNameError {
+    /// The empty string names nothing.
+    #[error("a socket name is not empty")]
+    Empty,
+    /// Longer than the documented bound.
+    #[error("a socket name is at most {MAX_SOCKET_NAME_BYTES} bytes")]
+    TooLong,
+    /// Not safe to print in an operator-facing line.
+    #[error("a socket name contains a control or directional-formatting character")]
+    UnsafeText,
+    /// Not a normalized path.
+    #[error("a socket name is a normalized path: {0}")]
+    Path(String),
+}
+
+/// Whether `name` is a legal socket name (`docs/SOCKET-PROGRAMS.md` §2).
+///
+/// The tree path grammar without a space in front of it: non-empty, at most
+/// [`MAX_SOCKET_NAME_BYTES`], display-safe, and already
+/// [`normalize_path`](crate::normalize_path)-normalized. So `/` may group names
+/// — `git`, `docs/git`, `ci/intake` — while `..`, empty components, a leading
+/// `/` and control characters are refused. Every existing `<space>/<path>`
+/// socket address is a legal name, so an old address can be activated again.
+pub fn validate_socket_name(name: &str) -> Result<(), SocketNameError> {
+    if name.is_empty() {
+        return Err(SocketNameError::Empty);
+    }
+    if name.len() > MAX_SOCKET_NAME_BYTES {
+        return Err(SocketNameError::TooLong);
+    }
+    if !display_text_is_safe(name) {
+        return Err(SocketNameError::UnsafeText);
+    }
+    match crate::path::normalize_path(name) {
+        Ok(normalized) if normalized == name => Ok(()),
+        Ok(normalized) => Err(SocketNameError::Path(format!(
+            "`{name}` is spelled `{normalized}` normalized"
+        ))),
+        Err(e) => Err(SocketNameError::Path(e.to_string())),
+    }
+}
+
+/// What a caller asks for on a fresh bi-stream.
+///
+/// One frame per stream, and the only two things a caller can ask: run a
+/// socket, or say which sockets it may run. `List` needs no runtime — a node
+/// that cannot serve sockets can still say which ones it has — and no new
+/// authorization: it applies the same scope rule `Open` does.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum SockRequest {
+    /// Run a socket; the stream becomes the invocation's.
+    Open(SockOpen),
+    /// The sockets this caller may open. Answered with one [`SockListed`].
+    List,
+}
+
 /// Opens one invocation. The caller's whole influence over what runs.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SockOpen {
     /// Protocol version; must be `SOCK_PROTO_VERSION`.
     pub v: u8,
-    /// The origin whose tree the socket is to be resolved in.
+    /// The origin whose activation table the socket is to be resolved in.
     ///
     /// Must be the callee's *own* origin. Carrying it — rather than letting the
     /// callee assume "me" — is what makes a relayed or replayed `Open`
     /// undeliverable anywhere but where it was addressed.
     pub origin: OriginId,
-    /// The space the socket lives in.
-    pub space: String,
-    /// The socket's path within that space.
-    pub path: String,
+    /// The socket's name on the callee (`docs/SOCKET-PROGRAMS.md` §2).
+    ///
+    /// A name in the callee's own namespace, not a path and not in any space:
+    /// `nas:git` and `laptop:git` are unrelated sockets.
+    pub socket: String,
     /// Caller-supplied metadata, readable by the program via `sy_conn_meta`.
     ///
     /// **Untrusted.** It is whatever the caller typed after `--meta`, and the
@@ -79,16 +152,21 @@ pub struct SockOpen {
 /// Appended to, never reordered: postcard numbers variants by position.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RefuseCode {
-    /// No entry at that path in the callee's own trie.
+    /// No socket of that name on the callee, or its program path has no live
+    /// entry in the callee's own trie.
     NoSuchPath,
-    /// There is an entry, but its kind is not [`Socket`](crate::EntryKind::Socket).
+    /// There is an entry at the program path, but it carries no content: a
+    /// directory or a symlink is not a program.
     NotASocket,
-    /// The path is not activated on the callee, or its activation was removed
-    /// or its content replaced while this admission was in flight.
+    /// The socket was deactivated, or its program's content was replaced,
+    /// while this admission was in flight.
     NotActivated,
-    /// The caller is not a member, or the space is not one it may read.
+    /// The caller is not a member at all: no live binding for its device key.
     Unauthorized,
-    /// The caller is a delegate and this space is outside its list (§3.5).
+    /// Retired with the space-shaped socket address it belonged to, and kept
+    /// so that postcard's variant numbering does not move under peers that
+    /// still decode it. Nothing emits it; [`OutOfScope`](Self::OutOfScope) is
+    /// what a delegate outside a socket's scope is told.
     SpaceNotDelegated,
     /// The socket is at its concurrency cap.
     Busy,
@@ -96,6 +174,9 @@ pub enum RefuseCode {
     ProgramInvalid,
     /// The callee has no eBPF runtime on this platform.
     Unsupported,
+    /// The caller is a delegate and none of its delegated spaces is in this
+    /// socket's scope (`docs/SOCKET-PROGRAMS.md` §2.2).
+    OutOfScope,
 }
 
 impl RefuseCode {
@@ -110,6 +191,7 @@ impl RefuseCode {
             RefuseCode::Busy => "busy",
             RefuseCode::ProgramInvalid => "program-invalid",
             RefuseCode::Unsupported => "unsupported",
+            RefuseCode::OutOfScope => "out-of-scope",
         }
     }
 }
@@ -121,10 +203,16 @@ pub enum SockOpened {
     Ok {
         /// The content root actually running.
         ///
-        /// Echoed so the caller can audit what it reached: with arming keyed by
-        /// content root, "which program answered me?" has an exact answer and
-        /// the protocol may as well give it.
+        /// Echoed so the caller can audit what it reached: "which program
+        /// answered me?" has an exact answer and the protocol may as well
+        /// give it.
         program: Hash,
+        /// `<space>/<path>` of the program the socket names on the callee.
+        ///
+        /// The audit a tree entry used to give for free: a caller that can
+        /// read the program's space can `synch cat` this path and compare
+        /// roots. A caller that cannot still gets the root.
+        program_path: String,
         /// The callee's id for this invocation, as `synch socket ps` prints it.
         invocation: u64,
     },
@@ -137,6 +225,41 @@ pub enum SockOpened {
         message: String,
     },
 }
+
+/// The callee's answer to [`SockRequest::List`]: the sockets this caller may
+/// open (`docs/SOCKET-PROGRAMS.md` §5).
+///
+/// Bounded by [`MAX_SOCKETS_PER_NODE`], which is what makes the frame bounded
+/// without a cap of its own to keep in step.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SockListed {
+    /// One entry per in-scope activation, ordered by name.
+    #[serde(deserialize_with = "bounded_sockets")]
+    pub sockets: Vec<SockEntry>,
+}
+
+/// One socket in a [`SockListed`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SockEntry {
+    /// The name to open.
+    pub name: String,
+    /// The content root its program currently names, or [`Hash::EMPTY`] when
+    /// the program is not published here and the socket cannot be opened.
+    pub program: Hash,
+    /// `<space>/<path>` of that program.
+    pub program_path: String,
+    /// The operator's note, as `synch socket ls` prints it.
+    pub note: String,
+}
+
+/// The largest accepted [`SockListed`] frame, in bytes.
+///
+/// Derived, like [`MAX_OPEN_FRAME_LEN`]: one entry per activation at the
+/// node's bound, each carrying a name, a tree path, a note bounded by the
+/// declaration-value cap, a root and postcard's varints.
+pub const MAX_LIST_FRAME_LEN: usize = MAX_SOCKETS_PER_NODE
+    * (MAX_SOCKET_NAME_BYTES + crate::MAX_KEY_LEN + MAX_DECLARATION_VALUE_BYTES + 64)
+    + 1024;
 
 /// How an invocation ended.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -198,12 +321,9 @@ pub enum OpenError {
     /// The protocol version is not one this build speaks.
     #[error("socket protocol version {0}, not the {SOCK_PROTO_VERSION} this build speaks")]
     Version(u8),
-    /// The space name is not a legal one.
-    #[error("invalid space name: {0}")]
-    Space(String),
-    /// The path is not a legal relative path.
-    #[error("invalid path: {0}")]
-    Path(String),
+    /// The socket name is not a legal one.
+    #[error("invalid socket name: {0}")]
+    Socket(#[from] SocketNameError),
     /// The metadata exceeds its documented bounds.
     #[error("metadata exceeds its bounds: {0}")]
     Meta(&'static str),
@@ -211,17 +331,11 @@ pub enum OpenError {
 
 impl SockOpen {
     /// Builds an `Open` for a socket on `origin`.
-    pub fn new(
-        origin: OriginId,
-        space: impl Into<String>,
-        path: impl Into<String>,
-        meta: Vec<(String, String)>,
-    ) -> Self {
+    pub fn new(origin: OriginId, socket: impl Into<String>, meta: Vec<(String, String)>) -> Self {
         SockOpen {
             v: SOCK_PROTO_VERSION,
             origin,
-            space: space.into(),
-            path: path.into(),
+            socket: socket.into(),
             meta,
         }
     }
@@ -231,13 +345,12 @@ impl SockOpen {
     ///
     /// Deliberately separate from the policy checks in `synch-net`: this is the
     /// syntactic gate, and it runs first so that a malformed frame never
-    /// reaches code that would have to reason about a path with `..` in it.
+    /// reaches code that would have to reason about a name with `..` in it.
     pub fn validate(&self) -> Result<(), OpenError> {
         if self.v != SOCK_PROTO_VERSION {
             return Err(OpenError::Version(self.v));
         }
-        crate::record::validate_space(&self.space).map_err(|e| OpenError::Space(format!("{e}")))?;
-        crate::path::normalize_path(&self.path).map_err(|e| OpenError::Path(format!("{e}")))?;
+        validate_socket_name(&self.socket)?;
         if self.meta.len() > MAX_OPEN_META_PAIRS {
             return Err(OpenError::Meta("too many pairs"));
         }
@@ -1087,6 +1200,43 @@ where
     deserializer.deserialize_seq(Visitor)
 }
 
+/// Decodes [`SockListed::sockets`] under [`MAX_SOCKETS_PER_NODE`].
+///
+/// Applied *during* the decode, like [`bounded_meta`]: a `Vec` that has
+/// already been deserialized has already cost what the bound was meant to
+/// deny. Entries past the cap are read and dropped, so a callee that
+/// activates more than this build's bound still yields a usable listing.
+fn bounded_sockets<'de, D>(deserializer: D) -> std::result::Result<Vec<SockEntry>, D::Error>
+where
+    D: serde::Deserializer<'de>,
+{
+    struct Visitor;
+
+    impl<'de> serde::de::Visitor<'de> for Visitor {
+        type Value = Vec<SockEntry>;
+
+        fn expecting(&self, f: &mut std::fmt::Formatter) -> std::fmt::Result {
+            write!(f, "at most {MAX_SOCKETS_PER_NODE} sockets")
+        }
+
+        fn visit_seq<A>(self, mut seq: A) -> std::result::Result<Self::Value, A::Error>
+        where
+            A: serde::de::SeqAccess<'de>,
+        {
+            let mut out =
+                Vec::with_capacity(seq.size_hint().unwrap_or(0).min(MAX_SOCKETS_PER_NODE));
+            while let Some(entry) = seq.next_element::<SockEntry>()? {
+                if out.len() < MAX_SOCKETS_PER_NODE {
+                    out.push(entry);
+                }
+            }
+            Ok(out)
+        }
+    }
+
+    deserializer.deserialize_seq(Visitor)
+}
+
 /// Decodes a refusal message under [`MAX_REFUSE_MESSAGE_LEN`], truncating on a
 /// character boundary rather than failing: a refusal that cannot be read is
 /// worse than one that is cut short.
@@ -1114,37 +1264,49 @@ mod tests {
     }
 
     fn open() -> SockOpen {
-        SockOpen::new(origin(), "code", "git.sock", vec![])
+        SockOpen::new(origin(), "git", vec![])
     }
 
     #[test]
     fn round_trips() {
         for msg in [
-            open(),
-            SockOpen::new(
+            SockRequest::Open(open()),
+            SockRequest::Open(SockOpen::new(
                 origin(),
-                "code",
-                "a/b/c.sock",
+                "docs/git",
                 vec![("user".into(), "zoe".into())],
-            ),
+            )),
+            SockRequest::List,
         ] {
             let bytes = postcard::to_stdvec(&msg).unwrap();
-            assert_eq!(postcard::from_bytes::<SockOpen>(&bytes).unwrap(), msg);
+            assert_eq!(postcard::from_bytes::<SockRequest>(&bytes).unwrap(), msg);
         }
 
         for msg in [
             SockOpened::Ok {
                 program: Hash::new(b"elf"),
+                program_path: "code/bin/gateway.o".into(),
                 invocation: 7,
             },
             SockOpened::Refused {
-                code: RefuseCode::NotActivated,
-                message: "deactivated during admission".into(),
+                code: RefuseCode::OutOfScope,
+                message: "not in this socket's scope".into(),
             },
         ] {
             let bytes = postcard::to_stdvec(&msg).unwrap();
             assert_eq!(postcard::from_bytes::<SockOpened>(&bytes).unwrap(), msg);
         }
+
+        let listed = SockListed {
+            sockets: vec![SockEntry {
+                name: "docs/git".into(),
+                program: Hash::new(b"elf"),
+                program_path: "code/bin/gateway.o".into(),
+                note: "the docs gateway".into(),
+            }],
+        };
+        let bytes = postcard::to_stdvec(&listed).unwrap();
+        assert_eq!(postcard::from_bytes::<SockListed>(&bytes).unwrap(), listed);
 
         for status in [
             SockStatus::Ok(0),
@@ -1164,7 +1326,7 @@ mod tests {
     }
 
     #[test]
-    fn a_legal_open_fits_the_frame_bound() {
+    fn a_legal_request_fits_the_frame_bound() {
         // No honest caller can build a frame its peer refuses: the largest
         // legal `Open` has to fit, or the bound is a wedge rather than a guard.
         let meta = (0..MAX_OPEN_META_PAIRS)
@@ -1173,11 +1335,28 @@ mod tests {
                 (format!("{i:0half$}", half = half), "v".repeat(half))
             })
             .collect();
-        let big = SockOpen::new(origin(), "code", "x".repeat(crate::MAX_KEY_LEN - 8), meta);
+        let big = SockOpen::new(origin(), "x".repeat(MAX_SOCKET_NAME_BYTES), meta);
         big.validate().unwrap();
         assert!(
-            postcard::to_stdvec(&big).unwrap().len() <= MAX_OPEN_FRAME_LEN,
+            postcard::to_stdvec(&SockRequest::Open(big)).unwrap().len() <= MAX_OPEN_FRAME_LEN,
             "the largest legal Open does not fit MAX_OPEN_FRAME_LEN"
+        );
+
+        // And the largest legal `List` reply fits its own bound, so a node at
+        // the activation bound can still answer a peer.
+        let listed = SockListed {
+            sockets: (0..MAX_SOCKETS_PER_NODE)
+                .map(|i| SockEntry {
+                    name: format!("{i:0>width$}", width = MAX_SOCKET_NAME_BYTES),
+                    program: Hash::new(b"elf"),
+                    program_path: "p".repeat(crate::MAX_KEY_LEN),
+                    note: "n".repeat(MAX_DECLARATION_VALUE_BYTES),
+                })
+                .collect(),
+        };
+        assert!(
+            postcard::to_stdvec(&listed).unwrap().len() <= MAX_LIST_FRAME_LEN,
+            "the largest legal List reply does not fit MAX_LIST_FRAME_LEN"
         );
     }
 
@@ -1187,17 +1366,34 @@ mod tests {
         o.v = SOCK_PROTO_VERSION + 1;
         assert!(matches!(o.validate(), Err(OpenError::Version(_))));
 
+        // A name is the tree path grammar without a space in front of it, so
+        // the escapes a path refuses a name refuses too.
+        for name in ["", "../../etc/passwd", "/git", "a//b", "a/./b"] {
+            let mut o = open();
+            o.socket = name.into();
+            assert!(
+                matches!(o.validate(), Err(OpenError::Socket(_))),
+                "accepted socket name {name:?}"
+            );
+        }
         let mut o = open();
-        o.path = "../../etc/passwd".into();
-        assert!(matches!(o.validate(), Err(OpenError::Path(_))));
+        o.socket = "x".repeat(MAX_SOCKET_NAME_BYTES + 1);
+        assert!(matches!(
+            o.validate(),
+            Err(OpenError::Socket(SocketNameError::TooLong))
+        ));
+        let mut o = open();
+        o.socket = "git\u{202e}kcos".into();
+        assert!(matches!(
+            o.validate(),
+            Err(OpenError::Socket(SocketNameError::UnsafeText))
+        ));
 
-        // A space name may hold a space character — `validate_space` bars only
-        // the empty string, `/`, control characters and over-length. The one
-        // that matters here is `/`, which would otherwise let a caller reach
-        // out of the space it named and into the key of another.
+        // Grouping by `/` is the whole reason the grammar is path-shaped: every
+        // socket that used to be `<space>/<path>` is a legal name.
         let mut o = open();
-        o.space = "code/../secrets".into();
-        assert!(matches!(o.validate(), Err(OpenError::Space(_))));
+        o.socket = "code/git.sock".into();
+        o.validate().unwrap();
 
         let mut o = open();
         o.meta = vec![("k".into(), "v".repeat(MAX_OPEN_META_BYTES))];
@@ -1213,15 +1409,13 @@ mod tests {
         struct Unbounded {
             v: u8,
             origin: OriginId,
-            space: String,
-            path: String,
+            socket: String,
             meta: Vec<(String, String)>,
         }
         let bytes = postcard::to_stdvec(&Unbounded {
             v: SOCK_PROTO_VERSION,
             origin: origin(),
-            space: "code".into(),
-            path: "git.sock".into(),
+            socket: "git".into(),
             meta: (0..MAX_OPEN_META_PAIRS * 4)
                 .map(|i| (format!("k{i}"), String::new()))
                 .collect(),

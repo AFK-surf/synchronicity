@@ -512,7 +512,8 @@ impl Harness {
         Invocation {
             program: Arc::new(elf.to_vec()),
             program_root: Hash::new(elf),
-            socket: SocketId::new("code", "test.sock"),
+            program_path: "code/test.o".into(),
+            socket: SocketId::new("test"),
             peer,
             policy,
             meta,

@@ -874,19 +874,28 @@ SY_ENTRY sy_s64 entry(void) { return 0; }\n";
     client
         .tool(
             "synch_socket_activate",
-            json!({ "space": "code", "path": "echo.o", "note": "from mcp" }),
+            json!({
+                "name": "echo",
+                "program_space": "code",
+                "program_path": "echo.o",
+                "note": "from mcp",
+            }),
         )
         .await;
-    // Activation makes the *scanner* publish the path as a socket, so the
-    // republish is a step of the lifecycle rather than an implementation
-    // detail — and the whole of it is reachable over the protocol.
+    // Publishing the program is the scanner's, so the republish is a step of
+    // the lifecycle rather than an implementation detail — and the whole of it
+    // is reachable over the protocol.
     client.tool("synch_source_scan", json!({})).await;
 
     let listed = client
         .tool("synch_socket_list", json!({ "long": true }))
         .await;
     let text = listed["content"][0]["text"].as_str().unwrap().to_string();
-    assert!(text.contains("echo.o"), "{text}");
+    assert!(text.contains("echo"), "{text}");
+    assert!(
+        text.contains("code/echo.o"),
+        "the listing names the program behind the name: {text}"
+    );
     assert!(
         text.contains(&root),
         "the listing names the root inspection described: {text}"
@@ -897,10 +906,7 @@ SY_ENTRY sy_s64 entry(void) { return 0; }\n";
 
     // Deactivation over the protocol completes the lifecycle.
     client
-        .tool(
-            "synch_socket_deactivate",
-            json!({ "space": "code", "path": "echo.o" }),
-        )
+        .tool("synch_socket_deactivate", json!({ "name": "echo" }))
         .await;
 
     client.close().await;

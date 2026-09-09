@@ -2287,7 +2287,7 @@ pub(crate) struct AuthContext {
     pub(crate) throttle: Arc<AuthThrottle>,
     /// The peer's IP, without its port (`peer_ip`).
     pub(crate) ip: String,
-    /// The socket being served, as `space/path`.
+    /// The socket being served, by name.
     pub(crate) socket: String,
 }
 

@@ -205,19 +205,19 @@ message Command {
     DelegateRm delegate_rm = 42;
     // `synch delegate ls`
     DelegateLs delegate_ls = 43;
-    // `synch socket activate <space>/<path> ...`
+    // `synch socket activate <name> --program <space>/<path> ...`
     SocketActivate socket_activate = 68;
-    // `synch socket deactivate <space>/<path>`
+    // `synch socket deactivate <name>`
     SocketDeactivate socket_deactivate = 69;
-    // `synch socket ls [<space>]`
+    // `synch socket ls [<origin>:]`
     SocketLs socket_ls = 51;
     // `synch socket sdk`
     SocketSdk socket_sdk = 52;
-    // `synch socket ps [<space>/<path>]`
+    // `synch socket ps [<name>]`
     SocketPs socket_ps = 53;
     // `synch socket kill <invocation>`
     SocketKill socket_kill = 54;
-    // `synch socket log <space>/<path>`
+    // `synch socket log <name>`
     SocketLog socket_log = 55;
     SourceAdd source_add = 56;
     SourceLs source_ls = 57;
@@ -838,7 +838,8 @@ message PartInfo {
 // ---- sockets (`docs/SOCKETS.md`) -------------------------------------------
 
 message SocketActivate {
-  // `<space>/<path>`.
+  // The socket's name on this node: a normalized path-shaped string, in no
+  // space and at no path.
   string target = 1;
   // `k=v` pairs the program reads through `sy_config_get`.
   repeated string config = 2;
@@ -846,24 +847,32 @@ message SocketActivate {
   uint32 max_streams = 3;
   // A free-form operator note.
   string note = 4;
+  // `<space>/<path>` of the program this name is bound to. Required.
+  string program = 5;
+  // Spaces whose delegates may open this socket. Empty is members only.
+  repeated string scope = 6;
 }
 
 message SocketDeactivate {
+  // The socket's name.
   string target = 1;
 }
 
 message SocketLs {
-  // Empty lists every space.
-  string space = 1;
-  // Show the published root, the manifest's declaration, configuration, and
-  // the stream cap.
+  // Was the space filter, back when a socket lived in one.
+  reserved 1;
+  // Show the program, its root, the manifest's declaration, the scope,
+  // the policy, and the other sockets the same program backs.
   bool long = 2;
+  // Empty lists this node's own sockets; an origin asks that peer which
+  // sockets this node may open, over the wire `List`.
+  string origin = 3;
 }
 
 message SocketSdk {}
 
 message SocketPs {
-  // Empty lists every socket's invocations.
+  // Empty lists every socket's invocations; otherwise a socket name.
   string target = 1;
 }
 
@@ -873,7 +882,7 @@ message SocketKill {
 }
 
 message SocketLog {
-  // `<space>/<path>`.
+  // The socket's name.
   string target = 1;
 }
 
@@ -890,9 +899,9 @@ message ConnectRequest {
 }
 
 message ConnectOpen {
-  // `<origin>:<space>/<path>` — origin-qualified, always. Connecting is the
-  // one read that takes no version policy: a socket is served by the node that
-  // published it, so there is nothing to select between.
+  // `<origin>:<name>` — origin-qualified, always. A socket name means
+  // something only on the node that activated it, so there is nothing to
+  // select between and no version policy to take.
   string reference = 1;
   // Caller-supplied metadata, readable by the program through `sy_conn_meta`.
   repeated MetaPair meta = 2;
@@ -921,6 +930,8 @@ message ConnectOpened {
   bytes program = 1;
   // The callee's id for this invocation, as `synch socket ps` prints it.
   uint64 invocation = 2;
+  // `<space>/<path>` of that program on the callee.
+  string program_path = 3;
 }
 
 message ConnectClosed {

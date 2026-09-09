@@ -17,8 +17,8 @@ own origin trie: the same act as saving a file into a filesystem-source director
 through the same ingest-and-publish path they all share. The caller supplies
 bytes and a verified identity. It still never supplies code, and it still never
 publishes anything: the program decides what is written, and the program is
-whatever content the operator's activated path currently holds — inspectable,
-and deployed on purpose.
+whatever content the operator's activated program path currently holds —
+inspectable, and deployed on purpose.
 
 ## 1. The non-goal, and why it is revisited
 
@@ -60,7 +60,7 @@ that surface:
    not decoration.
 3. **The caller still ships bytes, not decisions.** Which paths can be written,
    under what conditions, with whose input, is the program's logic — and every
-   change to it is a deployment the operator made to an activated path.
+   change to it is a deployment the operator made to a program path.
 
 What membership grants a caller therefore grows by exactly one clause: a member
 may *invoke programs at paths the callee activated*, and such a program may,
@@ -89,14 +89,16 @@ versions of its own view. DESIGN.md §12 says that plainly (§9 below).
   into an operator's directory is an attack surface with no matching need), no
   explicit directories (parents come into being as they do for a `PUT`: created
   on disk for filesystem sources, implicit in the trie), no mode bits in v1.
-- **Never a socket.** An activated path is not writable and not deletable
-  through this API, `SY_EPERM`, checked at open and re-checked inside the
-  commit. This is the rule that keeps tree-write grants and activation
-  composable: without it, a socket whose manifest writes a prefix containing
-  an activated path is remote code persistence in two moves (write the ELF,
-  invoke it) — every write to an activated path is a deployment, and a
-  deployment must come over channels outside the socket runtime. A program
-  also cannot *activate* sockets, declare delegations, or anything else: the
+- **A write to a program path is a deployment**, and nothing here refuses it
+  (`docs/SOCKET-PROGRAMS.md` §6). An earlier revision refused `sy_put_*` at an
+  activated path, at open and again inside the commit, on the grounds that a
+  grant covering it would be remote code persistence in two moves. That made
+  one write channel special among the several an activation already accepts —
+  an editor save, an adoption, an S3 `PUT` — and the operator is better served
+  by being *shown* the grant than by having it silently refused: `synch socket
+  activate` and `synch socket ls -l` name every activated program whose
+  manifest carries a tree-write grant covering the program path. A program
+  still cannot *activate* sockets, declare delegations, or anything else: the
   API stages file entries and tombstones, nothing more.
 - **Not a quota system.** What a member can cause a write-socket to publish
   is bounded per invocation (§8) as sanity, and unbounded across invocations
@@ -171,7 +173,7 @@ $ synch socket inspect drop-box.o
 ```
 
 A widened prefix is a changed root is a new deployment, visible in `synch
-socket ls -l` the moment the scanner publishes it — and activating a path
+socket ls -l` the moment the scanner publishes it — and activating a program
 whose future contents may declare writes is exactly the breadth the
 `synch socket activate` warning names. `synch socket ls -l` lists tree-write
 lines beside egress, and every commit is logged: socket, invocation, peer
@@ -313,13 +315,12 @@ cloud data plane's write tunnel, which opens one through the public
 `Node::open_tree_write` with every mode granted (docs/CLOUD-WRITES.md §6.3):
 
 - open: `ensure_adoptable` (publishable + `.syncignore`),
-  `normalized_adoption_path`, the declared-socket refusal, then
-  `Node::open_adoption` — filesystem sources staging beside the target with the
+  `normalized_adoption_path`, then `Node::open_adoption` — filesystem sources staging beside the target with the
   parent dirfd pinned, API sources staging in the daemon's scratch, both
   behind `Adoption`'s single choke point.
 - write: `Adoption::write` on the blocking pool.
-- commit: under the node's tree-write lock, the condition (§5.3) and the
-  socket refusal are re-checked; then `Adoption::commit` (fsync + rename);
+- commit: under the node's tree-write lock, the condition (§5.3) is
+  re-checked; then `Adoption::commit` (fsync + rename);
   then API source → `commit_api_file` (CAS ingest,
   `stage_api_reference` with `prev` and the `b:` ad) plus a
   `flush_staged`, filesystem source → `scan_publish_push`. The reported root is
@@ -443,7 +444,6 @@ Additions to the §10 tables of `docs/SOCKETS.md`:
 | What happens | Result |
 | --- | --- |
 | Open outside every declared prefix, or mode not declared | `SY_EPERM`, logged once per socket per hour, like undeclared egress. |
-| Target path has a `sockets` row | `SY_EPERM`, at open and re-checked in the commit transaction. |
 | Space unknown on this node | `SY_ENOENT`. |
 | Path `.syncignore`d (filesystem source) | `SY_EPERM` at open — the file would be invisible to the scanner forever. Deletes skip the check, as `delete_object` does. |
 | Node in recovery | `SY_EPERM` at open and again at commit. |
@@ -465,7 +465,7 @@ All applied in the change that built this:
   engine seam under a same-id tree-write declaration; open handles stage
   random-access writes and close conditionally publishes their version.
 - **`DESIGN.md` §12** — the membership-capability sentence extends: invoking a
-  activated socket may, where its manifest declares a tree-write prefix, cause the
+  socket may, where its manifest declares a tree-write prefix, cause the
   callee to publish new versions of its own view. Mitigations in place: the
   prefix and modes are data in the object the operator deployed, the version
   model scopes every write to the callee's own origin, and divergence remains

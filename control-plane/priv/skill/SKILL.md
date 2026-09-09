@@ -264,28 +264,31 @@ has, the path leaves the tree.
 
 ## Synchronicity sockets
 
-A **socket** exposes a program at a path in this node's published tree. Its
-file content is an eBPF ELF object; an incoming stream runs one invocation of
-that object on the node that published it. The caller supplies bytes and a
-verified peer identity, never code. This is the rule to keep in mind:
+A **program** is an ordinary file in this node's published tree whose content
+is an eBPF ELF object. A **socket** is a *name* of this node's own, bound to a
+program by a local activation; an incoming stream to that name runs one
+invocation of that program on this node. Many sockets may name one program,
+each with its own configuration, stream cap, scope and map. The caller
+supplies bytes and a verified peer identity, never code. This is the rule to
+keep in mind:
 
 > A node executes only eBPF that is present in its own published tree.
 
 That makes the two sides deliberately asymmetric. `synch socket ...` builds,
-inspects, activates and operates programs belonging to this node. `synch socket
+inspects, activates and operates sockets belonging to this node. `synch socket
 connect ...` is only a byte pump to a socket belonging to a named origin and
 needs no eBPF runtime on the caller.
 
-### Build, inspect and activate one
+### Build, deploy and activate one
 
 The normal path from C source to a runnable socket is:
 
 ```sh
-synch socket build git.c -o git.o               # C to eBPF; no daemon needed
-synch socket inspect git.o                      # stateless: root, manifest, load check
-cp git.o <source-dir>/git.sock                  # place it at the path
-synch socket activate code/git.sock             # the path is a socket until deactivated
-synch source scan code                          # publish it as kind=Socket
+synch socket build git.c -o gateway.o           # C to eBPF; no daemon needed
+synch socket inspect gateway.o                  # stateless: root, manifest, load check
+cp gateway.o <source-dir>/bin/gateway.o         # deploy it like any other file
+synch socket activate git --program code/bin/gateway.o
+synch source scan code                          # publish the program
 synch socket ls -l                              # verify published root and manifest
 ```
 
@@ -296,26 +299,32 @@ compatible `clang` and `llc` executables from `PATH` at `-O2`, and `-D
 NAME[=VALUE]` supplies compile-time definitions. Windows builds need this
 `--clang` route to build, but can connect normally.
 
-The object must live below a filesystem source registered with `synch
-source add`. Activation is the one local gate:
+The program must live in a space registered with `synch source add`, of either
+kind. Activation is the one local gate:
 
 - `synch socket inspect <file>` statelessly describes any eBPF object: the
   BLAKE3 root the tree would name for it, its `synchronicity.manifest`
   declaration — name, egress, process/file-transfer/tree-write capabilities,
   stream cap — and whether the program loads. Nothing executes: the manifest
   is data, and inspection touches no daemon state.
-- `synch socket activate <space>/<path>` makes the path a socket. The next
-  source scan publishes the entry as `kind=Socket`, and from then on **every
-  write to the path is an intentional deployment**: the new content serves
-  immediately under whatever its own manifest declares, until
-  `synch socket deactivate`. Add `--config k=v` for values read through
+- `synch socket activate <name> --program <space>/<path>` binds a socket name
+  to a program. `--program` is required. From then on **every write to that
+  program path is an intentional deployment**, to every socket that names it:
+  the new content serves immediately under whatever its own manifest declares,
+  until `synch socket deactivate`. Add `--scope SPACE` (repeatable) to admit
+  that space's delegates, `--config k=v` for values read through
   `sy_config_get`, `--max-streams N` for a local concurrency ceiling, or
   `--note TEXT` for an operator note.
-- Activation is about the path, never a content root. That breadth is the
-  grant: adoption and a read-write S3 key are deployment channels for an
-  activated path, so activate only paths whose every writer you mean as a
-  deployer. In-flight invocations keep the root snapshot they started with; a
-  deployment changes what the next connection runs.
+- Without `--scope`, a socket is open to **rooted members only**. Scope is
+  authorization and nothing else: it does not put the socket in the space and
+  does not let a delegate read the program's bytes.
+- Activation is about the program path, never a content root. That breadth is
+  the grant: adoption, a read-write S3 key and a program's own tree-write
+  grant are all deployment channels for a program path, so activate only
+  programs whose every writer you mean as a deployer. `activate` prints the
+  dependents and any tree-write grant covering the path. In-flight invocations
+  keep the root snapshot they started with; a deployment changes what the next
+  connection runs and clears each dependent socket's map.
 
 Serving sockets requires Linux, macOS or OpenBSD on x86-64 or arm64, where the
 async-ebpf runtime is available. Connecting works on every platform supported
@@ -323,15 +332,17 @@ by `synch` because the connecting side executes nothing.
 
 ### Connect to one
 
-Connections always require an origin-qualified reference; there is no
-`newest`, `strict`, or other version-selection policy for execution:
+Connections always require an origin-qualified name; a socket name means
+something only on the node that activated it, so there is no `newest`,
+`strict`, or other version-selection policy for execution:
 
 ```sh
-synch socket connect nas@cluster.acme.example.com:code/git.sock
-synch socket connect nas@cluster.acme.example.com:code/git.sock --meta repo=docs
-synch socket connect nas@cluster.acme.example.com:code/git.sock \
+synch socket ls nas@cluster.acme.example.com:    # what it will let you open
+synch socket connect nas@cluster.acme.example.com:git
+synch socket connect nas@cluster.acme.example.com:git --meta repo=docs
+synch socket connect nas@cluster.acme.example.com:git \
   --listen 127.0.0.1:9418
-synch socket connect nas@cluster.acme.example.com:code/git.sock \
+synch socket connect nas@cluster.acme.example.com:git \
   --listen 127.0.0.1:9418 --once
 ```
 
@@ -342,36 +353,38 @@ untrusted metadata the program may read. The local daemon owns the actual
 Synchronicity endpoint and bridges the control-socket stream, so it must be
 running on the connecting side too.
 
-The destination resolves the path only in the named origin's trie, verifies
-membership and delegation, requires the path to be locally activated, and
-parses the current content's manifest before anything runs. Publication alone
-is never execute permission. A program's undeclared outbound connections are
-denied. Reading the tree needs no declaration and is not denied.
+The destination resolves the name in its own activation table, checks the
+socket's scope against the caller's grant, resolves the program in its own
+trie, and parses the current content's manifest before anything runs.
+Publication alone is never execute permission. A program's undeclared outbound
+connections are denied. Reading the tree needs no declaration and is not
+denied.
 
-Adopting a peer's socket, materializing it in a replica checkout, or writing
+Adopting a peer's program, materializing it in a replica checkout, or writing
 it through S3 copies its bytes as an ordinary file — unless the *local*
-destination path is activated, in which case the write is a deployment, which
-is exactly what activation means. Socket-ness is a local assertion created
-only by `synch socket activate`. If one origin publishes a socket and another
-publishes a regular file with identical bytes, they are divergent versions
-rather than one unanimous version.
+destination path is one this node has activated a socket over, in which case
+the write is a deployment, which is exactly what activation means. A socket is
+a local assertion created only by `synch socket activate`, and nothing about
+it is published or replicated.
 
 ### Operate and troubleshoot sockets
 
 ```sh
-synch socket ls [<space>] -l          # activations, published roots, manifests
-synch socket ps [<space>/<path>]      # live invocations, ids, peers and counters
-synch socket log <space>/<path>       # recent sy_log output
+synch socket ls -l                    # program, root, manifest, scope, policy
+synch socket ls <origin>:             # a peer's sockets this node may open
+synch socket ps [<name>]              # live invocations, ids, peers and counters
+synch socket log <name>                # recent sy_log output
 synch socket kill <invocation>        # end one invocation
-synch socket deactivate <space>/<path> # refuse now; next scan publishes a file
+synch socket deactivate <name>        # refuse now; the program file is untouched
 ```
 
-The common refusals say which gate failed: `NoSuchPath` means that origin does
-not publish the path, `NotASocket` that it is not a socket entry,
-`NotActivated` that the path was deactivated or its content replaced during
-admission, `Unauthorized` that the caller is not a member or delegate,
-`SpaceNotDelegated` that the socket falls outside the caller's grant, `Busy`
-that its concurrency cap is full, and `ProgramInvalid` that the manifest does
+The common refusals say which gate failed: `NoSuchPath` means there is no
+socket of that name, or its program path has no live entry; `NotASocket` that
+the program path holds something with no content; `NotActivated` that the
+socket was deactivated or its program replaced during admission;
+`Unauthorized` that the caller has no live binding; `OutOfScope` that the
+caller is a delegate and none of its spaces is in the socket's scope; `Busy`
+that its concurrency cap is full; and `ProgramInvalid` that the manifest does
 not parse or the object could not load or link. An invalid update stays
 activated and unavailable: inspect `socket log` and `socket ls -l`, fix or
 rebuild the object, and deploy it — the next scan serves it.

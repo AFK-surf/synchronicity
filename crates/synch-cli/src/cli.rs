@@ -869,16 +869,25 @@ pub enum SocketCommand {
         /// The eBPF ELF object to describe.
         file: PathBuf,
     },
-    /// Make a path in one of this node's spaces a socket, until `deactivate`.
+    /// Bind a socket name to a program, until `deactivate`.
     ///
-    /// From the next scan the path publishes as a socket, and every later
-    /// write to it — an editor save, an adoption, an S3 PUT — is an
-    /// intentional deployment: the new content serves immediately, under
-    /// whatever its own manifest declares. Activate a path only when every
-    /// channel that can write it is one you mean as a deployment channel.
+    /// The program is an ordinary file in one of this node's spaces, and every
+    /// later write to it — an editor save, an adoption, an S3 PUT, a program's
+    /// own tree write — is an intentional deployment to every socket that
+    /// names it: the new content serves immediately, under whatever its own
+    /// manifest declares. Activate only programs whose every writer you mean
+    /// as a deployer.
     Activate {
-        /// `<space>/<path>`.
-        target: String,
+        /// The socket's name on this node. Grouped with `/` if you like:
+        /// `git`, `docs/git`, `ci/intake`.
+        name: String,
+        /// `<space>/<path>` of the program to run. Required.
+        #[arg(long, value_name = "SPACE/PATH")]
+        program: String,
+        /// A space whose delegates may open this socket. Repeatable; without
+        /// any, the socket is open to rooted members only.
+        #[arg(long = "scope", value_name = "SPACE")]
+        scope: Vec<String>,
         /// `k=v`, readable by the program through `sy_config_get`.
         #[arg(long = "config", value_name = "K=V")]
         config: Vec<String>,
@@ -889,17 +898,17 @@ pub enum SocketCommand {
         #[arg(long)]
         note: Option<String>,
     },
-    /// Stop a path being a socket; the next scan republishes it as a file.
+    /// Release a socket name; the program file is untouched.
     ///
     /// Admission refuses immediately; invocations already running keep their
     /// snapshot and finish.
     Deactivate {
-        /// `<space>/<path>`.
-        target: String,
+        /// The socket's name.
+        name: String,
     },
     /// Connect to a socket on any node, including this one.
     Connect {
-        /// `<origin>:<space>/<path>` — origin-qualified, always.
+        /// `<origin>:<name>` — origin-qualified, always.
         reference: String,
         /// `k=v` metadata the program can read with `sy_conn_meta`.
         #[arg(long = "meta", value_name = "K=V")]
@@ -911,18 +920,20 @@ pub enum SocketCommand {
         #[arg(long, requires = "listen")]
         once: bool,
     },
-    /// List this node's activated sockets.
+    /// List this node's activated sockets, or a peer's.
     Ls {
-        /// Only this space.
-        space: Option<String>,
-        /// Show the published root, what its manifest declares, and the policy.
+        /// `<origin>:` asks that peer which of its sockets this node may open.
+        /// Omitted, this node's own.
+        origin: Option<String>,
+        /// Show the program and its root, what its manifest declares, the
+        /// scope, the policy, and the other sockets the same program backs.
         #[arg(short, long)]
         long: bool,
     },
     /// Show the invocations running right now.
     Ps {
-        /// Only this socket, as `<space>/<path>`.
-        target: Option<String>,
+        /// Only this socket, by name.
+        name: Option<String>,
     },
     /// End one running invocation.
     ///
@@ -935,8 +946,8 @@ pub enum SocketCommand {
     },
     /// Show what a socket's programs have written with `sy_log`.
     Log {
-        /// `<space>/<path>`.
-        target: String,
+        /// The socket's name.
+        name: String,
     },
     /// Print the C SDK header a socket program is compiled against.
     Sdk,
@@ -948,9 +959,9 @@ pub enum SocketCommand {
     /// automatically and is the same header `synch socket sdk` prints; there
     /// is no libc.
     ///
-    /// This does not publish anything. The object it writes becomes a socket
-    /// when it is written into a source at a path `synch socket activate` has
-    /// made a socket.
+    /// This does not publish anything. The object it writes becomes a socket's
+    /// program when it is written into a source at a path some
+    /// `synch socket activate` names.
     Build {
         /// The C source to compile.
         source: PathBuf,

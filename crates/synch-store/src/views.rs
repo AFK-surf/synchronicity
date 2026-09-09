@@ -650,8 +650,11 @@ impl Store {
             if !exists {
                 return Ok(false);
             }
+            // A socket is a name, not a path in this space — but its program
+            // is one, and a socket whose program has no source behind it can
+            // never serve. The role owns them both.
             txn.conn().execute(
-                "DELETE FROM socket_activations WHERE space = ?1",
+                "DELETE FROM socket_activations WHERE program_space = ?1",
                 params![space],
             )?;
             txn.conn()

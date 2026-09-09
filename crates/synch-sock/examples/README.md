@@ -11,22 +11,22 @@ no BPF backend:
 synch socket build echo.c -o echo.o
 ```
 
-Then inspect it, and activate the path it will live at. A socket is a file in
-one of this node's spaces whose content is that object; `inspect` statelessly
-prints what the object's manifest says it needs, and `activate` makes the path
-a socket — from then on, every write to it is a deployment that serves
-immediately:
+Then inspect it, deploy it into one of this node's spaces, and bind a socket
+name to it. The object is the **program**; the name is the **socket**, and
+many names may share one program. `inspect` statelessly prints what the
+object's manifest says it needs, and from the activation onwards every write
+to the program path is a deployment that serves immediately:
 
 ```sh
 synch socket inspect echo.o
-cp echo.o ~/synchronicity/code/echo.sock
-synch socket activate code/echo.sock
+cp echo.o ~/synchronicity/code/bin/echo.o
+synch socket activate echo --program code/bin/echo.o
 ```
 
 And call it from another node in the cluster:
 
 ```sh
-synch socket connect nas:code/echo.sock
+synch socket connect nas:echo
 ```
 
 | | what it is for | what to read it for |

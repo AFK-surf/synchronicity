@@ -790,7 +790,7 @@ impl Control for ControlService {
             }
         };
 
-        let (origin, space, path) = socket_reference(&open.reference)?;
+        let (origin, socket) = socket_reference(&open.reference)?;
         let meta: Vec<(String, String)> = open
             .meta
             .into_iter()
@@ -799,7 +799,7 @@ impl Control for ControlService {
 
         let node = self.served.node()?.clone();
         let connection = node
-            .connect_socket(&origin, &space, &path, meta)
+            .connect_socket(&origin, &socket, meta)
             .await
             .map_err(ControlError::from)?;
 
@@ -1353,29 +1353,33 @@ fn domain_set_advice(domain: &str, node_id: NodeId, delegate: bool) -> Vec<Strin
     ]
 }
 
-/// Splits a `<origin>:<space>/<path>` socket reference.
+/// Splits a `<origin>:<name>` socket reference.
 ///
-/// Origin-qualified, always. A socket is served by the node that published it,
-/// so there is nothing to select between — and `newest` would let any member's
-/// `mtime_ns` decide whose program answers.
-fn socket_reference(text: &str) -> Result<(synch_core::OriginId, String, String), ControlError> {
-    let reference: synch_engine::EntryRef = text
-        .parse()
-        .map_err(|e| ControlError::invalid(format!("{e}")))?;
-    let Some(origin) = reference.origin else {
-        return Err(ControlError::invalid(format!(
-            "`{text}` names no origin; connecting takes `<origin>:<space>/<path>`"
-        )));
-    };
-    // `EntryRef` has already split the space from the path. Splitting the path
-    // again would drop its first component and quietly resolve a nested socket
-    // to the wrong one, which is a bug that looks like a working connection.
-    if reference.path.is_empty() {
-        return Err(ControlError::invalid(format!(
-            "`{text}` names a space root; a socket reference is `<origin>:<space>/<path>`"
-        )));
-    }
-    Ok((origin, reference.space, reference.path))
+/// Origin-qualified, always. A socket name means something only on the node
+/// that activated it: `nas:git` and `laptop:git` are unrelated, so there is
+/// nothing to select between and no version policy to take.
+fn socket_reference(text: &str) -> Result<(synch_core::OriginId, String), ControlError> {
+    let (origin, name) = split_origin(text).ok_or_else(|| {
+        ControlError::invalid(format!(
+            "`{text}` names no origin; connecting takes `<origin>:<name>`"
+        ))
+    })?;
+    synch_core::validate_socket_name(name)
+        .map_err(|e| ControlError::invalid(format!("`{text}`: {e}")))?;
+    Ok((origin, name.to_string()))
+}
+
+/// Splits `<origin>:<rest>` at the origin boundary, or `None` when the text
+/// names no origin or names one that does not parse.
+///
+/// The boundary is the last `:` before the first `/`, the same rule
+/// [`EntryRef`](synch_engine::EntryRef) uses: it keeps the `key:<z-base-32>`
+/// form unambiguous while letting what follows carry `/`, which a socket name
+/// may.
+fn split_origin(text: &str) -> Option<(synch_core::OriginId, &str)> {
+    let boundary = text.find('/').unwrap_or(text.len());
+    let idx = text[..boundary].rfind(':')?;
+    Some((text[..idx].parse().ok()?, &text[idx + 1..]))
 }
 
 /// Pumps bytes between one control stream and one socket invocation.
@@ -1400,12 +1404,14 @@ async fn bridge_socket(
         } => {
             let synch_net::sock::SockStream {
                 program,
+                program_path,
                 invocation,
                 send,
                 recv,
             } = stream;
             bridge_socket_parts(
                 program,
+                program_path,
                 invocation,
                 send,
                 recv,
@@ -1423,6 +1429,7 @@ async fn bridge_socket(
         }
         SocketConnection::Local {
             program,
+            program_path,
             invocation,
             stream,
             completion,
@@ -1430,6 +1437,7 @@ async fn bridge_socket(
             let (recv, send) = tokio::io::split(stream);
             bridge_socket_parts(
                 program,
+                program_path,
                 invocation,
                 send,
                 recv,
@@ -1442,8 +1450,13 @@ async fn bridge_socket(
     }
 }
 
+#[allow(
+    clippy::too_many_arguments,
+    reason = "the two halves of one bridged invocation, plus what it was opened as"
+)]
 async fn bridge_socket_parts<R, W, F>(
     program: synch_core::Hash,
+    program_path: String,
     invocation: u64,
     mut send: W,
     mut recv: R,
@@ -1459,6 +1472,7 @@ where
     tx.send(Ok(pb::ConnectResponse {
         kind: Some(pb::connect_response::Kind::Opened(pb::ConnectOpened {
             program: program.as_bytes().to_vec(),
+            program_path,
             invocation,
         })),
     }))
@@ -1666,28 +1680,72 @@ mod socket_response_tests {
     }
 }
 
-/// Splits a `<space>/<path>` socket target.
+/// Which activated programs carry a tree-write grant covering `path`
+/// (`docs/SOCKET-PROGRAMS.md` §6).
+///
+/// A program holding such a grant is one more channel that can write the
+/// program path, and therefore one more deployer — declared in a manifest the
+/// operator inspected before deploying it, and no more or less trusted than an
+/// S3 key with write access to the same prefix. What differs is only that the
+/// operator can be *told*, which is what this is for. Computed from the same
+/// manifest parse `ls -l` renders, so it says what is deployed rather than
+/// what was declared once.
+async fn socket_writers_over(node: &Node, path: &str) -> Result<Vec<String>, ControlError> {
+    let listing = node.clone();
+    let activations = read(&listing, move |n| Ok(n.socket_ls()?)).await?;
+    let mut out = Vec::new();
+    for activation in activations {
+        let resolved = {
+            let node = node.clone();
+            let row = activation.clone();
+            read(&node, move |n| Ok(n.resolve_socket_program(&row)?)).await?
+        };
+        let Ok(resolved) = resolved else { continue };
+        let declared = {
+            let node = node.clone();
+            let root = resolved.root;
+            read(&node, move |n| Ok(n.socket_program_declaration(&root))).await?
+        };
+        let Ok(declared) = declared else { continue };
+        for grant in declared.tree_writes.iter().filter(|g| g.covers(path)) {
+            out.push(format!(
+                "the tree-write grant of socket {} (prefix {})",
+                activation.name, grant.prefix
+            ));
+        }
+    }
+    Ok(out)
+}
+
+/// Checks a bare socket name.
 ///
 /// Origin-qualified references are refused rather than ignored: a socket a
-/// node declares is one of *its own*, and `nas:code/git.sock` here would be
-/// asking this node to declare something about somebody else's tree.
-fn split_socket_target(target: &str) -> Result<(String, String), ControlError> {
+/// node activates is one of *its own*, and `nas:git` here would be asking this
+/// node to say something about somebody else's namespace.
+fn socket_name(target: &str) -> Result<String, ControlError> {
     if target.contains(':') {
         return Err(ControlError::new(
             ErrorCode::Invalid,
             format!(
-                "`{target}` names another origin; a socket is declared on the node that \
-                 publishes it, so this takes `<space>/<path>`"
+                "`{target}` names another origin; a socket is activated on the node that \
+                 serves it, so this takes a bare name"
             ),
         ));
     }
-    match target.split_once('/') {
+    synch_core::validate_socket_name(target)
+        .map_err(|e| ControlError::new(ErrorCode::Invalid, format!("`{target}`: {e}")))?;
+    Ok(target.to_string())
+}
+
+/// Splits the `<space>/<path>` a socket's `--program` names.
+fn split_program(program: &str) -> Result<(String, String), ControlError> {
+    match program.split_once('/') {
         Some((space, path)) if !space.is_empty() && !path.is_empty() => {
             Ok((space.to_string(), path.to_string()))
         }
         _ => Err(ControlError::new(
             ErrorCode::Invalid,
-            format!("`{target}` is not `<space>/<path>`"),
+            format!("`--program {program}` is not `<space>/<path>`"),
         )),
     }
 }
@@ -3018,17 +3076,22 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
             }
         }
 
-        // ---- sockets (`docs/SOCKETS.md`) ----------------------------------
+        // ---- sockets (`docs/SOCKETS.md`, `docs/SOCKET-PROGRAMS.md`) -------
         Command::SocketActivate(pb::SocketActivate {
             target,
             config,
             max_streams,
             note,
+            program,
+            scope,
         }) => {
-            let (space, path) = split_socket_target(&target)?;
+            let name = socket_name(&target)?;
+            let (program_space, program_path) = split_program(&program)?;
             let row = synch_store::SocketActivation {
-                space: space.clone(),
-                path: path.clone(),
+                name: name.clone(),
+                program_space,
+                program_path,
+                scope,
                 config: config
                     .iter()
                     .map(|pair| match pair.split_once('=') {
@@ -3043,83 +3106,141 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
             let node = node.clone();
             let activated = row.clone();
             read(&node, move |n| Ok(n.socket_activate(&activated)?)).await?;
-            out.line(format!("activated {space}/{path}")).await?;
+            out.line(format!("activated {name} \u{2190} {}", row.program()))
+                .await?;
+            out.line(format!("open to: {}", render::socket_scope(&row.scope)))
+                .await?;
             if !synch_sock::SUPPORTED {
                 out.line(
                     "note: this build serves no sockets — this build supports Linux and macOS \
-                     on x86-64 and arm64. The entry will publish and replicate; \
-                     a peer connecting to it is refused."
+                     on x86-64 and arm64. The program will publish and replicate; \
+                     a peer connecting to this socket is refused."
                         .to_string(),
                 )
                 .await?;
             }
+
+            // The dependents are the point: the third activation of a program
+            // is the moment its blast radius became three sockets, and the
+            // operator should see that where they asked for it.
+            let (space, path) = (row.program_space.clone(), row.program_path.clone());
+            let dependents = {
+                let node = node.clone();
+                read(&node, move |n| Ok(n.sockets_backed_by(&space, &path)?)).await?
+            };
+            out.line(format!(
+                "every write to {} is a deployment to: {}",
+                row.program(),
+                dependents
+                    .iter()
+                    .map(|a| a.name.as_str())
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            ))
+            .await?;
+            let mut channels = vec!["adoption, S3 writes, `synch put`".to_string()];
+            for writer in socket_writers_over(&node, &row.program()).await? {
+                channels.push(writer);
+            }
+            out.line(format!("that includes {}", channels.join(", ")))
+                .await?;
             out.line(
-                "every write to this path is now a deployment: what it holds serves \
-                 immediately, under its own manifest, until `synch socket deactivate`. \
-                 That includes adoption and S3 writes — activate only paths whose every \
-                 writer you mean as a deployer."
-                    .to_string(),
+                "activate only programs whose every writer you mean as a deployer".to_string(),
             )
             .await?;
-            out.line("next: `synch source scan` publishes the current bytes".to_string())
-                .await?;
         }
 
         Command::SocketDeactivate(pb::SocketDeactivate { target }) => {
-            let (space, path) = split_socket_target(&target)?;
+            let name = socket_name(&target)?;
             let node = node.clone();
-            let (s, p) = (space.clone(), path.clone());
-            if !read(&node, move |n| Ok(n.socket_deactivate(&s, &p)?)).await? {
+            let removed = name.clone();
+            if !read(&node, move |n| Ok(n.socket_deactivate(&removed)?)).await? {
                 return Err(ControlError::new(
                     ErrorCode::NotFound,
-                    format!("{space}/{path} is not an activated socket"),
+                    format!("`{name}` is not an activated socket"),
                 ));
             }
             out.line(format!(
-                "deactivated {space}/{path} — connections refuse now; the next scan \
-                 republishes it as a file"
+                "deactivated {name} — connections refuse now; the program file is untouched"
             ))
             .await?;
         }
 
-        Command::SocketLs(pb::SocketLs { space, long }) => {
-            let filter = (!space.is_empty()).then_some(space);
+        Command::SocketLs(pb::SocketLs { long, origin }) => {
+            // The remote form is the wire `List` (`docs/SOCKET-PROGRAMS.md`
+            // §5): a peer answers with the sockets this node may open, and
+            // nothing else about its table is ours to print.
+            if !origin.is_empty() {
+                let origin: synch_core::OriginId = origin
+                    .parse()
+                    .map_err(|e| ControlError::invalid(format!("bad origin: {e}")))?;
+                let listed = node
+                    .list_sockets(&origin)
+                    .await
+                    .map_err(ControlError::from)?;
+                if listed.is_empty() {
+                    out.line(format!("{} offers you no sockets", origin.canonical()))
+                        .await?;
+                }
+                for entry in listed {
+                    let root = match entry.program == synch_core::Hash::EMPTY {
+                        true => "unpublished".to_string(),
+                        false => entry.program.to_hex(),
+                    };
+                    out.line(format!("{:<32}  {}", entry.name, root)).await?;
+                    if long {
+                        out.line(format!("    program  {}", entry.program_path))
+                            .await?;
+                        if !entry.note.is_empty() {
+                            out.line(format!("    note     {}", entry.note)).await?;
+                        }
+                    }
+                }
+                return Ok(());
+            }
+
             let node_for_read = node.clone();
-            let sockets =
-                read(&node_for_read, move |n| Ok(n.socket_ls(filter.as_deref())?)).await?;
+            let sockets = read(&node_for_read, move |n| Ok(n.socket_ls()?)).await?;
             if sockets.is_empty() {
                 out.line("no sockets activated".to_string()).await?;
             }
             for activation in sockets {
-                let qualified = activation.qualified();
-                // What the tree currently names, which is what a connection
-                // would run right now — and its manifest, from the same parse
-                // admission uses, so "invalid update" is visible here rather
-                // than only as connection errors.
+                // What the tree currently names for the program, which is what
+                // a connection would run right now — and its manifest, from
+                // the same parse admission uses, so "invalid update" is
+                // visible here rather than only as connection errors.
                 let resolved = {
                     let node = node.clone();
-                    let (s, p) = (activation.space.clone(), activation.path.clone());
-                    read(&node, move |n| Ok(n.resolve_socket(&s, &p)?)).await?
+                    let row = activation.clone();
+                    read(&node, move |n| Ok(n.resolve_socket_program(&row)?)).await?
                 };
                 let declared = match &resolved {
-                    Some(r) => {
+                    Ok(r) => {
                         let node = node.clone();
                         let root = r.root;
                         Some(read(&node, move |n| Ok(n.socket_program_declaration(&root))).await?)
                     }
-                    None => None,
+                    Err(_) => None,
                 };
                 let status = match (&resolved, &declared) {
-                    (None, _) => "unpublished — run `synch source scan`".to_string(),
-                    (Some(_), Some(Err(e))) => format!("activated, unavailable: {e}"),
-                    (Some(_), _) => "activated".to_string(),
+                    (Err(_), _) => "unpublished — deploy the program".to_string(),
+                    (Ok(_), Some(Err(e))) => format!("activated, unavailable: {e}"),
+                    (Ok(_), _) => "activated".to_string(),
                 };
-                out.line(format!("{qualified:<40}  {status}")).await?;
+                out.line(format!("{:<32}  {status}", activation.name))
+                    .await?;
                 if long {
-                    if let Some(r) = &resolved {
+                    out.line(format!("    program  {}", activation.program()))
+                        .await?;
+                    if let Ok(r) = &resolved {
                         out.line(format!("    tree     {}", r.root.to_hex()))
                             .await?;
                     }
+                    out.line(format!(
+                        "    open to  {}",
+                        render::socket_scope(&activation.scope)
+                    ))
+                    .await?;
                     if let Some(Ok(declared)) = &declared {
                         for line in declared.render().lines() {
                             out.line(format!("    declares {line}")).await?;
@@ -3132,6 +3253,23 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
                         out.line(format!("    note     {}", activation.note))
                             .await?;
                     }
+                    let (space, path) = (
+                        activation.program_space.clone(),
+                        activation.program_path.clone(),
+                    );
+                    let siblings = {
+                        let node = node.clone();
+                        read(&node, move |n| Ok(n.sockets_backed_by(&space, &path)?)).await?
+                    };
+                    let others: Vec<&str> = siblings
+                        .iter()
+                        .map(|a| a.name.as_str())
+                        .filter(|name| *name != activation.name)
+                        .collect();
+                    if !others.is_empty() {
+                        out.line(format!("    also     {}", others.join(", ")))
+                            .await?;
+                    }
                 }
             }
         }
@@ -3139,10 +3277,7 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
         Command::SocketPs(pb::SocketPs { target }) => {
             let filter = match target.is_empty() {
                 true => None,
-                false => {
-                    let (space, path) = split_socket_target(&target)?;
-                    Some(format!("{space}/{path}"))
-                }
+                false => Some(socket_name(&target)?),
             };
             let running = node.socket_ps(filter.as_deref());
             if running.is_empty() {
@@ -3182,10 +3317,10 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
         }
 
         Command::SocketLog(pb::SocketLog { target }) => {
-            let (space, path) = split_socket_target(&target)?;
-            let lines = node.socket_log(&space, &path);
+            let name = socket_name(&target)?;
+            let lines = node.socket_log(&name);
             if lines.is_empty() {
-                out.line(format!("{space}/{path} has said nothing recently"))
+                out.line(format!("{name} has said nothing recently"))
                     .await?;
             }
             for line in lines {
@@ -4083,25 +4218,35 @@ mod socket_reference_tests {
     use super::socket_reference;
 
     #[test]
-    fn a_nested_path_keeps_every_component() {
-        // The regression this exists for: `EntryRef` has already split the
-        // space off, and splitting the path a second time silently resolved
-        // `code/a/b/c.sock` as `b/c.sock` — a different socket, or none.
-        let (origin, space, path) =
-            socket_reference("nas@cluster.example:code/a/b/c.sock").unwrap();
+    fn a_grouped_name_keeps_every_component() {
+        // A socket name may carry `/` to group names, and the whole of what
+        // follows the origin is the name: splitting it again would resolve
+        // `code/a/b/c.sock` as some other socket, or none.
+        let (origin, name) = socket_reference("nas@cluster.example:code/a/b/c.sock").unwrap();
         assert_eq!(origin.canonical(), "nas@cluster.example");
-        assert_eq!(space, "code");
-        assert_eq!(path, "a/b/c.sock");
+        assert_eq!(name, "code/a/b/c.sock");
 
-        let (_, space, path) = socket_reference("nas@cluster.example:code/git.sock").unwrap();
-        assert_eq!((space.as_str(), path.as_str()), ("code", "git.sock"));
+        // The origin boundary is the last `:` before the first `/`, which is
+        // what keeps a key-shaped origin unambiguous.
+        let key = iroh_base::SecretKey::generate().public();
+        let (origin, name) = socket_reference(&format!("key:{}:docs/git", key.to_z32())).unwrap();
+        assert_eq!(origin, synch_core::OriginId::Key(key));
+        assert_eq!(name, "docs/git");
+
+        // And a flat name is the ordinary case.
+        let (_, name) = socket_reference("nas@cluster.example:git").unwrap();
+        assert_eq!(name, "git");
     }
 
     #[test]
-    fn a_reference_must_name_an_origin_and_a_path() {
-        // Unqualified: there is no policy to select a socket with.
+    fn a_reference_must_name_an_origin_and_a_legal_name() {
+        // Unqualified: a socket name means something only on one node.
+        assert!(socket_reference("git").is_err());
         assert!(socket_reference("code/git.sock").is_err());
-        // A space root names no socket.
-        assert!(socket_reference("nas@cluster.example:code").is_err());
+        // An origin and nothing after it names no socket.
+        assert!(socket_reference("nas@cluster.example:").is_err());
+        // And the name grammar is the tree path grammar without a space.
+        assert!(socket_reference("nas@cluster.example:../git").is_err());
+        assert!(socket_reference("nas@cluster.example:/git").is_err());
     }
 }

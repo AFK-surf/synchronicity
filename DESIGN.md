@@ -2021,19 +2021,26 @@ CREATE TABLE s3_upload_parts (upload TEXT NOT NULL
 
 -- ---- sockets (`docs/SOCKETS.md` §3) --------------------------------------
 --
--- Local operator state, never published and never replicated. Publication
--- cannot gate execution: `synch adopt path`, `synch adopt tree --replace` and an S3 PUT all
--- write bytes into a filesystem-source directory that the scanner publishes as this
--- node's own view. Activating a path makes those write paths deployment
--- channels for it: while the row exists, whatever the path holds is a socket
--- and its current content serves under its own embedded manifest. No content
--- root is ever an authorization pin.
-CREATE TABLE socket_activations (space TEXT NOT NULL, path TEXT NOT NULL,
+-- Local operator state, never published and never replicated. A socket is a
+-- name of this node's own, bound to a *program*: an ordinary file at
+-- `<space>/<path>` in this node's tree. Publication cannot gate execution:
+-- `synch adopt path`, `synch adopt tree --replace` and an S3 PUT all write
+-- bytes into a filesystem-source directory that the scanner publishes as this
+-- node's own view. Activating a name makes every write to its program path a
+-- deployment: whatever the path holds serves under its own embedded manifest.
+-- No content root is ever an authorization pin. `scope` is who may open it:
+-- empty admits rooted members only, and each space named admits that space's
+-- delegates.
+CREATE TABLE socket_activations (name TEXT PRIMARY KEY,
+                      program_space TEXT NOT NULL,
+                      program_path TEXT NOT NULL,
+                      scope TEXT NOT NULL DEFAULT '',    -- newline-separated spaces
                       config TEXT NOT NULL DEFAULT '',   -- newline-separated k=v
                       max_streams INTEGER,       -- NULL: the daemon's default
                       note TEXT NOT NULL DEFAULT '',
-                      activated_at INTEGER NOT NULL,
-                      PRIMARY KEY (space, path));
+                      activated_at INTEGER NOT NULL);
+CREATE INDEX socket_activations_by_program
+  ON socket_activations (program_space, program_path);
 ```
 
 The trie is authoritative; `entries` and `blob_providers` are derived caches and can

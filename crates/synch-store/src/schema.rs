@@ -99,7 +99,60 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         name: "empty verified ranges as null",
         run: v28_empty_ranges_as_null,
     },
+    Migration::Rust {
+        name: "sockets are names bound to programs",
+        run: v29_sockets_by_name,
+    },
 ];
+
+/// v29 — a socket is a name, and the path it used to be is its program
+/// (`docs/SOCKET-PROGRAMS.md` §8).
+///
+/// The old table keyed an activation by `(space, path)`, which was at once the
+/// socket's address, the program's location, and — because the path sat under
+/// `f:<space>/` — the socket's authorization boundary. Those are three things,
+/// and this rewrite separates them: the name is the address, `(program_space,
+/// program_path)` is the location, and `scope` is the grant.
+///
+/// No existing socket is carried over. Each old row is a statement about a
+/// path, and the two things the new row needs that the old one does not hold
+/// — a name, and a scope — are grants: choosing them for the operator would
+/// mean choosing who may run what. The old rows are dropped, one warn line
+/// each, and the operator re-activates with `synch socket activate <name>
+/// --program <space>/<path>`, which is where those choices belong. The v24
+/// migration took the same stance for the same reason.
+fn v29_sockets_by_name(tx: &Transaction<'_>) -> Result<()> {
+    let existing: Vec<(String, String)> = {
+        let mut stmt =
+            tx.prepare("SELECT space, path FROM socket_activations ORDER BY space, path")?;
+        let rows = stmt.query_map([], |row| Ok((row.get(0)?, row.get(1)?)))?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()?
+    };
+    for (space, path) in &existing {
+        tracing::warn!(
+            socket = format!("{space}/{path}"),
+            "socket activation dropped by the socket-namespace migration: a socket is now a \
+             name bound to a program, with a scope of its own — run `synch socket activate \
+             <name> --program {space}/{path}` to serve this program again"
+        );
+    }
+    tx.execute_batch(
+        "DROP TABLE socket_activations;
+         CREATE TABLE socket_activations (
+           name          TEXT PRIMARY KEY,
+           program_space TEXT NOT NULL,
+           program_path  TEXT NOT NULL,
+           scope         TEXT NOT NULL DEFAULT '',  -- newline-separated spaces; '' = members
+           config        TEXT NOT NULL DEFAULT '',  -- newline-separated k=v
+           max_streams   INTEGER,                   -- NULL: the daemon's default
+           note          TEXT NOT NULL DEFAULT '',
+           activated_at  INTEGER NOT NULL
+         );
+         CREATE INDEX socket_activations_by_program
+           ON socket_activations (program_space, program_path);",
+    )?;
+    Ok(())
+}
 
 /// v28 — `NULL` is the one spelling of an empty partial-cache bitmap.
 ///
@@ -1110,14 +1163,17 @@ CREATE TABLE s3_upload_parts (
 );
 
 CREATE TABLE socket_activations (
-  space         TEXT NOT NULL,
-  path          TEXT NOT NULL,
+  name          TEXT PRIMARY KEY,
+  program_space TEXT NOT NULL,
+  program_path  TEXT NOT NULL,
+  scope         TEXT NOT NULL DEFAULT '',
   config        TEXT NOT NULL DEFAULT '',
   max_streams   INTEGER,
   note          TEXT NOT NULL DEFAULT '',
-  activated_at  INTEGER NOT NULL,
-  PRIMARY KEY (space, path)
+  activated_at  INTEGER NOT NULL
 );
+CREATE INDEX socket_activations_by_program
+  ON socket_activations (program_space, program_path);
 "#;
 
 /// v14 — a DNS binding's identity includes the domain that published it.

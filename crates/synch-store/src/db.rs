@@ -1894,6 +1894,51 @@ mod tests {
         assert!(store.blob(&root).unwrap().is_none());
     }
 
+    /// v29 carries no socket over: a name and a scope are grants the operator
+    /// makes, not ones a migration infers from a path. The old row is gone
+    /// under every spelling, and the new table takes an activation.
+    #[test]
+    fn v29_drops_every_path_activation() {
+        let dir = tempfile::tempdir().unwrap();
+        {
+            let conn = database_at(dir.path(), 28);
+            conn.execute(
+                "INSERT INTO socket_activations
+                   (space, path, config, max_streams, note, activated_at)
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                params![
+                    "code",
+                    "git.sock",
+                    "upstream=git.internal",
+                    32,
+                    "the gateway",
+                    7
+                ],
+            )
+            .unwrap();
+        }
+        let store = Store::open(dir.path()).unwrap();
+
+        assert!(
+            store.socket_activations().unwrap().is_empty(),
+            "a path activation was carried into the socket namespace"
+        );
+        assert!(store.socket_activation("code/git.sock").unwrap().is_none());
+        assert!(store
+            .activations_backed_by("code", "git.sock")
+            .unwrap()
+            .is_empty());
+
+        // Re-activating under the old spelling is the operator's call, and it
+        // is a legal one.
+        let again = crate::SocketActivation::new("code/git.sock", "code", "git.sock", 8);
+        store.activate_socket(&again).unwrap();
+        assert_eq!(
+            store.activations_backed_by("code", "git.sock").unwrap(),
+            vec![again]
+        );
+    }
+
     /// A v2 database — the oldest layout still real — upgrades with its durable
     /// data intact, moves gateway configuration, and preserves old observations
     /// without inventing claimants for them.

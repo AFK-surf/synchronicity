@@ -3,7 +3,7 @@
 //!
 //! Everything here runs a compiled program against the engine's own gates: a
 //! commit is an ordinary local publish through the `Adoption` seam, a delete
-//! is this node's tombstone, and an activated socket path is never writable.
+//! is this node's tombstone, and a write to a program path is a deployment.
 //! The runtime's own lifecycle tests live in `synch-sock/tests/tree_writes.rs`.
 
 #![cfg(all(
@@ -39,19 +39,24 @@ fn compile(source: &str, name: &str) -> Vec<u8> {
     synch_cc::compile(source, name, &[("synch.h", synch_sock::sdk::HEADER)], &[]).unwrap()
 }
 
-/// Activates a path, writes one compiled program to it, and publishes it.
-async fn install(node: &Node, space_dir: &Path, path: &str, source: &str) {
+/// Writes one compiled program to `code/<program>` and activates `name` on it.
+async fn install(node: &Node, space_dir: &Path, name: &str, program: &str, source: &str) {
     let elf = compile(source, "prog.c");
-    write(space_dir, path, &elf);
-    node.socket_activate(&SocketActivation::new("code", path, synch_core::now_ns()))
-        .unwrap();
+    write(space_dir, program, &elf);
+    node.socket_activate(&SocketActivation::new(
+        name,
+        "code",
+        program,
+        synch_core::now_ns(),
+    ))
+    .unwrap();
     node.scan_and_publish().unwrap();
 }
 
 /// One local invocation: sends `payload`, half-closes, reads the reply.
-async fn drive(node: &Node, path: &str, payload: &[u8]) -> (SockStatus, Vec<u8>) {
+async fn drive(node: &Node, socket: &str, payload: &[u8]) -> (SockStatus, Vec<u8>) {
     let connection = node
-        .connect_socket(node.origin(), "code", path, Vec::new())
+        .connect_socket(node.origin(), socket, Vec::new())
         .await
         .unwrap();
     let SocketConnection::Local {
@@ -108,10 +113,10 @@ SY_ENTRY sy_s64 entry(void) {
 #[tokio::test]
 async fn a_socket_write_publishes_this_nodes_own_version() {
     let (_data, space, node) = node_with_space().await;
-    install(&node, space.path(), "drop.sock", DROP).await;
+    install(&node, space.path(), "drop", "bin/drop.o", DROP).await;
 
     let payload = b"a file arriving over the socket fabric";
-    let (status, reply) = drive(&node, "drop.sock", payload).await;
+    let (status, reply) = drive(&node, "drop", payload).await;
     assert_eq!(status, SockStatus::Ok(0));
 
     let expected = Hash::new(payload);
@@ -138,24 +143,61 @@ async fn a_socket_write_publishes_this_nodes_own_version() {
     node.shutdown().await.unwrap();
 }
 
+/// A program's write to a program path is a deployment, like every other
+/// write to it (`docs/SOCKET-PROGRAMS.md` §6). The refusal
+/// `docs/TREE-WRITES.md` §2 used to carry is gone with no replacement: a
+/// tree-write grant is one more channel the operator accepted when it
+/// activated the program, and it is shown the grant rather than told no.
 #[tokio::test]
-async fn an_activated_socket_path_is_never_writable() {
+async fn a_programs_write_to_a_program_path_is_a_deployment() {
     const SELF_WRITE: &str = r#"
 #include <synch.h>
 
 SY_MANIFEST("{\"manifest\":1,\"tree_writes\":[{\"id\":1,\"prefix\":\"code\",\"allow\":[\"create\",\"replace\",\"delete\"]}]}");
 
 SY_ENTRY sy_s64 entry(void) {
-  /* The whole space is granted, and the socket's own path is still refused:
-     writing an ELF over an activated socket path would be remote code
-     persistence in two moves. */
-  return sy_put_open(1, SY_STR("code/self.sock")) == SY_EPERM ? 0 : 1;
+  sy_s64 w = sy_put_open(1, SY_STR("code/deployed.o"));
+  if (w < 0) return w;
+  /* Split so C's greedy \x escape stops before the E. */
+  if (sy_put_write(w, "\x7f" "ELF the next program", 21) != 21) return 100;
+  sy_u8 root[32];
+  sy_s64 rc;
+  while ((rc = sy_put_commit(w, root)) == SY_EAGAIN) {
+    struct sy_pollfd fd = { w, SY_POLL_IN, 0 };
+    if (sy_poll(&fd, 1, 10000) <= 0) return 101;
+  }
+  return rc;
 }
 "#;
     let (_data, space, node) = node_with_space().await;
-    install(&node, space.path(), "self.sock", SELF_WRITE).await;
-    let (status, _) = drive(&node, "self.sock", b"").await;
-    assert_eq!(status, SockStatus::Ok(0));
+    // `code/deployed.o` is the program behind the socket `served`, and
+    // `writer` is a second socket whose tree-write grant covers it.
+    write(space.path(), "deployed.o", b"\x7fELF the first program");
+    node.socket_activate(&SocketActivation::new(
+        "served",
+        "code",
+        "deployed.o",
+        synch_core::now_ns(),
+    ))
+    .unwrap();
+    install(&node, space.path(), "writer", "bin/writer.o", SELF_WRITE).await;
+
+    let (status, _) = drive(&node, "writer", b"").await;
+    assert_eq!(status, SockStatus::Ok(0), "the write was refused");
+
+    let deployed = Hash::new(b"\x7fELF the next program");
+    let entry = node
+        .store()
+        .entry(node.origin(), "code", "deployed.o")
+        .unwrap()
+        .expect("the program path still has a version");
+    assert_eq!(entry.kind, EntryKind::File);
+    assert_eq!(entry.content, Some(deployed));
+    assert_eq!(
+        node.resolve_socket("served").unwrap().unwrap().root,
+        deployed,
+        "the dependent socket serves what the program's own write deployed"
+    );
     node.shutdown().await.unwrap();
 }
 
@@ -179,7 +221,7 @@ SY_ENTRY sy_s64 entry(void) {
 "#;
     let (_data, space, node) = node_with_space().await;
     write(space.path(), "inbox/gone.txt", b"present for now");
-    install(&node, space.path(), "reaper.sock", DELETER).await;
+    install(&node, space.path(), "reaper", "bin/reaper.o", DELETER).await;
     assert_eq!(
         node.store()
             .entry(node.origin(), "code", "inbox/gone.txt")
@@ -189,7 +231,7 @@ SY_ENTRY sy_s64 entry(void) {
         EntryKind::File
     );
 
-    let (status, _) = drive(&node, "reaper.sock", b"").await;
+    let (status, _) = drive(&node, "reaper", b"").await;
     assert_eq!(status, SockStatus::Ok(0));
 
     assert_eq!(
@@ -228,12 +270,12 @@ SY_ENTRY sy_s64 entry(void) {
 }
 "#;
     let (_data, space, node) = node_with_space().await;
-    install(&node, space.path(), "once.sock", CREATOR).await;
+    install(&node, space.path(), "once", "bin/once.o", CREATOR).await;
 
-    let (first, _) = drive(&node, "once.sock", b"").await;
+    let (first, _) = drive(&node, "once", b"").await;
     assert_eq!(first, SockStatus::Ok(0), "the first commit creates");
 
-    let (second, _) = drive(&node, "once.sock", b"").await;
+    let (second, _) = drive(&node, "once", b"").await;
     assert_eq!(
         second,
         SockStatus::Ok(-4),
@@ -264,9 +306,9 @@ SY_ENTRY sy_s64 entry(void) {
 "#;
     let (_data, space, node) = node_with_space().await;
     node.add_api_source("archive").unwrap();
-    install(&node, space.path(), "archiver.sock", DETACHED).await;
+    install(&node, space.path(), "archiver", "bin/archiver.o", DETACHED).await;
 
-    let (status, _) = drive(&node, "archiver.sock", b"").await;
+    let (status, _) = drive(&node, "archiver", b"").await;
     assert_eq!(status, SockStatus::Ok(0));
 
     let entry = node

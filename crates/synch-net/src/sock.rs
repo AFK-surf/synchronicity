@@ -36,7 +36,8 @@ use iroh::{
     protocol::{AcceptError, ProtocolHandler},
 };
 use synch_core::{
-    NodeId, RefuseCode, SockClosed, SockOpen, SockOpened, SockStatus, MAX_OPEN_FRAME_LEN,
+    NodeId, RefuseCode, SockClosed, SockEntry, SockListed, SockOpen, SockOpened, SockRequest,
+    SockStatus, MAX_OPEN_FRAME_LEN,
 };
 use synch_sock::{Admission, DuplexStream};
 use synch_store::Store;
@@ -65,6 +66,15 @@ pub trait SocketService: std::fmt::Debug + Send + Sync + 'static {
         stream_index: u64,
         open: &SockOpen,
     ) -> Result<Admission, (RefuseCode, String)>;
+
+    /// The sockets this caller may open, for [`SockRequest::List`].
+    ///
+    /// Needs no runtime and takes no slot: a node that cannot serve sockets
+    /// can still say which ones it has. It applies the same scope rule
+    /// `admit` does, so a socket the caller could not open is one it is not
+    /// shown, and it has no refusal frame — a caller the callee will not
+    /// answer for is shown nothing.
+    async fn list(&self, peer: NodeId) -> Vec<SockEntry>;
 
     /// Runs an admitted invocation to completion.
     ///
@@ -389,14 +399,16 @@ impl ProtocolHandler for SockProtocol {
 }
 
 impl SockProtocol {
-    /// The `Open` handshake: read the frame, admit, answer.
+    /// The request handshake: read the frame, then admit and answer, or list
+    /// and answer.
     ///
     /// Returns the admission, or `None` when the stream never became an
-    /// invocation — a refusal is already on the wire in its own frame, and
-    /// repeating it as a status would say the same thing twice in two
-    /// vocabularies. This is the phase the caller's timeout and in-flight
-    /// permit cover: a stream that never completes it has no runtime of its
-    /// own, so it must not own a task for as long as the peer likes.
+    /// invocation — a refusal, or a `List` reply, is already on the wire in
+    /// its own frame, and repeating it as a status would say the same thing
+    /// twice in two vocabularies. This is the phase the caller's timeout and
+    /// in-flight permit cover: a stream that never completes it has no
+    /// runtime of its own, so it must not own a task for as long as the peer
+    /// likes.
     async fn open_stream(
         &self,
         peer: NodeId,
@@ -405,7 +417,7 @@ impl SockProtocol {
         send: &mut iroh::endpoint::SendStream,
         recv: &mut iroh::endpoint::RecvStream,
     ) -> Option<Admission> {
-        let open = match tokio::select! {
+        let request = match tokio::select! {
             _ = self.state.cancelled() => {
                 let _ = frame::write_frame(
                     send,
@@ -417,19 +429,31 @@ impl SockProtocol {
                 let _ = send.finish();
                 return None;
             }
-            open = read_open(recv) => open,
+            request = read_request(recv) => request,
         } {
-            Ok(open) => open,
+            Ok(request) => request,
             Err(e) => {
-                tracing::debug!(peer = %peer.fmt_short(), "bad socket Open: {e}");
+                tracing::debug!(peer = %peer.fmt_short(), "bad socket request: {e}");
                 let _ = frame::write_frame(
                     send,
                     &SockOpened::Refused {
                         code: RefuseCode::NoSuchPath,
-                        message: format!("malformed Open: {e}"),
+                        message: format!("malformed request: {e}"),
                     },
                 )
                 .await;
+                let _ = send.finish();
+                return None;
+            }
+        };
+        let open = match request {
+            SockRequest::Open(open) => open,
+            SockRequest::List => {
+                let sockets = tokio::select! {
+                    _ = self.state.cancelled() => Vec::new(),
+                    sockets = self.service.list(peer) => sockets,
+                };
+                let _ = frame::write_frame(send, &SockListed { sockets }).await;
                 let _ = send.finish();
                 return None;
             }
@@ -453,7 +477,7 @@ impl SockProtocol {
             Err((code, message)) => {
                 tracing::debug!(
                     peer = %peer.fmt_short(),
-                    socket = format!("{}/{}", open.space, open.path),
+                    socket = open.socket,
                     "socket refused: {} ({message})", code.as_str()
                 );
                 let _ = frame::write_frame(send, &SockOpened::Refused { code, message }).await;
@@ -464,6 +488,7 @@ impl SockProtocol {
 
         let accepted = SockOpened::Ok {
             program: admission.program_root,
+            program_path: admission.program_path.clone(),
             invocation: admission.id,
         };
         if frame::write_frame(send, &accepted).await.is_err() {
@@ -473,19 +498,21 @@ impl SockProtocol {
     }
 }
 
-/// Reads and validates the `Open` frame.
+/// Reads and validates the request frame.
 ///
 /// The frame bound is applied by the framing layer before the decode, so an
-/// oversized `Open` never becomes an allocation. Validation runs before the
-/// service sees it, so nothing downstream has to reason about a path with `..`
-/// in it.
-async fn read_open(recv: &mut iroh::endpoint::RecvStream) -> Result<SockOpen, NetError> {
+/// oversized request never becomes an allocation. Validation runs before the
+/// service sees it, so nothing downstream has to reason about a name with
+/// `..` in it.
+async fn read_request(recv: &mut iroh::endpoint::RecvStream) -> Result<SockRequest, NetError> {
     let bytes = frame::read_bounded(recv, MAX_OPEN_FRAME_LEN).await?;
-    let open: SockOpen =
-        postcard::from_bytes(&bytes).map_err(|e| NetError::Decode(format!("Open: {e}")))?;
-    open.validate()
-        .map_err(|e| NetError::Unexpected(e.to_string()))?;
-    Ok(open)
+    let request: SockRequest =
+        postcard::from_bytes(&bytes).map_err(|e| NetError::Decode(format!("request: {e}")))?;
+    if let SockRequest::Open(open) = &request {
+        open.validate()
+            .map_err(|e| NetError::Unexpected(e.to_string()))?;
+    }
+    Ok(request)
 }
 
 /// The connecting side: one QUIC connection, one stream per invocation.
@@ -500,6 +527,9 @@ pub struct SockStream {
     /// The content root the callee says is running, so the caller can audit
     /// what it actually reached.
     pub program: synch_core::Hash,
+    /// `<space>/<path>` of that program on the callee, so a caller that can
+    /// read the program's space can `synch cat` it and compare roots.
+    pub program_path: String,
     /// The callee's id for this invocation.
     pub invocation: u64,
     /// Bytes to the program.
@@ -533,21 +563,41 @@ impl SockClient {
             .open_bi()
             .await
             .map_err(|e| NetError::Unexpected(e.to_string()))?;
-        frame::write_frame(&mut send, open).await?;
+        frame::write_frame(&mut send, &SockRequest::Open(open.clone())).await?;
 
         let answer: SockOpened = frame::read_frame(&mut recv).await?;
         match answer {
             SockOpened::Ok {
                 program,
+                program_path,
                 invocation,
             } => Ok(Ok(SockStream {
                 program,
+                program_path,
                 invocation,
                 send,
                 recv,
             })),
             SockOpened::Refused { code, message } => Ok(Err(Refused { code, message })),
         }
+    }
+
+    /// Asks which sockets this caller may open (`docs/SOCKET-PROGRAMS.md` §5).
+    ///
+    /// One bi-stream, one frame each way, and the stream is done: `List`
+    /// never becomes an invocation.
+    pub async fn list(&self) -> Result<Vec<SockEntry>, NetError> {
+        let (mut send, mut recv) = self
+            .connection
+            .open_bi()
+            .await
+            .map_err(|e| NetError::Unexpected(e.to_string()))?;
+        frame::write_frame(&mut send, &SockRequest::List).await?;
+        let _ = send.finish();
+        let bytes = frame::read_bounded(&mut recv, synch_core::MAX_LIST_FRAME_LEN).await?;
+        let listed: SockListed =
+            postcard::from_bytes(&bytes).map_err(|e| NetError::Decode(format!("Listed: {e}")))?;
+        Ok(listed.sockets)
     }
 
     /// Reads the next completed-invocation notice from the control stream.
@@ -638,7 +688,8 @@ mod tests {
             Ok(Admission {
                 program: Arc::new(Vec::new()),
                 program_root: Hash::EMPTY,
-                socket: SocketId::new(&open.space, &open.path),
+                program_path: "code/hold.o".into(),
+                socket: SocketId::new(&open.socket),
                 peer: PeerIdentity {
                     origin: OriginId::Key(peer),
                     device_key: peer,
@@ -653,6 +704,15 @@ mod tests {
                 id: 7,
                 slot: None,
             })
+        }
+
+        async fn list(&self, _peer: NodeId) -> Vec<synch_core::SockEntry> {
+            vec![synch_core::SockEntry {
+                name: "hold".into(),
+                program: Hash::EMPTY,
+                program_path: "code/hold.o".into(),
+                note: String::new(),
+            }]
         }
 
         async fn run(
@@ -676,9 +736,18 @@ mod tests {
         };
         let (server, client, _client_dir) = trusting_pair(store, options).await;
         let socket = client.connect_sock(server.direct_addr()).await.unwrap();
-        let open = SockOpen::new(OriginId::Key(server.id()), "code", "hold.sock", vec![]);
+        let open = SockOpen::new(OriginId::Key(server.id()), "hold", vec![]);
         let mut control = socket.control().await.unwrap();
         let stream = socket.open(&open).await.unwrap().unwrap();
+        assert_eq!(stream.program_path, "code/hold.o");
+
+        // `List` is answered on a stream of its own and never becomes an
+        // invocation, so nothing about it reaches the control stream and it is
+        // not what the drain below has to flush.
+        let listed = socket.list().await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(listed[0].name, "hold");
+        assert_eq!(listed[0].program_path, "code/hold.o");
 
         server.stop_socket_admission();
         service.release.notify_one();

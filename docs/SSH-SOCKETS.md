@@ -1077,7 +1077,7 @@ The daemon logs the SHA-256 fingerprint when it loads or creates the key. A
 stock client can use the existing byte pump directly:
 
 ```sh
-ssh -o 'ProxyCommand=synch socket connect %h:code/ssh.sock' nas
+ssh -o 'ProxyCommand=synch socket connect %h:ssh' nas
 ```
 
 The first SSH host-key exchange already travels through a mutually
@@ -1704,7 +1704,7 @@ invocation's ordinary handle and channel limits.
 A stock client reaches it through the existing transport bridge:
 
 ```sh
-ssh -o 'ProxyCommand=synch socket connect %h:code/ssh.sock' nas
+ssh -o 'ProxyCommand=synch socket connect %h:ssh' nas
 ```
 
 ### 15.3 Tree-backed `authorized_keys` and fixed commands

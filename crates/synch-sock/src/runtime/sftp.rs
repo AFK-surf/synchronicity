@@ -826,7 +826,7 @@ impl russh_sftp::server::Handler for TreeSftp {
             match self.entry_kind(prefix.clone()).await? {
                 HostEntryKind::Directory => {}
                 HostEntryKind::File => return Err(StatusCode::Failure),
-                HostEntryKind::Socket | HostEntryKind::Symlink | HostEntryKind::Tombstone => {
+                HostEntryKind::Symlink | HostEntryKind::Tombstone => {
                     return Err(StatusCode::PermissionDenied)
                 }
             }
@@ -867,7 +867,7 @@ impl russh_sftp::server::Handler for TreeSftp {
         match self.entry_kind(path.clone()).await? {
             HostEntryKind::File => {}
             HostEntryKind::Directory => return Err(StatusCode::Failure),
-            HostEntryKind::Socket | HostEntryKind::Symlink | HostEntryKind::Tombstone => {
+            HostEntryKind::Symlink | HostEntryKind::Tombstone => {
                 return Err(StatusCode::PermissionDenied)
             }
         }
@@ -893,7 +893,7 @@ impl russh_sftp::server::Handler for TreeSftp {
         match self.entry_kind(oldpath.clone()).await? {
             HostEntryKind::File => {}
             HostEntryKind::Directory => return Err(StatusCode::Failure),
-            HostEntryKind::Socket | HostEntryKind::Symlink | HostEntryKind::Tombstone => {
+            HostEntryKind::Symlink | HostEntryKind::Tombstone => {
                 return Err(StatusCode::PermissionDenied)
             }
         }

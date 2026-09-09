@@ -382,7 +382,7 @@ impl Inner {
                 addr: String::new(),
                 stream_index: 0,
             },
-            socket: SocketId::new("", ""),
+            socket: SocketId::new(""),
             self_origin: String::new(),
             meta: Vec::new(),
             host,
@@ -423,16 +423,12 @@ impl Inner {
         self.async_tasks.abort_all();
     }
 
-    /// Namespace shared state by both socket path and armed program root.
+    /// Namespace shared state by both socket name and running program root.
     ///
-    /// A NUL cannot occur in a normalized tree path, so this cannot collide
-    /// with another socket whose path merely has this one as a prefix.
+    /// A NUL cannot occur in a socket name, so this cannot collide with
+    /// another socket whose name merely has this one as a prefix.
     pub(crate) fn map_namespace(&self) -> String {
-        format!(
-            "{}\0{}",
-            self.socket.qualified(),
-            self.program_root.to_hex()
-        )
+        format!("{}\0{}", self.socket.as_str(), self.program_root.to_hex())
     }
 
     /// Looks a handle up.
@@ -795,13 +791,13 @@ impl Inner {
     /// `synch socket log` can show without asking them to go and find it.
     pub(crate) fn remember_log(&self, line: &str) {
         tracing::info!(
-            socket = %self.socket.qualified(),
+            socket = %self.socket.as_str(),
             invocation = self.id,
             "{line}"
         );
         if let Some(registry) = &self.registry {
             registry.log_line(
-                &self.socket.qualified(),
+                self.socket.as_str(),
                 self.id,
                 synch_core::now_ns(),
                 line.to_string(),
