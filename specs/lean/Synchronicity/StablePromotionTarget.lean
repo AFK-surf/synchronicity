@@ -3,6 +3,7 @@ import Synchronicity.AcceptanceProgress
 import Synchronicity.ReconciliationFloor
 import Synchronicity.StableAdvertisementProgress
 import Synchronicity.MptsyncConvergence
+import Synchronicity.ReconciliationExecution
 
 /-! Connect the version selected by stable advertisement handling to the
 candidate read by a later production promotion.  Selection is observed in the
@@ -126,5 +127,14 @@ theorem actual_promotion_reaches
       scope := by simpa [actual, targetFor] using targetScope
       replicas := by simpa [actual, targetFor] using targetReplicas
       before := by simpa [actual, targetFor] using targetBefore }
+
+/-- The next observation of an actual promotion step is exactly the final
+state forced by the independently constructed healthy readiness certificate. -/
+theorem actual_step_reaches_ready_final
+    (step : ReconciliationExecution.Step (.promotion origin now refused) state after)
+    (ready : PromotionProgress.Ready origin now refused state) :
+    after = ready.final := by
+  cases step
+  exact congrArg Prod.snd (PromotionProgress.promotes ready)
 
 end Synchronicity.StablePromotionTarget
