@@ -151,6 +151,67 @@ theorem actual_promotion_reaches
       replicas := by simpa [actual, targetFor] using targetReplicas
       before := by simpa [actual, targetFor] using targetBefore }
 
+/-- The full reachability theorem with fetch/retry frames between the
+advertisement fold and the promotion transaction.  The later slot observation
+is tied to the same stable maximum by M3, so no second acceptance or selected
+version premise is needed at promotion time. -/
+theorem actual_promotion_reaches_after_frames
+    (delivered : StableAdvertisementProgress.DeliveredLatest valid origin latestHead heads)
+    (accepted : ObservedAcceptanceFold (Origin.canonical origin) keep initial
+      initialState initialView initialSlots heads final acceptedState acceptedView)
+    (initialBound : initial ≤ rank latestHead)
+    (laterSlots : StableSlots state (Origin.canonical origin) final view)
+    (complete : view (Origin.canonical origin) .complete = none)
+    (ready : PromotionProgress.Ready origin now refused state)
+    (world : TrieDiffCoverage.World) (services : MaterializedView.Services)
+    (closed : state.pending = none)
+    (faithful : TrieDiffCoverage.Faithful world state)
+    (normalization : state.isNfc = services.nfc)
+    (relational : ∀ relation, relation = Trie.nodeSpace ∨ relation = Trie.valueSpace →
+      state.byteRelations.contains relation = true)
+    (initialViewReady : PromotionInitialView.Initial state.db origin world services)
+    (target : ViewTarget)
+    (targetOrigin : target.head.origin = origin)
+    (targetVersion : (⟨target.head.seq, target.head.root⟩ : HeadVersion) =
+      ⟨latestHead.seq, latestHead.root⟩)
+    (targetSnapshot : target.snapshot = world.snapshot)
+    (targetScope : target.scope = ready.scope)
+    (targetReplicas : target.replicas = ready.replicas)
+    (targetBefore : target.before = state.db) :
+    CorrectView services origin target ready.final.db := by
+  have used := ready_uses_delivered_latest_after_frames delivered accepted initialBound
+    laterSlots complete ready
+  have candidateVersion : (⟨ready.pending.head.seq, ready.pending.head.root⟩ : HeadVersion) =
+      ⟨latestHead.seq, latestHead.root⟩ := by
+    have pairs : (ready.pending.head.seq, ready.pending.head.root) =
+        (latestHead.seq, latestHead.root) := by
+      apply Prod.ext
+      · exact used.1
+      · exact used.2
+    exact congrArg (fun pair : UInt64 × ByteArray =>
+      (⟨pair.1, pair.2⟩ : HeadVersion)) pairs
+  obtain ⟨pendingOrigin, _, installed, files, current, forever⟩ :=
+    PromotionProgress.promotes_ready_view ready world services closed faithful normalization
+      relational initialViewReady
+  let actual := targetFor state world ready
+  have actualCorrect : CorrectView services origin actual ready.final.db := by
+    refine ⟨pendingOrigin, installed, ?_, current, forever⟩
+    change SnapshotViewProgress.ExactFiles services world.snapshot ready.pending.head.root
+      (fun key => ready.scope.admitsKeyPath (Trie.keyNibbles key) = true)
+      ready.final.db (Origin.canonical origin)
+    exact files
+  apply correctView_of_same_target (actual := actual) _ actualCorrect
+  exact
+    { origin := by simpa [actual, targetFor] using targetOrigin.trans pendingOrigin.symm
+      version := by
+        change (⟨target.head.seq, target.head.root⟩ : HeadVersion) =
+          ⟨ready.pending.head.seq, ready.pending.head.root⟩
+        exact targetVersion.trans candidateVersion.symm
+      snapshot := by simpa [actual, targetFor] using targetSnapshot
+      scope := by simpa [actual, targetFor] using targetScope
+      replicas := by simpa [actual, targetFor] using targetReplicas
+      before := by simpa [actual, targetFor] using targetBefore }
+
 /-- The next observation of an actual promotion step is exactly the final
 state forced by the independently constructed healthy readiness certificate. -/
 theorem actual_step_reaches_ready_final
