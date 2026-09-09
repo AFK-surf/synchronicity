@@ -170,6 +170,130 @@ private def promoteMissing (tx : Transaction) :
   fun effect => Replication.Promote.inTransaction tx
     (Inject.inject effect : Complete.Effects _)
 
+private theorem promotion_readBytes_of_verified
+    (tx : Transaction) (space : String) (address bytes : ByteArray)
+    (state : SimulatedHost.State) (quiet : state.faults = [])
+    (verified : readableBytes state space address = some bytes) :
+    ∃ final,
+      execute ((Missing.storage (.readBytes space address)).run.mapEffects
+        (promoteMissing tx)) state = (.ok (some bytes), final) ∧
+      replicaOfState final = replicaOfState state ∧ final.faults = [] := by
+  refine ⟨SimulatedHost.record state ("bytes:" ++ space), ?_, ?_, ?_⟩
+  · have readOk : readByteObject state space address = .ok (some bytes) := by
+      unfold readableBytes at verified
+      cases found : readByteObject state space address <;> simp [found] at verified ⊢
+      exact verified
+    rw [show ((Missing.storage (.readBytes space address)).run.mapEffects
+        (promoteMissing tx)) = Program.request
+          (promoteMissing tx (.left (.readBytes space address)))
+          (fun result => .pure (Except.mapError Missing.Error.host result)) by rfl]
+    simp [promoteMissing, Replication.Promote.inTransaction, Inject.inject,
+      execute, Interpreter.handle, SimulatedHost.storage, SimulatedHost.reply,
+      SimulatedHost.fault, quiet, readOk]
+  · rfl
+  · simpa [SimulatedHost.record] using quiet
+
+private theorem promotion_valueAbsent_false
+    (tx : Transaction) (node : Node) (address bytes : ByteArray)
+    (state : SimulatedHost.State) (quiet : state.faults = [])
+    (verified : Verified (replicaOfState state) (.value address bytes))
+    (bounded : bytes.size ≤ maxValueBytes)
+    (sized : isRoute node = true ∨ inlineValueMax < bytes.size) :
+    ∃ final,
+      execute ((valueAbsent node address).run.mapEffects (promoteMissing tx)) state =
+        (.ok false, final) ∧
+      replicaOfState final = replicaOfState state ∧ final.faults = [] := by
+  obtain ⟨read, readRun, replicaEq, quietRead⟩ :=
+    promotion_readBytes_of_verified tx valueSpace address bytes state quiet verified
+  let tail : Option ByteArray → Missing.Action Bool := fun answer =>
+    match answer with
+    | none => pure true
+    | some bytes =>
+        if bytes.size > maxValueBytes || (!isRoute node && bytes.size ≤ inlineValueMax) then
+          throw (.canonical (.valueLength address bytes.size (isRoute node)))
+        else pure false
+  have sequence := execute_mapped_bind_ok (promoteMissing tx)
+    (Missing.storage (.readBytes valueSpace address)) tail state read (some bytes) readRun
+  have validProp : ¬ (maxValueBytes < bytes.size ∨
+      (isRoute node = false ∧ bytes.size ≤ inlineValueMax)) := by
+    intro bad
+    rcases bad with tooLarge | ⟨notRoute, small⟩
+    · omega
+    · rcases sized with routed | large
+      · rw [routed] at notRoute
+        contradiction
+      · omega
+  refine ⟨read, ?_, replicaEq, quietRead⟩
+  rw [show valueAbsent node address =
+      Missing.storage (.readBytes valueSpace address) >>= tail by rfl]
+  rw [sequence]
+  simp [tail, validProp]
+  rfl
+
+private theorem promotion_inspectValuesAux_nil
+    (tx : Transaction) (node : Node) (addresses : List ByteArray)
+    (state : SimulatedHost.State) (quiet : state.faults = [])
+    (available : ∀ address ∈ addresses, ∃ bytes,
+      Verified (replicaOfState state) (.value address bytes) ∧
+      bytes.size ≤ maxValueBytes ∧
+      (isRoute node = true ∨ inlineValueMax < bytes.size)) :
+    ∃ final,
+      execute ((inspectValuesAux node addresses).run.mapEffects (promoteMissing tx)) state =
+        (.ok [], final) ∧
+      replicaOfState final = replicaOfState state ∧ final.faults = [] := by
+  induction addresses generalizing state with
+  | nil => exact ⟨state, rfl, rfl, quiet⟩
+  | cons head rest ih =>
+      obtain ⟨bytes, verified, bounded, sized⟩ := available head (by simp)
+      obtain ⟨checked, headRun, replicaHead, quietHead⟩ :=
+        promotion_valueAbsent_false tx node head bytes state quiet verified bounded sized
+      have availableRest : ∀ address ∈ rest, ∃ bytes,
+          Verified (replicaOfState checked) (.value address bytes) ∧
+          bytes.size ≤ maxValueBytes ∧
+          (isRoute node = true ∨ inlineValueMax < bytes.size) := by
+        intro address member
+        obtain ⟨payload, held, bounded, sized⟩ :=
+          available address (List.mem_cons_of_mem head member)
+        exact ⟨payload, by simpa [replicaHead] using held, bounded, sized⟩
+      obtain ⟨final, restRun, replicaRest, quietFinal⟩ :=
+        ih checked quietHead availableRest
+      let afterHead : Bool → Missing.Action (List ByteArray) := fun absent => do
+        let more ← inspectValuesAux node rest
+        return if absent then head :: more else more
+      have headTail := execute_mapped_bind_ok (promoteMissing tx)
+        (valueAbsent node head) afterHead state checked false headRun
+      let finish : List ByteArray → Missing.Action (List ByteArray) := fun more =>
+        pure more
+      have restTail := execute_mapped_bind_ok (promoteMissing tx)
+        (inspectValuesAux node rest) finish checked final [] restRun
+      refine ⟨final, ?_, replicaRest.trans replicaHead, quietFinal⟩
+      rw [show inspectValuesAux node (head :: rest) =
+          valueAbsent node head >>= afterHead by rfl]
+      rw [headTail]
+      change execute (((inspectValuesAux node rest >>= finish).run.mapEffects
+        (promoteMissing tx))) checked = _
+      rw [restTail]
+      rfl
+
+private theorem promotion_inspectValues_nil
+    (tx : Transaction) (context : Context) (position : Position) (node : Node)
+    (state : SimulatedHost.State) (quiet : state.faults = [])
+    (available : context.scope.admitsValue position.path.toList node = true →
+      ∀ address ∈ node.valueHashes, ∃ bytes,
+        Verified (replicaOfState state) (.value address bytes) ∧
+        bytes.size ≤ maxValueBytes ∧
+        (isRoute node = true ∨ inlineValueMax < bytes.size)) :
+    ∃ final,
+      execute ((inspectValues context position node).run.mapEffects
+        (promoteMissing tx)) state = (.ok [], final) ∧
+      replicaOfState final = replicaOfState state ∧ final.faults = [] := by
+  unfold inspectValues
+  cases admitted : context.scope.admitsValue position.path.toList node with
+  | false => exact ⟨state, by simp; rfl, rfl, quiet⟩
+  | true =>
+      simpa [admitted] using
+        promotion_inspectValuesAux_nil tx node node.valueHashes state quiet (available admitted)
+
 abbrev PromotionWalkOpportunity [WorkSet Visit V] [WorkSet ByteArray H]
     (tx : Transaction) (context : Context) (root : ByteArray) (steps : Nat)
     (state : SimulatedHost.State) (frontier : Frontier V H) (batch : Batch)
@@ -447,32 +571,307 @@ private theorem inherited_paired_child
           apply Needs.route (nibble := index.toUInt8) stored decodedClosed
           · simpa [indexEq] using edge
           · simpa [ByteArrayProofs.toList_eq_data] using required
-/-- Healthy transaction-lifted storage observations for each position reached
-by the finite walk.  This contract stops below `Missing.inspect`: it records
-the actual owned-holder read and loaded-node subprogram, together with the
-publisher bytes they returned.  It contains no successor `Work`, terminal
-frontier, exhaustion fact, or completeness Boolean. -/
+
+private theorem closed_has_decoded
+    {publisher : TrieProgramProofs.RawSnapshot} {addressHash : ByteArray}
+    (closed : TrieSnapshotClosure.Closed publisher addressHash) :
+    ∃ raw node, publisher nodeSpace addressHash = some raw ∧ decode raw = .ok node := by
+  cases closed with
+  | leaf held decoded payload => exact ⟨_, _, held, decoded⟩
+  | extension held decoded nonempty below => exact ⟨_, _, held, decoded⟩
+  | branch held decoded payload below => exact ⟨_, _, held, decoded⟩
+  | route held decoded payload below => exact ⟨_, _, held, decoded⟩
+
+private theorem closed_value_hashes
+    {publisher : TrieProgramProofs.RawSnapshot} {addressHash raw : ByteArray} {node : Node}
+    (closed : TrieSnapshotClosure.Closed publisher addressHash)
+    (held : publisher nodeSpace addressHash = some raw) (decoded : decode raw = .ok node) :
+    ∀ address ∈ node.valueHashes, ∃ bytes,
+      publisher valueSpace address = some bytes := by
+  have nodeClosed := TrieSnapshotClosure.loaded_node_closed closed held decoded
+  cases node with
+  | extension segment child => simp [Node.valueHashes]
+  | leaf suffix value =>
+      intro address member
+      cases value with
+      | inline inlineBytes => simp [Node.valueHashes] at member
+      | hash valueHash =>
+          simp only [Node.valueHashes, List.mem_cons, List.not_mem_nil, or_false] at member
+          subst address
+          obtain ⟨bytes, denotes⟩ := nodeClosed
+          cases denotes with
+          | stored storedHash bytes heldValue => exact ⟨bytes, heldValue⟩
+  | branch children value =>
+      intro address member
+      rcases nodeClosed with ⟨payload, below⟩
+      cases value with
+      | none => simp [Node.valueHashes] at member
+      | some valueNode =>
+          obtain ⟨bytes, denotes⟩ := payload valueNode rfl
+          cases valueNode with
+          | inline inlineBytes => simp [Node.valueHashes] at member
+          | hash valueHash =>
+              simp only [Node.valueHashes, List.mem_cons, List.not_mem_nil, or_false] at member
+              subst address
+              cases denotes with
+              | stored storedHash bytes heldValue => exact ⟨bytes, heldValue⟩
+  | route children value =>
+      intro address member
+      rcases nodeClosed with ⟨payload, below⟩
+      cases value with
+      | none => simp [Node.valueHashes] at member
+      | some valueHash =>
+          have same : address = valueHash := by simpa [Node.valueHashes] using member
+          subst address
+          obtain ⟨bytes, denotes⟩ := payload valueHash rfl
+          cases denotes with
+          | stored storedHash bytes heldValue => exact ⟨bytes, heldValue⟩
+def FitsPositionDepth (position : Position) : Node → Prop
+  | .leaf suffix _ => position.path.size + suffix.size ≤ Walk.maxDepthNibbles
+  | _ => True
+
+def PublisherExtensionChild (publisher : TrieProgramProofs.RawSnapshot)
+    (address : ByteArray) : Prop :=
+  ∃ parent raw segment, publisher nodeSpace parent = some raw ∧
+    decode raw = .ok (.extension segment address)
+
+/-- Publisher and host facts needed to turn semantic evidence into raw
+production reads.  The only execution premises are the ownership projection
+and the auxiliary child byte read used by extensions.  In particular this
+does not contain an execution of `inspect`, `prepareLoaded` or `inspectLoaded`,
+an empty absence list, paired children, a successor work item, exhaustion, or
+a completeness Boolean. -/
 structure PromotionReadOpportunity (publisher : TrieProgramProofs.RawSnapshot)
     (tx : Transaction) (context : Context) (root : ByteArray) : Prop where
   stored : TrieSnapshotClosure.StoredSnapshot publisher root
-  readPosition : ∀ (state : SimulatedHost.State)
+  quiet : ∀ (state : SimulatedHost.State)
       (work : Work (Std.HashSet Visit) (Std.HashSet ByteArray))
       (position : Position) (rest : List Position),
     work.frontier.positions = position :: rest →
     position.finish = false →
     CanonicalWork publisher context root work →
-    ∃ raw node loaded after pendingBranch,
-      position.path.size ≤ Walk.maxDepthNibbles ∧ node.wf ∧
-      publisher nodeSpace position.hash = some raw ∧ decode raw = .ok node ∧
-      execute ((loadOwned context.owner position.hash).run.mapEffects
-        (promoteMissing tx)) state = (.ok (some raw), loaded) ∧
-      execute ((inspectLoaded context work.frontier position raw).run.mapEffects
-        (promoteMissing tx)) loaded =
-          (.ok ⟨pairedChildren none node, pendingBranch, [], isRoute node⟩, after) ∧
-      replicaOfState after = replicaOfState state ∧
-      TrieSnapshotClosure.Closed publisher position.hash
+    state.faults = []
+  canonical : ∀ (work : Work (Std.HashSet Visit) (Std.HashSet ByteArray))
+      (position : Position) (rest : List Position) (raw : ByteArray) (node : Node),
+    work.frontier.positions = position :: rest →
+    position.finish = false →
+    CanonicalWork publisher context root work →
+    publisher nodeSpace position.hash = some raw → decode raw = .ok node →
+    position.path.size ≤ Walk.maxDepthNibbles ∧ node.wf ∧
+      (WorkSet.contains work.frontier.mustBeBranch position.hash = true →
+        isBranch node = true) ∧
+      FitsPositionDepth position node ∧
+      ∀ address bytes, address ∈ node.valueHashes →
+        publisher valueSpace address = some bytes →
+        bytes.size ≤ maxValueBytes ∧
+          (isRoute node = true ∨ inlineValueMax < bytes.size)
+  ownershipRead : ∀ (state : SimulatedHost.State) (origin : String)
+      (address : ByteArray),
+    Verified (replicaOfState state) (.provenance origin address) →
+    ∃ after,
+      execute ((rowPresent "trie_node_origins"
+        [("origin_id", .text origin), ("hash", .blob address)]).run.mapEffects
+          (promoteMissing tx)) state = (.ok true, after) ∧
+      replicaOfState after = replicaOfState state ∧ after.faults = []
+  supportingNodeRead : ∀ (state : SimulatedHost.State) (address : ByteArray),
+    PublisherExtensionChild publisher address →
+    state.faults = [] →
+    ∃ answer after,
+      execute ((Missing.storage (.readBytes nodeSpace address)).run.mapEffects
+        (promoteMissing tx)) state = (.ok answer, after) ∧
+      replicaOfState after = replicaOfState state ∧ after.faults = [] ∧
+      match answer with
+      | none => True
+      | some raw => ∃ node, decode raw = .ok node ∧ isBranch node = true
 
-private theorem inspect_of_readPosition
+private theorem promotion_loadOwned_of_settled
+    (publisher : TrieProgramProofs.RawSnapshot) (tx : Transaction)
+    (context : Context) (root : ByteArray)
+    (reads : PromotionReadOpportunity publisher tx context root)
+    (state : SimulatedHost.State) (position : Position) (raw : ByteArray)
+    (quiet : state.faults = [])
+    (admitted : context.scope.admitsPath position.path.toList = true)
+    (held : publisher nodeSpace position.hash = some raw)
+    (settled : TrieMissingCompletion.PositionSettled publisher context
+      (replicaOfState state) position) :
+    ∃ final,
+      execute ((loadOwned context.owner position.hash).run.mapEffects
+        (promoteMissing tx)) state = (.ok (some raw), final) ∧
+      replicaOfState final = replicaOfState state ∧ final.faults = [] := by
+  have nodeVerified : Verified (replicaOfState state) (.node position.hash raw) :=
+    settled _ (.node admitted held)
+  cases owner : context.owner with
+  | none =>
+      obtain ⟨final, ran, replicaEq, quietFinal⟩ :=
+        promotion_readBytes_of_verified tx nodeSpace position.hash raw state quiet nodeVerified
+      exact ⟨final, by simpa [loadOwned, owner] using ran, replicaEq, quietFinal⟩
+  | some origin =>
+      have provenanceVerified : Verified (replicaOfState state)
+          (.provenance origin position.hash) :=
+        settled _ (by
+          unfold TrieMissingCompletion.PositionRequires
+          simpa [owner] using (Needs.provenance admitted held :
+            Needs publisher context.scope (some origin) position.hash position.path.toList
+              (.provenance origin position.hash)))
+      obtain ⟨owned, ownedRun, replicaOwned, quietOwned⟩ :=
+        reads.ownershipRead state origin position.hash provenanceVerified
+      have nodeAtOwned : Verified (replicaOfState owned) (.node position.hash raw) := by
+        simpa [replicaOwned] using nodeVerified
+      obtain ⟨final, bytesRun, replicaFinal, quietFinal⟩ :=
+        promotion_readBytes_of_verified tx nodeSpace position.hash raw owned quietOwned nodeAtOwned
+      let tail : Bool → Missing.Action (Option ByteArray) := fun present =>
+        if !present then pure none else Missing.storage (.readBytes nodeSpace position.hash)
+      have ownedTail := execute_mapped_bind_ok (promoteMissing tx)
+        (rowPresent "trie_node_origins"
+          [("origin_id", .text origin), ("hash", .blob position.hash)]) tail
+        state owned true ownedRun
+      refine ⟨final, ?_, replicaFinal.trans replicaOwned, quietFinal⟩
+      rw [show loadOwned (some origin) position.hash =
+          rowPresent "trie_node_origins"
+            [("origin_id", .text origin), ("hash", .blob position.hash)] >>= tail by
+        simp [loadOwned, tail]]
+      rw [ownedTail]
+      simpa [tail] using bytesRun
+
+private theorem promotion_inspectPendingBranch
+    (publisher : TrieProgramProofs.RawSnapshot) (tx : Transaction)
+    (context : Context) (root : ByteArray)
+    (reads : PromotionReadOpportunity publisher tx context root)
+    (state : SimulatedHost.State) (node : Node) (quiet : state.faults = [])
+    (extensionChild : ∀ segment child, node = .extension segment child →
+      PublisherExtensionChild publisher child) :
+    ∃ pending final,
+      execute ((inspectPendingBranch node).run.mapEffects (promoteMissing tx)) state =
+        (.ok pending, final) ∧
+      replicaOfState final = replicaOfState state ∧ final.faults = [] := by
+  cases node with
+  | leaf suffix value => exact ⟨none, state, rfl, rfl, quiet⟩
+  | branch children value => exact ⟨none, state, rfl, rfl, quiet⟩
+  | route children value => exact ⟨none, state, rfl, rfl, quiet⟩
+  | extension segment child =>
+      obtain ⟨answer, final, readRun, replicaEq, quietFinal, safe⟩ :=
+        reads.supportingNodeRead state child (extensionChild segment child rfl) quiet
+      let tail : Option ByteArray → Missing.Action (Option ByteArray) := fun answer =>
+        match answer with
+        | none => pure (some child)
+        | some raw => do
+            if !isBranch (← decodeNode raw) then
+              throw (.canonical (.expectedBranch child))
+            pure none
+      have sequence := execute_mapped_bind_ok (promoteMissing tx)
+        (Missing.storage (.readBytes nodeSpace child)) tail state final answer readRun
+      cases answer with
+      | none =>
+          refine ⟨some child, final, ?_, replicaEq, quietFinal⟩
+          rw [show inspectPendingBranch (.extension segment child) =
+              Missing.storage (.readBytes nodeSpace child) >>= tail by rfl]
+          rw [sequence]
+          rfl
+      | some childRaw =>
+          obtain ⟨childNode, decoded, branch⟩ := safe
+          refine ⟨none, final, ?_, replicaEq, quietFinal⟩
+          rw [show inspectPendingBranch (.extension segment child) =
+              Missing.storage (.readBytes nodeSpace child) >>= tail by rfl]
+          rw [sequence]
+          simp [tail, decodeNode, decoded, branch, bind, ExceptT.bind,
+            ExceptT.bindCont, ExceptT.mk, pure, ExceptT.pure, Program.bind]
+          rfl
+
+private theorem promotion_prepareDecoded
+    (publisher : TrieProgramProofs.RawSnapshot) (tx : Transaction)
+    (context : Context) (root : ByteArray)
+    (reads : PromotionReadOpportunity publisher tx context root)
+    (state : SimulatedHost.State)
+    (work : Work (Std.HashSet Visit) (Std.HashSet ByteArray))
+    (position : Position) (node : Node)
+    (quiet : state.faults = []) (noRef : position.reference = none)
+    (branchShape : WorkSet.contains work.frontier.mustBeBranch position.hash = true →
+      isBranch node = true)
+    (depth : FitsPositionDepth position node)
+    (extensionChild : ∀ segment child, node = .extension segment child →
+      PublisherExtensionChild publisher child) :
+    ∃ prepared final,
+      execute ((prepareDecoded work.frontier position node).run.mapEffects
+        (promoteMissing tx)) state = (.ok prepared, final) ∧
+      prepared.node = node ∧ prepared.children = pairedChildren none node ∧
+      replicaOfState final = replicaOfState state ∧ final.faults = [] := by
+  have guardFalse : (WorkSet.contains work.frontier.mustBeBranch position.hash &&
+      !isBranch node) = false := by
+    cases present : WorkSet.contains work.frontier.mustBeBranch position.hash with
+    | false => rfl
+    | true => simp [branchShape present]
+  obtain ⟨pending, checked, pendingRun, replicaEq, quietChecked⟩ :=
+    promotion_inspectPendingBranch publisher tx context root reads state node quiet extensionChild
+  let tail : Option ByteArray → Missing.Action Prepared := fun pendingBranch => do
+    let reference ← inspectReference position.reference
+    validateNodeDepth position node
+    return ⟨node, pairedChildren reference node, pendingBranch⟩
+  have sequence := execute_mapped_bind_ok (promoteMissing tx)
+    (inspectPendingBranch node) tail state checked pending pendingRun
+  refine ⟨⟨node, pairedChildren none node, pending⟩, checked, ?_, rfl, rfl,
+    replicaEq, quietChecked⟩
+  rw [show prepareDecoded work.frontier position node =
+      inspectPendingBranch node >>= tail by
+    unfold prepareDecoded
+    simp [guardFalse, tail]]
+  rw [sequence]
+  cases node with
+  | leaf suffix value =>
+      have shallow : ¬ Walk.maxDepthNibbles < position.path.size + suffix.size := by
+        simpa [FitsPositionDepth] using Nat.not_lt.mpr depth
+      simp [tail, noRef, inspectReference, validateNodeDepth, shallow, bind,
+        ExceptT.bind, ExceptT.bindCont, ExceptT.mk, pure, ExceptT.pure, Program.bind]
+      rfl
+  | extension segment child =>
+      simp [tail, noRef, inspectReference, validateNodeDepth, bind,
+        ExceptT.bind, ExceptT.bindCont, ExceptT.mk, pure, ExceptT.pure, Program.bind]
+      rfl
+  | branch children value =>
+      simp [tail, noRef, inspectReference, validateNodeDepth, bind,
+        ExceptT.bind, ExceptT.bindCont, ExceptT.mk, pure, ExceptT.pure, Program.bind]
+      rfl
+  | route children value =>
+      simp [tail, noRef, inspectReference, validateNodeDepth, bind,
+        ExceptT.bind, ExceptT.bindCont, ExceptT.mk, pure, ExceptT.pure, Program.bind]
+      rfl
+
+private theorem promotion_prepareLoaded
+    (publisher : TrieProgramProofs.RawSnapshot) (tx : Transaction)
+    (context : Context) (root : ByteArray)
+    (reads : PromotionReadOpportunity publisher tx context root)
+    (state : SimulatedHost.State)
+    (work : Work (Std.HashSet Visit) (Std.HashSet ByteArray))
+    (position : Position) (raw : ByteArray) (node : Node)
+    (quiet : state.faults = [])
+    (held : publisher nodeSpace position.hash = some raw)
+    (decoded : decode raw = .ok node)
+    (noRef : position.reference = none)
+    (branchShape : WorkSet.contains work.frontier.mustBeBranch position.hash = true →
+      isBranch node = true)
+    (depth : FitsPositionDepth position node) :
+    ∃ prepared final,
+      execute ((prepareLoaded work.frontier position raw).run.mapEffects
+        (promoteMissing tx)) state = (.ok prepared, final) ∧
+      prepared.node = node ∧ prepared.children = pairedChildren none node ∧
+      replicaOfState final = replicaOfState state ∧ final.faults = [] := by
+  obtain ⟨prepared, final, preparedRun, preparedNode, children, replicaEq, quietFinal⟩ :=
+    promotion_prepareDecoded publisher tx context root reads state work position node quiet
+      noRef branchShape depth (fun segment child same => by
+        subst node
+        exact ⟨position.hash, raw, segment, held, decoded⟩)
+  let tail : Node → Missing.Action Prepared := prepareDecoded work.frontier position
+  have decodedRun : execute ((decodeNode raw).run.mapEffects (promoteMissing tx)) state =
+      (.ok node, state) := by
+    simp [decodeNode, decoded]
+    rfl
+  have sequence := execute_mapped_bind_ok (promoteMissing tx)
+    (decodeNode raw) tail state state node decodedRun
+  refine ⟨prepared, final, ?_, preparedNode, children, replicaEq, quietFinal⟩
+  rw [show prepareLoaded work.frontier position raw = decodeNode raw >>= tail by rfl]
+  rw [sequence]
+  exact preparedRun
+
+private theorem inspect_of_settled_reads
     (publisher : TrieProgramProofs.RawSnapshot) (tx : Transaction)
     (context : Context) (root : ByteArray)
     (reads : PromotionReadOpportunity publisher tx context root)
@@ -481,7 +880,9 @@ private theorem inspect_of_readPosition
     (position : Position) (rest : List Position)
     (pending : work.frontier.positions = position :: rest)
     (entering : position.finish = false)
-    (good : CanonicalWork publisher context root work) :
+    (good : CanonicalWork publisher context root work)
+    (settled : TrieMissingCompletion.PositionSettled publisher context
+      (replicaOfState state) position) :
     ∃ checked after,
       execute ((Missing.inspect context work.frontier position).run.mapEffects
         (promoteMissing tx)) state = (.ok checked, after) ∧
@@ -491,9 +892,10 @@ private theorem inspect_of_readPosition
         decode raw = .ok node ∧
         checked = .expand (pairedChildren none node) pendingBranch [] (isRoute node)) := by
   have noRef := good.2.2.1.1 position (by rw [pending]; simp)
-  obtain ⟨raw, node, loaded, after, pendingBranch, depth, wellFormed, held,
-      decoded, loadRun, loadedRun, replicaEq, closed⟩ :=
-    reads.readPosition state work position rest pending entering good
+  have closed := good.2.2.2.1 position (by rw [pending]; simp)
+  obtain ⟨raw, node, held, decoded⟩ := closed_has_decoded closed
+  obtain ⟨depth, wellFormed, branchShape, validDepth, valueShape⟩ :=
+    reads.canonical work position rest raw node pending entering good held decoded
   have shallow : ¬ position.path.size > Walk.maxDepthNibbles := by omega
   have refBeq : (position.reference == some position.hash) = false := by simp [noRef]
   by_cases seen : WorkSet.contains work.frontier.seen
@@ -503,8 +905,56 @@ private theorem inspect_of_readPosition
     simp [shallow, refBeq, seen]
     rfl
   ·
-    refine ⟨.expand (pairedChildren none node) pendingBranch [] (isRoute node), after,
-      ?_, replicaEq, .inr ⟨raw, node, pendingBranch, wellFormed, held, decoded, rfl⟩⟩
+    have quiet := reads.quiet state work position rest pending entering good
+    have admitted : context.scope.admitsPath position.path.toList = true :=
+      good.2.1.1.1 position (by rw [pending]; simp)
+    obtain ⟨loaded, loadRun, replicaLoaded, quietLoaded⟩ :=
+      promotion_loadOwned_of_settled publisher tx context root reads state position raw
+        quiet admitted held settled
+    obtain ⟨prepared, valuesStarted, preparedRun, preparedNode, preparedChildren,
+        replicaPrepared, quietPrepared⟩ :=
+      promotion_prepareLoaded publisher tx context root reads loaded work position raw node
+        quietLoaded held decoded noRef branchShape validDepth
+    have available : context.scope.admitsValue position.path.toList node = true →
+        ∀ address ∈ node.valueHashes, ∃ bytes,
+          Verified (replicaOfState valuesStarted) (.value address bytes) ∧
+          bytes.size ≤ maxValueBytes ∧
+          (isRoute node = true ∨ inlineValueMax < bytes.size) := by
+      intro valueAdmitted address member
+      obtain ⟨bytes, heldValue⟩ := closed_value_hashes closed held decoded address member
+      have verified : Verified (replicaOfState state) (.value address bytes) :=
+        settled _ (.value held decoded valueAdmitted member heldValue)
+      obtain ⟨bounded, sized⟩ := valueShape address bytes member heldValue
+      exact ⟨bytes, by simpa [replicaPrepared, replicaLoaded] using verified, bounded, sized⟩
+    obtain ⟨after, valuesRun, replicaValues, quietAfter⟩ :=
+      promotion_inspectValues_nil tx context position node valuesStarted quietPrepared available
+    have replicaEq : replicaOfState after = replicaOfState state :=
+      replicaValues.trans (replicaPrepared.trans replicaLoaded)
+    let finishValues : List ByteArray → Missing.Action Expansion := fun absent =>
+      pure ⟨prepared.children, prepared.pendingBranch, absent, isRoute prepared.node⟩
+    have valuesTail := execute_mapped_bind_ok (promoteMissing tx)
+      (inspectValues context position prepared.node) finishValues valuesStarted after []
+      (by simpa [preparedNode] using valuesRun)
+    let finishPrepared : Prepared → Missing.Action Expansion := fun prepared => do
+      let absent ← inspectValues context position prepared.node
+      return ⟨prepared.children, prepared.pendingBranch, absent, isRoute prepared.node⟩
+    have preparedTail := execute_mapped_bind_ok (promoteMissing tx)
+      (prepareLoaded work.frontier position raw) finishPrepared loaded valuesStarted prepared
+      preparedRun
+    have loadedRun : execute ((inspectLoaded context work.frontier position raw).run.mapEffects
+        (promoteMissing tx)) loaded =
+        (.ok ⟨pairedChildren none node, prepared.pendingBranch, [], isRoute node⟩, after) := by
+      rw [show inspectLoaded context work.frontier position raw =
+          prepareLoaded work.frontier position raw >>= finishPrepared by rfl]
+      rw [preparedTail]
+      change execute (((inspectValues context position prepared.node >>= finishValues).run.mapEffects
+        (promoteMissing tx))) valuesStarted = _
+      rw [valuesTail]
+      simp [finishValues, preparedNode, preparedChildren]
+      rfl
+    refine ⟨.expand (pairedChildren none node) prepared.pendingBranch [] (isRoute node), after,
+      ?_, replicaEq,
+      .inr ⟨raw, node, prepared.pendingBranch, wellFormed, held, decoded, rfl⟩⟩
     let tail : Option ByteArray → Missing.Action Checked := fun loaded =>
       match loaded with
       | none => pure Checked.absent
@@ -526,7 +976,7 @@ private theorem inspect_of_readPosition
         expansion.absentValues expansion.routing)
     have loadedTail := execute_mapped_bind_ok (promoteMissing tx)
       (inspectLoaded context work.frontier position raw) finish loaded after
-      (⟨pairedChildren none node, pendingBranch, [], isRoute node⟩ : Expansion) loadedRun
+      (⟨pairedChildren none node, prepared.pendingBranch, [], isRoute node⟩ : Expansion) loadedRun
     change execute (((inspectLoaded context work.frontier position raw >>= finish).run.mapEffects
       (promoteMissing tx))) loaded = _
     rw [loadedTail]
@@ -690,8 +1140,8 @@ private theorem promotion_batchStep_complete
           (replicaOfState state) position := fun evidence required =>
         complete evidence (inherited evidence required)
       obtain ⟨checked, after, inspected, replicaEq, shape⟩ :=
-        inspect_of_readPosition publisher tx context root reads state work position rest
-          pending finish good
+        inspect_of_settled_reads publisher tx context root reads state work position rest
+          pending finish good settled
       simp only [ExceptT.run] at inspected
       simp only [ExceptT.mk, ExceptT.run, bind] at ran
       rw [mapEffects_bind, SimulatedHost.execute_bind, inspected] at ran
