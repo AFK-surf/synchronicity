@@ -1,5 +1,6 @@
 import Synchronicity.AuthorizedFetchProgress
 import Synchronicity.OriginScheduleExecution
+import Synchronicity.MptsyncScheduleExecution
 
 /-! The production origin scheduler records only wire-level Fetch opportunity
 metadata.  This module states the additional, explicit bridge needed to relate
@@ -153,32 +154,90 @@ theorem ScheduledAdmission.admission
   obtain ⟨_, _, _, _, _, _, _, _, _, _, _, _, _, _, admission⟩ := scheduled
   exact admission.admission
 
-/-- At every remaining semantic deficit, a later admission is backed by an
-exact usable scheduled attempt and an explicit target/alignment bridge. -/
-def ScheduledSufficientResponses
-    (contacts : ContactExecution.Execution eligible peerMaximum peerDeadline peerRounds)
-    (peer : ByteArray)
-    (origins : OriginScheduleExecution.Execution .pendingFetch
-      items maximum deadline rounds)
-    (link : OriginScheduleExecution.LinkedToContact contacts peer origins)
-    (targetOf : OriginSchedule.Item → OriginScheduleExecution.Target)
-    (item : OriginSchedule.Item)
+/-- Alignment all the way to the stable public target. This prevents an
+admission for a different sequence or origin that happens to share a
+requirement root from discharging the scheduled liveness premise. -/
+def FinalTargetAligned (scheduled : OriginScheduleExecution.Target)
+    (actual : Fetch.Target) (finalOrigin : String) (finalSeq : UInt64)
+    (finalRoot : ByteArray) (scope : Serve.Scope) (owner : Option String)
+    (root : ByteArray) : Prop :=
+  scheduled.origin = finalOrigin ∧
+  scheduled.pointer.seq = finalSeq ∧
+  scheduled.pointer.root = finalRoot ∧
+  TargetAligned scheduled actual scope owner root
+
+/-- The pending opportunity derivable from the raw stable schedule inputs.
+This is the pending projection proved by M6, kept here at the operation layer
+so this shared module does not depend on a goal module. -/
+theorem pendingFetchOpportunities
+    (inputs : MptsyncScheduleExecution.StableScheduleInputs) :
+    OriginScheduleExecution.PendingFetchOpportunities inputs.contacts inputs.peer
+      inputs.pending inputs.pendingLink inputs.pendingTarget := by
+  exact OriginScheduleExecution.every_pending_has_a_fetch_opportunity inputs.contacts
+    inputs.peer inputs.pending inputs.pendingLink inputs.pendingTarget inputs.pendingPayloads
+    inputs.pendingDistinct inputs.pendingWithin inputs.pendingFit inputs.enoughPendingRounds
+
+/-- A fresh scheduling window opened after one particular deficit observation.
+The handler is invoked only with the exact attempt selected by the raw M6
+opportunity. It must return an independently justified target-indexed
+admission at or after this window's runtime observation. -/
+structure ResponseWindow (deficitAt : Nat) (finalOrigin : String)
+    (finalSeq : UInt64) (finalRoot : ByteArray)
+    (requirements : FiniteRequirements publisher scope owner root)
+    (states : Nat → State) where
+  observedAt : Nat
+  afterDeficit : deficitAt < observedAt
+  inputs : MptsyncScheduleExecution.StableScheduleInputs
+  item : OriginSchedule.Item
+  member : item ∈ inputs.pendingItems
+  admit : ∀ round attempt,
+    round < inputs.pendingRounds →
+    attempt ∈ (inputs.pending.observation round).attempts →
+    attempt.item = item →
+    OriginScheduleExecution.FetchOpportunity (inputs.pendingTarget item) attempt →
+    inputs.pendingLink.contactRound round < inputs.peerRounds →
+    ∀ peerAttempt,
+      peerAttempt ∈ (inputs.contacts.observation
+        (inputs.pendingLink.contactRound round)).attempts →
+      peerAttempt.peer = inputs.peer → peerAttempt.outcome = .success →
+      ∃ later, observedAt ≤ later ∧
+        ∃ actualTarget,
+          FinalTargetAligned (inputs.pendingTarget item) actualTarget
+            finalOrigin finalSeq finalRoot scope owner root ∧
+          AdmissionFor actualTarget requirements (states deficitAt) (states later)
+
+/-- The raw schedule and exact-attempt handler in one fresh window produce
+one later ordinary authorized admission. -/
+theorem ResponseWindow.responds
+    (window : ResponseWindow deficitAt finalOrigin finalSeq finalRoot requirements states) :
+    ∃ later, deficitAt < later ∧ Admission requirements (states deficitAt) (states later) := by
+  have opportunities := pendingFetchOpportunities window.inputs
+  obtain ⟨round, before, attempt, attempted, sameItem, opportunity, contactBefore,
+      peerAttempt, peerAttempted, samePeer, success⟩ :=
+    opportunities window.item window.member
+  obtain ⟨later, afterWindow, actualTarget, aligned, admission⟩ :=
+    window.admit round attempt before attempted sameItem opportunity contactBefore
+      peerAttempt peerAttempted samePeer success
+  exact ⟨later, Nat.lt_of_lt_of_le window.afterDeficit afterWindow, admission.admission⟩
+
+/-- Every deficit observation is followed by its own later raw scheduling
+window. A single finite window cannot satisfy all future observations because
+each witness carries an `observedAt` strictly after its indexed deficit. -/
+def ScheduledSufficientResponses (finalOrigin : String) (finalSeq : UInt64)
+    (finalRoot : ByteArray)
     (requirements : FiniteRequirements publisher scope owner root)
     (states : Nat → State) : Prop :=
   ∀ now, 0 < missingEvidence requirements.items (replicaOfState (states now)) →
-    ∃ later, now < later ∧ ScheduledAdmission contacts peer origins link targetOf item
-      requirements (states now) (states later)
+    Nonempty (ResponseWindow now finalOrigin finalSeq finalRoot requirements states)
 
-/-- Forgetting only the scheduler witness yields the ordinary authorized
-response premise used by finite Fetch convergence. -/
+/-- Per-deficit raw M6 windows and their exact-attempt handlers discharge the
+ordinary response premise used by finite Fetch convergence. -/
 theorem sufficientResponses
-    {peer : ByteArray}
-    {link : OriginScheduleExecution.LinkedToContact contacts peer origins}
-    (scheduled : ScheduledSufficientResponses contacts peer origins link targetOf item
+    (scheduled : ScheduledSufficientResponses finalOrigin finalSeq finalRoot
       requirements states) :
     SufficientResponses requirements states := by
   intro now missing
-  obtain ⟨later, after, admission⟩ := scheduled now missing
-  exact ⟨later, after, admission.admission⟩
+  obtain ⟨window⟩ := scheduled now missing
+  exact window.responds
 
 end Synchronicity.ScheduledFetchAdmission
