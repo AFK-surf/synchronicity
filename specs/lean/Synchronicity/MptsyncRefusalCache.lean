@@ -34,6 +34,14 @@ def Cache.hits (cache : Cache) (verdict : Verdict) : Prop :=
 def Cache.cleared (_cache : Cache) : Cache :=
   ⟨[]⟩
 
+/-- The origin-specific tuple list passed by the Rust adapter to both Fetch
+and promotion. Keeping this projection in the boundary model makes clearing
+the cache observable at the verified command call. -/
+def Cache.forOrigin (cache : Cache) (origin : String) :
+    List (UInt64 × ByteArray × ByteArray) :=
+  cache.refused.filterMap fun verdict =>
+    if verdict.origin = origin then some (verdict.seq, verdict.root, verdict.oldRoot) else none
+
 /-- A changed durable scope command followed by the production runtime
 callback. The durable execution is fully verified; `callbackCleared` is the
 explicit seam for process memory, which is outside `SimulatedHost.State`. -/
@@ -70,5 +78,15 @@ theorem same_head_misses_old_scope_verdict
   intro hit
   rw [observed.callbackCleared] at hit
   exact List.not_mem_nil hit
+
+/-- The actual argument projected for Fetch/promotion is empty after the
+scope-change callback, rather than merely carrying differently tagged stale
+verdicts. -/
+theorem scope_reset_clears_command_projection
+    (observed : ScopeResetObservation spaces now before after report cacheBefore cacheAfter)
+    (origin : String) :
+    cacheAfter.forOrigin origin = [] := by
+  rw [observed.callbackCleared]
+  rfl
 
 end Synchronicity.MptsyncRefusalCache
