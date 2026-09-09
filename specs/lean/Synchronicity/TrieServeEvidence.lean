@@ -149,7 +149,7 @@ structure UsableResponse (publisher : RawSnapshot) (owner : Option String)
 
 /-- One useful response item is tied both to its actual authority/serve
 executions and to the independent publisher-derived requirement it satisfies.
-`private` states the batch-wide non-leakage guarantee, not merely a fact about
+`scopePrivate` states the batch-wide non-leakage guarantee, not merely a fact about
 the selected item. -/
 structure UsableEvidenceResponse (publisher : RawSnapshot) (owner : Option String)
     (root : ByteArray) {initial : State} {peerKey : ByteArray}
