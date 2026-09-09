@@ -523,6 +523,37 @@ theorem versionRank_injective (left right : HeadVersion)
   cases right
   simp_all
 
+/-- The operation-independent sequence/root order used by `LatestValid`
+agrees with the production acceptance/exchange rank on native-width heads. -/
+theorem rank_le_of_version_order (candidate latest : Head)
+    (candidateValid : candidate.root.size = 32)
+    (latestValid : latest.root.size = 32)
+    (ordered : (⟨candidate.seq, candidate.root⟩ : HeadVersion) =
+        ⟨latest.seq, latest.root⟩ ∨
+      (⟨latest.seq, latest.root⟩ : HeadVersion).Newer
+        ⟨candidate.seq, candidate.root⟩) :
+    rank candidate ≤ rank latest := by
+  rcases ordered with same | newer
+  · cases candidate
+    cases latest
+    simp_all [rank]
+  · apply Nat.le_of_lt
+    have orderSpec : candidate.seq < latest.seq ∨
+        candidate.seq = latest.seq ∧
+          List.Lex (· < ·) candidate.root.data.toList latest.root.data.toList := by
+      rcases newer with sequence | ⟨sequence, root⟩
+      · exact Or.inl sequence
+      · refine Or.inr ⟨sequence.symm, ?_⟩
+        exact List.lex_lt.mpr root
+    have compared := (ExchangeVersionProofs.version_order_is_sequence_then_root
+      (advertisedVersion ⟨candidate.seq, candidate.root⟩)
+      (advertisedVersion ⟨latest.seq, latest.root⟩)
+      (by simpa [advertisedVersion] using candidateValid)
+      (by simpa [advertisedVersion] using latestValid)).mpr (by
+        simpa [advertisedVersion] using orderSpec)
+    simpa [rank, versionRank, advertisedVersion,
+      VerifiedCore.Replication.Exchange.version] using compared
+
 /-- The actual selected version of the two slots, with pending winning only
 when it is strictly newer. -/
 def selectedVersion (view : HeadView) (origin : String) : Option HeadVersion :=

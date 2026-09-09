@@ -24,7 +24,8 @@ structure CapturedHead where
 
 /-- Public version order, independent of the reconciliation implementation. -/
 def HeadVersion.Newer (next old : HeadVersion) : Prop :=
-  next.seq > old.seq ∨ (next.seq = old.seq ∧ old.root.toList < next.root.toList)
+  next.seq > old.seq ∨
+    (next.seq = old.seq ∧ old.root.data.toList < next.root.data.toList)
 
 abbrev HeadView := String → HeadSlot → Option HeadVersion
 
