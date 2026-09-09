@@ -421,8 +421,8 @@ impl Syncer {
     /// A deterministic wire-sized view of the local head summaries (§5.1).
     ///
     /// Callers without a peer identity get the first page without advancing
-    /// any scheduling state. Actual exchanges use [`Self::local_summaries_for`]
-    /// so each peer progresses through an oversized set independently.
+    /// any scheduling state. Actual exchanges maintain a separate cursor for
+    /// each peer, so peers progress through an oversized set independently.
     ///
     /// `complete` means "I hold the full trie under this root and can serve
     /// it"; a signed head alone proves nothing about that, so the flag is
