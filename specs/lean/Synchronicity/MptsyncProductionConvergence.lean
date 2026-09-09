@@ -25,8 +25,7 @@ structure PromotionWindow (services : MaterializedView.Services)
     (accepted : MptsyncAdvertisementWindow.AcceptedLatest valid origin target.head heads)
     (publisher : TrieProgramProofs.RawSnapshot)
     (requirements : FiniteRequirements publisher scope owner root)
-    (retry : MptsyncRetryExecution.RetryExecution requirements)
-    (finish : Nat) where
+    (retry : MptsyncRetryExecution.RetryExecution requirements) where
   index : Nat
   now : Int64
   refused : List (UInt64 × ByteArray × ByteArray)
@@ -37,9 +36,7 @@ structure PromotionWindow (services : MaterializedView.Services)
   requirementScope : opportunity.scope = scope
   requirementOwner : opportunity.authority.provenance.map Origin.canonical = owner
   requirementRoot : opportunity.pending.head.root = root
-  retryIndex : Nat
-  afterFinish : finish ≤ retryIndex
-  sameTime : retryStart + retryIndex = tailOffset + index
+  sameTime : retryStart + retry.endAt = tailOffset + index
   acceptanceInitialAt : accepted.initialState = timeline accepted.handledAt
   handledBeforeRetry : accepted.handledAt ≤ retryStart
   acceptedAt : accepted.acceptedState = timeline retryStart
@@ -49,7 +46,6 @@ structure PromotionWindow (services : MaterializedView.Services)
   laterView : HeadView
   laterSlots : StableSlots (trace.state index) (Origin.canonical origin)
     accepted.final laterView
-  noComplete : laterView (Origin.canonical origin) .complete = none
   world : TrieDiffCoverage.World
   host : MptsyncPromotionHistory.HostContracts (trace.state index) world services
   initial : MptsyncPromotionHistory.InitialViewEvidence services origin
@@ -80,15 +76,15 @@ structure StableRun (services : MaterializedView.Services)
   requirements : FiniteRequirements publisher scope owner root
   retry : MptsyncRetryExecution.RetryExecution requirements
   retryStart : Nat
-  retryAt : ∀ n, retry.state n = timeline (retryStart + n)
+  retryAt : ∀ n, n ≤ retry.endAt → retry.state n = timeline (retryStart + n)
+  responseTimeline : ScheduledFetchAdmission.ProductionScheduleTimeline retry.state
   responses : ScheduledFetchAdmission.ScheduledSufficientResponses
-    (Origin.canonical origin) target.head.seq target.head.root requirements retry.state
+    (Origin.canonical origin) target.head.seq target.head.root requirements retry.state responseTimeline
   promote : ∀ {heads}
-    (accepted : MptsyncAdvertisementWindow.AcceptedLatest valid origin target.head heads)
-    (finish : Nat),
-    PermittedComplete publisher scope owner root (replicaOfState (retry.state finish)) →
+    (accepted : MptsyncAdvertisementWindow.AcceptedLatest valid origin target.head heads),
+    PermittedComplete publisher scope owner root (replicaOfState (retry.state retry.endAt)) →
     Nonempty (PromotionWindow services origin target timeline tailOffset retryStart trace
-      accepted publisher requirements retry finish)
+      accepted publisher requirements retry)
 
 private theorem scheduled_accepted
     (run : StableRun services origin target timeline tailOffset trace valid) :
@@ -105,19 +101,16 @@ theorem StableRun.converges
     (targetOrigin : target.head.origin = origin) :
     EventuallyAlways fun n => CorrectView services origin target (timeline n).db := by
   obtain ⟨heads, ⟨accepted⟩⟩ := scheduled_accepted run
-  have sufficient := ScheduledFetchAdmission.sufficientResponses run.responses
-  obtain ⟨finish, after, complete⟩ :=
-    AuthorizedFetchProgress.sufficient_responses_converge run.requirements run.retry.state
-      run.retry.persistentEvidence sufficient 0
-  have completed := complete finish (Nat.le_refl _)
+  have completedEnd := ScheduledFetchAdmission.completeAtStationaryBoundary
+    run.responses run.retry.endAt run.retry.stationary
   -- `promote` is the explicit eventual healthy-host opportunity after the
   -- finite authorized deficit has reached zero.
-  obtain ⟨window⟩ := run.promote accepted finish completed
+  obtain ⟨window⟩ := run.promote accepted completedEnd
   have _chronology : accepted.observedAt < tailOffset + window.index := by
     calc
       accepted.observedAt < accepted.handledAt := accepted.afterDelivery
       _ ≤ run.retryStart := window.handledBeforeRetry
-      _ ≤ run.retryStart + window.retryIndex := Nat.le_add_right _ _
+      _ ≤ run.retryStart + run.retry.endAt := Nat.le_add_right _ _
       _ = tailOffset + window.index := window.sameTime
   have _actualAcceptance : AcceptanceExecution accepted.keep
       (timeline accepted.handledAt) heads (timeline run.retryStart) := by
@@ -130,25 +123,25 @@ theorem StableRun.converges
       window.requirementRoot] using run.requirements
   have promotionComplete : PermittedComplete run.publisher window.opportunity.scope
       (window.opportunity.authority.provenance.map Origin.canonical)
-      window.opportunity.pending.head.root (replicaOfState (run.retry.state finish)) := by
+      window.opportunity.pending.head.root
+        (replicaOfState (run.retry.state run.retry.endAt)) := by
     simpa only [window.requirementScope, window.requirementOwner,
-      window.requirementRoot] using completed
-  have retryCarried : EvidenceIncluded (replicaOfState (run.retry.state finish))
-      (replicaOfState (run.retry.state window.retryIndex)) := by
-    have carried := run.retry.carriedFrom finish (window.retryIndex - finish)
-    rwa [Nat.add_sub_of_le window.afterFinish] at carried
-  have promotionState : run.retry.state window.retryIndex = trace.state window.index := by
-    rw [run.retryAt, tailObserved, window.sameTime]
+      window.requirementRoot] using completedEnd
+  have promotionState : run.retry.state run.retry.endAt = trace.state window.index := by
+    rw [run.retryAt run.retry.endAt (Nat.le_refl _), tailObserved, window.sameTime]
   have acceptedStart : accepted.acceptedState = run.retry.state 0 := by
-    simpa only [Nat.add_zero, run.retryAt 0] using window.acceptedAt
+    simpa only [Nat.add_zero, run.retryAt 0 (Nat.zero_le _)] using window.acceptedAt
   have actualBetween : ReconciliationExecution.Execution (run.retry.state 0)
-      window.observations (run.retry.state window.retryIndex) := by
+      window.observations (run.retry.state run.retry.endAt) := by
     simpa only [← acceptedStart, promotionState] using window.intervening
   have _actualSafety := Goals.Mptsync.M3.safety actualBetween
-  have carriedToStart : EvidenceIncluded (replicaOfState (run.retry.state finish))
+  have carriedToStart : EvidenceIncluded
+      (replicaOfState (run.retry.state run.retry.endAt))
       (replicaOfState (trace.state window.index)) := by
-    rwa [promotionState] at retryCarried
-  have carriedToPrepared : EvidenceIncluded (replicaOfState (run.retry.state finish))
+    rw [promotionState]
+    exact EvidenceIncluded.refl _
+  have carriedToPrepared : EvidenceIncluded
+      (replicaOfState (run.retry.state run.retry.endAt))
       (replicaOfState window.opportunity.prepared) := by
     exact carriedToStart.trans (ProductionTimeline.promotion_prepare_includes
       (trace.state window.index) window.opportunity.opened window.opportunity.prepared
@@ -158,7 +151,7 @@ theorem StableRun.converges
     run.publisher promotionRequirements promotionComplete carriedToPrepared window.reads
   have reachedFinal : CorrectView services origin target ready.final.db := by
     exact StablePromotionTarget.actual_promotion_reaches_after_frames accepted.delivered
-      accepted.accepted accepted.initialBound window.laterSlots window.noComplete ready
+      accepted.accepted accepted.initialBound window.laterSlots ready
       window.world services window.host.closed window.host.faithful window.host.normalization
       window.host.relational window.initial.initial target targetOrigin rfl
       window.targetSnapshot window.targetScope window.targetReplicas window.targetBefore
