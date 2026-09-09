@@ -26,10 +26,12 @@ inductive PromotionInitialSource (services : MaterializedView.Services)
     (origin : Origin.Parsed)
     {history : StableAdvertisementProgress.StableAuthorizedHistory origin}
     (accepted : MptsyncAdvertisementWindow.AcceptedLatest origin history latest heads)
-    (state : SimulatedHost.State) (world : TrieDiffCoverage.World) : Prop where
+    (state : SimulatedHost.State) (world : TrieDiffCoverage.World)
+    (cacheAtCall : MptsyncRefusalCache.Cache) : Prop where
   | atPromotion
-      (evidence : MptsyncPromotionHistory.InitialViewEvidence services origin state world) :
-      PromotionInitialSource services origin accepted state world
+      (evidence : MptsyncPromotionHistory.InitialViewEvidence services origin state world
+        cacheAtCall) :
+      PromotionInitialSource services origin accepted state world cacheAtCall
   | afterHistory
       (historyView : MptsyncPromotionHistory.EstablishedView services origin
         previousState previousTarget)
@@ -37,19 +39,20 @@ inductive PromotionInitialSource (services : MaterializedView.Services)
         previousLatest carryWorld previousState accepted.initialState)
       (metadata : PromotionContinuationBaseline.MetadataContracts
         state.db origin previousTarget world services) :
-      PromotionInitialSource services origin accepted state world
+      PromotionInitialSource services origin accepted state world cacheAtCall
   | afterScopeChange
-      (production : ScopeChangeRefinement.Successful spaces changedAt before
-        accepted.initialState report)
+      (reset : MptsyncRefusalCache.ScopeResetObservation spaces changedAt before
+        accepted.initialState report cacheBefore cacheReset)
+      (cacheCarry : MptsyncRefusalCache.OriginProjectionCarry origin cacheReset cacheAtCall)
       (quiet : before.faults = [])
       (reported : decision ∈ report.demotions)
       (originAligned : decision.complete.origin = Origin.canonical origin)
       (metadata : ScopeChangePromotionBaseline.MetadataContracts
         state.db origin world services) :
-      PromotionInitialSource services origin accepted state world
+      PromotionInitialSource services origin accepted state world cacheAtCall
 
 theorem PromotionInitialSource.initial
-    (source : PromotionInitialSource services origin accepted state world)
+    (source : PromotionInitialSource services origin accepted state world cacheAtCall)
     (retry : MptsyncRetryExecution.RetryExecution requirements)
     (acceptedStart : accepted.acceptedState = retry.state 0)
     (promotionState : retry.state retry.endAt = state)
@@ -63,9 +66,9 @@ theorem PromotionInitialSource.initial
       have carried := MptsyncViewCarry.correct_after_acceptance_and_retry
         beforeAcceptance accepted.accepted retry acceptedStart promotionState
       exact PromotionContinuationBaseline.initial_of_correct carried metadata
-  | afterScopeChange production quiet reported originAligned metadata =>
+  | afterScopeChange reset cacheCarry quiet reported originAligned metadata =>
       exact MptsyncScopeChangeCarry.initial_after_acceptance_and_retry
-        production quiet reported originAligned accepted.accepted retry acceptedStart
+        reset.durable quiet reported originAligned accepted.accepted retry acceptedStart
           promotionState laterSlots metadata
 
 /-- The actual promotion observation following one completed retry trace. -/
@@ -88,6 +91,8 @@ structure PromotionWindow (services : MaterializedView.Services)
   index : Nat
   now : Int64
   refused : List (UInt64 × ByteArray × ByteArray)
+  cacheAtCall : MptsyncRefusalCache.Cache
+  refusalProjection : MptsyncRefusalCache.CommandProjection .promote cacheAtCall origin refused
   opportunity : TrieCompleteConverse.PromotionOpportunity origin now refused (trace.state index)
   reads : TrieCompleteConverse.PromotionReadOpportunity publisher opportunity.tx
     ⟨opportunity.scope, opportunity.authority.provenance.map Origin.canonical⟩
@@ -105,6 +110,7 @@ structure PromotionWindow (services : MaterializedView.Services)
   world : TrieDiffCoverage.World
   host : MptsyncPromotionHistory.HostContracts (trace.state index) world services
   initial : PromotionInitialSource services origin accepted.accepted (trace.state index) world
+    cacheAtCall
   targetSnapshot : target.snapshot = world.snapshot
   targetScope : target.scope = opportunity.scope
   targetReplicas : target.replicas = opportunity.replicas
