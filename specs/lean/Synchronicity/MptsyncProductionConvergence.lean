@@ -1,4 +1,5 @@
 import Synchronicity.MptsyncAdvertisementWindow
+import Synchronicity.MptsyncDeviceExecution
 import Synchronicity.ScheduledFetchAdmission
 import Synchronicity.MptsyncRetryExecution
 import Synchronicity.MptsyncPromotionHistory
@@ -72,7 +73,9 @@ structure PromotionWindow (services : MaterializedView.Services)
     (origin : Origin.Parsed)
     {history : StableAdvertisementProgress.StableAuthorizedHistory origin}
     (target : ViewTarget)
-    (timeline : Nat → SimulatedHost.State) (tailOffset retryStart : Nat)
+    (timeline : Nat → SimulatedHost.State)
+    (registry : MptsyncDeviceExecution.Registry timeline)
+    (tailOffset retryStart : Nat)
     (trace : MptsyncStableTail.Trace)
     (schedule : MptsyncScheduleExecution.StableScheduleInputs)
     (advertisementTimeline : MptsyncAdvertisementWindow.AdvertisementTimeline schedule timeline)
@@ -95,6 +98,10 @@ structure PromotionWindow (services : MaterializedView.Services)
   sameTime : retryStart + retry.endAt = tailOffset + index
   handledBeforeRetry : accepted.accepted.handledAt ≤ retryStart
   acceptedAt : accepted.accepted.acceptedState = timeline retryStart
+  prePromotion : MptsyncDeviceExecution.PrePromotionSegment registry origin schedule
+    advertisementTimeline history target.head occurrence accepted retryStart retry
+  registeredPromotion : MptsyncDeviceExecution.PromotionSegment registry origin
+    (tailOffset + index)
   world : TrieDiffCoverage.World
   host : MptsyncPromotionHistory.HostContracts (trace.state index) world services
   initial : PromotionInitialSource services origin accepted.accepted (trace.state index) world
@@ -114,7 +121,8 @@ structure StableRun (services : MaterializedView.Services)
     (origin : Origin.Parsed) (target : ViewTarget)
     (timeline : Nat → SimulatedHost.State) (tailOffset : Nat)
     (trace : MptsyncStableTail.Trace)
-    (history : StableAdvertisementProgress.StableAuthorizedHistory origin) where
+    (history : StableAdvertisementProgress.StableAuthorizedHistory origin)
+    (registry : MptsyncDeviceExecution.Registry timeline) where
   schedule : MptsyncScheduleExecution.StableScheduleInputs
   advertisementTimeline : MptsyncAdvertisementWindow.AdvertisementTimeline schedule timeline
   advertisement : MptsyncAdvertisementWindow.AcceptanceOpportunity
@@ -134,11 +142,11 @@ structure StableRun (services : MaterializedView.Services)
     (accepted : MptsyncAdvertisementWindow.AcceptedLatestOnTimeline schedule timeline
       advertisementTimeline origin history target.head occurrence),
     PermittedComplete publisher scope owner root (replicaOfState (retry.state retry.endAt)) →
-    Nonempty (PromotionWindow services origin target timeline tailOffset retryStart trace
+    Nonempty (PromotionWindow services origin target timeline registry tailOffset retryStart trace
       schedule advertisementTimeline occurrence accepted publisher requirements retry)
 
 private theorem scheduled_accepted
-    (run : StableRun services origin target timeline tailOffset trace history) :
+    (run : StableRun services origin target timeline tailOffset trace history registry) :
     ∃ occurrence, Nonempty (MptsyncAdvertisementWindow.AcceptedLatestOnTimeline
       run.schedule timeline run.advertisementTimeline origin history target.head occurrence) :=
   MptsyncAdvertisementWindow.scheduled_acceptance run.schedule run.advertisementTimeline
@@ -148,7 +156,7 @@ private theorem scheduled_accepted
 through actual scheduling, acceptance, authorized admissions, retry frames and
 promotion, then remains there under the actual reconciliation tail. -/
 theorem StableRun.converges
-    (run : StableRun services origin target timeline tailOffset trace history)
+    (run : StableRun services origin target timeline tailOffset trace history registry)
     (tailObserved : ∀ n, trace.state n = timeline (tailOffset + n))
     (targetOrigin : target.head.origin = origin) :
     EventuallyAlways fun n => CorrectView services origin target (timeline n).db := by
@@ -244,6 +252,7 @@ structure SystemExecution {Device : Type}
     (history : (origin : Origin.Parsed) →
       StableAdvertisementProgress.StableAuthorizedHistory origin) where
   timeline : Device → Nat → SimulatedHost.State
+  registry : (device : Device) → MptsyncDeviceExecution.Registry (timeline device)
   tailTrace : Device → MptsyncStableTail.Trace
   tailOffset : Device → Nat
   tailObserved : ∀ device n,
@@ -251,6 +260,8 @@ structure SystemExecution {Device : Type}
   run : ∀ pair : Device × Origin.Parsed, pair ∈ coverage.pairs →
     StableRun services pair.2 (scenario.target pair.1 pair.2)
       (timeline pair.1) (tailOffset pair.1) (tailTrace pair.1) (history pair.2)
+        (registry pair.1)
+  stableVersions : MptsyncDeviceExecution.StableScenarioHistory scenario history
   observed : ∀ device n, (timeline device n).db = databases n device
 
 end Synchronicity.MptsyncProductionConvergence
