@@ -177,20 +177,26 @@ def FetchOpportunity (target : Target) (attempt : Attempt) : Prop :=
           response.submittedToAdmit = true
   | _ => False
 
-/-- Runtime payload observations required of a usable Hello attempt. This is
-an external transport fact: the scheduler chooses the item, while the trace
-records the exact sent and peer-observed lists. -/
+/-- The signed heads constructed for one actual planned Hello page. Every
+selected atomic origin group contributes only the complete heads which the
+same native snapshot marked scoped-servable. -/
+def scheduledSentHeads
+    (execution : Execution .advertisement items maximum deadline rounds)
+    (sentFor : Item → List VerifiedCore.Replication.Head) (round : Nat) :
+    List VerifiedCore.Replication.Head :=
+  (selectedItems items (plan items (execution.cursor round) maximum)).flatMap sentFor
+
+/-- Runtime payload observations required of a usable Hello attempt. The sent
+list is the pure whole-page construction above, not a free per-origin payload;
+the trace records only the peer-observed list and its actual containment. -/
 structure AdvertisementPayloads
     (execution : Execution .advertisement items maximum deadline rounds)
-    (latest : Item → VerifiedCore.Replication.Head) : Prop where
-  sameOrigin : ∀ item ∈ items,
-    VerifiedCore.Origin.canonical (latest item).origin = item.origin
+    (sentFor : Item → List VerifiedCore.Replication.Head) : Prop where
   observed : ∀ round, round < rounds →
     ∀ attempt ∈ (execution.observation round).attempts,
-      ∃ sent received,
-        attempt.payload = .advertisement sent received ∧
-        latest attempt.item ∈ sent ∧
-        ∀ head ∈ sent, head ∈ received
+      ∃ received,
+        attempt.payload = .advertisement (scheduledSentHeads execution sentFor round) received ∧
+        ∀ head ∈ scheduledSentHeads execution sentFor round, head ∈ received
 
 /-- Runtime payload observations required of a usable pending-Fetch attempt.
 The response is an actual authorized response handed to admission, not a
@@ -206,15 +212,15 @@ structure PendingPayloads
           response.target = target attempt.item ∧ response.authorized = true ∧
             response.submittedToAdmit = true
 
-def LatestDeliveredOnUsableContact
+def SentHeadsDeliveredOnUsableContact
     (contacts : ContactExecution.Execution eligible peerMaximum peerDeadline peerRounds)
     (peer : ByteArray)
     (origins : Execution .advertisement items maximum deadline rounds)
     (link : LinkedToContact contacts peer origins)
-    (latest : Item → VerifiedCore.Replication.Head) : Prop :=
-  ∀ item ∈ items,
+    (sentFor : Item → List VerifiedCore.Replication.Head) : Prop :=
+  ∀ item ∈ items, ∀ head ∈ sentFor item,
     ∃ round < rounds, ∃ attempt ∈ (origins.observation round).attempts,
-      attempt.item = item ∧ DeliveredLatest (latest item) attempt ∧
+      attempt.item = item ∧ DeliveredLatest head attempt ∧
       link.contactRound round < peerRounds ∧
       ∃ peerAttempt ∈ (contacts.observation (link.contactRound round)).attempts,
         peerAttempt.peer = peer ∧ peerAttempt.outcome = .success
@@ -250,30 +256,36 @@ theorem every_item_is_attempted_on_a_usable_contact
   exact ⟨round, before, originAttempt, attempted, same, contactBefore,
     peerAttempt, peerAttempted, samePeer, success⟩
 
-/-- Bounded scheduling plus the factual Hello payload turns a later stable
-origin into delivery of its latest signed target on a successful contact. -/
-theorem every_latest_is_delivered
+/-- Bounded scheduling plus the factual Hello payload delivers every actual
+servable head attached to the selected item on a successful contact. -/
+theorem every_sent_head_is_delivered
     (contacts : ContactExecution.Execution eligible peerMaximum peerDeadline peerRounds)
     (peer : ByteArray)
     (origins : Execution .advertisement items maximum deadline rounds)
     (link : LinkedToContact contacts peer origins)
-    (latest : Item → VerifiedCore.Replication.Head)
-    (payloads : AdvertisementPayloads origins latest)
+    (sentFor : Item → List VerifiedCore.Replication.Head)
+    (payloads : AdvertisementPayloads origins sentFor)
     (distinct : ∀ left ∈ items, ∀ right ∈ items,
       key left.origin = key right.origin → left = right)
     (within : items.length ≤ UInt64.size)
     (fits : ∀ item ∈ items, item.weight.toNat ≤ maximum)
     (enough : (index items).toList.length ≤ rounds) :
-    LatestDeliveredOnUsableContact contacts peer origins link latest := by
+    SentHeadsDeliveredOnUsableContact contacts peer origins link sentFor := by
   have fair := every_item_is_attempted_on_a_usable_contact contacts peer origins link
     distinct within fits enough
-  intro item member
+  intro item member head sentMember
   obtain ⟨round, before, attempt, attempted, same, contactBefore,
     peerAttempt, peerAttempted, samePeer, success⟩ := fair item member
-  obtain ⟨sent, received, payload, sentLatest, receivedSent⟩ :=
+  obtain ⟨received, payload, receivedSent⟩ :=
     payloads.observed round before attempt attempted
-  have sentItem : latest item ∈ sent := by simpa only [same] using sentLatest
-  have delivered : DeliveredLatest (latest item) attempt := by
+  have selected : item ∈ selectedItems items
+      (plan items (origins.cursor round) maximum) := by
+    have mapped : item ∈ (origins.observation round).attempts.map Attempt.item :=
+      List.mem_map.mpr ⟨attempt, attempted, same⟩
+    rwa [(origins.completed round before).attemptsMatch] at mapped
+  have sentItem : head ∈ scheduledSentHeads origins sentFor round := by
+    exact List.mem_flatMap.mpr ⟨item, selected, sentMember⟩
+  have delivered : DeliveredLatest head attempt := by
     unfold DeliveredLatest
     rw [payload]
     exact receivedSent _ sentItem

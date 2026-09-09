@@ -1900,6 +1900,59 @@ mod tests {
         assert_eq!(pending[0].seq, 2);
     }
 
+    /// The native bulk-read seam passed to the verified origin planner keeps
+    /// three distinct facts aligned: both summary slots form one origin group,
+    /// only a scoped-complete `complete` slot supplies a signed head, and an
+    /// accepted `pending` slot appears in the next outer pending pass.
+    #[test]
+    fn accepted_pending_drives_the_next_native_origin_plan() {
+        let (_dir, store, key, origin) = setup();
+        let syncer = Syncer::new(store.clone());
+        let complete_root = publish(&store, &["complete"]);
+        assert_eq!(
+            syncer
+                .offer_head(
+                    &SignedHead::sign(&key, origin.clone(), 1, complete_root, 0),
+                    0,
+                )
+                .unwrap(),
+            HeadOutcome::Completed
+        );
+
+        let pending_root = Hash::new(b"not-present-yet");
+        assert_eq!(
+            syncer
+                .offer_head(
+                    &SignedHead::sign(&key, origin.clone(), 2, pending_root, 0),
+                    0,
+                )
+                .unwrap(),
+            HeadOutcome::Pending
+        );
+
+        let summaries = syncer.all_local_summaries().unwrap();
+        assert_eq!(summaries.len(), 2);
+        assert!(summaries.iter().all(|summary| summary.origin == origin));
+        assert!(summaries
+            .iter()
+            .any(|summary| summary.seq == 1 && summary.root == complete_root && summary.complete));
+        assert!(summaries.iter().any(|summary| {
+            summary.seq == 2 && summary.root == pending_root && !summary.complete
+        }));
+
+        let servable = syncer.heads_for(std::slice::from_ref(&origin)).unwrap();
+        assert_eq!(servable.len(), 1);
+        assert_eq!(servable[0].seq, 1);
+        assert_eq!(servable[0].root, complete_root);
+
+        let pending = store.all_heads(Slot::Pending).unwrap();
+        let planned = rotate_pending(pending, None, 1, |stored| &stored.head.origin).unwrap();
+        assert_eq!(planned.len(), 1);
+        assert_eq!(planned[0].head.origin, origin);
+        assert_eq!(planned[0].head.seq, 2);
+        assert_eq!(planned[0].head.root, pending_root);
+    }
+
     #[test]
     fn oversized_summary_pages_rotate_without_splitting_an_origins_slots() {
         let origins = (0..(synch_core::MAX_HEADS_PER_MESSAGE / 2 + 1))

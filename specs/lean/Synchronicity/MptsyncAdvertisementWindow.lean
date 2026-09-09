@@ -36,12 +36,14 @@ structure AdvertisementOccurrence
     (inputs : MptsyncScheduleExecution.StableScheduleInputs) where
   item : OriginSchedule.Item
   member : item ∈ inputs.advertisementItems
+  head : Head
+  sent : head ∈ inputs.advertisementSource.sentHeads item
   round : Nat
   roundWithin : round < inputs.advertisementRounds
   attempt : OriginScheduleExecution.Attempt
   attempted : attempt ∈ (inputs.advertisements.observation round).attempts
   sameItem : attempt.item = item
-  delivered : OriginScheduleExecution.DeliveredLatest (inputs.latest item) attempt
+  delivered : OriginScheduleExecution.DeliveredLatest head attempt
   contactWithin : inputs.advertisementLink.contactRound round < inputs.peerRounds
   peerAttempt : ContactExecution.Attempt
   peerAttempted : peerAttempt ∈ (inputs.contacts.observation
@@ -72,18 +74,53 @@ structure AcceptedLatestOnTimeline
   recorded : timeline.occurrenceAt accepted.observedAt = some occurrence
   initialAt : accepted.initialState = states accepted.handledAt
 
-/-- A stable origin item and the actual handling promised for the exact
-payload delivered by its bounded production scheduler attempt. -/
+/-- The receiving node's next successful native pending-slot bulk read is the
+state/view produced by the actual acceptance fold. Strict advancement rules
+out the already-complete retain case; the fold theorem then derives the exact
+pending pointer and queue membership. -/
+structure AcceptedLatestQueued
+    (inputs : MptsyncScheduleExecution.StableScheduleInputs)
+    (states : Nat → SimulatedHost.State)
+    (timeline : AdvertisementTimeline inputs states)
+    (origin : Origin.Parsed)
+    (history : StableAdvertisementProgress.StableAuthorizedHistory origin) (latest : Head)
+    (occurrence : AdvertisementOccurrence inputs) where
+  accepted : AcceptedLatestOnTimeline inputs states timeline origin history latest occurrence
+  strict : accepted.accepted.initial < AcceptanceProgress.rank latest
+  pendingState : inputs.pendingSource.state = accepted.accepted.acceptedState
+  pendingView : inputs.pendingSource.view = accepted.accepted.acceptedView
+
+theorem AcceptedLatestQueued.pendingMember
+    (queued : AcceptedLatestQueued inputs states timeline origin history latest occurrence) :
+    OriginQueueSource.pendingItem (Origin.canonical origin) ∈ inputs.pendingItems := by
+  have selected := StableAdvertisementProgress.actual_fold_selects_latest
+    queued.accepted.accepted.delivered queued.accepted.accepted.accepted
+      queued.accepted.accepted.initialBound
+  have strictVersion : queued.accepted.accepted.initial <
+      AcceptanceProgress.versionRank
+        ({ seq := latest.seq, root := latest.root } : HeadVersion) := by
+    simpa [AcceptanceProgress.rank, AcceptanceProgress.versionRank] using queued.strict
+  exact inputs.pendingSource.pendingItem_mem_after_acceptance
+    queued.accepted.accepted.accepted queued.pendingState queued.pendingView selected strictVersion
+
+/-- A stable stored head and the actual handling promised for the exact
+payload delivered by its bounded production scheduler attempt. The planner
+item is derived from the successful bulk-head snapshot; it is not a free
+membership witness supplied by the caller. -/
 structure AcceptanceOpportunity (inputs : MptsyncScheduleExecution.StableScheduleInputs)
     (states : Nat → SimulatedHost.State) (timeline : AdvertisementTimeline inputs states)
     (origin : Origin.Parsed)
     (history : StableAdvertisementProgress.StableAuthorizedHistory origin) (latest : Head) where
-  item : OriginSchedule.Item
-  member : item ∈ inputs.advertisementItems
-  sameHead : inputs.latest item = latest
+  complete : inputs.advertisementSource.view (Origin.canonical origin) .complete = some
+      ({ seq := latest.seq, root := latest.root } : HeadVersion)
+  listedHead : inputs.advertisementSource.completeHead
+    (Origin.canonical origin) = latest
+  servable : inputs.advertisementSource.nativeServable (Origin.canonical origin) = true
   accept : ∀ occurrence : AdvertisementOccurrence inputs,
-    occurrence.item = item →
-    Nonempty (AcceptedLatestOnTimeline inputs states timeline origin history latest occurrence)
+    occurrence.item = OriginQueueSource.advertisementItem
+      inputs.advertisementSource.view (Origin.canonical origin) →
+    occurrence.head = latest →
+    Nonempty (AcceptedLatestQueued inputs states timeline origin history latest occurrence)
 
 /-- M6's raw bounded service selects an attempt, and the external healthy-host
 contract executes acceptance over that very attempt's received head list. -/
@@ -93,27 +130,72 @@ theorem scheduled_acceptance
     (opportunity : AcceptanceOpportunity inputs states timeline origin history latest) :
     ∃ occurrence, Nonempty
       (AcceptedLatestOnTimeline inputs states timeline origin history latest occurrence) := by
-  have service := inputs.latestDelivered
+  have service := inputs.sentHeadsDelivered
+  let item := OriginQueueSource.advertisementItem inputs.advertisementSource.view
+    (Origin.canonical origin)
+  have member : item ∈ inputs.advertisementItems :=
+    inputs.advertisementSource.advertisementItem_mem_of_complete opportunity.complete
+  have sent : latest ∈ inputs.advertisementSource.sentHeads item := by
+    have listed := inputs.advertisementSource.completeHead_mem_sentHeads opportunity.servable
+    rw [opportunity.listedHead] at listed
+    exact listed
   obtain ⟨round, before, attempt, attempted, sameItem, delivered, contactBefore,
       peerAttempt, peerAttempted, samePeer, success⟩ :=
-    service opportunity.item opportunity.member
-  have targetDelivered : OriginScheduleExecution.DeliveredLatest latest attempt := by
-    rw [← opportunity.sameHead]
-    exact delivered
+    service item member latest sent
   let occurrence : AdvertisementOccurrence inputs :=
-    { item := opportunity.item
-      member := opportunity.member
+    { item := item
+      member := member
+      head := latest
+      sent := sent
       round := round
       roundWithin := before
       attempt := attempt
       attempted := attempted
       sameItem := sameItem
-      delivered := by simpa only [opportunity.sameHead] using targetDelivered
+      delivered := delivered
       contactWithin := contactBefore
       peerAttempt := peerAttempt
       peerAttempted := peerAttempted
       samePeer := samePeer
       success := success }
-  exact ⟨occurrence, opportunity.accept occurrence rfl⟩
+  let ⟨queued⟩ := opportunity.accept occurrence rfl rfl
+  exact ⟨occurrence, ⟨queued.accepted⟩⟩
+
+/-- Strong form retaining the acceptance-to-pending-queue bridge consumed by
+the first outer pending pass. -/
+theorem scheduled_acceptance_queued
+    (inputs : MptsyncScheduleExecution.StableScheduleInputs)
+    (timeline : AdvertisementTimeline inputs states)
+    (opportunity : AcceptanceOpportunity inputs states timeline origin history latest) :
+    ∃ occurrence, Nonempty
+      (AcceptedLatestQueued inputs states timeline origin history latest occurrence) := by
+  have service := inputs.sentHeadsDelivered
+  let item := OriginQueueSource.advertisementItem inputs.advertisementSource.view
+    (Origin.canonical origin)
+  have member : item ∈ inputs.advertisementItems :=
+    inputs.advertisementSource.advertisementItem_mem_of_complete opportunity.complete
+  have sent : latest ∈ inputs.advertisementSource.sentHeads item := by
+    have listed := inputs.advertisementSource.completeHead_mem_sentHeads opportunity.servable
+    rw [opportunity.listedHead] at listed
+    exact listed
+  obtain ⟨round, before, attempt, attempted, sameItem, delivered, contactBefore,
+      peerAttempt, peerAttempted, samePeer, success⟩ := service item member latest sent
+  let occurrence : AdvertisementOccurrence inputs :=
+    { item := item
+      member := member
+      head := latest
+      sent := sent
+      round := round
+      roundWithin := before
+      attempt := attempt
+      attempted := attempted
+      sameItem := sameItem
+      delivered := delivered
+      contactWithin := contactBefore
+      peerAttempt := peerAttempt
+      peerAttempted := peerAttempted
+      samePeer := samePeer
+      success := success }
+  exact ⟨occurrence, opportunity.accept occurrence rfl rfl⟩
 
 end Synchronicity.MptsyncAdvertisementWindow

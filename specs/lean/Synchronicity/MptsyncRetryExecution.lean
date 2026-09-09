@@ -791,10 +791,7 @@ structure RequeuedAfterLimit
     (origins : OriginScheduleExecution.Execution .pendingFetch
       items maximum deadline rounds)
     (link : OriginScheduleExecution.LinkedToContact contacts peer origins)
-    (targetOf : OriginSchedule.Item → OriginScheduleExecution.Target)
-    (item : OriginSchedule.Item) : Prop where
-  member : item ∈ items
-  sameOrigin : item.origin = Origin.canonical origin
+    (targetOf : OriginSchedule.Item → OriginScheduleExecution.Target) : Prop where
   opportunities : OriginScheduleExecution.PendingFetchOpportunities
     contacts peer origins link targetOf
 

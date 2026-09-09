@@ -1,4 +1,4 @@
-import Synchronicity.OriginScheduleExecution
+import Synchronicity.OriginQueueSource
 
 /-! Stable-window runtime inputs shared by the mptsync goal hierarchy.
 This module records production contact/origin executions, wire observations
@@ -23,46 +23,64 @@ structure StableScheduleInputs where
   enoughPeerRounds : (Contact.index eligible).toList.length ≤ peerRounds * peerMaximum
   peerMember : peer ∈ eligible
   peerHealthy : healthy peer
-  advertisementItems : List OriginSchedule.Item
+  advertisementSource : OriginQueueSource.BulkHeadSnapshot
   advertisementMaximum : Nat
   advertisementDeadline : Nat
   advertisementRounds : Nat
   advertisements : OriginScheduleExecution.Execution .advertisement
-    advertisementItems advertisementMaximum advertisementDeadline advertisementRounds
+    advertisementSource.advertisementItems advertisementMaximum advertisementDeadline
+      advertisementRounds
   advertisementLink : OriginScheduleExecution.LinkedToContact contacts peer advertisements
-  latest : OriginSchedule.Item → Head
-  advertisementPayloads : OriginScheduleExecution.AdvertisementPayloads advertisements latest
-  advertisementDistinct : ∀ left ∈ advertisementItems, ∀ right ∈ advertisementItems,
-    OriginSchedule.key left.origin = OriginSchedule.key right.origin → left = right
-  advertisementsWithin : advertisementItems.length ≤ UInt64.size
-  advertisementsFit : ∀ item ∈ advertisementItems,
+  advertisementPayloads : OriginScheduleExecution.AdvertisementPayloads advertisements
+    advertisementSource.sentHeads
+  advertisementsWithin : advertisementSource.advertisementItems.length ≤ UInt64.size
+  advertisementsFit : ∀ item ∈ advertisementSource.advertisementItems,
     item.weight.toNat ≤ advertisementMaximum
   enoughAdvertisementRounds :
-    (OriginSchedule.index advertisementItems).toList.length ≤ advertisementRounds
-  pendingItems : List OriginSchedule.Item
+    (OriginSchedule.index advertisementSource.advertisementItems).toList.length ≤
+      advertisementRounds
+  pendingSource : OriginQueueSource.BulkHeadSnapshot
   pendingMaximum : Nat
   pendingDeadline : Nat
   pendingRounds : Nat
   pending : OriginScheduleExecution.Execution .pendingFetch
-    pendingItems pendingMaximum pendingDeadline pendingRounds
+    pendingSource.pendingItems pendingMaximum pendingDeadline pendingRounds
   pendingLink : OriginScheduleExecution.LinkedToContact contacts peer pending
-  pendingTarget : OriginSchedule.Item → OriginScheduleExecution.Target
-  pendingPayloads : OriginScheduleExecution.PendingPayloads pending pendingTarget
-  pendingDistinct : ∀ left ∈ pendingItems, ∀ right ∈ pendingItems,
-    OriginSchedule.key left.origin = OriginSchedule.key right.origin → left = right
-  pendingWithin : pendingItems.length ≤ UInt64.size
-  pendingFit : ∀ item ∈ pendingItems, item.weight.toNat ≤ pendingMaximum
-  enoughPendingRounds : (OriginSchedule.index pendingItems).toList.length ≤ pendingRounds
+  pendingPayloads : OriginScheduleExecution.PendingPayloads pending pendingSource.pendingTarget
+  pendingWithin : pendingSource.pendingItems.length ≤ UInt64.size
+  pendingFit : ∀ item ∈ pendingSource.pendingItems, item.weight.toNat ≤ pendingMaximum
+  enoughPendingRounds :
+    (OriginSchedule.index pendingSource.pendingItems).toList.length ≤ pendingRounds
 
-/-- The raw scheduler inputs themselves entail delivery of every latest
-advertisement. Goal modules may package this fact, but operation composition
-depends only on this reusable execution theorem. -/
-theorem StableScheduleInputs.latestDelivered
+abbrev StableScheduleInputs.advertisementItems (inputs : StableScheduleInputs) :=
+  inputs.advertisementSource.advertisementItems
+
+theorem StableScheduleInputs.advertisementDistinct (inputs : StableScheduleInputs) :
+    ∀ left ∈ inputs.advertisementItems, ∀ right ∈ inputs.advertisementItems,
+      OriginSchedule.key left.origin = OriginSchedule.key right.origin → left = right :=
+  inputs.advertisementSource.advertisementDistinct
+
+abbrev StableScheduleInputs.pendingItems (inputs : StableScheduleInputs) :=
+  inputs.pendingSource.pendingItems
+
+abbrev StableScheduleInputs.pendingTarget (inputs : StableScheduleInputs) :=
+  inputs.pendingSource.pendingTarget
+
+theorem StableScheduleInputs.pendingDistinct (inputs : StableScheduleInputs) :
+    ∀ left ∈ inputs.pendingItems, ∀ right ∈ inputs.pendingItems,
+      OriginSchedule.key left.origin = OriginSchedule.key right.origin → left = right :=
+  inputs.pendingSource.pendingDistinct
+
+/-- The raw scheduler inputs themselves entail delivery of every signed head
+that the same native Hello construction marked servable. -/
+theorem StableScheduleInputs.sentHeadsDelivered
     (inputs : StableScheduleInputs) :
-    OriginScheduleExecution.LatestDeliveredOnUsableContact
-      inputs.contacts inputs.peer inputs.advertisements inputs.advertisementLink inputs.latest :=
-  OriginScheduleExecution.every_latest_is_delivered inputs.contacts inputs.peer
-    inputs.advertisements inputs.advertisementLink inputs.latest inputs.advertisementPayloads
+    OriginScheduleExecution.SentHeadsDeliveredOnUsableContact
+      inputs.contacts inputs.peer inputs.advertisements inputs.advertisementLink
+        inputs.advertisementSource.sentHeads :=
+  OriginScheduleExecution.every_sent_head_is_delivered inputs.contacts inputs.peer
+    inputs.advertisements inputs.advertisementLink inputs.advertisementSource.sentHeads
+      inputs.advertisementPayloads
     inputs.advertisementDistinct inputs.advertisementsWithin inputs.advertisementsFit
     inputs.enoughAdvertisementRounds
 

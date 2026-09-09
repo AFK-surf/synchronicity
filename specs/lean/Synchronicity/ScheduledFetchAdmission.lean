@@ -207,21 +207,25 @@ structure ResponseWindow (turn : Nat) (finalOrigin : String)
   withinRetry : turn < execution.endAt
   occurrence : ScheduleOccurrence
   recorded : timeline.occurrenceAt turn = some occurrence
-  item : OriginSchedule.Item
-  member : item ∈ occurrence.inputs.pendingItems
+  /-- This exact native `all_heads(.pending)` snapshot was read from the
+  receiver state at the recorded outer scheduling pass. -/
+  sourceAt : occurrence.inputs.pendingSource.state = execution.state turn
+  pending : occurrence.inputs.pendingSource.view finalOrigin .pending = some
+    ({ seq := finalSeq, root := finalRoot } : HeadVersion)
   admit : ∀ round attempt,
     round < occurrence.inputs.pendingRounds →
     attempt ∈ (occurrence.inputs.pending.observation round).attempts →
-    attempt.item = item →
-    OriginScheduleExecution.FetchOpportunity (occurrence.inputs.pendingTarget item) attempt →
+    attempt.item = OriginQueueSource.pendingItem finalOrigin →
+    OriginScheduleExecution.FetchOpportunity
+      (occurrence.inputs.pendingTarget (OriginQueueSource.pendingItem finalOrigin)) attempt →
     occurrence.inputs.pendingLink.contactRound round < occurrence.inputs.peerRounds →
     ∀ peerAttempt,
       peerAttempt ∈ (occurrence.inputs.contacts.observation
         (occurrence.inputs.pendingLink.contactRound round)).attempts →
       peerAttempt.peer = occurrence.inputs.peer → peerAttempt.outcome = .success →
       ∃ actualTarget,
-        FinalTargetAligned (occurrence.inputs.pendingTarget item) actualTarget
-          finalOrigin finalSeq finalRoot scope owner root ∧
+        TargetAligned (occurrence.inputs.pendingTarget
+          (OriginQueueSource.pendingItem finalOrigin)) actualTarget scope owner root ∧
         ∃ admission : AdmissionFor actualTarget requirements (execution.state turn)
             (execution.state (turn + 1)),
           execution.step turn withinRetry =
@@ -234,9 +238,18 @@ theorem ResponseWindow.checkpoint
       execution timeline) :
     MptsyncRetryExecution.AdmissionCheckpoint requirements execution turn := by
   have opportunities := pendingFetchOpportunities window.occurrence.inputs
+  let item := OriginQueueSource.pendingItem finalOrigin
+  have representedAtTurn : HeadView.Represents (execution.state turn).db
+      window.occurrence.inputs.pendingSource.view := by
+    rw [← window.sourceAt]
+    exact window.occurrence.inputs.pendingSource.represented
+  obtain ⟨_row, _selected, _points⟩ :=
+    HeadView.existing representedAtTurn window.pending
+  have member : item ∈ window.occurrence.inputs.pendingItems :=
+    window.occurrence.inputs.pendingSource.pendingItem_mem window.pending
   obtain ⟨round, before, attempt, attempted, sameItem, opportunity, contactBefore,
       peerAttempt, peerAttempted, samePeer, success⟩ :=
-    opportunities window.item window.member
+    opportunities item member
   obtain ⟨actualTarget, aligned, admission, exactStep⟩ :=
     window.admit round attempt before attempted sameItem opportunity contactBefore
       peerAttempt peerAttempted samePeer success
@@ -260,18 +273,19 @@ structure AfterRetryLimitWindow
   withinRetry : turn < execution.endAt
   occurrence : ScheduleOccurrence
   recorded : timeline.occurrenceAt turn = some occurrence
-  item : OriginSchedule.Item
+  sourceAt : occurrence.inputs.pendingSource.state = execution.state turn
+  pending : occurrence.inputs.pendingSource.view finalOrigin .pending = some
+    ({ seq := finalSeq, root := finalRoot } : HeadVersion)
   requeued : MptsyncRetryExecution.RequeuedAfterLimit exit occurrence.inputs.contacts
     occurrence.inputs.peer occurrence.inputs.pending occurrence.inputs.pendingLink
-      occurrence.inputs.pendingTarget item
+      occurrence.inputs.pendingTarget
   finalOriginMatchesExit : finalOrigin = Origin.canonical origin
-  sequence : (occurrence.inputs.pendingTarget item).pointer.seq = finalSeq
-  targetRoot : (occurrence.inputs.pendingTarget item).pointer.root = finalRoot
   admit : ∀ round attempt,
     round < occurrence.inputs.pendingRounds →
     attempt ∈ (occurrence.inputs.pending.observation round).attempts →
-    attempt.item = item →
-    OriginScheduleExecution.FetchOpportunity (occurrence.inputs.pendingTarget item) attempt →
+    attempt.item = OriginQueueSource.pendingItem finalOrigin →
+    OriginScheduleExecution.FetchOpportunity
+      (occurrence.inputs.pendingTarget (OriginQueueSource.pendingItem finalOrigin)) attempt →
     occurrence.inputs.pendingLink.contactRound round < occurrence.inputs.peerRounds →
     ∀ peerAttempt,
       peerAttempt ∈ (occurrence.inputs.contacts.observation
@@ -295,30 +309,41 @@ theorem AfterRetryLimitWindow.checkpoint
     MptsyncRetryExecution.AdmissionCheckpoint requirements execution turn := by
   -- Consume the opportunity attached to this exact retry-limit requeue rather
   -- than deriving an interchangeable opportunity from the raw inputs again.
+  let item := OriginQueueSource.pendingItem finalOrigin
+  have representedAtTurn : HeadView.Represents (execution.state turn).db
+      window.occurrence.inputs.pendingSource.view := by
+    rw [← window.sourceAt]
+    exact window.occurrence.inputs.pendingSource.represented
+  obtain ⟨_row, _selected, _points⟩ :=
+    HeadView.existing representedAtTurn window.pending
+  have member : item ∈ window.occurrence.inputs.pendingItems :=
+    window.occurrence.inputs.pendingSource.pendingItem_mem window.pending
   obtain ⟨round, before, attempt, attempted, sameItem, opportunity, contactBefore,
       peerAttempt, peerAttempted, samePeer, success⟩ :=
-    window.requeued.opportunities window.item window.requeued.member
+    window.requeued.opportunities item member
   obtain ⟨actualTarget, aligned, admission, exactStep⟩ :=
     window.admit round attempt before attempted sameItem opportunity contactBefore
       peerAttempt peerAttempted samePeer success
   have finalAligned : FinalTargetAligned
-      (window.occurrence.inputs.pendingTarget window.item) actualTarget
+      (window.occurrence.inputs.pendingTarget item) actualTarget
       finalOrigin finalSeq finalRoot scope owner root := by
-    refine ⟨?_, window.sequence, window.targetRoot, aligned⟩
-    exact ((window.occurrence.inputs.pendingPayloads.sameOrigin window.item
-      window.requeued.member).trans window.requeued.sameOrigin).trans
-        window.finalOriginMatchesExit.symm
+    have target := window.occurrence.inputs.pendingSource.pendingTarget_at window.pending
+    refine ⟨?_, ?_, ?_, aligned⟩
+    · rfl
+    · simpa [item] using congrArg (fun value => value.pointer.seq) target
+    · simpa [item] using congrArg (fun value => value.pointer.root) target
   exact ⟨window.withinRetry, admission.admission, exactStep⟩
 
-/-- One fresh response source is either an ordinary newly queued raw window,
-or the next raw window causally attached to an actual retry-limit exit and
-requeue observation. -/
+/-- One response source is either a separately recorded actual outer
+`all_heads(.pending)`/Hello pass, or such a pass causally attached to an actual
+retry-limit exit. There is no source-free freshness constructor: both branches
+carry a state-anchored bulk read and non-reusable scheduler occurrence. -/
 inductive ResponseOpportunity (turn : Nat) (finalOrigin : String)
     (finalSeq : UInt64) (finalRoot : ByteArray)
     (requirements : FiniteRequirements publisher scope owner root)
     (execution : MptsyncRetryExecution.RetryExecution requirements)
     (timeline : ProductionScheduleTimeline execution.state) where
-  | fresh (window : ResponseWindow turn finalOrigin finalSeq finalRoot requirements execution
+  | outerPass (window : ResponseWindow turn finalOrigin finalSeq finalRoot requirements execution
       timeline)
   | afterRetry
       {origin : Origin.Parsed} {expected : Option (UInt64 × ByteArray)}
@@ -335,7 +360,7 @@ theorem ResponseOpportunity.checkpoint
       requirements execution timeline) :
     MptsyncRetryExecution.AdmissionCheckpoint requirements execution turn := by
   cases opportunity with
-  | fresh window => exact window.checkpoint
+  | outerPass window => exact window.checkpoint
   | afterRetry exit window => exact window.checkpoint
 
 /-- A finite ordered list of reserved scheduler turns, one per unit of the

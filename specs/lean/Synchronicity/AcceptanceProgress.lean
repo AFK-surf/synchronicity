@@ -953,6 +953,48 @@ theorem ObservedAcceptanceFold.selects_delivered_latest
       · exact latestValid
       · simpa [selectedEq, optionRank, rank, versionRank] using selectedRank
 
+/-- If the finally selected advertisement is strictly above the fold's
+initial floor, it is the actual pending slot installed by acceptance. The
+complete slot is preserved by the fold and therefore cannot name that newer
+version. This is the slot-level bridge used by the subsequent native
+`all_heads(.pending)` queue read. -/
+theorem ObservedAcceptanceFold.pending_eq_selected_of_initial_lt
+    (run : ObservedAcceptanceFold origin keep initial state view stable
+      heads final finalState finalView)
+    (selected : selectedVersion finalView origin = some version)
+    (strict : initial < versionRank version) :
+    finalView origin .pending = some version := by
+  have initialCompleteBound : optionRank (view origin .complete) ≤ initial := by
+    rw [← stable.maximum]
+    exact Nat.le_max_left ..
+  have finalCompleteBound : optionRank (finalView origin .complete) ≤ initial := by
+    rw [run.complete_preserved]
+    exact initialCompleteBound
+  cases complete : finalView origin .complete with
+  | none =>
+      cases pending : finalView origin .pending with
+      | none => simp [selectedVersion, complete, pending] at selected
+      | some pendingVersion =>
+          simp only [selectedVersion, complete, pending] at selected
+          exact selected
+  | some completeVersion =>
+      cases pending : finalView origin .pending with
+      | none =>
+          simp only [selectedVersion, complete, pending] at selected
+          have same : completeVersion = version := Option.some.inj selected
+          cases same
+          simp only [complete, optionRank] at finalCompleteBound
+          omega
+      | some pendingVersion =>
+          by_cases newer : versionRank completeVersion < versionRank pendingVersion
+          · simp only [selectedVersion, complete, pending, if_pos newer] at selected
+            exact selected
+          · simp only [selectedVersion, complete, pending, if_neg newer] at selected
+            have same : completeVersion = version := Option.some.inj selected
+            cases same
+            simp only [complete, optionRank] at finalCompleteBound
+            omega
+
 /-- Membership, not ordering or multiplicity, determines the semantic latest
 rank.  This is the fold counterpart of planner selection invariance. -/
 theorem latestRank_eq_of_same (same : ∀ head, head ∈ left ↔ head ∈ right) :

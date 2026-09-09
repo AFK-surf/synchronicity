@@ -27,7 +27,7 @@ structure BoundedService
     (advertisements : OriginScheduleExecution.Execution .advertisement
       advertisementItems advertisementMaximum advertisementDeadline advertisementRounds)
     (advertisementLink : OriginScheduleExecution.LinkedToContact contacts peer advertisements)
-    (latest : OriginSchedule.Item → Head)
+    (sentFor : OriginSchedule.Item → List Head)
     (pending : OriginScheduleExecution.Execution .pendingFetch
       pendingItems pendingMaximum pendingDeadline pendingRounds)
     (pendingLink : OriginScheduleExecution.LinkedToContact contacts peer pending)
@@ -36,8 +36,8 @@ structure BoundedService
   selectedPeerHealthy : peer ∈ eligible ∧ healthy peer
   advertisedOrigins : OriginScheduleExecution.ItemsAttemptedOnUsableContact
     contacts peer advertisements advertisementLink
-  deliveredLatest : OriginScheduleExecution.LatestDeliveredOnUsableContact
-    contacts peer advertisements advertisementLink latest
+  deliveredHeads : OriginScheduleExecution.SentHeadsDeliveredOnUsableContact
+    contacts peer advertisements advertisementLink sentFor
   pendingOrigins : OriginScheduleExecution.ItemsAttemptedOnUsableContact
     contacts peer pending pendingLink
   pendingFetchOpportunity : OriginScheduleExecution.PendingFetchOpportunities
@@ -58,8 +58,8 @@ theorem bounded_service
     (advertisements : OriginScheduleExecution.Execution .advertisement
       advertisementItems advertisementMaximum advertisementDeadline advertisementRounds)
     (advertisementLink : OriginScheduleExecution.LinkedToContact contacts peer advertisements)
-    (latest : OriginSchedule.Item → Head)
-    (advertisementPayloads : OriginScheduleExecution.AdvertisementPayloads advertisements latest)
+    (sentFor : OriginSchedule.Item → List Head)
+    (advertisementPayloads : OriginScheduleExecution.AdvertisementPayloads advertisements sentFor)
     (advertisementDistinct : ∀ left ∈ advertisementItems, ∀ right ∈ advertisementItems,
       OriginSchedule.key left.origin = OriginSchedule.key right.origin → left = right)
     (advertisementsWithin : advertisementItems.length ≤ UInt64.size)
@@ -78,15 +78,15 @@ theorem bounded_service
     (pendingFit : ∀ item ∈ pendingItems, item.weight.toNat ≤ pendingMaximum)
     (enoughPendingRounds :
       (OriginSchedule.index pendingItems).toList.length ≤ pendingRounds) :
-    BoundedService healthy contacts peer advertisements advertisementLink latest
+    BoundedService healthy contacts peer advertisements advertisementLink sentFor
       pending pendingLink pendingTarget := by
   refine ⟨ContactExecution.healthy_peers_receive_bounded_attempts contacts peerWidth peersWithin
     peerMaximumPositive enoughPeerRounds healthy, ⟨peerMember, peerHealthy⟩, ?_, ?_, ?_, ?_⟩
   · exact OriginScheduleExecution.every_item_is_attempted_on_a_usable_contact
       contacts peer advertisements advertisementLink advertisementDistinct advertisementsWithin
       advertisementsFit enoughAdvertisementRounds
-  · exact OriginScheduleExecution.every_latest_is_delivered contacts peer advertisements
-      advertisementLink latest advertisementPayloads advertisementDistinct advertisementsWithin
+  · exact OriginScheduleExecution.every_sent_head_is_delivered contacts peer advertisements
+      advertisementLink sentFor advertisementPayloads advertisementDistinct advertisementsWithin
       advertisementsFit enoughAdvertisementRounds
   · exact OriginScheduleExecution.every_item_is_attempted_on_a_usable_contact
       contacts peer pending pendingLink pendingDistinct pendingWithin pendingFit enoughPendingRounds
@@ -100,11 +100,12 @@ the shared input record requires the production executions and wire observations
 that `bounded_service` consumes. -/
 theorem inputs_service (inputs : StableScheduleInputs) :
     BoundedService inputs.healthy inputs.contacts inputs.peer inputs.advertisements
-      inputs.advertisementLink inputs.latest inputs.pending inputs.pendingLink
+      inputs.advertisementLink inputs.advertisementSource.sentHeads inputs.pending inputs.pendingLink
       inputs.pendingTarget := by
   exact bounded_service inputs.contacts inputs.peerWidth inputs.peersWithin
     inputs.peerMaximumPositive inputs.enoughPeerRounds inputs.healthy inputs.peerMember
-    inputs.peerHealthy inputs.advertisements inputs.advertisementLink inputs.latest
+    inputs.peerHealthy inputs.advertisements inputs.advertisementLink
+    inputs.advertisementSource.sentHeads
     inputs.advertisementPayloads inputs.advertisementDistinct inputs.advertisementsWithin
     inputs.advertisementsFit inputs.enoughAdvertisementRounds inputs.pending inputs.pendingLink
     inputs.pendingTarget inputs.pendingPayloads inputs.pendingDistinct inputs.pendingWithin
