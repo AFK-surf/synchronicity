@@ -100,3 +100,15 @@ import Synchronicity.Goals.Mptsync.M2
 import Synchronicity.Goals.Mptsync.M6
 import Synchronicity.MptsyncConvergence
 import Synchronicity.MptsyncViewStability
+import Synchronicity.MptsyncScheduleExecution
+import Synchronicity.MptsyncRetryExecution
+import Synchronicity.TrieCompleteConverse
+import Synchronicity.StablePromotionTarget
+import Synchronicity.ScopeChangePromotionBaseline
+import Synchronicity.PromotionContinuationBaseline
+import Synchronicity.MptsyncPromotionHistory
+import Synchronicity.MptsyncAdvertisementWindow
+import Synchronicity.MptsyncProductionConvergence
+import Synchronicity.Goals.Mptsync.M7
+import Synchronicity.Goals.Mptsync.M8
+import Synchronicity.Goals.Mptsync.M1
