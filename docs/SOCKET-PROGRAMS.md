@@ -81,10 +81,11 @@ nothing to any other node: `nas:git` and `laptop:git` are unrelated, as
 `nas:code/git.sock` and `laptop:code/git.sock` are unrelated today (SOCKETS.md
 §2.3).
 
-Choosing a path-shaped grammar rather than a flat identifier is what makes
-the migration invisible (§8): every existing socket `code/git.sock` becomes a
-socket *named* `code/git.sock`, and `synch socket connect nas:code/git.sock`
-keeps working with the same spelling and a new meaning.
+Choosing a path-shaped grammar rather than a flat identifier is what keeps
+every old address available: an existing socket `code/git.sock` can be
+re-activated as a socket *named* `code/git.sock` (§8), and `synch socket
+connect nas:code/git.sock` then works with the same spelling and a new
+meaning.
 
 ### 2.1 The activation
 
@@ -129,8 +130,8 @@ implication has to be written down, and it is written on the activation.
   the socket's `scope`. An activation with an empty scope is **members
   only**, and that is the default: offering a socket to delegates is a
   broader grant than offering it to members, so it is asked for by name. The
-  migration (§8) sets the scope to the space each existing socket sat in, so
-  no delegate loses a socket it can reach today.
+  migration (§8) carries no socket over, so every scope is one an operator
+  wrote.
 - Inside the program, `sy_peer_has_space` and the rest of the identity family
   keep answering from the handshake, and remain the way to write rules finer
   than scope.
@@ -263,9 +264,9 @@ new one and refuses likewise. Neither side misaddresses anything: the failure
 is at the handshake, before any policy runs. SOCKETS.md §11 already sets the
 rollout order for a change peers cannot decode — **upgrade, then activate**
 — and the connecting side is a byte pump with no runtime, so upgrading it is
-the cheap half. Because the migration keeps every old spelling meaningful
-(§8), the first thing an upgraded caller types is the thing it typed
-yesterday.
+the cheap half. Every old `<space>/<path>` spelling is a legal name (§2), so
+an operator who re-activates under the old spelling (§8) gives an upgraded
+caller the address it typed yesterday.
 
 ## 6. A write is a write
 
@@ -346,28 +347,21 @@ same shapes.
 
 ## 8. Migration
 
-Schema `v29` rewrites `socket_activations` in place. For every existing row
-`(space, path, …)`:
+Schema `v29` drops every existing activation and creates the new table
+empty. Nothing is carried over: the two things a new row needs that an old
+one does not hold — a name, and a scope — are grants, and choosing them on the
+operator's behalf would mean choosing who may run what. The migration logs
+one warn line per dropped row, naming the path and the `synch socket
+activate <name> --program <space>/<path>` that serves it again. The v24
+migration took the same stance for the same reason.
 
-```
-name          = "<space>/<path>"
-program_space = space
-program_path  = path
-scope         = space
-```
-
-Every existing socket keeps its address, its program, its config, its cap,
-and its reachability — a delegate of `code` could open `code/git.sock`
-yesterday and can today, because the scope says so. The migration logs one
-line per socket naming the scope it wrote, since the scope is now an explicit
-grant the operator can narrow with a re-activation. The file at the old path
-publishes as `File` from the next scan; nothing about its bytes changes, and
-peers that materialized it as a file keep a file.
-
-The one thing an operator may want to do afterwards is move the object: put
-it at `code/bin/gateway.o`, re-activate `code/git.sock --program
-code/bin/gateway.o`, and delete the old file. Until then the socket is
-self-backed in all but name.
+The file at the old path is untouched and publishes as `File` from the next
+scan; nothing about its bytes changes, and peers that materialized it as a
+file keep a file. Re-activating it under its old spelling — `synch socket
+activate code/git.sock --program code/git.sock` — restores the old address
+exactly, since every `<space>/<path>` is a legal name; a fresh name and a
+`bin/` for the object is the better shape, and the migration is the moment to
+choose it.
 
 ## 9. Failure and limits
 
@@ -438,10 +432,10 @@ Each step leaves the tree building and every existing test passing. Steps 1,
 engine, the wire and the command surface at once, and there is no intermediate
 between them that compiles.
 
-1. **Store.** The new table shape, the `v29` rewrite with its log line,
+1. **Store.** The new table shape, the `v29` drop with its log line,
    `SocketActivation`, `activations_backed_by`, `is_program_path`,
-   `remove_source`. Store tests: migration preserves address, program and
-   scope; reverse lookups.
+   `remove_source`. Store tests: the migration drops every path activation;
+   reverse lookups.
 2. **Tree writes.** Remove `refuse_socket_path` and its call sites; the
    tree-write test that asserted the refusal becomes one asserting that a
    program's write to a program path deploys it.

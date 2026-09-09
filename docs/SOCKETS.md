@@ -76,10 +76,12 @@ names — `git`, `docs/git`, `ci/intake` — and `..`, empty components, a leadi
 `/` and control characters are refused. Names are unique per node and mean
 nothing to any other node: `nas:git` and `laptop:git` are unrelated.
 
-The path-shaped grammar is what made the migration invisible: every socket
-that used to be the path `code/git.sock` is now a socket *named*
-`code/git.sock`, and `synch socket connect nas:code/git.sock` keeps working
-with the same spelling and a new meaning.
+The path-shaped grammar is what keeps every old address available. The
+schema migration carries no activation over — a name and a scope are grants,
+and it does not choose them for the operator — but a socket that used to be
+the path `code/git.sock` can be re-activated as a socket *named*
+`code/git.sock`, and `synch socket connect nas:code/git.sock` then works with
+the same spelling and a new meaning.
 
 The tree publishes **nothing new, and one thing less**. A program is an
 ordinary file under `f:<space>/<path>`, and it inherits versioning,

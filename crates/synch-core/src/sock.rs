@@ -87,7 +87,7 @@ pub enum SocketNameError {
 /// [`normalize_path`](crate::normalize_path)-normalized. So `/` may group names
 /// — `git`, `docs/git`, `ci/intake` — while `..`, empty components, a leading
 /// `/` and control characters are refused. Every existing `<space>/<path>`
-/// socket address is a legal name, which is what makes the migration invisible.
+/// socket address is a legal name, so an old address can be activated again.
 pub fn validate_socket_name(name: &str) -> Result<(), SocketNameError> {
     if name.is_empty() {
         return Err(SocketNameError::Empty);

@@ -1894,12 +1894,11 @@ mod tests {
         assert!(store.blob(&root).unwrap().is_none());
     }
 
-    /// v29 keeps every socket's address, its program and its reachability: a
-    /// socket that was the path `code/git.sock` becomes a socket *named*
-    /// `code/git.sock` backed by the program at that path, scoped to the space
-    /// it sat in — so the delegates of `code` that could open it still can.
+    /// v29 carries no socket over: a name and a scope are grants the operator
+    /// makes, not ones a migration infers from a path. The old row is gone
+    /// under every spelling, and the new table takes an activation.
     #[test]
-    fn v29_keeps_a_sockets_address_program_and_reach() {
+    fn v29_drops_every_path_activation() {
         let dir = tempfile::tempdir().unwrap();
         {
             let conn = database_at(dir.path(), 28);
@@ -1920,29 +1919,24 @@ mod tests {
         }
         let store = Store::open(dir.path()).unwrap();
 
-        let migrated = store
-            .socket_activation("code/git.sock")
+        assert!(
+            store.socket_activations().unwrap().is_empty(),
+            "a path activation was carried into the socket namespace"
+        );
+        assert!(store.socket_activation("code/git.sock").unwrap().is_none());
+        assert!(store
+            .activations_backed_by("code", "git.sock")
             .unwrap()
-            .expect("the old address is the new name");
-        assert_eq!(migrated.program(), "code/git.sock");
-        assert_eq!(
-            migrated.scope,
-            vec!["code".to_string()],
-            "a delegate of the space the socket sat in must still be able to open it"
-        );
-        assert!(migrated.admits(Some(&["code".to_string()])));
-        assert!(!migrated.admits(Some(&["docs".to_string()])));
-        assert_eq!(
-            migrated.config,
-            vec![("upstream".to_string(), "git.internal".to_string())]
-        );
-        assert_eq!(migrated.max_streams, Some(32));
-        assert_eq!(migrated.note, "the gateway");
-        assert_eq!(migrated.activated_at, 7);
+            .is_empty());
 
-        // And the reverse lookup finds it from the program it now names.
-        let backed = store.activations_backed_by("code", "git.sock").unwrap();
-        assert_eq!(backed, vec![migrated]);
+        // Re-activating under the old spelling is the operator's call, and it
+        // is a legal one.
+        let again = crate::SocketActivation::new("code/git.sock", "code", "git.sock", 8);
+        store.activate_socket(&again).unwrap();
+        assert_eq!(
+            store.activations_backed_by("code", "git.sock").unwrap(),
+            vec![again]
+        );
     }
 
     /// A v2 database — the oldest layout still real — upgrades with its durable

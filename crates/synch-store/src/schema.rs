@@ -114,13 +114,13 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
 /// and this rewrite separates them: the name is the address, `(program_space,
 /// program_path)` is the location, and `scope` is the grant.
 ///
-/// Every existing socket keeps all three. `name` is the old `<space>/<path>`,
-/// so `synch socket connect nas:code/git.sock` keeps working with the same
-/// spelling; the program is the same path; and the scope is the space the
-/// socket sat in, so a delegate of `code` that could open `code/git.sock`
-/// yesterday can open it today. That last one is now an explicit grant an
-/// operator may want to narrow, so each migrated row says which scope was
-/// written for it.
+/// No existing socket is carried over. Each old row is a statement about a
+/// path, and the two things the new row needs that the old one does not hold
+/// — a name, and a scope — are grants: choosing them for the operator would
+/// mean choosing who may run what. The old rows are dropped, one warn line
+/// each, and the operator re-activates with `synch socket activate <name>
+/// --program <space>/<path>`, which is where those choices belong. The v24
+/// migration took the same stance for the same reason.
 fn v29_sockets_by_name(tx: &Transaction<'_>) -> Result<()> {
     let existing: Vec<(String, String)> = {
         let mut stmt =
@@ -131,14 +131,13 @@ fn v29_sockets_by_name(tx: &Transaction<'_>) -> Result<()> {
     for (space, path) in &existing {
         tracing::warn!(
             socket = format!("{space}/{path}"),
-            program = format!("{space}/{path}"),
-            scope = space,
-            "socket migrated to a name of its own; its scope was set to the space it sat in, so \
-             the delegates that could open it still can — re-activate it to narrow that grant"
+            "socket activation dropped by the socket-namespace migration: a socket is now a \
+             name bound to a program, with a scope of its own — run `synch socket activate \
+             <name> --program {space}/{path}` to serve this program again"
         );
     }
     tx.execute_batch(
-        "ALTER TABLE socket_activations RENAME TO socket_activations_v28;
+        "DROP TABLE socket_activations;
          CREATE TABLE socket_activations (
            name          TEXT PRIMARY KEY,
            program_space TEXT NOT NULL,
@@ -149,13 +148,8 @@ fn v29_sockets_by_name(tx: &Transaction<'_>) -> Result<()> {
            note          TEXT NOT NULL DEFAULT '',
            activated_at  INTEGER NOT NULL
          );
-         INSERT INTO socket_activations
-           (name, program_space, program_path, scope, config, max_streams, note, activated_at)
-           SELECT space || '/' || path, space, path, space, config, max_streams, note, activated_at
-             FROM socket_activations_v28;
          CREATE INDEX socket_activations_by_program
-           ON socket_activations (program_space, program_path);
-         DROP TABLE socket_activations_v28;",
+           ON socket_activations (program_space, program_path);",
     )?;
     Ok(())
 }
