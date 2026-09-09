@@ -110,10 +110,12 @@ structure Scenario (Device : Type) where
   participates : Device → Prop
   includes : Origin.Parsed → Prop
   latest : Origin.Parsed → HeadVersion
+  snapshot : Origin.Parsed → RawSnapshot
   target : Device → Origin.Parsed → ViewTarget
   target_latest : ∀ device origin,
     ⟨(target device origin).head.seq, (target device origin).head.root⟩ = latest origin
   target_origin : ∀ device origin, (target device origin).head.origin = origin
+  target_snapshot : ∀ device origin, (target device origin).snapshot = snapshot origin
 
 def CorrectDevice (services : MaterializedView.Services) (scenario : Scenario Device)
     (databases : Device → Database) (device : Device) : Prop :=
@@ -236,9 +238,7 @@ theorem correct_devices_with_equal_scopes_agree
     (rightMember : scenario.participates right)
     (included : scenario.includes origin)
     (sameScope : (scenario.target left origin).scope =
-      (scenario.target right origin).scope)
-    (sameSnapshot : (scenario.target left origin).snapshot =
-      (scenario.target right origin).snapshot) :
+      (scenario.target right origin).scope) :
     ∀ space path values,
       MaterializedView.Observed (databases left) (Origin.canonical origin)
           (.file space path) values ↔
@@ -248,6 +248,8 @@ theorem correct_devices_with_equal_scopes_agree
   have rightCorrect := correct right rightMember origin included
   have sameVersion := (scenario.target_latest left origin).trans
     (scenario.target_latest right origin).symm
+  have sameSnapshot := (scenario.target_snapshot left origin).trans
+    (scenario.target_snapshot right origin).symm
   have sameRoot : (scenario.target left origin).head.root =
       (scenario.target right origin).head.root := by
     simpa using congrArg HeadVersion.root sameVersion
