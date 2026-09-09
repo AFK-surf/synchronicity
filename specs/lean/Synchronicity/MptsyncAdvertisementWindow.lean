@@ -13,6 +13,9 @@ open AcceptanceProgress MptsyncConvergence
 /-- An actual acceptance fold over precisely one peer-observed Hello payload. -/
 structure AcceptedLatest (valid : Head → Prop) (origin : Origin.Parsed)
     (latest : Head) (heads : List Head) where
+  observedAt : Nat
+  handledAt : Nat
+  afterDelivery : observedAt < handledAt
   keep : Nat
   initial : Nat
   final : Nat

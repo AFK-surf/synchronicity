@@ -3,6 +3,8 @@ import Synchronicity.ScheduledFetchAdmission
 import Synchronicity.MptsyncRetryExecution
 import Synchronicity.MptsyncPromotionHistory
 import Synchronicity.ReconciliationViewExecution
+import Synchronicity.Goals.Mptsync.M3
+import Synchronicity.ProductionTimeline
 
 /-! Composition of the actual stable-window executions used by M1.
 
@@ -18,6 +20,7 @@ open MptsyncConvergence AcceptanceProgress
 /-- The actual promotion observation following one completed retry trace. -/
 structure PromotionWindow (services : MaterializedView.Services)
     (origin : Origin.Parsed) (target : ViewTarget)
+    (timeline : Nat → SimulatedHost.State) (tailOffset retryStart : Nat)
     (trace : MptsyncStableTail.Trace)
     (accepted : MptsyncAdvertisementWindow.AcceptedLatest valid origin target.head heads)
     (publisher : TrieProgramProofs.RawSnapshot)
@@ -27,12 +30,22 @@ structure PromotionWindow (services : MaterializedView.Services)
   index : Nat
   now : Int64
   refused : List (UInt64 × ByteArray × ByteArray)
-  opportunity : TrieCompleteConverse.ReadyOpportunity origin now refused (trace.state index)
+  opportunity : TrieCompleteConverse.PromotionOpportunity origin now refused (trace.state index)
+  reads : TrieCompleteConverse.PromotionReadOpportunity publisher opportunity.tx
+    ⟨opportunity.scope, opportunity.authority.provenance.map Origin.canonical⟩
+    opportunity.pending.head.root
   requirementScope : opportunity.scope = scope
   requirementOwner : opportunity.authority.provenance.map Origin.canonical = owner
   requirementRoot : opportunity.pending.head.root = root
-  carried : EvidenceIncluded (replicaOfState (retry.state finish))
-    (replicaOfState opportunity.prepared)
+  retryIndex : Nat
+  afterFinish : finish ≤ retryIndex
+  sameTime : retryStart + retryIndex = tailOffset + index
+  acceptanceInitialAt : accepted.initialState = timeline accepted.handledAt
+  handledBeforeRetry : accepted.handledAt ≤ retryStart
+  acceptedAt : accepted.acceptedState = timeline retryStart
+  observations : List ReconciliationExecution.Observation
+  intervening : ReconciliationExecution.Execution accepted.acceptedState observations
+    (trace.state index)
   laterView : HeadView
   laterSlots : StableSlots (trace.state index) (Origin.canonical origin)
     accepted.final laterView
@@ -55,6 +68,7 @@ permissions have stabilized. Scheduler observations are shared by delivery
 and Fetch, while every useful response remains tied to its real admission. -/
 structure StableRun (services : MaterializedView.Services)
     (origin : Origin.Parsed) (target : ViewTarget)
+    (timeline : Nat → SimulatedHost.State) (tailOffset : Nat)
     (trace : MptsyncStableTail.Trace) (valid : Head → Prop) where
   schedule : MptsyncScheduleExecution.StableScheduleInputs
   advertisement : MptsyncAdvertisementWindow.AcceptanceOpportunity
@@ -65,23 +79,19 @@ structure StableRun (services : MaterializedView.Services)
   root : ByteArray
   requirements : FiniteRequirements publisher scope owner root
   retry : MptsyncRetryExecution.RetryExecution requirements
-  pendingItem : OriginSchedule.Item
-  pendingMember : pendingItem ∈ schedule.pendingItems
-  pendingOrigin : (schedule.pendingTarget pendingItem).origin = Origin.canonical origin
-  pendingSequence : (schedule.pendingTarget pendingItem).pointer.seq = target.head.seq
-  pendingRoot : (schedule.pendingTarget pendingItem).pointer.root = target.head.root
+  retryStart : Nat
+  retryAt : ∀ n, retry.state n = timeline (retryStart + n)
   responses : ScheduledFetchAdmission.ScheduledSufficientResponses
-    schedule.contacts schedule.peer schedule.pending schedule.pendingLink
-    schedule.pendingTarget pendingItem requirements retry.state
+    (Origin.canonical origin) target.head.seq target.head.root requirements retry.state
   promote : ∀ {heads}
     (accepted : MptsyncAdvertisementWindow.AcceptedLatest valid origin target.head heads)
     (finish : Nat),
     PermittedComplete publisher scope owner root (replicaOfState (retry.state finish)) →
-    Nonempty (PromotionWindow services origin target trace
+    Nonempty (PromotionWindow services origin target timeline tailOffset retryStart trace
       accepted publisher requirements retry finish)
 
 private theorem scheduled_accepted
-    (run : StableRun services origin target trace valid) :
+    (run : StableRun services origin target timeline tailOffset trace valid) :
     ∃ heads, Nonempty (MptsyncAdvertisementWindow.AcceptedLatest
       valid origin target.head heads) :=
   MptsyncAdvertisementWindow.scheduled_acceptance run.schedule run.advertisement
@@ -90,9 +100,10 @@ private theorem scheduled_accepted
 through actual scheduling, acceptance, authorized admissions, retry frames and
 promotion, then remains there under the actual reconciliation tail. -/
 theorem StableRun.converges
-    (run : StableRun services origin target trace valid)
+    (run : StableRun services origin target timeline tailOffset trace valid)
+    (tailObserved : ∀ n, trace.state n = timeline (tailOffset + n))
     (targetOrigin : target.head.origin = origin) :
-    EventuallyAlways fun n => CorrectView services origin target (trace.state n).db := by
+    EventuallyAlways fun n => CorrectView services origin target (timeline n).db := by
   obtain ⟨heads, ⟨accepted⟩⟩ := scheduled_accepted run
   have sufficient := ScheduledFetchAdmission.sufficientResponses run.responses
   obtain ⟨finish, after, complete⟩ :=
@@ -102,6 +113,16 @@ theorem StableRun.converges
   -- `promote` is the explicit eventual healthy-host opportunity after the
   -- finite authorized deficit has reached zero.
   obtain ⟨window⟩ := run.promote accepted finish completed
+  have _chronology : accepted.observedAt < tailOffset + window.index := by
+    calc
+      accepted.observedAt < accepted.handledAt := accepted.afterDelivery
+      _ ≤ run.retryStart := window.handledBeforeRetry
+      _ ≤ run.retryStart + window.retryIndex := Nat.le_add_right _ _
+      _ = tailOffset + window.index := window.sameTime
+  have _actualAcceptance : AcceptanceExecution accepted.keep
+      (timeline accepted.handledAt) heads (timeline run.retryStart) := by
+    rw [← window.acceptanceInitialAt, ← window.acceptedAt]
+    exact accepted.accepted.actual.execution
   have promotionRequirements : FiniteRequirements run.publisher window.opportunity.scope
       (window.opportunity.authority.provenance.map Origin.canonical)
       window.opportunity.pending.head.root := by
@@ -112,8 +133,29 @@ theorem StableRun.converges
       window.opportunity.pending.head.root (replicaOfState (run.retry.state finish)) := by
     simpa only [window.requirementScope, window.requirementOwner,
       window.requirementRoot] using completed
+  have retryCarried : EvidenceIncluded (replicaOfState (run.retry.state finish))
+      (replicaOfState (run.retry.state window.retryIndex)) := by
+    have carried := run.retry.carriedFrom finish (window.retryIndex - finish)
+    rwa [Nat.add_sub_of_le window.afterFinish] at carried
+  have promotionState : run.retry.state window.retryIndex = trace.state window.index := by
+    rw [run.retryAt, tailObserved, window.sameTime]
+  have acceptedStart : accepted.acceptedState = run.retry.state 0 := by
+    simpa only [Nat.add_zero, run.retryAt 0] using window.acceptedAt
+  have actualBetween : ReconciliationExecution.Execution (run.retry.state 0)
+      window.observations (run.retry.state window.retryIndex) := by
+    simpa only [← acceptedStart, promotionState] using window.intervening
+  have _actualSafety := Goals.Mptsync.M3.safety actualBetween
+  have carriedToStart : EvidenceIncluded (replicaOfState (run.retry.state finish))
+      (replicaOfState (trace.state window.index)) := by
+    rwa [promotionState] at retryCarried
+  have carriedToPrepared : EvidenceIncluded (replicaOfState (run.retry.state finish))
+      (replicaOfState window.opportunity.prepared) := by
+    exact carriedToStart.trans (ProductionTimeline.promotion_prepare_includes
+      (trace.state window.index) window.opportunity.opened window.opportunity.prepared
+      window.opportunity.tx origin window.now _ window.opportunity.began
+      window.opportunity.preparation)
   let ready := TrieCompleteConverse.ready_of_semantic_completion window.opportunity
-    run.publisher promotionRequirements promotionComplete window.carried
+    run.publisher promotionRequirements promotionComplete carriedToPrepared window.reads
   have reachedFinal : CorrectView services origin target ready.final.db := by
     exact StablePromotionTarget.actual_promotion_reaches_after_frames accepted.delivered
       accepted.accepted accepted.initialBound window.laterSlots window.noComplete ready
@@ -129,21 +171,31 @@ theorem StableRun.converges
   have reached : CorrectView services origin target (trace.state (window.index + 1)).db := by
     rw [sameFinal]
     exact reachedFinal
-  exact ReconciliationViewExecution.stable_tail trace services origin target accepted.final
-    window.stableViews window.world (window.index + 1) window.stableFacts reached
+  obtain ⟨localStart, stable⟩ := ReconciliationViewExecution.stable_tail trace services
+    origin target accepted.final window.stableViews window.world (window.index + 1)
+      window.stableFacts reached
+  refine ⟨tailOffset + localStart, fun now after => ?_⟩
+  obtain ⟨delta, rfl⟩ := Nat.exists_eq_add_of_le after
+  have held := stable (localStart + delta) (Nat.le_add_right localStart delta)
+  change CorrectView services origin target (trace.state (localStart + delta)).db at held
+  rw [tailObserved (localStart + delta)] at held
+  simpa only [Nat.add_assoc] using held
 
-/-- Actual per-origin reconciliation observations for one finite system
-coverage. The public database sequence is shared by all origin-specific views
-of a device; the event decomposition may differ only in which origin's
-invariant is being proved. -/
+/-- Actual reconciliation observations for one finite system coverage. Each
+device has one public production timeline and one shared stable tail; every
+origin-specific proof is anchored in those same observations. -/
 structure SystemExecution {Device : Type}
     (services : MaterializedView.Services) (scenario : Scenario Device)
     (databases : Nat → Device → Database) (coverage : FiniteCoverage scenario)
     (valid : Origin.Parsed → Head → Prop) where
-  localTrace : Device → Origin.Parsed → MptsyncStableTail.Trace
+  timeline : Device → Nat → SimulatedHost.State
+  tailTrace : Device → MptsyncStableTail.Trace
+  tailOffset : Device → Nat
+  tailObserved : ∀ device n,
+    (tailTrace device).state n = timeline device (tailOffset device + n)
   run : ∀ pair : Device × Origin.Parsed, pair ∈ coverage.pairs →
     StableRun services pair.2 (scenario.target pair.1 pair.2)
-      (localTrace pair.1 pair.2) (valid pair.2)
-  observed : ∀ device origin n, ((localTrace device origin).state n).db = databases n device
+      (timeline pair.1) (tailOffset pair.1) (tailTrace pair.1) (valid pair.2)
+  observed : ∀ device n, (timeline device n).db = databases n device
 
 end Synchronicity.MptsyncProductionConvergence

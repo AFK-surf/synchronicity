@@ -38,11 +38,11 @@ theorem eventual_convergence
   apply finite_targets_converge services scenario databases coverage
   intro pair member
   have convergence := (execution.run pair member).converges
-    (scenario.target_origin pair.1 pair.2)
+    (execution.tailObserved pair.1) (scenario.target_origin pair.1 pair.2)
   obtain ⟨start, stable⟩ := convergence
   refine ⟨start, fun now after => ?_⟩
   dsimp only
-  rw [← execution.observed pair.1 pair.2 now]
+  rw [← execution.observed pair.1 now]
   exact stable now after
 
 end Synchronicity.Goals.Mptsync.M1
