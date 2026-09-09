@@ -188,14 +188,17 @@ a separately verified scheduler or database implementation. M3 imposes no fairne
 successful-peer, ready-view or eventual-progress assumption.
 
 For M4, [PromotionPublication](../specs/lean/Synchronicity/PromotionPublication.lean)
-proves that a successful invocation executes its preparation, completeness and
-authority checks, materialization and commit. `promote_flipped` derives these
-witnesses and proves commit installs the materializer's entire staged database.
-Every body prefix keeps the committed database unchanged. `promote_failure`
-establishes the same for any failed invocation, including faults in commit,
-rollback and post-rollback retirement. Successful refusal may retire its pending
-target. M4 remains open: exact permitted-view readiness, diff/materialized-view
-correctness and retention refinement still need proofs. Neither walk exhaustion
+connects promotion to its checks, materialization and whole staged commit.
+Body prefixes and failed invocations preserve committed rows;
+successful refusal may retire pending work.
+[Diff semantics](../specs/lean/Synchronicity/TrieDiffSemantics.lean) prove exact
+payload comparison and position changes under explicit hash contracts.
+[Cursor semantics](../specs/lean/Synchronicity/TrieCursorSemantics.lean) connect
+actual reads to snapshot entries and justify shared-child pruning/enumeration.
+[Retention](../specs/lean/Synchronicity/MaterializationRetention.lean) protects
+referenced/forever-held content and establishes acquisition requests.
+M4 remains open: stream coverage, exact views, retention refinement and goal-level
+composition are unproved. Neither walk exhaustion
 nor successful materialization defines an exact view.
 
 Content histories require faithful metadata storage and a Bao decoder preserving

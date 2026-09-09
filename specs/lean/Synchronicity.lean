@@ -76,3 +76,4 @@ import Synchronicity.ReconciliationFloor
 import Synchronicity.Goals.Mptsync.M3
 import Synchronicity.ReconciliationSafety
 import Synchronicity.PromotionPublication
+import Synchronicity.MaterializationRetention

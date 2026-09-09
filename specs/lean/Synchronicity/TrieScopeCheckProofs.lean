@@ -1,6 +1,7 @@
 import VerifiedCore.Trie.ScopeCheck
 import Synchronicity.TrieSnapshotClosure
 import Synchronicity.TrieWalkProofs
+import Synchronicity.TrieCursorSemantics
 
 /-! A publication scope check must account for independently defined snapshot
 entries, rather than assuming that the walk visited everything it needed to.
@@ -12,10 +13,7 @@ open TrieProgramProofs TrieSnapshotProofs TrieSnapshotClosure
 /-- The raw snapshot visible to the current storage transaction. -/
 private def view (state : State) : RawSnapshot := readableBytes state
 
-/-- Meaning of the real walk cursor, including virtual compressed suffixes. -/
-private def CursorEntry (store : RawSnapshot) : Cursor → Path → ByteArray → Prop
-  | .empty, _, _ => False
-  | .at node, path, bytes => NodeEntries store node path bytes
+open TrieCursorSemantics (CursorEntry next_before_entry)
 
 @[simp] private theorem view_record (state : State) (event : String) :
     view (record state event) = view state := rfl
@@ -123,79 +121,6 @@ private theorem subtree_grants_entry (scope : Serve.Scope) (path tail : Path)
     (granted : scope.containsSubtree path = true) : scope.admitsKeyPath (path ++ tail) = true := by
   simp only [Serve.Scope.admitsKeyPath, Bool.or_eq_true]
   exact .inl (TrieServeProofs.containsSubtree_append scope path tail granted)
-
-private theorem occupied_before_entry (children : List (Option ByteArray)) (offset index : Nat)
-    (address : ByteArray) (edge : children[index]? = some (some address)) :
-    ∃ found, offset ≤ found ∧ found ≤ offset + index ∧
-      Cursor.nextChild.occupied children offset = some (UInt8.ofNat found) := by
-  induction children generalizing offset index with
-  | nil => simp at edge
-  | cons first rest ih =>
-    cases first with
-    | some _ => exact ⟨offset, Nat.le_refl _, Nat.le_add_right _ _, rfl⟩
-    | none =>
-      cases index with
-      | zero => simp at edge
-      | succ index =>
-        have tail : rest[index]? = some (some address) := by simpa using edge
-        obtain ⟨found, lower, upper, selected⟩ := ih (offset + 1) index tail
-        exact ⟨found, by omega, by omega, selected⟩
-
-private theorem branch_next_before_entry (children : List (Option ByteArray))
-    (start nibble : UInt8) (child : ByteArray)
-    (edge : children[nibble.toNat]? = some (some child)) (lower : start.toNat ≤ nibble.toNat)
-    (bounded : nibble.toNat < 16) :
-    ∃ found, start.toNat ≤ found.toNat ∧ found.toNat ≤ nibble.toNat ∧
-      Cursor.nextChild.occupied (children.drop start.toNat) start.toNat = some found := by
-  have remaining : (children.drop start.toNat)[nibble.toNat - start.toNat]? = some (some child) := by
-    simpa [List.getElem?_drop, Nat.add_sub_of_le lower] using edge
-  obtain ⟨found, first, last, selected⟩ := occupied_before_entry
-    (children.drop start.toNat) start.toNat (nibble.toNat - start.toNat) child remaining
-  have upper : found ≤ nibble.toNat := by omega
-  have converted : (UInt8.ofNat found).toNat = found := by
-    exact TrieCodecProofs.toNat_ofNat_of_lt (by omega)
-  exact ⟨UInt8.ofNat found, by simpa only [converted] using first,
-    by simpa only [converted] using upper, selected⟩
-
-private theorem byte_get_optional (bytes : ByteArray) (index : Nat) :
-    bytes[index]? = bytes.data[index]? := by
-  simp [getElem?_def, ByteArray.getElem_eq_getElem_data]
-
-/-- A queued entry prevents the cursor's child enumerator from skipping
-past its nibble. This is about the actual occupied-slot implementation. -/
-private theorem next_before_entry (entry : CursorEntry store cursor (nibble :: tail) bytes)
-    (start : UInt8) (lower : start.toNat ≤ nibble.toNat) (bounded : nibble.toNat < 16) :
-    ∃ found, start.toNat ≤ found.toNat ∧ found.toNat ≤ nibble.toNat ∧
-      cursor.nextChild start = some found := by
-  cases cursor with
-  | empty => cases entry
-  | «at» node =>
-    cases node with
-    | leaf suffix value =>
-      obtain ⟨same, _⟩ := entry
-      have first : suffix[0]? = some nibble := by
-        have index := congrArg (fun path : Path => path[0]?) same.symm
-        simpa [TrieWalkProofs.toList_eq, byte_get_optional] using index
-      refine ⟨nibble, lower, Nat.le_refl _, ?_⟩
-      simp [Cursor.nextChild, first, UInt8.le_iff_toNat_le, lower]
-    | extension segment child =>
-      obtain ⟨nonempty, rest, same, _⟩ := entry
-      cases segmentList : segment.toList with
-      | nil => exact False.elim (nonempty segmentList)
-      | cons first remaining =>
-        have sameFirst : nibble = first := by simpa [segmentList] using congrArg List.head? same
-        subst first
-        have index : segment[0]? = some nibble := by
-          have first := congrArg (fun path : Path => path[0]?) segmentList
-          simpa [TrieWalkProofs.toList_eq, byte_get_optional] using first
-        refine ⟨nibble, lower, Nat.le_refl _, ?_⟩
-        simp [Cursor.nextChild, index, UInt8.le_iff_toNat_le, lower]
-    | branch children value =>
-      obtain ⟨child, edge, _⟩ := entry
-      exact branch_next_before_entry children start nibble child edge lower bounded
-    | route children value =>
-      obtain ⟨child, edge, _⟩ := entry
-      exact branch_next_before_entry children start nibble child edge lower bounded
 
 private theorem cursor_at_preserves (state : State) (hash : Option ByteArray)
     (quiet : state.faults = []) :

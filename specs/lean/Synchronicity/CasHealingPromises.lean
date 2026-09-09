@@ -32,7 +32,7 @@ private theorem conflict_key (incoming current : Fields)
     intro _
     exact (beq_iff_eq (a := ar) (b := br))
 
-private theorem upsert_hasKey (table : List Fields) (incoming : Fields) (key : Key)
+theorem upsert_hasKey (table : List Fields) (incoming : Fields) (key : Key)
     (valid : WellKeyed table) (incomingValid : (keyOf incoming).isSome = true) :
     hasKey (upsertRows table incoming ["root", "holder"] []) key ↔
       hasKey table key ∨ keyOf incoming = some key := by
