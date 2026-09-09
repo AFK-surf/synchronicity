@@ -4,6 +4,7 @@ import Synchronicity.PromotionBaseline
 import Synchronicity.PromotionContinuationBaseline
 import Synchronicity.ScopeChangePromotionBaseline
 import Synchronicity.ScopeChangeRefinement
+import Synchronicity.MptsyncRefusalCache
 import Synchronicity.ScheduledFetchAdmission
 import Synchronicity.ProductionTimeline
 import Synchronicity.MptsyncViewCarry
@@ -36,6 +37,8 @@ semantic completion result nor `Ready`. -/
 structure ProductionPromotionOpportunity (origin : Origin.Parsed) (now : Int64)
     (refused : List (UInt64 × ByteArray × ByteArray))
     (state : SimulatedHost.State) where
+  cache : MptsyncRefusalCache.Cache
+  refusalProjection : refused = cache.forOrigin (Origin.canonical origin)
   raw : PromotionOpportunity origin now refused state
   publisher : TrieProgramProofs.RawSnapshot
   requirements : FiniteRequirements publisher raw.scope
@@ -106,13 +109,14 @@ inductive EstablishedView (services : MaterializedView.Services)
       (aligned : TargetAlignment target state world opportunity) :
       EstablishedView services origin opportunity.raw.final target
   | changed
-      (production : ScopeChangeRefinement.Successful spaces changedAt before state report)
+      (opportunity : ProductionPromotionOpportunity origin now refused state)
+      (reset : MptsyncRefusalCache.ScopeResetObservation spaces changedAt before state report
+        cacheBefore opportunity.cache)
       (quiet : before.faults = [])
       (reported : decision ∈ report.demotions)
       (originAligned : decision.complete.origin = Origin.canonical origin)
       (metadata : ScopeChangePromotionBaseline.MetadataContracts
         state.db origin world services)
-      (opportunity : ProductionPromotionOpportunity origin now refused state)
       (host : HostContracts state world services)
       (aligned : TargetAlignment target state world opportunity) :
       EstablishedView services origin opportunity.raw.final target
@@ -141,9 +145,9 @@ theorem EstablishedView.correct
   | clean baseline opportunity host aligned =>
       exact correct_of_opportunity opportunity _ _ host
         (PromotionBaseline.initial_origin baseline) _ aligned
-  | changed production quiet reported originAligned metadata opportunity host aligned =>
+  | changed opportunity reset quiet reported originAligned metadata host aligned =>
       obtain ⟨source, raw⟩ :=
-        ScopeChangeRefinement.successful_change_raw production quiet reported
+        ScopeChangeRefinement.successful_change_raw reset.durable quiet reported
       have baseline := ScopeChangePromotionBaseline.clean_origin_baseline raw
         originAligned metadata
       exact correct_of_opportunity opportunity _ _ host
@@ -168,32 +172,34 @@ theorem EstablishedView.nextInitial
 start: first use, a committed scope reset, or a preceding actual promotion.
 No constructor stores the old-view correctness conclusion. -/
 inductive InitialViewEvidence (services : MaterializedView.Services)
-    (origin : Origin.Parsed) (state : State) (world : TrieDiffCoverage.World) : Prop where
+    (origin : Origin.Parsed) (state : State) (world : TrieDiffCoverage.World)
+    (cache : MptsyncRefusalCache.Cache) : Prop where
   | clean
       (baseline : PromotionBaseline.CleanOriginBaseline state.db origin world services) :
-      InitialViewEvidence services origin state world
+      InitialViewEvidence services origin state world cache
   | changed
-      (production : ScopeChangeRefinement.Successful spaces changedAt before state report)
+      (reset : MptsyncRefusalCache.ScopeResetObservation spaces changedAt before state report
+        cacheBefore cache)
       (quiet : before.faults = [])
       (reported : decision ∈ report.demotions)
       (originAligned : decision.complete.origin = Origin.canonical origin)
       (metadata : ScopeChangePromotionBaseline.MetadataContracts
         state.db origin world services) :
-      InitialViewEvidence services origin state world
+      InitialViewEvidence services origin state world cache
   | continued
       (history : EstablishedView services origin state previous)
       (metadata : PromotionContinuationBaseline.MetadataContracts
         state.db origin previous world services) :
-      InitialViewEvidence services origin state world
+      InitialViewEvidence services origin state world cache
 
 theorem InitialViewEvidence.initial
-    (evidence : InitialViewEvidence services origin state world) :
+    (evidence : InitialViewEvidence services origin state world cache) :
     PromotionInitialView.Initial state.db origin world services := by
   cases evidence with
   | clean baseline => exact PromotionBaseline.initial_origin baseline
-  | changed production quiet reported originAligned metadata =>
+  | changed reset quiet reported originAligned metadata =>
       obtain ⟨source, raw⟩ :=
-        ScopeChangeRefinement.successful_change_raw production quiet reported
+        ScopeChangeRefinement.successful_change_raw reset.durable quiet reported
       exact PromotionBaseline.initial_origin
         (ScopeChangePromotionBaseline.clean_origin_baseline raw originAligned metadata)
   | continued history metadata => exact history.nextInitial metadata
