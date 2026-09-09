@@ -1,6 +1,7 @@
 import Synchronicity.MptsyncStableTail
 import Synchronicity.PromotionAtomicView
 import Synchronicity.AcceptanceProgress
+import Synchronicity.ReconciliationPayloadFrame
 
 /-! Refinement of actual reconciliation operations to the stable public-view
 transition.  Execution witnesses remain in `ReconciliationExecution`; the
@@ -108,8 +109,8 @@ theorem payload_step_refines (step : Step event state final)
       ⟨target.head.seq, target.head.root⟩ = latest)
     (frame : MptsyncStableTail.PayloadFrame state.db final.db) :
     MptsyncStableTail.Refines services origin target state.db final.db := by
-  exact Or.inr (Or.inr ⟨frame, installed_after_step step origin target beforeView afterView
-    before after sameOrigin installed targetLatest⟩)
+  exact Or.inr (Or.inr (Or.inl ⟨frame, installed_after_step step origin target beforeView afterView
+    before after sameOrigin installed targetLatest⟩))
 
 /-- A direct actual production promotion refines the stable public transition.
 All M4 host/snapshot premises are explicit; no promotion result is assumed. -/
@@ -231,5 +232,126 @@ theorem completed_settlement_refines
         subst replicas
         exact Or.inr (Or.inl ⟨by rw [finalState, ← currentDb, facts.snapshot]; exact ready,
           selected⟩)
+
+/-- Stable-tail evidence is stated over actual raw observations. It contains
+slot representations/maxima and host facts, never `Refines` or `CorrectView`. -/
+structure StableFacts (trace : MptsyncStableTail.Trace)
+    (services : MaterializedView.Services) (origin : Origin.Parsed)
+    (target : ViewTarget) (latest : Nat) (views : Nat → HeadView)
+    (world : TrieDiffCoverage.World) : Prop where
+  targetOrigin : target.head.origin = origin
+  targetLatest : AcceptanceProgress.versionRank
+    ⟨target.head.seq, target.head.root⟩ = latest
+  slots : ∀ n, AcceptanceProgress.StableSlots (trace.state n)
+    (Origin.canonical origin) latest (views n)
+  promotionHost : ∀ n now refused,
+    trace.event n = .promotion origin now refused →
+      PromotionHost origin target world services (trace.state n)
+  foreignPromotion : ∀ n promoted now refused,
+    trace.event n = .promotion promoted now refused → promoted ≠ origin →
+      MptsyncStableTail.ForeignFrame origin target (trace.state n).db
+        (trace.state (n + 1)).db
+  settlementHost : ∀ n refused scope fetchTarget key,
+    trace.event n = .settlement origin refused scope fetchTarget key (.ok true) →
+      ∀ now current,
+        execute (raise Promote.Error.host Clock.nowNs : Fetch.Action Int64) (trace.state n) =
+          (.ok now, current) → PromotionHost origin target world services current
+  foreignSettlement : ∀ n settled refused scope fetchTarget key,
+    trace.event n = .settlement settled refused scope fetchTarget key (.ok true) →
+      settled ≠ origin → MptsyncStableTail.ForeignFrame origin target (trace.state n).db
+        (trace.state (n + 1)).db
+
+private theorem stable_step_refines
+    (trace : MptsyncStableTail.Trace) (services : MaterializedView.Services)
+    (origin : Origin.Parsed) (target : ViewTarget) (latest : Nat)
+    (views : Nat → HeadView) (world : TrieDiffCoverage.World)
+    (facts : StableFacts trace services origin target latest views world)
+    (n : Nat) (correct : CorrectView services origin target (trace.state n).db) :
+    MptsyncStableTail.Refines services origin target (trace.state n).db
+      (trace.state (n + 1)).db := by
+  have actual := trace.step n
+  generalize eventEq : trace.event n = event at actual
+  have payload (nonPublishing : ReconciliationPayloadFrame.NonPublishing event) :=
+    payload_step_refines actual origin target services (views n) (views (n + 1))
+      (facts.slots n) (facts.slots (n + 1)) facts.targetOrigin correct.2.1
+      facts.targetLatest (ReconciliationPayloadFrame.step_payload actual nonPublishing)
+  cases event with
+  | advertisement => exact payload trivial
+  | request => exact payload trivial
+  | retirement => exact payload trivial
+  | selection => exact payload trivial
+  | abandonment => exact payload trivial
+  | promotion promoted now refused =>
+    by_cases same : promoted = origin
+    · subst promoted
+      have host := facts.promotionHost n now refused eventEq
+      exact promotion_refines actual target world services host.snapshot host.closed host.faithful
+        host.normalization host.relational host.initial host.policy (views n) (views (n + 1))
+        (facts.slots n) (facts.slots (n + 1)) facts.targetOrigin correct.2.1 facts.targetLatest
+    · exact Or.inr (Or.inr (Or.inr ⟨facts.foreignPromotion n promoted now refused eventEq same,
+        installed_after_step actual origin target (views n) (views (n + 1))
+          (facts.slots n) (facts.slots (n + 1)) facts.targetOrigin correct.2.1
+          facts.targetLatest⟩))
+  | settlement settled refused scope fetchTarget key result =>
+    cases result with
+    | error _ => exact payload trivial
+    | ok complete =>
+      cases complete with
+      | false => exact payload trivial
+      | true =>
+        by_cases same : settled = origin
+        · subst settled
+          exact completed_settlement_refines actual target world services
+            (facts.settlementHost n refused scope fetchTarget key eventEq)
+            (views n) (views (n + 1)) (facts.slots n) (facts.slots (n + 1))
+            facts.targetOrigin correct.2.1 facts.targetLatest
+        · exact Or.inr (Or.inr (Or.inr ⟨
+            facts.foreignSettlement n settled refused scope fetchTarget key eventEq same,
+            installed_after_step actual origin target (views n) (views (n + 1))
+              (facts.slots n) (facts.slots (n + 1)) facts.targetOrigin correct.2.1
+              facts.targetLatest⟩))
+
+private theorem correct_from (trace : MptsyncStableTail.Trace)
+    (services : MaterializedView.Services) (origin : Origin.Parsed) (target : ViewTarget)
+    (latest : Nat) (views : Nat → HeadView) (world : TrieDiffCoverage.World)
+    (facts : StableFacts trace services origin target latest views world)
+    (start : Nat) (reached : CorrectView services origin target (trace.state start).db) :
+    ∀ n, start ≤ n → CorrectView services origin target (trace.state n).db := by
+  have steps : ∀ offset,
+      CorrectView services origin target (trace.state (start + offset)).db := by
+    intro offset
+    induction offset with
+    | zero => simpa using reached
+    | succ offset correct =>
+      rw [Nat.add_succ]
+      exact MptsyncStableTail.refines_preserves
+        (stable_step_refines trace services origin target latest views world facts
+          (start + offset) correct) correct
+  intro n after
+  obtain ⟨offset, rfl⟩ := Nat.exists_eq_add_of_le after
+  exact steps offset
+
+/-- Actual slot observations, actual non-publication frames, and the explicit
+M4 host contracts derive refinement of the whole production tail. -/
+theorem trace_refinedFrom (trace : MptsyncStableTail.Trace)
+    (services : MaterializedView.Services) (origin : Origin.Parsed) (target : ViewTarget)
+    (latest : Nat) (views : Nat → HeadView) (world : TrieDiffCoverage.World)
+    (facts : StableFacts trace services origin target latest views world)
+    (start : Nat) (reached : CorrectView services origin target (trace.state start).db) :
+    MptsyncStableTail.RefinedFrom trace services origin target start := by
+  intro n after
+  exact stable_step_refines trace services origin target latest views world facts n
+    (correct_from trace services origin target latest views world facts start reached n after)
+
+/-- Reached correctness plus the derived production refinement yields the
+stable suffix required by M1, without assuming `RefinedFrom`. -/
+theorem stable_tail (trace : MptsyncStableTail.Trace)
+    (services : MaterializedView.Services) (origin : Origin.Parsed) (target : ViewTarget)
+    (latest : Nat) (views : Nat → HeadView) (world : TrieDiffCoverage.World)
+    (facts : StableFacts trace services origin target latest views world)
+    (start : Nat) (reached : CorrectView services origin target (trace.state start).db) :
+    EventuallyAlways fun n => CorrectView services origin target (trace.state n).db :=
+  MptsyncStableTail.eventuallyAlways_of_refined_actual_tail trace services origin target start reached
+    (trace_refinedFrom trace services origin target latest views world facts start reached)
 
 end Synchronicity.ReconciliationViewExecution

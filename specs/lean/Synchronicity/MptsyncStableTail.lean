@@ -15,6 +15,18 @@ def PayloadFrame (before after : Database) : Prop :=
   rows after "pins" = rows before "pins" ∧
   rows after "content_want" = rows before "content_want"
 
+/-- Cross-origin publication contract. The production SQL must leave this
+origin's file observations unchanged, while the foreign M4 ready view (under
+the same device replica policy) re-establishes global current and forever
+retention duties. This is deliberately field-level, not `CorrectView`. -/
+structure ForeignFrame (origin : Origin.Parsed) (target : ViewTarget)
+    (before after : Database) : Prop where
+  files : ∀ space path values,
+    MaterializedView.Observed after (Origin.canonical origin) (.file space path) values ↔
+      MaterializedView.Observed before (Origin.canonical origin) (.file space path) values
+  current : MaterializedView.CurrentRequirements target.replicas after
+  forever : MaterializedView.ForeverRequirements target.replicas before after
+
 /-- One public observation either remains byte-for-byte unchanged, or is an
 M4-ready replacement for exactly the stable target. The final installed-head
 condition is the version-selection fact supplied by M2/M3. -/
@@ -25,14 +37,15 @@ def Refines (services : MaterializedView.Services) (origin : Origin.Parsed)
     (AtomicFileView.Ready services target.snapshot origin target.scope target.replicas before after ∧
       ∀ head, head.origin = origin → AtomicFileView.Installed after head →
         head.seq = target.head.seq ∧ head.root = target.head.root) ∨
-    PayloadFrame before after ∧ AtomicFileView.Installed after target.head
+    PayloadFrame before after ∧ AtomicFileView.Installed after target.head ∨
+    ForeignFrame origin target before after ∧ AtomicFileView.Installed after target.head
 
 theorem refines_preserves (step : Refines services origin target before after)
     (correct : CorrectView services origin target before) :
     CorrectView services origin target after := by
   rcases step with unchanged | replacement
   · exact MptsyncViewStability.unchanged_preserves_correct target correct unchanged
-  · rcases replacement with ⟨ready, selected⟩ | ⟨frame, installed⟩
+  · rcases replacement with ⟨ready, selected⟩ | ⟨frame, installed⟩ | ⟨frame, installed⟩
     · obtain ⟨head, headOrigin, installed, files, current, forever⟩ := ready
       obtain ⟨sameSeq, sameRoot⟩ := selected head headOrigin installed
       have targetOrigin := correct.1
@@ -57,6 +70,11 @@ theorem refines_preserves (step : Refines services origin target before after)
           MaterializationRetention.Required, entries, pins, wants] using correct.2.2.2.1
       · simpa only [MaterializedView.ForeverRequirements,
           MaterializationRetention.Required, pins, wants] using correct.2.2.2.2
+    · refine ⟨correct.1, installed, ?_, frame.current,
+        MptsyncViewStability.forever_trans correct.2.2.2.2 frame.forever⟩
+      intro space path values
+      rw [frame.files]
+      exact correct.2.2.1 space path values
 
 /-- An infinite production trace. Its constructor stores only actual step
 facts, without stability, readiness, projection or correctness assumptions. -/
