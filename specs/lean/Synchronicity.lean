@@ -36,6 +36,7 @@ import Synchronicity.CasCollectProofs
 import Synchronicity.CasProjectProofs
 import Synchronicity.TrieServeProofs
 import Synchronicity.TrieServePrivacyProofs
+import Synchronicity.TrieServeEvidence
 import Synchronicity.TrieMissingProofs
 import Synchronicity.TrieCompleteProofs
 import Synchronicity.TrieCollectProofs
