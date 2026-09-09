@@ -1,6 +1,7 @@
 import Synchronicity.PromotionProgress
 import Synchronicity.AcceptanceProgress
 import Synchronicity.ReconciliationFloor
+import Synchronicity.StableAdvertisementProgress
 
 /-! Connect the version selected by stable advertisement handling to the
 candidate read by a later production promotion.  Selection is observed in the
@@ -38,5 +39,22 @@ theorem ready_uses_observed_pending
   have sameCandidate : current = ready.pending := Option.some.inj selected.symm
   subst current
   exact ⟨by simpa using sameSeq, sameRoot⟩
+
+/-- Delivery of the stable greatest signed head, its actual acceptance fold,
+and an empty complete slot determine the later production promotion candidate.
+No selected-version or promotion-result premise is needed. -/
+theorem ready_uses_delivered_latest
+    (delivered : StableAdvertisementProgress.DeliveredLatest valid origin latestHead heads)
+    (accepted : ObservedAcceptanceFold (Origin.canonical origin) keep initial
+      initialState initialView initialSlots heads final state view)
+    (initialBound : initial ≤ rank latestHead)
+    (complete : view (Origin.canonical origin) .complete = none)
+    (ready : PromotionProgress.Ready origin now refused state) :
+    ready.pending.head.seq = latestHead.seq ∧
+      ready.pending.head.root = latestHead.root := by
+  have selected := StableAdvertisementProgress.actual_fold_selects_latest
+    delivered accepted initialBound
+  have pending := pending_of_selected_without_complete complete selected
+  exact ready_uses_observed_pending ready accepted.final_stable pending
 
 end Synchronicity.StablePromotionTarget
