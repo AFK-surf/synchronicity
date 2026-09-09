@@ -2,6 +2,7 @@ import Synchronicity.TableInvariant
 import Synchronicity.ReconciliationFailure
 import Synchronicity.MptsyncStableTail
 import Synchronicity.FetchPayloadFrame
+import Synchronicity.AcceptanceProgress
 
 /-! Actual signed-head acceptance changes only heads/history bookkeeping.  The
 materialized payload and retention tables are framed through every transaction
@@ -107,6 +108,25 @@ theorem accept_payload (head : Head) (now : Int64) (keep : Nat)
   exact ⟨accept_relation "entries" (by decide) (by decide) head now keep state closed,
     accept_relation "pins" (by decide) (by decide) head now keep state closed,
     accept_relation "content_want" (by decide) (by decide) head now keep state closed⟩
+
+/-- A whole actual acceptance fold preserves materialized entries. This is
+the scope-change bridge used before retry starts. -/
+theorem acceptance_fold_entries
+    (run : AcceptanceProgress.ActualAcceptanceFold origin keep initial state
+      heads final finalState) :
+    rows finalState.db "entries" = rows state.db "entries" := by
+  induction run with
+  | nil => rfl
+  | advance current state head tail named strict candidateValid ready rest ih =>
+    have step := accept_relation "entries" (by decide) (by decide)
+      head state.now keep state ready.noOpenTransaction
+    rw [AcceptanceProgress.newer_executes head keep state ready] at step
+    exact ih.trans step
+  | retain current state head tail named blocked ready rest ih =>
+    have step := accept_relation "entries" (by decide) (by decide)
+      head state.now keep state ready.noOpenTransaction
+    rw [AcceptanceProgress.obsolete_executes head keep state ready] at step
+    exact ih.trans step
 
 def RetireAllowed (relation : String) (A : Type) : Promote.Effects A → Prop
   | .left (.left effect) => TableInvariant.StorageAllowed relation effect

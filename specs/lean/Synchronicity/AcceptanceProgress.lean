@@ -814,6 +814,26 @@ theorem ObservedAcceptanceFold.final_stable
   | retain current state view stable head tail named blocked ready afterView
       afterRepresents afterBacked rest ih => exact ih
 
+/-- Acceptance writes only the pending slot. Across an observed fold the
+complete version therefore remains exactly the initial complete version. -/
+theorem ObservedAcceptanceFold.complete_preserved
+    (run : ObservedAcceptanceFold origin keep initial state view stable
+      heads final finalState finalView) :
+    finalView origin .complete = view origin .complete := by
+  induction run with
+  | nil => rfl
+  | advance current state view stable head tail named strict candidateValid ready afterView
+      afterRepresents afterBacked completeFrame rest ih =>
+    exact ih.trans completeFrame
+  | retain current state view stable head tail named blocked ready afterView
+      afterRepresents afterBacked rest ih =>
+    have sameRows : rows ready.afterCommit.db "heads" = rows state.db "heads" := by
+      have kept := obsolete_preserves_heads head keep state ready
+      rw [obsolete_executes head keep state ready] at kept
+      exact kept
+    have kept := represented_slot_eq stable.represents afterRepresents sameRows origin .complete
+    exact ih.trans kept
+
 /-- Factual execution trace, independent of the semantic rank proof. -/
 inductive AcceptanceExecution (keep : Nat) : State → List Head → State → Prop where
   | nil (state : State) : AcceptanceExecution keep state [] state

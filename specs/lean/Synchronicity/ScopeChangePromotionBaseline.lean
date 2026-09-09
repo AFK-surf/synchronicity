@@ -1,5 +1,6 @@
 import Synchronicity.ScopeChangeRefinement
 import Synchronicity.PromotionBaseline
+import Synchronicity.HeadView
 
 /-! Permission-change cleanup supplies the origin-local empty database facts
 needed by the next promotion.  Schema, immutable-snapshot and materialization
@@ -62,6 +63,44 @@ private theorem no_joined_slot_of_raw_empty (db : Database) (origin slot : Strin
   rw [filtered] at present
   exact List.not_mem_nil present
 
+private theorem no_selected_complete_of_raw_empty (db : Database) (origin : String)
+    (empty : query db "heads"
+      ["origin_id", "slot", "seq", "root", "received_at", "verified_at"]
+      [("origin_id", .text origin), ("slot", .text "complete")] [] [] = []) :
+    ¬ ∃ row, HeadView.Selected db origin .complete row := by
+  have rawRows :
+      ((rows db "heads").filter fun candidate =>
+        equals candidate [("origin_id", .text origin), ("slot", .text "complete")]).map
+          (project ["origin_id", "slot", "seq", "root", "received_at", "verified_at"]) =
+        [] := by
+    rw [← SimulatedHost.unordered_query]
+    exact empty
+  have filtered :
+      (rows db "heads").filter (fun candidate =>
+        equals candidate [("origin_id", .text origin), ("slot", .text "complete")]) = [] :=
+    List.map_eq_nil_iff.mp rawRows
+  rintro ⟨row, member, named⟩
+  have present : row ∈ (rows db "heads").filter (fun candidate =>
+      equals candidate [("origin_id", .text origin), ("slot", .text "complete")]) := by
+    exact List.mem_filter.mpr ⟨member, named⟩
+  rw [filtered] at present
+  exact List.not_mem_nil present
+
+/-- The two origin-local absence facts established by an actual committed
+scope change, exposed separately so later real acceptance/retry frames can
+transport them to promotion time. -/
+theorem invalidated_absence
+    (raw : ScopeChangeRefinement.RawInvalidated decision now db)
+    (originAligned : decision.complete.origin = Origin.canonical origin) :
+    (¬ ∃ row, HeadView.Selected db (Origin.canonical origin) .complete row) ∧
+      (rows db "entries").any
+        (fun row => equals row [("origin_id", .text (Origin.canonical origin))]) = false := by
+  rcases raw with ⟨⟨noComplete, _, noEntries, _, _⟩, _⟩
+  constructor
+  · rw [← originAligned]
+    exact no_selected_complete_of_raw_empty db decision.complete.origin noComplete
+  · rwa [← originAligned]
+
 private theorem no_origin_entries
     (absent : (rows db "entries").any
       (fun row => equals row [("origin_id", .text origin)]) = false) :
@@ -76,6 +115,41 @@ private theorem no_origin_entries
     simpa [SimulatedHost.equals] using selected.1
   rw [originSelected] at originAbsent
   contradiction
+
+private theorem no_complete_query_of_absence
+    (absent : ¬ ∃ row, HeadView.Selected db (Origin.canonical origin) .complete row) :
+    query db "heads" History.headColumns
+      [("origin_id", .text (Origin.canonical origin)), ("slot", .text "complete")]
+      [] History.headJoin = [] := by
+  rw [ReconciliationRead.slot_query]
+  apply List.map_eq_nil_iff.mpr
+  apply List.filter_eq_nil_iff.mpr
+  intro joined joinedMember
+  obtain ⟨row, rowMember, joinedMember⟩ := List.mem_flatMap.mp joinedMember
+  obtain ⟨history, _, rfl⟩ := List.mem_map.mp joinedMember
+  rw [ReconciliationRead.joined_names]
+  intro named
+  exact absent ⟨row, rowMember, named⟩
+
+/-- Origin-local raw absence at a later actual observation is sufficient for
+the same empty-view baseline as scope cleanup. The caller must derive these
+two absence facts from the intervening production executions. -/
+theorem clean_origin_baseline_of_absence
+    (completeAbsent : ¬ ∃ row,
+      HeadView.Selected db (Origin.canonical origin) .complete row)
+    (entriesAbsent : (rows db "entries").any
+      (fun row => equals row [("origin_id", .text (Origin.canonical origin))]) = false)
+    (metadata : MetadataContracts db origin world services) :
+    PromotionBaseline.CleanOriginBaseline db origin world services := by
+  exact
+    { schema := metadata.schema
+      noComplete := no_complete_query_of_absence completeAbsent
+      noEntries := no_origin_entries entriesAbsent
+      emptySnapshot := metadata.emptySnapshot
+      policiesAgree := metadata.policiesAgree
+      current := metadata.current
+      unique := metadata.unique
+      supported := metadata.supported }
 
 /-- The actual committed M8 cleanup, aligned with its typed decision origin,
 provides the two database-absence fields of the promotion baseline.  All
