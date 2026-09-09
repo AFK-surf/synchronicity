@@ -91,3 +91,4 @@ import Synchronicity.Goals.Mptsync.M4
 import Synchronicity.Goals.Mptsync.M2
 import Synchronicity.Goals.Mptsync.M6
 import Synchronicity.MptsyncConvergence
+import Synchronicity.MptsyncViewStability
