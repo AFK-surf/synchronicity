@@ -118,8 +118,10 @@ inductive EstablishedView (services : MaterializedView.Services)
       EstablishedView services origin opportunity.raw.final target
   | continued
       (previous : EstablishedView services origin prior previousTarget)
+      (intervening : MptsyncViewCarry.StablePrefix services origin previousTarget
+        previousLatest carryWorld prior beforeAcceptance)
       (acceptance : AcceptanceProgress.ObservedAcceptanceFold
-        (Origin.canonical origin) keep initial prior initialView initialSlots
+        (Origin.canonical origin) keep initial beforeAcceptance initialView initialSlots
           heads final accepted acceptedView)
       (opportunity : ProductionPromotionOpportunity origin now refused state)
       (acceptedStart : accepted = opportunity.retry.state 0)
@@ -146,8 +148,9 @@ theorem EstablishedView.correct
         originAligned metadata
       exact correct_of_opportunity opportunity _ _ host
         (PromotionBaseline.initial_origin baseline) _ aligned
-  | continued previous acceptance opportunity acceptedStart promotionState metadata host aligned ih =>
-      have carried := MptsyncViewCarry.correct_after_acceptance_and_retry ih
+  | continued previous intervening acceptance opportunity acceptedStart promotionState metadata host aligned ih =>
+      have beforeAcceptance := intervening.preserves ih
+      have carried := MptsyncViewCarry.correct_after_acceptance_and_retry beforeAcceptance
         acceptance opportunity.retry acceptedStart promotionState
       exact correct_of_opportunity opportunity _ _ host
         (PromotionContinuationBaseline.initial_of_correct carried metadata) _ aligned

@@ -453,6 +453,93 @@ structure StableFacts (trace : MptsyncStableTail.Trace)
           (.ok clockNow, current) →
             ForeignPromotionHost origin settled target world services current
 
+/-- Raw facts for one actual reconciliation step in a stable version/policy
+window. This is the finite-prefix counterpart of `StableFacts`: it contains no
+`Refines`, `CorrectView`, `Initial`, or successful operation result. -/
+structure StableStepFacts (event : ReconciliationExecution.Event)
+    (state final : State) (services : MaterializedView.Services)
+    (origin : Origin.Parsed) (target : ViewTarget) (latest : Nat)
+    (world : TrieDiffCoverage.World) where
+  beforeView : HeadView
+  afterView : HeadView
+  targetOrigin : target.head.origin = origin
+  targetLatest : AcceptanceProgress.versionRank
+    ⟨target.head.seq, target.head.root⟩ = latest
+  before : StableSlotInputs state (Origin.canonical origin) latest beforeView
+  after : StableSlotInputs final (Origin.canonical origin) latest afterView
+  promotionHost : ∀ now refused, event = .promotion origin now refused →
+    PromotionHost origin target world services state
+  foreignPromotion : ∀ promoted now refused,
+    event = .promotion promoted now refused → promoted ≠ origin →
+      ForeignPromotionHost origin promoted target world services state
+  settlementHost : ∀ refused scope fetchTarget key,
+    event = .settlement origin refused scope fetchTarget key (.ok true) →
+      ∀ now current,
+        execute (raise Promote.Error.host Clock.nowNs : Fetch.Action Int64) state =
+          (.ok now, current) → PromotionHost origin target world services current
+  foreignSettlement : ∀ settled refused scope fetchTarget key,
+    event = .settlement settled refused scope fetchTarget key (.ok true) →
+      settled ≠ origin → ∀ clockNow current,
+        execute (raise Promote.Error.host Clock.nowNs : Fetch.Action Int64) state =
+          (.ok clockNow, current) →
+            ForeignPromotionHost origin settled target world services current
+
+/-- Every production event, including same/foreign promotion and completed
+settlement, refines the common public-view transition from only the actual step
+and its raw stable facts. -/
+theorem stable_actual_step_refines
+    (actual : ReconciliationExecution.Step event state final)
+    (facts : StableStepFacts event state final services origin target latest world)
+    (correct : CorrectView services origin target state.db) :
+    MptsyncStableTail.Refines services origin target state.db final.db ∧
+      AcceptanceProgress.StableSlots final (Origin.canonical origin) latest facts.afterView := by
+  have installedNext := installed_after_step actual origin target facts.beforeView facts.afterView
+    facts.before facts.after facts.targetOrigin correct.2.1 facts.targetLatest
+  have nextSlots := stable_slots_of_installed facts.after target facts.targetOrigin installedNext
+    facts.targetLatest
+  have refinement : MptsyncStableTail.Refines services origin target state.db final.db := by
+    have payload (nonPublishing : ReconciliationPayloadFrame.NonPublishing event) :=
+      payload_step_refines actual origin target services facts.beforeView facts.afterView
+        facts.before facts.after facts.targetOrigin correct.2.1 facts.targetLatest
+        (ReconciliationPayloadFrame.step_payload actual nonPublishing)
+    cases event with
+    | advertisement => exact payload trivial
+    | request => exact payload trivial
+    | retirement => exact payload trivial
+    | selection => exact payload trivial
+    | abandonment => exact payload trivial
+    | promotion promoted now refused =>
+      by_cases same : promoted = origin
+      · subst promoted
+        have host := facts.promotionHost now refused rfl
+        exact promotion_refines actual target world services host.snapshot host.closed host.faithful
+          host.normalization host.relational
+          (PromotionContinuationBaseline.initial_of_correct correct host.metadata) host.policy
+          facts.beforeView facts.afterView facts.before facts.after facts.targetOrigin correct.2.1
+          facts.targetLatest
+      · exact foreign_promotion_refines actual origin target world services
+          (facts.foreignPromotion promoted now refused rfl same)
+          facts.beforeView facts.afterView facts.before facts.after
+          facts.targetOrigin correct.2.1 correct facts.targetLatest
+    | settlement settled refused scope fetchTarget key result =>
+      cases result with
+      | error _ => exact payload trivial
+      | ok complete =>
+        cases complete with
+        | false => exact payload trivial
+        | true =>
+          by_cases same : settled = origin
+          · subst settled
+            exact completed_settlement_refines actual target world services
+              (facts.settlementHost refused scope fetchTarget key rfl)
+              facts.beforeView facts.afterView facts.before facts.after
+              facts.targetOrigin correct.2.1 correct facts.targetLatest
+          · exact foreign_completed_settlement_refines actual origin target world services
+              (facts.foreignSettlement settled refused scope fetchTarget key rfl same)
+              facts.beforeView facts.afterView facts.before facts.after
+              facts.targetOrigin correct.2.1 correct facts.targetLatest
+  exact ⟨refinement, nextSlots⟩
+
 private theorem stable_step_refines
     (trace : MptsyncStableTail.Trace) (services : MaterializedView.Services)
     (origin : Origin.Parsed) (target : ViewTarget) (latest : Nat)
@@ -465,58 +552,23 @@ private theorem stable_step_refines
         (trace.state (n + 1)).db ∧
       AcceptanceProgress.StableSlots (trace.state (n + 1))
         (Origin.canonical origin) latest (views (n + 1)) := by
-  have actual := trace.step n
   have stableNext : stableFrom ≤ n + 1 := Nat.le_trans stable (Nat.le_succ n)
-  have installedNext := installed_after_step actual origin target (views n) (views (n + 1))
-    (facts.slots n stable) (facts.slots (n + 1) stableNext) facts.targetOrigin correct.2.1
-      facts.targetLatest
-  have nextSlots := stable_slots_of_installed (facts.slots (n + 1) stableNext) target
-    facts.targetOrigin installedNext facts.targetLatest
-  have refinement : MptsyncStableTail.Refines services origin target (trace.state n).db
-      (trace.state (n + 1)).db := by
-    generalize eventEq : trace.event n = event at actual
-    have payload (nonPublishing : ReconciliationPayloadFrame.NonPublishing event) :=
-      payload_step_refines actual origin target services (views n) (views (n + 1))
-        (facts.slots n stable) (facts.slots (n + 1) stableNext) facts.targetOrigin correct.2.1
-        facts.targetLatest (ReconciliationPayloadFrame.step_payload actual nonPublishing)
-    cases event with
-    | advertisement => exact payload trivial
-    | request => exact payload trivial
-    | retirement => exact payload trivial
-    | selection => exact payload trivial
-    | abandonment => exact payload trivial
-    | promotion promoted now refused =>
-      by_cases same : promoted = origin
-      · subst promoted
-        have host := facts.promotionHost n now refused stable eventEq
-        exact promotion_refines actual target world services host.snapshot host.closed host.faithful
-          host.normalization host.relational
-          (PromotionContinuationBaseline.initial_of_correct correct host.metadata) host.policy
-          (views n) (views (n + 1))
-          (facts.slots n stable) (facts.slots (n + 1) stableNext) facts.targetOrigin correct.2.1
-          facts.targetLatest
-      · exact foreign_promotion_refines actual origin target world services
-          (facts.foreignPromotion n promoted now refused stable eventEq same)
-          (views n) (views (n + 1)) (facts.slots n stable) (facts.slots (n + 1) stableNext)
-          facts.targetOrigin correct.2.1 correct facts.targetLatest
-    | settlement settled refused scope fetchTarget key result =>
-      cases result with
-      | error _ => exact payload trivial
-      | ok complete =>
-        cases complete with
-        | false => exact payload trivial
-        | true =>
-          by_cases same : settled = origin
-          · subst settled
-            exact completed_settlement_refines actual target world services
-              (facts.settlementHost n refused scope fetchTarget key stable eventEq)
-              (views n) (views (n + 1)) (facts.slots n stable) (facts.slots (n + 1) stableNext)
-              facts.targetOrigin correct.2.1 correct facts.targetLatest
-          · exact foreign_completed_settlement_refines actual origin target world services
-              (facts.foreignSettlement n settled refused scope fetchTarget key stable eventEq same)
-              (views n) (views (n + 1)) (facts.slots n stable) (facts.slots (n + 1) stableNext)
-              facts.targetOrigin correct.2.1 correct facts.targetLatest
-  exact ⟨refinement, nextSlots⟩
+  let stepFacts : StableStepFacts (trace.event n) (trace.state n) (trace.state (n + 1))
+      services origin target latest world :=
+    { beforeView := views n
+      afterView := views (n + 1)
+      targetOrigin := facts.targetOrigin
+      targetLatest := facts.targetLatest
+      before := facts.slots n stable
+      after := facts.slots (n + 1) stableNext
+      promotionHost := fun now refused event => facts.promotionHost n now refused stable event
+      foreignPromotion := fun promoted now refused event different =>
+        facts.foreignPromotion n promoted now refused stable event different
+      settlementHost := fun refused scope fetchTarget key event =>
+        facts.settlementHost n refused scope fetchTarget key stable event
+      foreignSettlement := fun settled refused scope fetchTarget key event different =>
+        facts.foreignSettlement n settled refused scope fetchTarget key stable event different }
+  exact stable_actual_step_refines (trace.step n) stepFacts correct
 
 private theorem correct_from (trace : MptsyncStableTail.Trace)
     (services : MaterializedView.Services) (origin : Origin.Parsed) (target : ViewTarget)

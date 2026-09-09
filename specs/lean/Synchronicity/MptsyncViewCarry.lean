@@ -13,6 +13,45 @@ namespace Synchronicity.MptsyncViewCarry
 open VerifiedCore VerifiedCore.Host VerifiedCore.Replication
 open SimulatedHost AcceptanceProgress MptsyncConvergence
 
+/-- A finite prefix of actual reconciliation commands between an established
+promotion and the next Hello handler. Each edge carries only raw slot and host
+contracts for `stable_actual_step_refines`; no edge stores refinement,
+correctness, readiness, or an initial-view conclusion. -/
+inductive StablePrefix (services : MaterializedView.Services)
+    (origin : Origin.Parsed) (target : ViewTarget) (latest : Nat)
+    (world : TrieDiffCoverage.World) : State → State → Prop where
+  | nil (state : State) : StablePrefix services origin target latest world state state
+  | cons
+      (actual : ReconciliationExecution.Step event state next)
+      (facts : ReconciliationViewExecution.StableStepFacts event state next
+        services origin target latest world)
+      (rest : StablePrefix services origin target latest world next final) :
+      StablePrefix services origin target latest world state final
+
+/-- Erasing the raw stable contracts leaves precisely a finite production
+`ReconciliationExecution.Execution`. -/
+theorem StablePrefix.execution
+    (run : StablePrefix services origin target latest world state final) :
+    ∃ observations, ReconciliationExecution.Execution state observations final := by
+  induction run with
+  | nil => exact ⟨[], .nil _⟩
+  | @cons event state next final actual facts rest ih =>
+      obtain ⟨observations, execution⟩ := ih
+      exact ⟨⟨event, state, next⟩ :: observations, .cons actual execution⟩
+
+/-- An established public view survives every finite actual reconciliation
+prefix whose per-step stability/host contracts are supplied independently. -/
+theorem StablePrefix.preserves
+    (run : StablePrefix services origin target latest world state final)
+    (correct : CorrectView services origin target state.db) :
+    CorrectView services origin target final.db := by
+  induction run with
+  | nil => exact correct
+  | cons actual facts rest ih =>
+      have refined := ReconciliationViewExecution.stable_actual_step_refines
+        actual facts correct
+      exact ih (MptsyncStableTail.refines_preserves refined.1 correct)
+
 private theorem installed_of_observed
     (represented : HeadView.Represents db view)
     (sameOrigin : head.origin = origin)

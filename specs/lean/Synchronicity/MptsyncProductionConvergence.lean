@@ -31,7 +31,9 @@ inductive PromotionInitialSource (services : MaterializedView.Services)
       PromotionInitialSource services origin accepted state world
   | afterHistory
       (historyView : MptsyncPromotionHistory.EstablishedView services origin
-        accepted.initialState previousTarget)
+        previousState previousTarget)
+      (intervening : MptsyncViewCarry.StablePrefix services origin previousTarget
+        previousLatest carryWorld previousState accepted.initialState)
       (metadata : PromotionContinuationBaseline.MetadataContracts
         state.db origin previousTarget world services) :
       PromotionInitialSource services origin accepted state world
@@ -55,9 +57,10 @@ theorem PromotionInitialSource.initial
     PromotionInitialView.Initial state.db origin world services := by
   cases source with
   | atPromotion evidence => exact evidence.initial
-  | afterHistory historyView metadata =>
+  | afterHistory historyView intervening metadata =>
+      have beforeAcceptance := intervening.preserves historyView.correct
       have carried := MptsyncViewCarry.correct_after_acceptance_and_retry
-        historyView.correct accepted.accepted retry acceptedStart promotionState
+        beforeAcceptance accepted.accepted retry acceptedStart promotionState
       exact PromotionContinuationBaseline.initial_of_correct carried metadata
   | afterScopeChange production quiet reported originAligned metadata =>
       exact MptsyncScopeChangeCarry.initial_after_acceptance_and_retry
