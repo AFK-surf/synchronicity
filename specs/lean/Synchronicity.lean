@@ -75,3 +75,13 @@ import Synchronicity.ReconciliationRejection
 import Synchronicity.ReconciliationFloor
 import Synchronicity.Goals.Mptsync.M3
 import Synchronicity.ReconciliationSafety
+import Synchronicity.PromotionPublication
+import Synchronicity.MaterializationRetention
+import Synchronicity.MaterializationStream
+import Synchronicity.MaterializationAcquisition
+import Synchronicity.MaterializationRelease
+import Synchronicity.MaterializationFileApply
+import Synchronicity.MaterializationProviderApply
+import Synchronicity.MaterializationExactFiles
+import Synchronicity.MaterializationWholeRetention
+import Synchronicity.Goals.Mptsync.M4

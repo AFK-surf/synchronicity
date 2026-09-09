@@ -82,16 +82,15 @@ promise to install every intermediate version during ongoing edits.
 
 ### mptsync goals
 
-These specialize the promises to the actual metadata-sync implementation. M3 is
-checked under the raw-host and backed-slot contracts below; the other goals remain
-open as whole-system guarantees.
+M3 and M4 are checked under the initial-view, metadata and host contracts below;
+the other metadata-sync goals remain open.
 
 | Goal | Property to establish |
 | --- | --- |
 | M1 | Once versions and permissions settle, devices eventually expose and retain the correct permitted views. |
 | M2 | Reordering or duplicating the same valid advertisements does not change the selected version. |
 | [M3](../specs/lean/Synchronicity/Goals/Mptsync/M3.lean) | Delayed replies and obsolete work cannot overwrite or clear newer targets or accepted versions. |
-| M4 | A new file list replaces the old one only when ready; version, entries and retention obligations change atomically. |
+| [M4](../specs/lean/Synchronicity/Goals/Mptsync/M4.lean) | A new file list replaces the old one only when ready; version, entries and retention obligations change atomically. |
 | M5 | Relays cannot forge changes or widen sharing; received, stored and served data remains tied to legitimate authority. |
 | M6 | Faulty or stalling peers/publishers do not permanently starve healthy syncing. |
 | M7 | Cancellation and retry preserve valid progress without manufacturing completeness. |
@@ -116,12 +115,12 @@ convergence.
 
 | Area | Implemented and checked | Still open |
 | --- | --- | --- |
-| Trie | Production Lean ingress, lookup/mutation, scan/diff, completeness, collection, Merkle proofs, normalization and scope check. Scoped proofs cover lookup, retained nodes, preserved publication entries/routing and scope-checked entries. | General exact edits/listings/differences, legitimate caller grants, exact completion and atomic promotion. |
+| Trie | Production Lean ingress, lookup/mutation, scan/diff, completeness, collection, Merkle proofs, normalization and scope check. Scoped proofs cover lookup, retained nodes, publication routing, scope-checked entries and exact structural diff streams. | General exact edits/listings, legitimate caller grants and exact completion. |
 | Fetch/serving | Production Lean. Actual rejection/rollback/storage coherence and no transaction across waits; position/response checks and native privacy/cancellation tests. | Productive Fetch progress and end-to-end authority/disclosure. Exhaustion does not prove completeness. |
 | CAS | Production Lean local content operations, coverage, retention/repair, durability, collection and projections. Scoped exact-read, unchanged-size transfer/replay, retention and saved-byte advertisement results. | Broader size-change/host failures and cloud/publication/source-hold composition. |
 | Cloud | Production Lean cache/range restoration, associated adoption, hydration and outboard caching; native content/recovery/cancellation tests. | Remaining discovery/upload/finalize/read/serve orchestration and composed proofs. |
 | Identity/authority | Production Lean origin APIs and whole authority/scope reads, including borrowed promotion transactions and materialized delegation updates. Native expiry, grant, corruption and index tests. | Remaining identity lifecycle policy and grant-to-publication/serving proofs. |
-| Replication | Production Lean signed-head acceptance, history/fork retention, pending-fetch lifecycle, promotion and streamed file/provider/delegation views with replica retention. M3 obsolete-work safety is checked across acceptance, promotion and suspended requesting/retirement. Exchange/contact selection has checked order independence and bounded turns for fixed eligible inputs. Bounded TLA+ recovery checks. | Advertisement observation, recovery/publication orchestration and real scheduling remain Rust. Exact-view/atomic-promotion proofs and the other mptsync goals remain open. |
+| Replication | Production Lean acceptance, history/fork retention, pending-fetch lifecycle, promotion and streamed views with replica retention. M3 obsolete-work safety and M4 atomic ready-view promotion are checked. Contact selection has checked order independence and bounded turns for fixed eligible inputs. Bounded TLA+ recovery checks. | Advertisement observation, recovery/local-publication orchestration and real scheduling remain Rust. The other mptsync goals remain open. |
 
 Reconciliation reads authority, completeness, slot pointers and derived-view policy
 in the promotion transaction. Failed materialization rolls it back before retiring
@@ -187,14 +186,20 @@ database. Native SQLite/concurrent refinement remains a tested host contract, no
 a separately verified scheduler or database implementation. M3 imposes no fairness,
 successful-peer, ready-view or eventual-progress assumption.
 
-For M4, every execution prefix of the actual materializer preserves the committed
-database: its streamed file/provider/delegation and retention writes cannot commit
-themselves. The executed promotion finish stage publishes all staged rows together,
-or discards them on body failure; commit failure cannot become success, even if
-rollback also fails. These cover isolation and the commit boundary, not the whole
-promotion theorem. Deriving exact permitted-view readiness from completeness,
-proving the diff/materialized view and retention obligations correct, and composing
-the entire promotion remain open. Walk exhaustion is not an assumed exact view.
+[M4 safety](../specs/lean/Synchronicity/Goals/Mptsync/M4.lean) proves that every
+primitive prefix of actual received-version promotion exposes either the old
+view or one ready replacement: its version, exact permitted file records and
+retention obligations agree. This includes errors, waiting, cached refusals and
+post-rollback retirement. Readiness follows actual version/policy reads, diff
+coverage and soundness, SQL updates and the final commit—not a completion flag.
+The initial list must match its readable complete version and fixed policy;
+metadata has finite hash-faithful images and canonical bounded keys. Retention
+requires well-keyed holds/requests and consistent replica policies: each current
+reference has a live hold or acquisition request, and forever obligations survive.
+Downloads and provider-floor/grace deadlines are not asserted.
+Unicode and exclusive SQLite transactions remain host contracts.
+Changed-policy rebuilding is M8; Rust local publication and repair orchestration
+are not included in this received-version theorem.
 
 Content histories require faithful metadata storage and a Bao decoder preserving
 previously verified bytes even after a partial write fails. Fresh-store/inline

@@ -26,6 +26,17 @@ theorem bind_assoc (program : Program E A)
     funext reply
     exact ih reply
 
+theorem operation_bind_assoc (first : OperationOver E ε A)
+    (next : A → OperationOver E ε B) (last : B → OperationOver E ε C) :
+    ((first >>= next) >>= last) = (first >>= fun value => next value >>= last) := by
+  simp only [Bind.bind, ExceptT.bind, ExceptT.mk, bind_assoc]
+  congr 1
+  funext result
+  cases result <;> rfl
+
+theorem operation_pure_bind (value : A) (next : A → OperationOver E ε B) :
+    ((pure value : OperationOver E ε A) >>= next) = next value := rfl
+
 /-- A failed acquisition of the transaction runs neither the body nor cleanup. -/
 theorem transaction_begin (body : Transaction → Operation A) :
     (transaction body).run = Program.request Storage.begin (fun reply =>
