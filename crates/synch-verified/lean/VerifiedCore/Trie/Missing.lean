@@ -34,6 +34,9 @@ structure Position where
   reference : Option ByteArray
   hash : ByteArray
   path : ByteArray
+  /-- Internal postorder marker.  A visit enters `seen` only when this marker
+  reaches the head of the DFS stack, after every admitted child completed. -/
+  finish : Bool := false
   deriving BEq, DecidableEq
 
 inductive Fault where
@@ -81,7 +84,7 @@ def initial [WorkSet Visit V] [WorkSet ByteArray H] (context : Context)
   { positions := match rootOf root with
       | none => []
       | some hash => if context.scope.admitsPath [] then
-          [⟨reference.bind rootOf, hash, ByteArray.empty⟩] else [],
+          [⟨reference.bind rootOf, hash, ByteArray.empty, false⟩] else [],
     deferred := [], seen := WorkSet.empty Visit, mustBeBranch := WorkSet.empty ByteArray, fault := none }
 
 def Frontier.isExhausted (frontier : Frontier V H) : Bool :=
@@ -134,19 +137,19 @@ def pairedChildren (reference : Option Node) : Node → List Position
       | some (.extension theirSegment theirChild) =>
         if theirSegment == segment then some theirChild else none
       | _ => none
-    [⟨paired, child, segment⟩]
+    [⟨paired, child, segment, false⟩]
   | .branch children _ =>
     children.zipIdx.filterMap fun (child, index) => child.map fun hash =>
       let paired := match reference with
         | some (.branch theirs _) => (theirs[index]?).getD none
         | _ => none
-      ⟨paired, hash, ⟨#[index.toUInt8]⟩⟩
+      ⟨paired, hash, ⟨#[index.toUInt8]⟩, false⟩
   | .route children _ =>
     children.zipIdx.filterMap fun (child, index) => child.map fun hash =>
       let paired := match reference with
         | some (.route theirs _) => (theirs[index]?).getD none
         | _ => none
-      ⟨paired, hash, ⟨#[index.toUInt8]⟩⟩
+      ⟨paired, hash, ⟨#[index.toUInt8]⟩, false⟩
 
 def isBranch : Node → Bool
   | .branch _ _ => true
@@ -164,6 +167,86 @@ inductive Checked where
   | expand (children : List Position) (pendingBranch : Option ByteArray)
       (absentValues : List ByteArray) (routing : Bool := false)
 
+structure Expansion where
+  children : List Position
+  pendingBranch : Option ByteArray
+  absentValues : List ByteArray
+  routing : Bool
+
+structure Prepared where
+  node : Node
+  children : List Position
+  pendingBranch : Option ByteArray
+
+/-- Inspect one addressed payload.  The factored operation makes the
+successful-presence contract independent of the list traversal using it. -/
+def valueAbsent (node : Node) (hash : ByteArray) : Action Bool := do
+  match ← storage (.readBytes valueSpace hash) with
+  | none => return true
+  | some bytes =>
+    if bytes.size > maxValueBytes || (!isRoute node && bytes.size ≤ inlineValueMax) then
+      throw (.canonical (.valueLength hash bytes.size (isRoute node)))
+    return false
+
+def inspectValuesAux (node : Node) : List ByteArray → Action (List ByteArray)
+  | [] => pure []
+  | hash :: rest => do
+    let absent ← valueAbsent node hash
+    let more ← inspectValuesAux node rest
+    return if absent then hash :: more else more
+
+/-- Missing values directly named by an admitted holder. -/
+def inspectValues (context : Context) (position : Position) (node : Node) :
+    Action (List ByteArray) :=
+  if context.scope.admitsValue position.path.toList node then
+    inspectValuesAux node node.valueHashes
+  else pure []
+
+def inspectPendingBranch (node : Node) : Action (Option ByteArray) :=
+  match node with
+  | .extension _ child => do
+    match ← storage (.readBytes nodeSpace child) with
+    | none => pure (some child)
+    | some raw =>
+      if !isBranch (← decodeNode raw) then throw (.canonical (.expectedBranch child))
+      pure none
+  | _ => pure none
+
+def inspectReference : Option ByteArray → Action (Option Node)
+  | none => pure none
+  | some hash => do
+    match ← storage (.readBytes nodeSpace hash) with
+    | none => pure none
+    | some raw => pure (some (← decodeNode raw))
+
+def validateNodeDepth (position : Position) : Node → Action Unit
+  | .leaf suffix _ =>
+    let depth := position.path.size + suffix.size
+    if depth > Walk.maxDepthNibbles then throw (.canonical (.valueDepth depth)) else pure ()
+  | _ => pure ()
+
+def prepareDecoded [WorkSet Visit V] [WorkSet ByteArray H] (frontier : Frontier V H)
+    (position : Position) (node : Node) : Action Prepared := do
+  if WorkSet.contains frontier.mustBeBranch position.hash && !isBranch node then
+    throw (.canonical (.expectedBranch position.hash))
+  let pendingBranch ← inspectPendingBranch node
+  let reference ← inspectReference position.reference
+  validateNodeDepth position node
+  return ⟨node, pairedChildren reference node, pendingBranch⟩
+
+/-- Decode and validate a found holder before checking its payloads. -/
+def prepareLoaded [WorkSet Visit V] [WorkSet ByteArray H] (frontier : Frontier V H)
+    (position : Position) (raw : ByteArray) : Action Prepared := do
+  let node ← decodeNode raw
+  prepareDecoded frontier position node
+
+/-- Continue inspection after the holder bytes have been found. -/
+def inspectLoaded [WorkSet Visit V] [WorkSet ByteArray H] (context : Context)
+    (frontier : Frontier V H) (position : Position) (raw : ByteArray) : Action Expansion := do
+  let prepared ← prepareLoaded frontier position raw
+  let absent ← inspectValues context position prepared.node
+  return ⟨prepared.children, prepared.pendingBranch, absent, isRoute prepared.node⟩
+
 /-- Inspect one pending position without changing any frontier state.
 Every storage failure or decode error therefore leaves it retryable. -/
 def inspect [WorkSet Visit V] [WorkSet ByteArray H] (context : Context)
@@ -178,39 +261,9 @@ def inspect [WorkSet Visit V] [WorkSet ByteArray H] (context : Context)
     -- Keep this position outstanding until its bytes or authenticated omission
     -- evidence arrive; scope alone cannot justify dropping an admitted spine.
     return .absent
-  | some raw =>
-    let node ← decodeNode raw
-    if WorkSet.contains frontier.mustBeBranch position.hash && !isBranch node then
-      throw (.canonical (.expectedBranch position.hash))
-    let pendingBranch ← match node with
-      | .extension _ child => do
-        match ← storage (.readBytes nodeSpace child) with
-        | none => pure (some child)
-        | some raw =>
-          if !isBranch (← decodeNode raw) then throw (.canonical (.expectedBranch child))
-          pure none
-      | _ => pure none
-    let reference ← match position.reference with
-      | none => pure none
-      | some hash => do
-        match ← storage (.readBytes nodeSpace hash) with
-        | none => pure none
-        | some raw => pure (some (← decodeNode raw))
-    match node with
-    | .leaf suffix _ =>
-      let depth := position.path.size + suffix.size
-      if depth > Walk.maxDepthNibbles then throw (.canonical (.valueDepth depth))
-    | _ => pure ()
-    let absent ← if context.scope.admitsValue position.path.toList node then
-        node.valueHashes.filterM fun hash => do
-          match ← storage (.readBytes valueSpace hash) with
-          | none => return true
-          | some bytes =>
-            if bytes.size > maxValueBytes || (!isRoute node && bytes.size ≤ inlineValueMax) then
-              throw (.canonical (.valueLength hash bytes.size (isRoute node)))
-            return false
-      else pure []
-    return .expand (pairedChildren reference node) pendingBranch absent (isRoute node)
+  | some raw => do
+    let expansion ← inspectLoaded context frontier position raw
+    return .expand expansion.children expansion.pendingBranch expansion.absentValues expansion.routing
 
 structure Work (V H : Type) where
   frontier : Frontier V H
@@ -241,7 +294,6 @@ def commit [WorkSet Visit V] [WorkSet ByteArray H] (context : Context)
     { work with
       frontier := { work.frontier with
         positions := rest
-        seen := WorkSet.insert work.frontier.seen (visit context.scope position.hash position.path)
         deferred := position :: work.frontier.deferred }
       batch := { work.batch with nodes := (position.path, position.hash) :: work.batch.nodes } }
   | .expand children pendingBranch absentValues routing =>
@@ -249,19 +301,37 @@ def commit [WorkSet Visit V] [WorkSet ByteArray H] (context : Context)
     let pending := match pendingBranch with
       | none => pending
       | some child => WorkSet.insert pending child
-    let positions := pushChildren context.scope position.path children rest
+    let positions := pushChildren context.scope position.path children
+      (if absentValues.isEmpty then { position with finish := true } :: rest else rest)
     let (asked, values) := askValues position.path absentValues work.asked work.batch.values
     let routeValues := if routing then absentValues.foldl (fun known hash =>
       if known.contains hash then known else hash :: known) work.batch.routeValues
       else work.batch.routeValues
     { frontier := { work.frontier with
         positions
-        seen := WorkSet.insert work.frontier.seen (visit context.scope position.hash position.path)
         mustBeBranch := pending
         deferred := if absentValues.isEmpty then work.frontier.deferred
           else position :: work.frontier.deferred }
       batch := { work.batch with values, routeValues }
       asked }
+
+/-- Postorder completion is the sole way a freshly inspected visit enters
+`seen`.  Keeping it separate from `commit` prevents a later DAG occurrence
+from pruning a subtree whose children are still pending. -/
+def settle [WorkSet Visit V] (context : Context) (work : Work V H)
+    (position : Position) (rest : List Position) : Work V H :=
+  if work.frontier.deferred.isEmpty then
+    { work with frontier := { work.frontier with
+        positions := rest
+        seen := WorkSet.insert work.frontier.seen
+          (visit context.scope position.hash position.path) } }
+  else
+    -- A missing descendant may have been found earlier in this batch.  Keep
+    -- its ancestors behind every retryable position; only a later postorder
+    -- pass with no deferred dependency may certify their visits as settled.
+    { work with frontier := { work.frontier with
+        positions := rest
+        deferred := work.frontier.deferred ++ [position] } }
 
 /-- Only canonicality faults poison the walk. A failed host read or decode
 returns the frontier at the interrupted position, including earlier visits. -/
@@ -284,7 +354,8 @@ def batchStep [WorkSet Visit V] [WorkSet ByteArray H] (context : Context)
     match work.frontier.positions with
     | [] => pure (.inr (finished work))
     | position :: rest =>
-      if work.batch.size ≥ maximum then pure (.inr (finished work))
+      if position.finish then pure (.inl (settle context work position rest))
+      else if work.batch.size ≥ maximum then pure (.inr (finished work))
       else ExceptT.mk do
         let result ← (inspect context work.frontier position).run
         return .ok (match result with
