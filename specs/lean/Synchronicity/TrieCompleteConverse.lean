@@ -234,47 +234,399 @@ preserve, not a terminal result supplied by an opportunity. -/
 def CompleteWork (publisher : TrieProgramProofs.RawSnapshot)
     (context : Context) (root : ByteArray) (work : Work V H) : Prop :=
   work.frontier.fault = none ∧ work.frontier.deferred = [] ∧
-    work.batch = {} ∧ FrontierInherited publisher context root work.frontier
+  work.batch = {} ∧ FrontierInherited publisher context root work.frontier
+
+def FrontierClosed (publisher : TrieProgramProofs.RawSnapshot)
+    (frontier : Frontier V H) : Prop :=
+  (∀ position ∈ frontier.positions,
+      TrieSnapshotClosure.Closed publisher position.hash) ∧
+    ∀ position ∈ frontier.deferred,
+      TrieSnapshotClosure.Closed publisher position.hash
+
+def CanonicalWork (publisher : TrieProgramProofs.RawSnapshot)
+    (context : Context) (root : ByteArray) (work : Work V H) : Prop :=
+  CompleteWork publisher context root work ∧
+    TrieMissingProofs.WorkAdmitted context.scope work ∧
+    NoReferences work.frontier ∧ FrontierClosed publisher work.frontier
 
 theorem initial_completeWork [WorkSet Visit V] [WorkSet ByteArray H]
-    (publisher : TrieProgramProofs.RawSnapshot) (context : Context) (root : ByteArray)
-    (rooted : rootOf root = some root) (admitted : context.scope.admitsPath [] = true) :
+    (publisher : TrieProgramProofs.RawSnapshot) (context : Context) (root : ByteArray) :
     CompleteWork publisher context root
       ⟨initial (V := V) (H := H) context none root, {}, WorkSet.empty ByteArray⟩ := by
   refine ⟨rfl, rfl, rfl, ?_⟩
   constructor
   · intro position member evidence required
-    simp only [initial, rooted, admitted, ↓reduceIte, List.mem_cons,
-      List.not_mem_nil, or_false] at member
-    subst position
-    simpa [TrieMissingCompletion.PositionRequires] using required
+    unfold initial at member
+    cases rooted : rootOf root with
+    | none => simp [rooted] at member
+    | some hash =>
+      have hashEq : hash = root := by
+        unfold rootOf at rooted
+        split at rooted <;> simp_all
+      subst hash
+      cases admitted : context.scope.admitsPath [] with
+      | false => simp [rooted, admitted] at member
+      | true =>
+        simp only [rooted, admitted, ↓reduceIte, List.mem_cons,
+          List.not_mem_nil, or_false] at member
+        subst position
+        simpa [TrieMissingCompletion.PositionRequires] using required
   · intro position member
     simp [initial] at member
 
-/-- Healthy transaction-lifted raw reads for one fully present position.
-The contract is deliberately local: it says neither that the whole walk
-terminates nor that its final frontier is exhausted.  Its returned shape is
-the production `inspect`/`commit` step, and it is available only after the
-semantic proof establishes that the inspected position is settled. -/
+private theorem initial_closed [WorkSet Visit V] [WorkSet ByteArray H]
+    (publisher : TrieProgramProofs.RawSnapshot) (context : Context) (root : ByteArray)
+    (stored : TrieSnapshotClosure.StoredSnapshot publisher root) :
+    FrontierClosed publisher (initial (V := V) (H := H) context none root) := by
+  constructor
+  · intro position member
+    unfold initial at member
+    cases rooted : rootOf root with
+    | none => simp [rooted] at member
+    | some hash =>
+      have hashEq : hash = root := by
+        unfold rootOf at rooted
+        split at rooted <;> simp_all
+      have closedHash : TrieSnapshotClosure.Closed publisher hash := by
+        rcases stored with empty | closed
+        · change root.data.all (fun x => x == 0) 0 root.size = true at empty
+          have emptyRoot : rootOf root = none := by simp [rootOf, empty]
+          rw [emptyRoot] at rooted
+          contradiction
+        · simpa [hashEq] using closed
+      simp only [rooted] at member
+      split at member
+      · rcases List.mem_singleton.mp member with rfl
+        exact closedHash
+      · simp at member
+  · intro position member
+    simp [initial] at member
+
+private theorem initial_canonicalWork [WorkSet Visit V] [WorkSet ByteArray H]
+    (publisher : TrieProgramProofs.RawSnapshot) (context : Context) (root : ByteArray)
+    (stored : TrieSnapshotClosure.StoredSnapshot publisher root) :
+    CanonicalWork publisher context root
+      ⟨initial (V := V) (H := H) context none root, {}, WorkSet.empty ByteArray⟩ := by
+  refine ⟨initial_completeWork publisher context root, ?_,
+    initial_no_references context root, initial_closed publisher context root stored⟩
+  exact ⟨TrieMissingProofs.initial_admitted context none root, by simp [TrieMissingProofs.BatchAdmitted,
+    TrieMissingProofs.WantsAdmitted]⟩
+
+private theorem closed_paired_child
+    {publisher : TrieProgramProofs.RawSnapshot} {hash raw : ByteArray} {node : Node}
+    (closed : TrieSnapshotClosure.Closed publisher hash)
+    (held : publisher nodeSpace hash = some raw) (decoded : decode raw = .ok node)
+    (child : Position) (member : child ∈ pairedChildren none node) :
+    TrieSnapshotClosure.Closed publisher child.hash := by
+  cases closed with
+  | leaf stored decodedClosed payload =>
+      have sameRaw := Option.some.inj (stored.symm.trans held)
+      subst raw
+      have sameNode := Except.ok.inj (decodedClosed.symm.trans decoded)
+      subst node
+      simp [pairedChildren] at member
+  | extension stored decodedClosed nonempty below =>
+      have sameRaw := Option.some.inj (stored.symm.trans held)
+      subst raw
+      have sameNode := Except.ok.inj (decodedClosed.symm.trans decoded)
+      subst node
+      simp only [pairedChildren, List.mem_cons, List.not_mem_nil, or_false] at member
+      subst child
+      exact below
+  | branch stored decodedClosed payload below =>
+      have sameRaw := Option.some.inj (stored.symm.trans held)
+      subst raw
+      have sameNode := Except.ok.inj (decodedClosed.symm.trans decoded)
+      subst node
+      simp only [pairedChildren] at member
+      rcases List.mem_filterMap.mp member with ⟨entry, inEntries, made⟩
+      rcases entry with ⟨candidate, index⟩
+      cases candidate with
+      | none => simp at made
+      | some address =>
+          simp only [Option.map_some] at made
+          have childEq := Option.some.inj made
+          subst child
+          exact below index address (List.mk_mem_zipIdx_iff_getElem?.mp inEntries)
+  | route stored decodedClosed payload below =>
+      have sameRaw := Option.some.inj (stored.symm.trans held)
+      subst raw
+      have sameNode := Except.ok.inj (decodedClosed.symm.trans decoded)
+      subst node
+      simp only [pairedChildren] at member
+      rcases List.mem_filterMap.mp member with ⟨entry, inEntries, made⟩
+      rcases entry with ⟨candidate, index⟩
+      cases candidate with
+      | none => simp at made
+      | some address =>
+          simp only [Option.map_some] at made
+          have childEq := Option.some.inj made
+          subst child
+          exact below index address (List.mk_mem_zipIdx_iff_getElem?.mp inEntries)
+
+private theorem inherited_paired_child
+    {publisher : TrieProgramProofs.RawSnapshot} {context : Context} {root raw : ByteArray}
+    {node : Node} (position child : Position)
+    (closed : TrieSnapshotClosure.Closed publisher position.hash)
+    (held : publisher nodeSpace position.hash = some raw)
+    (decoded : decode raw = .ok node) (wellFormed : node.wf)
+    (member : child ∈ pairedChildren none node)
+    (inherited : PositionInherited publisher context root position) :
+    PositionInherited publisher context root
+      { child with path := position.path ++ child.path } := by
+  intro evidence required
+  apply inherited evidence
+  unfold TrieMissingCompletion.PositionRequires at required ⊢
+  rw [show (position.path ++ child.path).toList =
+      position.path.toList ++ child.path.toList by
+    simp [ByteArrayProofs.toList_eq_data]] at required
+  cases closed with
+  | leaf stored decodedClosed payload =>
+      have sameRaw := Option.some.inj (stored.symm.trans held)
+      subst raw
+      have sameNode := Except.ok.inj (decodedClosed.symm.trans decoded)
+      subst node
+      simp [pairedChildren] at member
+  | extension stored decodedClosed nonempty below =>
+      have sameRaw := Option.some.inj (stored.symm.trans held)
+      subst raw
+      have sameNode := Except.ok.inj (decodedClosed.symm.trans decoded)
+      subst node
+      simp only [pairedChildren, List.mem_cons, List.not_mem_nil, or_false] at member
+      subst child
+      exact .extension stored decodedClosed nonempty required
+  | branch stored decodedClosed payload below =>
+      have sameRaw := Option.some.inj (stored.symm.trans held)
+      subst raw
+      have sameNode := Except.ok.inj (decodedClosed.symm.trans decoded)
+      subst node
+      obtain ⟨width, _, _⟩ := wellFormed
+      simp only [pairedChildren] at member
+      rcases List.mem_filterMap.mp member with ⟨entry, inEntries, made⟩
+      rcases entry with ⟨candidate, index⟩
+      cases candidate with
+      | none => simp at made
+      | some address =>
+          simp only [Option.map_some] at made
+          have childEq := Option.some.inj made
+          subst child
+          have edge := List.mk_mem_zipIdx_iff_getElem?.mp inEntries
+          have indexBound : index < _ := (List.getElem?_eq_some_iff.mp edge).1
+          have bound : index < 16 := by
+            omega
+          have indexEq : index.toUInt8.toNat = index := by
+            simpa [Nat.toUInt8_eq] using
+              (UInt8.toNat_ofNat_of_lt' (n := index)
+                (by simpa [UInt8.size] using (show index < 256 by omega)))
+          apply Needs.branch (nibble := index.toUInt8) stored decodedClosed
+          · simpa [indexEq] using edge
+          · simpa [ByteArrayProofs.toList_eq_data] using required
+  | route stored decodedClosed payload below =>
+      have sameRaw := Option.some.inj (stored.symm.trans held)
+      subst raw
+      have sameNode := Except.ok.inj (decodedClosed.symm.trans decoded)
+      subst node
+      obtain ⟨width, _, _⟩ := wellFormed
+      simp only [pairedChildren] at member
+      rcases List.mem_filterMap.mp member with ⟨entry, inEntries, made⟩
+      rcases entry with ⟨candidate, index⟩
+      cases candidate with
+      | none => simp at made
+      | some address =>
+          simp only [Option.map_some] at made
+          have childEq := Option.some.inj made
+          subst child
+          have edge := List.mk_mem_zipIdx_iff_getElem?.mp inEntries
+          have indexBound : index < _ := (List.getElem?_eq_some_iff.mp edge).1
+          have bound : index < 16 := by
+            omega
+          have indexEq : index.toUInt8.toNat = index := by
+            simpa [Nat.toUInt8_eq] using
+              (UInt8.toNat_ofNat_of_lt' (n := index)
+                (by simpa [UInt8.size] using (show index < 256 by omega)))
+          apply Needs.route (nibble := index.toUInt8) stored decodedClosed
+          · simpa [indexEq] using edge
+          · simpa [ByteArrayProofs.toList_eq_data] using required
+/-- Healthy transaction-lifted storage observations for each position reached
+by the finite walk.  This contract stops below `Missing.inspect`: it records
+the actual owned-holder read and loaded-node subprogram, together with the
+publisher bytes they returned.  It contains no successor `Work`, terminal
+frontier, exhaustion fact, or completeness Boolean. -/
 structure PromotionReadOpportunity (publisher : TrieProgramProofs.RawSnapshot)
     (tx : Transaction) (context : Context) (root : ByteArray) : Prop where
-  inspect : ∀ (state : SimulatedHost.State)
+  stored : TrieSnapshotClosure.StoredSnapshot publisher root
+  readPosition : ∀ (state : SimulatedHost.State)
       (work : Work (Std.HashSet Visit) (Std.HashSet ByteArray))
       (position : Position) (rest : List Position),
     work.frontier.positions = position :: rest →
     position.finish = false →
-    CompleteWork publisher context root work →
-    TrieMissingCompletion.PositionSettled publisher context
-      (replicaOfState state) position →
+    CanonicalWork publisher context root work →
+    ∃ raw node loaded after pendingBranch,
+      position.path.size ≤ Walk.maxDepthNibbles ∧ node.wf ∧
+      publisher nodeSpace position.hash = some raw ∧ decode raw = .ok node ∧
+      execute ((loadOwned context.owner position.hash).run.mapEffects
+        (promoteMissing tx)) state = (.ok (some raw), loaded) ∧
+      execute ((inspectLoaded context work.frontier position raw).run.mapEffects
+        (promoteMissing tx)) loaded =
+          (.ok ⟨pairedChildren none node, pendingBranch, [], isRoute node⟩, after) ∧
+      replicaOfState after = replicaOfState state ∧
+      TrieSnapshotClosure.Closed publisher position.hash
+
+private theorem inspect_of_readPosition
+    (publisher : TrieProgramProofs.RawSnapshot) (tx : Transaction)
+    (context : Context) (root : ByteArray)
+    (reads : PromotionReadOpportunity publisher tx context root)
+    (state : SimulatedHost.State)
+    (work : Work (Std.HashSet Visit) (Std.HashSet ByteArray))
+    (position : Position) (rest : List Position)
+    (pending : work.frontier.positions = position :: rest)
+    (entering : position.finish = false)
+    (good : CanonicalWork publisher context root work) :
     ∃ checked after,
       execute ((Missing.inspect context work.frontier position).run.mapEffects
         (promoteMissing tx)) state = (.ok checked, after) ∧
       replicaOfState after = replicaOfState state ∧
-      ((checked = .skip ∧
-          CompleteWork publisher context root (commit context work position rest checked)) ∨
-        ∃ children pending routing,
-          checked = .expand children pending [] routing ∧
-          CompleteWork publisher context root (commit context work position rest checked))
+      (checked = .skip ∨ ∃ raw node pendingBranch,
+        node.wf ∧ publisher nodeSpace position.hash = some raw ∧
+        decode raw = .ok node ∧
+        checked = .expand (pairedChildren none node) pendingBranch [] (isRoute node)) := by
+  have noRef := good.2.2.1.1 position (by rw [pending]; simp)
+  obtain ⟨raw, node, loaded, after, pendingBranch, depth, wellFormed, held,
+      decoded, loadRun, loadedRun, replicaEq, closed⟩ :=
+    reads.readPosition state work position rest pending entering good
+  have shallow : ¬ position.path.size > Walk.maxDepthNibbles := by omega
+  have refBeq : (position.reference == some position.hash) = false := by simp [noRef]
+  by_cases seen : WorkSet.contains work.frontier.seen
+      (visit context.scope position.hash position.path) = true
+  · refine ⟨.skip, state, ?_, rfl, .inl rfl⟩
+    unfold Missing.inspect
+    simp [shallow, refBeq, seen]
+    rfl
+  ·
+    refine ⟨.expand (pairedChildren none node) pendingBranch [] (isRoute node), after,
+      ?_, replicaEq, .inr ⟨raw, node, pendingBranch, wellFormed, held, decoded, rfl⟩⟩
+    let tail : Option ByteArray → Missing.Action Checked := fun loaded =>
+      match loaded with
+      | none => pure Checked.absent
+      | some raw => do
+          let expansion ← inspectLoaded context work.frontier position raw
+          return .expand expansion.children expansion.pendingBranch
+            expansion.absentValues expansion.routing
+    have whole : Missing.inspect context work.frontier position =
+        loadOwned context.owner position.hash >>= tail := by
+      unfold Missing.inspect
+      simp [shallow, refBeq, seen, tail]
+      rfl
+    rw [whole]
+    have loadTail := execute_mapped_bind_ok (promoteMissing tx)
+      (loadOwned context.owner position.hash) tail state loaded (some raw) loadRun
+    rw [loadTail]
+    let finish : Expansion → Missing.Action Checked := fun expansion =>
+      pure (.expand expansion.children expansion.pendingBranch
+        expansion.absentValues expansion.routing)
+    have loadedTail := execute_mapped_bind_ok (promoteMissing tx)
+      (inspectLoaded context work.frontier position raw) finish loaded after
+      (⟨pairedChildren none node, pendingBranch, [], isRoute node⟩ : Expansion) loadedRun
+    change execute (((inspectLoaded context work.frontier position raw >>= finish).run.mapEffects
+      (promoteMissing tx))) loaded = _
+    rw [loadedTail]
+    rfl
+
+private theorem pushChildren_cases (scope : Serve.Scope) (path : ByteArray)
+    (children stack : List Position) (probe : Position)
+    (member : probe ∈ pushChildren scope path children stack) :
+    probe ∈ stack ∨ ∃ child, child ∈ children ∧
+      scope.admitsPath (path ++ child.path).toList = true ∧
+      probe = { child with path := path ++ child.path } := by
+  induction children generalizing stack with
+  | nil => exact .inl member
+  | cons head rest ih =>
+      simp only [pushChildren, List.foldl_cons] at member
+      split at member
+      · rename_i admitted
+        rcases ih ({ head with path := path ++ head.path } :: stack) member with
+          old | ⟨child, inRest, childAdmitted, rfl⟩
+        · rcases List.mem_cons.mp old with same | inStack
+          · exact .inr ⟨head, List.mem_cons_self, admitted, same⟩
+          · exact .inl inStack
+        · exact .inr ⟨child, List.mem_cons_of_mem _ inRest, childAdmitted, rfl⟩
+      · rcases ih stack member with old | ⟨child, inRest, childAdmitted, rfl⟩
+        · exact .inl old
+        · exact .inr ⟨child, List.mem_cons_of_mem _ inRest, childAdmitted, rfl⟩
+
+private theorem expand_canonical
+    (publisher : TrieProgramProofs.RawSnapshot) (context : Context) (root : ByteArray)
+    (work : Work (Std.HashSet Visit) (Std.HashSet ByteArray))
+    (position : Position) (rest : List Position) (raw : ByteArray) (node : Node)
+    (pendingBranch : Option ByteArray)
+    (pending : work.frontier.positions = position :: rest)
+    (good : CanonicalWork publisher context root work)
+    (held : publisher nodeSpace position.hash = some raw)
+    (decoded : decode raw = .ok node) (wellFormed : node.wf)
+    (closed : TrieSnapshotClosure.Closed publisher position.hash) :
+    CanonicalWork publisher context root
+      (commit context work position rest
+        (.expand (pairedChildren none node) pendingBranch [] (isRoute node))) := by
+  have parentInherited := good.1.2.2.2.1 position (by rw [pending]; simp)
+  have restInherited : ∀ probe ∈ rest, PositionInherited publisher context root probe :=
+    fun probe member => good.1.2.2.2.1 probe (by rw [pending]; exact List.mem_cons_of_mem _ member)
+  have restClosed : ∀ probe ∈ rest, TrieSnapshotClosure.Closed publisher probe.hash :=
+    fun probe member => good.2.2.2.1 probe (by rw [pending]; exact List.mem_cons_of_mem _ member)
+  refine ⟨?_, TrieMissingProofs.commit_admitted context work position rest
+      (.expand (pairedChildren none node) pendingBranch [] (isRoute node)) good.2.1 pending,
+    commit_no_references context work position rest
+      (.expand (pairedChildren none node) pendingBranch [] (isRoute node)) pending good.2.2.1 ?_, ?_⟩
+  · unfold CompleteWork
+    simp only [commit, List.isEmpty_nil, ↓reduceIte]
+    refine ⟨good.1.1, good.1.2.1, ?_, ?_⟩
+    · simp [askValues, good.1.2.2.1]
+    · constructor
+      · intro probe member
+        rcases pushChildren_cases context.scope position.path (pairedChildren none node)
+            ({ position with finish := true } :: rest) probe member with
+          inStack | ⟨child, childMember, admitted, rfl⟩
+        · rcases List.mem_cons.mp inStack with rfl | inRest
+          · exact parentInherited
+          · exact restInherited probe inRest
+        · exact inherited_paired_child position child closed held decoded wellFormed
+            childMember parentInherited
+      · exact good.1.2.2.2.2
+  · intro children pending absent routing same
+    injection same with childrenEq
+    subst children
+    exact pairedChildren_none_have_no_references node
+  · unfold FrontierClosed
+    simp only [commit, List.isEmpty_nil, ↓reduceIte]
+    constructor
+    · intro probe member
+      rcases pushChildren_cases context.scope position.path (pairedChildren none node)
+          ({ position with finish := true } :: rest) probe member with
+        inStack | ⟨child, childMember, admitted, rfl⟩
+      · rcases List.mem_cons.mp inStack with rfl | inRest
+        · exact closed
+        · exact restClosed probe inRest
+      · exact closed_paired_child closed held decoded child childMember
+    · exact good.2.2.2.2
+
+private theorem skip_canonical
+    (publisher : TrieProgramProofs.RawSnapshot) (context : Context) (root : ByteArray)
+    (work : Work (Std.HashSet Visit) (Std.HashSet ByteArray))
+    (position : Position) (rest : List Position)
+    (pending : work.frontier.positions = position :: rest)
+    (good : CanonicalWork publisher context root work) :
+    CanonicalWork publisher context root (commit context work position rest .skip) := by
+  refine ⟨?_, TrieMissingProofs.commit_admitted context work position rest .skip good.2.1 pending,
+    commit_no_references context work position rest .skip pending good.2.2.1
+      (by intro children pending absent routing impossible; cases impossible), ?_⟩
+  · unfold CompleteWork
+    simp only [commit]
+    refine ⟨good.1.1, good.1.2.1, good.1.2.2.1, ?_⟩
+    exact ⟨fun probe member => good.1.2.2.2.1 probe (by
+      rw [pending]; exact List.mem_cons_of_mem _ member), good.1.2.2.2.2⟩
+  · unfold FrontierClosed
+    simp only [commit]
+    exact ⟨fun probe member => good.2.2.2.1 probe (by
+      rw [pending]; exact List.mem_cons_of_mem _ member), good.2.2.2.2⟩
 
 private theorem promotion_batchStep_complete
     (publisher : TrieProgramProofs.RawSnapshot) (tx : Transaction)
@@ -286,23 +638,23 @@ private theorem promotion_batchStep_complete
       BatchResult (Std.HashSet Visit) (Std.HashSet ByteArray)}
     (complete : PermittedComplete publisher context.scope context.owner root
       (replicaOfState state))
-    (good : CompleteWork publisher context root work)
+    (good : CanonicalWork publisher context root work)
     (ran : execute ((batchStep context 1 work).run.mapEffects (promoteMissing tx)) state =
       (.ok result, final)) :
     match result with
-    | .inl next => CompleteWork publisher context root next ∧
+    | .inl next => CanonicalWork publisher context root next ∧
         PermittedComplete publisher context.scope context.owner root
           (replicaOfState final)
     | .inr (frontier, .ok _batch) => frontier.isExhausted = true
     | .inr (_, .error _) => False := by
   unfold batchStep at ran
-  simp only [good.1] at ran
+  simp only [good.1.1] at ran
   cases pending : work.frontier.positions with
   | nil =>
     simp only [pending, pure, ExceptT.pure, ExceptT.mk, ExceptT.run,
       Program.mapEffects, execute, Except.ok.injEq, Prod.mk.injEq] at ran
     rcases ran with ⟨rfl, rfl⟩
-    simp [finished, Frontier.isExhausted, pending, good.2.1, good.1]
+    simp [finished, Frontier.isExhausted, pending, good.1.2.1, good.1.1]
   | cons position rest =>
     simp only [pending] at ran
     cases finish : position.finish with
@@ -312,35 +664,46 @@ private theorem promotion_batchStep_complete
         Prod.mk.injEq] at ran
       rcases ran with ⟨rfl, rfl⟩
       refine ⟨?_, complete⟩
-      unfold CompleteWork at good ⊢
-      rw [settle, good.2.1]
+      have completeWork : CompleteWork publisher context root
+          (settle context work position rest) := by
+        unfold CompleteWork
+        rw [settle, good.1.2.1]
+        simp only [List.isEmpty_nil, ↓reduceIte]
+        refine ⟨good.1.1, good.1.2.1, good.1.2.2.1, ?_⟩
+        exact ⟨fun probe member => good.1.2.2.2.1 probe (by
+          rw [pending]; exact List.mem_cons_of_mem _ member), good.1.2.2.2.2⟩
+      refine ⟨completeWork,
+        TrieMissingProofs.settle_admitted context work position rest good.2.1 pending,
+        settle_no_references context work position rest pending good.2.2.1, ?_⟩
+      unfold FrontierClosed
+      rw [settle, good.1.2.1]
       simp only [List.isEmpty_nil, ↓reduceIte]
-      refine ⟨good.1, good.2.1, good.2.2.1, ?_⟩
-      constructor
-      · exact fun probe member => good.2.2.2.1 probe (by
-          rw [pending]
-          exact List.mem_cons_of_mem _ member)
-      · exact good.2.2.2.2
+      exact ⟨fun probe member => good.2.2.2.1 probe (by
+        rw [pending]; exact List.mem_cons_of_mem _ member), good.2.2.2.2⟩
     | false =>
       have noBatch : (work.batch.size ≥ 1) = false := by
-        rw [good.2.2.1]
+        rw [good.1.2.2.1]
         decide
       simp only [finish, Bool.false_eq_true, noBatch, ↓reduceIte] at ran
-      have inherited := good.2.2.2.1 position (by rw [pending]; simp)
+      have inherited := good.1.2.2.2.1 position (by rw [pending]; simp)
       have settled : TrieMissingCompletion.PositionSettled publisher context
           (replicaOfState state) position := fun evidence required =>
         complete evidence (inherited evidence required)
       obtain ⟨checked, after, inspected, replicaEq, shape⟩ :=
-        reads.inspect state work position rest pending finish good settled
+        inspect_of_readPosition publisher tx context root reads state work position rest
+          pending finish good
       simp only [ExceptT.run] at inspected
       simp only [ExceptT.mk, ExceptT.run, bind] at ran
       rw [mapEffects_bind, SimulatedHost.execute_bind, inspected] at ran
       have completeAfter : PermittedComplete publisher context.scope context.owner root
           (replicaOfState after) := by simpa [replicaEq] using complete
       cases ran
-      rcases shape with ⟨rfl, kept⟩ | ⟨children, pendingBranch, routing, rfl, kept⟩
-      · exact ⟨kept, completeAfter⟩
-      · exact ⟨kept, completeAfter⟩
+      rcases shape with rfl | ⟨raw, node, pendingBranch, wellFormed, held, decoded, rfl⟩
+      · exact ⟨skip_canonical publisher context root work position rest pending good,
+          completeAfter⟩
+      · exact ⟨expand_canonical publisher context root work position rest raw node pendingBranch
+          pending good held decoded wellFormed
+          (good.2.2.2.1 position (by rw [pending]; simp)), completeAfter⟩
 
 private theorem iterate_complete [Interpreter E]
     (body : S → Program E (Except ε (S ⊕ R))) (exhausted : ε)
@@ -385,8 +748,6 @@ theorem promotion_walk_exhausted_of_complete
     (state final : SimulatedHost.State)
     (frontier : Frontier (Std.HashSet Visit) (Std.HashSet ByteArray))
     (batch : Batch)
-    (rooted : rootOf root = some root)
-    (admitted : context.scope.admitsPath [] = true)
     (reads : PromotionReadOpportunity publisher tx context root)
     (complete : PermittedComplete publisher context.scope context.owner root
       (replicaOfState state))
@@ -396,7 +757,7 @@ theorem promotion_walk_exhausted_of_complete
   let initialWork : Work (Std.HashSet Visit) (Std.HashSet ByteArray) :=
     ⟨initial context none root, {}, WorkSet.empty ByteArray⟩
   let P : SimulatedHost.State → Work (Std.HashSet Visit) (Std.HashSet ByteArray) → Prop :=
-    fun observed work => CompleteWork publisher context root work ∧
+    fun observed work => CanonicalWork publisher context root work ∧
       PermittedComplete publisher context.scope context.owner root
         (replicaOfState observed)
   let Q : SimulatedHost.State →
@@ -405,7 +766,7 @@ theorem promotion_walk_exhausted_of_complete
       | (frontier, .ok _) => frontier.isExhausted = true
       | (_, .error _) => False
   have initialHeld : P state initialWork :=
-    ⟨initial_completeWork publisher context root rooted admitted, complete⟩
+    ⟨initial_canonicalWork publisher context root reads.stored, complete⟩
   have keeps : ∀ observed work next after, P observed work →
       execute ((batchStep context 1 work).run.mapEffects (promoteMissing tx)) observed =
         (.ok (.inl next), after) → P after next := by
@@ -448,8 +809,6 @@ structure PromotionFreshOpportunity
   steps : Nat
   frontier : Frontier (Std.HashSet Visit) (Std.HashSet ByteArray)
   batch : Batch
-  rooted : rootOf root = some root
-  admitted : context.scope.admitsPath [] = true
   startedReplica : replicaOfState started = replicaOfState state
   keyRun : execute ((Memo.keyFor (E := Complete.Effects) Missing.Error.host
     context.scope root context.owner).run.mapEffects
@@ -480,8 +839,8 @@ theorem promotion_isComplete_mapped_exec
       (replicaOfState ready.started) := by
     simpa only [ready.startedReplica] using complete
   have exhausted := promotion_walk_exhausted_of_complete publisher tx context root
-    ready.steps ready.started ready.walked ready.frontier ready.batch ready.rooted
-      ready.admitted reads completeStarted ready.walk ready.withinFuel
+    ready.steps ready.started ready.walked ready.frontier ready.batch
+      reads completeStarted ready.walk ready.withinFuel
   let afterWalk : Frontier (Std.HashSet Visit) (Std.HashSet ByteArray) ×
       Except Missing.Error Batch → Complete.Action Bool := fun answer =>
     match answer.2 with
