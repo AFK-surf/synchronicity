@@ -80,6 +80,7 @@ import Synchronicity.ReconciliationGuards
 import Synchronicity.MaterializationPrivate
 import Synchronicity.ReconciliationAcceptance
 import Synchronicity.AcceptanceProgress
+import Synchronicity.StableAdvertisementProgress
 import Synchronicity.ReconciliationRejection
 import Synchronicity.ReconciliationFloor
 import Synchronicity.Goals.Mptsync.M3
