@@ -21,17 +21,24 @@ def select (origin : Origin.Parsed) (expected : Option (UInt64 × ByteArray)) : 
     return some (pending, old, scope, authority.provenance))
 
 def settle (origin : Origin.Parsed) (refused : List (UInt64 × ByteArray × ByteArray))
+    (scope : Trie.Serve.Scope)
     (target : Trie.Fetch.Target) (key : UInt64 × ByteArray × ByteArray)
     (result : Except Promote.Error Bool) : Fetch.Action FetchReport := do
   match result with
-  | .ok false => return ⟨⟨.idle, none, none⟩, true⟩
+  | .ok false =>
+    if ← Fetch.scopeApplies origin scope then
+      within Fetch.fetchError (Trie.Fetch.abandon target)
+      return ⟨⟨.idle, none, none⟩, true⟩
+    return ⟨⟨.idle, none, none⟩, false⟩
   | .ok true =>
     let now ← raise Promote.Error.host Clock.nowNs
     return ⟨← Fetch.lift (Promote.promote origin now refused), false⟩
   | .error (.domain error) =>
     if Fetch.originFault error then
-      within Fetch.fetchError (Trie.Fetch.abandon target)
-      return ⟨⟨.refused, some error, some key⟩, false⟩
+      if ← Fetch.scopeApplies origin scope then
+        within Fetch.fetchError (Trie.Fetch.abandon target)
+        return ⟨⟨.refused, some error, some key⟩, false⟩
+      return ⟨⟨.idle, none, none⟩, false⟩
     throw (.domain error)
   | .error error => throw error
 
@@ -43,11 +50,13 @@ def selected (origin : Origin.Parsed) (refused : List (UInt64 × ByteArray × By
   let target : Trie.Fetch.Target := ⟨pending.head.root, Origin.canonical origin, pending.head.seq,
     ⟨scope, owner.map Origin.canonical⟩⟩
   if refused.contains key then
-    within Fetch.fetchError (Trie.Fetch.abandon target)
-    return ⟨⟨.refused, none, none⟩, false⟩
+    if ← Fetch.scopeApplies origin scope then
+      within Fetch.fetchError (Trie.Fetch.abandon target)
+      return ⟨⟨.refused, none, none⟩, false⟩
+    return ⟨⟨.idle, none, none⟩, false⟩
   let result ← Fetch.attempt (within Fetch.fetchError (Trie.Fetch.fetch (Std.HashSet Trie.Missing.Visit)
     (Std.HashSet ByteArray) target reference maximum retryLimit))
-  settle origin refused target key result
+  settle origin refused scope target key result
 
 theorem fetch_decomposes (origin : Origin.Parsed) (expected : Option (UInt64 × ByteArray))
     (refused : List (UInt64 × ByteArray × ByteArray)) (maximum retryLimit : Nat) :
@@ -144,23 +153,37 @@ theorem abandon_only (row : Fields) (target : Trie.Fetch.Target)
     Only (allowed row) (within Fetch.fetchError (Trie.Fetch.abandon target) : Fetch.Action Unit).run :=
   Only.within _ _ (FetchHeadSafety.abandon_only row target different) (trie_mapped row)
 
+theorem scopeApplies_only (row : Fields) (origin : Origin.Parsed) (scope : Trie.Serve.Scope) :
+    Only (allowed row) (Fetch.scopeApplies origin scope).run := by
+  unfold Fetch.scopeApplies
+  apply lift_only
+  apply Only.transaction _ _ _ trivial (fun _ => trivial) (fun _ => trivial)
+  intro tx
+  exact (promote_read row _
+    (PromotionReads.auth_only _ (ReconciliationReadOnly.scope_only tx origin))).seq fun _ => .done _
+
 /-- The entire non-publication settlement, not just its delete helper, cannot
 touch a newer target. Faults and malformed-origin refusals are included. -/
 theorem settle_without_publication (row : Fields) (origin : Origin.Parsed)
-    (refused : List (UInt64 × ByteArray × ByteArray)) (target : Trie.Fetch.Target)
+    (refused : List (UInt64 × ByteArray × ByteArray)) (scope : Trie.Serve.Scope) (target : Trie.Fetch.Target)
     (key : UInt64 × ByteArray × ByteArray) (result : Except Promote.Error Bool)
     (notComplete : result ≠ .ok true) (different : equals row (Trie.Fetch.targetRows target) = false) :
-    Only (allowed row) (settle origin refused target key result).run := by
+    Only (allowed row) (settle origin refused scope target key result).run := by
   unfold settle
   cases result with
-  | ok result => cases result <;> first | exact .done _ | exact False.elim (notComplete rfl)
+  | ok result => cases result with
+    | false =>
+      exact (scopeApplies_only row origin scope).seq fun applies => by
+        cases applies <;> first | exact .done _ | exact (abandon_only row target different).seq fun _ => .done _
+    | true => exact False.elim (notComplete rfl)
   | error error =>
     cases error with
     | host _ => exact .done _
     | domain error =>
       dsimp only
       split
-      · exact (abandon_only row target different).seq fun _ => .done _
+      · exact (scopeApplies_only row origin scope).seq fun applies => by
+          cases applies <;> first | exact .done _ | exact (abandon_only row target different).seq fun _ => .done _
       · exact .done _
 
 theorem promote_agrees (effect : Promote.Effects A) (state : State) :
@@ -182,9 +205,9 @@ theorem promote_agrees (effect : Promote.Effects A) (state : State) :
 /-- A delayed successful fetch never publishes its captured head or scope.
 Its actual publication is a newly executed promote on the current database. -/
 theorem completed_fetch_rechecks (origin : Origin.Parsed) (refused : List (UInt64 × ByteArray × ByteArray))
-    (target : Trie.Fetch.Target) (key : UInt64 × ByteArray × ByteArray)
+    (scope : Trie.Serve.Scope) (target : Trie.Fetch.Target) (key : UInt64 × ByteArray × ByteArray)
     (state final : State) (report : FetchReport)
-    (executed : execute (settle origin refused target key (.ok true)) state = (.ok report, final)) :
+    (executed : execute (settle origin refused scope target key (.ok true)) state = (.ok report, final)) :
     ∃ now current result,
       execute (raise Promote.Error.host Clock.nowNs : Fetch.Action Int64) state = (.ok now, current) ∧
       execute (Promote.promote origin now refused) current = (.ok result, final) ∧
@@ -202,15 +225,15 @@ theorem completed_fetch_rechecks (origin : Origin.Parsed) (refused : List (UInt6
 promotion starting immediately after the actual clock read. This includes
 pending rows and failure outcomes, not just successful promotion reports. -/
 theorem completed_settlement_changes_recheck (origin : Origin.Parsed)
-    (refused : List (UInt64 × ByteArray × ByteArray)) (target : Trie.Fetch.Target)
+    (refused : List (UInt64 × ByteArray × ByteArray)) (scope : Trie.Serve.Scope) (target : Trie.Fetch.Target)
     (key : UInt64 × ByteArray × ByteArray) (state : State) (row : Fields)
     (present : row ∈ rows state.db "heads")
-    (lost : row ∉ rows (execute (settle origin refused target key (.ok true)) state).2.db "heads") :
+    (lost : row ∉ rows (execute (settle origin refused scope target key (.ok true)) state).2.db "heads") :
     ∃ now current,
       execute (raise Promote.Error.host Clock.nowNs : Fetch.Action Int64) state = (.ok now, current) ∧
       current.db = state.db ∧
       (execute (Promote.promote origin now refused) current).2 =
-        (execute (settle origin refused target key (.ok true)) state).2 := by
+        (execute (settle origin refused scope target key (.ok true)) state).2 := by
   have dbFrame : (execute (raise Promote.Error.host Clock.nowNs : Fetch.Action Int64) state).2.db = state.db := by
     apply reply_preserves_db
     intro s
@@ -237,12 +260,12 @@ theorem completed_settlement_changes_recheck (origin : Origin.Parsed)
 /-- Complete-version safety of the entire successful-request settlement,
 including a failing clock, promotion preparation, commit or rollback. -/
 theorem completed_settlement_bound (origin : Origin.Parsed)
-    (refused : List (UInt64 × ByteArray × ByteArray)) (target : Trie.Fetch.Target)
+    (refused : List (UInt64 × ByteArray × ByteArray)) (scope : Trie.Serve.Scope) (target : Trie.Fetch.Target)
     (key : UInt64 × ByteArray × ByteArray) (state : State) (closed : state.pending = none)
     (seq : Int64) (root : ByteArray)
     (stored : ReconciliationRead.StoredFloor state.db (Origin.canonical origin) "complete" seq root) :
     PromotionBound.good (Origin.canonical origin) ⟨seq.toUInt64, root⟩
-      (rows (execute (settle origin refused target key (.ok true)) state).2.db "heads") := by
+      (rows (execute (settle origin refused scope target key (.ok true)) state).2.db "heads") := by
   have dbFrame : (execute (raise Promote.Error.host Clock.nowNs : Fetch.Action Int64) state).2.db = state.db := by
     apply reply_preserves_db
     intro s
@@ -300,14 +323,14 @@ theorem UntilPromotion.seq {operation : Fetch.Action A} {next : A → Fetch.Acti
   | ok value => exact tail value
 
 theorem settle_phases (row : Fields) (origin : Origin.Parsed)
-    (refused : List (UInt64 × ByteArray × ByteArray)) (target : Trie.Fetch.Target)
+    (refused : List (UInt64 × ByteArray × ByteArray)) (scope : Trie.Serve.Scope) (target : Trie.Fetch.Target)
     (key : UInt64 × ByteArray × ByteArray) (result : Except Promote.Error Bool)
     (different : equals row (Trie.Fetch.targetRows target) = false) :
-    UntilPromotion row origin refused (settle origin refused target key result).run := by
+    UntilPromotion row origin refused (settle origin refused scope target key result).run := by
   by_cases complete : result = .ok true
   · subst result
     exact UntilPromotion.seq (Only.raise _ _ trivial) fun now => .fresh now
-  · exact .safe (settle_without_publication row origin refused target key result complete different)
+  · exact .safe (settle_without_publication row origin refused scope target key result complete different)
 
 /-- All work after selection either retains every noncaptured row, or passes
 control to a new promotion. This covers cached refusal, arbitrary requester
@@ -321,12 +344,13 @@ theorem selected_phases (row : Fields) (origin : Origin.Parsed)
   unfold selected
   dsimp only
   split
-  · exact .safe ((abandon_only row _ different).seq fun _ => .done _)
+  · exact .safe ((scopeApplies_only row origin scope).seq fun applies => by
+      cases applies <;> first | exact .done _ | exact (abandon_only row _ different).seq fun _ => .done _)
   · apply UntilPromotion.seq
     · exact (Only.within _ _ (FetchHeadSafety.fetch_only _ _ row _ different _ maximum retryLimit)
         (trie_mapped row)).bind fun _ => .done _
     · intro result
-      exact settle_phases row origin refused _ _ result different
+      exact settle_phases row origin refused scope _ _ result different
 
 /-- An actual execution that changes a noncaptured row must have reached a
 fresh promotion, with that row still present immediately before promotion.

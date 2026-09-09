@@ -110,7 +110,8 @@ def abandon (target : Target) : Action Unit :=
     let _ ← request (Storage.deleteRows tx "heads" (targetRows target))
 
 /-- `true` asks promotion to recheck this view in its own transaction;
-`false` reports abandonment after repeated replies without verified progress. -/
+`false` asks the owning replication operation to revalidate its captured scope
+before abandoning after repeated replies without verified progress. -/
 def step [WorkSet Visit V] [WorkSet ByteArray H] (target : Target)
     (maximum retryLimit : Nat) (state : State V H) : Action (State V H ⊕ Bool) := do
   let (state, missing, certified) ← inspect target state maximum
@@ -132,7 +133,6 @@ def step [WorkSet Visit V] [WorkSet ByteArray H] (target : Target)
     learned := learned + (← admit (H := H) target true missing.values served missing.routeValues)
   let unproductive := if learned == 0 then state.unproductive + 1 else 0
   if unproductive ≥ retryLimit then
-    abandon target
     return .inr false
   if learned > 0 then touch target
   return .inl { state with unproductive, frontier := resume target.context state.frontier }

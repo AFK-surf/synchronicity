@@ -331,6 +331,23 @@ impl Syncer {
         refused.insert(key);
     }
 
+    /// Invalidates every process-local decision made under the prior scope.
+    ///
+    /// Trie completeness certificates already include scope in their key and
+    /// the durable derived views are cleared by `set_read_scope`. Refusal
+    /// verdicts do not include scope, so retaining one would let a structural
+    /// outcome from an old view suppress rebuilding the same head under the
+    /// new permission for the rest of this process.
+    pub(crate) fn scope_changed(&self) {
+        self.refused
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        for wake in [&self.on_change, &self.on_replica].into_iter().flatten() {
+            wake.notify_one();
+        }
+    }
+
     /// Rings `wake` whenever a head flips to complete (§5.2).
     ///
     /// Every merge path ends in [`Syncer::try_promote`] — the Hello exchange
@@ -1133,9 +1150,7 @@ impl Syncer {
                 spaces = ?effective,
                 "the read scope moved: every foreign origin will be refetched and rebuilt under it"
             );
-            for wake in [&self.on_change, &self.on_replica].into_iter().flatten() {
-                wake.notify_one();
-            }
+            self.scope_changed();
         }
         Ok(())
     }
