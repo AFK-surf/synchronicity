@@ -576,6 +576,14 @@ impl Store {
     /// what the new scope adds. This node's own origin is never touched: it
     /// built that trie and there is nobody to refetch it from.
     pub fn set_read_scope(&self, spaces: Option<&[String]>) -> Result<bool> {
+        self.set_read_scope_at(spaces, synch_core::now_ns())
+    }
+
+    /// Timestamped implementation of [`Store::set_read_scope`].  Maintenance
+    /// supplies the same clock reading it uses to age pending heads, so a head
+    /// demoted by this scope transition cannot be swept immediately using the
+    /// age it accumulated under the old scope.
+    fn set_read_scope_at(&self, spaces: Option<&[String]>, now: i64) -> Result<bool> {
         let current = self.local_scope()?;
         let next = spaces.map(|s| s.to_vec());
         if current == next {
@@ -639,6 +647,25 @@ impl Store {
                 }
                 txn.clear_head(origin, crate::heads::Slot::Complete)?;
             }
+            // Every surviving foreign pending head now asks a different
+            // completeness question.  Its verified content-addressed records
+            // remain reusable, but its retry window starts at this transition,
+            // not at the time the old-scope work first occupied the slot.
+            match own {
+                Some(origin) => {
+                    txn.conn().execute(
+                        "UPDATE heads SET received_at = ?1
+                           WHERE slot = 'pending' AND origin_id <> ?2",
+                        rusqlite::params![now, origin],
+                    )?;
+                }
+                None => {
+                    txn.conn().execute(
+                        "UPDATE heads SET received_at = ?1 WHERE slot = 'pending'",
+                        rusqlite::params![now],
+                    )?;
+                }
+            }
             Ok(true)
         })
     }
@@ -660,11 +687,13 @@ impl Store {
         match (self.local_scope()?, grant) {
             // A live grant is the authoritative scope: a grant materialized
             // since the last pass widens, one that shrank narrows.
-            (Some(spaces), Some(grant)) if spaces != grant => self.set_read_scope(Some(&grant)),
+            (Some(spaces), Some(grant)) if spaces != grant => {
+                self.set_read_scope_at(Some(&grant), now)
+            }
             // No grant left: a confined scope collapses to the empty one —
             // `m:self` and the `d:` namespace, no file data — not to `None`,
             // which would read as unrestricted.
-            (Some(spaces), None) if !spaces.is_empty() => self.set_read_scope(Some(&[])),
+            (Some(spaces), None) if !spaces.is_empty() => self.set_read_scope_at(Some(&[]), now),
             _ => Ok(false),
         }
     }
@@ -832,12 +861,19 @@ mod tests {
         store.put_head(Slot::Complete, &complete, 100, 100).unwrap();
         store.put_head(Slot::Pending, &pending, 200, 200).unwrap();
 
-        assert!(store.set_read_scope(Some(&["photos".to_string()])).unwrap());
+        assert!(store
+            .set_read_scope_at(Some(&["photos".to_string()]), at(20))
+            .unwrap());
         assert_eq!(store.complete_head(&origin()).unwrap(), None);
         assert_eq!(
             store.pending_head(&origin()).unwrap(),
             Some(pending),
             "the newer pending head survived the demotion"
+        );
+        assert_eq!(
+            store.head(&origin(), Slot::Pending).unwrap().unwrap().received_at,
+            at(20),
+            "scope-invalidated pending work gets a fresh retry window"
         );
         assert_eq!(
             store.head_floor(&origin()).unwrap(),
@@ -851,10 +887,18 @@ mod tests {
             .clear_head_at(&origin(), Slot::Pending, 7, &Hash([7u8; 32]))
             .unwrap();
         assert!(store
-            .set_read_scope(Some(&["photos".to_string(), "finance".to_string()]))
+            .set_read_scope_at(
+                Some(&["photos".to_string(), "finance".to_string()]),
+                at(30),
+            )
             .unwrap());
         assert_eq!(store.complete_head(&origin()).unwrap(), None);
         assert_eq!(store.pending_head(&origin()).unwrap(), Some(later));
+        assert_eq!(
+            store.head(&origin(), Slot::Pending).unwrap().unwrap().received_at,
+            at(30),
+            "a newly demoted head is not born with its old complete-slot age"
+        );
     }
 
     fn binding(origin: OriginId, key: NodeId, expires: Option<i64>) -> Binding {
