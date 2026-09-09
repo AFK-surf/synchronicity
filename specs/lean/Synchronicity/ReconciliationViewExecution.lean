@@ -3,6 +3,7 @@ import Synchronicity.PromotionAtomicView
 import Synchronicity.AcceptanceProgress
 import Synchronicity.ReconciliationPayloadFrame
 import Synchronicity.ForeignMaterializationFrame
+import Synchronicity.PromotionContinuationBaseline
 
 /-! Refinement of actual reconciliation operations to the stable public-view
 transition.  Execution witnesses remain in `ReconciliationExecution`; the
@@ -163,7 +164,8 @@ structure PromotionHost (origin : Origin.Parsed) (target : ViewTarget)
   normalization : state.isNfc = services.nfc
   relational : ∀ relation, relation = Trie.nodeSpace ∨ relation = Trie.valueSpace →
     state.byteRelations.contains relation = true
-  initial : PromotionInitialView.Initial state.db origin world services
+  metadata : PromotionContinuationBaseline.MetadataContracts
+    state.db origin target world services
   policy : StablePolicy origin target state.db
 
 /-- Factual host certificate for an interleaved promotion of another origin.
@@ -243,6 +245,7 @@ theorem completed_settlement_refines
     (after : AcceptanceProgress.StableSlots final (Origin.canonical origin) latest afterView)
     (sameOrigin : target.head.origin = origin)
     (installed : AtomicFileView.Installed state.db target.head)
+    (correct : CorrectView services origin target state.db)
     (targetLatest : AcceptanceProgress.versionRank
       ⟨target.head.seq, target.head.root⟩ = latest) :
     MptsyncStableTail.Refines services origin target state.db final.db := by
@@ -286,8 +289,12 @@ theorem completed_settlement_refines
         obtain ⟨answer, after⟩ := promoted
         cases answer <;> rfl
       have facts := host now current rfl
+      have currentCorrect : CorrectView services origin target current.db := by
+        rw [currentDb]
+        exact correct
       have replacement := PromotionAtomicView.promote_refines origin now refused current world
-        services facts.closed facts.faithful facts.normalization facts.relational facts.initial
+        services facts.closed facts.faithful facts.normalization facts.relational
+          (PromotionContinuationBaseline.initial_of_correct currentCorrect facts.metadata)
       rcases replacement with unchanged | ⟨actualScope, replicas, read, ready⟩
       · exact Or.inl (by rw [finalState, ← currentDb]; exact unchanged)
       · obtain ⟨scopeSame, replicasSame⟩ := facts.policy actualScope replicas read
@@ -416,7 +423,9 @@ private theorem stable_step_refines
     · subst promoted
       have host := facts.promotionHost n now refused stable eventEq
       exact promotion_refines actual target world services host.snapshot host.closed host.faithful
-        host.normalization host.relational host.initial host.policy (views n) (views (n + 1))
+        host.normalization host.relational
+        (PromotionContinuationBaseline.initial_of_correct correct host.metadata) host.policy
+        (views n) (views (n + 1))
         (facts.slots n stable) (facts.slots (n + 1) stableNext) facts.targetOrigin correct.2.1
         facts.targetLatest
     · exact foreign_promotion_refines actual origin target world services
@@ -435,7 +444,7 @@ private theorem stable_step_refines
           exact completed_settlement_refines actual target world services
             (facts.settlementHost n refused scope fetchTarget key stable eventEq)
             (views n) (views (n + 1)) (facts.slots n stable) (facts.slots (n + 1) stableNext)
-            facts.targetOrigin correct.2.1 facts.targetLatest
+            facts.targetOrigin correct.2.1 correct facts.targetLatest
         · exact foreign_completed_settlement_refines actual origin target world services
             (facts.foreignSettlement n settled refused scope fetchTarget key stable eventEq same)
             (views n) (views (n + 1)) (facts.slots n stable) (facts.slots (n + 1) stableNext)
