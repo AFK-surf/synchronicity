@@ -531,6 +531,29 @@ fn internal_routes(req: Request, auth: AuthContext) -> Response {
     ],
       Post
     -> cue_api.enroll_device(req, auth, cue_workspace_id)
+    [
+      "internal",
+      "v1",
+      "integrations",
+      "cue",
+      "workspaces",
+      cue_workspace_id,
+      "api-keys",
+    ],
+      Post
+    -> cue_api.mint_api_key(req, auth, cue_workspace_id)
+    [
+      "internal",
+      "v1",
+      "integrations",
+      "cue",
+      "workspaces",
+      cue_workspace_id,
+      "api-keys",
+      key_id,
+    ],
+      Delete
+    -> cue_api.revoke_api_key(req, auth, cue_workspace_id, key_id)
     _, _ -> wisp.not_found()
   }
 }
