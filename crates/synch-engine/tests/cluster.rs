@@ -799,6 +799,95 @@ async fn a_deletion_is_adopted_and_the_path_leaves_the_tree() {
     shutdown(&[&nas.node, &laptop.node]).await;
 }
 
+/// A write is answered by this node's own durability, not by a peer's silence.
+///
+/// The regression this pins: publishing used to await the push, so one trusted
+/// member that was switched off put its dial deadline — and, for a peer that
+/// accepted the connection and then said nothing, the network layer's request
+/// deadline — in front of every `synch put`, `delete` and scan. Ten seconds of
+/// wall clock for a five-hundred-byte file, with the write itself long since
+/// durable.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_publish_answers_promptly_while_a_trusted_peer_says_nothing() {
+    let _blocking = synch_core::BlockingScope::enter();
+    let nas = spawn("nas").await;
+    let laptop = spawn("laptop").await;
+    introduce(&[&nas, &laptop]);
+
+    // A real, dialable endpoint that answers nothing at all: what a member that
+    // is switched off looks like from here, and the shape that costs a full
+    // dial deadline on the old code (measured: 10.0 s). Held for the test's
+    // lifetime so the address stays live.
+    let silent = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+        .secret_key(iroh_base::SecretKey::generate())
+        .relay_mode(iroh::endpoint::RelayMode::Disabled)
+        .clear_address_lookup()
+        .clear_ip_transports()
+        .bind_addr("127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap())
+        .unwrap()
+        .alpns(vec![synch_core::ALPN_MPT.to_vec()])
+        .bind()
+        .await
+        .unwrap();
+    let silent_addr = iroh::EndpointAddr::from_parts(
+        silent.id(),
+        silent
+            .bound_sockets()
+            .into_iter()
+            .map(iroh::TransportAddr::Ip),
+    );
+    nas.node
+        .store()
+        .put_binding(&common::binding(
+            &synch_core::OriginId::named("offline", "cluster.example").unwrap(),
+            &silent.id(),
+        ))
+        .unwrap();
+    nas.node.remember_peer(&silent_addr).unwrap();
+
+    off_runtime({
+        let node = nas.node.clone();
+        let path = nas.space.path().to_path_buf();
+        move || node.add_filesystem_source("shared", &path).unwrap()
+    })
+    .await;
+    std::fs::write(nas.space.path().join("notes.txt"), b"one").unwrap();
+
+    let started = std::time::Instant::now();
+    let head = nas.node.scan_publish_push().await.unwrap().unwrap();
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < Duration::from_secs(5),
+        "a publish waited {elapsed:?} on a peer that says nothing"
+    );
+
+    // And the push still happened: the peer that is up has the head in its
+    // pending slot without anybody pulling for it. Polled, because the pusher
+    // is a task of its own and gets its turn when it gets its turn.
+    let deadline = std::time::Instant::now() + Duration::from_secs(10);
+    let pending = loop {
+        let got = {
+            let (node, origin) = (laptop.node.clone(), nas.node.origin().clone());
+            off_runtime(move || node.store().pending_head(&origin).unwrap()).await
+        };
+        if got.is_some() || std::time::Instant::now() > deadline {
+            break got;
+        }
+        tokio::time::sleep(Duration::from_millis(20)).await;
+    };
+    assert_eq!(
+        pending.map(|head| head.root),
+        Some(head.root),
+        "the reachable peer must still be told about the head"
+    );
+
+    // The silent peer's dial is still in flight when the stop arrives, and the
+    // abort must not be held behind it.
+    tokio::time::timeout(Duration::from_secs(5), shutdown(&[&nas.node, &laptop.node]))
+        .await
+        .expect("the pusher must not hold the node's shutdown open");
+}
+
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn a_pushed_head_is_followed_by_its_trie_without_waiting_for_the_interval() {
     let _blocking = synch_core::BlockingScope::enter();

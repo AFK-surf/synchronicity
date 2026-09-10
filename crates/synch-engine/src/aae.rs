@@ -54,6 +54,22 @@ const REACTIVE_FLOOR: Duration = Duration::from_secs(2);
 /// costs propagation nothing that the floor was not already spending.
 const PUSH_FANOUT: usize = 32;
 
+/// What one peer gets to answer a reactive push.
+///
+/// The push is the optimistic half of §5.3 and the periodic round is the half
+/// that guarantees convergence, so a peer that cannot be told within this
+/// budget is left to the next round rather than being waited out. It is the
+/// reactive floor's own two seconds: a full fan-out is sized to fit inside that
+/// floor at ordinary latencies ([`PUSH_FANOUT`]), so a peer still silent after
+/// it was never going to be one of the pushes the floor was about.
+///
+/// Deliberately not a [`crate::config::NodeConfig`] field. The pusher has no
+/// caller waiting on it, so an operator who turned this off would silently
+/// demote every publish to interval latency — the same class of mistake as a
+/// private second opinion about who to dial, which `dial_targets` exists to
+/// prevent.
+pub(crate) const REACTIVE_PUSH_BUDGET: Duration = Duration::from_secs(2);
+
 /// Maximum peers considered by one standing anti-entropy round.
 const ANTI_ENTROPY_FANOUT: usize = 3;
 
@@ -228,12 +244,12 @@ impl Node {
         Ok(report)
     }
 
-    /// Pushes a head to every trusted peer (§5.3, reactive path).
+    /// Pushes a head to every trusted peer (§5.3).
     ///
     /// Concurrently, because each push is bounded by a dial timeout and a
-    /// request deadline: sequentially those add up across the membership and a
-    /// publish waits for all of them before it returns, while run together one
-    /// slow peer costs one deadline rather than delaying every peer behind it.
+    /// request deadline: sequentially those add up across the membership, while
+    /// run together one slow peer costs one deadline rather than delaying every
+    /// peer behind it.
     ///
     /// Bounded concurrently, though, at `PUSH_FANOUT`. Every peer at once is
     /// the shape §5.3 was written for at the N ≤ 100 sizes §12 assumes, and it
@@ -243,23 +259,68 @@ impl Node {
     /// [`Node::publish_material_claims`] whenever coverage moves. The buffer
     /// admits the next peer the instant one finishes, so the total is still one
     /// deadline plus the queue rather than a deadline per peer.
+    ///
+    /// No timer of its own: each peer is bounded by the network layer's dial
+    /// and request deadlines. A caller with somebody waiting on it — the
+    /// rotation that has to reach the membership, a test — wants exactly this,
+    /// and the caller with nobody waiting says so by naming a budget of its own
+    /// (`push_head_within`, which the reactive path uses).
     pub async fn push_head(&self, head: &SignedHead) -> Result<usize> {
+        self.push_head_at(head, None).await
+    }
+
+    /// Pushes a head, giving each peer `budget` to take it.
+    ///
+    /// What the reactive path uses (`crate::pusher`), with
+    /// `REACTIVE_PUSH_BUDGET`. The budget covers the whole attempt — the dial
+    /// *and* the request — rather than the handshake alone: a peer that
+    /// completes a connection and then says nothing is bounded only by the
+    /// network layer's request deadline otherwise, and one silent peer would
+    /// hold the pass for minutes while every later head waits its turn.
+    ///
+    /// A peer that does not answer inside the budget is a peer the periodic
+    /// round will try again (§5.3), so the expiry is reported the way every
+    /// other failed push is: `debug!`, and a `false` for that peer alone.
+    pub(crate) async fn push_head_within(
+        &self,
+        head: &SignedHead,
+        budget: Duration,
+    ) -> Result<usize> {
+        self.push_head_at(head, Some(budget)).await
+    }
+
+    /// The fan-out itself, with a per-peer budget when the caller has one.
+    async fn push_head_at(&self, head: &SignedHead, budget: Option<Duration>) -> Result<usize> {
         let targets = self.dial_targets().await?;
         let pushes: Vec<_> = targets
             .into_iter()
             .map(|(peer, addr)| async move {
-                match self.net().connect_mpt(addr).await {
-                    Ok(client) => match client.push_head(head).await {
-                        Ok(()) => true,
+                let attempt = async {
+                    match self.net().connect_mpt(addr).await {
+                        Ok(client) => match client.push_head(head).await {
+                            Ok(()) => true,
+                            Err(e) => {
+                                tracing::debug!(peer = %peer.fmt_short(), error = %e, "head push failed");
+                                false
+                            }
+                        },
                         Err(e) => {
-                            tracing::debug!(peer = %peer.fmt_short(), error = %e, "head push failed");
+                            tracing::debug!(peer = %peer.fmt_short(), error = %e, "peer unreachable");
                             false
                         }
-                    },
-                    Err(e) => {
-                        tracing::debug!(peer = %peer.fmt_short(), error = %e, "peer unreachable");
-                        false
                     }
+                };
+                match budget {
+                    Some(budget) => tokio::time::timeout(budget, attempt).await.unwrap_or_else(
+                        |_| {
+                            tracing::debug!(
+                                peer = %peer.fmt_short(),
+                                "head push went unanswered past its budget"
+                            );
+                            false
+                        },
+                    ),
+                    None => attempt.await,
                 }
             })
             .collect();
@@ -267,11 +328,13 @@ impl Node {
         Ok(results.into_iter().filter(|pushed| *pushed).count())
     }
 
-    /// Scans, publishes, and pushes the resulting head in one step.
+    /// Scans, publishes, and hands the resulting head to the pusher.
     ///
     /// The scan stages into the publisher and then flushes it, so the result is
     /// one batch and one head — including anything a watcher-triggered rescan
-    /// had already staged — and the head is out before this returns.
+    /// had already staged — and the head is durable and offered to the pusher
+    /// before this returns. Whether peers have it is the pusher's business and
+    /// not a fact this call can report (§5.3).
     pub async fn scan_publish_push(&self) -> Result<Option<SignedHead>> {
         self.scan_and_stage_async().await?;
         self.flush_staged().await

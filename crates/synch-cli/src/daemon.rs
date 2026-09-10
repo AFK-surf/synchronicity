@@ -540,12 +540,13 @@ pub async fn run(config: NodeConfig) -> Result<()> {
         node.run_publisher(shutdown).await
     });
 
-    // An initial scan and push, so a fresh daemon converges immediately rather
-    // than waiting a full interval — with the stop signal watched throughout
-    // it. The scan reads every space and pushes the head it produces to every
-    // peer, so it is the one piece of startup work that depends on the outside
-    // world, and a daemon that cannot be stopped while it runs is a daemon an
-    // operator has to kill.
+    // An initial scan, so a fresh daemon converges immediately rather than
+    // waiting a full interval — with the stop signal watched throughout it.
+    // The scan reads every space, hashes what changed and publishes one head;
+    // telling peers about it is the pusher's business, off this path, so what
+    // is left here is local work. A big enough tree still makes that work long,
+    // and a daemon that cannot be stopped while it runs is a daemon an operator
+    // has to kill.
     let mut stopping = false;
     tokio::select! {
         scanned = node.scan_publish_push() => {
@@ -566,6 +567,12 @@ pub async fn run(config: NodeConfig) -> Result<()> {
     // bounded by the dial timeout and the per-request deadline the network
     // layer applies, so none of them can outlive the stop by more than one
     // request.
+    //
+    // Absent from the list, and deliberately: the reactive head pusher. It is
+    // owned by the node rather than by this host (`Node::open`), and
+    // `node.shutdown()` below aborts it, so joining it here would only be a
+    // second way to stop the same task — and one that could not report it,
+    // since the list's names and indices are read together.
     //
     // The results are read, not discarded. A `JoinError` here means a loop
     // ended by panicking rather than by the stop signal — which happened at

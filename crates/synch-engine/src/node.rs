@@ -169,6 +169,8 @@ struct NodeInner {
     config: NodeConfig,
     /// The batch between staging and one signed root (§7.1).
     publisher: Publisher,
+    /// New heads on their way to peers, off the publisher's path (§5.3).
+    pusher: crate::pusher::Pusher,
     ad_clock: std::sync::Mutex<std::collections::HashMap<Hash, i64>>,
     /// Serializes bounded repair rounds and retains their last completed peer.
     contact_cursor: tokio::sync::Mutex<Option<Vec<u8>>>,
@@ -888,6 +890,7 @@ impl Node {
         }
         let net = Net::bind(store.clone(), secret.clone(), config.net.clone()).await?;
         let publisher = Publisher::new(config.publish_quiesce, config.publish_batch_max);
+        let pusher = crate::pusher::Pusher::new();
         let node = Node {
             inner: Arc::new(NodeInner {
                 store,
@@ -899,6 +902,7 @@ impl Node {
                 secret: std::sync::RwLock::new(secret),
                 config,
                 publisher,
+                pusher,
                 ad_clock: std::sync::Mutex::new(Default::default()),
                 contact_cursor: tokio::sync::Mutex::new(None),
                 provider_misses: std::sync::Mutex::new(Default::default()),
@@ -919,6 +923,12 @@ impl Node {
                 cloud: std::sync::Mutex::new(Default::default()),
             }),
         };
+        // The reactive push starts with the node rather than with a host that
+        // remembers to run it: every `flush_staged` caller must be served,
+        // including a bare node whose host runs no standing loop at all
+        // (`crate::pusher`). Started before the node is handed out, so a
+        // publish that lands immediately still finds the pusher behind it.
+        node.pusher().start(&node);
         // The handler was mounted on the endpoint before the node existed;
         // this is where it learns what it dispatches to. Done before anything
         // else that can await, so the window in which a connection finds it
@@ -1014,6 +1024,11 @@ impl Node {
     /// The batch between staging and one signed root (§7.1).
     pub fn publisher(&self) -> &Publisher {
         &self.inner.publisher
+    }
+
+    /// The task that offers new heads to peers after a publish (§5.3).
+    pub(crate) fn pusher(&self) -> &crate::pusher::Pusher {
+        &self.inner.pusher
     }
 
     /// The endpoint under the active device key.
@@ -1130,6 +1145,11 @@ impl Node {
 
     /// Shuts every endpoint this node holds down cleanly.
     pub async fn shutdown(&self) -> Result<()> {
+        // Before the endpoint goes anywhere: a push in flight is cancelled
+        // rather than left to race the endpoint out from under it. What the
+        // abort drops is a push, never a publish — the head is durable, and
+        // peers pick it up at the next anti-entropy round (§5.3).
+        self.pusher().stop().await;
         let retiring = self.retiring_nets();
         let active = self.net();
 

@@ -139,22 +139,27 @@ impl Node {
         self.publisher().stage(changes);
     }
 
-    /// Publishes everything staged so far as one new signed root and pushes it
-    /// to reachable peers (§7.1).
+    /// Publishes everything staged so far as one new signed root, and offers it
+    /// to the pusher (§7.1).
     ///
     /// This is the whole batch, not one caller's share of it: a `synch source scan`
     /// that lands while a watcher-triggered rescan is still buffered publishes
     /// both, which is the point of batching.
     ///
     /// A failed publish puts the batch back rather than dropping it, so the
-    /// next flush retries it. A failed *push* does not fail the flush: the head
-    /// is published, and peers pick it up at the next anti-entropy round.
+    /// next flush retries it. The push is not part of what this returns: the
+    /// head is durable when it does, and peers hear it from `crate::pusher` —
+    /// which starts on the head now, so nothing waits out an interval (§5.3) —
+    /// or, for a peer the push could not reach, from the next anti-entropy
+    /// round.
     pub async fn flush_staged(&self) -> Result<Option<SignedHead>> {
         let head = self.publish_staged().await?;
         if let Some(head) = &head {
-            if let Err(e) = self.push_head(head).await {
-                tracing::debug!(error = %e, "could not push the new head");
-            }
+            // Offered, not delivered. Waiting for the push here is what made a
+            // publish answer ten seconds late on a cluster with one peer
+            // switched off, and nothing downstream ever read the answer: a
+            // failed push has never failed a flush.
+            self.pusher().stage(head);
             // This node's own origin's tree just moved, and both checkouts
             // and the replicas follow the unified tree — which
             // includes it.
@@ -168,8 +173,8 @@ impl Node {
     /// telling anybody about it.
     ///
     /// The half of a flush that is this node's own business. Peers learn the
-    /// head from the push in [`Node::flush_staged`], or from the next
-    /// anti-entropy round if nobody pushes it.
+    /// head from `crate::pusher`, or from the next anti-entropy round if nobody
+    /// pushes it.
     async fn publish_staged(&self) -> Result<Option<SignedHead>> {
         let batch = self.publisher().take();
         if batch.is_empty() {

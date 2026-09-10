@@ -470,7 +470,8 @@ nothing, while adoption writes *files*, one selected version per path, into a
 source. When the same namespace is also a replica, the two compose: retained objects need no network
 read during adoption.
 
-Tree adoption scans, publishes, and pushes successful changes before returning.
+Tree adoption scans and publishes successful changes before returning; peers hear
+about the new head from the node's own push, which does not hold the command open.
 Written files carry the selected version's mtime and masked mode so adoption
 restates that version rather than minting a wall-clock winner. A node in key-loss
 recovery refuses adoption before writing anything; run `synch recover` first.

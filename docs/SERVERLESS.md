@@ -567,7 +567,10 @@ The publish-before-Litestream-ships window (§4) loses acked metadata on a
 crash. Two mechanisms bound it:
 
 **Self-readoption at boot.** The cluster usually remembers what the node
-forgot: peers hold the pushed head, signed by this node's own key. On
+forgot: peers hold the pushed head, signed by this node's own key — "usually"
+because the push is dispatched as the write commits and not waited for (§5.3
+of DESIGN.md), so a pod that dies before its dial lands is the other case.
+On
 startup — after restore, before the first publish — the node collects
 `Hello` summaries exactly as recovery does (§3.4 of DESIGN.md), and if a
 peer advertises **this node's own origin** at a seq above its restored
@@ -596,7 +599,9 @@ salvage (`synch pin add <root>` re-publishes an ad; a re-`PUT` of the same
 content is a no-op upload). This residue is documented, not designed away:
 closing it would mean a synchronous redo log in cloud storage per publish batch,
 whose cost (a PUT on the ack path) is not justified for a window that
-peers already close in every multi-node deployment.
+peers already close in every multi-node deployment — a peer that answers is
+told within milliseconds of the commit, since the push starts as the head is
+published, and only a crash inside that window leaves the residue.
 
 ---
 

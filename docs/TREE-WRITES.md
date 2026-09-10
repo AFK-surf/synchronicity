@@ -276,7 +276,8 @@ at commit when it already does.
 
 Success means what an S3 `PutObject` response means, and a little more: the
 bytes are durably staged, the entry is folded into a signed head, and the head
-was flushed and pushed (`scan_publish_push` — §6). The returned root is
+was flushed and offered to the pusher (`scan_publish_push` — §6), which dials
+the membership behind the commit rather than holding it open. The returned root is
 therefore immediately readable back through `sy_open` of the same path, and
 citable to the caller. The cost is symmetric: **one commit is one head**. A
 program with many files to publish per invocation should know that a burst of
