@@ -263,8 +263,8 @@ impl Node {
     /// No timer of its own: each peer is bounded by the network layer's dial
     /// and request deadlines. A caller with somebody waiting on it — the
     /// rotation that has to reach the membership, a test — wants exactly this,
-    /// and the caller with nobody waiting ([`Node::push_head_within`]) says so
-    /// by naming a budget.
+    /// and the caller with nobody waiting says so by naming a budget of its own
+    /// (`push_head_within`, which the reactive path uses).
     pub async fn push_head(&self, head: &SignedHead) -> Result<usize> {
         self.push_head_at(head, None).await
     }
