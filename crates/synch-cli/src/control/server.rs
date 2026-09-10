@@ -2478,7 +2478,9 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
             let staged = offload(move || Ok(removing.source_removal(&removed_id)?)).await?;
             let removed = staged.len();
             // Explicit commands publish before they answer, so the count they
-            // report is one that peers can already see (§7.1).
+            // report describes this node's own head (§7.1). Who else has heard
+            // of it is the pusher's business, and it is never a fact the
+            // command can report (§5.3).
             node.stage(staged);
             node.flush_staged().await?;
             let removed_id = id.clone();
@@ -2512,7 +2514,9 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
             }
             // An explicit scan is already one batch, so it stages and then
             // flushes rather than waiting out the quiesce: the "published seq"
-            // line below is true by the time the client reads it (§7.1).
+            // line below is true by the time the client reads it (§7.1) — true
+            // of this node's head, which is the whole of what a seq can promise
+            // now that the push is made off this path (§5.3).
             let head = node.flush_staged().await?;
             let mut summary = format!(
                 "hashed {} · unchanged {} · deleted {} · ignored {}",
@@ -2767,7 +2771,8 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
                 out.line(format!("adopted into {}", path.display())).await?;
             }
             // Path adoption publishes before it answers, for the same reason
-            // `source scan` does: the seq it prints has to be a real one (§7.1).
+            // `source scan` does: the seq it prints has to be a real one (§7.1)
+            // — the head's, not a claim that a peer has it (§5.3).
             match node.scan_publish_push().await? {
                 Some(head) => out.line(format!("published seq {}", head.seq)).await?,
                 None => {

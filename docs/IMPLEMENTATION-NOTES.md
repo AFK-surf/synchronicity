@@ -63,15 +63,17 @@ waiting for an answer:
 - `synch source scan`, `synch adopt path`, and `synch source rm` **flush** before they answer.
   Each is already one batch by construction, so flushing costs no extra head,
   and it keeps their output (`published seq N`, `unpublished N record(s)`)
-  describing something peers can already ask for. `synch-s3`'s `PutObject`
-  keeps its own, stricter timing — see §9.4 below.
+  describing this node's own head — which is all a seq can describe, since the
+  push that tells peers about it is made off the command's path (§5.3).
+  `synch-s3`'s `PutObject` keeps its own, stricter timing — see §9.4 below.
 
 A flush publishes the *whole* buffer, not the flushing caller's share of it, so
 a `synch source scan` that lands while a watcher rescan is still buffered publishes
 both. A publish that is refused (§3.4) puts its batch back rather than dropping
-it; a *push* that fails does not fail the flush, because the head exists and
-the next anti-entropy round carries it. A clean daemon stop flushes what is
-left.
+it; the push is not awaited at all, so it cannot fail the flush, and the next
+anti-entropy round carries whatever a push missed. A clean daemon stop flushes
+what is left — and, since the node's push loop is aborted at shutdown rather
+than drained, publishes it without offering it to peers.
 
 One visible consequence of batching: `FileEntry.seq` is the seq the scan
 expected to publish at, and a batch that lands after some unrelated publish

@@ -769,7 +769,7 @@ Hello      { proto: u16, heads: Vec<HeadSummary>,
                                                         //   a signed head alone proves nothing about that
 HeadsWant  { origins: Vec<OriginId> }                   // "yours is newer, send full signed head"
 Heads      { heads: Vec<SignedHead> }
-HeadPush   { head: SignedHead }                         // reactive: sent on any head change
+HeadPush   { head: SignedHead }                         // reactive: the newest head, sent after a change
 
 // one bidirectional stream per fetch batch. Each want carries the nibble
 // position it claims, which is what a responder authorizes on (§5.5): a hash
@@ -928,13 +928,21 @@ are rolled back to it everywhere.
 
 ### 5.3 Anti-entropy scheduling
 
-- **Reactive**: a local publish (§7) is pushed (`HeadPush`) to *every* trusted
-  peer immediately — dialling the ones not already connected, all concurrently —
-  which gives sub-second propagation on connected clusters. Pushing to the whole
-  membership rather than to current connections is what makes a second hop
-  unnecessary at the N ≤ 100 §12 sizes: the publisher already reaches everyone it
-  can reach. A received head is *not* relayed onward, so a member reachable from
-  some peer but not from the origin learns of it on its next pull rather than by
+- **Reactive**: a local publish (§7) hands its new head to the node's push loop,
+  which dials (`HeadPush`) *every* trusted peer — the ones not already connected
+  included, all concurrently — starting the moment the head exists, which gives
+  sub-second propagation on connected clusters. The publisher does not wait for it.
+  A peer that is switched off would otherwise put its dial deadline in front of every
+  `put`, `delete` and scan, and a failed push has never failed a publish; a peer that
+  does not take the head within the reactive budget (2 s) is simply left to the
+  periodic round below. Heads coalesce on the way, because they are monotone: the
+  newest head supersedes any whose push has not gone out, and a superseded head is
+  never sent — a receiver takes the greater one anyway (§5.2).
+
+  Pushing to the whole membership rather than to current connections is what makes a
+  second hop unnecessary at the N ≤ 100 §12 sizes: the push reaches everyone the
+  origin can reach. A received head is *not* relayed onward, so a member reachable
+  from some peer but not from the origin learns of it on its next pull rather than by
   epidemic spread.
 
   A pushed head lands in the receiver's **pending** slot — by construction, since
@@ -950,7 +958,7 @@ are rolled back to it everywhere.
   The adoption signal **stores a permit**, and that is load-bearing rather than an
   implementation detail. The loop is parked on it only *between* rounds; it spends
   the rest of its time inside a round, dialling peers — which is exactly when the
-  pushes it needs to hear about arrive, because a publisher pushes to the whole
+  pushes it needs to hear about arrive, because a node's push goes out to the whole
   membership concurrently, so peer X's round is in flight while pushes from other
   origins land. A signal that keeps nothing for an unparked listener is therefore
   silent for precisely the pushes that matter, and the interval-length wait comes
@@ -1295,8 +1303,9 @@ behavior with zero kernel dependencies:
   publishes no head" property), a retargeted one stages an update, and a deleted
   one is swept into a tombstone like any other path.
 - **Publisher**: staged changes are batched (default: quiesce 2 s or 1000 entries) into
-  a single new trie root: bump `seq`, sign, store, `HeadPush` to connected peers. One
-  save in an editor costs one head; a 100k-file initial index costs a handful.
+  a single new trie root: bump `seq`, sign, store, and hand to the pusher, which sends
+  `HeadPush` to the membership. One save in an editor costs one head; a 100k-file initial
+  index costs a handful. The publish itself does not wait for that push (§5.3).
 
 Ignore rules: `.syncignore` per space root (gitignore syntax), plus sensible built-in
 defaults (`.DS_Store`, `Thumbs.db`, temp/lock patterns).
@@ -1315,7 +1324,8 @@ selection policy: `--select newest` (default), `--select origin=<id>`, or
 - `synch adopt tree` does the same additively for a subtree. Existing differing
   files are reported unless `--replace` is explicit; `--dry-run` is a complete
   preview. It never infers removal from absence. A successful non-dry run scans,
-  publishes, and pushes before returning.
+  publishes before returning, and offers the head to the pusher — whether peers
+  have it yet is not something the command waits for (§5.3).
 
 A replica may also have `--checkout <path>`. That directory is only a view of
 content the replica already holds: checkout never creates retention demand and

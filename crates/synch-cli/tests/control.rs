@@ -286,6 +286,76 @@ async fn daemon_with_space(
     (dir, daemon, space, scan)
 }
 
+/// A trusted peer that accepts a session and answers nothing, with its binding
+/// and address recorded on `node`.
+///
+/// The endpoint is real, so a dial reaches a bound socket instead of failing at
+/// once: this is what a member that is simply switched off looks like from
+/// here, and it costs a dial deadline rather than a refusal. Both handles are
+/// returned to be held for the caller's lifetime — the endpoint keeps the
+/// address dialable, the task keeps accepted connections open, and the whole
+/// point of the fixture is that neither ever answers.
+async fn trust_a_silent_peer(
+    node: &Node,
+    origin: &str,
+) -> (iroh::Endpoint, tokio::task::JoinHandle<()>) {
+    let silent = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
+        .secret_key(SecretKey::generate())
+        .relay_mode(iroh::endpoint::RelayMode::Disabled)
+        .clear_address_lookup()
+        .clear_ip_transports()
+        .bind_addr("127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap())
+        .unwrap()
+        .alpns(vec![synch_core::ALPN_MPT.to_vec()])
+        .bind()
+        .await
+        .unwrap();
+    let addr = iroh::EndpointAddr::from_parts(
+        silent.id(),
+        silent
+            .bound_sockets()
+            .into_iter()
+            .map(iroh::TransportAddr::Ip),
+    );
+    let listening = silent.clone();
+    let accepting = tokio::spawn(async move {
+        let mut held = Vec::new();
+        while let Some(incoming) = listening.accept().await {
+            if let Ok(connection) = incoming.await {
+                held.push(connection);
+            }
+        }
+    });
+    let (seeding, peer_id) = (node.clone(), silent.id());
+    let peer_origin = OriginId::named(origin, "cluster.example").unwrap();
+    off_runtime(move || {
+        seeding
+            .store()
+            .put_binding(&synch_store::Binding {
+                origin: peer_origin,
+                node_id: peer_id,
+                source: synch_store::BindingSource::Static,
+                domain: None,
+                issuer: None,
+                spaces: Vec::new(),
+                note: None,
+                added_at: 0,
+                expires_at: None,
+            })
+            .unwrap();
+        seeding
+            .store()
+            .record_peer_seen(
+                &peer_id,
+                Some(&synch_engine::node::encode_addr(&addr)),
+                synch_core::now_ns(),
+            )
+            .unwrap();
+    })
+    .await;
+    (silent, accepting)
+}
+
 /// Runs a command and asserts its output contains `needle`.
 async fn says(data_dir: &Path, command: Command, needle: &str) -> String {
     let out = lines(data_dir, command).await;
@@ -1746,6 +1816,50 @@ async fn put_into_a_filesystem_source_writes_the_file() {
     daemon.shutdown().await;
 }
 
+/// A write is answered by this daemon's own work, not by a peer that is off.
+///
+/// Telling peers about a new head is the node's own business and is done off
+/// this path (§5.3), so one trusted member that answers nothing must not put a
+/// deadline in front of every `put` — and the same goes for the tombstone
+/// `delete` publishes. What this pins is the whole complaint, and worse than it:
+/// on the old code this `put` took 120 s, not the 10 s the dial timeout alone
+/// would cost, because a peer that accepts a session and then says nothing is
+/// bounded only by the network layer's request deadline.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_write_answers_while_a_trusted_peer_says_nothing() {
+    let (dir, daemon, _space, _scan) = daemon_with_space(&[]).await;
+    let data_dir = dir.path();
+    let files = tempfile::tempdir().unwrap();
+    std::fs::write(files.path().join("notes.txt"), b"kept\n").unwrap();
+
+    let (silent, accepting) = trust_a_silent_peer(&daemon.node, "silent").await;
+
+    let started = std::time::Instant::now();
+    let written = synch_cli::write::put(data_dir, &files.path().join("notes.txt"), "media/")
+        .await
+        .unwrap();
+    assert_eq!(written.entry.path, "notes.txt");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "put waited {elapsed:?} on a peer that says nothing"
+    );
+
+    let started = std::time::Instant::now();
+    synch_cli::write::delete(data_dir, "media/notes.txt")
+        .await
+        .unwrap();
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed < std::time::Duration::from_secs(5),
+        "delete waited {elapsed:?} on a peer that says nothing"
+    );
+
+    daemon.shutdown().await;
+    accepting.abort();
+    silent.close().await;
+}
+
 /// A reader that hands over a fixed number of bytes and then fails — a
 /// producer that died mid-stream, for a test, since no file on disk fails
 /// to read on cue.
@@ -2115,97 +2229,50 @@ async fn adopt_path_adopts_a_peers_deletion_over_the_socket() {
     daemon.shutdown().await;
 }
 
-/// A daemon stops while its startup work is stalled on a peer: the initial
-/// scan pushes to every known peer, a peer that answers nothing holds that
-/// push for the whole deadline, and the stop signal must be heard during it
-/// — an operator stopping a daemon must not wait on a stranger.
+/// A daemon starts and stops with a trusted peer that answers nothing.
+///
+/// The silent peer is trusted before the daemon opens, so the startup
+/// readoption probe stalls on it and control has to answer "starting" before
+/// readiness — an operator stopping a daemon must not wait on a stranger. The
+/// reactive push covers the same ground from the other side: the initial scan
+/// publishes a head, the pusher dials that peer behind the scan's back, and
+/// `Node::shutdown` aborts the dial rather than waiting it out.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-async fn a_daemon_stops_while_its_first_scan_is_stalled_on_a_peer() {
+async fn a_daemon_starts_and_stops_with_a_peer_that_answers_nothing() {
     let dir = tempfile::tempdir().unwrap();
     let space = space_with(&[("notes.txt", b"hello")]);
 
-    // A peer that accepts the session and answers nothing.
-    let silent = iroh::Endpoint::builder(iroh::endpoint::presets::N0)
-        .secret_key(SecretKey::generate())
-        .relay_mode(iroh::endpoint::RelayMode::Disabled)
-        .clear_address_lookup()
-        .clear_ip_transports()
-        .bind_addr("127.0.0.1:0".parse::<std::net::SocketAddr>().unwrap())
-        .unwrap()
-        .alpns(vec![synch_core::ALPN_MPT.to_vec()])
-        .bind()
-        .await
-        .unwrap();
-    let silent_addr = iroh::EndpointAddr::from_parts(
-        silent.id(),
-        silent
-            .bound_sockets()
-            .into_iter()
-            .map(iroh::TransportAddr::Ip),
-    );
-    let listening = silent.clone();
-    let accepting = tokio::spawn(async move {
-        let mut held = Vec::new();
-        while let Some(incoming) = listening.accept().await {
-            if let Ok(connection) = incoming.await {
-                held.push(connection);
-            }
-        }
-    });
-
-    // The silent peer is trusted and addressed so the initial scan pushes to it.
+    // Trusted and addressed before the daemon opens, so its recovery exchange
+    // and its first push both have the silent peer in front of them.
     let path = dir.path().to_path_buf();
     off_runtime(move || {
         Node::init_named_by_zone(&path, OriginId::named("nas", "cluster.example").unwrap())
     })
     .await
     .unwrap();
-    {
+    let (silent, accepting) = {
         let node = Node::open(NodeConfig::loopback(dir.path())).await.unwrap();
         let seeding = node.clone();
         let space_path = space.path().to_path_buf();
-        let (peer_id, peer_addr) = (silent.id(), silent_addr.clone());
-        off_runtime(move || {
-            seeding.add_filesystem_source("s", &space_path).unwrap();
-            seeding
-                .store()
-                .put_binding(&synch_store::Binding {
-                    origin: OriginId::named("silent", "cluster.example").unwrap(),
-                    node_id: peer_id,
-                    source: synch_store::BindingSource::Static,
-                    domain: None,
-                    issuer: None,
-                    spaces: Vec::new(),
-                    note: None,
-                    added_at: 0,
-                    expires_at: None,
-                })
-                .unwrap();
-            seeding
-                .store()
-                .record_peer_seen(
-                    &peer_id,
-                    Some(&synch_engine::node::encode_addr(&peer_addr)),
-                    synch_core::now_ns(),
-                )
-                .unwrap();
-        })
-        .await;
+        off_runtime(move || seeding.add_filesystem_source("s", &space_path).unwrap()).await;
+        let handles = trust_a_silent_peer(&node, "silent").await;
         node.shutdown().await.unwrap();
-    }
+        handles
+    };
 
-    // Long enough that only the initial scan talks to the peer during the
-    // test. That must include anti-entropy: a round mid-request when the stop
-    // arrives is allowed by design to run to its per-request deadline (the
-    // daemon's join waits for it), so with the default interval whether this
-    // test measured the scan's cancellation or that deadline was a jitter
-    // draw.
+    // Long enough that the startup work and the pusher are the only things that
+    // talk to the peer during the test. That must include anti-entropy: a round
+    // mid-request when the stop arrives is allowed by design to run to its
+    // per-request deadline (the daemon's join waits for it), so with the
+    // default interval whether this test measured the stop's promptness or that
+    // deadline was a jitter draw.
     let mut config = NodeConfig::loopback(dir.path());
     config.publish_quiesce = std::time::Duration::from_secs(300);
     config.aae_interval = std::time::Duration::from_secs(300);
     // Bounds the startup readoption probe of the same silent peer, which runs
-    // while control requests report starting. The initial scan's
-    // push keeps its deadline — the stop must be heard while it is stalled.
+    // while control requests report starting. The push the initial scan leaves
+    // behind is bounded per peer on its own (§5.3), so what the stop has to
+    // survive here is this probe and a dial that gets aborted behind it.
     config.sync_round_budget = std::time::Duration::from_secs(1);
     let running = tokio::spawn(synch_cli::daemon::run(config));
 

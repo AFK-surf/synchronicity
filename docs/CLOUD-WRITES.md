@@ -106,7 +106,8 @@ control-plane/README.md.
    ```
 
 4. Every node in the network sees the path at its next anti-entropy round —
-   the hosted node pushes the head at commit, the same as an S3 `PUT` does —
+   usually well before it, because the hosted node hands the head to its pusher
+   as the commit lands, the same as an S3 `PUT` does —
    selected by `newest` because it carries the present instant. Where a
    customer node published a different version, both are visible: the file
    browser's version drawer shows `nas` and `cloud-1` side by side, and the
@@ -298,7 +299,7 @@ Success is `200` with the JSON in §2, an `ETag` of `"<root>"` and
 `x-synch-root`, and it means what an S3 `PutObject` success means on a
 cloud-backend node, and a little more: the bytes are durable in the tenant's
 prefix, the `f:`/`b:` records are in a signed head, the head is flushed and
-pushed, and the version is readable back through the same `GET` (§6.3).
+offered to the pusher, and the version is readable back through the same `GET` (§6.3).
 
 **Conditions.** Two, taken from HTTP:
 
@@ -661,14 +662,15 @@ driven gate for gate as TREE-WRITES §6 lists them:
    `commit_api_file` (the CAS ingest, which **uploads to the tenant's prefix
    and gets the provider's ack before the blob row exists** — SERVERLESS §4's
    order), `stage_api_reference` (the `f:` entry with `prev`, and the `b:`
-   ad), then `flush_staged`, which signs one head over the batch, pushes it to
-   every reachable member, and wakes the replicas. The `committed` frame is
-   sent after the flush returns.
+   ad), then `flush_staged`, which signs one head over the batch, hands it to the
+   pusher that dials every reachable member, and wakes the replicas. The
+   `committed` frame is sent after the flush returns — after the head is durable,
+   not after any peer has it (§5.3).
 
 So the ack chain is SERVERLESS §4's chain with one more link:
 
 ```
-object ack → blob row → f:/b: staged → head signed & pushed → committed frame → HTTP 200
+object ack → blob row → f:/b: staged → head signed & offered to the pusher → committed frame → HTTP 200
 ```
 
 One commit is one head, as TREE-WRITES §5.3 prices it; a caller with many
@@ -705,13 +707,16 @@ row — and rides the in-process replica stream on its one-second interval
 (CLOUD-DATAPLANE §5.3). A pod that dies inside that second loses the
 *metadata* of an acknowledged write while its *bytes* are already durable in
 the prefix: SERVERLESS §4's window, unchanged. What closes it is that the
-head was **pushed at commit** to the customer's own nodes, which then hold
+head is **pushed at commit** to the customer's own nodes, which then hold
 `cloud-1`'s signed head at a seq above what the stream restored; the next
 pod's `readopt_self_on_startup` — which already runs before any loop, for
 exactly this reason — fetches that trie back and continues above it. The
-cluster remembers what the pod forgot. Where no member heard the push, the
-residue is SERVERLESS §8.3's: bytes kept, one second of metadata gone, and
-the `PUT` may be repeated (a re-put of the same content is a no-op upload).
+cluster remembers what the pod forgot. The push is dispatched at commit and not
+waited for (§5.3), so what it closes is narrower than "acknowledged": a pod that
+dies before its dial lands leaves whatever the stream had not shipped. Where no
+member heard the push, the residue is SERVERLESS §8.3's: bytes kept, one second
+of metadata gone, and the `PUT` may be repeated (a re-put of the same content is
+a no-op upload).
 
 ### 6.6 Delete
 

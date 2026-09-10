@@ -22,6 +22,7 @@ pub mod lifecycle;
 pub mod membership;
 pub mod node;
 pub mod publisher;
+mod pusher;
 pub mod reconcile;
 pub mod recovery;
 pub mod reference;
