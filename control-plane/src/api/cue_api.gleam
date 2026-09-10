@@ -17,12 +17,28 @@
 //// transaction; a retry also cancels pending collection and preserves placement.
 //// The paired remote/local retry lifecycle is modeled in the Cue repository at
 //// `tla/cue_synchronicity/WorkspaceProvisioning.tla`.
+////
+//// The same secret also mints and revokes **member org keys** for a
+//// Workspace's org (`mint_api_key`, `revoke_api_key`), which is how Cue's
+//// backend reaches the org API — above all the network's file surface,
+//// `…/browse/{ls,stat,file}` — on the Workspace's behalf with no person
+//// signed in. `api/api_keys_api` refuses to let a key mint a key, because
+//// revoking the key you knew about would not end the access it minted; the
+//// provisioning secret is not a key and already holds wider authority over
+//// these orgs (it creates them and enrolls their devices), so minting under
+//// it widens nothing. What keeps the trail whole: every key minted here is
+//// an ordinary row in the org's key list, revocable by its admins in the
+//// dashboard, and its `apikey.create` audit row names `cue:provisioning` as
+//// the actor — so an operator rotating the secret can find what it minted.
 
+import api/api_keys_api
 import api/auth_api.{type AuthContext, with_db}
 import api/common.{
-  body_decoder, constraint_response, db_error, ok_json, zone_mutation,
+  audit, body_decoder, constraint_response, db_error, ok_json, transaction,
+  zone_mutation,
 }
 import api/middleware.{Bearer, error_json, now_unix, presented}
+import auth/api_key
 import auth/principal
 import cloud/dataplane
 import config.{type CueProvisioning}
@@ -42,6 +58,19 @@ type Owner {
   Owner(subject: String, email: String, name: Option(String))
 }
 
+/// Every Workspace org holds exactly one network, and this is its name.
+const default_network = "default"
+
+/// The name a minted key carries when the caller gives none. Cue's backend is
+/// the one holder, so the name only has to say which key this is in the
+/// org's list beside keys people minted.
+const default_key_name = "cue-backend"
+
+/// The one role a Cue-minted key may hold. The file surface is `member`
+/// floor everywhere, and `member` is what a Workspace member already has, so
+/// a wider key would be authority nobody asked for.
+const minted_role = "member"
+
 /// `PUT /internal/v1/integrations/cue/workspaces/<cue_workspace_id>`.
 pub fn provision_workspace(
   req: Request,
@@ -49,28 +78,13 @@ pub fn provision_workspace(
   cue_workspace_id: String,
 ) -> Response {
   case ctx.cue_provisioning {
-    None ->
-      error_json(
-        503,
-        "provisioning_not_configured",
-        "cue provisioning is not enabled on this control plane",
-      )
+    None -> not_configured()
     Some(cfg) -> {
       use <- authorized(req, cfg)
       use <- valid_id(cue_workspace_id, "invalid_workspace")
-      let owner_decoder = {
-        use subject <- decode.field("subject", decode.string)
-        use email <- decode.field("email", decode.string)
-        use name <- decode.optional_field(
-          "name",
-          None,
-          decode.optional(decode.string),
-        )
-        decode.success(Owner(subject, email, name))
-      }
       let decoder = {
         use ws_name <- decode.field("name", decode.string)
-        use owner <- decode.field("owner", owner_decoder)
+        use owner <- decode.field("owner", owner_decoder())
         decode.success(#(ws_name, owner))
       }
       use #(ws_name, owner) <- body_decoder(req, decoder)
@@ -103,7 +117,7 @@ fn converge(
 ) -> Response {
   // A synthetic principal: the provisioning secret has already authenticated
   // the caller, so `who` is only the audit/zone actor here.
-  let who = principal.Principal("cue:provisioning", principal.Cookie(""))
+  let who = provisioning_principal()
 
   zone_mutation(conn, ctx, who, publish.Widening, fn() {
     // Resolve the mapping under the writer lock, including concurrent creates.
@@ -112,13 +126,14 @@ fn converge(
       Ok(Some(#(org_id, network_id))) -> {
         use sync_user_id <- result.try(ensure_owner(conn, cfg, org_id, owner))
         use _ <- result.try(enable_cloud_features(conn, network_id))
-        Ok(provisioned(org_id, network_id, sync_user_id, False))
+        use slug <- result.try(org_slug(conn, org_id))
+        Ok(provisioned(org_id, slug, network_id, sync_user_id, False))
       }
       Ok(None) -> {
         let org_id = id.new()
         let network_id = id.new()
 
-        use _ <- result.try(insert_org(conn, org_id, ws_name))
+        use slug <- result.try(insert_org(conn, org_id, ws_name))
         use _ <- result.try(insert_network(conn, network_id, org_id))
         use sync_user_id <- result.try(ensure_owner(conn, cfg, org_id, owner))
         use _ <- result.try(insert_mapping(
@@ -129,7 +144,7 @@ fn converge(
         ))
 
         use _ <- result.try(enable_cloud_features(conn, network_id))
-        Ok(provisioned(org_id, network_id, sync_user_id, True))
+        Ok(provisioned(org_id, slug, network_id, sync_user_id, True))
       }
     }
   })
@@ -241,11 +256,12 @@ fn find_workspace_org(
   }
 }
 
+/// Creates the org and returns its slug — the name the org API routes by.
 fn insert_org(
   conn: Connection,
   org_id: String,
   ws_name: String,
-) -> Result(Nil, Response) {
+) -> Result(String, Response) {
   // The slug is DNS-label safe by construction (`cue-` + lowercase hex).
   let slug = "cue-" <> id.new()
 
@@ -261,9 +277,34 @@ fn insert_org(
       ],
     )
   {
-    Ok(_) -> Ok(Nil)
+    Ok(_) -> Ok(slug)
     Error(e) -> Error(constraint_response(e))
   }
+}
+
+fn org_slug(conn: Connection, org_id: String) -> Result(String, Response) {
+  scalar_text(conn, "SELECT slug FROM orgs WHERE id = ?", [Text(org_id)])
+}
+
+/// The owner every internal route carries: the Cue subject that anchors the
+/// identity under the hub provider, and the email the trusted caller asserts
+/// for it.
+fn owner_decoder() -> decode.Decoder(Owner) {
+  use subject <- decode.field("subject", decode.string)
+  use email <- decode.field("email", decode.string)
+  use name <- decode.optional_field(
+    "name",
+    None,
+    decode.optional(decode.string),
+  )
+  decode.success(Owner(subject, email, name))
+}
+
+/// The synthetic actor of every write these routes make: the provisioning
+/// secret has already authenticated the caller, so this names the service in
+/// the audit trail and the zone's publish rows, never a person.
+fn provisioning_principal() -> principal.Principal {
+  principal.Principal("cue:provisioning", principal.Cookie(""))
 }
 
 fn insert_network(
@@ -453,15 +494,21 @@ fn ensure_membership(
   }
 }
 
+/// `org_slug` and `network` beside the ids: the org API (`/api/orgs/<slug>/
+/// networks/<network>/…`) routes by those, so a caller holding a key minted
+/// below needs them to reach the Workspace's files without a second lookup.
 fn provisioned(
   org_id: String,
+  org_slug: String,
   network_id: String,
   sync_user_id: String,
   created: Bool,
 ) -> Json {
   json.object([
     #("org_id", json.string(org_id)),
+    #("org_slug", json.string(org_slug)),
     #("network_id", json.string(network_id)),
+    #("network", json.string(default_network)),
     #("sync_user_id", json.string(sync_user_id)),
     #("created", json.bool(created)),
   ])
@@ -483,29 +530,14 @@ pub fn enroll_device(
   cue_workspace_id: String,
 ) -> Response {
   case ctx.cue_provisioning {
-    None ->
-      error_json(
-        503,
-        "provisioning_not_configured",
-        "cue provisioning is not enabled on this control plane",
-      )
+    None -> not_configured()
     Some(cfg) -> {
       use <- authorized(req, cfg)
       use <- valid_id(cue_workspace_id, "invalid_workspace")
-      let owner_decoder = {
-        use subject <- decode.field("subject", decode.string)
-        use email <- decode.field("email", decode.string)
-        use name <- decode.optional_field(
-          "name",
-          None,
-          decode.optional(decode.string),
-        )
-        decode.success(Owner(subject, email, name))
-      }
       let decoder = {
         use nk <- decode.field("nk", decode.string)
         use label <- decode.field("label", decode.string)
-        use owner <- decode.field("owner", owner_decoder)
+        use owner <- decode.field("owner", owner_decoder())
         decode.success(#(nk, label, owner))
       }
       use #(nk, label, owner) <- body_decoder(req, decoder)
@@ -534,12 +566,7 @@ pub fn enroll_device(
                   Ok(Nil) ->
                     case find_workspace_org(conn, cue_workspace_id) {
                       Error(response) -> response
-                      Ok(None) ->
-                        error_json(
-                          404,
-                          "workspace_not_provisioned",
-                          "this workspace has no synchronicity org yet",
-                        )
+                      Ok(None) -> not_provisioned()
                       Ok(Some(#(org_id, network_id))) ->
                         enroll(
                           conn,
@@ -623,7 +650,7 @@ fn ensure_member(
           )
       }
     Ok(False) -> {
-      let who = principal.Principal("cue:provisioning", principal.Cookie(""))
+      let who = provisioning_principal()
       zone_mutation(conn, ctx, who, publish.Widening, fn() {
         use _ <- result.try(insert_network_device(conn, network_id, device_id))
         use domain <- result.try(build_domain(conn, org_id, network_id))
@@ -648,7 +675,7 @@ fn create_device(
   nk: String,
   nk_bytes: BitArray,
 ) -> Response {
-  let who = principal.Principal("cue:provisioning", principal.Cookie(""))
+  let who = provisioning_principal()
   zone_mutation(conn, ctx, who, publish.Widening, fn() {
     use user_id <- result.try(ensure_identity(conn, cfg, owner))
     let device_id = id.new()
@@ -808,8 +835,230 @@ fn enrolled(
   json.object([
     #("device_id", json.string(device_id)),
     #("network_id", json.string(network_id)),
-    #("network", json.string("default")),
+    #("network", json.string(default_network)),
     #("domain", json.string(domain)),
     #("created", json.bool(created)),
   ])
+}
+
+// --- API keys ----------------------------------------------------------------
+
+/// `POST /internal/v1/integrations/cue/workspaces/<cue_workspace_id>/api-keys`.
+///
+/// Mints a `member` org key for the Workspace's org and returns the token —
+/// the only time it exists anywhere but the caller's hands, as with every
+/// key. Body: `{"owner": {...}, "name"?: "…", "expires_in"?: seconds}`; the
+/// owner is the same object the other internal routes take, and is what
+/// `created_by` names (the column references `users`, and the Workspace
+/// owner is the person this key acts for). `role` is not a field: see
+/// `minted_role`.
+///
+/// Not idempotent, and cannot be: a retry after a lost reply has no token to
+/// return, so every call is a new key. The caller keeps the one it received
+/// and revokes any it can no longer name through `revoke_api_key`; the org's
+/// admins see every one of them in the dashboard's key list meanwhile.
+pub fn mint_api_key(
+  req: Request,
+  ctx: AuthContext,
+  cue_workspace_id: String,
+) -> Response {
+  case ctx.cue_provisioning {
+    None -> not_configured()
+    Some(cfg) -> {
+      use <- authorized(req, cfg)
+      use <- valid_id(cue_workspace_id, "invalid_workspace")
+      let decoder = {
+        use name <- decode.optional_field(
+          "name",
+          default_key_name,
+          decode.string,
+        )
+        use expires_in <- decode.optional_field("expires_in", 0, decode.int)
+        use owner <- decode.field("owner", owner_decoder())
+        decode.success(#(name, expires_in, owner))
+      }
+      use #(name_input, expires_in, owner) <- body_decoder(req, decoder)
+      let name = string.trim(name_input)
+      use <- valid_id(owner.subject, "invalid_subject")
+      case
+        valid_email(owner.email),
+        api_keys_api.check_name(name),
+        api_keys_api.expires_at_from(expires_in)
+      {
+        False, _, _ ->
+          error_json(400, "invalid_email", "owner email is not a valid address")
+        _, Error(refusal), _ | _, _, Error(refusal) -> refusal
+        True, Ok(Nil), Ok(expires_at) ->
+          with_db(ctx, fn(conn) {
+            case hub_provider_exists(conn, cfg) {
+              Error(response) -> response
+              Ok(Nil) ->
+                case find_workspace_org(conn, cue_workspace_id) {
+                  Error(response) -> response
+                  Ok(None) -> not_provisioned()
+                  Ok(Some(#(org_id, _network_id))) ->
+                    mint(conn, cfg, org_id, owner, name, expires_at)
+                }
+            }
+          })
+      }
+    }
+  }
+}
+
+/// The row and its trail together, or neither — the same bracket
+/// `api_keys_api.create_key` puts around a mint, for the same reason: a live
+/// key with no `apikey.create` row is a credential nobody knows exists.
+fn mint(
+  conn: Connection,
+  cfg: CueProvisioning,
+  org_id: String,
+  owner: Owner,
+  name: String,
+  expires_at: Option(Int),
+) -> Response {
+  let key_id = id.new()
+  let who = provisioning_principal()
+  let minted =
+    transaction(conn, fn() {
+      use user_id <- result.try(ensure_identity(conn, cfg, owner))
+      use #(token, prefix) <- result.try(
+        api_key.create(
+          conn,
+          key_id,
+          org_id,
+          None,
+          name,
+          minted_role,
+          user_id,
+          expires_at,
+          now_unix(),
+        )
+        |> result.map_error(constraint_response),
+      )
+      use _ <- result.try(
+        audit(conn, who, org_id, "apikey.create", [
+          #("key", json.string(key_id)),
+          #("name", json.string(name)),
+          #("role", json.string(minted_role)),
+          #("network", json.string("")),
+        ])
+        |> result.map_error(fn(_) { db_error() }),
+      )
+      use slug <- result.try(org_slug(conn, org_id))
+      Ok(#(token, prefix, slug))
+    })
+  case minted {
+    Error(refusal) -> refusal
+    Ok(#(token, prefix, slug)) ->
+      ok_json(
+        json.object([
+          #(
+            "result",
+            json.object([
+              #("key_id", json.string(key_id)),
+              #("name", json.string(name)),
+              #("role", json.string(minted_role)),
+              #("prefix", json.string(prefix)),
+              #("expires_at", json.int(option.unwrap(expires_at, 0))),
+              #("token", json.string(token)),
+              #("org_id", json.string(org_id)),
+              #("org_slug", json.string(slug)),
+              #("network", json.string(default_network)),
+            ]),
+          ),
+        ]),
+      )
+  }
+}
+
+/// `DELETE /internal/v1/integrations/cue/workspaces/<cue_workspace_id>/api-keys/<key_id>`.
+///
+/// Revokes a key of the Workspace's org, which is deleting its row: the token
+/// authenticates by the hash there, and the audit rows that minted and ended
+/// it are what survive. Confined to the Workspace's own org in the `WHERE`,
+/// as the dashboard's delete is, so another org's key id is a 404 rather
+/// than a revocation. A repeat is a 404 too — the row is gone — which a
+/// caller converging on "this key no longer works" reads as done.
+pub fn revoke_api_key(
+  req: Request,
+  ctx: AuthContext,
+  cue_workspace_id: String,
+  key_id: String,
+) -> Response {
+  case ctx.cue_provisioning {
+    None -> not_configured()
+    Some(cfg) -> {
+      use <- authorized(req, cfg)
+      use <- valid_id(cue_workspace_id, "invalid_workspace")
+      use <- valid_id(key_id, "invalid_key")
+      with_db(ctx, fn(conn) {
+        case find_workspace_org(conn, cue_workspace_id) {
+          Error(response) -> response
+          Ok(None) -> not_provisioned()
+          Ok(Some(#(org_id, _network_id))) -> revoke(conn, org_id, key_id)
+        }
+      })
+    }
+  }
+}
+
+fn revoke(conn: Connection, org_id: String, key_id: String) -> Response {
+  let who = provisioning_principal()
+  let revoked =
+    transaction(conn, fn() {
+      case
+        sqlite.exec(conn, "DELETE FROM api_keys WHERE id = ? AND org_id = ?", [
+          Text(key_id),
+          Text(org_id),
+        ])
+      {
+        Ok(Done(1, _)) ->
+          case
+            audit(conn, who, org_id, "apikey.delete", [
+              #("key", json.string(key_id)),
+            ])
+          {
+            Ok(Nil) ->
+              Ok(
+                ok_json(
+                  json.object([
+                    #("result", json.object([#("revoked", json.bool(True))])),
+                  ]),
+                ),
+              )
+            // Rolls the delete back with it: a key that stopped working with
+            // nothing saying when, or by whose hand, is where an incident
+            // starts.
+            Error(_) -> Error(db_error())
+          }
+        Ok(_) ->
+          Error(error_json(
+            404,
+            "not_found",
+            "no such API key in this workspace's org",
+          ))
+        Error(e) -> Error(constraint_response(e))
+      }
+    })
+  case revoked {
+    Ok(response) -> response
+    Error(response) -> response
+  }
+}
+
+fn not_configured() -> Response {
+  error_json(
+    503,
+    "provisioning_not_configured",
+    "cue provisioning is not enabled on this control plane",
+  )
+}
+
+fn not_provisioned() -> Response {
+  error_json(
+    404,
+    "workspace_not_provisioned",
+    "this workspace has no synchronicity org yet",
+  )
 }

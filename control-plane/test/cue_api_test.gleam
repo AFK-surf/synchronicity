@@ -8,8 +8,9 @@ import api/router
 import config
 import email/mailer
 import fixtures.{tmp_db}
+import gleam/dynamic/decode
 import gleam/erlang/process
-import gleam/http.{Post, Put}
+import gleam/http.{Delete, Get, Post, Put}
 import gleam/json
 import gleam/option.{type Option, None, Some}
 import gleam/string
@@ -767,4 +768,303 @@ pub fn rejected_backfill_rolls_back_flags_placement_and_collection_test() {
     )
     == 1
   assert count(env, "SELECT count(*) FROM cloud_collect_queue", []) == 1
+}
+
+// --- API keys ----------------------------------------------------------------
+
+fn key_body(subject: String, email: String) -> json.Json {
+  json.object([
+    #(
+      "owner",
+      json.object([
+        #("subject", json.string(subject)),
+        #("email", json.string(email)),
+      ]),
+    ),
+  ])
+}
+
+fn key_body_with(
+  subject: String,
+  email: String,
+  name: String,
+  expires_in: Int,
+) -> json.Json {
+  json.object([
+    #("name", json.string(name)),
+    #("expires_in", json.int(expires_in)),
+    #(
+      "owner",
+      json.object([
+        #("subject", json.string(subject)),
+        #("email", json.string(email)),
+      ]),
+    ),
+  ])
+}
+
+fn post_key(
+  env: Env,
+  workspace_id: String,
+  token: Option(String),
+  payload: json.Json,
+) -> wisp.Response {
+  let base =
+    simulate.request(
+      Post,
+      "/internal/v1/integrations/cue/workspaces/" <> workspace_id <> "/api-keys",
+    )
+    |> simulate.json_body(payload)
+  let req = case token {
+    Some(t) -> simulate.header(base, "authorization", "Bearer " <> t)
+    None -> base
+  }
+  router.handle(req, env.ctx)
+}
+
+fn delete_key(
+  env: Env,
+  workspace_id: String,
+  token: Option(String),
+  key_id: String,
+) -> wisp.Response {
+  let base =
+    simulate.request(
+      Delete,
+      "/internal/v1/integrations/cue/workspaces/"
+        <> workspace_id
+        <> "/api-keys/"
+        <> key_id,
+    )
+  let req = case token {
+    Some(t) -> simulate.header(base, "authorization", "Bearer " <> t)
+    None -> base
+  }
+  router.handle(req, env.ctx)
+}
+
+/// A request carrying the minted key and no cookie — what Cue's backend sends.
+fn keyed(env: Env, token: String, path: String) -> wisp.Response {
+  simulate.request(Get, path)
+  |> simulate.header("authorization", "Bearer " <> token)
+  |> router.handle(env.ctx)
+}
+
+type Minted {
+  Minted(key_id: String, token: String, org_slug: String, expires_at: Int)
+}
+
+fn minted_of(resp: wisp.Response) -> Minted {
+  let decoder = {
+    use key_id <- decode.subfield(["result", "key_id"], decode.string)
+    use token <- decode.subfield(["result", "token"], decode.string)
+    use org_slug <- decode.subfield(["result", "org_slug"], decode.string)
+    use expires_at <- decode.subfield(["result", "expires_at"], decode.int)
+    decode.success(Minted(key_id, token, org_slug, expires_at))
+  }
+  let assert Ok(minted) = json.parse(simulate.read_body(resp), decoder)
+  minted
+}
+
+pub fn provisioning_reports_org_slug_and_network_test() {
+  let env = setup()
+  let created =
+    put(env, "wsp_slug", Some(secret), body("S", "usr_slug", "s@cue.test"))
+  assert created.status == 200
+  let out = simulate.read_body(created)
+  assert string.contains(out, "\"org_slug\":\"cue-")
+  assert string.contains(out, "\"network\":\"default\"")
+
+  let reused =
+    put(env, "wsp_slug", Some(secret), body("S", "usr_slug", "s@cue.test"))
+  assert reused.status == 200
+  assert string.contains(simulate.read_body(reused), "\"org_slug\":\"cue-")
+}
+
+pub fn minted_key_is_a_member_key_that_reaches_the_org_api_test() {
+  let env = setup()
+  let #(subject, email) = provisioned_workspace(env, "wsp_key")
+
+  let resp = post_key(env, "wsp_key", Some(secret), key_body(subject, email))
+  assert resp.status == 200
+  let out = simulate.read_body(resp)
+  assert string.contains(out, "\"role\":\"member\"")
+  assert string.contains(out, "\"name\":\"cue-backend\"")
+  assert string.contains(out, "\"network\":\"default\"")
+  let minted = minted_of(resp)
+  assert string.starts_with(minted.token, "synch_")
+  assert string.starts_with(minted.org_slug, "cue-")
+  assert minted.expires_at == 0
+
+  // The token reaches the Workspace's org at the member floor ...
+  let org = keyed(env, minted.token, "/api/orgs/" <> minted.org_slug)
+  assert org.status == 200
+  assert string.contains(simulate.read_body(org), "\"role\":\"member\"")
+  // ... and no further: a key cannot see, let alone mint, keys.
+  assert keyed(
+      env,
+      minted.token,
+      "/api/orgs/" <> minted.org_slug <> "/api-keys",
+    ).status
+    == 403
+
+  // One row, a member key in the workspace's org, minted for its owner, with
+  // the trail naming the service rather than a person.
+  assert count(
+      env,
+      "SELECT count(*) FROM api_keys k
+       JOIN cue_workspace_orgs w ON w.org_id = k.org_id
+       JOIN auth_identities i ON i.user_id = k.created_by
+       WHERE w.cue_workspace_id = ? AND k.role = 'member'
+         AND k.network_id IS NULL AND i.subject = ?",
+      [sqlite.Text("wsp_key"), sqlite.Text(subject)],
+    )
+    == 1
+  assert count(
+      env,
+      "SELECT count(*) FROM audit_log
+       WHERE action = 'apikey.create' AND actor = 'cue:provisioning'",
+      [],
+    )
+    == 1
+}
+
+pub fn every_mint_is_a_new_key_test() {
+  let env = setup()
+  let #(subject, email) = provisioned_workspace(env, "wsp_two")
+  let first = post_key(env, "wsp_two", Some(secret), key_body(subject, email))
+  let second = post_key(env, "wsp_two", Some(secret), key_body(subject, email))
+  assert first.status == 200
+  assert second.status == 200
+  assert minted_of(first).token != minted_of(second).token
+  assert count(env, "SELECT count(*) FROM api_keys", []) == 2
+  // Both are the one owner's; a retry mints, it does not mint a user.
+  assert count(env, "SELECT count(*) FROM users WHERE email = ?", [
+      sqlite.Text(email),
+    ])
+    == 1
+}
+
+pub fn mint_stores_a_named_expiring_key_test() {
+  let env = setup()
+  let #(subject, email) = provisioned_workspace(env, "wsp_exp")
+  let resp =
+    post_key(
+      env,
+      "wsp_exp",
+      Some(secret),
+      key_body_with(subject, email, "  agent  ", 3600),
+    )
+  assert resp.status == 200
+  let minted = minted_of(resp)
+  assert minted.expires_at > 0
+  assert string.contains(simulate.read_body(resp), "\"name\":\"agent\"")
+  assert count(
+      env,
+      "SELECT count(*) FROM api_keys WHERE name = 'agent' AND expires_at = ?",
+      [sqlite.Int(minted.expires_at)],
+    )
+    == 1
+}
+
+pub fn mint_refuses_a_bad_name_or_expiry_test() {
+  let env = setup()
+  let #(subject, email) = provisioned_workspace(env, "wsp_bad")
+  let unnamed =
+    post_key(
+      env,
+      "wsp_bad",
+      Some(secret),
+      key_body_with(subject, email, " ", 0),
+    )
+  assert unnamed.status == 400
+  assert string.contains(simulate.read_body(unnamed), "bad_name")
+  let past =
+    post_key(
+      env,
+      "wsp_bad",
+      Some(secret),
+      key_body_with(subject, email, "agent", -1),
+    )
+  assert past.status == 400
+  assert string.contains(simulate.read_body(past), "bad_expiry")
+  assert count(env, "SELECT count(*) FROM api_keys", []) == 0
+}
+
+pub fn mint_for_unprovisioned_workspace_is_not_found_test() {
+  let env = setup()
+  let resp =
+    post_key(env, "wsp_none", Some(secret), key_body("usr_n", "n@cue.test"))
+  assert resp.status == 404
+  assert string.contains(simulate.read_body(resp), "workspace_not_provisioned")
+  assert count(env, "SELECT count(*) FROM api_keys", []) == 0
+}
+
+pub fn mint_with_wrong_secret_is_unauthenticated_test() {
+  let env = setup()
+  let #(subject, email) = provisioned_workspace(env, "wsp_secret")
+  let resp =
+    post_key(
+      env,
+      "wsp_secret",
+      Some("not-the-secret"),
+      key_body(subject, email),
+    )
+  assert resp.status == 401
+  assert post_key(env, "wsp_secret", None, key_body(subject, email)).status
+    == 401
+  assert count(env, "SELECT count(*) FROM api_keys", []) == 0
+}
+
+pub fn revoke_ends_access_and_stays_inside_the_workspace_org_test() {
+  let env = setup()
+  let #(subject_a, email_a) = provisioned_workspace(env, "wsp_ra")
+  let #(subject_b, email_b) = provisioned_workspace(env, "wsp_rb")
+  let a =
+    minted_of(post_key(
+      env,
+      "wsp_ra",
+      Some(secret),
+      key_body(subject_a, email_a),
+    ))
+  let b =
+    minted_of(post_key(
+      env,
+      "wsp_rb",
+      Some(secret),
+      key_body(subject_b, email_b),
+    ))
+  assert keyed(env, a.token, "/api/orgs/" <> a.org_slug).status == 200
+
+  // Another workspace's key id is a miss, and that key keeps working.
+  let cross = delete_key(env, "wsp_rb", Some(secret), a.key_id)
+  assert cross.status == 404
+  assert keyed(env, a.token, "/api/orgs/" <> a.org_slug).status == 200
+
+  let revoked = delete_key(env, "wsp_ra", Some(secret), a.key_id)
+  assert revoked.status == 200
+  assert string.contains(simulate.read_body(revoked), "\"revoked\":true")
+  assert keyed(env, a.token, "/api/orgs/" <> a.org_slug).status == 401
+  assert keyed(env, b.token, "/api/orgs/" <> b.org_slug).status == 200
+
+  // A repeat is a 404: the row is gone, and the trail says who ended it.
+  assert delete_key(env, "wsp_ra", Some(secret), a.key_id).status == 404
+  assert count(
+      env,
+      "SELECT count(*) FROM audit_log
+       WHERE action = 'apikey.delete' AND actor = 'cue:provisioning'",
+      [],
+    )
+    == 1
+  assert count(env, "SELECT count(*) FROM api_keys", []) == 1
+}
+
+pub fn revoke_with_wrong_secret_is_unauthenticated_test() {
+  let env = setup()
+  let #(subject, email) = provisioned_workspace(env, "wsp_rs")
+  let minted =
+    minted_of(post_key(env, "wsp_rs", Some(secret), key_body(subject, email)))
+  assert delete_key(env, "wsp_rs", Some("not-the-secret"), minted.key_id).status
+    == 401
+  assert keyed(env, minted.token, "/api/orgs/" <> minted.org_slug).status == 200
 }
