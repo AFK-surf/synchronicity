@@ -56,6 +56,7 @@ impl Crypto {
                 .map(|origin| self.origin(origin))
                 .transpose()?,
             spaces: binding.spaces,
+            read_only: binding.read_only,
             note: binding.note,
             added_at: binding.added_at,
             expires_at: binding.expires_at,
@@ -351,6 +352,7 @@ pub(crate) fn materialization_scope_on(
 pub(crate) struct LocalAuthority {
     pub(crate) issuers: Vec<OriginId>,
     pub(crate) grant: Option<Vec<String>>,
+    pub(crate) read_only: Vec<String>,
     pub(crate) rooted_elsewhere: bool,
 }
 
@@ -366,6 +368,7 @@ pub(crate) fn local_authority(store: &Store, now: i64) -> Result<LocalAuthority>
                 .map(|value| crypto.origin(value))
                 .collect::<Result<_>>()?,
             grant: answer.grant,
+            read_only: answer.read_only,
             rooted_elsewhere: answer.rooted_elsewhere,
         })
     })
@@ -481,6 +484,7 @@ mod tests {
             domain: None,
             issuer: None,
             spaces: vec![],
+            read_only: Vec::new(),
             note: None,
             added_at: 0,
             expires_at: None,
@@ -495,6 +499,7 @@ mod tests {
             domain: None,
             issuer: Some(issuer),
             spaces: vec!["photos".into()],
+            read_only: Vec::new(),
             note: None,
             added_at: 0,
             expires_at: Some(expires),

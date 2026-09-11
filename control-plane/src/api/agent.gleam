@@ -276,11 +276,15 @@ pub type ReplicaSpace {
 /// `live` is the node's own answer, not a date comparison this side can
 /// redo: derived trust dies with its source, so a grant whose issuer has been
 /// removed or has lapsed from DNS is dead well before `not_after`.
+///
+/// `read_only` is the part of the grant the key may read but not publish
+/// into (DESIGN.md 3.5); a daemon that predates it reports none.
 pub type Delegation {
   Delegation(
     key: String,
     issuer: String,
     spaces: List(String),
+    read_only: List(String),
     live: Bool,
     not_after: Int,
     added_at: Int,
@@ -1466,6 +1470,11 @@ fn delegation_decoder() -> Decoder(Delegation) {
   use key <- decode.field("key", decode.string)
   use issuer <- decode.field("issuer", decode.string)
   use spaces <- decode.field("spaces", decode.list(decode.string))
+  use read_only <- decode.optional_field(
+    "read_only",
+    [],
+    decode.list(decode.string),
+  )
   use live <- decode.field("live", decode.bool)
   use not_after <- decode.optional_field("not_after", 0, nullable_int())
   use added_at <- decode.field("added_at", decode.int)
@@ -1474,6 +1483,7 @@ fn delegation_decoder() -> Decoder(Delegation) {
     key,
     issuer,
     spaces,
+    read_only,
     live,
     not_after,
     added_at,

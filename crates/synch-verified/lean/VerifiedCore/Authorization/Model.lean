@@ -46,6 +46,10 @@ def parseSource (text : String) : Except Error Source :=
   | "delegated" => .ok .delegated
   | other => .error (.column "bindings.source" other)
 
+/-- A delegated binding carries two space lists. `spaces` is read-write: the
+key reads the space and publishes into it. `readOnly` is read alone: served
+exactly like a read-write space, and refused at head promotion exactly like
+a space outside the grant. Both are empty for a rooted binding. -/
 structure Binding where
   origin : Origin.Parsed
   nodeId : ByteArray
@@ -53,10 +57,15 @@ structure Binding where
   domain : Option String
   issuer : Option Origin.Parsed
   spaces : List String
+  readOnly : List String
   note : Option String
   addedAt : Int64
   expiresAt : Option Int64
   deriving BEq, DecidableEq
+
+/-- Every space a binding lets its key read: read-write and read-only alike.
+Publication asks `spaces` alone. -/
+def Binding.readable (binding : Binding) : List String := binding.spaces ++ binding.readOnly
 
 inductive PublishScope where
   | untrusted
@@ -98,16 +107,23 @@ def validSpace (space : String) : Bool :=
 def decodeSpaces (text : String) : List String :=
   (text.toList.splitOn '\n').map String.ofList |>.filter validSpace
 
+def nibbleBytes (text : String) : ByteArray := ⟨(Trie.keyNibbles text.toUTF8).toArray⟩
+
 def scopeOf (publicNamespace : String) (spaces : List String) : Trie.Serve.Scope :=
   let spaces := spaces.filter validSpace
-  let nibbleBytes := fun text : String => (⟨(Trie.keyNibbles text.toUTF8).toArray⟩ : ByteArray)
   ⟨some (nibbleBytes publicNamespace :: spaces.map (fun space => nibbleBytes ("f:" ++ space ++ "/"))),
     nibbleBytes "m:self" :: spaces.flatMap (fun space =>
       [nibbleBytes ("m:space/" ++ space), nibbleBytes ("r:" ++ space)])⟩
 
 def readScope (spaces : List String) : Trie.Serve.Scope := scopeOf "d:" spaces
 
-def publicationScope (spaces : List String) : Trie.Serve.Scope := scopeOf "b:" spaces
+/-- What a confined origin may hold in its own trie. A read-only space
+contributes its `r:` claim alone: replicating a space is holding its content,
+which a read-only grant permits, while its `f:` subtree and `m:space/` record
+describe the tree and stay refused. -/
+def publicationScope (spaces readOnly : List String) : Trie.Serve.Scope :=
+  let base := scopeOf "b:" spaces
+  ⟨base.prefixes, base.exact ++ (readOnly.filter validSpace).map (fun space => nibbleBytes ("r:" ++ space))⟩
 
 def fullScope : Trie.Serve.Scope := ⟨none, []⟩
 
@@ -146,22 +162,23 @@ def keyField (column : String) (bytes : ByteArray) : Action ByteArray := do
 public key and source retain their original first-error order. -/
 def decodeBinding (row : Row) : Action Binding := do
   match row with
-  | [origin, nodeId, source, domain, issuer, spaces, note, addedAt, expiresAt] =>
+  | [origin, nodeId, source, domain, issuer, spaces, readOnly, note, addedAt, expiresAt] =>
     let origin ← checked (textField 0 "origin_id" origin)
     let nodeId ← checked (blobField 1 "node_id" nodeId)
     let source ← checked (textField 2 "source" source)
     let domain ← checked (optionalText 3 "domain" domain)
     let issuer ← checked (textField 4 "issuer" issuer)
     let spaces ← checked (optionalText 5 "spaces" spaces)
-    let note ← checked (optionalText 6 "note" note)
-    let addedAt ← checked (integerField 7 "added_at" addedAt)
-    let expiresAt ← checked (optionalInteger 8 "expires_at" expiresAt)
+    let readOnly ← checked (optionalText 6 "read_only" readOnly)
+    let note ← checked (optionalText 7 "note" note)
+    let addedAt ← checked (integerField 8 "added_at" addedAt)
+    let expiresAt ← checked (optionalInteger 9 "expires_at" expiresAt)
     let issuer ← if issuer.isEmpty then pure none else do pure (some (← originField "bindings.issuer" issuer))
     let origin ← originField "bindings.origin_id" origin
     let nodeId ← keyField "bindings.node_id" nodeId
     let source ← checked (parseSource source)
     return ⟨origin, nodeId, source, domain.filter (!·.isEmpty), issuer,
-      spaces.map decodeSpaces |>.getD [], note, addedAt, expiresAt⟩
+      spaces.map decodeSpaces |>.getD [], readOnly.map decodeSpaces |>.getD [], note, addedAt, expiresAt⟩
   | _ => throw .malformed
 
 end VerifiedCore.Authorization

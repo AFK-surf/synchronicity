@@ -25,7 +25,7 @@ pub use record::{
     parse_delegation_key, parse_file_key, parse_replica_claim_key, replica_claim_key,
     space_info_key, space_prefix, validate_space, AdState, BlobAd, Delegation, EntryKind,
     FileEntry, KeyError, NodeManifest, ReplicaClaim, ScopeKeys, SpaceInfo, AD_SPAN_GRANULARITY,
-    MAX_AD_SPANS, MAX_DELEGATION_SPACES, RECORD_VERSION,
+    DELEGATION_VERSION_READ_ONLY, MAX_AD_SPANS, MAX_DELEGATION_SPACES, RECORD_VERSION,
 };
 pub use sock::{
     display_text_is_safe, parse_socket_manifest, valid_ebpf_stack_frame_size, validate_socket_name,

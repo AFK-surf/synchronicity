@@ -269,8 +269,9 @@ struct OptionalFieldTests {
 
   @Test func delegateAddCarriesEveryScope() {       // GrantAccessSheet
     let command = Cmd.delegateAdd(
-      key: "k", spaces: ["photos", "incoming"], until: "7d", note: "for Ada")
+      key: "k", spaces: ["photos", "incoming"], readOnly: ["docs"], until: "7d", note: "for Ada")
     #expect(command.delegateAdd.spaces == ["photos", "incoming"])
+    #expect(command.delegateAdd.readOnly == ["docs"])
     #expect(command.delegateAdd.until == "7d")
   }
 

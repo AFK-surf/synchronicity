@@ -1262,6 +1262,7 @@ mod tests {
                 domain: Some("x.example".to_string()),
                 issuer: None,
                 spaces: Vec::new(),
+                read_only: Vec::new(),
                 note: None,
                 added_at: 0,
                 expires_at,

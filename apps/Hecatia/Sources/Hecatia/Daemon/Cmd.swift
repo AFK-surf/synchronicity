@@ -60,11 +60,16 @@ enum Cmd {
     }
   }
   static var delegateLs: Command { make { $0.delegateLs = .init() } }
-  static func delegateAdd(key: String, spaces: [String], until: String?, note: String?) -> Command {
+  /// `readOnly` spaces are served to the device like `spaces` and refused
+  /// when it publishes into them (DESIGN.md 3.5). Disjoint from `spaces`.
+  static func delegateAdd(
+    key: String, spaces: [String], readOnly: [String] = [], until: String?, note: String?
+  ) -> Command {
     make {
       $0.delegateAdd = .with {
         $0.key = key
         $0.spaces = spaces
+        $0.readOnly = readOnly
         if let until, !until.isEmpty { $0.until = until }
         if let note, !note.isEmpty { $0.note = note }
       }

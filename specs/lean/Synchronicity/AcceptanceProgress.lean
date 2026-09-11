@@ -18,7 +18,7 @@ open VerifiedCore VerifiedCore.Host VerifiedCore.Replication
 open Synchronicity.SimulatedHost
 
 /-- The concrete rooted authorization record audited by `FreshReady`.  It is
-the same nine-column raw representation consumed by `Authorization.readBindings`. -/
+the same ten-column raw representation consumed by `Authorization.readBindings`. -/
 def staticBindingRow (head : Head) (addedAt : Int64) : Fields :=
   [("origin_id", .text (Origin.canonical head.origin)),
    ("node_id", .blob head.signedBy),
@@ -26,6 +26,7 @@ def staticBindingRow (head : Head) (addedAt : Int64) : Fields :=
    ("domain", .null),
    ("issuer", .text ""),
    ("spaces", .null),
+   ("read_only", .null),
    ("note", .null),
    ("added_at", .integer addedAt),
    ("expires_at", .null)]

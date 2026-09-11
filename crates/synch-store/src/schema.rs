@@ -103,7 +103,25 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         name: "sockets are names bound to programs",
         run: v29_sockets_by_name,
     },
+    Migration::Sql(V30_READ_ONLY_DELEGATIONS),
 ];
+
+/// v30 — a delegation may grant a space read-only (§3.5).
+///
+/// A delegated binding gains the second list a `d:` record may carry: the
+/// spaces its key is served like any other but may not publish into. It is a
+/// column beside `spaces` rather than a marker inside it because the two
+/// lists answer two different questions — the serve and content gates ask
+/// for the union, head promotion for `spaces` alone — and a reader that had
+/// to strip markers to answer either would be one more place to get the
+/// boundary wrong.
+///
+/// Nothing is backfilled, for v17's reason: the rows are a materialized view
+/// of `d:` leaves, and no record published before this version names a
+/// read-only space. `NULL` is the empty list, as it is for `spaces`.
+const V30_READ_ONLY_DELEGATIONS: &str = r#"
+ALTER TABLE bindings ADD COLUMN read_only TEXT; -- delegated: newline-separated read-only space ids
+"#;
 
 /// v29 — a socket is a name, and the path it used to be is its program
 /// (`docs/SOCKET-PROGRAMS.md` §8).
@@ -1018,6 +1036,7 @@ CREATE TABLE bindings (
   note         TEXT,
   added_at     INTEGER NOT NULL,
   expires_at   INTEGER,
+  read_only    TEXT,                     -- delegated: newline-separated read-only space ids
   PRIMARY KEY (origin_id, node_id, source, domain, issuer)
 );
 CREATE INDEX bindings_by_key    ON bindings (node_id);

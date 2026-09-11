@@ -2118,6 +2118,7 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
         Command::DelegateAdd(pb::DelegateAdd {
             key,
             spaces,
+            read_only,
             until,
             note,
         }) => {
@@ -2132,9 +2133,11 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
             // so they go to the blocking pool (§10).
             let head = {
                 let spaces = spaces.clone();
+                let read_only = read_only.clone();
                 let note = note.clone();
                 read(node, move |n| {
-                    let change = n.delegate_add(subject, &spaces, not_after, note.as_deref())?;
+                    let change =
+                        n.delegate_add(subject, &spaces, &read_only, not_after, note.as_deref())?;
                     Ok(n.publish(&[change])?)
                 })
                 .await?
@@ -2148,17 +2151,33 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
             for space in &spaces {
                 out.line(format!("  {space}")).await?;
             }
+            for space in &read_only {
+                out.line(format!("  {space} (read-only)")).await?;
+            }
             if let Some(head) = head {
                 out.line(format!("published at seq {}", head.seq)).await?;
             }
             // What the subject will and will not see, said at the moment the
             // operator can still choose otherwise.
+            let readable: Vec<&str> = spaces
+                .iter()
+                .chain(&read_only)
+                .map(String::as_str)
+                .collect();
             out.line(format!(
                 "this node will serve it a projection of every trie covering {}, \
                  and nothing else — it will not learn that any other space exists",
-                spaces.join(", ")
+                readable.join(", ")
             ))
             .await?;
+            if !read_only.is_empty() {
+                out.line(format!(
+                    "every member will refuse whole any head of its publishing into {}; \
+                     a member older than read-only delegations refuses this grant entirely",
+                    read_only.join(", ")
+                ))
+                .await?;
+            }
         }
 
         Command::DelegateRm(pb::DelegateRm { key }) => {
@@ -2209,7 +2228,7 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
                 out.line(format!(
                     "{} {:<28} {:<10} ← {issuer}",
                     binding.node_id.to_z32(),
-                    binding.spaces.join(","),
+                    crate::render::delegation_scope(&binding.spaces, &binding.read_only),
                     match binding.expires_at {
                         // Dated fine, but cut off: its issuer holds no live
                         // rooted binding here any more.

@@ -121,6 +121,6 @@ def socketAuthority (key : ByteArray) (reading : Int64) : Action (Option SocketA
     let some first := live.head? | return none
     match live.find? (·.source.rooted) with
     | some rooted => return some ⟨rooted.origin, none⟩
-    | none => return some ⟨first.origin, some (canonicalSpaces (live.flatMap (·.spaces)))⟩
+    | none => return some ⟨first.origin, some (canonicalSpaces (live.flatMap (·.readable)))⟩
 
 end VerifiedCore.Authorization

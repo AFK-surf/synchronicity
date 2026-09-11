@@ -338,6 +338,7 @@ async fn trust_a_silent_peer(
                 domain: None,
                 issuer: None,
                 spaces: Vec::new(),
+                read_only: Vec::new(),
                 note: None,
                 added_at: 0,
                 expires_at: None,
@@ -708,20 +709,43 @@ async fn every_command_variant_round_trips() {
         Command::DelegateAdd(pb::DelegateAdd {
             key: subject.clone(),
             spaces: vec!["media".into()],
+            read_only: vec!["docs".into()],
             until: Some("7d".into()),
             note: Some("a test laptop".into()),
         }),
         "delegated",
     )
     .await;
-    // The grant names its spaces, and says what the subject will not see.
+    // The grant names its spaces, read-only ones marked, and says what the
+    // subject will not see and what it may not publish.
     assert!(delegated.contains("media"), "{delegated}");
+    assert!(delegated.contains("docs (read-only)"), "{delegated}");
     assert!(
         delegated.contains("it will not learn that any other space exists"),
         "{delegated}"
     );
+    assert!(
+        delegated.contains("refuse whole any head of its publishing into docs"),
+        "{delegated}"
+    );
     let listed = says(data_dir, Command::DelegateLs(pb::DelegateLs {}), &subject).await;
     assert!(listed.contains("this node"), "{listed}");
+    assert!(listed.contains("media,docs:ro"), "{listed}");
+    // A space is one or the other, and the refusal is the daemon's.
+    assert_eq!(
+        failure(
+            data_dir,
+            Command::DelegateAdd(pb::DelegateAdd {
+                key: subject.clone(),
+                spaces: vec!["media".into()],
+                read_only: vec!["media".into()],
+                until: None,
+                note: None,
+            }),
+        )
+        .await,
+        ErrorCode::Invalid
+    );
     says(
         data_dir,
         Command::DelegateRm(pb::DelegateRm {

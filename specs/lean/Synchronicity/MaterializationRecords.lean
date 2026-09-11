@@ -54,11 +54,15 @@ theorem blob_schema : Ensures Records.blob (fun fields => fields.map Prod.fst = 
 theorem delegation_schema : Ensures Records.delegation
     (fun fields => fields.map Prod.fst = (Address.delegation ByteArray.empty).columns) := by
   unfold Records.delegation
+  -- The version branch binds the read-only list, so the continuation
+  -- arrives as an applied lambda over local `have`s; reducing it exposes the
+  -- same `if`/`throw`/`pure` shape the other decoders present directly.
   repeat' first
     | (apply pure_ensures; solve | simp [Address.columns])
     | apply throw_ensures
     | (apply bind_ensures; intro value)
     | split
+    | dsimp only
 
 /-- Successful production decoding returns the actual parser output and has
 no database or primitive-state effect. -/

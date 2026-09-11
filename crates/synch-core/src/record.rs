@@ -33,11 +33,21 @@ pub const PREFIX_DELEGATION: u8 = b'd';
 /// The `r:` key prefix: what this origin replicates (`docs/REPLICATION.md` §4.1).
 pub const PREFIX_REPLICA: u8 = b'r';
 
-/// The most spaces one [`Delegation`] may name. A delegation is a restriction,
-/// so a list too long to be unreadable is the wrong shape — and the record is
-/// replicated to every member, so the bound keeps one issuer from growing
-/// everybody's trie.
+/// The most spaces one [`Delegation`] may name, read-write and read-only
+/// together. A delegation is a restriction, so a list too long to be
+/// unreadable is the wrong shape — and the record is replicated to every
+/// member, so the bound keeps one issuer from growing everybody's trie.
 pub const MAX_DELEGATION_SPACES: usize = 32;
+
+/// The [`Delegation`] schema version that carries a read-only list.
+///
+/// Stamped only on a record that names a read-only space. A build that reads
+/// delegations at [`RECORD_VERSION`] refuses the record whole — a delegation
+/// it cannot read grants nothing — rather than decoding the read-write list
+/// and honoring the read-only space it never saw as unmentioned. A record
+/// naming no read-only space keeps the older stamp, so a mixed cluster keeps
+/// honoring every delegation that means what it always meant.
+pub const DELEGATION_VERSION_READ_ONLY: u8 = 2;
 
 /// What a [`FileEntry`] describes.
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -370,37 +380,148 @@ pub struct ReplicaClaim {
 /// accept-time question is a direct lookup. The issuer is implicit — the
 /// record sits in the issuer's trie — so there is no issuer field to check,
 /// and none to forge.
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Two lists, one grant. `spaces` is read-write: the subject reads every
+/// member's copy of the space and publishes its own. `read_only` is read
+/// alone: the subject is served the space exactly as it would be a read-write
+/// one, and a head of its own that holds a key under `f:<space>/` or the
+/// space's own `m:space/<space>` is refused whole by every member, exactly as
+/// a key outside the grant altogether is. The two are disjoint by
+/// construction, and a space in neither is not mentioned to the subject at
+/// all.
+///
+/// The read-only list is the one field a `v: 1` reader does not know, so it
+/// travels only under [`DELEGATION_VERSION_READ_ONLY`]: a record naming no
+/// read-only space is encoded exactly as it always was and stays honored by
+/// every build, while one that does is refused by a build that would
+/// otherwise read it as a narrower read-write grant with nothing missing.
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct Delegation {
-    /// Schema version.
+    /// Schema version: [`RECORD_VERSION`], or
+    /// [`DELEGATION_VERSION_READ_ONLY`] when `read_only` is non-empty.
     pub v: u8,
-    /// The spaces the subject may read and publish into. Closed list, at most
-    /// [`MAX_DELEGATION_SPACES`], never a wildcard.
+    /// The spaces the subject may read and publish into. Closed list, never
+    /// a wildcard; with `read_only`, at most [`MAX_DELEGATION_SPACES`].
     pub spaces: Vec<String>,
     /// When the delegation stops being honored, in unix nanoseconds.
     pub not_after: i64,
     /// A note for `trust ls` and `doctor`.
     pub note: Option<String>,
+    /// The spaces the subject may read but not publish into. Disjoint from
+    /// `spaces`.
+    pub read_only: Vec<String>,
 }
 
 impl Delegation {
+    /// The version stamp a record with these lists must carry.
+    pub fn version_for(read_only: &[String]) -> u8 {
+        match read_only.is_empty() {
+            true => RECORD_VERSION,
+            false => DELEGATION_VERSION_READ_ONLY,
+        }
+    }
+
     /// True if this record is well-formed enough to grant anything.
     ///
     /// Fail-closed, unlike the same question asked of an `f:` or `b:` record:
     /// a file entry this node cannot read loses a row, while a delegation it
-    /// cannot read would otherwise grant whatever the caller assumed.
+    /// cannot read would otherwise grant whatever the caller assumed. A
+    /// read-only list under the older stamp is refused for the same reason:
+    /// a `v: 1` reader would honor such a record as read-write-only, and two
+    /// builds reading one record as two different grants is the one thing
+    /// the stamp exists to rule out.
     pub fn is_well_formed(&self) -> bool {
-        is_supported_version(self.v)
-            && !self.spaces.is_empty()
-            && self.spaces.len() <= MAX_DELEGATION_SPACES
-            && self.spaces.iter().all(|s| validate_space(s).is_ok())
+        let count = self.spaces.len() + self.read_only.len();
+        self.v <= DELEGATION_VERSION_READ_ONLY
+            && (self.v >= DELEGATION_VERSION_READ_ONLY || self.read_only.is_empty())
+            && count > 0
+            && count <= MAX_DELEGATION_SPACES
+            && self
+                .spaces
+                .iter()
+                .chain(&self.read_only)
+                .all(|s| validate_space(s).is_ok())
             && {
-                let mut sorted: Vec<&String> = self.spaces.iter().collect();
+                let mut sorted: Vec<&String> = self.spaces.iter().chain(&self.read_only).collect();
                 sorted.sort();
                 let before = sorted.len();
                 sorted.dedup();
                 sorted.len() == before
             }
+    }
+
+    /// Every space the subject may read, read-write and read-only alike.
+    pub fn readable(&self) -> impl Iterator<Item = &String> {
+        self.spaces.iter().chain(&self.read_only)
+    }
+}
+
+/// The wire shape every reader knows: the four fields of a `v: 1` record.
+///
+/// A record at [`DELEGATION_VERSION_READ_ONLY`] appends the read-only list
+/// after them, which is why the two shapes are serialized as tuples rather
+/// than one derived struct: postcard lays a struct out as its fields in
+/// order with nothing between, so a tuple of the same fields is the same
+/// bytes, and choosing the tuple by version is what keeps a plain delegation
+/// byte-identical to what every earlier build published.
+impl Serialize for Delegation {
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if self.v >= DELEGATION_VERSION_READ_ONLY {
+            (
+                self.v,
+                &self.spaces,
+                self.not_after,
+                &self.note,
+                &self.read_only,
+            )
+                .serialize(serializer)
+        } else {
+            (self.v, &self.spaces, self.not_after, &self.note).serialize(serializer)
+        }
+    }
+}
+
+impl<'de> Deserialize<'de> for Delegation {
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        struct Visitor;
+
+        impl<'de> serde::de::Visitor<'de> for Visitor {
+            type Value = Delegation;
+
+            fn expecting(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+                f.write_str("a delegation record")
+            }
+
+            fn visit_seq<A: serde::de::SeqAccess<'de>>(
+                self,
+                mut seq: A,
+            ) -> Result<Delegation, A::Error> {
+                use serde::de::Error;
+                let missing =
+                    |index: usize| A::Error::invalid_length(index, &"a delegation record");
+                let v: u8 = seq.next_element()?.ok_or_else(|| missing(0))?;
+                let spaces: Vec<String> = seq.next_element()?.ok_or_else(|| missing(1))?;
+                let not_after: i64 = seq.next_element()?.ok_or_else(|| missing(2))?;
+                let note: Option<String> = seq.next_element()?.ok_or_else(|| missing(3))?;
+                // The fifth field exists only from the stamp that introduced
+                // it. Not asking for it under the older stamp is what lets an
+                // older publisher's record — four fields and then nothing —
+                // decode here at all.
+                let read_only: Vec<String> = match v >= DELEGATION_VERSION_READ_ONLY {
+                    true => seq.next_element()?.ok_or_else(|| missing(4))?,
+                    false => Vec::new(),
+                };
+                Ok(Delegation {
+                    v,
+                    spaces,
+                    not_after,
+                    note,
+                    read_only,
+                })
+            }
+        }
+
+        deserializer.deserialize_tuple(5, Visitor)
     }
 }
 
@@ -632,6 +753,7 @@ mod tests {
             spaces: vec!["photos".into(), "incoming".into()],
             not_after: 1,
             note: None,
+            read_only: vec![],
         };
         assert!(good.is_well_formed());
         for spaces in [
@@ -649,6 +771,118 @@ mod tests {
             };
             assert!(!d.is_well_formed(), "{:?} passed", d.spaces);
         }
+    }
+
+    /// A read-only list is one grant with the read-write list: bounded,
+    /// distinct and valid together, disjoint, and carried only under the
+    /// stamp that introduced it.
+    #[test]
+    fn a_read_only_list_shares_the_grants_bound_and_needs_its_own_stamp() {
+        let good = Delegation {
+            v: DELEGATION_VERSION_READ_ONLY,
+            spaces: vec!["photos".into()],
+            not_after: 1,
+            note: None,
+            read_only: vec!["docs".into()],
+        };
+        assert!(good.is_well_formed());
+        assert!(Delegation {
+            spaces: vec![],
+            ..good.clone()
+        }
+        .is_well_formed());
+        for (spaces, read_only) in [
+            (vec!["photos".into()], vec!["photos".into()]),
+            (vec![], vec!["docs".into(), "docs".into()]),
+            (vec![], vec!["bad/id".into()]),
+            (vec![], vec![]),
+            (
+                vec!["s".into()],
+                (0..MAX_DELEGATION_SPACES)
+                    .map(|i| format!("r{i}"))
+                    .collect(),
+            ),
+        ] {
+            let d = Delegation {
+                spaces,
+                read_only,
+                ..good.clone()
+            };
+            assert!(
+                !d.is_well_formed(),
+                "{:?} / {:?} passed",
+                d.spaces,
+                d.read_only
+            );
+        }
+        let understamped = Delegation {
+            v: RECORD_VERSION,
+            ..good.clone()
+        };
+        assert!(!understamped.is_well_formed());
+        assert!(!Delegation {
+            v: DELEGATION_VERSION_READ_ONLY + 1,
+            ..good
+        }
+        .is_well_formed());
+        assert_eq!(Delegation::version_for(&[]), RECORD_VERSION);
+        assert_eq!(
+            Delegation::version_for(&["docs".into()]),
+            DELEGATION_VERSION_READ_ONLY
+        );
+    }
+
+    /// The four fields every build reads, in the shape it reads them.
+    #[derive(Debug, PartialEq, Serialize, Deserialize)]
+    struct DelegationV1 {
+        v: u8,
+        spaces: Vec<String>,
+        not_after: i64,
+        note: Option<String>,
+    }
+
+    /// A delegation naming no read-only space is the bytes it always was, a
+    /// `v: 1` record from an older build decodes here with an empty list,
+    /// and a read-only record read as the older shape carries a stamp the
+    /// older build refuses — so no build reads it as a wider grant.
+    #[test]
+    fn a_read_only_delegation_is_refused_rather_than_widened_by_an_older_reader() {
+        let plain = Delegation {
+            v: RECORD_VERSION,
+            spaces: vec!["photos".into()],
+            not_after: 7,
+            note: Some("phone".into()),
+            read_only: vec![],
+        };
+        let older = DelegationV1 {
+            v: RECORD_VERSION,
+            spaces: vec!["photos".into()],
+            not_after: 7,
+            note: Some("phone".into()),
+        };
+        let bytes = encode(&plain).unwrap();
+        assert_eq!(
+            bytes,
+            encode(&older).unwrap(),
+            "a plain delegation changed shape"
+        );
+        assert_eq!(decode::<Delegation>(&bytes).unwrap(), plain);
+        assert_eq!(decode::<DelegationV1>(&bytes).unwrap(), older);
+
+        let read_only = Delegation {
+            v: DELEGATION_VERSION_READ_ONLY,
+            read_only: vec!["docs".into()],
+            ..plain.clone()
+        };
+        let bytes = encode(&read_only).unwrap();
+        assert_eq!(decode::<Delegation>(&bytes).unwrap(), read_only);
+        let seen_by_older = decode::<DelegationV1>(&bytes).unwrap();
+        assert_eq!(seen_by_older.spaces, vec!["photos".to_string()]);
+        assert!(
+            !is_supported_version(seen_by_older.v),
+            "an older build would honor a read-only delegation as read-write"
+        );
+        assert_eq!(decode::<Delegation>(&bytes).unwrap().read_only, ["docs"]);
     }
 
     #[test]
@@ -732,6 +966,14 @@ mod tests {
             spaces: vec!["photos".into(), "incoming".into()],
             not_after: 1_800_000_000_000_000_000,
             note: Some("zeynep's phone".into()),
+            read_only: vec![],
+        });
+        round_trips(Delegation {
+            v: DELEGATION_VERSION_READ_ONLY,
+            spaces: vec!["photos".into()],
+            not_after: 1_800_000_000_000_000_000,
+            note: None,
+            read_only: vec!["incoming".into(), "docs".into()],
         });
     }
 

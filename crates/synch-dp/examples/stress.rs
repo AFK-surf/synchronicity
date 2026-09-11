@@ -1084,6 +1084,7 @@ impl Harness {
                 } else {
                     Vec::new()
                 },
+                read_only: Vec::new(),
                 note: None,
                 added_at: now,
                 expires_at: Some(ttl),

@@ -6,10 +6,15 @@ a node with no delegation does not scan unrelated peer bindings. -/
 namespace VerifiedCore.Authorization
 open Host
 
+/-- `grant` is everything this node may read; `readOnly` is the part of it
+this node may not publish into, once every issuer has spoken — a space one
+issuer grants read-write and another read-only is read-write, since each
+vouches independently and grants add. -/
 structure LocalAuthority where
   ownOrigin : Option Origin.Parsed
   issuers : List Origin.Parsed
   grant : Option (List String)
+  readOnly : List String
   rootedElsewhere : Bool
   deriving BEq, DecidableEq
 
@@ -51,7 +56,8 @@ def localAuthorityIn (tx : Transaction) (reading : Int64) : Action LocalAuthorit
   let keys ← ownKeys tx own
   let now ← trustInstant tx reading
   let mut issuers := []
-  let mut spaces := []
+  let mut writable := []
+  let mut readOnly := []
   let mut rootedElsewhere := false
   for key in keys do
     let live ← liveForKey tx key now
@@ -60,10 +66,13 @@ def localAuthorityIn (tx : Transaction) (reading : Int64) : Action LocalAuthorit
         match binding.issuer with
         | some issuer => issuers := issuer :: issuers
         | none => pure ()
-        spaces := binding.spaces ++ spaces
+        writable := binding.spaces ++ writable
+        readOnly := binding.readOnly ++ readOnly
       if binding.source.rooted && own != some binding.origin then rootedElsewhere := true
-  let grant := if spaces.isEmpty then none else some (canonicalSpaces spaces)
-  return ⟨own, issuers.reverse, grant, rootedElsewhere⟩
+  let readable := writable ++ readOnly
+  let grant := if readable.isEmpty then none else some (canonicalSpaces readable)
+  let unwritable := (canonicalSpaces readOnly).filter (fun space => !writable.contains space)
+  return ⟨own, issuers.reverse, grant, unwritable, rootedElsewhere⟩
 
 def localAuthority (reading : Int64) : Action LocalAuthority := transaction fun tx => localAuthorityIn tx reading
 

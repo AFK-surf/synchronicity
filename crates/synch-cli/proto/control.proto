@@ -199,7 +199,7 @@ message Command {
     ControlPlaneDisable control_plane_disable = 39;
     // `synch control-plane status`
     ControlPlaneStatus control_plane_status = 40;
-    // `synch delegate add <key> --space <id> [--until <dur>] [--note <text>]`
+    // `synch delegate add <key> --space <id> [--read-only <id>] [--until <dur>] [--note <text>]`
     DelegateAdd delegate_add = 41;
     // `synch delegate rm <key>`
     DelegateRm delegate_rm = 42;
@@ -302,13 +302,18 @@ message TrustLs {}
 message DelegateAdd {
   // The subject's z-base-32 device key.
   string key = 1;
-  // The spaces the delegation covers. At least one, never a wildcard.
+  // The spaces the delegation covers read-write. Never a wildcard; with
+  // `read_only`, at least one between them.
   repeated string spaces = 2;
   // How long the delegation lasts, as a duration string. Unset takes the
   // default.
   optional string until = 3;
   // A note for `trust ls` and `doctor`.
   optional string note = 4;
+  // The spaces the delegation covers read-only (DESIGN.md 3.5): served like
+  // `spaces`, refused at head promotion like a space outside the grant.
+  // Disjoint from `spaces`.
+  repeated string read_only = 5;
 }
 
 message DelegateRm {

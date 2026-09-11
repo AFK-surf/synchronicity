@@ -412,6 +412,7 @@ fn introduce(peers: &[&Peer]) {
                     domain: None,
                     issuer: None,
                     spaces: Vec::new(),
+                    read_only: Vec::new(),
                     note: None,
                     added_at: 0,
                     expires_at: None,

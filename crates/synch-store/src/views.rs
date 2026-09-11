@@ -1592,6 +1592,7 @@ mod tests {
             spaces: vec!["photos".to_string()],
             not_after: synch_core::MIN_TRUSTED_NS + 86_400_000_000_000,
             note: None,
+            read_only: vec![],
         };
         let with = trie
             .insert(
@@ -1627,6 +1628,77 @@ mod tests {
             delegated(&store),
             0,
             "a rebuild left a revoked delegation in the trust table"
+        );
+    }
+
+    /// The materializer reads both shapes of a `d:` record (§3.5): the
+    /// four-field record every build publishes lands with an empty read-only
+    /// list, and the stamped five-field one lands with both lists — while a
+    /// stamp past the one this build reads grants nothing, exactly as a `d:`
+    /// record it cannot decode never has.
+    #[test]
+    fn a_delegation_materializes_its_read_only_list_by_stamp() {
+        let (_d, store) = store();
+        let issuer = origin_named("nas");
+        let trie = Trie::new(&store);
+        let expiry = synch_core::MIN_TRUSTED_NS + 86_400_000_000_000;
+        let older = iroh_base::SecretKey::generate().public();
+        let scoped = iroh_base::SecretKey::generate().public();
+        let future = iroh_base::SecretKey::generate().public();
+        // The bytes an older publisher writes: four fields, no stamp for more.
+        let older_record = postcard::to_stdvec(&(
+            synch_core::RECORD_VERSION,
+            vec!["photos".to_string()],
+            expiry,
+            None::<String>,
+        ))
+        .unwrap();
+        let scoped_record = postcard::to_stdvec(&synch_core::Delegation {
+            v: synch_core::DELEGATION_VERSION_READ_ONLY,
+            spaces: vec!["photos".to_string()],
+            not_after: expiry,
+            note: None,
+            read_only: vec!["docs".to_string()],
+        })
+        .unwrap();
+        let future_record = postcard::to_stdvec(&(
+            synch_core::DELEGATION_VERSION_READ_ONLY + 1,
+            vec!["photos".to_string()],
+            expiry,
+            None::<String>,
+            Vec::<String>::new(),
+        ))
+        .unwrap();
+        let mut root = Hash::EMPTY;
+        for (subject, record) in [
+            (&older, &older_record),
+            (&scoped, &scoped_record),
+            (&future, &future_record),
+        ] {
+            root = trie
+                .insert(root, &synch_core::delegation_key(subject), record)
+                .unwrap();
+        }
+        store
+            .transaction(|txn| txn.materialize_diff(&issuer, Hash::EMPTY, root))
+            .unwrap();
+
+        let find = |subject: &synch_core::NodeId| {
+            store
+                .bindings_for_key(subject)
+                .unwrap()
+                .into_iter()
+                .find(|b| b.source == crate::BindingSource::Delegated)
+        };
+        let plain = find(&older).expect("an older record still grants");
+        assert_eq!(plain.spaces, ["photos"]);
+        assert!(plain.read_only.is_empty());
+        let both = find(&scoped).expect("a stamped record grants both lists");
+        assert_eq!(both.spaces, ["photos"]);
+        assert_eq!(both.read_only, ["docs"]);
+        assert!(
+            find(&future).is_none(),
+            "a record past the stamp this build reads granted something"
         );
     }
 

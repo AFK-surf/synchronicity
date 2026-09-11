@@ -114,6 +114,7 @@ fn trust_static(store: &Store, origin: &OriginId, key: &NodeId) {
             domain: None,
             issuer: None,
             spaces: Vec::new(),
+            read_only: Vec::new(),
             note: None,
             added_at: 0,
             expires_at: None,
@@ -127,6 +128,7 @@ fn delegation(subject: &NodeId, spaces: &[&str]) -> (Vec<u8>, Vec<u8>) {
         spaces: spaces.iter().map(|s| s.to_string()).collect(),
         not_after: now_ns() + 86_400_000_000_000,
         note: Some("audit delegate".into()),
+        read_only: vec![],
     };
     (
         delegation_key(subject),
@@ -298,6 +300,7 @@ async fn a_delegate_pulls_metadata_only_from_a_full_member_of_its_cluster() {
             domain: None,
             issuer: None,
             spaces: Vec::new(),
+            read_only: Vec::new(),
             note: None,
             added_at: 0,
             expires_at: None,
