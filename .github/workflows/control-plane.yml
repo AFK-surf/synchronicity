@@ -47,6 +47,11 @@ jobs:
       - run: gleam format --check src test
       - run: gleam deps download
       - run: gleam test
+      - name: Socket gateway HTTP/WebSocket integration
+        run: |
+          python3 -m venv "$RUNNER_TEMP/socket-gateway-venv"
+          "$RUNNER_TEMP/socket-gateway-venv/bin/pip" install websockets==15.0.1
+          "$RUNNER_TEMP/socket-gateway-venv/bin/python" e2e/socket-gateway.py
       - run: gleam build
 
   # GitHub has no hosted OpenBSD runners, so boot one in a VM and run

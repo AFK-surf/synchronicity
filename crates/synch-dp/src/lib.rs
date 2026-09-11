@@ -19,6 +19,7 @@ pub mod error;
 pub mod metrics;
 pub mod reconciler;
 pub mod rotation;
+mod socket_gateway;
 pub mod spaces;
 pub mod store;
 pub mod tenant;
