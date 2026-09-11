@@ -392,6 +392,21 @@ impl Node {
             e => e,
         })?;
 
+        // The ingest opened the path by name again, after the stat above, and
+        // a rename can land between the two. The stat after the read closes
+        // that: git never reuses an inode for a ref, so a path that still
+        // shows the walk's `(size, mtime, inode)` on both sides of the read
+        // pointed at that inode throughout, and the bytes are the walk's.
+        if let Some(walked) = walked {
+            let after = std::fs::metadata(path)?;
+            let after = (after.len(), mtime_nanos(&after), file_identity(&after));
+            if *walked != after || walked.0 != size {
+                return Err(EngineError::Io(std::io::Error::other(
+                    "the ref changed while it was being read; the next scan publishes it",
+                )));
+            }
+        }
+
         if stat_match && known.as_ref().is_some_and(|k| k.content == Some(content)) {
             // Racily clean and actually clean. Refreshing `scanned_at` is what
             // lets the stat become trustworthy: once it is two seconds past
@@ -1167,7 +1182,10 @@ impl Node {
                     other.root == git_root && other.class == synch_core::GitClass::Object
                 })
             })
-            .filter(|path| root.join(path).symlink_metadata().is_err())
+            // A regular file, not merely something at the path: a directory
+            // or a dangling symlink standing there is exactly what keeps the
+            // object from being written, and so keeps the refs waiting.
+            .filter(|path| !std::fs::metadata(root.join(path)).is_ok_and(|meta| meta.is_file()))
             .count())
     }
 
@@ -3199,6 +3217,76 @@ mod tests {
             String::from_utf8_lossy(&output.stderr)
         );
         Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
+    /// The same race one step later: the ref is replaced between the stat
+    /// that checked the walk's signature and the read that ingests it. The
+    /// stat after the read catches it, and the scan behaves as above.
+    #[tokio::test]
+    async fn a_ref_replaced_while_being_read_waits_for_the_next_scan() {
+        let (_d, space, node) = node_with_space().await;
+        let repo = space.path().join("app");
+        std::fs::create_dir_all(&repo).unwrap();
+        if git(&repo, &["init", "-q"]).is_none() {
+            eprintln!("git is not installed; skipping");
+            node.shutdown().await.unwrap();
+            return;
+        }
+        std::fs::write(repo.join("a.txt"), b"a").unwrap();
+        git(&repo, &["add", "a.txt"]);
+        git(&repo, &["commit", "-q", "-m", "first"]);
+        let first = git(&repo, &["rev-parse", "main"]).unwrap();
+
+        // The commit lands inside the ingest of the ref itself: after
+        // `index_file` compared the stat, before it read the bytes.
+        let racing = repo.clone();
+        let store = node.store().clone();
+        let report = node
+            .scan_space_with_ingest("media", &mut |path| {
+                // The ref itself, not its reflog under `logs/`, which the
+                // walk reads earlier.
+                if path.ends_with(".git/refs/heads/main") {
+                    std::fs::write(racing.join("b.txt"), b"b").unwrap();
+                    git(&racing, &["add", "b.txt"]);
+                    git(&racing, &["commit", "-q", "-m", "second"]);
+                }
+                Ok(store.ingest_file(path, now_ns())?)
+            })
+            .unwrap();
+        assert!(
+            report
+                .skipped
+                .iter()
+                .any(|(p, why)| p == "app/.git/refs/heads/main" && why.contains("being read")),
+            "{:?}",
+            report.skipped
+        );
+        node.publish(&report.staged).unwrap();
+        let live = node
+            .store()
+            .published_paths(node.origin(), "media")
+            .unwrap();
+        assert!(!live.iter().any(|p| p == "app/.git/refs/heads/main"));
+        let object_of = |hex: &str| format!("app/.git/objects/{}/{}", &hex[..2], &hex[2..]);
+        assert!(live.contains(&object_of(&first)));
+
+        let second = git(&repo, &["rev-parse", "main"]).unwrap();
+        let (report, head) = node.scan_and_publish().unwrap();
+        assert!(head.is_some(), "{report:?}");
+        assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+        let live = node
+            .store()
+            .published_paths(node.origin(), "media")
+            .unwrap();
+        assert!(live.contains(&object_of(&second)), "{live:?}");
+        let published_ref = published(&node, "media", "app/.git/refs/heads/main");
+        assert_eq!(
+            node.store()
+                .read_all(&published_ref.content.unwrap())
+                .unwrap(),
+            format!("{second}\n").into_bytes()
+        );
+        node.shutdown().await.unwrap();
     }
 
     /// A commit landing between the walk and the ingest of the ref it moves

@@ -210,8 +210,10 @@ per entry. Beside it, it consults the classifier:
   is skipped for that scan — the previously published value stands, the
   path is exempt from the deletion sweep like any skipped one, and the
   rescan the watcher already owes for that write publishes the ref and its
-  objects together. Git replaces a ref by rename, so a matching stat is the
-  inode the walk saw.
+  objects together. The stat is taken on both sides of the read, because
+  the read opens the path by name again; git replaces a ref by rename and
+  never reuses an inode, so a path showing the walk's stat before and
+  after the read pointed at that inode throughout.
 
 Nothing else changes in the walk. Objects arrive as ordinary files, are hashed
 with BLAKE3 and land in the CAS (loose objects are almost always under
@@ -408,7 +410,10 @@ selected version at the path and every other *live* version at
 `packed-refs` is many refs in one file, and git reads packed refs from one
 place only, so each `refs/…` line it carries is expanded into a loose
 mirror of its own, from the bytes the replica holds; the names are a
-peer's, and one git would refuse is refused before it becomes a path. This
+peer's, and one git would refuse is refused before it becomes a path. An
+origin's loose ref overrides its own packed entry, for the mirror as for
+git: a packed entry is not expanded when that origin publishes a live loose
+ref of the same name, whether that loose ref won or is mirrored itself. This
 holds when the selected version is a deletion too: the branch is gone from
 `refs/heads/`, and the other machine's copy of it, with whatever commits
 only it had, stands under `refs/synch/` until that machine agrees. These
@@ -724,9 +729,14 @@ in the test and skipped where the binary is absent:
   expands the losing `packed-refs` into mirrors, both lines and the losing
   tag stay reachable, and the mirrors go once the publishers agree.
 - An adoption whose `.syncignore` excludes `objects/` holds every ref that
-  names objects and writes the symbolic `HEAD`.
+  names objects and writes the symbolic `HEAD`; so does one where a
+  directory stands at an object's path.
+- A publisher that packed its refs and committed again: the mirror of its
+  losing `main` is its current loose tip, not the stale packed entry, and
+  the winner's own stale packed entry is not mirrored.
 - (`scanner.rs`) A commit landing between the walk and the ingest of the ref
-  it moves: the ref is skipped that scan, the earlier value's object is
+  it moves, and one landing between the stat and the read of the ref
+  itself: the ref is skipped that scan, the earlier value's object is
   published, and the next scan publishes the ref with its objects.
 
 `crates/synch-store/src/unified.rs` covers the selection rules on rows

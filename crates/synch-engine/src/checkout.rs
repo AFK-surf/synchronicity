@@ -163,6 +163,8 @@ impl Node {
             mut wanted,
             mirrors,
             mut pending_objects,
+            packed_mirrors: _,
+            loose_refs: _,
         } = plan;
         let checkout_holder = replica.holder();
 
@@ -624,6 +626,32 @@ struct CheckoutPass {
     mirrors: HashSet<String>,
     /// Objects not on disk at plan time, per repository and publishing origin.
     pending_objects: PendingObjects,
+    /// Refs expanded out of losing `packed-refs` files, planned only once the
+    /// whole listing has been seen: an origin's loose ref overrides its own
+    /// packed entry, as it does for git, and the loose refs come later in
+    /// listing order.
+    packed_mirrors: Vec<DeferredMirror>,
+    /// `(root, canonical origin, ref name)` for every live loose ref in the
+    /// listing, which is what a packed entry defers to.
+    loose_refs: HashSet<(String, String, String)>,
+}
+
+/// A ref a losing `packed-refs` names, waiting for the end of the plan.
+#[derive(Debug)]
+struct DeferredMirror {
+    /// The git directory root within the space.
+    root: String,
+    /// The origin whose packed entry this is, canonically and in short form.
+    origin: String,
+    origin_short: String,
+    /// The ref name without `refs/`.
+    name: String,
+    /// `<hex>\n`.
+    bytes: Vec<u8>,
+    /// The `packed-refs` entry's metadata, stamped on the mirror.
+    meta: Metadata,
+    /// Whether the root is a linked worktree's private directory.
+    worktree_private: bool,
 }
 
 /// Decides, and performs, everything one pass can settle without the network.
@@ -733,8 +761,23 @@ fn plan_pass(
         // otherwise have nothing holding them. Local-only: the class is
         // transient, so a scan never publishes them and the sweep only
         // removes the stale ones.
-        if let Some(git) = git.filter(|_| set.is_divergent()) {
-            plan_mirrors(node, &mut pass, root_dir, set, &git, &selected);
+        if let Some(git) = git {
+            if let Some(name) = git.loose_ref() {
+                for entry in set
+                    .entries
+                    .iter()
+                    .filter(|e| e.kind != EntryKind::Tombstone)
+                {
+                    pass.loose_refs.insert((
+                        git.root.to_string(),
+                        entry.origin.canonical(),
+                        name.to_string(),
+                    ));
+                }
+            }
+            if set.is_divergent() {
+                plan_mirrors(node, &mut pass, root_dir, set, &git, &selected);
+            }
         }
 
         // A path leaves the checkout when newest is a tombstone — the
@@ -795,7 +838,100 @@ fn plan_pass(
         }
     }
 
+    // The refs out of losing `packed-refs` files, now that every loose ref
+    // has been seen: an entry the origin itself overrides with a loose ref is
+    // not its current value and is not mirrored, and a loose mirror already
+    // planned at the path keeps it.
+    for deferred in std::mem::take(&mut pass.packed_mirrors) {
+        let overridden = pass.loose_refs.contains(&(
+            deferred.root.clone(),
+            deferred.origin.clone(),
+            deferred.name.clone(),
+        ));
+        if overridden {
+            continue;
+        }
+        let content = synch_core::Hash::new(&deferred.bytes);
+        let size = deferred.bytes.len() as u64;
+        plan_mirror(
+            node,
+            &mut pass,
+            root_dir,
+            &deferred.root,
+            deferred.worktree_private,
+            &deferred.origin,
+            &deferred.origin_short,
+            &deferred.name,
+            content,
+            size,
+            deferred.meta,
+            Some(deferred.bytes),
+        );
+    }
+
     Ok(pass)
+}
+
+/// Plans one `refs/synch/<origin>/<name>` mirror, unless the name is one git
+/// would refuse, the path would escape, or a mirror is already planned there.
+#[allow(clippy::too_many_arguments)]
+fn plan_mirror(
+    node: &Node,
+    pass: &mut CheckoutPass,
+    root_dir: &Path,
+    git_root: &str,
+    worktree_private: bool,
+    origin: &str,
+    origin_short: &str,
+    name: &str,
+    content: synch_core::Hash,
+    size: u64,
+    meta: Metadata,
+    bytes: Option<Vec<u8>>,
+) {
+    // The name is a peer's bytes: a ref name git would refuse is refused
+    // here too, before it becomes a path.
+    if synch_core::normalize_path(name).is_err()
+        || unsafe_name(name).is_some()
+        || name.starts_with("synch/")
+    {
+        return;
+    }
+    let mirror = format!(
+        "{git_root}/{}",
+        synch_core::git::mirror_ref_path(origin_short, name)
+    );
+    let Some(rank) = synch_core::git::classify(&mirror)
+        .filter(|m| m.class == synch_core::GitClass::Transient)
+        .map(|m| m.class.materialize_rank())
+    else {
+        return;
+    };
+    if escapes_via_symlink(root_dir, &mirror) || !pass.mirrors.insert(mirror.clone()) {
+        return;
+    }
+    let target = root_dir.join(&mirror);
+    let planned = plan_file(
+        node,
+        pass,
+        mirror,
+        target,
+        content,
+        size,
+        meta,
+        Some(GitWant {
+            root: git_root.to_string(),
+            rank: (rank, 1),
+            hold: Some(vec![origin.to_string()]),
+            releases: Vec::new(),
+            mirror: true,
+            worktree_private,
+        }),
+        bytes,
+    );
+    if planned == Planned::Current {
+        pass.report.mirrored += 1;
+    }
 }
 
 /// Plans the `refs/synch/<origin>/` mirrors of a divergent loose ref
@@ -826,77 +962,48 @@ fn plan_mirrors(
             let Some(content) = entry.content else {
                 continue;
             };
-            // A loose ref mirrors as the bytes it is. A losing `packed-refs`
-            // is many refs in one file, and git reads packed refs from one
-            // place only, so each ref it names is expanded into a loose
-            // mirror of its own — from the bytes the replica holds, since a
-            // replica holds every version. Not yet fetched means not yet
-            // mirrored; the next pass tries again.
-            let refs: Vec<(String, Option<Vec<u8>>, synch_core::Hash, u64)> = if packed {
+            // A loose ref mirrors as the bytes it is, now. A losing
+            // `packed-refs` is many refs in one file, and git reads packed
+            // refs from one place only, so each ref it names is expanded
+            // into a loose mirror of its own — from the bytes the replica
+            // holds, since a replica holds every version — but only at the
+            // end of the plan, because a loose ref of the same origin
+            // overrides its packed entry and the loose refs come later in
+            // the listing. Not yet fetched means not yet mirrored; the next
+            // pass tries again.
+            if packed {
                 let Ok(bytes) = node.store().read_all(&content) else {
                     continue;
                 };
-                synch_core::git::parse_packed_refs(&bytes)
-                    .into_iter()
-                    .filter_map(|(object, name)| {
-                        let name = name.strip_prefix("refs/")?;
-                        let line = format!("{object}\n").into_bytes();
-                        let root = synch_core::Hash::new(&line);
-                        let size = line.len() as u64;
-                        Some((name.to_string(), Some(line), root, size))
-                    })
-                    .collect()
-            } else {
-                let Some(name) = git.loose_ref() else {
-                    return;
-                };
-                vec![(name.to_string(), None, content, entry.size)]
-            };
-            for (name, bytes, content, size) in refs {
-                // The name is a peer's bytes: a ref name git would refuse is
-                // refused here too, before it becomes a path.
-                if synch_core::normalize_path(&name).is_err()
-                    || unsafe_name(&name).is_some()
-                    || name.starts_with("synch/")
-                {
-                    continue;
+                for (object, name) in synch_core::git::parse_packed_refs(&bytes) {
+                    let Some(name) = name.strip_prefix("refs/") else {
+                        continue;
+                    };
+                    pass.packed_mirrors.push(DeferredMirror {
+                        root: git.root.to_string(),
+                        origin: origin.canonical(),
+                        origin_short: origin.short(),
+                        name: name.to_string(),
+                        bytes: format!("{object}\n").into_bytes(),
+                        meta: Metadata::of(entry),
+                        worktree_private: git.in_worktree_private_dir(),
+                    });
                 }
-                let mirror = format!(
-                    "{}/{}",
-                    git.root,
-                    synch_core::git::mirror_ref_path(&origin.short(), &name)
-                );
-                let Some(rank) = synch_core::git::classify(&mirror)
-                    .filter(|m| m.class == synch_core::GitClass::Transient)
-                    .map(|m| m.class.materialize_rank())
-                else {
-                    continue;
-                };
-                if escapes_via_symlink(root_dir, &mirror) || !pass.mirrors.insert(mirror.clone()) {
-                    continue;
-                }
-                let target = root_dir.join(&mirror);
-                let planned = plan_file(
+            } else if let Some(name) = git.loose_ref() {
+                plan_mirror(
                     node,
                     pass,
-                    mirror,
-                    target,
+                    root_dir,
+                    git.root,
+                    git.in_worktree_private_dir(),
+                    &origin.canonical(),
+                    &origin.short(),
+                    name,
                     content,
-                    size,
+                    entry.size,
                     Metadata::of(entry),
-                    Some(GitWant {
-                        root: git.root.to_string(),
-                        rank: (rank, 1),
-                        hold: Some(vec![origin.canonical()]),
-                        releases: Vec::new(),
-                        mirror: true,
-                        worktree_private: git.in_worktree_private_dir(),
-                    }),
-                    bytes,
+                    None,
                 );
-                if planned == Planned::Current {
-                    pass.report.mirrored += 1;
-                }
             }
         }
     }

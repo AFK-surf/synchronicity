@@ -653,6 +653,116 @@ async fn a_losing_packed_refs_is_expanded_into_mirrors() {
     shutdown(&[&a.node, &b.node, &replica.node]).await;
 }
 
+/// A publisher that packed its refs and then committed again has a loose
+/// ref overriding its packed entry. When both lose, the mirror carries the
+/// loose value — the origin's current tip — never the stale packed one.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_losing_origins_loose_ref_overrides_its_packed_entry() {
+    if !have_git() {
+        return;
+    }
+    let _blocking = synch_core::BlockingScope::enter();
+    let a = spawn("a").await;
+    let b = spawn("b").await;
+    let replica = spawn("replica").await;
+    introduce(&[&a, &b, &replica]);
+    let repo_a = init_repo(a.space.path());
+    let repo_b = b.space.path().join(REPO);
+    copy_dir(&repo_a, &repo_b);
+    for (repo, name) in [(&repo_a, "a"), (&repo_b, "b")] {
+        std::fs::write(repo.join(format!("{name}.txt")), name).unwrap();
+        git(repo, &["add", "."]);
+        git(repo, &["commit", "-q", "-m", name]);
+        git(repo, &["pack-refs", "--all"]);
+        std::fs::write(repo.join(format!("{name}2.txt")), name).unwrap();
+        git(repo, &["add", "."]);
+        git(repo, &["commit", "-q", "-m", &format!("{name} again")]);
+        assert!(
+            repo.join(".git/refs/heads/main").is_file(),
+            "loose over packed"
+        );
+        std::thread::sleep(std::time::Duration::from_millis(20));
+    }
+    let (tip_a, tip_b) = (
+        git(&repo_a, &["rev-parse", "main"]),
+        git(&repo_b, &["rev-parse", "main"]),
+    );
+    for peer in [&a, &b] {
+        peer.node
+            .add_filesystem_source(SPACE, peer.space.path())
+            .unwrap();
+        peer.node.scan_publish_push().await.unwrap();
+    }
+    let checkout = add_checkout(&replica).await;
+    let report = converge(&replica.node, &[&a.node, &b.node]).await;
+    let mirror = checkout.join(REPO);
+    assert_eq!(git(&mirror, &["rev-parse", "main"]), tip_b, "{report:?}");
+    let mirrored_a = mirror.join(".git").join(synch_core::git::mirror_ref_path(
+        &a.node.origin().short(),
+        "heads/main",
+    ));
+    assert_eq!(
+        std::fs::read_to_string(&mirrored_a).unwrap().trim(),
+        tip_a,
+        "the loser's current tip, not its stale packed entry"
+    );
+    assert!(
+        !mirror
+            .join(".git")
+            .join(synch_core::git::mirror_ref_path(
+                &b.node.origin().short(),
+                "heads/main"
+            ))
+            .exists(),
+        "the winner's own stale packed entry is not mirrored either"
+    );
+    let all = git(&mirror, &["rev-list", "--all"]);
+    assert!(all.contains(&tip_a) && all.contains(&tip_b), "{all}");
+    git(&mirror, &["fsck", "--strict"]);
+    shutdown(&[&a.node, &b.node, &replica.node]).await;
+}
+
+/// A directory standing where an object belongs is not an object: the
+/// adoption skips it and keeps every ref that needs it held.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn adoption_holds_refs_when_a_directory_blocks_an_object() {
+    if !have_git() {
+        return;
+    }
+    let _blocking = synch_core::BlockingScope::enter();
+    let a = spawn("a").await;
+    let b = spawn("b").await;
+    introduce(&[&a, &b]);
+    let repo_a = init_repo(a.space.path());
+    a.node.add_filesystem_source(SPACE, a.space.path()).unwrap();
+    a.node.scan_publish_push().await.unwrap();
+    let commit = git(&repo_a, &["rev-parse", "main"]);
+    let blocked = b.space.path().join(format!(
+        "app/.git/objects/{}/{}",
+        &commit[..2],
+        &commit[2..]
+    ));
+    std::fs::create_dir_all(&blocked).unwrap();
+    b.node.add_filesystem_source(SPACE, b.space.path()).unwrap();
+    let report = adopt(&b.node, &a.node, AdoptTreeOptions::default()).await;
+    assert!(
+        report
+            .skipped
+            .iter()
+            .any(|(p, why)| p.ends_with(&commit[2..]) && why.contains("directory")),
+        "{report:?}"
+    );
+    assert!(
+        report
+            .skipped
+            .iter()
+            .any(|(p, why)| p == "app/.git/refs/heads/main" && why.contains("still being acquired")),
+        "{report:?}"
+    );
+    assert!(!b.space.path().join("app/.git/refs/heads/main").exists());
+    shutdown(&[&a.node, &b.node]).await;
+}
+
 /// Objects a tree adoption passes over — here excluded by `.syncignore` —
 /// keep the refs that name them held: a ref is never written into a
 /// repository whose objects the run did not put there.
