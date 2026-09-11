@@ -187,9 +187,8 @@ impl Node {
             // `unchanged`. The files stayed unpublished until the process was
             // restarted.
             //
-            // Only failures about *this path* are tolerated. A store failure is
-            // not one, and swallowing it would silently drop the file the same
-            // way.
+            // Only filesystem failures about this path are tolerated, including
+            // ingest I/O errors normalized below. Other store failures remain fatal.
             match self.index_file(space_id, candidate, seq, &mut report, ingest) {
                 Ok(()) => {}
                 Err(EngineError::Io(e)) => {
@@ -370,7 +369,13 @@ impl Node {
             return Ok(());
         }
 
-        let (content, size) = ingest(path)?;
+        let (content, size) = ingest(path).map_err(|e| match e {
+            // Ingest wraps source open/read failures in StoreError. Give these
+            // the same per-path handling as stat failures; do not normalize
+            // errors from the metadata-store operations around this call.
+            EngineError::Store(synch_store::StoreError::Io(e)) => EngineError::Io(e),
+            e => e,
+        })?;
 
         if stat_match && known.as_ref().is_some_and(|k| k.content == Some(content)) {
             // Racily clean and actually clean. Refreshing `scanned_at` is what
@@ -2374,11 +2379,44 @@ fn walk(
         }
         if is_dir {
             walk(root, &path, ignore, report, found)?;
-        } else {
+        } else if metadata.is_file() || metadata.is_symlink() {
             found.push((path, rel, metadata.is_symlink()));
+        } else {
+            // Never open special files: FIFOs can block and devices may never
+            // reach EOF. Preserve any previously published version through the
+            // unjudged sweep exemption, just as for an unreadable path.
+            report.skipped.push((
+                rel,
+                format!(
+                    "unsupported file type ({})",
+                    special_file_type(metadata.file_type())
+                ),
+            ));
         }
     }
     Ok(())
+}
+
+fn special_file_type(file_type: std::fs::FileType) -> &'static str {
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::FileTypeExt;
+        if file_type.is_socket() {
+            return "socket";
+        }
+        if file_type.is_fifo() {
+            return "FIFO";
+        }
+        if file_type.is_block_device() {
+            return "block device";
+        }
+        if file_type.is_char_device() {
+            return "character device";
+        }
+    }
+    #[cfg(not(unix))]
+    let _ = file_type;
+    "unknown"
 }
 
 /// The change signal a symlink's target reduces to.
@@ -2830,6 +2868,142 @@ mod tests {
         assert!(!unjudged_covers(&unjudged, "d/subterfuge.txt"));
         assert!(!unjudged_covers(&unjudged, "solo.txt.bak"));
         assert!(!unjudged_covers(&[], "anything"));
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn special_files_are_skipped_while_files_publish_and_deletions_sweep() {
+        use std::os::unix::net::UnixListener;
+
+        let (_d, space, node) = node_with_space().await;
+        let replaced = space.path().join("socket");
+        std::fs::write(&replaced, b"old version").unwrap();
+        std::fs::write(space.path().join("deleted"), b"gone").unwrap();
+        node.scan_and_publish().unwrap();
+        std::fs::remove_file(&replaced).unwrap();
+        std::fs::remove_file(space.path().join("deleted")).unwrap();
+        let _socket = UnixListener::bind(&replaced).unwrap();
+        rustix::fs::mkfifoat(
+            rustix::fs::CWD,
+            space.path().join("fifo"),
+            rustix::fs::Mode::RUSR,
+        )
+        .unwrap();
+        std::fs::write(space.path().join("a.txt"), b"before socket").unwrap();
+        std::fs::write(space.path().join("z.txt"), b"after socket").unwrap();
+        std::os::unix::fs::symlink("a.txt", space.path().join("link")).unwrap();
+
+        // Fail before invoking ingest if a regression admits the FIFO, so the
+        // test reports a failure instead of hanging in a blocking open.
+        let mut walked = ScanReport::default();
+        let mut found = Vec::new();
+        walk(
+            space.path(),
+            space.path(),
+            &IgnoreSet::for_space(space.path()).unwrap(),
+            &mut walked,
+            &mut found,
+        )
+        .unwrap();
+        assert_eq!(
+            found
+                .iter()
+                .map(|(_, rel, _)| rel.as_str())
+                .collect::<Vec<_>>(),
+            ["a.txt", "link", "z.txt"]
+        );
+
+        let (report, head) = node.scan_and_publish().unwrap();
+        assert!(head.is_some());
+        assert_eq!(
+            report.skipped,
+            vec![
+                ("fifo".into(), "unsupported file type (FIFO)".into()),
+                ("socket".into(), "unsupported file type (socket)".into()),
+            ]
+        );
+        assert_eq!(report.deleted, 1);
+        assert_eq!(
+            published(&node, "media", "deleted").kind,
+            EntryKind::Tombstone
+        );
+        assert_eq!(
+            published(&node, "media", "socket").content,
+            Some(Hash::new(b"old version"))
+        );
+        for (path, bytes) in [
+            ("a.txt", b"before socket".as_slice()),
+            ("z.txt", b"after socket".as_slice()),
+        ] {
+            assert_eq!(
+                published(&node, "media", path).content,
+                Some(Hash::new(bytes))
+            );
+        }
+        assert_eq!(published(&node, "media", "link").kind, EntryKind::Symlink);
+        assert!(node.store().local_file("media", "fifo").unwrap().is_none());
+        node.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn ingest_io_failure_skips_one_path_and_retries_it_on_the_next_scan() {
+        let (_d, space, node) = node_with_space().await;
+        std::fs::write(space.path().join("b.txt"), b"old").unwrap();
+        node.scan_and_publish().unwrap();
+        for path in ["a.txt", "b.txt", "c.txt"] {
+            std::fs::write(space.path().join(path), path.as_bytes()).unwrap();
+        }
+        let report = node
+            .scan_space_with_ingest("media", &mut |path| {
+                if path.ends_with("b.txt") {
+                    return Err(synch_store::StoreError::Io(std::io::Error::new(
+                        std::io::ErrorKind::PermissionDenied,
+                        "ingest denied",
+                    ))
+                    .into());
+                }
+                Ok(node.store().ingest_file(path, now_ns())?)
+            })
+            .unwrap();
+        assert_eq!(
+            report.skipped,
+            vec![("b.txt".into(), "ingest denied".into())]
+        );
+        assert_eq!(report.deleted, 0);
+        node.publish(&report.staged).unwrap();
+        for path in ["a.txt", "c.txt"] {
+            assert_eq!(
+                published(&node, "media", path).content,
+                Some(Hash::new(path.as_bytes()))
+            );
+        }
+        assert_eq!(
+            published(&node, "media", "b.txt").content,
+            Some(Hash::new(b"old"))
+        );
+        let (report, _) = node.scan_and_publish().unwrap();
+        assert!(report.skipped.is_empty());
+        assert_eq!(
+            published(&node, "media", "b.txt").content,
+            Some(Hash::new(b"b.txt"))
+        );
+        node.shutdown().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn non_io_ingest_store_failure_still_fails_the_space() {
+        let (_d, space, node) = node_with_space().await;
+        std::fs::write(space.path().join("file"), b"data").unwrap();
+        let error = node
+            .scan_space_with_ingest("media", &mut |_| {
+                Err(synch_store::StoreError::Decode("corrupt store".into()).into())
+            })
+            .unwrap_err();
+        assert!(matches!(
+            error,
+            EngineError::Store(synch_store::StoreError::Decode(_))
+        ));
+        node.shutdown().await.unwrap();
     }
 
     /// A path the walk could not judge is not tombstoned: a published file
