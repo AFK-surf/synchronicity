@@ -51,7 +51,7 @@ fn ed25519_verify(message: BitArray, signature: BitArray, key: BitArray) -> Bool
 
 /// The newest write-tunnel protocol version this build speaks. Its own
 /// counter, unrelated to the browse tunnel's.
-pub const protocol_version = 1
+pub const protocol_version = 2
 
 /// The oldest version this build still serves.
 pub const min_protocol_version = 1
@@ -137,6 +137,8 @@ pub type Ask {
     if_match: String,
     reply: Subject(Event),
   )
+  /// Generic delegation mutation; protocol v2 and hosted nodes only.
+  Delegate(mutation: Json, reply: Subject(Event))
   /// Abandon a write.
   Cancel(id: Int)
   /// The heartbeat tick this session schedules for itself.
@@ -158,6 +160,8 @@ pub type Event {
   Committed(root: String, size: Int, seq: Int, mtime_ns: Int, origin: String)
   /// The tombstone was published, or there was nothing to withdraw.
   Deleted(still_published: Bool, withdrawn: Bool)
+  /// A delegation mutation was published.
+  Delegated
   /// A coded refusal, in the node's own vocabulary.
   Failed(code: String, message: String)
 }
@@ -391,6 +395,23 @@ pub fn remove(
   }
 }
 
+/// Ask a v2 hosted writer to mutate its own delegation record.
+pub fn mutate_delegate(session: Session, mutation: Json) -> Event {
+  case session.version < 2 {
+    True ->
+      Failed("unsupported", "the hosted data plane needs write protocol v2")
+    False -> {
+      let reply = process.new_subject()
+      process.send(session.inbox, Delegate(mutation, reply))
+      case process.receive(reply, commit_timeout) {
+        Ok(event) -> event
+        Error(Nil) ->
+          Failed("unavailable", "the hosted node did not answer in time")
+      }
+    }
+  }
+}
+
 // -- the attach endpoint -----------------------------------------------------
 
 /// What the attach endpoint needs to do its work.
@@ -587,6 +608,7 @@ fn incoming(
     Ok("credit"), Live(_) -> forward(state, body, credit_decoder(), False)
     Ok("committed"), Live(_) -> forward(state, body, committed_decoder(), True)
     Ok("deleted"), Live(_) -> forward(state, body, deleted_decoder(), True)
+    Ok("delegated"), Live(_) -> forward(state, body, delegated_decoder(), True)
     Ok("err"), Live(_) ->
       case json.parse(body, error_decoder()) {
         // No id names the connection itself: every caller waiting on it is
@@ -946,7 +968,28 @@ fn outgoing(
         ]),
       )
     }
-    Open(_, _, _, _, _, _, reply), _ | Remove(_, _, _, _, reply), _ -> {
+    Delegate(mutation, reply), Live(_) -> {
+      let id = state.next_id
+      let _ =
+        send(
+          conn,
+          json.object([
+            #("t", json.string("delegate")),
+            #("id", json.int(id)),
+            #("mutation", mutation),
+          ]),
+        )
+      mist.continue(
+        Conn(..state, next_id: id + 1, waiting: [
+          #(id, Waiting(reply, Some(now_unix() + waiting_lease))),
+          ..state.waiting
+        ]),
+      )
+    }
+    Open(_, _, _, _, _, _, reply), _
+    | Remove(_, _, _, _, reply), _
+    | Delegate(_, reply), _
+    -> {
       process.send(reply, Failed("unavailable", "the session is not live"))
       mist.continue(state)
     }
@@ -1065,4 +1108,9 @@ pub fn session_json(session: Session) -> Json {
     #("protocol", json.int(session.version)),
     #("attached_at", json.int(session.attached_at)),
   ])
+}
+
+fn delegated_decoder() -> Decoder(#(Int, Event)) {
+  use id <- decode.field("id", decode.int)
+  decode.success(#(id, Delegated))
 }

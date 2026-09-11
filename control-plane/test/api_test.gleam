@@ -4512,3 +4512,76 @@ pub fn hosting_decides_writes_and_hosting_off_drops_the_sessions_test() {
     ))
   assert string.contains(off, "\"writes\":{\"enabled\":false")
 }
+
+pub fn delegation_mutations_are_authenticated_hosted_and_thin_test() {
+  let h = harness_sized(1)
+  org_with_network(h, "acme", "prod")
+  let path = "/api/orgs/acme/networks/prod/delegations/" <> nk()
+  let body =
+    json.object([
+      #("spaces", json.array(["docs"], json.string)),
+      #("expires_at", json.int(now_unix() + 600)),
+    ])
+  assert call(h, simulate.request(Put, path) |> simulate.json_body(body)).status
+    == 401
+  assert call_json(h, Put, path, body).status == 409
+  let join = mint_join(h, "acme", "prod", "not-a-delegation-issuer")
+  assert call(h, keyed(join, Put, path) |> simulate.json_body(body)).status
+    == 403
+  assert call(h, keyed(join, Delete, path)).status == 403
+  org_named(h, "other")
+  let wrong_org = mint(h, "other", "other-member", "member")
+  assert call(h, keyed(wrong_org, Delete, path)).status == 404
+  let member = mint(h, "acme", "delegation-issuer", "member")
+  assert host_network(h, "acme", "prod", True) == 200
+  assert call_json(h, Put, path, body).status == 503
+  let conn = read_db(h)
+  let assert Ok([[sqlite.Text(network_id)]]) =
+    sqlite.query(conn, "SELECT id FROM networks WHERE name = 'prod'", [])
+  sqlite.close(conn)
+  let inbox = process.new_subject()
+  let writer =
+    cloud_writer.Session(
+      "delegate-test",
+      network_id,
+      "acme",
+      "cloud-1",
+      "cloud-1@prod.acme.sync.test",
+      "k1",
+      "dp-1",
+      1,
+      1,
+      now_unix(),
+      inbox,
+    )
+  let registry = browse_api.writers(h.ctx.browse)
+  process.send(registry, cloud_writer.Join(writer))
+  assert call_json(h, Put, path, body).status == 409
+  process.send(registry, cloud_writer.Leave(writer.id))
+  let parent = process.new_subject()
+  let ready = process.new_subject()
+  process.spawn_unlinked(fn() {
+    let inbox = process.new_subject()
+    process.send(ready, inbox)
+    list.each([1, 2], fn(_) {
+      let assert Ok(cloud_writer.Delegate(mutation, reply)) =
+        process.receive(inbox, 5000)
+      process.send(parent, json.to_string(mutation))
+      process.send(reply, cloud_writer.Delegated)
+    })
+  })
+  let assert Ok(inbox) = process.receive(ready, 1000)
+  process.send(
+    registry,
+    cloud_writer.Join(cloud_writer.Session(..writer, version: 2, inbox: inbox)),
+  )
+  assert call(h, keyed(member, Put, path) |> simulate.json_body(body)).status
+    == 200
+  let assert Ok(sent) = process.receive(parent, 5000)
+  assert string.contains(sent, "\"action\":\"put\"")
+  assert string.contains(sent, "\"spaces\":[\"docs\"]")
+  let replica = read_only(h, "https://primary.test")
+  assert call(replica, authed(replica, Delete, path)).status == 200
+  let assert Ok(sent) = process.receive(parent, 5000)
+  assert string.contains(sent, "\"action\":\"delete\"")
+}

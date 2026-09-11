@@ -756,3 +756,9 @@ start: a credential that quietly does nothing is a lie. See
 
 Day-2 operations (replicas, key ceremony, backups) live in
 `ops/RUNBOOK.md`.
+
+## Hosted delegate registration
+
+The authenticated network delegation PUT/DELETE routes are thin proxies to
+the managed data plane. See [Hosted delegation API](../docs/HOSTED-DELEGATES.md)
+for the request contract, v2 compatibility and retry/revocation semantics.
