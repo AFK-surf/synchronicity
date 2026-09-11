@@ -458,7 +458,9 @@ function ApiKeys({ slug }: { slug: string }) {
                         would need a network it was never given, or would hand
                         a deployed secret a reach nobody audited it for. So it
                         never becomes a select, editing or not. */}
-                    {k.role === 'join' ? (
+                    {k.role === 'managed_data' ? (
+                      <span className="text-xs text-neutral-400">managed data only</span>
+                    ) : k.role === 'join' ? (
                       <span className="text-xs text-neutral-400">
                         join · <span className="font-mono">{k.network}</span>
                       </span>
@@ -609,6 +611,7 @@ function ApiKeys({ slug }: { slug: string }) {
         >
           <option value="member">org key · member</option>
           <option value="admin">org key · admin</option>
+          <option value="managed_data">org key · managed data only</option>
           {/* A join key is scoped to a network, so there has to be one. The
               option stays visible and disabled rather than vanishing: an
               absent choice reads as a missing feature. */}

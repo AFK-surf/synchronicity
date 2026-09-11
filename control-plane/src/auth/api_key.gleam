@@ -23,7 +23,7 @@
 //// `auth/principal` value this module hands back, and `api/common` is where
 //// that value becomes a permission.
 
-import auth/principal.{type Principal, ApiKey, JoinKey, Principal}
+import auth/principal.{type Principal, ApiKey, JoinKey, ManagedData, Principal}
 import gleam/option.{type Option, None, Some}
 import gleam/string
 import store/sqlite.{type Connection, Blob, Int as VInt, Null, Text}
@@ -52,6 +52,8 @@ const use_stamp_interval = 3600
 
 /// The role string that marks a join key. Not a rank — see `auth/principal`.
 pub const join_role = "join"
+
+pub const managed_role = "managed_data"
 
 /// Mints a key. Returns the token and the display prefix; the row's id is an
 /// argument, because the caller needs it for the audit row either way.
@@ -166,6 +168,8 @@ pub fn authenticate(
             "join", "" -> Error(Nil)
             "join", network ->
               Ok(Principal(created_by, JoinKey(key_id, org_id, network)))
+            "managed_data", "" ->
+              Ok(Principal(created_by, ManagedData(key_id, org_id)))
             _, _ -> Ok(Principal(created_by, ApiKey(key_id, org_id, role)))
           }
         }

@@ -388,7 +388,12 @@ fn kind_is_fixed(
   case stored, role {
     Ok([[Text(was)]]), Some(wants)
       if was != wants
-      && { was == api_key.join_role || wants == api_key.join_role }
+      && {
+        was == api_key.join_role
+        || wants == api_key.join_role
+        || was == api_key.managed_role
+        || wants == api_key.managed_role
+      }
     ->
       error_json(
         400,
@@ -474,12 +479,12 @@ pub fn check_name(name: String) -> Result(Nil, Response) {
 /// CHECK.
 fn check_role(role: String) -> Result(Nil, Response) {
   case role {
-    "admin" | "member" | "join" -> Ok(Nil)
+    "admin" | "member" | "join" | "managed_data" -> Ok(Nil)
     _ ->
       Error(error_json(
         400,
         "bad_role",
-        "an API key's role is admin, member or join: an org is only ever "
+        "an API key's role is admin, member, join or managed_data: an org is only ever "
           <> "handed away by an owner, and no key is one",
       ))
   }

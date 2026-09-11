@@ -18,7 +18,7 @@
 import api/agent.{type Session}
 import api/auth_api.{type AuthContext}
 import api/cloud_writer
-import api/common.{Admin, Member, audit, check_org, db_error, ok_json}
+import api/common.{Admin, Member, audit, check_managed_org, db_error, ok_json}
 import api/middleware.{error_json}
 import api/reads.{type Reads}
 import auth/principal.{type Principal}
@@ -48,7 +48,13 @@ pub type Browse {
 /// `hosted` is the whole of the write gate: a hosted network takes writes,
 /// and no other does (docs/CLOUD-WRITES.md §4.1).
 type Network {
-  Network(org_id: String, network_id: String, enabled: Bool, hosted: Bool)
+  Network(
+    org_id: String,
+    network_id: String,
+    enabled: Bool,
+    hosted: Bool,
+    managed_only: Bool,
+  )
 }
 
 // -- status ------------------------------------------------------------------
@@ -540,7 +546,7 @@ fn resolve(
   who: Principal,
   minimum: common.Role,
 ) -> Result(Network, Response) {
-  use #(org_id, _role) <- result.try(check_org(conn, slug, who, minimum))
+  use #(org_id, _role) <- result.try(check_managed_org(conn, slug, who, minimum))
   case
     sqlite.query(
       conn,
@@ -550,7 +556,22 @@ fn resolve(
     )
   {
     Ok([[Text(network_id), VInt(enabled), VInt(hosted)]]) ->
-      Ok(Network(org_id, network_id, enabled != 0, hosted != 0))
+      case principal.managed_only(who) && hosted == 0 {
+        True ->
+          Error(error_json(
+            409,
+            "hosting-disabled",
+            "managed data key requires cloud hosting",
+          ))
+        False ->
+          Ok(Network(
+            org_id,
+            network_id,
+            enabled != 0,
+            hosted != 0,
+            principal.managed_only(who),
+          ))
+      }
     Ok(_) -> Error(error_json(404, "not_found", "no such network"))
     Error(_) -> Error(db_error())
   }
@@ -562,8 +583,7 @@ fn resolve(
 fn attached(browse: Browse, net: Network) -> List(Session) {
   case net.enabled {
     False -> []
-    True ->
-      agent.sessions_for(process.named_subject(browse.registry), net.network_id)
+    True -> read_sessions(browse, net.network_id, net.managed_only)
   }
 }
 
@@ -697,4 +717,24 @@ fn version_json(version: agent.Version) -> Json {
     #("seq", json.int(version.seq)),
     #("attestors", json.array(version.attestors, json.string)),
   ])
+}
+
+/// Managed-data keys never fall back to a customer daemon. The browse key
+/// must match a verified write-tunnel attachment for this hosted network;
+/// a label such as cloud-1 alone is not a proof of managed ownership.
+pub fn read_sessions(
+  browse: Browse,
+  network_id: String,
+  managed_only: Bool,
+) -> List(Session) {
+  let sessions = agent.sessions_for(registry(browse), network_id)
+  case managed_only {
+    False -> sessions
+    True -> {
+      let hosted = cloud_writer.sessions_for(writers(browse), network_id)
+      list.filter(sessions, fn(s) {
+        list.any(hosted, fn(h) { h.key_id == s.key_id && h.origin == s.origin })
+      })
+    }
+  }
 }

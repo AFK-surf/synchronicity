@@ -90,7 +90,8 @@ pub fn handle(
 
   let registry = browse_api.registry(browse)
   let download = Download(registry, holder, path)
-  let sessions = agent.sessions_for(registry, network_id)
+  let sessions =
+    browse_api.read_sessions(browse, network_id, principal.managed_only(who))
   case browse_api.pick(space, sessions, origin) {
     Error(message) -> deny(503, message)
     Ok(first) ->

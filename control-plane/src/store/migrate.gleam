@@ -62,7 +62,7 @@ fn apply(conn: Connection, sql: String, to: Int) -> Result(Int, MigrateError) {
 }
 
 fn migrations() -> List(String) {
-  [v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14]
+  [v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15]
 }
 
 /// V14: data planes are named, and this service decides what each one hosts
@@ -811,4 +811,29 @@ CREATE TABLE network_hosting_status (
 
 INSERT INTO users (id, email, name, created_at)
   VALUES ('system-dataplane', 'system-dataplane', 'cloud data plane', 0);
+"
+
+/// Add an immutable, org-scoped managed-data key kind; preserve existing keys.
+const v15 = "
+ALTER TABLE api_keys RENAME TO old_api_keys;
+DROP INDEX api_keys_by_org;
+DROP INDEX api_keys_by_network;
+CREATE TABLE api_keys (
+  id           TEXT PRIMARY KEY,
+  org_id       TEXT NOT NULL REFERENCES orgs(id),
+  network_id   TEXT REFERENCES networks(id),
+  name         TEXT NOT NULL CHECK (length(name) BETWEEN 1 AND 64),
+  prefix       TEXT NOT NULL,
+  token_hash   BLOB NOT NULL UNIQUE CHECK (length(token_hash) = 32),
+  role         TEXT NOT NULL CHECK (role IN ('admin','member','join','managed_data')),
+  created_by   TEXT NOT NULL REFERENCES users(id),
+  created_at   INTEGER NOT NULL,
+  expires_at   INTEGER,
+  last_used_at INTEGER,
+  CHECK ((role = 'join') = (network_id IS NOT NULL))
+);
+CREATE INDEX api_keys_by_org ON api_keys (org_id);
+CREATE INDEX api_keys_by_network ON api_keys (network_id);
+INSERT INTO api_keys SELECT * FROM old_api_keys;
+DROP TABLE old_api_keys;
 "

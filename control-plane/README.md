@@ -762,3 +762,10 @@ Day-2 operations (replicas, key ceremony, backups) live in
 The authenticated network delegation PUT/DELETE routes are thin proxies to
 the managed data plane. See [Hosted delegation API](../docs/HOSTED-DELEGATES.md)
 for the request contract, v2 compatibility and retry/revocation semantics.
+
+## Managed-data-only credentials
+
+Org admins can mint an immutable `managed_data` API-key kind for CP-mediated
+hosted data operations without org/device/network administration. See
+[managed-data key boundaries](../docs/MANAGED-DATA-KEYS.md) for the exact surface,
+verified hosted-only read routing, migration and revocation semantics.

@@ -5,6 +5,7 @@ import api/cloud_writer
 import api/reads
 import api/router
 import api/skill
+import auth/api_key as auth_api_key
 import auth/dataplane_key
 import auth/google
 import auth/session
@@ -2000,7 +2001,10 @@ pub fn api_key_carries_its_own_role_test() {
       ]),
     )
   assert owner_key.status == 400
-  assert string.contains(simulate.read_body(owner_key), "admin, member or join")
+  assert string.contains(
+    simulate.read_body(owner_key),
+    "admin, member, join or managed_data",
+  )
   assert call(h, keyed(admin, Get, "/api/orgs/acme/oidc")).status == 403
 }
 
@@ -4513,7 +4517,7 @@ pub fn hosting_decides_writes_and_hosting_off_drops_the_sessions_test() {
   assert string.contains(off, "\"writes\":{\"enabled\":false")
 }
 
-pub fn delegation_mutations_are_authenticated_hosted_and_thin_test() {
+fn delegation_mutations_with_role(role: String) {
   let h = harness_sized(1)
   org_with_network(h, "acme", "prod")
   let path = "/api/orgs/acme/networks/prod/delegations/" <> nk()
@@ -4532,7 +4536,7 @@ pub fn delegation_mutations_are_authenticated_hosted_and_thin_test() {
   org_named(h, "other")
   let wrong_org = mint(h, "other", "other-member", "member")
   assert call(h, keyed(wrong_org, Delete, path)).status == 404
-  let member = mint(h, "acme", "delegation-issuer", "member")
+  let member = mint(h, "acme", "delegation-issuer", role)
   assert host_network(h, "acme", "prod", True) == 200
   assert call_json(h, Put, path, body).status == 503
   let conn = read_db(h)
@@ -4584,4 +4588,131 @@ pub fn delegation_mutations_are_authenticated_hosted_and_thin_test() {
   assert call(replica, authed(replica, Delete, path)).status == 200
   let assert Ok(sent) = process.receive(parent, 5000)
   assert string.contains(sent, "\"action\":\"delete\"")
+}
+
+pub fn delegation_mutations_are_authenticated_hosted_and_thin_test() {
+  delegation_mutations_with_role("member")
+}
+
+pub fn managed_data_key_forwards_delegation_mutations_on_primary_and_replica_test() {
+  delegation_mutations_with_role("managed_data")
+}
+
+pub fn managed_data_keys_cannot_reach_control_or_other_orgs_test() {
+  let h = harness()
+  org_with_network(h, "acme", "prod")
+  org_with_network(h, "other", "prod")
+  let token = mint(h, "acme", "managed-only", "managed_data")
+  let body =
+    json.object([
+      #("spaces", json.array(["docs"], json.string)),
+      #("expires_at", json.int(now_unix() + 600)),
+    ])
+  list.each(
+    [
+      #(Get, "/api/me"),
+      #(Get, "/api/orgs/acme"),
+      #(Get, "/api/orgs/acme/networks"),
+      #(Delete, "/api/orgs/acme/networks/prod"),
+      #(Get, "/api/orgs/acme/devices"),
+      #(Post, "/api/orgs/acme/networks/prod/devices"),
+      #(Get, "/api/orgs/acme/api-keys"),
+      #(Post, "/api/orgs/acme/api-keys"),
+      #(Put, "/api/orgs/acme/networks/prod/browse/enabled"),
+      #(Put, "/api/orgs/acme/networks/prod/hosting"),
+    ],
+    fn(entry) {
+      let response =
+        call(h, keyed(token, entry.0, entry.1) |> simulate.json_body(body))
+      // A malformed body can be refused before the permission gate; never success.
+      assert response.status >= 400
+    },
+  )
+  assert call(h, keyed(token, Get, "/dp/v1/networks")).status == 403
+  assert call(h, keyed(token, Get, "/api/orgs/other/networks/prod/browse")).status
+    == 404
+  assert call(h, keyed(token, Get, "/api/orgs/acme/networks/prod/browse")).status
+    == 409
+  assert host_network(h, "acme", "prod", True) == 200
+  assert call(h, keyed(token, Get, "/api/orgs/acme/networks/prod/browse")).status
+    == 200
+  let path = "/api/orgs/acme/networks/prod/delegations/" <> nk()
+  // These reach DP selection, not the generic org gate.
+  assert call(h, keyed(token, Put, path) |> simulate.json_body(body)).status
+    == 503
+  assert call(h, keyed(token, Delete, path)).status == 503
+  // Streaming file authorization uses the same hosted-only scope gate.
+  let conn = read_db(h)
+  let assert Ok(who) = auth_api_key.authenticate(conn, token, now_unix())
+  sqlite.close(conn)
+  let pool = case h.ctx.api {
+    router.Writable(a) -> a.reads.pool
+    router.ReadOnly(r, _) -> r.pool
+  }
+  let assert Ok(_) = browse_api.for_download(pool, who, "acme", "prod")
+  let assert Error(_) = browse_api.for_download(pool, who, "other", "prod")
+  // Kind is immutable, even when a human admin edits a key.
+  let conn = read_db(h)
+  let assert Ok([[sqlite.Text(key_id)]]) =
+    sqlite.query(
+      conn,
+      "SELECT id FROM api_keys WHERE name = 'managed-only'",
+      [],
+    )
+  sqlite.close(conn)
+  assert call_json(
+      h,
+      Patch,
+      "/api/orgs/acme/api-keys/" <> key_id,
+      json.object([#("role", json.string("admin"))]),
+    ).status
+    == 400
+  assert call(h, authed(h, Delete, "/api/orgs/acme/api-keys/" <> key_id)).status
+    == 200
+  assert call(h, keyed(token, Get, "/api/orgs/acme/networks/prod/browse")).status
+    == 401
+}
+
+pub fn managed_key_migration_preserves_existing_tokens_and_kind_is_fixed_test() {
+  let h = harness()
+  org_with_network(h, "acme", "prod")
+  let member = mint(h, "acme", "member-before", "member")
+  let admin = mint(h, "acme", "admin-before", "admin")
+  let join = mint_join(h, "acme", "prod", "join-before")
+  let assert Ok(conn) = db.open_primary(h.db_path)
+  let assert Ok(before) =
+    sqlite.query(conn, "SELECT * FROM api_keys ORDER BY id", [])
+  // Exercise the v14→v15 table rebuild over real token/scope/expiry rows.
+  let assert Ok(_) = sqlite.exec(conn, "PRAGMA user_version = 14", [])
+  let assert Ok(15) = migrate.migrate(conn)
+  let assert Ok(after) =
+    sqlite.query(conn, "SELECT * FROM api_keys ORDER BY id", [])
+  assert after == before
+  list.each([member, admin, join], fn(token) {
+    let assert Ok(_) = auth_api_key.authenticate(conn, token, now_unix())
+  })
+  let assert Ok([[sqlite.Text(key_id)]]) =
+    sqlite.query(
+      conn,
+      "SELECT id FROM api_keys WHERE name = 'member-before'",
+      [],
+    )
+  sqlite.close(conn)
+  assert call_json(
+      h,
+      Patch,
+      "/api/orgs/acme/api-keys/" <> key_id,
+      json.object([#("role", json.string("managed_data"))]),
+    ).status
+    == 400
+  let token = mint(h, "acme", "managed-expiring", "managed_data")
+  let assert Ok(conn) = db.open_primary(h.db_path)
+  let assert Ok(_) =
+    sqlite.exec(
+      conn,
+      "UPDATE api_keys SET expires_at = ? WHERE name = 'managed-expiring'",
+      [sqlite.Int(now_unix() - 1)],
+    )
+  let assert Error(_) = auth_api_key.authenticate(conn, token, now_unix())
+  sqlite.close(conn)
 }
