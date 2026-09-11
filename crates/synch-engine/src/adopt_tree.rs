@@ -55,8 +55,8 @@ use synch_store::{Donor, EntryRow, VersionPolicy, VersionSet};
 
 use crate::{
     checkout::{
-        apply_metadata, attestors_of, escapes_via_symlink, materialize_symlink,
-        note_pending_object, GitWant, Metadata, PendingObjects, HELD,
+        apply_metadata, attestors_of, escapes_via_symlink, materialize_symlink, GitWant, Metadata,
+        PendingObjects, HELD,
     },
     error::{EngineError, Result},
     ignore::IgnoreSet,
@@ -263,7 +263,7 @@ impl Node {
             let ignore = IgnoreSet::for_space(&root_dir)?;
             let listing = node.unified_listing(&space, &prefix, None, None)?;
             let (report, wanted, links, pending_objects) = decide(
-                &node, &space, &prefix, &root_dir, &listing, &policy, &ignore, options,
+                &node, &space, &root_dir, &listing, &policy, &ignore, options,
             )?;
             // The git directories this run would write into, for the
             // in-progress guard the write half takes.
@@ -781,7 +781,6 @@ struct PendingLink {
 fn decide(
     node: &Node,
     space_id: &str,
-    prefix: &str,
     root_dir: &Path,
     listing: &[VersionSet],
     policy: &VersionPolicy,
@@ -1076,17 +1075,14 @@ fn decide(
         };
         let attestors = attestors_of(set, &selected);
         let git_want = GitWant::of(git.as_ref(), selected.size, &attestors);
-        if let Some(git) = git.filter(|git| git.class == synch_core::GitClass::Object) {
-            note_pending_object(&mut pending_objects, git.root, &attestors);
-        }
-        // A prefix inside a git directory lists none of its objects, so the
-        // hold would have nothing to wait on. What is on disk answers
-        // instead, once per repository and origin: the objects the origin
-        // publishes that are not here by path (`docs/GIT.md` §8.1).
-        if let Some(git) = git_want
-            .as_ref()
-            .filter(|git| git.hold.is_some() && !git.root.starts_with(prefix.trim_end_matches('/')))
-        {
+        // What a held ref waits on is seeded from the disk, once per
+        // repository and publishing origin: every object file that origin
+        // publishes and that is not here by path (`docs/GIT.md` §8.1). Not
+        // from what this run plans to write — an object the plan passes over
+        // (excluded by `.syncignore`, a directory in its way, no donor, or
+        // simply outside a narrowed prefix) is exactly one the ref must keep
+        // waiting for, and only a successful write releases it.
+        if let Some(git) = git_want.as_ref().filter(|git| git.hold.is_some()) {
             for origin in &attestors {
                 let key = (git.root.clone(), origin.clone());
                 if pending_objects.contains_key(&key) {

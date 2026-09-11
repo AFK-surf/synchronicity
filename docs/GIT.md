@@ -202,6 +202,17 @@ per entry. Beside it, it consults the classifier:
   checkout serves a dangling ref until the next scan. The class order closes
   that at the source; §7.2 closes what remains on the consumer.
 
+  The order is a statement about the value a ref had *when the walk passed
+  it*, and the walk only discovers: the bytes are ingested after the whole
+  walk. A commit landing in between would put a newer value in the file
+  than the walk vouched for. So the walk records each ref file's `(size,
+  mtime, inode)`, and a ref whose stat has moved by the time it is ingested
+  is skipped for that scan — the previously published value stands, the
+  path is exempt from the deletion sweep like any skipped one, and the
+  rescan the watcher already owes for that write publishes the ref and its
+  objects together. Git replaces a ref by rename, so a matching stat is the
+  inode the walk saw.
+
 Nothing else changes in the walk. Objects arrive as ordinary files, are hashed
 with BLAKE3 and land in the CAS (loose objects are almost always under
 `INLINE_BLOB_MAX` and are stored inline in SQLite rather than as CAS files);
@@ -393,8 +404,12 @@ When a Refs-class path under `refs/` is divergent, the checkout writes the
 selected version at the path and every other *live* version at
 `refs/synch/<origin>/<path without refs/>` — `refs/synch/nas/heads/main` for
 `nas`'s copy of `refs/heads/main`, named by the origin's short form
-(`OriginId::short`), one per origin asserting a losing version. This holds
-when the selected version is a deletion too: the branch is gone from
+(`OriginId::short`), one per origin asserting a losing version. A losing
+`packed-refs` is many refs in one file, and git reads packed refs from one
+place only, so each `refs/…` line it carries is expanded into a loose
+mirror of its own, from the bytes the replica holds; the names are a
+peer's, and one git would refuse is refused before it becomes a path. This
+holds when the selected version is a deletion too: the branch is gone from
 `refs/heads/`, and the other machine's copy of it, with whatever commits
 only it had, stands under `refs/synch/` until that machine agrees. These
 are Transient-class paths: never published (the scanner never sees a
@@ -424,10 +439,15 @@ decisions and the same order and hold as §7.
 ### 8.1 Order and hold
 
 `write_adoption` writes in the §7.1 order within each git directory. A
-Refs-class path is written under the §7.2 rule, evaluated against what is on
-disk *after* the objects planned in the same adoption have landed — an
-adoption of a whole repository from a fresh machine fetches the objects and
-then writes the refs, in one run. `adopt path` on a Refs-class path is
+Refs-class path is written under the §7.2 rule. What it waits on is seeded
+from the disk, once per repository and publishing origin: every object file
+that origin publishes and that is not here by path. Not from what the run
+plans to write — an object the plan passes over, excluded by `.syncignore`,
+blocked by a directory, without a donor, or outside a narrowed prefix, is
+exactly one the ref must keep waiting for — and only a successful write
+releases one. An adoption of a whole repository from a fresh machine
+therefore fetches the objects and then writes the refs, in one run, and an
+adoption that cannot write the objects writes no ref. `adopt path` on a Refs-class path is
 refused outright when the rule would hold it, with an error naming `adopt
 tree` for the repository, because a source holds none of a peer's content
 until something adopts it (`docs/DELTA-SYNC.md`, the retention model) and a
@@ -700,6 +720,14 @@ in the test and skipped where the binary is absent:
   an adopted copy, and git resolves the submodule's HEAD in both.
 - A lock an earlier release materialized goes once the tree tombstones it;
   a lock git itself left, unknown to the tree, stays.
+- Two publishers that both packed their refs and diverged: the checkout
+  expands the losing `packed-refs` into mirrors, both lines and the losing
+  tag stay reachable, and the mirrors go once the publishers agree.
+- An adoption whose `.syncignore` excludes `objects/` holds every ref that
+  names objects and writes the symbolic `HEAD`.
+- (`scanner.rs`) A commit landing between the walk and the ingest of the ref
+  it moves: the ref is skipped that scan, the earlier value's object is
+  published, and the next scan publishes the ref with its objects.
 
 `crates/synch-store/src/unified.rs` covers the selection rules on rows
 alone: object identity by name, tombstones dropped while a copy is live and

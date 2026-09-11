@@ -171,7 +171,7 @@ impl Node {
         // working example, and worse than the hashing on anything larger.
         let mut seen: std::collections::HashSet<&str> = std::collections::HashSet::new();
         for candidate in &found {
-            let (_, rel, _) = candidate;
+            let (_, rel, _, _) = candidate;
             // A path that vanished between the walk and here is skipped, not
             // fatal — the same tolerance `walk` above already applies to
             // `read_dir` and `symlink_metadata`, and for the same reason: a
@@ -330,12 +330,12 @@ impl Node {
     fn index_file(
         &self,
         space_id: &str,
-        candidate: &(PathBuf, String, bool),
+        candidate: &Found,
         seq: u64,
         report: &mut ScanReport,
         ingest: &mut impl FnMut(&Path) -> Result<(Hash, u64)>,
     ) -> Result<()> {
-        let (path, rel, is_symlink) = candidate;
+        let (path, rel, is_symlink, walked) = candidate;
         if *is_symlink {
             return self.index_symlink(space_id, path, rel, seq, report);
         }
@@ -344,6 +344,21 @@ impl Node {
         let size = metadata.len();
         let mtime_ns = mtime_nanos(&metadata);
         let file_id = file_identity(&metadata);
+
+        // A git ref that moved since the walk saw it names a commit whose
+        // objects the walk may not have found (`Found`). It is skipped, not
+        // published: the previously published value stays, this path is
+        // exempt from the deletion sweep like any skipped one, and the
+        // watcher's rescan of the write that moved it publishes both the ref
+        // and its objects together.
+        if let Some(walked) = walked {
+            if *walked != (size, mtime_ns, file_id.clone()) {
+                return Err(EngineError::Io(std::io::Error::other(
+                    "the ref changed after the walk read the objects it names; \
+                     the next scan publishes it",
+                )));
+            }
+        }
 
         let known = self.store().local_file(space_id, rel)?;
         let stat_match = match &known {
@@ -2404,8 +2419,20 @@ impl Drop for Adoption {
 }
 
 /// One file the walk found: its absolute path, its normalized relative path,
-/// and whether it is a symlink.
-type Found = (PathBuf, String, bool);
+/// whether it is a symlink, and — for a git ref — the `(size, mtime_ns,
+/// file_id)` it had when the walk saw it.
+///
+/// The walk reads a git directory's refs before its objects so that every
+/// object a ref value needs is discovered in the same scan (`docs/GIT.md`
+/// §5.1). That is a statement about the value the ref had *when the walk
+/// passed it*; the bytes are only ingested after the whole walk, and a commit
+/// landing in between would put a newer value in the file than the walk
+/// vouched for. The signature is how `index_file` tells: git replaces a ref
+/// by rename, so a ref whose stat still matches is the inode the walk saw.
+type Found = (PathBuf, String, bool, Option<WalkSignature>);
+
+/// What the walk recorded about a ref file: `(size, mtime_ns, file_id)`.
+type WalkSignature = (u64, i64, Option<Vec<u8>>);
 
 /// True if `path` is one of the paths this pass could not judge, or is under
 /// one of them.
@@ -2512,7 +2539,16 @@ fn walk(
         if is_dir {
             walk(root, &path, ignore, report, found)?;
         } else if file_type.is_file() || file_type.is_symlink() {
-            found.push((path, rel, file_type.is_symlink()));
+            let signature = synch_core::git::classify(&rel)
+                .filter(|git| git.class == synch_core::GitClass::Ref && file_type.is_file())
+                .map(|_| {
+                    (
+                        metadata.len(),
+                        mtime_nanos(&metadata),
+                        file_identity(&metadata),
+                    )
+                });
+            found.push((path, rel, file_type.is_symlink(), signature));
         } else {
             // Never open special files: FIFOs can block and devices may never
             // reach EOF. Preserve any previously published version through the
@@ -3097,7 +3133,7 @@ mod tests {
         assert_eq!(
             found
                 .iter()
-                .map(|(_, rel, _)| rel.as_str())
+                .map(|(_, rel, _, _)| rel.as_str())
                 .collect::<Vec<_>>(),
             ["a.txt", "link", "z.txt"]
         );
@@ -3131,6 +3167,115 @@ mod tests {
         }
         assert_eq!(published(&node, "media", "link").kind, EntryKind::Symlink);
         assert!(node.store().local_file("media", "fifo").unwrap().is_none());
+        node.shutdown().await.unwrap();
+    }
+
+    /// Runs `git` hermetically in `dir`; `None` when the binary is absent.
+    fn git(dir: &Path, args: &[&str]) -> Option<String> {
+        let output = std::process::Command::new("git")
+            .args([
+                "-c",
+                "user.name=t",
+                "-c",
+                "user.email=t@example",
+                "-c",
+                "gc.auto=0",
+            ])
+            .args([
+                "-c",
+                "init.defaultBranch=main",
+                "-c",
+                "commit.gpgsign=false",
+            ])
+            .args(args)
+            .current_dir(dir)
+            .env("GIT_CONFIG_GLOBAL", "/dev/null")
+            .env("GIT_CONFIG_NOSYSTEM", "1")
+            .output()
+            .ok()?;
+        assert!(
+            output.status.success(),
+            "git {args:?}: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+        Some(String::from_utf8_lossy(&output.stdout).trim().to_string())
+    }
+
+    /// A commit landing between the walk and the ingest of the ref it moves
+    /// must not publish the new ref value with its objects undiscovered
+    /// (`docs/GIT.md` §5.1): the ref is skipped this scan, the previously
+    /// published value stands, and the next scan publishes ref and objects
+    /// together.
+    #[tokio::test]
+    async fn a_ref_moved_after_the_walk_waits_for_the_next_scan() {
+        let (_d, space, node) = node_with_space().await;
+        let repo = space.path().join("app");
+        std::fs::create_dir_all(&repo).unwrap();
+        if git(&repo, &["init", "-q"]).is_none() {
+            eprintln!("git is not installed; skipping");
+            node.shutdown().await.unwrap();
+            return;
+        }
+        std::fs::write(repo.join("a.txt"), b"a").unwrap();
+        git(&repo, &["add", "a.txt"]);
+        git(&repo, &["commit", "-q", "-m", "first"]);
+        let first = git(&repo, &["rev-parse", "main"]).unwrap();
+
+        // The walk sees `main` at `first`; the very first ingest then lands a
+        // second commit, so every later read — the ref's included — sees a
+        // repository the walk did not.
+        let mut committed = false;
+        let racing = repo.clone();
+        let store = node.store().clone();
+        let report = node
+            .scan_space_with_ingest("media", &mut |path| {
+                if !committed {
+                    committed = true;
+                    std::fs::write(racing.join("b.txt"), b"b").unwrap();
+                    git(&racing, &["add", "b.txt"]);
+                    git(&racing, &["commit", "-q", "-m", "second"]);
+                }
+                Ok(store.ingest_file(path, now_ns())?)
+            })
+            .unwrap();
+        assert!(
+            report
+                .skipped
+                .iter()
+                .any(|(p, why)| p == "app/.git/refs/heads/main" && why.contains("after the walk")),
+            "{:?}",
+            report.skipped
+        );
+        node.publish(&report.staged).unwrap();
+        let live = node
+            .store()
+            .published_paths(node.origin(), "media")
+            .unwrap();
+        assert!(
+            !live.iter().any(|p| p == "app/.git/refs/heads/main"),
+            "the moved ref is not published this scan"
+        );
+        let object_of = |hex: &str| format!("app/.git/objects/{}/{}", &hex[..2], &hex[2..]);
+        assert!(live.contains(&object_of(&first)));
+
+        // The next scan publishes the ref and every object it needs.
+        let second = git(&repo, &["rev-parse", "main"]).unwrap();
+        let (report, head) = node.scan_and_publish().unwrap();
+        assert!(head.is_some(), "{report:?}");
+        assert!(report.skipped.is_empty(), "{:?}", report.skipped);
+        let live = node
+            .store()
+            .published_paths(node.origin(), "media")
+            .unwrap();
+        assert!(live.iter().any(|p| p == "app/.git/refs/heads/main"));
+        assert!(live.contains(&object_of(&second)), "{live:?}");
+        let published_ref = published(&node, "media", "app/.git/refs/heads/main");
+        assert_eq!(
+            node.store()
+                .read_all(&published_ref.content.unwrap())
+                .unwrap(),
+            format!("{second}\n").into_bytes()
+        );
         node.shutdown().await.unwrap();
     }
 

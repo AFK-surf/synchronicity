@@ -399,6 +399,30 @@ pub fn parse_ref(bytes: &[u8]) -> Option<RefValue> {
         .then(|| RefValue::Object(hex.to_string()))
 }
 
+/// The refs a `packed-refs` file names, as `(object name, ref name)` pairs
+/// in file order. Header lines (`# pack-refs with: …`) and peeled lines
+/// (`^<hex>`, the tag's target) carry no ref of their own and are skipped,
+/// as is anything that is not `<hex> refs/…`.
+///
+/// The ref names are a peer's bytes: a consumer that turns one into a path
+/// validates it first.
+pub fn parse_packed_refs(bytes: &[u8]) -> Vec<(String, String)> {
+    let Ok(text) = std::str::from_utf8(bytes) else {
+        return Vec::new();
+    };
+    text.lines()
+        .filter_map(|line| {
+            let (hex, name) = line.trim_end().split_once(' ')?;
+            let object = ((hex.len() == 40 || hex.len() == 64)
+                && hex.bytes().all(|b| b.is_ascii_hexdigit()))
+            .then_some(hex)?;
+            let name = name.trim();
+            (name.starts_with("refs/") && !name.contains(' '))
+                .then(|| (object.to_string(), name.to_string()))
+        })
+        .collect()
+}
+
 /// The `gitdir:` target of a `.git` pointer file, or `None` if the content is
 /// not one.
 pub fn parse_gitdir(bytes: &[u8]) -> Option<&str> {
@@ -654,6 +678,25 @@ mod tests {
         );
         assert_eq!(parse_gitdir(b"gitdir:/abs/path"), Some("/abs/path"));
         assert_eq!(parse_gitdir(b"not a pointer"), None);
+        let packed = b"# pack-refs with: peeled fully-peeled sorted \n\
+0123456789abcdef0123456789abcdef01234567 refs/heads/main\n\
+89abcdef0123456789abcdef0123456789abcdef refs/tags/v1\n\
+^0123456789abcdef0123456789abcdef01234567\n\
+garbage line\n\
+0123456789abcdef0123456789abcdef01234567 notrefs/x\n";
+        assert_eq!(
+            parse_packed_refs(packed),
+            vec![
+                (
+                    "0123456789abcdef0123456789abcdef01234567".to_string(),
+                    "refs/heads/main".to_string()
+                ),
+                (
+                    "89abcdef0123456789abcdef0123456789abcdef".to_string(),
+                    "refs/tags/v1".to_string()
+                ),
+            ]
+        );
         assert_eq!(
             mirror_ref_path("key:abcdefghij", "heads/main"),
             "refs/synch/key-abcdefghij/heads/main"

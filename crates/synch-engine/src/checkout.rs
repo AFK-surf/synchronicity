@@ -192,7 +192,9 @@ impl Node {
                 report.skipped.push((want.path, HELD.into()));
                 continue;
             }
-            let ready = {
+            let ready = if want.bytes.is_some() {
+                true
+            } else {
                 let store = self.store().clone();
                 let (root, holder) = (want.content, checkout_holder.clone());
                 crate::blocking::offload(move || {
@@ -261,10 +263,20 @@ impl Node {
                 // A materialization that fails takes its path down with it and
                 // nothing else: the target is untouched, and the next pass
                 // tries again.
-                let kind = match self
-                    .materialize_blob(&want.content, want.size, want.target.clone())
-                    .await
-                {
+                let materialized = match &want.bytes {
+                    Some(bytes) => {
+                        let (target, bytes) = (want.target.clone(), bytes.clone());
+                        crate::blocking::offload(move || Ok(write_bytes(&target, &bytes)))
+                            .await?
+                            .map(|()| crate::CloneKind::Copy)
+                            .map_err(EngineError::from)
+                    }
+                    None => {
+                        self.materialize_blob(&want.content, want.size, want.target.clone())
+                            .await
+                    }
+                };
+                let kind = match materialized {
                     Ok(kind) => kind,
                     Err(e) => {
                         report
@@ -447,6 +459,10 @@ struct WantedContent {
     meta: Metadata,
     /// What this path is to the git directory it lies in, if any.
     git: Option<GitWant>,
+    /// The bytes themselves, for a file the pass derives rather than fetches
+    /// — a ref expanded out of another origin's `packed-refs` (§7.4). `None`
+    /// means `content` names an object the replica holds.
+    bytes: Option<Vec<u8>>,
 }
 
 impl WantedContent {
@@ -552,6 +568,15 @@ pub(crate) fn note_pending_object(pending: &mut PendingObjects, root: &str, atte
     }
 }
 
+/// The reverse: an object proven on disk is one fewer for its publishers.
+fn release_pending_object(pending: &mut PendingObjects, root: &str, attestors: &[String]) {
+    for origin in attestors {
+        if let Some(n) = pending.get_mut(&(root.to_string(), origin.clone())) {
+            *n = n.saturating_sub(1);
+        }
+    }
+}
+
 /// The origins asserting the version `selected` belongs to, canonically.
 pub(crate) fn attestors_of(set: &synch_store::VersionSet, selected: &EntryRow) -> Vec<String> {
     set.versions
@@ -643,6 +668,20 @@ fn plan_pass(
             continue;
         }
         pass.known.insert(set.path.clone());
+        // Every live object counts as pending for the origins publishing it
+        // until the pass proves it on disk or writes it (`docs/GIT.md`
+        // §7.2). Counted here, ahead of every guard below, so an object a
+        // guard turns away — an unsafe name, a symlink in its way, a
+        // collision — keeps the refs that need it waiting.
+        if let Some(git) = git.filter(|git| git.class == synch_core::GitClass::Object) {
+            if let synch_store::Selection::Selected(entry) = set.select(&VersionPolicy::Newest, now)
+            {
+                if entry.kind == EntryKind::File {
+                    let attestors = attestors_of(set, &entry);
+                    note_pending_object(&mut pass.pending_objects, git.root, &attestors);
+                }
+            }
+        }
         // Before the target path is built, because building it is already
         // the damage: on Windows `Path::join` reads a backslash as a
         // separator and a drive-prefixed argument as a root, so a published
@@ -745,10 +784,13 @@ fn plan_pass(
             selected.size,
             Metadata::of(&selected),
             git_want,
+            None,
         );
-        if planned == Planned::Wanted {
+        // An object already here is one fewer for its publishers' refs to
+        // wait on; one that is wanted is released when it lands.
+        if planned == Planned::Current {
             if let Some(git) = git.filter(|git| git.class == synch_core::GitClass::Object) {
-                note_pending_object(&mut pass.pending_objects, git.root, &attestors);
+                release_pending_object(&mut pass.pending_objects, git.root, &attestors);
             }
         }
     }
@@ -768,9 +810,10 @@ fn plan_mirrors(
     git: &synch_core::GitPath<'_>,
     selected: &EntryRow,
 ) {
-    let Some(name) = git.loose_ref() else {
+    let packed = git.inner == "packed-refs";
+    if !packed && git.loose_ref().is_none() {
         return;
-    };
+    }
     let losing = set
         .versions
         .iter()
@@ -783,43 +826,102 @@ fn plan_mirrors(
             let Some(content) = entry.content else {
                 continue;
             };
-            let mirror = format!(
-                "{}/{}",
-                git.root,
-                synch_core::git::mirror_ref_path(&origin.short(), name)
-            );
-            let Some(rank) = synch_core::git::classify(&mirror).map(|m| m.class.materialize_rank())
-            else {
-                continue;
+            // A loose ref mirrors as the bytes it is. A losing `packed-refs`
+            // is many refs in one file, and git reads packed refs from one
+            // place only, so each ref it names is expanded into a loose
+            // mirror of its own — from the bytes the replica holds, since a
+            // replica holds every version. Not yet fetched means not yet
+            // mirrored; the next pass tries again.
+            let refs: Vec<(String, Option<Vec<u8>>, synch_core::Hash, u64)> = if packed {
+                let Ok(bytes) = node.store().read_all(&content) else {
+                    continue;
+                };
+                synch_core::git::parse_packed_refs(&bytes)
+                    .into_iter()
+                    .filter_map(|(object, name)| {
+                        let name = name.strip_prefix("refs/")?;
+                        let line = format!("{object}\n").into_bytes();
+                        let root = synch_core::Hash::new(&line);
+                        let size = line.len() as u64;
+                        Some((name.to_string(), Some(line), root, size))
+                    })
+                    .collect()
+            } else {
+                let Some(name) = git.loose_ref() else {
+                    return;
+                };
+                vec![(name.to_string(), None, content, entry.size)]
             };
-            if !pass.mirrors.insert(mirror.clone()) {
-                continue;
-            }
-            let target = root_dir.join(&mirror);
-            let planned = plan_file(
-                node,
-                pass,
-                mirror,
-                target,
-                content,
-                entry.size,
-                Metadata::of(entry),
-                Some(GitWant {
-                    root: git.root.to_string(),
-                    rank: (rank, 1),
-                    hold: git
-                        .names_objects(entry.size)
-                        .then(|| vec![origin.canonical()]),
-                    releases: Vec::new(),
-                    mirror: true,
-                    worktree_private: git.in_worktree_private_dir(),
-                }),
-            );
-            if planned == Planned::Current {
-                pass.report.mirrored += 1;
+            for (name, bytes, content, size) in refs {
+                // The name is a peer's bytes: a ref name git would refuse is
+                // refused here too, before it becomes a path.
+                if synch_core::normalize_path(&name).is_err()
+                    || unsafe_name(&name).is_some()
+                    || name.starts_with("synch/")
+                {
+                    continue;
+                }
+                let mirror = format!(
+                    "{}/{}",
+                    git.root,
+                    synch_core::git::mirror_ref_path(&origin.short(), &name)
+                );
+                let Some(rank) = synch_core::git::classify(&mirror)
+                    .filter(|m| m.class == synch_core::GitClass::Transient)
+                    .map(|m| m.class.materialize_rank())
+                else {
+                    continue;
+                };
+                if escapes_via_symlink(root_dir, &mirror) || !pass.mirrors.insert(mirror.clone()) {
+                    continue;
+                }
+                let target = root_dir.join(&mirror);
+                let planned = plan_file(
+                    node,
+                    pass,
+                    mirror,
+                    target,
+                    content,
+                    size,
+                    Metadata::of(entry),
+                    Some(GitWant {
+                        root: git.root.to_string(),
+                        rank: (rank, 1),
+                        hold: Some(vec![origin.canonical()]),
+                        releases: Vec::new(),
+                        mirror: true,
+                        worktree_private: git.in_worktree_private_dir(),
+                    }),
+                    bytes,
+                );
+                if planned == Planned::Current {
+                    pass.report.mirrored += 1;
+                }
             }
         }
     }
+}
+
+/// Writes a small derived file the way materialization does: staged beside
+/// the target and renamed into place, so an interrupted pass never leaves a
+/// half-written file wearing the name.
+fn write_bytes(target: &Path, bytes: &[u8]) -> std::io::Result<()> {
+    let parent = target
+        .parent()
+        .ok_or_else(|| std::io::Error::other("a mirror ref has no parent directory"))?;
+    std::fs::create_dir_all(parent)?;
+    let name = target
+        .file_name()
+        .map(|n| n.to_string_lossy().into_owned())
+        .unwrap_or_default();
+    let staging = parent.join(format!(
+        ".{name}.{}.synch-materialize",
+        synch_core::fs::unique_suffix()
+    ));
+    std::fs::write(&staging, bytes)?;
+    std::fs::rename(&staging, target).inspect_err(|_| {
+        let _ = std::fs::remove_file(&staging);
+    })
 }
 
 /// What phase 1 decided about one file.
@@ -851,6 +953,7 @@ fn plan_file(
     size: u64,
     meta: Metadata,
     git: Option<GitWant>,
+    bytes: Option<Vec<u8>>,
 ) -> Planned {
     let report = &mut pass.report;
     let recorded = node.checkout_write_was(&target);
@@ -919,6 +1022,7 @@ fn plan_file(
         size,
         meta,
         git,
+        bytes,
     });
     Planned::Wanted
 }

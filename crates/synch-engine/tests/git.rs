@@ -569,6 +569,124 @@ async fn concurrent_commits_are_both_reachable_in_a_checkout() {
     shutdown(&[&a.node, &b.node, &replica.node]).await;
 }
 
+/// Two publishers that both packed their refs and diverged: the checkout
+/// selects one `packed-refs` and expands the other's refs into mirrors, so
+/// both lines stay reachable; the mirrors go once the publishers agree.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_losing_packed_refs_is_expanded_into_mirrors() {
+    if !have_git() {
+        return;
+    }
+    let _blocking = synch_core::BlockingScope::enter();
+    let a = spawn("a").await;
+    let b = spawn("b").await;
+    let replica = spawn("replica").await;
+    introduce(&[&a, &b, &replica]);
+    let repo_a = init_repo(a.space.path());
+    let repo_b = b.space.path().join(REPO);
+    copy_dir(&repo_a, &repo_b);
+    std::fs::write(repo_a.join("a.txt"), b"a").unwrap();
+    git(&repo_a, &["add", "a.txt"]);
+    git(&repo_a, &["commit", "-q", "-m", "on a"]);
+    git(&repo_a, &["tag", "only-a"]);
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    std::fs::write(repo_b.join("b.txt"), b"b").unwrap();
+    git(&repo_b, &["add", "b.txt"]);
+    git(&repo_b, &["commit", "-q", "-m", "on b"]);
+    for repo in [&repo_a, &repo_b] {
+        git(repo, &["pack-refs", "--all"]);
+        assert!(!repo.join(".git/refs/heads/main").exists(), "packed");
+    }
+    let (commit_a, commit_b) = (
+        git(&repo_a, &["rev-parse", "main"]),
+        git(&repo_b, &["rev-parse", "main"]),
+    );
+    for peer in [&a, &b] {
+        peer.node
+            .add_filesystem_source(SPACE, peer.space.path())
+            .unwrap();
+        peer.node.scan_publish_push().await.unwrap();
+    }
+    let checkout = add_checkout(&replica).await;
+    let report = converge(&replica.node, &[&a.node, &b.node]).await;
+    let mirror = checkout.join(REPO);
+    assert_eq!(git(&mirror, &["rev-parse", "main"]), commit_b, "{report:?}");
+    assert!(report.mirrored >= 2, "main and the tag: {report:?}");
+    let mirrored_main = mirror.join(".git").join(synch_core::git::mirror_ref_path(
+        &a.node.origin().short(),
+        "heads/main",
+    ));
+    assert_eq!(
+        std::fs::read_to_string(&mirrored_main).unwrap().trim(),
+        commit_a
+    );
+    let all = git(&mirror, &["rev-list", "--all"]);
+    assert!(all.contains(&commit_a) && all.contains(&commit_b), "{all}");
+    git(&mirror, &["fsck", "--strict"]);
+    git(&mirror, &["prune", "--expire=now"]);
+    git(&mirror, &["cat-file", "-e", &commit_a]);
+    assert_eq!(
+        git(
+            &mirror,
+            &["rev-parse", "synch/a@cluster.example/tags/only-a"]
+        ),
+        git(&repo_a, &["rev-parse", "only-a"])
+    );
+
+    git(&repo_b, &["fetch", "-q", repo_a.to_str().unwrap(), "main"]);
+    git(&repo_b, &["reset", "-q", "--hard", "FETCH_HEAD"]);
+    // The tag too: two `packed-refs` that differ at all stay two versions
+    // (§12 rules out resolving refs one by one across them), so the mirrors
+    // go only once the files are the same bytes.
+    git(&repo_b, &["tag", "-f", "only-a", &commit_a]);
+    git(&repo_b, &["pack-refs", "--all"]);
+    assert_eq!(
+        std::fs::read(repo_a.join(".git/packed-refs")).unwrap(),
+        std::fs::read(repo_b.join(".git/packed-refs")).unwrap()
+    );
+    b.node.scan_publish_push().await.unwrap();
+    converge(&replica.node, &[&a.node, &b.node]).await;
+    assert!(
+        !mirrored_main.exists(),
+        "the mirror is swept once the refs agree"
+    );
+    shutdown(&[&a.node, &b.node, &replica.node]).await;
+}
+
+/// Objects a tree adoption passes over — here excluded by `.syncignore` —
+/// keep the refs that name them held: a ref is never written into a
+/// repository whose objects the run did not put there.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn adoption_holds_refs_whose_objects_it_skipped() {
+    if !have_git() {
+        return;
+    }
+    let _blocking = synch_core::BlockingScope::enter();
+    let a = spawn("a").await;
+    let b = spawn("b").await;
+    introduce(&[&a, &b]);
+    init_repo(a.space.path());
+    a.node.add_filesystem_source(SPACE, a.space.path()).unwrap();
+    a.node.scan_publish_push().await.unwrap();
+    std::fs::write(b.space.path().join(".syncignore"), b"app/.git/objects/\n").unwrap();
+    b.node.add_filesystem_source(SPACE, b.space.path()).unwrap();
+    let report = adopt(&b.node, &a.node, AdoptTreeOptions::default()).await;
+    assert!(report.ignored > 0, "{report:?}");
+    assert!(
+        report
+            .skipped
+            .iter()
+            .any(|(p, why)| p == "app/.git/refs/heads/main" && why.contains("still being acquired")),
+        "{report:?}"
+    );
+    assert!(!b.space.path().join("app/.git/refs/heads/main").exists());
+    assert!(
+        b.space.path().join("app/.git/HEAD").is_file(),
+        "a symbolic ref needs no objects"
+    );
+    shutdown(&[&a.node, &b.node]).await;
+}
+
 /// A fresh machine adopting a whole repository gets a clean one, objects
 /// before refs; adopting a single ref before the objects is refused; and a
 /// repository mid-rebase is not written into until the rebase is over.
