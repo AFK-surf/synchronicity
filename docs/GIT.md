@@ -1,12 +1,17 @@
 # Git repositories
 
-Status: **proposed**. Nothing here is built. The document describes what the
-engine does today with a `.git` directory (§1), what a git directory is to a
-sync engine (§2), and the handling this design adds so that a synced git
-repository is a repository git can open, whose refs never point at objects
-that are not there, in which no commit any member published ever becomes
-unreachable, and which converges to one member's repository whenever one
-member at a time is active. Section 13 is the implementation map.
+Status: **implemented**. `synch-core::git` is the classifier, `synch-store`'s
+`unified.rs` the selection rules, `synch-engine`'s scanner, checkout and tree
+adoption the ordering, hold and guards, and `crates/synch-engine/tests/git.rs`
+drives all of it against repositories made by `git` itself. Where the built
+thing differs from the first draft of this design, the document says so at
+that point. The document describes what the engine did with a `.git`
+directory before (§1), what a git directory is to a sync engine (§2), and the
+handling that makes a synced git repository a repository git can open, whose
+refs never point at objects that are not there, in which no commit any member
+published ever becomes unreachable, and which converges to one member's
+repository whenever one member at a time is active. Section 13 is the
+implementation map.
 
 The design changes no record, no trie key, no wire message and nothing in the
 Lean core. Everything it adds is interpretation: which paths the scanner
@@ -354,10 +359,12 @@ In steady state objects are small, fetched within a pass or two, and a ref
 lags them by that; during an initial replication of a large repository the
 refs land last, which is the point.
 
-`reftable/**` is written in class order but not parsed, so it gets the order
-and not the hold; a repository using the reftable backend can show a
-dangling ref for the duration of a fetch. The format is opt-in and young, and
-parsing it is on the §12 list.
+Whether a ref names objects is judged from the size the entry publishes,
+never from its bytes: git writes a loose object-valued ref as exactly 41 or
+65 bytes, and a symbolic ref is never either length. `packed-refs`, `shallow`
+and `reftable/**` always name objects and are always held — the first draft
+of this design gave reftables the order without the hold, on the assumption
+that the hold needed to parse the ref; it does not, so they get both.
 
 ### 7.3 What is never removed
 
@@ -429,9 +436,11 @@ single ref is never the thing to adopt first.
   replaced Refs-class path the report carries the old and new value (the
   object names, read from the files), because "replaced `refs/heads/main`"
   is a sentence that should name what was there; and a *selected tombstone*
-  is listed under a new `deleted` heading rather than skipped, since under
-  §6.2 that is the newest state of the ref and `adopt path` of the tombstone
-  is how the user applies it. `adopt tree` still never removes anything.
+  for a path that is present locally is listed under a new `deleted` heading
+  rather than skipped, since under §6.2 that is the newest state of the ref
+  and `adopt path` of the tombstone is how the user applies it. Worktree
+  state follows the same rule, so a deleted branch's reflog is listed beside
+  the branch. `adopt tree` still never removes anything.
 - **Transient and machine-local.** `refuse_if_ignored` refuses Transient;
   machine-local paths are never in the tree to adopt.
 - **Repository files, object caches.** Unchanged.
@@ -465,12 +474,12 @@ recover the blobs, which are objects and were not removed.
 ## 9. Status and reporting
 
 - `synch ls` and `synch status` render Objects-class paths as unanimous
-  (§6.1); a Refs-class version whose bytes are at hand (loose refs are inline
-  blobs) is rendered by the object name or symref it holds rather than by the
-  content root, so `synch status repo/.git/refs/heads/main` reads as
-  `a1b2c3…  nas, laptop` / `d4e5f6…  desktop`, which is the sentence the user
-  needs. A tombstone version in a Refs-class set renders as `(deleted)` and,
-  when it is the selected one, is marked as such.
+  (§6.1) and a Refs-class set with its tombstone in the running (§6.2), with
+  no change to the renderer: both follow from the version set. Rendering a
+  ref version by the object name it holds rather than by its content root
+  was in the first draft and is not built: it needs the blob's bytes in the
+  renderer, and `synch status` reads rows. The tree adoption report names
+  ref values instead (§8.2), where the bytes are on disk.
 - Scan reports name machine-local paths with their reason (§5.1) and, once
   per repository, an `objects/info/alternates` (§11).
 - Checkout reports name held refs with the §7.2 reason and the `refs/synch/`
@@ -572,7 +581,6 @@ worktree's files, and `git worktree repair <path>` rewrites both pointers.
 - **`index` in a checkout.** A user running `git status` in a checkout makes
   git rewrite `index`; the next pass rewrites it back. Harmless churn on a
   directory that is documented as a view.
-- **reftable** gets order without hold (§7.2).
 - **A space rooted at a bare repository** is unsupported (§4).
 - **Metadata volume.** A repository that is never gc'd is one entry per loose
   object (§5.3). Git's auto-gc keeps that bounded for any repository git is
@@ -602,55 +610,75 @@ worktree's files, and `git worktree repair <path>` rewrites both pointers.
 
 ## 13. Implementation map
 
-1. **#151 first**: `walk` skips sockets, FIFOs and devices with a reason,
-   and a `StoreError::Io` from one path's ingest no longer fails the space.
-2. `synch-core`: `git::classify` and `GitClass`; loose-ref and `gitdir:`
-   line parsers; the Transient/machine-local pattern tables. Unit tests over
-   the §2 table, nested `modules/` and `worktrees/`, bare-repo names, and
-   paths outside any root.
-3. `synch-engine/src/scanner.rs`: class-aware `walk` (skip Transient, report
-   machine-local, `(class rank, name)` order inside git directories, the
-   `.git`-file check); `refuse_if_ignored` refusing Transient.
-4. `synch-store/src/unified.rs`: `identity_of` for Objects; the tombstone-
-   inclusive maximum for Refs and Worktree state; `describe`/`identity_text`
-   rendering object names when the blob is inline.
-5. `synch-engine/src/checkout.rs`: partition phase 2 into outside-git and
-   per-git-directory class-ordered writes; the hold rule from the plan's
-   listing; `objects/` and `refs/` creation; Objects and Transient exempt from
-   removal and sweep; `refs/synch/` mirrors and their cleanup.
-6. `synch-engine/src/adopt_tree.rs` and the `adopt path` handler: the same
-   order and hold; Objects present-means-current; `deleted` and replaced-ref
-   values in `AdoptTreeReport`; the in-progress guard.
-7. `synch-cli`: rendering (§9) and the new report and refusal lines.
-8. `DESIGN.md` §7.1 gains a pointer here; `docs/IMPLEMENTATION-NOTES.md`
-   gains nothing until something built differs from this document.
+What landed, and where:
+
+1. **#151** landed separately as #152: `walk`
+   (`crates/synch-engine/src/scanner.rs`) pushes only regular files and
+   symlinks, skipping a socket, FIFO or device with a reason, and an I/O
+   failure in one path's ingest is that path's failure rather than the
+   space's.
+2. `crates/synch-core/src/git.rs`: `classify`, `GitClass`, `GitPath` with
+   its write order and `names_objects`; `parse_ref`, `parse_gitdir`,
+   `IN_PROGRESS_MARKERS`, `REQUIRED_DIRS`, `mirror_ref_path`. Unit tests over
+   the §2 table, nested `modules/` and `worktrees/`, bare-repository names,
+   and paths outside any root.
+3. `crates/synch-engine/src/scanner.rs`: the class-aware walk (Transient
+   ignored, machine-local named, `(class rank, name)` order inside a git
+   directory, the `.git`-file check in `pointer_refusal`);
+   `refuse_if_ignored` refusing the excluded classes; `refuse_git_adoption`,
+   the single-path gates of §8.1 and §8.3, taken by `adopt_from` and
+   `adopt_deletion`.
+4. `crates/synch-store/src/unified.rs`: `identity_of` collapsing the Objects
+   class and dropping its tombstones while a copy is live; `select` and
+   `exists` ranking tombstones with live versions for Refs and Worktree
+   state.
+5. `crates/synch-engine/src/checkout.rs`: `plan_file` and the class-ordered
+   phase 2; `GitWant` and `PendingObjects`, the hold rule, shared with tree
+   adoption; `objects/` and `refs/` creation; Objects and Transient exempt
+   from removal and from `sweep`; the `refs/synch/` mirrors and their
+   cleanup; `held` and `mirrored` on `CheckoutReport`.
+6. `crates/synch-engine/src/adopt_tree.rs`: the same order and hold;
+   Objects present-means-current; `deleted` and `replaced_refs` on
+   `AdoptTreeReport`; the in-progress guard in `plan_adoption`.
+7. `crates/synch-engine/src/gitdir.rs`: the filesystem half — in-progress
+   markers, required directories, a ref's value for a report.
+8. `crates/synch-cli/src/control/server.rs`: the `deleted` and moved-ref
+   lines of `adopt tree`, and `git refs held`/`mirrored` on the checkout
+   line of `replica sync`.
+9. `DESIGN.md` §7.1 points here.
 
 ## 14. Tests
 
-Behavioral, against real repositories built with `git` in the test (the
-workspace tests already shell out where a tool is the specification), and
-skipped where the binary is absent:
+`crates/synch-engine/tests/git.rs`, against repositories built with `git`
+in the test and skipped where the binary is absent:
 
-- A source containing a repository with a live `index.lock`, `tmp_obj_*` and
-  a `fsmonitor--daemon.ipc` socket publishes the repository and none of them.
-- Two nodes, one commit: the checkout never holds a ref to an object that is
-  not on its disk at any pass boundary, and `git fsck` in the checkout is
-  clean after every pass. Assert by driving the replica fetch one object at a
-  time.
-- Two encodings of one loose object are one version; `adopt tree` reports
-  nothing differing.
-- `git gc` on one source: the checkout keeps every loose object, gains the
-  pack, drops the packed loose refs, and `git fsck` is clean before and after.
-- `git branch -d` on one source removes the ref from the checkout even though
-  the other source still publishes it; a ref written on the other source
-  after the tombstone wins.
-- Concurrent commits: the checkout has both commits reachable, one under
-  `refs/synch/`; `git gc` in the checkout removes nothing; the mirror goes
-  when the divergence ends.
-- `adopt tree` into a repository mid-rebase is refused naming
-  `rebase-merge/`; after `git rebase --abort` it proceeds, objects first.
-- A fresh source adopting a whole repository ends with `git status` clean,
-  and a linked worktree's `.git` file is reported, not written.
-- The classifier and `entry_key` changes are deterministic: `repair
-  rebuild-views` on a second node yields byte-identical selections for a
-  repository space with divergent refs and duplicate objects.
+- A source containing a repository with a live `index.lock`, `tmp_obj_*`, a
+  `fsmonitor--daemon.ipc` socket and a linked worktree publishes the
+  repository and none of the transient or machine-local files; a socket
+  beside the repository is skipped on its own (#151).
+- With the refs' bytes acquired ahead of the objects, the symbolic `HEAD`
+  lands, the branch is held, `git` sees a repository; once the objects are
+  there the branch follows, `git fsck --strict` is clean and `git status` is
+  empty.
+- `git gc` on the publisher: the checkout keeps every loose object, gains
+  the pack, drops the packed loose ref, resolves the branch through
+  `packed-refs`, and stays `fsck`-clean.
+- Two encodings of one loose object are one version with two attestors;
+  `adopt tree` reports nothing differing.
+- `git branch -D` on one source removes the ref from the checkout while the
+  other source still publishes it; a ref written to a new value after the
+  deletion wins it back.
+- Concurrent commits: the checkout has the newer as the branch and the other
+  under `refs/synch/`, both reachable, `git gc` there removes neither, and
+  the mirror is swept once the sources agree.
+- A fresh source adopting a whole repository ends `fsck`-clean with `git
+  status` empty; `adopt path` of a ref before its objects is refused naming
+  `adopt tree`; `adopt tree` into a repository mid-rebase is refused naming
+  `rebase-merge/`, proceeds once it is gone, and names the moved ref's
+  values.
+- A branch the publisher deleted is listed under `deleted` and left on disk.
+
+`crates/synch-store/src/unified.rs` covers the selection rules on rows
+alone: object identity by name, tombstones dropped while a copy is live and
+kept when none is, a ref deletion outranking an older live copy and losing
+to a newer one, and a document beside the repository keeping the §8 rule.

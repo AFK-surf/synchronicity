@@ -782,10 +782,20 @@ impl Node {
         // Resolving the target first means a path outside every filesystem source
         // is refused before anything is fetched. It reads the space row, so it
         // goes to the blocking pool like every other store read on an async
-        // path (§10).
+        // path (§10). A path inside a git directory takes the git gates in the
+        // same step (`docs/GIT.md` §8).
         {
-            let (node, space_id, path) = (self.clone(), space_id.to_string(), path.to_string());
-            crate::blocking::offload(move || node.adoption_target(&space_id, &path)).await?;
+            let (node, space_id, path, origin) = (
+                self.clone(),
+                space_id.to_string(),
+                path.to_string(),
+                origin.clone(),
+            );
+            crate::blocking::offload(move || {
+                let (_, (root, normalized)) = node.adoption_target_checked(&space_id, &path)?;
+                node.refuse_git_adoption(&space_id, &root, &normalized, Some(&origin))
+            })
+            .await?;
         }
         let range = self.prepare_range(space_id, path, &policy, 0, None).await?;
         // The write lands through the space-validated adoption: the target's
@@ -855,7 +865,8 @@ impl Node {
             )?]);
             return Ok(previous.map(|_| PathBuf::from(format!("{space_id}/{normalized}"))));
         }
-        let target = self.adoption_target(space_id, path)?;
+        let (target, (root, normalized)) = self.adoption_target_checked(space_id, path)?;
+        self.refuse_git_adoption(space_id, &root, &normalized, None)?;
         // `symlink_metadata`, so a symlink is removed as the link it is rather
         // than followed to whatever it points at.
         if std::fs::symlink_metadata(&target).is_err() {
@@ -1057,6 +1068,77 @@ impl Node {
         if IgnoreSet::for_space(Path::new(local_path))?.excludes_path(&normalized) {
             return Err(EngineError::invalid(format!(
                 "{space_id}/{path} matches an ignore rule, so it could never be published"
+            )));
+        }
+        // The same refusal for the git classes a scan never publishes: a lock
+        // file written into a repository would sit there blocking git, and a
+        // scan would neither publish nor sweep it (`docs/GIT.md` §5.1).
+        if synch_core::git::classify(&normalized).is_some_and(|git| git.class.is_excluded()) {
+            return Err(EngineError::invalid(format!(
+                "{space_id}/{path} is a transient or machine-local git file, which is never \
+                 published (docs/GIT.md §2)"
+            )));
+        }
+        Ok(())
+    }
+
+    /// The gates a single-path adoption takes inside a git directory
+    /// (`docs/GIT.md` §8): nothing is written while git is mid-operation
+    /// there, and a ref that names objects is not written while the objects
+    /// its publisher wrote before it are missing here — a source holds none
+    /// of a peer's content until something adopts it, and a single ref is
+    /// never the thing to adopt first.
+    ///
+    /// `origin` is the publisher whose version is being adopted, or `None`
+    /// for a deletion, which names no objects.
+    pub(crate) fn refuse_git_adoption(
+        &self,
+        space_id: &str,
+        root: &Path,
+        normalized: &str,
+        origin: Option<&synch_core::OriginId>,
+    ) -> Result<()> {
+        let Some(git) = synch_core::git::classify(normalized) else {
+            return Ok(());
+        };
+        let markers = crate::gitdir::in_progress_markers(&root.join(git.root));
+        if !markers.is_empty() {
+            return Err(EngineError::invalid(format!(
+                "a git operation is in progress in {space_id}/{} ({}); finish or abort it, \
+                 then adopt again (docs/GIT.md §8.3)",
+                git.root,
+                markers.join(", ")
+            )));
+        }
+        let Some(origin) = origin else {
+            return Ok(());
+        };
+        let size = self
+            .store()
+            .entry(origin, space_id, normalized)?
+            .map(|entry| entry.size)
+            .unwrap_or_default();
+        if !git.names_objects(size) {
+            return Ok(());
+        }
+        let missing = self
+            .store()
+            .published_paths(origin, space_id)?
+            .into_iter()
+            .filter(|path| {
+                synch_core::git::classify(path).is_some_and(|other| {
+                    other.root == git.root && other.class == synch_core::GitClass::Object
+                })
+            })
+            .filter(|path| root.join(path).symlink_metadata().is_err())
+            .count();
+        if missing > 0 {
+            let repository = git.root.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("");
+            return Err(EngineError::invalid(format!(
+                "{space_id}/{normalized} names objects, and {missing} object(s) {origin} publishes \
+                 for {} are not here yet; `synch adopt tree {space_id}/{repository}` adopts the \
+                 repository objects first (docs/GIT.md §8.1)",
+                git.root
             )));
         }
         Ok(())
@@ -2347,11 +2429,7 @@ fn walk(
     // space's work, which is the containment this wants.
     let mut sorted = Vec::new();
     for entry in entries {
-        sorted.push(entry?);
-    }
-    sorted.sort_by_key(|e| e.file_name());
-
-    for entry in sorted {
+        let entry = entry?;
         let path = entry.path();
         let Ok(relative) = path.strip_prefix(root) else {
             continue;
@@ -2365,6 +2443,18 @@ fn walk(
                 continue;
             }
         };
+        sorted.push((path, rel));
+    }
+    // Name order, except inside a git directory, where the walk reads classes
+    // in reverse dependency order — refs and worktree state first, objects
+    // last (`docs/GIT.md` §5.1). Git writes an object before the ref that
+    // names it, so a walk that reads refs before objects captures, in the same
+    // scan, every object a captured ref value needs; in name order (`HEAD` <
+    // `objects` < `refs`) a commit landing mid-walk puts the ref in one head
+    // and its objects in the next.
+    sorted.sort_by(|(_, a), (_, b)| scan_rank(a).cmp(&scan_rank(b)).then_with(|| a.cmp(b)));
+
+    for (path, rel) in sorted {
         let metadata = match std::fs::symlink_metadata(&path) {
             Ok(m) => m,
             Err(e) => {
@@ -2372,29 +2462,67 @@ fn walk(
                 continue;
             }
         };
-        let is_dir = metadata.is_dir();
+        let file_type = metadata.file_type();
+        let is_dir = file_type.is_dir();
         if ignore.is_ignored(&rel, is_dir) {
             report.ignored += 1;
             continue;
         }
+        // The git classes a scan never publishes (`docs/GIT.md` §5.1). A lock
+        // file or a temporary object is ignored like a `.syncignore` match; a
+        // machine-local pointer is named, because the operator may need to
+        // know that a repository borrowing objects from an alternate store is
+        // a repository whose objects are not all here.
+        if let Some(git) = synch_core::git::classify(&rel) {
+            match git.class {
+                synch_core::GitClass::Transient => {
+                    report.ignored += 1;
+                    continue;
+                }
+                synch_core::GitClass::MachineLocal => {
+                    report.skipped.push((
+                        rel,
+                        "holds a path of this machine only, so it is not published \
+                         (docs/GIT.md §2)"
+                            .into(),
+                    ));
+                    continue;
+                }
+                synch_core::GitClass::Pointer if file_type.is_file() => {
+                    if let Some(reason) = pointer_refusal(&path, &rel) {
+                        report.skipped.push((rel, reason));
+                        continue;
+                    }
+                }
+                _ => {}
+            }
+        }
         if is_dir {
             walk(root, &path, ignore, report, found)?;
-        } else if metadata.is_file() || metadata.is_symlink() {
-            found.push((path, rel, metadata.is_symlink()));
+        } else if file_type.is_file() || file_type.is_symlink() {
+            found.push((path, rel, file_type.is_symlink()));
         } else {
             // Never open special files: FIFOs can block and devices may never
             // reach EOF. Preserve any previously published version through the
             // unjudged sweep exemption, just as for an unreadable path.
             report.skipped.push((
                 rel,
-                format!(
-                    "unsupported file type ({})",
-                    special_file_type(metadata.file_type())
-                ),
+                format!("unsupported file type ({})", special_file_type(file_type)),
             ));
         }
     }
     Ok(())
+}
+
+/// The order a walk reads a directory's children in: name order everywhere,
+/// and inside a git directory the reverse of the order a consumer writes it
+/// (`GitClass::materialize_rank`), so refs are read before the objects they
+/// name.
+fn scan_rank(rel: &str) -> u8 {
+    match synch_core::git::classify(rel) {
+        Some(git) => u8::MAX - git.class.materialize_rank(),
+        None => 0,
+    }
 }
 
 fn special_file_type(file_type: std::fs::FileType) -> &'static str {
@@ -2417,6 +2545,49 @@ fn special_file_type(file_type: std::fs::FileType) -> &'static str {
     #[cfg(not(unix))]
     let _ = file_type;
     "unknown"
+}
+
+/// Why a `.git` pointer file is not published, or `None` if it is portable
+/// (`docs/GIT.md` §5.2).
+///
+/// A submodule's `.git` reads `gitdir: ../.git/modules/name` and every machine
+/// can follow it; a linked worktree's reads an absolute path of the machine
+/// that made it. The file is published only when its target is relative and,
+/// resolved against the file's own directory, stays inside the space.
+fn pointer_refusal(path: &Path, rel: &str) -> Option<String> {
+    let bytes = match std::fs::read(path) {
+        Ok(bytes) => bytes,
+        Err(e) => return Some(format!("could not be read: {e}")),
+    };
+    let Some(target) = synch_core::git::parse_gitdir(&bytes) else {
+        // Not a pointer at all: an ordinary file that happens to be called
+        // `.git`, published as one.
+        return None;
+    };
+    if Path::new(target).is_absolute() || target.starts_with('/') {
+        return Some(format!(
+            "points at {target}, a path of this machine only, so it is not published; \
+             `git worktree repair` recreates it elsewhere (docs/GIT.md §5.2)"
+        ));
+    }
+    // Depth of the pointer's own directory, then the target walked against it.
+    let mut depth = rel.matches('/').count();
+    for component in target.split(['/', '\\']) {
+        match component {
+            "" | "." => {}
+            ".." => {
+                if depth == 0 {
+                    return Some(format!(
+                        "points at {target}, outside the space, so it is not published \
+                         (docs/GIT.md §5.2)"
+                    ));
+                }
+                depth -= 1;
+            }
+            _ => depth += 1,
+        }
+    }
+    None
 }
 
 /// The change signal a symlink's target reduces to.

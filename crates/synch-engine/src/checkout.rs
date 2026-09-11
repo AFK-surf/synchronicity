@@ -54,6 +54,13 @@ pub struct CheckoutReport {
     /// Entries skipped, with the reason, including content the replica has not
     /// acquired yet and metadata the filesystem refused.
     pub skipped: Vec<(String, String)>,
+    /// Git refs held back because the objects their publisher wrote before
+    /// them are not all on disk yet (`docs/GIT.md` §7.2). A subset of
+    /// `skipped`, counted so a pass can say why a repository is not whole.
+    pub held: usize,
+    /// Other origins' divergent git refs written under `refs/synch/`
+    /// (`docs/GIT.md` §7.4), whether fresh or already current.
+    pub mirrored: usize,
 }
 
 impl Node {
@@ -153,14 +160,38 @@ impl Node {
         let CheckoutPass {
             mut report,
             known,
-            wanted,
+            mut wanted,
+            mirrors,
+            mut pending_objects,
         } = plan;
         let checkout_holder = replica.holder();
 
         // Phase 2: fetch what phase 1 could not satisfy locally — building each
         // new object in the CAS out of the old one where it can — and
         // materialize it as it lands.
+        //
+        // Listing order outside git directories, and inside each one the
+        // order a repository has to be written in: objects before the refs
+        // that name them, `index` last (`docs/GIT.md` §7.1). The symlink
+        // guard does not depend on this order — it is re-taken before every
+        // write below.
+        wanted.sort_by(|a, b| a.order().cmp(&b.order()));
         for want in wanted {
+            // The hold rule (`docs/GIT.md` §7.2): a ref whose value is an
+            // object name is written only once every object one of its
+            // publishers has in this repository is on disk. That publisher
+            // wrote those objects before it wrote the ref, so their presence
+            // implies the ref's whole closure is here — which is the fact a
+            // checkout can establish without reading a single object.
+            if want
+                .git
+                .as_ref()
+                .is_some_and(|git| !git.released(&pending_objects))
+            {
+                report.held += 1;
+                report.skipped.push((want.path, HELD.into()));
+                continue;
+            }
             let ready = {
                 let store = self.store().clone();
                 let (root, holder) = (want.content, checkout_holder.clone());
@@ -196,9 +227,16 @@ impl Node {
             let path = want.path.clone();
             let written_target = want.target.clone();
             let target = want.target.clone();
+            let git_root = want.git.as_ref().map(|git| root.join(&git.root));
             let ready = crate::blocking::offload(move || {
                 if escapes_via_symlink(&root, &path) {
                     return Ok(false);
+                }
+                // The first write into a git directory makes it a repository:
+                // git requires `objects/` and `refs/` to exist, and empty
+                // directories are never published (`docs/GIT.md` §7.1).
+                if let Some(git_root) = git_root {
+                    crate::gitdir::ensure_required_dirs(&git_root)?;
                 }
                 // A directory standing where a file belongs is cleared first, if
                 // it is empty. The tree has published this path as a file and the
@@ -261,14 +299,22 @@ impl Node {
             // (`Node::note_checkout_write`).
             if let Written::Fully(_, record) | Written::WithoutMetadata(_, record, _) = &outcome {
                 self.note_checkout_write(&written_target, record.clone());
+                // An object that landed releases, for each origin publishing
+                // it, one of the objects a ref of theirs may be waiting on.
+                if let Some(git) = &want.git {
+                    git.landed(&mut pending_objects);
+                }
             }
+            let mirror = want.git.as_ref().is_some_and(|git| git.mirror);
             match outcome {
                 Written::Fully(kind, _) => {
                     report.written += 1;
+                    report.mirrored += usize::from(mirror);
                     report.reflinked += usize::from(kind == crate::CloneKind::Reflink);
                 }
                 Written::WithoutMetadata(kind, _, why) => {
                     report.written += 1;
+                    report.mirrored += usize::from(mirror);
                     report.reflinked += usize::from(kind == crate::CloneKind::Reflink);
                     report.skipped.push((
                         want.path,
@@ -292,7 +338,7 @@ impl Node {
         // what is on disk and drop whatever the tree no longer names.
         let removed = crate::blocking::offload(move || {
             let root = root_dir;
-            sweep(&root, &root, &known)
+            sweep(&root, &root, &known, &mirrors)
         })
         .await?;
         report.removed += removed.len();
@@ -395,7 +441,116 @@ struct WantedContent {
     size: u64,
     /// The metadata to stamp on once the bytes are there.
     meta: Metadata,
+    /// What this path is to the git directory it lies in, if any.
+    git: Option<GitWant>,
 }
+
+impl WantedContent {
+    /// Where this write falls in the pass: everything outside a git directory
+    /// first, in listing order; then each git directory in the order a
+    /// repository is written in (`GitPath::materialize_rank`).
+    fn order(&self) -> (u8, &str, (u8, u8), &str) {
+        GitWant::order(self.git.as_ref(), &self.path)
+    }
+}
+
+/// The git-directory facts a write carries (`docs/GIT.md` §7). Shared with
+/// tree adoption, which writes a repository in the same order under the same
+/// hold.
+#[derive(Debug)]
+pub(crate) struct GitWant {
+    /// The git directory root within the space.
+    pub(crate) root: String,
+    /// The write order within that directory.
+    pub(crate) rank: (u8, u8),
+    /// For a ref that names objects: the canonical origins asserting the
+    /// version being written. The write waits until one of them has no
+    /// object pending in this repository.
+    pub(crate) hold: Option<Vec<String>>,
+    /// For an object: the canonical origins publishing it, each of which has
+    /// one fewer object pending once it lands.
+    pub(crate) releases: Vec<String>,
+    /// True for another origin's divergent ref written under `refs/synch/`.
+    pub(crate) mirror: bool,
+}
+
+impl GitWant {
+    /// The facts for the selected version of one path, given the origins
+    /// asserting that version.
+    pub(crate) fn of(git: &synch_core::GitPath<'_>, size: u64, attestors: &[String]) -> GitWant {
+        GitWant {
+            root: git.root.to_string(),
+            rank: git.materialize_rank(),
+            hold: git.names_objects(size).then(|| attestors.to_vec()),
+            releases: if git.class == synch_core::GitClass::Object {
+                attestors.to_vec()
+            } else {
+                Vec::new()
+            },
+            mirror: false,
+        }
+    }
+
+    /// Whether the hold rule releases this write: some asserting origin has
+    /// no object of this repository still pending.
+    pub(crate) fn released(&self, pending: &PendingObjects) -> bool {
+        match &self.hold {
+            None => true,
+            Some(attestors) => attestors.iter().any(|origin| {
+                pending
+                    .get(&(self.root.clone(), origin.clone()))
+                    .is_none_or(|n| *n == 0)
+            }),
+        }
+    }
+
+    /// Records that this write landed, releasing one object per publishing
+    /// origin.
+    pub(crate) fn landed(&self, pending: &mut PendingObjects) {
+        for origin in &self.releases {
+            if let Some(n) = pending.get_mut(&(self.root.clone(), origin.clone())) {
+                *n = n.saturating_sub(1);
+            }
+        }
+    }
+
+    /// Where this write falls among a repository's: after everything outside
+    /// git directories, in class order within its own.
+    pub(crate) fn order<'a>(
+        this: Option<&'a GitWant>,
+        path: &'a str,
+    ) -> (u8, &'a str, (u8, u8), &'a str) {
+        match this {
+            None => (0, "", (0, 0), path),
+            Some(git) => (1, &git.root, git.rank, path),
+        }
+    }
+}
+
+/// Counts one more object pending for every origin publishing it.
+pub(crate) fn note_pending_object(pending: &mut PendingObjects, root: &str, attestors: &[String]) {
+    for origin in attestors {
+        *pending
+            .entry((root.to_string(), origin.clone()))
+            .or_default() += 1;
+    }
+}
+
+/// The origins asserting the version `selected` belongs to, canonically.
+pub(crate) fn attestors_of(set: &synch_store::VersionSet, selected: &EntryRow) -> Vec<String> {
+    set.versions
+        .iter()
+        .find(|v| v.attestors.contains(&selected.origin))
+        .map(|v| v.attestors.iter().map(|o| o.canonical()).collect())
+        .unwrap_or_default()
+}
+
+/// The objects a git directory still lacks, per `(root, canonical origin)`,
+/// so the hold rule can be answered without a directory walk per ref.
+pub(crate) type PendingObjects = HashMap<(String, String), usize>;
+
+/// Why a ref was not written this pass (`docs/GIT.md` §7.2).
+pub(crate) const HELD: &str = "objects of this ref's publisher are still being acquired";
 
 /// How one write in phase 2 ended.
 #[derive(Debug)]
@@ -422,6 +577,12 @@ struct CheckoutPass {
     known: HashSet<String>,
     /// What is left for the asynchronous half to fetch.
     wanted: Vec<WantedContent>,
+    /// The `refs/synch/` mirrors this pass keeps (`docs/GIT.md` §7.4); the
+    /// sweep removes any other file under that directory, which is how a
+    /// mirror goes when its divergence ends.
+    mirrors: HashSet<String>,
+    /// Objects not on disk at plan time, per repository and publishing origin.
+    pending_objects: PendingObjects,
 }
 
 /// Decides, and performs, everything one pass can settle without the network.
@@ -442,166 +603,281 @@ fn plan_pass(
     // and checkouts whichever version has the greater content hash
     // (`Store::read_instant`).
     let now = node.store().read_instant()?;
-    let mut report = CheckoutReport::default();
-    let mut known: HashSet<String> = HashSet::new();
-    let mut wanted: Vec<WantedContent> = Vec::new();
+    let mut pass = CheckoutPass::default();
 
-    {
-        for set in listing {
-            known.insert(set.path.clone());
-            // Before the target path is built, because building it is already
-            // the damage: on Windows `Path::join` reads a backslash as a
-            // separator and a drive-prefixed argument as a root, so a published
-            // `..\..\Users\x` or `C:\Windows\x` names a file outside the
-            // checkout root — and the branches below remove what they are given.
-            // Both bytes are ordinary in a Unix filename, so they stay legal
-            // where entries are published and are refused here, at the boundary
-            // where they mean something.
-            if let Some(reason) = unsafe_name(&set.path) {
-                report.skipped.push((set.path.clone(), reason));
-                continue;
-            }
-            let target = root_dir.join(&set.path);
-            // Defense in depth against a peer that plants a symlink and a file
-            // beneath it (`sub` -> `/etc`, then `sub/passwd`): materialized in
-            // path order the symlink lands first, and a later write to
-            // `sub/passwd` would resolve through it to `/etc/passwd`, outside
-            // the checkout root. Refuse — for writes and removals alike — any
-            // path whose ancestors include a symlink the checkout itself wrote.
-            if escapes_via_symlink(root_dir, &set.path) {
-                report.skipped.push((
-                    set.path.clone(),
-                    "path resolves through a symlink; refusing to write outside the checkout"
-                        .into(),
-                ));
-                continue;
-            }
-            let selected = match set.select(&VersionPolicy::Newest, now) {
-                synch_store::Selection::Selected(entry) => *entry,
-                synch_store::Selection::Absent => {
-                    report.removed += remove_if_present(&target)?;
-                    node.forget_checkout_write(&target);
+    for set in listing {
+        let git = synch_core::git::classify(&set.path);
+        // A lock file or a machine-local pointer published by a member
+        // running older software: never written (`docs/GIT.md` §2), and the
+        // sweep leaves whatever git itself has at the path alone.
+        if git.is_some_and(|git| git.class.is_excluded()) {
+            continue;
+        }
+        pass.known.insert(set.path.clone());
+        // Before the target path is built, because building it is already
+        // the damage: on Windows `Path::join` reads a backslash as a
+        // separator and a drive-prefixed argument as a root, so a published
+        // `..\..\Users\x` or `C:\Windows\x` names a file outside the
+        // checkout root — and the branches below remove what they are given.
+        // Both bytes are ordinary in a Unix filename, so they stay legal
+        // where entries are published and are refused here, at the boundary
+        // where they mean something.
+        if let Some(reason) = unsafe_name(&set.path) {
+            pass.report.skipped.push((set.path.clone(), reason));
+            continue;
+        }
+        let target = root_dir.join(&set.path);
+        // Defense in depth against a peer that plants a symlink and a file
+        // beneath it (`sub` -> `/etc`, then `sub/passwd`): materialized in
+        // path order the symlink lands first, and a later write to
+        // `sub/passwd` would resolve through it to `/etc/passwd`, outside
+        // the checkout root. Refuse — for writes and removals alike — any
+        // path whose ancestors include a symlink the checkout itself wrote.
+        if escapes_via_symlink(root_dir, &set.path) {
+            pass.report.skipped.push((
+                set.path.clone(),
+                "path resolves through a symlink; refusing to write outside the checkout".into(),
+            ));
+            continue;
+        }
+        let selected = match set.select(&VersionPolicy::Newest, now) {
+            synch_store::Selection::Selected(entry) => *entry,
+            synch_store::Selection::Absent => {
+                // A git object is never removed by a deletion elsewhere: the
+                // object store only grows, and `git gc` in the checkout is the
+                // one thing that shrinks it (`docs/GIT.md` §7.3).
+                if git.is_some_and(|git| git.class == synch_core::GitClass::Object) {
                     continue;
                 }
-                synch_store::Selection::Divergent => unreachable!("newest always selects"),
-            };
-
-            // A path leaves the checkout when newest is a tombstone — the
-            // deletion is the assertion this checkout follows.
-            if selected.kind == EntryKind::Tombstone {
-                report.removed += remove_if_present(&target)?;
+                pass.report.removed += remove_if_present(&target)?;
                 node.forget_checkout_write(&target);
                 continue;
             }
-            if selected.kind == EntryKind::Dir {
-                continue;
-            }
-            // Claim before dispatching on kind so symlinks participate in the
-            // same folded-name collision rule as regular files (§7.2).
-            if let Err(reason) = claim_folded_name(&mut claimed, &set.path) {
-                report.skipped.push((set.path.clone(), reason));
-                continue;
-            }
-            if selected.kind == EntryKind::Symlink {
-                match materialize_symlink(&target, selected.symlink_target.as_deref()) {
-                    Ok(true) => report.written += 1,
-                    Ok(false) => report.current += 1,
-                    Err(reason) => report.skipped.push((set.path.clone(), reason)),
-                }
-                continue;
-            }
-            let Some(content) = selected.content else {
-                report
-                    .skipped
-                    .push((set.path.clone(), "entry has no content".into()));
-                continue;
-            };
-            let meta = Metadata::of(&selected);
-            // The currency check: is the file on disk already the selected
-            // version? A record this process holds answers with a stat — the
-            // checkout wrote or hashed the file itself, and length, stored
-            // mtime, and platform identity all still match, past the racy
-            // window — because nothing that moves the file leaves the stat
-            // standing. Without a record the content speaks for itself: a
-            // file of the right length is hashed, because that hash *is* the
-            // answer, and the answer becomes the record.
-            let recorded = node.checkout_write_was(&target);
-            if let Some(recorded) = &recorded {
-                if let Ok(stat) = std::fs::metadata(&target) {
-                    if stat.is_file() && still_current(recorded, &stat, &content) {
-                        // Believed without a read. Only the metadata can have
-                        // drifted: a bare chmod moves nothing the record
-                        // holds.
-                        if metadata_matches(&target, meta) {
-                            report.current += 1;
-                        } else if let Err(e) = apply_metadata(&target, meta) {
-                            report.skipped.push((
-                                set.path.clone(),
-                                format!(
-                                    "content is current, but its metadata could not be reproduced: {e}"
-                                ),
-                            ));
-                        } else {
-                            // The stamp moved the mtime; re-anchor the record
-                            // to the stat it leaves behind.
-                            note_record(node, &target, content);
-                            report.retouched += 1;
-                        }
-                        continue;
-                    }
-                }
-            }
+            synch_store::Selection::Divergent => unreachable!("newest always selects"),
+        };
 
-            let on_disk = same_size_root(&target, selected.size);
-            if on_disk == Some(content) {
-                // Right bytes, and possibly the wrong mode or mtime: a local
-                // `chmod`, a file this checkout wrote before it stamped metadata
-                // at all, or a mode the origin has since changed without
-                // touching the content. Repairing it is a `stat` and a syscall
-                // or two — refetching the object to fix a permission bit is
-                // not.
+        // A path leaves the checkout when newest is a tombstone — the
+        // deletion is the assertion this checkout follows.
+        if selected.kind == EntryKind::Tombstone {
+            if git.is_some_and(|git| git.class == synch_core::GitClass::Object) {
+                continue;
+            }
+            pass.report.removed += remove_if_present(&target)?;
+            node.forget_checkout_write(&target);
+            continue;
+        }
+        if selected.kind == EntryKind::Dir {
+            continue;
+        }
+        // Claim before dispatching on kind so symlinks participate in the
+        // same folded-name collision rule as regular files (§7.2).
+        if let Err(reason) = claim_folded_name(&mut claimed, &set.path) {
+            pass.report.skipped.push((set.path.clone(), reason));
+            continue;
+        }
+        if selected.kind == EntryKind::Symlink {
+            match materialize_symlink(&target, selected.symlink_target.as_deref()) {
+                Ok(true) => pass.report.written += 1,
+                Ok(false) => pass.report.current += 1,
+                Err(reason) => pass.report.skipped.push((set.path.clone(), reason)),
+            }
+            continue;
+        }
+        let Some(content) = selected.content else {
+            pass.report
+                .skipped
+                .push((set.path.clone(), "entry has no content".into()));
+            continue;
+        };
+
+        // The origins asserting the selected version: what an object's
+        // landing releases, and what a ref's hold waits on.
+        let attestors = attestors_of(set, &selected);
+        let git_want = git.map(|git| GitWant::of(&git, selected.size, &attestors));
+        let planned = plan_file(
+            node,
+            &mut pass,
+            set.path.clone(),
+            target,
+            content,
+            selected.size,
+            Metadata::of(&selected),
+            git_want,
+        );
+        if planned == Planned::Wanted {
+            if let Some(git) = git.filter(|git| git.class == synch_core::GitClass::Object) {
+                note_pending_object(&mut pass.pending_objects, git.root, &attestors);
+            }
+        }
+
+        // A divergent ref is every origin's ref (`docs/GIT.md` §7.4): the
+        // versions `newest` did not select are written under
+        // `refs/synch/<origin>/`, so no commit any member published is
+        // unreachable in the checkout and `git log --all` shows the whole
+        // cluster's state. Local-only: the class is transient, so a scan
+        // never publishes them and the sweep only removes the stale ones.
+        let Some(git) = git else {
+            continue;
+        };
+        let Some(name) = git.loose_ref() else {
+            continue;
+        };
+        if !set.is_divergent() {
+            continue;
+        }
+        for version in set.versions.iter().filter(|v| !v.is_tombstone()) {
+            for origin in version
+                .attestors
+                .iter()
+                .filter(|origin| **origin != selected.origin)
+            {
+                let Some(entry) = set.entries.iter().find(|e| &e.origin == origin) else {
+                    continue;
+                };
+                let Some(content) = entry.content else {
+                    continue;
+                };
+                let mirror = format!(
+                    "{}/{}",
+                    git.root,
+                    synch_core::git::mirror_ref_path(&origin.short(), name)
+                );
+                let Some(mirror_rank) =
+                    synch_core::git::classify(&mirror).map(|m| m.class.materialize_rank())
+                else {
+                    continue;
+                };
+                if !pass.mirrors.insert(mirror.clone()) {
+                    continue;
+                }
+                let target = root_dir.join(&mirror);
+                let names_objects = git.names_objects(entry.size);
+                let before = pass.report.current;
+                let planned = plan_file(
+                    node,
+                    &mut pass,
+                    mirror,
+                    target,
+                    content,
+                    entry.size,
+                    Metadata::of(entry),
+                    Some(GitWant {
+                        root: git.root.to_string(),
+                        rank: (mirror_rank, 1),
+                        hold: names_objects.then(|| vec![origin.canonical()]),
+                        releases: Vec::new(),
+                        mirror: true,
+                    }),
+                );
+                if planned == Planned::Current && pass.report.current > before {
+                    pass.report.mirrored += 1;
+                }
+            }
+        }
+    }
+
+    Ok(pass)
+}
+
+/// What phase 1 decided about one file.
+#[derive(Debug, PartialEq, Eq)]
+enum Planned {
+    /// The bytes on disk are the version, and the metadata now matches.
+    Current,
+    /// Queued for the asynchronous half.
+    Wanted,
+}
+
+/// Decides whether the file at `target` is already the version described, and
+/// queues it for phase 2 if not.
+///
+/// The currency check: is the file on disk already the selected version? A
+/// record this process holds answers with a stat — the checkout wrote or
+/// hashed the file itself, and length, stored mtime, and platform identity all
+/// still match, past the racy window — because nothing that moves the file
+/// leaves the stat standing. Without a record the content speaks for itself: a
+/// file of the right length is hashed, because that hash *is* the answer, and
+/// the answer becomes the record.
+#[allow(clippy::too_many_arguments)]
+fn plan_file(
+    node: &Node,
+    pass: &mut CheckoutPass,
+    path: String,
+    target: PathBuf,
+    content: synch_core::Hash,
+    size: u64,
+    meta: Metadata,
+    git: Option<GitWant>,
+) -> Planned {
+    let report = &mut pass.report;
+    let recorded = node.checkout_write_was(&target);
+    if let Some(recorded) = &recorded {
+        if let Ok(stat) = std::fs::metadata(&target) {
+            if stat.is_file() && still_current(recorded, &stat, &content) {
+                // Believed without a read. Only the metadata can have
+                // drifted: a bare chmod moves nothing the record holds.
                 if metadata_matches(&target, meta) {
                     report.current += 1;
                 } else if let Err(e) = apply_metadata(&target, meta) {
                     report.skipped.push((
-                        set.path.clone(),
+                        path,
                         format!(
                             "content is current, but its metadata could not be reproduced: {e}"
                         ),
                     ));
                 } else {
+                    // The stamp moved the mtime; re-anchor the record to
+                    // the stat it leaves behind.
+                    note_record(node, &target, content);
                     report.retouched += 1;
                 }
-                // The hash just proved the file; anchor the record to the
-                // stat the pass leaves behind (a retouch moved the mtime).
-                // This is also what graduates a racily-clean record: once the
-                // proof is comfortably newer than the mtime it vouches for,
-                // later passes trust the stat and skip this hash.
-                note_record(node, &target, content);
-                continue;
+                return Planned::Current;
             }
-
-            // The file is not the selected version. A file that is not there
-            // proves nothing, and whatever was recorded about it is stale.
-            if on_disk.is_none() {
-                node.forget_checkout_write(&target);
-            }
-
-            wanted.push(WantedContent {
-                path: set.path.clone(),
-                target,
-                content,
-                size: selected.size,
-                meta,
-            });
         }
     }
 
-    Ok(CheckoutPass {
-        report,
-        known,
-        wanted,
-    })
+    let on_disk = same_size_root(&target, size);
+    if on_disk == Some(content) {
+        // Right bytes, and possibly the wrong mode or mtime: a local
+        // `chmod`, a file this checkout wrote before it stamped metadata
+        // at all, or a mode the origin has since changed without
+        // touching the content. Repairing it is a `stat` and a syscall
+        // or two — refetching the object to fix a permission bit is
+        // not.
+        if metadata_matches(&target, meta) {
+            report.current += 1;
+        } else if let Err(e) = apply_metadata(&target, meta) {
+            report.skipped.push((
+                path,
+                format!("content is current, but its metadata could not be reproduced: {e}"),
+            ));
+        } else {
+            report.retouched += 1;
+        }
+        // The hash just proved the file; anchor the record to the
+        // stat the pass leaves behind (a retouch moved the mtime).
+        // This is also what graduates a racily-clean record: once the
+        // proof is comfortably newer than the mtime it vouches for,
+        // later passes trust the stat and skip this hash.
+        note_record(node, &target, content);
+        return Planned::Current;
+    }
+
+    // The file is not the selected version. A file that is not there
+    // proves nothing, and whatever was recorded about it is stale.
+    if on_disk.is_none() {
+        node.forget_checkout_write(&target);
+    }
+
+    pass.wanted.push(WantedContent {
+        path,
+        target,
+        content,
+        size,
+        meta,
+        git,
+    });
+    Planned::Wanted
 }
 
 /// How many bytes of an object a set of chunk groups covers.
@@ -875,7 +1151,18 @@ fn remove_if_present(target: &Path) -> Result<usize> {
 
 /// Removes files under a checkout root whose path the unified tree no longer
 /// carries, and returns the targets that went.
-fn sweep(root: &Path, dir: &Path, known: &HashSet<String>) -> Result<Vec<PathBuf>> {
+///
+/// Two git classes are exempt (`docs/GIT.md` §7.3): objects, which only a
+/// local `git gc` removes, and transient files, which belong to whatever git
+/// process made them — except this pass's own mirror refs, of which only the
+/// ones in `mirrors` survive. The `objects/` and `refs/` directories of a
+/// repository are left standing even when empty, because git needs them.
+fn sweep(
+    root: &Path,
+    dir: &Path,
+    known: &HashSet<String>,
+    mirrors: &HashSet<String>,
+) -> Result<Vec<PathBuf>> {
     let entries = match std::fs::read_dir(dir) {
         Ok(entries) => entries,
         Err(e) if e.kind() == std::io::ErrorKind::NotFound => return Ok(Vec::new()),
@@ -884,19 +1171,6 @@ fn sweep(root: &Path, dir: &Path, known: &HashSet<String>) -> Result<Vec<PathBuf
     let mut removed = Vec::new();
     for entry in entries.filter_map(|e| e.ok()) {
         let path = entry.path();
-        // `is_dir` follows links, and a materialized symlink pointing at a
-        // directory would then be descended into and its *contents* swept.
-        // The sweep only ever looks at what the checkout itself wrote.
-        let is_dir = std::fs::symlink_metadata(&path)
-            .map(|m| m.is_dir())
-            .unwrap_or(false);
-        if is_dir {
-            removed.extend(sweep(root, &path, known)?);
-            // Remove an emptied directory so a later pass can materialize a
-            // non-directory at the same path. Non-empty directories fail safely.
-            let _ = std::fs::remove_dir(&path);
-            continue;
-        }
         let Ok(relative) = path.strip_prefix(root) else {
             continue;
         };
@@ -905,12 +1179,43 @@ fn sweep(root: &Path, dir: &Path, known: &HashSet<String>) -> Result<Vec<PathBuf
             .map(|c| c.as_os_str().to_string_lossy())
             .collect::<Vec<_>>()
             .join("/");
-        if !known.contains(&relative) {
+        let git = synch_core::git::classify(&relative);
+        // `is_dir` follows links, and a materialized symlink pointing at a
+        // directory would then be descended into and its *contents* swept.
+        // The sweep only ever looks at what the checkout itself wrote.
+        let is_dir = std::fs::symlink_metadata(&path)
+            .map(|m| m.is_dir())
+            .unwrap_or(false);
+        if is_dir {
+            removed.extend(sweep(root, &path, known, mirrors)?);
+            // Remove an emptied directory so a later pass can materialize a
+            // non-directory at the same path. Non-empty directories fail safely.
+            let required =
+                git.is_some_and(|git| synch_core::git::REQUIRED_DIRS.contains(&git.inner));
+            if !required {
+                let _ = std::fs::remove_dir(&path);
+            }
+            continue;
+        }
+        let keep = match git.map(|git| git.class) {
+            Some(synch_core::GitClass::Object) => true,
+            Some(synch_core::GitClass::Transient) => {
+                !relative_is_mirror(git) || mirrors.contains(&relative)
+            }
+            _ => known.contains(&relative),
+        };
+        if !keep {
             std::fs::remove_file(&path)?;
             removed.push(path);
         }
     }
     Ok(removed)
+}
+
+/// True if a classified path is one of this checkout's own `refs/synch/`
+/// mirrors rather than some other transient file.
+fn relative_is_mirror(git: Option<synch_core::GitPath<'_>>) -> bool {
+    git.is_some_and(|git| git.inner.starts_with("refs/synch/"))
 }
 
 /// Names Windows refuses, plus trailing dots and spaces, plus reserved

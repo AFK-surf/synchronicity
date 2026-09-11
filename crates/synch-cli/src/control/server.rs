@@ -2456,14 +2456,23 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
             };
             for (checkout, report) in checkouts {
                 let report = report?;
-                out.line(format!(
+                let mut line = format!(
                     "checkout {checkout}  written {} · current {} · removed {} · blocked {}",
                     report.written,
                     report.current,
                     report.removed,
                     report.skipped.len()
-                ))
-                .await?;
+                );
+                // Only when a repository is involved: a held ref is a
+                // repository that is not whole yet (docs/GIT.md §7.2), and a
+                // mirror is another member's branch made visible (§7.4).
+                if report.held > 0 {
+                    line.push_str(&format!(" · git refs held {}", report.held));
+                }
+                if report.mirrored > 0 {
+                    line.push_str(&format!(" · git refs mirrored {}", report.mirrored));
+                }
+                out.line(line).await?;
             }
             // What this node says it holds should not be left behind by a sync
             // the operator ran deliberately: the standing loop publishes its
@@ -2924,9 +2933,26 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
                 ))
                 .await?;
             }
+            // A moved git ref names what it moved from and to: the old value
+            // is the one thing a replacement loses, and for a ref that is a
+            // commit (docs/GIT.md §8.2).
+            for (path, before, after) in &report.replaced_refs {
+                out.line(format!("  {}/{path}: {before} -> {after}", reference.space))
+                    .await?;
+            }
             for path in &report.differing {
                 out.line(format!(
                     "differing {}/{path} (local content differs; --replace replaces it)",
+                    reference.space
+                ))
+                .await?;
+            }
+            // A ref the adopted repository has deleted. Tree adoption removes
+            // nothing, so it is named rather than applied; `synch adopt path`
+            // of the deletion is how it is applied.
+            for path in &report.deleted {
+                out.line(format!(
+                    "deleted {}/{path} (the newest version is a deletion; `synch adopt path` applies it)",
                     reference.space
                 ))
                 .await?;
