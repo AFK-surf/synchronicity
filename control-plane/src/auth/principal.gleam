@@ -43,6 +43,8 @@ pub type Credential {
   /// and role from its own row — never from `org_members`, which a key has
   /// no place in.
   ApiKey(key_id: String, org_id: String, role: String)
+  /// Org-scoped access only through explicitly gated managed-data APIs.
+  ManagedData(key_id: String, org_id: String)
   /// A **join key**: scoped to one network, and able to do exactly one thing
   /// — put a device into it.
   ///
@@ -93,7 +95,8 @@ pub type Credential {
 pub fn actor(who: Principal) -> String {
   case who.credential {
     Cookie(_) -> who.user_id
-    ApiKey(key_id, _, _) | JoinKey(key_id, _, _) -> "key:" <> key_id
+    ApiKey(key_id, _, _) | JoinKey(key_id, _, _) | ManagedData(key_id, _) ->
+      "key:" <> key_id
     // Its own prefix rather than `key:`, because the two live in different
     // tables and answer different questions: `key:<id>` is resolvable against
     // `api_keys` and belongs to one org, `dpkey:<id>` against `dataplane_keys`
@@ -101,5 +104,13 @@ pub fn actor(who: Principal) -> String {
     // would invite a reader to look the second one up in the first place and
     // conclude the key had been revoked.
     Dataplane(key_id, _) -> "dpkey:" <> key_id
+  }
+}
+
+/// Whether reads must be routed exclusively to the managed data plane.
+pub fn managed_only(who: Principal) -> Bool {
+  case who.credential {
+    ManagedData(..) -> True
+    _ -> False
   }
 }

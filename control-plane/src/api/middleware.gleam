@@ -216,6 +216,7 @@ pub fn require_user(who: Principal, next: fn() -> Response) -> Response {
   case who.credential {
     Cookie(_) -> next()
     principal.ApiKey(..) -> api_key_refused()
+    principal.ManagedData(..) -> managed_data_refused()
     // A join key gets the refusal that names the one thing it *can* do,
     // rather than a list of things no key may.
     principal.JoinKey(..) -> join_key_refused()
@@ -248,5 +249,13 @@ pub fn dataplane_refused() -> Response {
     "dataplane_forbidden",
     "a data-plane key reaches the hosted-replica API and nothing else: "
       <> "/dp/v1/networks and the routes below it",
+  )
+}
+
+pub fn managed_data_refused() -> Response {
+  error_json(
+    403,
+    "managed_data_forbidden",
+    "this key can only access managed data plane APIs",
   )
 }

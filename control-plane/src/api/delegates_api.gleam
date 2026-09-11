@@ -76,7 +76,7 @@ fn mutate(
   // Return the connection before any network wait, including a one-slot pool.
   let target =
     pool.with_connection(reads.pool, fn(conn) {
-      use #(org, _) <- result.try(common.check_org(
+      use #(org, _) <- result.try(common.check_managed_org(
         conn,
         slug,
         who,

@@ -109,6 +109,7 @@ pub fn check_org(
     principal.Cookie(_) -> member_org(conn, slug, who.user_id, minimum)
     principal.JoinKey(_, _, _) -> Error(middleware.join_key_refused())
     principal.Dataplane(_, _) -> Error(middleware.dataplane_refused())
+    principal.ManagedData(..) -> Error(middleware.managed_data_refused())
     principal.ApiKey(_, key_org_id, role_text) ->
       case
         sqlite.query(conn, "SELECT id FROM orgs WHERE slug = ?", [Text(slug)])
@@ -118,6 +119,27 @@ pub fn check_org(
         Ok(_) -> Error(error_json(404, "not_found", "no such org"))
         Error(_) -> Error(db_error())
       }
+  }
+}
+
+/// Opt-in gate for managed data operations only. Callers must also require
+/// cloud hosting and route reads exclusively to authenticated hosted nodes.
+/// Administrative operations never gain a rank from this credential.
+pub fn check_managed_org(
+  conn: Connection,
+  slug: String,
+  who: Principal,
+  minimum: Role,
+) -> Result(#(String, Role), Response) {
+  case who.credential, minimum {
+    principal.ManagedData(key, org), Member ->
+      check_org(
+        conn,
+        slug,
+        principal.Principal(who.user_id, principal.ApiKey(key, org, "member")),
+        Member,
+      )
+    _, _ -> check_org(conn, slug, who, minimum)
   }
 }
 
@@ -450,8 +472,9 @@ fn credential_fields(
 ) -> List(#(String, Json)) {
   case who.credential {
     principal.Cookie(_) -> []
-    principal.ApiKey(key_id, _, _) | principal.JoinKey(key_id, _, _) ->
-      describe_key(conn, key_id)
+    principal.ApiKey(key_id, _, _)
+    | principal.JoinKey(key_id, _, _)
+    | principal.ManagedData(key_id, _) -> describe_key(conn, key_id)
     // A different table, so a different lookup — `describe_key` would find
     // nothing in `api_keys` and say nothing, which reads as "the key was
     // revoked" rather than "this was never an org key". There is no minter to
