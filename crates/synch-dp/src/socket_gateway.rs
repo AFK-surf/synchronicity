@@ -52,17 +52,16 @@ impl Gateway {
         id: u32,
         origin: String,
         socket: Option<String>,
-    ) -> crate::Result<()> {
+    ) -> crate::Result<Option<tokio_tungstenite::tungstenite::Message>> {
         self.streams.retain(|_, stream| !stream.task.is_finished());
         if self.streams.contains_key(&id) || self.streams.len() >= MAX_SOCKETS {
-            writes
-                .try_send(text(&Up::Err {
-                    id: Some(id),
-                    code: "busy".into(),
-                    message: "too many or duplicate socket requests".into(),
-                })?)
-                .map_err(|_| crate::DpError::Control("managed tunnel overloaded".into()))?;
-            return Ok(());
+            // The tunnel owns at most one pending refusal and pauses reads until
+            // writer capacity returns. A full queue is not a failed connection.
+            return Ok(Some(text(&Up::Err {
+                id: Some(id),
+                code: "busy".into(),
+                message: "too many or duplicate socket requests".into(),
+            })?));
         }
         let (input, receiver) = mpsc::channel(1);
         let input_credit = Arc::new(AtomicBool::new(false));
@@ -199,7 +198,7 @@ impl Gateway {
                 task,
             },
         );
-        Ok(())
+        Ok(None)
     }
 
     pub(crate) fn cancel(&mut self, id: u32) {

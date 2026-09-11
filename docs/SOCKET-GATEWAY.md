@@ -71,6 +71,10 @@ validation applies to decoded WebSocket messages.
 
 DP allows 32 socket requests per attached managed tunnel, separate from file
 reservations. A capacity refusal is busy; it does not evict another stream.
+If the shared writer queue is full, the tunnel holds at most one pending refusal
+and pauses incoming frames until it is queued. Existing socket tasks, the writer,
+and heartbeat/failure handling continue; there is no task per rejected request.
+A transport that remains stalled is still subject to the existing tunnel timeout.
 Open/list attempts have 15-second timeouts. CP waits 20 seconds for opening and
 at most 22 seconds for a listing.
 
@@ -110,7 +114,8 @@ proof of the new HTTP routing or stream lifecycle.
 
 - cargo test -p synch-dp --lib: real loopback peer listing, bytes, half-close,
   explicit cancel, tunnel loss, output backpressure, and remote completion
-  while client input stays open, plus existing DP regressions.
+  while client input stays open, and a full shared writer with 32 live sockets
+  refusing the 33rd without evicting them, plus existing DP regressions.
 - cd control-plane && gleam test: bearer scope, hosting, join-key refusal,
   expiry, and existing CP regressions.
 - cd control-plane && uv run e2e/socket-gateway.py: real HTTP/WebSocket edge,

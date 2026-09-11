@@ -166,3 +166,144 @@ async fn socket_gateway_streams_remote_bytes_and_cancels_on_tunnel_loss() {
     node.shutdown().await.unwrap();
     remote.shutdown().await.unwrap();
 }
+
+#[cfg(all(
+    any(target_os = "linux", target_os = "macos"),
+    any(target_arch = "x86_64", target_arch = "aarch64")
+))]
+#[tokio::test]
+async fn socket_capacity_refusal_waits_for_writer_without_evicting_live_streams() {
+    use std::sync::atomic::AtomicBool;
+    let (_data, node) = tenant().await;
+    let source = tempfile::tempdir().unwrap();
+    let program = include_str!("../../synch-sock/examples/echo.c")
+        .replace("max_streams\\\":16", "max_streams\\\":64");
+    let elf = synch_cc::compile(
+        &program,
+        "echo.c",
+        &[("synch.h", synch_sock::sdk::HEADER)],
+        &[],
+    )
+    .unwrap();
+    std::fs::write(source.path().join("echo.o"), elf).unwrap();
+    node.add_filesystem_source("code", source.path()).unwrap();
+    node.socket_activate(&synch_store::SocketActivation::new(
+        "echo",
+        "code",
+        "echo.o",
+        synch_core::now_ns(),
+    ))
+    .unwrap();
+    node.scan_and_publish().unwrap();
+
+    let (down, mut incoming) = mpsc::unbounded_channel::<Message>();
+    let (up_tx, mut up) = mpsc::unbounded_channel::<Message>();
+    let (entered_tx, mut entered) = mpsc::unbounded_channel();
+    let (read_tx, mut read) = mpsc::unbounded_channel();
+    let paused = Arc::new(AtomicBool::new(false));
+    let gate = Arc::new(tokio::sync::Semaphore::new(0));
+    let (pause_sink, sink_gate) = (paused.clone(), gate.clone());
+    let sink = futures_util::sink::unfold(up_tx, move |tx, message: Message| {
+        let (paused, gate, entered) = (pause_sink.clone(), sink_gate.clone(), entered_tx.clone());
+        async move {
+            if paused.load(Ordering::Acquire) {
+                entered.send(()).unwrap();
+                gate.acquire().await.unwrap().forget();
+            }
+            tx.send(message)
+                .map_err(|_| tokio_tungstenite::tungstenite::Error::ConnectionClosed)?;
+            Ok::<_, tokio_tungstenite::tungstenite::Error>(tx)
+        }
+    });
+    let stream = futures_util::stream::poll_fn(move |cx| {
+        incoming.poll_recv(cx).map(|message| {
+            message.map(|frame| {
+                read_tx.send(()).unwrap();
+                Ok(frame)
+            })
+        })
+    });
+    let hosted = node.clone();
+    let mut task = tokio::spawn(async move {
+        serve(
+            &hosted,
+            Box::pin(sink),
+            Box::pin(stream),
+            "capacity",
+            &limits(),
+        )
+        .await
+    });
+    for id in 1..=32 {
+        down.send(down_msg(&Down::SocketOpen {
+            id,
+            origin: node.origin().canonical(),
+            socket: "echo".into(),
+        }))
+        .unwrap();
+        assert!(matches!(next_up(&mut up).await, Up::SocketOpened { .. }));
+        read.recv().await.unwrap();
+    }
+    paused.store(true, Ordering::Release);
+    down.send(down_msg(&Down::Ping)).unwrap();
+    read.recv().await.unwrap();
+    entered.recv().await.unwrap(); // Writer is now blocked inside sink.send.
+    for _ in 0..WRITE_AHEAD {
+        down.send(down_msg(&Down::Ping)).unwrap();
+        read.recv().await.unwrap();
+    }
+    down.send(down_msg(&Down::SocketOpen {
+        id: 33,
+        origin: node.origin().canonical(),
+        socket: "echo".into(),
+    }))
+    .unwrap();
+    read.recv().await.unwrap();
+    // A pending refusal must apply input backpressure instead of allocating
+    // another waiting sender or dropping any of the 32 live invocations.
+    let _ = down.send(Message::Binary(encode_chunk(1, 0, b"still alive").into()));
+    assert!(
+        tokio::time::timeout(Duration::from_millis(100), &mut task)
+            .await
+            .is_err(),
+        "capacity refusal terminated the shared tunnel"
+    );
+    assert!(
+        read.try_recv().is_err(),
+        "input advanced while refusal had no writer capacity"
+    );
+    assert_eq!(node.socket_ps(None).len(), 32);
+    paused.store(false, Ordering::Release);
+    gate.add_permits(1);
+    let mut busy = false;
+    let mut echoed = false;
+    while !busy || !echoed {
+        match tokio::time::timeout(Duration::from_secs(5), up.recv())
+            .await
+            .unwrap()
+            .unwrap()
+        {
+            Message::Text(body) => match serde_json::from_str::<Up>(&body).unwrap() {
+                Up::Err {
+                    id: Some(33), code, ..
+                } => {
+                    assert_eq!(code, "busy");
+                    busy = true;
+                }
+                Up::Pong | Up::Credit { .. } => {}
+                other => panic!("unexpected response: {other:?}"),
+            },
+            Message::Binary(frame) => {
+                let (id, _, data) = decode_chunk(&frame).unwrap();
+                assert_eq!(id, 1);
+                assert_eq!(data, b"still alive");
+                echoed = true;
+            }
+            other => panic!("unexpected frame: {other:?}"),
+        }
+    }
+    assert_eq!(node.socket_ps(None).len(), 32);
+    drop(down);
+    task.await.unwrap().unwrap();
+    node.shutdown().await.unwrap();
+}

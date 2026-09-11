@@ -738,6 +738,9 @@ where
     let mut in_flight: HashMap<u32, Write> = HashMap::new();
     let mut requests: usize = 0;
     let mut sockets = crate::socket_gateway::Gateway::new();
+    // One deferred rejection bounds memory without evicting admitted streams.
+    // Pause incoming frames while it waits; writer failures and heartbeats still run.
+    let mut pending_refusal = None;
     let mut beat = tokio::time::interval_at(tokio::time::Instant::now() + HEARTBEAT, HEARTBEAT);
     beat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut unanswered = 0u32;
@@ -766,7 +769,11 @@ where
                 unanswered += 1;
                 let _ = writes.try_send(text(&Up::Ping)?);
             }
-            incoming = stream.next() => {
+            permit = writes.reserve(), if pending_refusal.is_some() => {
+                let permit = permit.map_err(|_| crate::DpError::Control("tunnel writer closed".into()))?;
+                permit.send(pending_refusal.take().expect("guarded pending refusal"));
+            }
+            incoming = stream.next(), if pending_refusal.is_none() => {
                 let Some(incoming) = incoming else { return Ok(()) };
                 let incoming = incoming
                     .map_err(|e| crate::DpError::Control(format!("the tunnel read failed: {e}")))?;
@@ -777,8 +784,8 @@ where
                             crate::DpError::Control(format!("malformed tunnel frame: {e}"))
                         })?;
                         match frame {
-                            Down::SocketList { id, origin } => sockets.open(node, &writes, id, origin, None)?,
-                            Down::SocketOpen { id, origin, socket } => sockets.open(node, &writes, id, origin, Some(socket))?,
+                            Down::SocketList { id, origin } => pending_refusal = sockets.open(node, &writes, id, origin, None)?,
+                            Down::SocketOpen { id, origin, socket } => pending_refusal = sockets.open(node, &writes, id, origin, Some(socket))?,
                             Down::SocketAck { id } => {
                                 if let Err(error) = sockets.ack(id) {
                                     sockets.cancel(id);
