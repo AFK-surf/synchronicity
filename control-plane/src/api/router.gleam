@@ -47,6 +47,7 @@ import api/auth_api.{type AuthContext}
 import api/browse_api.{type Browse}
 import api/cue_api
 import api/dataplane_api
+import api/delegates_api
 import api/devices_api
 import api/middleware
 import api/networks_api
@@ -318,6 +319,17 @@ fn read_routes(req: Request, reads: Reads, browse: Browse) -> Option(Response) {
       Some({
         use who <- with_principal(req, reads)
         browse_api.status(reads, browse, who, slug, net)
+      })
+    // Hosted mutations have no CP state and are available on replicas too.
+    ["api", "orgs", slug, "networks", net, "delegations", key], Put ->
+      Some({
+        use who <- with_principal(req, reads)
+        delegates_api.put(req, reads, browse, who, slug, net, key)
+      })
+    ["api", "orgs", slug, "networks", net, "delegations", key], Delete ->
+      Some({
+        use who <- with_principal(req, reads)
+        delegates_api.delete(reads, browse, who, slug, net, key)
       })
     ["api", "orgs", slug, "networks", net, "delegations"], Get ->
       Some({

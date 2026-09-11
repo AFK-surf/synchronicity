@@ -35,7 +35,7 @@ use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
 ///
 /// Its own counter, unrelated to the browse tunnel's: the two share a
 /// handshake shape and nothing else.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 2;
 
 /// The oldest settled version this build serves under.
 const MIN_PROTOCOL_VERSION: u32 = 1;
@@ -102,6 +102,13 @@ pub enum Down {
         session: String,
         /// The protocol version the control plane settled on.
         v: u32,
+    },
+    /// Version 2: mutate the hosted member's own delegation record.
+    Delegate {
+        /// Request identifier.
+        id: u32,
+        /// Generic delegation operation.
+        mutation: crate::delegates::Mutation,
     },
     /// Open a write of exactly `size` bytes.
     Put {
@@ -187,6 +194,11 @@ pub enum Up {
         sig: String,
         /// The device key that produced it, z-base-32.
         key: String,
+    },
+    /// The requested delegation mutation has been published.
+    Delegated {
+        /// Request identifier.
+        id: u32,
     },
     /// A write may begin.
     Opened {
@@ -887,6 +899,35 @@ fn handle(
                 },
             );
         }
+        Down::Delegate { id, mutation } => {
+            if over_capacity(writes, in_flight, *requests, id) {
+                return Ok(());
+            }
+            *requests += 1;
+            let node = node.clone();
+            let writes = writes.clone();
+            let internal = internal.clone();
+            tokio::spawn(async move {
+                let result =
+                    synch_core::offload(move || crate::delegates::apply(&node, mutation)).await;
+                let frame = match result {
+                    Ok(()) => Up::Delegated { id },
+                    Err(error) => Up::Err {
+                        id: Some(id),
+                        code: match &error {
+                            EngineError::Invalid(_) => "invalid",
+                            _ => "unavailable",
+                        }
+                        .into(),
+                        message: error.to_string(),
+                    },
+                };
+                if let Ok(message) = text(&frame) {
+                    let _ = writes.send(message).await;
+                }
+                let _ = internal.send(Internal::RequestDone).await;
+            });
+        }
         Down::Delete {
             id,
             space,
@@ -1490,6 +1531,35 @@ mod tests {
             staging: StagingBudget::new(1 << 20),
             budget_bytes: 0,
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn delegation_frames_publish_and_withdraw_existing_records() {
+        let _scope = synch_core::BlockingScope::enter();
+        let (_dir, node) = tenant().await;
+        let (down, mut up, task) = session(&node, limits());
+        let key = iroh_base::SecretKey::generate().public().to_z32();
+        down.send(down_msg(&Down::Delegate {
+            id: 1,
+            mutation: crate::delegates::Mutation::Put {
+                key: key.clone(),
+                spaces: vec!["docs".into()],
+                expires_at: synch_core::now_ns() / 1_000_000_000 + 600,
+            },
+        }))
+        .unwrap();
+        assert!(matches!(next_up(&mut up).await, Up::Delegated { id: 1 }));
+        assert_eq!(node.delegations().unwrap().len(), 1);
+        down.send(down_msg(&Down::Delegate {
+            id: 2,
+            mutation: crate::delegates::Mutation::Delete { key },
+        }))
+        .unwrap();
+        assert!(matches!(next_up(&mut up).await, Up::Delegated { id: 2 }));
+        assert!(node.delegations().unwrap().is_empty());
+        drop(down);
+        task.await.unwrap().unwrap();
+        node.shutdown().await.unwrap();
     }
 
     /// A whole write round-trips: `put`, frames under credit, `commit`, and

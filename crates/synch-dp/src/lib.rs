@@ -14,6 +14,7 @@
 pub mod config;
 pub mod control;
 pub mod dbrepl;
+pub mod delegates;
 pub mod error;
 pub mod metrics;
 pub mod reconciler;
