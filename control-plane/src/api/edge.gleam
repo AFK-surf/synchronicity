@@ -18,6 +18,7 @@ import api/agent
 import api/browse_api.{type Browse}
 import api/browse_file
 import api/cloud_writer
+import api/socket_gateway
 import gleam/http.{Delete, Get, Put}
 import gleam/http/request.{type Request as HttpRequest}
 import gleam/http/response.{type Response as HttpResponse}
@@ -36,6 +37,25 @@ pub fn handler(
 ) -> fn(HttpRequest(mist.Connection)) -> HttpResponse(mist.ResponseData) {
   fn(req: HttpRequest(mist.Connection)) {
     case request.path_segments(req), req.method {
+      ["api", "orgs", slug, "networks", network, "sockets"], Get ->
+        socket_gateway.handle(
+          req,
+          surface.browse,
+          surface.db,
+          slug,
+          network,
+          False,
+        )
+      ["api", "orgs", slug, "networks", network, "sockets", "connect"], Get ->
+        socket_gateway.handle(
+          req,
+          surface.browse,
+          surface.db,
+          slug,
+          network,
+          True,
+        )
+
       ["agent", "v1", "attach"], Get ->
         agent.handle(
           req,

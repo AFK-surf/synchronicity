@@ -51,7 +51,7 @@ fn ed25519_verify(message: BitArray, signature: BitArray, key: BitArray) -> Bool
 
 /// The newest write-tunnel protocol version this build speaks. Its own
 /// counter, unrelated to the browse tunnel's.
-pub const protocol_version = 2
+pub const protocol_version = 3
 
 /// The oldest version this build still serves.
 pub const min_protocol_version = 1
@@ -139,6 +139,12 @@ pub type Ask {
   )
   /// Generic delegation mutation; protocol v2 and hosted nodes only.
   Delegate(mutation: Json, reply: Subject(Event))
+  /// Generic socket operations on the managed member, protocol v3.
+  SocketOpen(origin: String, socket: String, reply: Subject(Event))
+  SocketList(origin: String, reply: Subject(Event))
+  SocketAck(id: Int)
+  SocketEof(id: Int)
+  SocketOwnerDown(process.Down)
   /// Abandon a write.
   Cancel(id: Int)
   /// The heartbeat tick this session schedules for itself.
@@ -162,6 +168,10 @@ pub type Event {
   Deleted(still_published: Bool, withdrawn: Bool)
   /// A delegation mutation was published.
   Delegated
+  /// Opaque socket metadata/control, forwarded without interpreting its protocol.
+  SocketInfo(body: String)
+  SocketData(seq: Int, data: BitArray)
+  SocketEnd(body: String)
   /// A coded refusal, in the node's own vocabulary.
   Failed(code: String, message: String)
 }
@@ -469,7 +479,11 @@ type Waiting {
   /// A request whose events go to one caller; one-shots carry the second
   /// past which they are abandoned, writes none — a stalled write is the
   /// caller's own timeout to notice.
-  Waiting(reply: Subject(Event), deadline: Option(Int))
+  Waiting(
+    reply: Subject(Event),
+    deadline: Option(Int),
+    monitor: Option(process.Monitor),
+  )
 }
 
 type Conn {
@@ -503,10 +517,20 @@ pub fn handle(
           process.send_after(inbox, 30_000, Beat)
           #(
             Conn(attach, dp, inbox, Opening, 1, [], 0),
-            Some(process.new_selector() |> process.select(inbox)),
+            Some(
+              process.new_selector()
+              |> process.select(inbox)
+              |> process.select_monitors(SocketOwnerDown),
+            ),
           )
         },
         on_close: fn(state: Conn) {
+          list.each(state.waiting, fn(entry) {
+            process.send(
+              entry.1.reply,
+              Failed("unavailable", "managed tunnel closed"),
+            )
+          })
           case state.phase {
             Live(session) -> process.send(attach.registry, Leave(session.id))
             _ -> Nil
@@ -577,13 +601,19 @@ fn socket(
 ) -> mist.Next(Conn, Ask) {
   case message {
     mist.Text(body) -> incoming(state, body, conn)
-    // Content only ever travels downward on this tunnel.
-    mist.Binary(_) ->
-      refuse(
-        conn,
-        "invalid",
-        "nothing travels up this tunnel but control frames",
-      )
+    mist.Binary(frame) ->
+      case frame, state.phase {
+        <<id:big-size(32), seq:big-size(32), data:bits>>, Live(session)
+          if session.version >= 3
+        -> {
+          case list.key_find(state.waiting, id) {
+            Ok(wait) -> process.send(wait.reply, SocketData(seq, data))
+            Error(_) -> Nil
+          }
+          mist.continue(state)
+        }
+        _, _ -> refuse(conn, "invalid", "unexpected binary frame")
+      }
     mist.Custom(ask) -> outgoing(state, ask, conn)
     mist.Closed | mist.Shutdown -> mist.stop()
   }
@@ -609,13 +639,29 @@ fn incoming(
     Ok("committed"), Live(_) -> forward(state, body, committed_decoder(), True)
     Ok("deleted"), Live(_) -> forward(state, body, deleted_decoder(), True)
     Ok("delegated"), Live(_) -> forward(state, body, delegated_decoder(), True)
+    Ok("socketlist"), Live(_) ->
+      forward(state, body, socket_info_decoder(body), True)
+    Ok("socketopened"), Live(_) ->
+      forward(state, body, socket_info_decoder(body), False)
+    Ok("socketeof"), Live(_) ->
+      forward(state, body, socket_info_decoder(body), False)
+    Ok("socketclosed"), Live(_) ->
+      forward(
+        state,
+        body,
+        {
+          use id <- decode.field("id", decode.int)
+          decode.success(#(id, SocketEnd(body)))
+        },
+        True,
+      )
     Ok("err"), Live(_) ->
       case json.parse(body, error_decoder()) {
         // No id names the connection itself: every caller waiting on it is
         // told, and the session ends rather than leaving them to time out.
         Ok(#(0, event)) -> {
           list.each(state.waiting, fn(entry) {
-            let Waiting(reply, _) = entry.1
+            let Waiting(reply, _, _) = entry.1
             process.send(reply, event)
           })
           mist.stop()
@@ -864,7 +910,7 @@ fn forward(
     Error(_) -> mist.continue(state)
     Ok(#(id, event)) -> {
       case list.key_find(state.waiting, id) {
-        Ok(Waiting(reply, _)) -> process.send(reply, event)
+        Ok(Waiting(reply, _, _)) -> process.send(reply, event)
         Error(Nil) -> Nil
       }
       // A refusal ends a request whichever kind it was; a write that was
@@ -885,7 +931,13 @@ fn forward(
 }
 
 fn without(waiting: List(#(Int, Waiting)), id: Int) -> List(#(Int, Waiting)) {
-  list.filter(waiting, fn(pair) { pair.0 != id })
+  list.filter(waiting, fn(pair) {
+    case pair.0 == id, pair.1.monitor {
+      True, Some(monitor) -> process.demonitor_process(monitor)
+      _, _ -> Nil
+    }
+    pair.0 != id
+  })
 }
 
 /// Drops one-shot requests whose deadline has passed, replying an error to
@@ -894,12 +946,16 @@ fn sweep_waiting(state: Conn, now: Int) -> Conn {
   let #(expired, kept) =
     list.partition(state.waiting, fn(entry) {
       case entry.1 {
-        Waiting(_, Some(deadline)) -> deadline <= now
-        Waiting(_, None) -> False
+        Waiting(_, Some(deadline), _) -> deadline <= now
+        Waiting(_, None, _) -> False
       }
     })
   list.each(expired, fn(entry) {
-    let Waiting(reply, _) = entry.1
+    let Waiting(reply, _, monitor) = entry.1
+    case monitor {
+      Some(m) -> process.demonitor_process(m)
+      None -> Nil
+    }
     process.send(reply, Failed("unavailable", "the hosted node did not answer"))
   })
   Conn(..state, waiting: kept)
@@ -913,6 +969,13 @@ fn outgoing(
   conn: mist.WebsocketConnection,
 ) -> mist.Next(Conn, Ask) {
   case ask, state.phase {
+    SocketOwnerDown(process.ProcessDown(monitor, _, _)), _ -> {
+      let gone =
+        list.filter(state.waiting, fn(pair) { pair.1.monitor == Some(monitor) })
+      list.each(gone, fn(pair) { process.send(state.inbox, Cancel(pair.0)) })
+      mist.continue(state)
+    }
+    SocketOwnerDown(_), _ -> mist.continue(state)
     Beat, _ ->
       case state.misses >= 2 {
         True -> mist.stop()
@@ -923,6 +986,40 @@ fn outgoing(
           mist.continue(Conn(..state, misses: state.misses + 1))
         }
       }
+    SocketOpen(origin, socket, reply), Live(session) ->
+      socket_request(
+        state,
+        session,
+        conn,
+        "socketopen",
+        origin,
+        socket,
+        reply,
+        None,
+      )
+    SocketList(origin, reply), Live(session) ->
+      socket_request(
+        state,
+        session,
+        conn,
+        "socketlist",
+        origin,
+        "",
+        reply,
+        Some(now_unix() + waiting_lease),
+      )
+    SocketAck(id), Live(_) | SocketEof(id), Live(_) -> {
+      let tag = case ask {
+        SocketAck(_) -> "socketack"
+        _ -> "socketeof"
+      }
+      let _ =
+        send(
+          conn,
+          json.object([#("t", json.string(tag)), #("id", json.int(id))]),
+        )
+      mist.continue(state)
+    }
     Open(space, path, size, from, if_match, if_none_match, reply), Live(_) -> {
       let id = state.next_id
       let _ =
@@ -942,7 +1039,7 @@ fn outgoing(
       process.send(reply, Assigned(id))
       mist.continue(
         Conn(..state, next_id: id + 1, waiting: [
-          #(id, Waiting(reply, None)),
+          #(id, Waiting(reply, None, None)),
           ..state.waiting
         ]),
       )
@@ -963,7 +1060,7 @@ fn outgoing(
         )
       mist.continue(
         Conn(..state, next_id: id + 1, waiting: [
-          #(id, Waiting(reply, Some(now_unix() + waiting_lease))),
+          #(id, Waiting(reply, Some(now_unix() + waiting_lease), None)),
           ..state.waiting
         ]),
       )
@@ -981,7 +1078,7 @@ fn outgoing(
         )
       mist.continue(
         Conn(..state, next_id: id + 1, waiting: [
-          #(id, Waiting(reply, Some(now_unix() + waiting_lease))),
+          #(id, Waiting(reply, Some(now_unix() + waiting_lease), None)),
           ..state.waiting
         ]),
       )
@@ -989,6 +1086,8 @@ fn outgoing(
     Open(_, _, _, _, _, _, reply), _
     | Remove(_, _, _, _, reply), _
     | Delegate(_, reply), _
+    | SocketOpen(_, _, reply), _
+    | SocketList(_, reply), _
     -> {
       process.send(reply, Failed("unavailable", "the session is not live"))
       mist.continue(state)
@@ -1020,7 +1119,8 @@ fn outgoing(
         )
       mist.continue(Conn(..state, waiting: without(state.waiting, id)))
     }
-    Chunk(..), _ | Commit(_), _ -> mist.continue(state)
+    Chunk(..), _ | Commit(_), _ | SocketAck(_), _ | SocketEof(_), _ ->
+      mist.continue(state)
   }
 }
 
@@ -1113,4 +1213,54 @@ pub fn session_json(session: Session) -> Json {
 fn delegated_decoder() -> Decoder(#(Int, Event)) {
   use id <- decode.field("id", decode.int)
   decode.success(#(id, Delegated))
+}
+
+fn socket_info_decoder(body: String) -> Decoder(#(Int, Event)) {
+  use id <- decode.field("id", decode.int)
+  decode.success(#(id, SocketInfo(body)))
+}
+
+fn socket_request(
+  state: Conn,
+  session: Session,
+  conn: mist.WebsocketConnection,
+  tag: String,
+  origin: String,
+  socket: String,
+  reply: Subject(Event),
+  deadline: Option(Int),
+) -> mist.Next(Conn, Ask) {
+  case session.version < 3 {
+    True -> {
+      process.send(
+        reply,
+        Failed("unsupported", "the hosted data plane needs tunnel v3"),
+      )
+      mist.continue(state)
+    }
+    False -> {
+      let id = state.next_id
+      let monitor =
+        process.subject_owner(reply)
+        |> result.map(process.monitor)
+        |> option.from_result
+      let _ =
+        send(
+          conn,
+          json.object([
+            #("t", json.string(tag)),
+            #("id", json.int(id)),
+            #("origin", json.string(origin)),
+            #("socket", json.string(socket)),
+          ]),
+        )
+      process.send(reply, Assigned(id))
+      mist.continue(
+        Conn(..state, next_id: id + 1, waiting: [
+          #(id, Waiting(reply, deadline, monitor)),
+          ..state.waiting
+        ]),
+      )
+    }
+  }
 }

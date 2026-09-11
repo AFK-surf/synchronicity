@@ -2,6 +2,11 @@
 
 Status: **implemented** · 2026-09-02
 
+Managed tunnels also carry delegation mutations (v2) and the
+[managed socket gateway](SOCKET-GATEWAY.md) (v3). The file-write contract below
+is unchanged. Socket bytes can flow upward on v3; customer browse tunnels still
+encode no write or socket-connect operation.
+
 The engine half is `Node::open_tree_write` and `PutCondition::Selected`
 (`crates/synch-engine/src/sockets.rs`, `crates/synch-sock/src/lib.rs`), the
 data-plane half is `crates/synch-dp/src/writes.rs`, the control-plane half is
