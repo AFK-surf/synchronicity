@@ -2883,12 +2883,18 @@ mod tests {
         std::fs::remove_file(&replaced).unwrap();
         std::fs::remove_file(space.path().join("deleted")).unwrap();
         let _socket = UnixListener::bind(&replaced).unwrap();
-        rustix::fs::mkfifoat(
-            rustix::fs::CWD,
-            space.path().join("fifo"),
-            rustix::fs::Mode::RUSR,
-        )
-        .unwrap();
+        // rustix::fs::mkfifoat is unavailable on Apple platforms. Use the
+        // POSIX utility, as the store's FIFO fixtures do, on Linux and macOS.
+        let created = std::process::Command::new("mkfifo")
+            .args(["-m", "600"])
+            .arg(space.path().join("fifo"))
+            .output()
+            .expect("run POSIX mkfifo for the scanner fixture");
+        assert!(
+            created.status.success(),
+            "mkfifo failed: {}",
+            String::from_utf8_lossy(&created.stderr)
+        );
         std::fs::write(space.path().join("a.txt"), b"before socket").unwrap();
         std::fs::write(space.path().join("z.txt"), b"after socket").unwrap();
         std::os::unix::fs::symlink("a.txt", space.path().join("link")).unwrap();
