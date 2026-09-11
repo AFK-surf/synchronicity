@@ -1310,6 +1310,11 @@ behavior with zero kernel dependencies:
 Ignore rules: `.syncignore` per space root (gitignore syntax), plus sensible built-in
 defaults (`.DS_Store`, `Thumbs.db`, temp/lock patterns).
 
+A `.git` directory is not an ordinary subtree: its objects are a set named by
+their content, its refs are state whose deletion is an update, and a ref is
+meaningful only once the objects it names are present. `docs/GIT.md` is the
+design for publishing, selecting, materializing and adopting one correctly.
+
 ### 7.2 Materialization and adoption
 
 Materialization reads the unified tree (§8), so every read surface takes one
