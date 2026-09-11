@@ -52,6 +52,21 @@ pub(crate) fn socket_scope(scope: &[String]) -> String {
     }
 }
 
+/// A delegation's grant as `delegate ls` lays it out (§3.5): the comma-joined
+/// space list, each read-only space marked `:ro`.
+///
+/// One column, not two, because the line is parsed by position downstream
+/// and everything between the key and the expiry is the scope text; marking
+/// inside the list keeps a read-only grant the same shape as any other.
+pub(crate) fn delegation_scope(spaces: &[String], read_only: &[String]) -> String {
+    spaces
+        .iter()
+        .cloned()
+        .chain(read_only.iter().map(|space| format!("{space}:ro")))
+        .collect::<Vec<_>>()
+        .join(",")
+}
+
 /// The mark a divergent path carries in a listing: the number of versions it
 /// holds (§8, §14).
 ///
@@ -482,6 +497,13 @@ pub fn doctor(node: &Node) -> Lines {
                  this node is never served it and never asks for it"
                     .into(),
             );
+            if !report.read_only.is_empty() {
+                out.push(format!(
+                    "  read-only: {} (§3.5) — served in full, and every member refuses whole \
+                     any head of this node's publishing into them",
+                    report.read_only.join(", ")
+                ));
+            }
         }
     }
 

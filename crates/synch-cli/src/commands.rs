@@ -847,11 +847,13 @@ fn to_command(cli: &Cli) -> Result<Cmd> {
             DelegateCommand::Add {
                 key,
                 spaces,
+                read_only,
                 until,
                 note,
             } => Cmd::DelegateAdd(pb::DelegateAdd {
                 key: key.clone(),
                 spaces: spaces.clone(),
+                read_only: read_only.clone(),
                 until: until.clone(),
                 note: note.clone(),
             }),

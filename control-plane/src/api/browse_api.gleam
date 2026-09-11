@@ -362,6 +362,7 @@ fn delegation_json(row: agent.Delegation) -> Json {
     #("key", json.string(row.key)),
     #("issuer", json.string(row.issuer)),
     #("spaces", json.array(row.spaces, json.string)),
+    #("read_only", json.array(row.read_only, json.string)),
     #("live", json.bool(row.live)),
     #("not_after", json.int(row.not_after)),
     #("added_at", json.int(row.added_at)),

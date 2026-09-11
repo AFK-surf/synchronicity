@@ -269,6 +269,10 @@ pub struct DoctorReport {
     /// working as delegated" — the same partial trie reads as either one until
     /// an operator can see the scope it was held under.
     pub local_scope: Option<Vec<String>>,
+    /// The part of `local_scope` this node may read but not publish into
+    /// (§3.5): a source registered for one of these would have every head
+    /// refused, so the report names them beside the scope.
+    pub read_only: Vec<String>,
     /// Device keys a domain's answer published under more than one `id=`, whose
     /// every binding was therefore dropped (§3.2).
     ///
@@ -502,6 +506,7 @@ impl Node {
                 domain: Some(set.domain.clone()),
                 issuer: None,
                 spaces: Vec::new(),
+                read_only: Vec::new(),
                 note: None,
                 added_at: now,
                 expires_at: Some(expires_at),
@@ -1003,6 +1008,7 @@ impl Node {
             unreconciled,
             domains: self.resolving_domains(),
             local_scope: self.store().local_scope()?,
+            read_only: self.store().own_read_only(now)?,
             ambiguous,
             self_origin_mismatch,
             clock,

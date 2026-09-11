@@ -35,6 +35,7 @@ fn self_binding(origin: &OriginId, node_id: NodeId, now: i64) -> Binding {
         domain: None,
         issuer: None,
         spaces: Vec::new(),
+        read_only: Vec::new(),
         note: Some("self".into()),
         added_at: now,
         expires_at: None,
@@ -1195,6 +1196,7 @@ impl Node {
             domain: None,
             issuer: None,
             spaces: Vec::new(),
+            read_only: Vec::new(),
             note: note.map(str::to_string),
             added_at: now_ns(),
             expires_at: None,
@@ -1202,7 +1204,8 @@ impl Node {
         Ok(origin)
     }
 
-    /// Delegates a device key into the cluster, confined to `spaces` (§3.5).
+    /// Delegates a device key into the cluster, confined to `spaces`
+    /// read-write and `read_only` read alone (§3.5).
     ///
     /// Returns the staged `d:` record for the caller to publish. The
     /// delegation is not a credential and nothing is handed to the subject:
@@ -1215,10 +1218,17 @@ impl Node {
     /// without a live rooted binding, so a delegate publishing one would
     /// merely be ignored. Failing here says so at the point an operator can
     /// still do something about it.
+    ///
+    /// A record naming a read-only space is stamped a schema version that
+    /// members predating read-only delegations refuse whole (they honor
+    /// nothing they cannot read), so a mixed cluster admits such a subject
+    /// only at the members that enforce the whole grant. A record naming
+    /// none keeps the older stamp and is honored everywhere.
     pub fn delegate_add(
         &self,
         subject: NodeId,
         spaces: &[String],
+        read_only: &[String],
         not_after: i64,
         note: Option<&str>,
     ) -> Result<StagedChange> {
@@ -1238,20 +1248,26 @@ impl Node {
         // rather than every space. A closed list is the only thing a
         // delegation can be, and a user reaching for a wildcard has to be told
         // that rather than handed an empty grant.
-        if spaces.iter().any(|s| s == "*") {
+        if spaces.iter().chain(read_only).any(|s| s == "*") {
             return Err(EngineError::invalid(
                 "a delegation names spaces explicitly; there is no wildcard",
             ));
         }
+        if let Some(both) = read_only.iter().find(|s| spaces.contains(s)) {
+            return Err(EngineError::invalid(format!(
+                "{both} is named both read-write and read-only; a space is one or the other"
+            )));
+        }
         let delegation = Delegation {
-            v: synch_core::RECORD_VERSION,
+            v: Delegation::version_for(read_only),
             spaces: spaces.to_vec(),
             not_after,
             note: note.map(str::to_string),
+            read_only: read_only.to_vec(),
         };
         if !delegation.is_well_formed() {
             return Err(EngineError::invalid(format!(
-                "a delegation names between 1 and {} distinct valid spaces",
+                "a delegation names between 1 and {} distinct valid spaces, read-write and read-only together",
                 synch_core::MAX_DELEGATION_SPACES
             )));
         }
@@ -1324,6 +1340,30 @@ impl Node {
         Ok(self.store().has_delegations()? && self.store().local_scope()?.is_some())
     }
 
+    /// Refuses a publisher role for a space this node holds read-only (§3.5).
+    ///
+    /// Courtesy, like [`Node::is_delegated`]: every member refuses a head of
+    /// this origin holding a key under the space whether or not a source is
+    /// registered here, and refuses it *whole*, so a read-only source would
+    /// not merely fail to publish — it would stall every other space this
+    /// node publishes behind the first scan. Saying so here is what keeps the
+    /// operator from learning that from `doctor` a round later; a replica
+    /// checkout is the shape a read-only space takes locally.
+    fn refuse_read_only_source(&self, id: &str) -> Result<()> {
+        if self
+            .store()
+            .own_read_only(now_ns())?
+            .iter()
+            .any(|s| s == id)
+        {
+            return Err(EngineError::invalid(format!(
+                "this node is delegated {id} read-only, so it cannot publish into it; \
+                 `synch replica add {id} --checkout <dir>` materializes it locally instead"
+            )));
+        }
+        Ok(())
+    }
+
     /// Records a peer's address so it can be dialed later.
     pub fn remember_peer(&self, addr: &EndpointAddr) -> Result<()> {
         let encoded = encode_addr(addr);
@@ -1356,6 +1396,7 @@ impl Node {
             ));
         }
         validate_space(id)?;
+        self.refuse_read_only_source(id)?;
         let path = canonical_dir(path.as_ref())?;
         for replica in self.store().replicas()? {
             if let Some(checkout) = replica.checkout_path {
@@ -1419,6 +1460,7 @@ impl Node {
     /// Registers an API-only publisher (`docs/SERVERLESS.md` §10).
     pub fn add_api_source(&self, id: &str) -> Result<()> {
         validate_space(id)?;
+        self.refuse_read_only_source(id)?;
         if let Some(source) = self.store().source(id)? {
             return match source.local_path {
                 None => Ok(()),
@@ -2200,6 +2242,7 @@ mod tests {
                 .delegate_add(
                     subject,
                     &["photos".to_string()],
+                    &[],
                     now_ns() + 86_400_000_000_000,
                     None,
                 )
@@ -2229,6 +2272,58 @@ mod tests {
             store.all_delegations().unwrap().is_empty(),
             "the rows went with the name that issued them"
         );
+    }
+
+    /// A source for a space this node holds read-only is refused where the
+    /// operator can still choose a replica instead (§3.5): every member
+    /// would refuse the head whole, and `doctor` names the space beside the
+    /// scope. A read-write space of the same grant is unaffected.
+    #[tokio::test]
+    async fn a_read_only_delegate_cannot_register_a_source_for_the_space() {
+        let dir = node_dir();
+        let report = Node::init(dir.path(), None).unwrap();
+        let node = Node::open(NodeConfig::loopback(dir.path())).await.unwrap();
+        let issuer = OriginId::named("nas", "cluster.example").unwrap();
+        let rooted = Binding {
+            origin: issuer.clone(),
+            node_id: iroh_base::SecretKey::generate().public(),
+            source: BindingSource::Static,
+            domain: None,
+            issuer: None,
+            spaces: Vec::new(),
+            read_only: Vec::new(),
+            note: None,
+            added_at: 0,
+            expires_at: None,
+        };
+        let granted = Binding {
+            origin: OriginId::Key(report.node_id),
+            node_id: report.node_id,
+            source: BindingSource::Delegated,
+            domain: None,
+            issuer: Some(issuer),
+            spaces: vec!["photos".to_string()],
+            read_only: vec!["docs".to_string()],
+            note: None,
+            added_at: 0,
+            expires_at: Some(now_ns() + 86_400_000_000_000),
+        };
+        for binding in [&rooted, &granted] {
+            node.store().put_binding(binding).unwrap();
+        }
+
+        let refused = node.add_api_source("docs").unwrap_err().to_string();
+        assert!(refused.contains("read-only"), "{refused}");
+        let directory = tempfile::tempdir().unwrap();
+        let refused = node
+            .add_filesystem_source("docs", directory.path())
+            .unwrap_err()
+            .to_string();
+        assert!(refused.contains("replica add docs"), "{refused}");
+        assert!(node.store().source("docs").unwrap().is_none());
+        node.add_api_source("photos").unwrap();
+        assert_eq!(node.doctor().unwrap().read_only, ["docs"]);
+        node.shutdown().await.unwrap();
     }
 
     /// A zone that answers and does not name this node is a *delegate*, not a
@@ -2342,6 +2437,7 @@ mod tests {
                 domain: None,
                 issuer: Some(issuer.clone()),
                 spaces: vec!["photos".to_string()],
+                read_only: Vec::new(),
                 note: None,
                 added_at: 0,
                 expires_at: None,

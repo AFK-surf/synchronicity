@@ -443,6 +443,7 @@ control-plane change, nobody else's configuration touched:
 
 ```sh
 synch delegate add <their-device-key> --space photos --space incoming --until 7d
+synch delegate add <their-device-key> --space incoming --read-only photos
 synch delegate ls
 synch delegate rm <their-device-key>
 ```
@@ -454,6 +455,15 @@ published at seq 3
 this node will serve it a projection of every trie covering media, and nothing
 else — it will not learn that any other space exists
 ```
+
+`--read-only <space>` grants a space to read and never to publish into: the
+delegate is served it exactly like a `--space` one, and every member refuses
+whole any head of the delegate's that holds a file under it. A space is one or
+the other. `delegate ls` marks such a space `photos:ro` inside the list, and on
+the delegate `synch source add` refuses it — `synch replica add <space>
+--checkout <dir>` is the local shape of a read-only space. A member older than
+read-only delegations refuses a grant that names one entirely, so mixed clusters
+admit that delegate only where the whole grant is enforced.
 
 Nothing is handed to the delegate: the grant is a record in the issuer's trie,
 so every member learns it through ordinary replication. The delegate joins from

@@ -478,10 +478,11 @@ by publishing a record into its own trie:
 ```rust
 // key: d:<32-byte device key>   — the delegated key IS the trie key
 struct Delegation {
-    v: u8,
-    spaces: Vec<String>,   // closed list, ≤ 32, distinct, never a wildcard
-    not_after: i64,        // unix nanos
+    v: u8,                  // 1, or 2 when read_only is named
+    spaces: Vec<String>,    // read-write; with read_only: closed list, ≤ 32, distinct, never a wildcard
+    not_after: i64,         // unix nanos
     note: Option<String>,
+    read_only: Vec<String>, // v2 only: read, never published into; disjoint from spaces
 }
 ```
 
@@ -511,6 +512,40 @@ data is not refused but never sent (§5.5). A space is a cluster-wide namespace,
 delegating `photos` grants every member's `photos`: it has to, because the unified
 tree (§8) merges across origins by `(space, path)`, and a per-origin grant would
 describe a view no reader could render.
+
+**A space may be granted read-only.** `read_only` names spaces the delegate reads
+exactly as it reads `spaces` — served in full, its content fetchable, part of the
+read scope every member declares — and may not publish into: a head of the
+delegate's origin holding any key under `f:<space>/`, or the space's own
+`m:space/<space>`, is refused whole, precisely as a head holding a key outside
+the grant is. Its `r:<space>` claim is still admitted, because replicating a
+space is holding its content and a read-only grant permits exactly that — a
+replica checkout is the local shape of a read-only space. The two lists are one grant — together non-empty, bounded by 32,
+distinct across both, so a space is one or the other — and they answer two
+different questions: the serve, content and socket gates and the read scope ask
+for the union, and the publication authority a head is judged by asks for
+`spaces` alone. A key granted only read-only spaces is therefore confined to no
+space and still trusted, which is what lets it advertise the `b:` content it
+holds; "no binding" stays a different answer. Grants add across issuers as
+before, so a space one issuer grants read-only and another read-write is
+read-write. The delegate learns which spaces are read-only from the same
+record every member reads, and `synch source add` refuses one of them where a
+replica checkout is the right shape; `doctor` names them beside the read scope.
+
+The read-only list is the one field a build predating it does not know, and a
+record carrying it is stamped `v: 2` for exactly that reason. postcard ignores
+trailing bytes, so an older build would otherwise decode such a record as the
+narrower read-write grant with nothing missing — and honor a space the issuer
+meant to withhold writes from as merely unmentioned. Stamped, the older build
+refuses the record whole, which is what a delegation it cannot read must do
+(§4.2). A record naming no read-only space keeps `v: 1`, byte-identical to what
+every build has always published, so a rolling upgrade changes nothing for
+the grants already in force. Refusing a record is erasing its row while the
+leaf stays in a trie the member holds complete, and materialization applies
+deltas — so a member upgraded *after* meeting such a record would never revisit
+the leaf. The upgrade therefore rebuilds, once, every origin whose `d:` leaves
+have no row (§10), and the delegate is admitted from the first start of the
+build that reads the grant.
 
 **A delegation binds `OriginId::Key` only.** If it could name a `Named` origin, any
 member could delegate `nas@cluster.example.com` and squat a label the DNS zone
@@ -650,10 +685,11 @@ struct SpaceInfo {            // one per space, under m:space/<space-id>
 }
 
 struct Delegation {           // under d:<32-byte device key> (§3.5)
-    v: u8,
-    spaces: Vec<String>,      // closed list, <= 32, distinct, never a wildcard
+    v: u8,                    // 1, or 2 when read_only is named
+    spaces: Vec<String>,      // read-write; closed list, never a wildcard
     not_after: i64,
     note: Option<String>,
+    read_only: Vec<String>,   // v2 only: read alone; <= 32 with spaces, distinct across both
 }
 ```
 
@@ -1852,10 +1888,11 @@ CREATE TABLE bindings (
   source       TEXT NOT NULL,            -- 'static' | 'dns' | 'delegated'
   domain       TEXT NOT NULL DEFAULT '', -- the membership domain, '' if not dns
   issuer       TEXT NOT NULL DEFAULT '', -- for delegated source: the vouching origin
-  spaces       TEXT,                     -- for delegated source: newline-separated space ids
+  spaces       TEXT,                     -- for delegated source: newline-separated read-write space ids
   note         TEXT,
   added_at     INTEGER NOT NULL,
   expires_at   INTEGER,                  -- NULL for static
+  read_only    TEXT,                     -- for delegated source: newline-separated read-only space ids
   PRIMARY KEY (origin_id, node_id, source, domain, issuer)
 );
 CREATE INDEX bindings_by_key    ON bindings (node_id);   -- connection-accept lookup
@@ -2117,11 +2154,11 @@ CI (GitHub Actions):
 - **Authorization**: membership-based (§3.2), enforced on accept and per-origin on
   every head/record; a trusted peer relaying data for an untrusted origin is ignored.
   Binary for members, and space-scoped for delegates (§3.5): a delegated key may read
-  and publish only within its list, enforced at four points — the trie serve (by
-  position, §5.5), the blob serve (by whether a granted path names the content), the
-  head promotion of the delegated origin (its trie must hold nothing outside the
-  list), and the ordinary accept gate, which is unchanged because a delegated binding
-  is a binding. What delegation does *not* do is constrain the members that issue it:
+  only within its list and publish only within the read-write part of it, enforced
+  at four points — the trie serve (by position, §5.5), the blob serve (by whether a
+  granted path names the content), the head promotion of the delegated origin (its
+  trie must hold nothing outside the read-write list), and the ordinary accept gate,
+  which is unchanged because a delegated binding is a binding. What delegation does *not* do is constrain the members that issue it:
   a rooted member is unrestricted by construction, so any of them may delegate any
   space. That power is not created by delegation — a member already reads every space
   and can hand over its device secret — but delegation is what makes an exercise of it

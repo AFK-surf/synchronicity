@@ -10,7 +10,7 @@ namespace VerifiedCore.Authorization
 open Host
 
 def bindingColumns : List String :=
-  ["origin_id", "node_id", "source", "domain", "issuer", "spaces", "note", "added_at", "expires_at"]
+  ["origin_id", "node_id", "source", "domain", "issuer", "spaces", "read_only", "note", "added_at", "expires_at"]
 
 def readBindings (tx : Transaction) (equals : Fields) : Action (List Binding) := do
   let scan ← storage (.scanRows tx "bindings" bindingColumns equals
@@ -78,7 +78,11 @@ def liveForKey (tx : Transaction) (key : ByteArray) (now : Int64) : Action (List
 def liveForOrigin (tx : Transaction) (origin : String) (now : Int64) : Action (List Binding) := do
   liveAmong tx (← readBindings tx [("origin_id", .text origin)]) now
 
-/-- Authority of an origin and trie serving both honor a rooted binding first. -/
+/-- Authority of an origin and trie serving both honor a rooted binding first.
+A confined origin publishes into its read-write spaces alone: a read-only
+space is outside this scope exactly as an undelegated one is, so a head
+holding a key under it is refused whole. A key granted only read-only spaces
+is confined to none, which still lets it advertise the content it holds. -/
 def originScope (live : List Binding) : PublishScope :=
   if live.isEmpty then .untrusted
   else if live.any (·.source.rooted) then .unrestricted
@@ -86,10 +90,12 @@ def originScope (live : List Binding) : PublishScope :=
 
 /-- Peer publication/content scope gives a nonempty replicated delegation
 priority over local rooted trust. This precedence intentionally differs from
-origin publication authority and metadata serving. -/
+origin publication authority and metadata serving. It is the *read* side of
+the grant — what content a peer may fetch and what read scope it is declared —
+so read-only spaces count in full. -/
 def peerPublishScope (live : List Binding) : PublishScope :=
   if live.isEmpty then .untrusted else
-  let delegated := live.filter (fun binding => binding.source == .delegated) |>.flatMap (·.spaces)
+  let delegated := live.filter (fun binding => binding.source == .delegated) |>.flatMap (·.readable)
   if !delegated.isEmpty then .confined (canonicalSpaces delegated)
   else originScope live
 
@@ -106,7 +112,7 @@ def peerAuthorityIn (tx : Transaction) (key : ByteArray) (reading : Int64) : Act
   let now ← trustInstant tx reading
   let live ← liveForKey tx key now
   let rooted := live.any (·.source.rooted)
-  let serving := if rooted then fullScope else readScope (canonicalSpaces (live.flatMap (·.spaces)))
+  let serving := if rooted then fullScope else readScope (canonicalSpaces (live.flatMap (·.readable)))
   return ⟨serving, peerPublishScope live, live.map (·.origin), rooted⟩
 
 structure OriginAuthority where
@@ -126,8 +132,10 @@ def originAuthorityIn (tx : Transaction) (origin : Origin.Parsed) (reading : Int
   let owner := if own == some origin || scope == .unrestricted then none else some origin
   let keys := match scope with
     | .unrestricted => fullScope
-    | .untrusted => publicationScope []
-    | .confined spaces => publicationScope spaces
+    | .untrusted => publicationScope [] []
+    | .confined spaces =>
+      publicationScope spaces
+        ((canonicalSpaces (live.flatMap (·.readOnly))).filter (fun space => !spaces.contains space))
   return ⟨scope, keys, owner⟩
 
 def peerAuthority (key : ByteArray) (reading : Int64) : Action PeerAuthority :=

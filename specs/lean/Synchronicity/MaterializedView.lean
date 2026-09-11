@@ -27,7 +27,7 @@ def Address.key (origin : String) : Address → Fields
 def Address.columns : Address → List String
   | .file .. => ["kind", "size", "mtime_ns", "unix_mode", "content", "seq", "prev", "symlink_target"]
   | .provider .. => ["size", "complete", "spans"]
-  | .delegation .. => ["spaces", "expires_at", "note"]
+  | .delegation .. => ["spaces", "read_only", "expires_at", "note"]
 
 /-- The same primitive key-validity and Unicode contracts used at the host
 boundary; these functions do not decide any publication or retention policy. -/

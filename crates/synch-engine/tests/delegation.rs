@@ -91,11 +91,18 @@ async fn a_spine_branch_exposes_its_children_but_not_its_own_payload() {
 
 /// The `d:` record an issuer publishes to delegate `subject` (§3.5).
 fn delegation(subject: &NodeId, spaces: &[&str]) -> (Vec<u8>, Vec<u8>) {
+    scoped_delegation(subject, spaces, &[])
+}
+
+/// As [`delegation`], granting `read_only` read alone.
+fn scoped_delegation(subject: &NodeId, spaces: &[&str], read_only: &[&str]) -> (Vec<u8>, Vec<u8>) {
+    let read_only: Vec<String> = read_only.iter().map(|s| s.to_string()).collect();
     let record = Delegation {
-        v: synch_core::RECORD_VERSION,
+        v: Delegation::version_for(&read_only),
         spaces: spaces.iter().map(|s| s.to_string()).collect(),
         not_after: now_ns() + 86_400_000_000_000,
         note: Some("test delegate".into()),
+        read_only,
     };
     (
         delegation_key(subject),
@@ -333,6 +340,135 @@ async fn a_delegate_publishing_outside_its_spaces_is_refused() {
         report.heads_failed, 1,
         "the origin is reported as left behind"
     );
+}
+
+/// A read-only space is read like any other and published into like none
+/// (§3.5): the delegate is served it, learns it as part of its scope, and
+/// fetches its bytes — and a head of its own holding a key under it is
+/// refused whole by the member, exactly as one holding a key outside the
+/// grant is, while the read-write space keeps promoting.
+#[tokio::test]
+async fn a_read_only_delegate_reads_the_space_and_is_refused_publishing_into_it() {
+    let issuer = WireNode::spawn(Some("nas")).await;
+    let delegate = WireNode::spawn(None).await;
+    trust_static(&delegate.store, &issuer.origin, &issuer.key());
+
+    issuer.publish(
+        1,
+        &[
+            ("photos", "a.jpg", b"read-write bytes"),
+            ("docs", "d.pdf", b"read-only bytes"),
+            ("finance", "q3.pdf", b"withheld bytes"),
+        ],
+        &[scoped_delegation(&delegate.key(), &["photos"], &["docs"])],
+    );
+    // The member reads the record as two answers: what the key may read, and
+    // what the origin may publish.
+    assert_eq!(
+        issuer
+            .store
+            .publish_scope_of_key(&delegate.key(), now_ns())
+            .unwrap(),
+        synch_store::PublishScope::Confined(vec!["docs".to_string(), "photos".to_string()])
+    );
+    assert_eq!(
+        issuer
+            .store
+            .publish_scope(&delegate.origin, now_ns())
+            .unwrap(),
+        synch_store::PublishScope::Confined(vec!["photos".to_string()])
+    );
+
+    // Read: the delegate learns both spaces as its scope and holds both.
+    exchange(&delegate, &issuer).await;
+    assert_eq!(
+        delegate.store.local_scope().unwrap(),
+        Some(vec!["docs".to_string(), "photos".to_string()])
+    );
+    assert_eq!(
+        delegate.store.own_read_only(now_ns()).unwrap(),
+        vec!["docs".to_string()]
+    );
+    let head = delegate
+        .store
+        .complete_head(&issuer.origin)
+        .unwrap()
+        .expect("the delegate promoted the issuer's head");
+    let trie = Trie::new(delegate.store.as_ref());
+    for (space, path) in [("photos", "a.jpg"), ("docs", "d.pdf")] {
+        assert!(
+            trie.get(head.root, &file_key(space, path).unwrap())
+                .unwrap()
+                .is_some(),
+            "{space}/{path} was not served"
+        );
+    }
+    assert!(trie
+        .get(head.root, &file_key("finance", "q3.pdf").unwrap())
+        .is_err());
+    let blob = connect_blob(&delegate, &issuer).await;
+    let slice = blob
+        .get_slice(Hash::new(b"read-only bytes"), &ChunkRanges::single(0, 1))
+        .await
+        .unwrap();
+    assert!(!slice.encoded.is_empty(), "read-only content did not serve");
+    assert!(blob
+        .get_slice(Hash::new(b"withheld bytes"), &ChunkRanges::single(0, 1))
+        .await
+        .is_err());
+
+    // Publish: the read-write space promotes, the read-only one is refused
+    // whole and the origin stalls at its legitimate head.
+    delegate.publish(1, &[("photos", "mine.jpg", b"in scope")], &[]);
+    let syncer = Syncer::new(issuer.store.clone());
+    let client = connect(&issuer, &delegate).await;
+    syncer.sync_with(&client).await.unwrap();
+    let promoted = |seq: u64| {
+        issuer
+            .store
+            .complete_head(&delegate.origin)
+            .unwrap()
+            .map(|h| h.seq)
+            == Some(seq)
+    };
+    assert!(promoted(1), "the read-write space did not promote");
+    // Replicating the read-only space is holding its content, which the
+    // grant permits: the claim that says so promotes.
+    let claim = synch_core::ReplicaClaim {
+        v: synch_core::RECORD_VERSION,
+        since_ns: now_ns(),
+        policy: "current".into(),
+        grace_secs: 0,
+        objects: 1,
+        bytes: 15,
+        complete: true,
+    };
+    delegate.publish(
+        2,
+        &[],
+        &[(
+            synch_core::replica_claim_key("docs").unwrap(),
+            postcard::to_stdvec(&claim).unwrap(),
+        )],
+    );
+    syncer.sync_with(&client).await.unwrap();
+    assert!(
+        promoted(2),
+        "a replica claim for a read-only space was refused"
+    );
+    delegate.publish(3, &[("docs", "edit.pdf", b"read-only, so refused")], &[]);
+    let report = syncer.sync_with(&client).await.unwrap();
+    assert!(
+        promoted(2),
+        "a delegate published into a read-only space and the head was promoted"
+    );
+    assert_eq!(
+        issuer.store.pending_head(&delegate.origin).unwrap(),
+        None,
+        "a refused head kept the pending slot"
+    );
+    assert_eq!(report.heads_failed, 1);
+    common::wire::shutdown_all(&[&issuer, &delegate]).await;
 }
 
 /// A scoped peer cannot reach a redacted node by claiming a position for it —

@@ -88,8 +88,11 @@ pub struct Binding {
     pub domain: Option<String>,
     /// The origin that vouched for this key, for delegated bindings.
     pub issuer: Option<OriginId>,
-    /// The spaces a delegated binding covers (§3.5).
+    /// The spaces a delegated binding covers read-write (§3.5).
     pub spaces: Vec<String>,
+    /// The spaces a delegated binding covers read-only (§3.5): served like
+    /// `spaces`, and refused at head promotion like a space outside the grant.
+    pub read_only: Vec<String>,
     /// A user note, for static bindings.
     pub note: Option<String>,
     /// When the binding was added, in unix nanoseconds.
@@ -108,11 +111,16 @@ pub(crate) fn encode_spaces(spaces: &[String]) -> String {
 
 /// Inserts or refreshes a binding on whichever connection is handed in.
 fn put_binding_in(conn: &rusqlite::Connection, binding: &Binding) -> Result<()> {
+    let list = |spaces: &[String]| match spaces.is_empty() {
+        true => None,
+        false => Some(encode_spaces(spaces)),
+    };
     conn.execute(
-        "INSERT INTO bindings (origin_id, node_id, source, domain, issuer, spaces, note, added_at, expires_at)
-         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+        "INSERT INTO bindings (origin_id, node_id, source, domain, issuer, spaces, read_only, note, added_at, expires_at)
+         VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10)
          ON CONFLICT(origin_id, node_id, source, domain, issuer) DO UPDATE SET
            spaces = excluded.spaces,
+           read_only = excluded.read_only,
            note = COALESCE(excluded.note, bindings.note),
            expires_at = excluded.expires_at",
         params![
@@ -125,10 +133,8 @@ fn put_binding_in(conn: &rusqlite::Connection, binding: &Binding) -> Result<()> 
                 .as_ref()
                 .map(|o| o.canonical())
                 .unwrap_or_default(),
-            match binding.spaces.is_empty() {
-                true => None,
-                false => Some(encode_spaces(&binding.spaces)),
-            },
+            list(&binding.spaces),
+            list(&binding.read_only),
             binding.note,
             binding.added_at,
             binding.expires_at,
@@ -529,6 +535,17 @@ impl Store {
         Ok(crate::lean_authorization::local_authority(self, now)?.grant)
     }
 
+    /// The part of [`Store::own_grant`] this node may read but not publish
+    /// into (§3.5): the spaces every issuer that grants them grants read-only.
+    ///
+    /// Empty when the node is not a delegate, and when every space it holds
+    /// is read-write. A source registered for one of these publishes into a
+    /// space every member refuses, so the engine refuses it first, at the
+    /// point the operator can still choose a replica instead.
+    pub fn own_read_only(&self, now: i64) -> Result<Vec<String>> {
+        Ok(crate::lean_authorization::local_authority(self, now)?.read_only)
+    }
+
     /// Why this node must not pull metadata from `peer`, or `None` if it may
     /// (§5.5).
     ///
@@ -911,6 +928,7 @@ mod tests {
             domain: None,
             issuer: None,
             spaces: Vec::new(),
+            read_only: Vec::new(),
             note: None,
             added_at: 0,
             expires_at: expires,
@@ -919,6 +937,16 @@ mod tests {
 
     /// A delegation of `spaces` from `issuer` to `subject`, live a millennium.
     fn delegation(subject: NodeId, issuer: OriginId, spaces: &[&str]) -> Binding {
+        scoped_delegation(subject, issuer, spaces, &[])
+    }
+
+    /// As [`delegation`], with `read_only` granted read alone.
+    fn scoped_delegation(
+        subject: NodeId,
+        issuer: OriginId,
+        spaces: &[&str],
+        read_only: &[&str],
+    ) -> Binding {
         Binding {
             origin: OriginId::Key(subject),
             node_id: subject,
@@ -926,10 +954,168 @@ mod tests {
             domain: None,
             issuer: Some(issuer),
             spaces: spaces.iter().map(|s| s.to_string()).collect(),
+            read_only: read_only.iter().map(|s| s.to_string()).collect(),
             note: None,
             added_at: at(0),
             expires_at: Some(at(1000)),
         }
+    }
+
+    /// A read-only space is one grant with two answers (§3.5): the serve and
+    /// content gates count it — the subject is served the space and fetches
+    /// its bytes exactly as a read-write one — while the publication
+    /// authority its own heads are judged by does not, so a key granted only
+    /// read-only spaces is confined to none and still trusted.
+    #[test]
+    fn a_read_only_space_is_served_and_fetched_but_never_published() {
+        let (_d, store) = store();
+        let issuer_key = SecretKey::generate().public();
+        let subject = SecretKey::generate().public();
+        let issuer = OriginId::named("nas", "x.example").unwrap();
+        store
+            .put_binding(&binding(issuer.clone(), issuer_key, None))
+            .unwrap();
+        store
+            .put_binding(&scoped_delegation(
+                subject,
+                issuer.clone(),
+                &["photos"],
+                &["docs"],
+            ))
+            .unwrap();
+        let path = |bytes: &[u8]| synch_mpt::Nibbles::from_bytes(bytes).as_slice().to_vec();
+
+        // Read: both spaces, in the trie served and in the content gate.
+        let served = store.scope_for_key(&subject, at(10)).unwrap();
+        assert!(served.prefixes().unwrap().contains(&path(b"f:docs/")));
+        assert!(served.prefixes().unwrap().contains(&path(b"f:photos/")));
+        assert!(served.exact().contains(&path(b"m:space/docs")));
+        assert_eq!(
+            store.publish_scope_of_key(&subject, at(10)).unwrap(),
+            PublishScope::Confined(vec!["docs".to_string(), "photos".to_string()])
+        );
+        assert_eq!(
+            store
+                .socket_scope_for_key(&subject, at(10))
+                .unwrap()
+                .unwrap()
+                .1,
+            Some(vec!["docs".to_string(), "photos".to_string()])
+        );
+
+        // Publish: the read-write space alone, in the answer and in the keys
+        // the promotion scope check walks.
+        assert_eq!(
+            store
+                .publish_scope(&OriginId::Key(subject), at(10))
+                .unwrap(),
+            PublishScope::Confined(vec!["photos".to_string()])
+        );
+        let authority = store
+            .transaction::<_, StoreError>(|tx| {
+                tx.promotion_authority(&OriginId::Key(subject), at(10))
+            })
+            .unwrap();
+        assert!(authority
+            .trie_scope
+            .prefixes()
+            .unwrap()
+            .contains(&path(b"f:photos/")));
+        assert!(!authority
+            .trie_scope
+            .prefixes()
+            .unwrap()
+            .contains(&path(b"f:docs/")));
+        assert!(!authority
+            .trie_scope
+            .exact()
+            .contains(&path(b"m:space/docs")));
+        // Replicating a read-only space is holding its content, which the
+        // grant permits, so the claim that says so is publishable.
+        assert!(authority.trie_scope.exact().contains(&path(b"r:docs")));
+
+        // Read-only alone is still a live, confined binding — not "no
+        // binding", which would refuse the `b:` ads the subject may publish.
+        let reader = SecretKey::generate().public();
+        store
+            .put_binding(&scoped_delegation(reader, issuer, &[], &["docs"]))
+            .unwrap();
+        assert!(store.is_trusted_key(&reader, at(10)).unwrap());
+        assert_eq!(
+            store.publish_scope(&OriginId::Key(reader), at(10)).unwrap(),
+            PublishScope::Confined(Vec::new())
+        );
+        assert_eq!(
+            store.publish_scope_of_key(&reader, at(10)).unwrap(),
+            PublishScope::Confined(vec!["docs".to_string()])
+        );
+    }
+
+    /// Grants add across issuers (§3.5): a space one issuer grants read-only
+    /// and another read-write is read-write, and the node's own view of what
+    /// it may not publish into says so.
+    #[test]
+    fn a_read_write_grant_from_a_second_issuer_lifts_read_only() {
+        let (_d, store) = store();
+        let own = SecretKey::generate();
+        store.set_self_origin(&OriginId::Key(own.public())).unwrap();
+        store
+            .add_device_key(&own, crate::KeyState::Active, 1)
+            .unwrap();
+        let nas = OriginId::named("nas", "x.example").unwrap();
+        let vps = OriginId::named("vps", "x.example").unwrap();
+        for issuer in [&nas, &vps] {
+            store
+                .put_binding(&binding(
+                    issuer.clone(),
+                    SecretKey::generate().public(),
+                    None,
+                ))
+                .unwrap();
+        }
+        store
+            .put_binding(&scoped_delegation(
+                own.public(),
+                nas.clone(),
+                &["photos"],
+                &["docs", "finance"],
+            ))
+            .unwrap();
+        assert_eq!(
+            store.own_grant(at(10)).unwrap(),
+            Some(vec![
+                "docs".to_string(),
+                "finance".to_string(),
+                "photos".to_string()
+            ])
+        );
+        assert_eq!(
+            store.own_read_only(at(10)).unwrap(),
+            vec!["docs".to_string(), "finance".to_string()]
+        );
+
+        store
+            .put_binding(&scoped_delegation(own.public(), vps, &["docs"], &[]))
+            .unwrap();
+        assert_eq!(
+            store.own_read_only(at(10)).unwrap(),
+            vec!["finance".to_string()],
+            "a read-write grant from any issuer is read-write"
+        );
+        assert_eq!(
+            store
+                .publish_scope(&OriginId::Key(own.public()), at(10))
+                .unwrap(),
+            PublishScope::Confined(vec!["docs".to_string(), "photos".to_string()])
+        );
+
+        // Withdrawing the read-write issuer puts the space back to read-only.
+        store.remove_origin_bindings(&nas).unwrap();
+        assert_eq!(store.own_read_only(at(10)).unwrap(), Vec::<String>::new());
+        assert_eq!(
+            store.own_grant(at(10)).unwrap(),
+            Some(vec!["docs".to_string()])
+        );
     }
 
     #[test]

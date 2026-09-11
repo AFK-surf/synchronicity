@@ -201,6 +201,17 @@ struct ParserTests {
     #expect(result.rows[0].scope == "photos")
   }
 
+  /// A read-only space is marked inside the list (`render::delegation_scope`),
+  /// so the grant keeps the shape every other line has and the marker stays
+  /// with the scope text rather than becoming a column of its own.
+  @Test func delegationKeepsAReadOnlyMarkInTheScope() {
+    let key = String(repeating: "m", count: 52)
+    let result = Listings.delegations(["\(key) photos,docs:ro               6d         ← this node"])
+    #expect(result.isClean)
+    #expect(result.rows[0].scope == "photos,docs:ro")
+    #expect(result.rows[0].expiry == "6d")
+  }
+
   @Test func delegationHandlesAScopeContainingASpace() {
     let key = String(repeating: "k", count: 52)
     let result = Listings.delegations(["\(key) family photos,work           never      ← this node"])

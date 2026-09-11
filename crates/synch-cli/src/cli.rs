@@ -715,9 +715,15 @@ pub enum DelegateCommand {
     Add {
         /// The subject's z-base-32 device key.
         key: String,
-        /// A space the delegation covers. Repeat for more than one.
-        #[arg(long = "space", required = true)]
+        /// A space the delegation covers read-write: the subject reads it
+        /// and publishes into it. Repeat for more than one.
+        #[arg(long = "space", required_unless_present = "read_only")]
         spaces: Vec<String>,
+        /// A space the delegation covers read-only: the subject is served it
+        /// like any other, and a head of its own publishing into it is
+        /// refused whole. Repeat for more than one.
+        #[arg(long = "read-only", value_name = "SPACE")]
+        read_only: Vec<String>,
         /// How long the delegation lasts, e.g. `7d`. Default 30d.
         #[arg(long)]
         until: Option<String>,

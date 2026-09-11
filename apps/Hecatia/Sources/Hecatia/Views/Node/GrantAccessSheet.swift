@@ -7,6 +7,8 @@ struct GrantAccessSheet: View {
 
   @State private var key = ""
   @State private var chosen: Set<String> = []
+  /// The ticked spaces the device may read but not publish into.
+  @State private var readOnly: Set<String> = []
   @State private var duration = "7d"
   @State private var note = ""
 
@@ -17,7 +19,7 @@ struct GrantAccessSheet: View {
   var body: some View {
     VStack(alignment: .leading, spacing: Theme.Space.l) {
       Text("Grant Access").font(.title3.weight(.semibold))
-      Text("The device sees only the spaces you tick, down to the filenames. It cannot pass the access on.")
+      Text("The device sees only the spaces you tick, down to the filenames. It cannot pass the access on. A read-only space is shown to it in full and refuses its changes.")
         .font(.callout).foregroundStyle(Theme.muted)
         .fixedSize(horizontal: false, vertical: true)
 
@@ -27,11 +29,26 @@ struct GrantAccessSheet: View {
       VStack(alignment: .leading, spacing: Theme.Space.xs) {
         Text("Spaces").font(.caption).foregroundStyle(Theme.muted)
         ForEach(node.spaces) { space in
-          Toggle(space.id, isOn: Binding(
-            get: { chosen.contains(space.id) },
-            set: { on in if on { chosen.insert(space.id) } else { chosen.remove(space.id) } }
-          ))
-          .toggleStyle(.checkbox)
+          HStack {
+            Toggle(space.id, isOn: Binding(
+              get: { chosen.contains(space.id) },
+              set: { on in
+                if on { chosen.insert(space.id) } else {
+                  chosen.remove(space.id)
+                  readOnly.remove(space.id)
+                }
+              }
+            ))
+            .toggleStyle(.checkbox)
+            Spacer()
+            Toggle("Read-only", isOn: Binding(
+              get: { readOnly.contains(space.id) },
+              set: { on in if on { readOnly.insert(space.id) } else { readOnly.remove(space.id) } }
+            ))
+            .toggleStyle(.checkbox)
+            .disabled(!chosen.contains(space.id))
+            .accessibilityLabel("\(space.id) read-only")
+          }
         }
         if node.spaces.isEmpty {
           Text("This Mac has no spaces to grant yet.").font(.caption).foregroundStyle(Theme.muted)
@@ -58,12 +75,18 @@ struct GrantAccessSheet: View {
 
   private func grant() {
     let trimmed = key.trimmingCharacters(in: .whitespaces)
-    let spaces = chosen.sorted()
+    // A space is read-write or read-only, never both: the daemon refuses a
+    // grant naming one twice, so the split is made here.
+    let readable = chosen.subtracting(readOnly).sorted()
+    let readOnlySpaces = chosen.intersection(readOnly).sorted()
+    let flags = readable.map { "--space \(Shell.quote($0))" }
+      + readOnlySpaces.map { "--read-only \(Shell.quote($0))" }
     node.enqueue {
       await node.run(
         Operations.require("delegate.add"),
-        Cmd.delegateAdd(key: trimmed, spaces: spaces, until: duration, note: note),
-        commandLine: "synch delegate add \(trimmed) " + spaces.map { "--space \(Shell.quote($0))" }.joined(separator: " "))
+        Cmd.delegateAdd(
+          key: trimmed, spaces: readable, readOnly: readOnlySpaces, until: duration, note: note),
+        commandLine: "synch delegate add \(trimmed) " + flags.joined(separator: " "))
     }
     dismiss()
   }

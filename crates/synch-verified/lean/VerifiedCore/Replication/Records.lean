@@ -91,16 +91,35 @@ def strings : Nat → List String → Decoder (List String)
   | 0, acc => pure acc.reverse
   | n + 1, acc => do strings n ((← string) :: acc)
 
+/-- The delegation schema version that appends a read-only space list. A
+record at version 1 carries no such list and is read exactly as before; a
+record past 2 is refused whole, since a grant this build cannot read must
+grant nothing rather than what an older shape would make of it. -/
+def delegationVersion : Decoder Nat := do
+  let v ← byte
+  if v > 2 then throw s!"delegation is schema version {v}, past the 2 this build reads"
+  return v.toNat
+
+def spaceList (count : Nat) : Decoder (List String) := do
+  if count > 32 then throw "invalid delegation space count"
+  strings count []
+
+/-- Read-write and read-only spaces are one grant: together nonempty, bounded,
+valid and distinct, so no space is both. The read-only list is decoded only
+from the version that introduced it, which is what lets a four-field record
+from an older publisher decode here at all. -/
 def delegation : Decoder Fields := do
-  version
-  let count ← uint
-  if count == 0 || count > 32 then throw "invalid delegation space count"
-  let spaces ← strings count []
-  if !spaces.all validSpace || spaces.eraseDups.length != spaces.length then
-    throw "invalid delegation spaces"
+  let v ← delegationVersion
+  let spaces ← spaceList (← uint)
   let expires ← sint
   let note ← optional string
-  return [("spaces", .text (String.intercalate "\n" spaces)),
+  let readOnly ← if v ≥ 2 then do spaceList (← uint) else pure []
+  let all := spaces ++ readOnly
+  if all.isEmpty || all.length > 32 then throw "invalid delegation space count"
+  if !all.all validSpace || all.eraseDups.length != all.length then
+    throw "invalid delegation spaces"
+  return [("spaces", nullable .text (if spaces.isEmpty then none else some (String.intercalate "\n" spaces))),
+    ("read_only", nullable .text (if readOnly.isEmpty then none else some (String.intercalate "\n" readOnly))),
     ("expires_at", .integer expires), ("note", nullable .text note)]
 
 /-- NFC is checked separately by a primitive Unicode service. All path and

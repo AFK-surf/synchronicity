@@ -15,6 +15,7 @@ fn delegation(subject: &NodeId, spaces: &[&str]) -> (Vec<u8>, Vec<u8>) {
         spaces: spaces.iter().map(|s| s.to_string()).collect(),
         not_after: now_ns() + 86_400_000_000_000,
         note: Some("test delegate".into()),
+        read_only: vec![],
     };
     (
         delegation_key(subject),

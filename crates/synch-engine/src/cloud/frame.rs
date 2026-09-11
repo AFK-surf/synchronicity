@@ -430,8 +430,13 @@ pub(crate) struct DelegationJson {
     pub key: String,
     /// The origin that issued it, canonically rendered.
     pub issuer: String,
-    /// The spaces the grant covers.
+    /// The spaces the grant covers read-write.
     pub spaces: Vec<String>,
+    /// The spaces the grant covers read-only (§3.5). Additive: a control
+    /// plane that predates it reads the read-write list and nothing else,
+    /// which is a narrower view of the same grant rather than a wrong one.
+    #[serde(default)]
+    pub read_only: Vec<String>,
     /// Whether this node honors it *now*, cascade applied.
     pub live: bool,
     /// When the delegation expires, unix nanoseconds.
@@ -519,6 +524,7 @@ mod tests {
                 key: "abc".into(),
                 issuer: "nas@cluster.example".into(),
                 spaces: vec!["photos".into()],
+                read_only: vec!["docs".into()],
                 live: true,
                 not_after: Some(1_700_000_000_000_000_000),
                 added_at: 12,
@@ -532,6 +538,7 @@ mod tests {
         assert_eq!(row["key"], "abc");
         assert_eq!(row["issuer"], "nas@cluster.example");
         assert_eq!(row["spaces"][0], "photos");
+        assert_eq!(row["read_only"][0], "docs");
         assert_eq!(row["live"], true);
         assert_eq!(row["not_after"], 1_700_000_000_000_000_000i64);
         assert_eq!(row["added_at"], 12);
@@ -550,6 +557,7 @@ mod tests {
                 key: "k".into(),
                 issuer: String::new(),
                 spaces: Vec::new(),
+                read_only: Vec::new(),
                 live: false,
                 not_after: None,
                 added_at: 0,
@@ -559,6 +567,7 @@ mod tests {
         .unwrap();
         assert!(bare["delegations"][0]["not_after"].is_null());
         assert!(bare["delegations"][0]["note"].is_null());
+        assert_eq!(bare["delegations"][0]["read_only"], serde_json::json!([]));
     }
 
     /// A daemon serves under an older control plane, and refuses a version

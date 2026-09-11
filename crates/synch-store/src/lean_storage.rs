@@ -468,6 +468,7 @@ fn columns_for(relation: &str) -> Result<&'static [&'static str]> {
             "domain",
             "issuer",
             "spaces",
+            "read_only",
             "note",
             "added_at",
             "expires_at",

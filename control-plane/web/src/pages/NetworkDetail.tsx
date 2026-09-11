@@ -167,7 +167,15 @@ function DelegatedTrust({ slug, network }: { slug: string; network: string }) {
                     <td className="px-4 py-2 font-mono text-xs" title={d.key}>
                       {d.key.slice(0, 12)}…
                     </td>
-                    <td className="px-4 py-2">{d.spaces.join(', ')}</td>
+                    <td className="px-4 py-2">
+                      {d.spaces.join(', ')}
+                      {d.read_only.length > 0 && (
+                        <span className="text-neutral-400">
+                          {d.spaces.length > 0 ? ', ' : ''}
+                          {d.read_only.join(' (read-only), ')} (read-only)
+                        </span>
+                      )}
+                    </td>
                     <td className="px-4 py-2 font-mono text-xs">{d.issuer}</td>
                     <td className="px-4 py-2 text-neutral-400">
                       {d.not_after === 0 ? '—' : remaining(d.not_after)}

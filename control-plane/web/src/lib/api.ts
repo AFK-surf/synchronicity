@@ -289,7 +289,10 @@ export async function writeFile(
 export interface Delegation {
   key: string
   issuer: string
+  /// The spaces the key reads and publishes into.
   spaces: string[]
+  /// The spaces the key reads but may not publish into (DESIGN.md §3.5).
+  read_only: string[]
   live: boolean
   not_after: number
   added_at: number
