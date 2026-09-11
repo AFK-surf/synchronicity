@@ -763,6 +763,74 @@ async fn adoption_holds_refs_when_a_directory_blocks_an_object() {
     shutdown(&[&a.node, &b.node]).await;
 }
 
+/// A mixed layout: one publisher's divergent `main` lives only in its
+/// `packed-refs`, the other's is loose. No path is divergent, yet the
+/// checkout's loose ref would hide the packed tip — so the mirror is
+/// planned from each origin's effective refs, not from divergent paths.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_packed_ref_shadowed_by_another_origins_loose_ref_is_mirrored() {
+    if !have_git() {
+        return;
+    }
+    let _blocking = synch_core::BlockingScope::enter();
+    let a = spawn("a").await;
+    let b = spawn("b").await;
+    let replica = spawn("replica").await;
+    introduce(&[&a, &b, &replica]);
+    let repo_a = init_repo(a.space.path());
+    let repo_b = b.space.path().join(REPO);
+    copy_dir(&repo_a, &repo_b);
+    std::fs::write(repo_a.join("a.txt"), b"a").unwrap();
+    git(&repo_a, &["add", "a.txt"]);
+    git(&repo_a, &["commit", "-q", "-m", "on a"]);
+    git(&repo_a, &["pack-refs", "--all"]);
+    assert!(!repo_a.join(".git/refs/heads/main").exists(), "a is packed");
+    std::thread::sleep(std::time::Duration::from_millis(20));
+    std::fs::write(repo_b.join("b.txt"), b"b").unwrap();
+    git(&repo_b, &["add", "b.txt"]);
+    git(&repo_b, &["commit", "-q", "-m", "on b"]);
+    assert!(repo_b.join(".git/refs/heads/main").is_file(), "b is loose");
+    let (tip_a, tip_b) = (
+        git(&repo_a, &["rev-parse", "main"]),
+        git(&repo_b, &["rev-parse", "main"]),
+    );
+    for peer in [&a, &b] {
+        peer.node
+            .add_filesystem_source(SPACE, peer.space.path())
+            .unwrap();
+        peer.node.scan_publish_push().await.unwrap();
+    }
+    let checkout = add_checkout(&replica).await;
+    let report = converge(&replica.node, &[&a.node, &b.node]).await;
+    let mirror = checkout.join(REPO);
+    assert_eq!(git(&mirror, &["rev-parse", "main"]), tip_b, "{report:?}");
+    let mirrored_a = mirror.join(".git").join(synch_core::git::mirror_ref_path(
+        &a.node.origin().short(),
+        "heads/main",
+    ));
+    assert_eq!(
+        std::fs::read_to_string(&mirrored_a).unwrap().trim(),
+        tip_a,
+        "a's packed tip, hidden by b's loose ref, is mirrored: {report:?}"
+    );
+    assert!(
+        !mirror
+            .join(".git")
+            .join(synch_core::git::mirror_ref_path(
+                &b.node.origin().short(),
+                "heads/main"
+            ))
+            .exists(),
+        "b's ref is what the checkout resolves; no mirror"
+    );
+    let all = git(&mirror, &["rev-list", "--all"]);
+    assert!(all.contains(&tip_a) && all.contains(&tip_b), "{all}");
+    git(&mirror, &["fsck", "--strict"]);
+    let again = replica.node.sync_checkout(SPACE).await.unwrap();
+    assert_eq!(again.written, 0, "stable: {again:?}");
+    shutdown(&[&a.node, &b.node, &replica.node]).await;
+}
+
 /// Objects a tree adoption passes over — here excluded by `.syncignore` —
 /// keep the refs that name them held: a ref is never written into a
 /// repository whose objects the run did not put there.

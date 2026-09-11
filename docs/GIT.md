@@ -402,19 +402,22 @@ the file, as any tombstone does today.
 
 ### 7.4 Divergent refs are refs
 
-When a Refs-class path under `refs/` is divergent, the checkout writes the
-selected version at the path and every other *live* version at
-`refs/synch/<origin>/<path without refs/>` — `refs/synch/nas/heads/main` for
-`nas`'s copy of `refs/heads/main`, named by the origin's short form
-(`OriginId::short`), one per origin asserting a losing version. A losing
-`packed-refs` is many refs in one file, and git reads packed refs from one
-place only, so each `refs/…` line it carries is expanded into a loose
-mirror of its own, from the bytes the replica holds; the names are a
-peer's, and one git would refuse is refused before it becomes a path. An
-origin's loose ref overrides its own packed entry, for the mirror as for
-git: a packed entry is not expanded when that origin publishes a live loose
-ref of the same name, whether that loose ref won or is mirrored itself. This
-holds when the selected version is a deletion too: the branch is gone from
+Git resolves a ref from two places, a loose file first and `packed-refs`
+second, and the checkout's two come from whichever origins `newest` picked
+for each path. So what git resolves in the checkout can differ from what an
+origin resolves in its own repository even when no path is divergent: one
+origin's packed `main` is hidden by another's loose one. The mirrors are
+therefore computed on *effective* refs, once the pass has seen the whole
+listing. For every origin, its live loose refs over the entries of its live
+`packed-refs`; for the checkout, the selected loose refs over the selected
+`packed-refs`. Every origin ref whose value the checkout does not resolve to
+is written at `refs/synch/<origin>/<name without refs/>` —
+`refs/synch/nas/heads/main` for `nas`'s `refs/heads/main`, named by the
+origin's short form (`OriginId::short`) — holding that origin's value: the
+loose ref's bytes, or `<hex>\n` for a packed entry, from the bytes the
+replica holds. The names are a peer's, and one git would refuse is refused
+before it becomes a path. This holds when the selected version is a
+deletion too: the branch is gone from
 `refs/heads/`, and the other machine's copy of it, with whatever commits
 only it had, stands under `refs/synch/` until that machine agrees. These
 are Transient-class paths: never published (the scanner never sees a
@@ -734,6 +737,9 @@ in the test and skipped where the binary is absent:
 - A publisher that packed its refs and committed again: the mirror of its
   losing `main` is its current loose tip, not the stale packed entry, and
   the winner's own stale packed entry is not mirrored.
+- A mixed layout, one publisher's `main` packed and the other's loose, with
+  no path divergent: the packed tip the checkout's loose ref hides is
+  mirrored, and a second pass writes nothing.
 - (`scanner.rs`) A commit landing between the walk and the ingest of the ref
   it moves, and one landing between the stat and the read of the ref
   itself: the ref is skipped that scan, the earlier value's object is
