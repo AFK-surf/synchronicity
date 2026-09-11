@@ -172,7 +172,7 @@ export interface ApiKeyRow {
   prefix: string
   // `admin` and `member` are org keys, reaching whatever that role reaches
   // across the org. `join` is a join key: one network, one operation.
-  role: 'admin' | 'member' | 'join'
+  role: 'admin' | 'member' | 'join' | 'managed_data'
   created_at: number
   expires_at: number
   last_used_at: number

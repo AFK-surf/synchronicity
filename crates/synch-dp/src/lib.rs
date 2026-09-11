@@ -14,10 +14,12 @@
 pub mod config;
 pub mod control;
 pub mod dbrepl;
+pub mod delegates;
 pub mod error;
 pub mod metrics;
 pub mod reconciler;
 pub mod rotation;
+mod socket_gateway;
 pub mod spaces;
 pub mod store;
 pub mod tenant;

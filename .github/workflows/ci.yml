@@ -89,7 +89,9 @@ jobs:
   test-engine:
     name: test synch-engine (${{ matrix.os }})
     runs-on: ${{ matrix.os }}
-    timeout-minutes: 30
+    # Windows test steps finish in ~24 minutes, but cache packing runs in
+    # post-job cleanup and shares this budget. Match the other Windows jobs.
+    timeout-minutes: ${{ matrix.os == 'windows-latest' && 45 || 30 }}
     strategy:
       fail-fast: false
       matrix:

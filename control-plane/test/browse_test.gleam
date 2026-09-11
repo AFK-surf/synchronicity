@@ -1,5 +1,6 @@
 import api/agent
 import api/browse_api
+import api/cloud_writer
 import config
 import dns/name
 import dns/wire
@@ -16,6 +17,7 @@ import provider/provider
 import store/db
 import store/migrate
 import store/sqlite.{Int as VInt}
+import util/id
 import zone/build
 import zone/model.{type ZoneInput, Member, NsHost, TxtName, ZoneInput, ZoneMeta}
 import zone/render_external
@@ -807,4 +809,37 @@ fn txt_text(rd: BitArray) -> Result(String, Nil) {
     }
     _ -> Error(Nil)
   }
+}
+
+pub fn managed_reads_require_a_matching_hosted_attachment_test() {
+  let agents = process.new_name("managed_agents_" <> id.new())
+  let writers = process.new_name("managed_writers_" <> id.new())
+  let assert Ok(_) = agent.start(agents)
+  let assert Ok(_) = cloud_writer.start(writers)
+  let browse = browse_api.Browse(agents, "", writers, "")
+  // A customer-controlled label is not a hosted identity.
+  let customer = session("customer", "cloud-1@x.example")
+  let hosted = session("hosted", "cloud-1@x.example")
+  process.send(browse_api.registry(browse), agent.Join(customer))
+  process.send(browse_api.registry(browse), agent.Join(hosted))
+  assert list.length(browse_api.read_sessions(browse, "n1", False)) == 2
+  assert browse_api.read_sessions(browse, "n1", True) == []
+  let writer =
+    cloud_writer.Session(
+      "w",
+      "n1",
+      "o1",
+      "cloud-1",
+      hosted.origin,
+      hosted.key_id,
+      "dp-1",
+      1,
+      2,
+      0,
+      process.new_subject(),
+    )
+  process.send(browse_api.writers(browse), cloud_writer.Join(writer))
+  assert browse_api.read_sessions(browse, "n1", True) == [hosted]
+  process.send(browse_api.writers(browse), cloud_writer.Leave("w"))
+  assert browse_api.read_sessions(browse, "n1", True) == []
 }

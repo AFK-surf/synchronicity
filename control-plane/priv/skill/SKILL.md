@@ -735,6 +735,18 @@ rotation window, revoking a key. What it cannot take is the handful that would
 let it widen its own reach — **What a key can never reach**, below, is the
 whole list.
 
+### Managed-data-only org keys
+
+An owner/admin may mint `role: "managed_data"` through the existing API-key
+creation endpoint or Settings. Its immutable kind permits only hosted-network
+browse/file operations, delegation queries/mutations and replication queries
+through the CP. Reads require cloud hosting and a verified managed DP attachment;
+there is no fallback to customer daemons. Existing browse toggles still apply.
+It cannot list/manage orgs or networks, enroll formal devices, manage people or
+keys, change hosting/browsing settings, or access fleet `/dp/v1` APIs. It has the
+same hashed storage, expiry and revocation as other org keys. Revoking the key
+does not undo writes or revoke delegations it already issued.
+
 ### Getting a token
 
 An org owner or admin mints one under **Settings → API keys**. Both kinds look
@@ -853,6 +865,14 @@ switch:
 | `PUT` | `…/browse/file?space=&path=` | member | the body becomes the hosted replica's version of the path; `Content-Length` required, `If-Match: "<root>"` / `If-None-Match: *` honoured |
 | `DELETE` | `…/browse/file?space=&path=` | member | withdraws the hosted replica's version of the path — never a customer node's |
 | `GET` | `…/networks/<net>/delegations` | member | the delegated keys an attached daemon reports |
+| `PUT` | `…/networks/<net>/delegations/<key>` | member | hosted member creates/replaces its grant: `{"spaces":["docs"],"expires_at":<unix-seconds>}` |
+| `DELETE` | `…/networks/<net>/delegations/<key>` | member | hosted member withdraws its own grant; missing is success |
+
+Delegation mutations require cloud hosting and write-tunnel v2. The control
+plane only authenticates/routes them; the data plane publishes existing signed
+delegation records, with no invitation entity or zone naming. A timeout is an
+unknown outcome; retry the same absolute-expiry request. Replication and
+revocation are asynchronous, not termination of existing application sessions.
 
 Space and path are query parameters and never path segments — a file path may
 contain anything, separators included.

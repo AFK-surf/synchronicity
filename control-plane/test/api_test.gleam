@@ -2,9 +2,12 @@ import api/agent
 import api/auth_api
 import api/browse_api
 import api/cloud_writer
+import api/edge
 import api/reads
 import api/router
 import api/skill
+import api/socket_gateway
+import auth/api_key as auth_api_key
 import auth/dataplane_key
 import auth/google
 import auth/session
@@ -13,6 +16,7 @@ import dns/name as dns_name
 import dns/serve
 import dns/wire
 import email/mailer
+import envoy
 import exception
 import fixtures.{nk, now_unix, tmp_db}
 import gleam/bit_array
@@ -23,13 +27,17 @@ import gleam/int
 import gleam/json
 import gleam/list
 import gleam/option.{None, Some}
+import gleam/result
 import gleam/string
+import mist
+import simplifile
 import store/db
 import store/migrate
 import store/sqlite
 import util/id
 import wisp
 import wisp/simulate
+import wisp/wisp_mist
 import zone/model
 import zone/publish
 
@@ -2000,7 +2008,10 @@ pub fn api_key_carries_its_own_role_test() {
       ]),
     )
   assert owner_key.status == 400
-  assert string.contains(simulate.read_body(owner_key), "admin, member or join")
+  assert string.contains(
+    simulate.read_body(owner_key),
+    "admin, member, join or managed_data",
+  )
   assert call(h, keyed(admin, Get, "/api/orgs/acme/oidc")).status == 403
 }
 
@@ -4511,4 +4522,376 @@ pub fn hosting_decides_writes_and_hosting_off_drops_the_sessions_test() {
       authed(h, Get, "/api/orgs/acme/networks/prod/browse"),
     ))
   assert string.contains(off, "\"writes\":{\"enabled\":false")
+}
+
+fn delegation_mutations_with_role(role: String) {
+  let h = harness_sized(1)
+  org_with_network(h, "acme", "prod")
+  let path = "/api/orgs/acme/networks/prod/delegations/" <> nk()
+  let body =
+    json.object([
+      #("spaces", json.array(["docs"], json.string)),
+      #("expires_at", json.int(now_unix() + 600)),
+    ])
+  assert call(h, simulate.request(Put, path) |> simulate.json_body(body)).status
+    == 401
+  assert call_json(h, Put, path, body).status == 409
+  let join = mint_join(h, "acme", "prod", "not-a-delegation-issuer")
+  assert call(h, keyed(join, Put, path) |> simulate.json_body(body)).status
+    == 403
+  assert call(h, keyed(join, Delete, path)).status == 403
+  org_named(h, "other")
+  let wrong_org = mint(h, "other", "other-member", "member")
+  assert call(h, keyed(wrong_org, Delete, path)).status == 404
+  let member = mint(h, "acme", "delegation-issuer", role)
+  assert host_network(h, "acme", "prod", True) == 200
+  assert call_json(h, Put, path, body).status == 503
+  let conn = read_db(h)
+  let assert Ok([[sqlite.Text(network_id)]]) =
+    sqlite.query(conn, "SELECT id FROM networks WHERE name = 'prod'", [])
+  sqlite.close(conn)
+  let inbox = process.new_subject()
+  let writer =
+    cloud_writer.Session(
+      "delegate-test",
+      network_id,
+      "acme",
+      "cloud-1",
+      "cloud-1@prod.acme.sync.test",
+      "k1",
+      "dp-1",
+      1,
+      1,
+      now_unix(),
+      inbox,
+    )
+  let registry = browse_api.writers(h.ctx.browse)
+  process.send(registry, cloud_writer.Join(writer))
+  assert call_json(h, Put, path, body).status == 409
+  process.send(registry, cloud_writer.Leave(writer.id))
+  let parent = process.new_subject()
+  let ready = process.new_subject()
+  process.spawn_unlinked(fn() {
+    let inbox = process.new_subject()
+    process.send(ready, inbox)
+    list.each([1, 2], fn(_) {
+      let assert Ok(cloud_writer.Delegate(mutation, reply)) =
+        process.receive(inbox, 5000)
+      process.send(parent, json.to_string(mutation))
+      process.send(reply, cloud_writer.Delegated)
+    })
+  })
+  let assert Ok(inbox) = process.receive(ready, 1000)
+  process.send(
+    registry,
+    cloud_writer.Join(cloud_writer.Session(..writer, version: 2, inbox: inbox)),
+  )
+  assert call(h, keyed(member, Put, path) |> simulate.json_body(body)).status
+    == 200
+  let assert Ok(sent) = process.receive(parent, 5000)
+  assert string.contains(sent, "\"action\":\"put\"")
+  assert string.contains(sent, "\"spaces\":[\"docs\"]")
+  let replica = read_only(h, "https://primary.test")
+  assert call(replica, authed(replica, Delete, path)).status == 200
+  let assert Ok(sent) = process.receive(parent, 5000)
+  assert string.contains(sent, "\"action\":\"delete\"")
+}
+
+pub fn delegation_mutations_are_authenticated_hosted_and_thin_test() {
+  delegation_mutations_with_role("member")
+}
+
+pub fn managed_data_key_forwards_delegation_mutations_on_primary_and_replica_test() {
+  delegation_mutations_with_role("managed_data")
+}
+
+pub fn managed_data_keys_cannot_reach_control_or_other_orgs_test() {
+  let h = harness()
+  org_with_network(h, "acme", "prod")
+  org_with_network(h, "other", "prod")
+  let token = mint(h, "acme", "managed-only", "managed_data")
+  let body =
+    json.object([
+      #("spaces", json.array(["docs"], json.string)),
+      #("expires_at", json.int(now_unix() + 600)),
+    ])
+  list.each(
+    [
+      #(Get, "/api/me"),
+      #(Get, "/api/orgs/acme"),
+      #(Get, "/api/orgs/acme/networks"),
+      #(Delete, "/api/orgs/acme/networks/prod"),
+      #(Get, "/api/orgs/acme/devices"),
+      #(Post, "/api/orgs/acme/networks/prod/devices"),
+      #(Get, "/api/orgs/acme/api-keys"),
+      #(Post, "/api/orgs/acme/api-keys"),
+      #(Put, "/api/orgs/acme/networks/prod/browse/enabled"),
+      #(Put, "/api/orgs/acme/networks/prod/hosting"),
+    ],
+    fn(entry) {
+      let response =
+        call(h, keyed(token, entry.0, entry.1) |> simulate.json_body(body))
+      // A malformed body can be refused before the permission gate; never success.
+      assert response.status >= 400
+    },
+  )
+  assert call(h, keyed(token, Get, "/dp/v1/networks")).status == 403
+  assert call(h, keyed(token, Get, "/api/orgs/other/networks/prod/browse")).status
+    == 404
+  assert call(h, keyed(token, Get, "/api/orgs/acme/networks/prod/browse")).status
+    == 409
+  assert host_network(h, "acme", "prod", True) == 200
+  assert call(h, keyed(token, Get, "/api/orgs/acme/networks/prod/browse")).status
+    == 200
+  let path = "/api/orgs/acme/networks/prod/delegations/" <> nk()
+  // These reach DP selection, not the generic org gate.
+  assert call(h, keyed(token, Put, path) |> simulate.json_body(body)).status
+    == 503
+  assert call(h, keyed(token, Delete, path)).status == 503
+  // Streaming file authorization uses the same hosted-only scope gate.
+  let conn = read_db(h)
+  let assert Ok(who) = auth_api_key.authenticate(conn, token, now_unix())
+  sqlite.close(conn)
+  let pool = case h.ctx.api {
+    router.Writable(a) -> a.reads.pool
+    router.ReadOnly(r, _) -> r.pool
+  }
+  let assert Ok(_) = browse_api.for_download(pool, who, "acme", "prod")
+  let assert Error(_) = browse_api.for_download(pool, who, "other", "prod")
+  // Kind is immutable, even when a human admin edits a key.
+  let conn = read_db(h)
+  let assert Ok([[sqlite.Text(key_id)]]) =
+    sqlite.query(
+      conn,
+      "SELECT id FROM api_keys WHERE name = 'managed-only'",
+      [],
+    )
+  sqlite.close(conn)
+  assert call_json(
+      h,
+      Patch,
+      "/api/orgs/acme/api-keys/" <> key_id,
+      json.object([#("role", json.string("admin"))]),
+    ).status
+    == 400
+  assert call(h, authed(h, Delete, "/api/orgs/acme/api-keys/" <> key_id)).status
+    == 200
+  assert call(h, keyed(token, Get, "/api/orgs/acme/networks/prod/browse")).status
+    == 401
+}
+
+pub fn managed_key_migration_preserves_existing_tokens_and_kind_is_fixed_test() {
+  let h = harness()
+  org_with_network(h, "acme", "prod")
+  let member = mint(h, "acme", "member-before", "member")
+  let admin = mint(h, "acme", "admin-before", "admin")
+  let join = mint_join(h, "acme", "prod", "join-before")
+  let assert Ok(conn) = db.open_primary(h.db_path)
+  let assert Ok(before) =
+    sqlite.query(conn, "SELECT * FROM api_keys ORDER BY id", [])
+  // Exercise the v14→v15 table rebuild over real token/scope/expiry rows.
+  let assert Ok(_) = sqlite.exec(conn, "PRAGMA user_version = 14", [])
+  let assert Ok(15) = migrate.migrate(conn)
+  let assert Ok(after) =
+    sqlite.query(conn, "SELECT * FROM api_keys ORDER BY id", [])
+  assert after == before
+  list.each([member, admin, join], fn(token) {
+    let assert Ok(_) = auth_api_key.authenticate(conn, token, now_unix())
+  })
+  let assert Ok([[sqlite.Text(key_id)]]) =
+    sqlite.query(
+      conn,
+      "SELECT id FROM api_keys WHERE name = 'member-before'",
+      [],
+    )
+  sqlite.close(conn)
+  assert call_json(
+      h,
+      Patch,
+      "/api/orgs/acme/api-keys/" <> key_id,
+      json.object([#("role", json.string("managed_data"))]),
+    ).status
+    == 400
+  let token = mint(h, "acme", "managed-expiring", "managed_data")
+  let assert Ok(conn) = db.open_primary(h.db_path)
+  let assert Ok(_) =
+    sqlite.exec(
+      conn,
+      "UPDATE api_keys SET expires_at = ? WHERE name = 'managed-expiring'",
+      [sqlite.Int(now_unix() - 1)],
+    )
+  let assert Error(_) = auth_api_key.authenticate(conn, token, now_unix())
+  sqlite.close(conn)
+}
+
+pub fn socket_gateway_bearer_scope_and_revocation_test() {
+  let h = harness()
+  org_with_network(h, "acme", "prod")
+  org_with_network(h, "other", "prod")
+  let pool = case h.ctx.api {
+    router.Writable(a) -> a.reads.pool
+    router.ReadOnly(r, _) -> r.pool
+  }
+  let token = mint(h, "acme", "gateway", "managed_data")
+  let headers = [#("authorization", "Bearer " <> token)]
+  let assert Error(#(401, _)) =
+    socket_gateway.authorize([], pool, "acme", "prod")
+  let assert Error(#(401, _)) =
+    socket_gateway.authorize(
+      [#("cookie", "session=" <> h.token)],
+      pool,
+      "acme",
+      "prod",
+    )
+  let assert Error(#(404, _)) =
+    socket_gateway.authorize(headers, pool, "acme", "prod")
+  assert host_network(h, "acme", "prod", True) == 200
+  let assert Ok(_) = socket_gateway.authorize(headers, pool, "acme", "prod")
+  let assert Error(#(404, _)) =
+    socket_gateway.authorize(headers, pool, "other", "prod")
+  let join = mint_join(h, "acme", "prod", "gateway-join")
+  let assert Error(_) =
+    socket_gateway.authorize(
+      [#("authorization", "Bearer " <> join)],
+      pool,
+      "acme",
+      "prod",
+    )
+  let assert Ok(conn) = db.open_primary(h.db_path)
+  let assert Ok(_) =
+    sqlite.exec(
+      conn,
+      "UPDATE api_keys SET expires_at = 1 WHERE name = 'gateway'",
+      [],
+    )
+  sqlite.close(conn)
+  let assert Error(#(401, _)) =
+    socket_gateway.authorize(headers, pool, "acme", "prod")
+}
+
+/// Local-only server fixture for e2e/socket-gateway.py. The managed actor echoes
+/// bytes, so the test isolates the real HTTP/WS edge from the DP transport.
+pub fn gateway_fixture() {
+  let h = harness()
+  org_with_network(h, "acme", "prod")
+  assert host_network(h, "acme", "prod", True) == 200
+  let token = mint(h, "acme", "gateway-fixture", "managed_data")
+  let pool = case h.ctx.api {
+    router.Writable(a) -> a.reads.pool
+    router.ReadOnly(r, _) -> r.pool
+  }
+  let assert Ok(network_id) =
+    socket_gateway.authorize(
+      [#("authorization", "Bearer " <> token)],
+      pool,
+      "acme",
+      "prod",
+    )
+  let ready = process.new_subject()
+  process.spawn_unlinked(fn() {
+    let inbox = process.new_subject()
+    process.send(ready, inbox)
+    echo_gateway(inbox, [], 1)
+  })
+  let assert Ok(inbox) = process.receive(ready, 1000)
+  let registry = browse_api.writers(h.ctx.browse)
+  process.send(
+    registry,
+    cloud_writer.Join(cloud_writer.Session(
+      "gateway",
+      network_id,
+      "acme",
+      "cloud-1",
+      "cloud-1@prod.acme.sync.test",
+      "key",
+      "dp-1",
+      1,
+      3,
+      now_unix(),
+      inbox,
+    )),
+  )
+  let assert Ok(port) = envoy.get("GATEWAY_TEST_PORT") |> result.try(int.parse)
+  let handler = fn(req) { router.handle(req, h.ctx) }
+  let assert Ok(_) =
+    handler
+    |> wisp_mist.handler("test-secret")
+    |> edge.handler(edge.Surface(h.ctx.browse, pool, "test-secret"))
+    |> mist.new
+    |> mist.bind("127.0.0.1")
+    |> mist.port(port)
+    |> mist.start
+  let assert Ok(path) = envoy.get("GATEWAY_TEST_READY")
+  let assert Ok(_) =
+    simplifile.write(
+      path,
+      json.to_string(
+        json.object([
+          #("token", json.string(token)),
+          #("database", json.string(h.db_path)),
+        ]),
+      ),
+    )
+  process.sleep_forever()
+}
+
+fn echo_gateway(
+  inbox: process.Subject(cloud_writer.Ask),
+  streams: List(#(Int, process.Subject(cloud_writer.Event))),
+  next_id: Int,
+) {
+  let ask = process.receive_forever(inbox)
+  case ask {
+    cloud_writer.SocketOpen(_, name, reply) -> {
+      process.send(reply, cloud_writer.Assigned(next_id))
+      case name {
+        "refuse" ->
+          process.send(
+            reply,
+            cloud_writer.Failed("unauthorized", "denied by peer"),
+          )
+        _ ->
+          process.send(
+            reply,
+            cloud_writer.SocketInfo(
+              "{\"t\":\"socketopened\",\"controller\":\"test-key\"}",
+            ),
+          )
+      }
+      echo_gateway(inbox, [#(next_id, reply), ..streams], next_id + 1)
+    }
+    cloud_writer.SocketList(_, reply) -> {
+      process.send(reply, cloud_writer.Assigned(next_id))
+      process.send(
+        reply,
+        cloud_writer.SocketInfo("{\"t\":\"socketlist\",\"sockets\":[]}"),
+      )
+      echo_gateway(inbox, streams, next_id + 1)
+    }
+    cloud_writer.Chunk(id, seq, data) -> {
+      let assert Ok(reply) = list.key_find(streams, id)
+      process.send(reply, cloud_writer.SocketData(seq, data))
+      process.send(reply, cloud_writer.Credit(id, 1))
+      echo_gateway(inbox, streams, next_id)
+    }
+    cloud_writer.SocketEof(id) -> {
+      let assert Ok(reply) = list.key_find(streams, id)
+      process.send(reply, cloud_writer.SocketInfo("{\"t\":\"socketeof\"}"))
+      process.send(
+        reply,
+        cloud_writer.SocketEnd("{\"t\":\"socketclosed\",\"status\":{\"Ok\":0}}"),
+      )
+      echo_gateway(inbox, streams, next_id)
+    }
+    cloud_writer.Cancel(id) -> {
+      let assert Ok(path) = envoy.get("GATEWAY_TEST_CANCEL")
+      let assert Ok(_) = simplifile.write(path, int.to_string(id))
+      echo_gateway(
+        inbox,
+        list.filter(streams, fn(pair) { pair.0 != id }),
+        next_id,
+      )
+    }
+    _ -> echo_gateway(inbox, streams, next_id)
+  }
 }

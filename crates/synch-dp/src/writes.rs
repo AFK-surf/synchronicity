@@ -35,7 +35,7 @@ use tokio_tungstenite::tungstenite::{client::IntoClientRequest, Message};
 ///
 /// Its own counter, unrelated to the browse tunnel's: the two share a
 /// handshake shape and nothing else.
-pub const PROTOCOL_VERSION: u32 = 1;
+pub const PROTOCOL_VERSION: u32 = 3;
 
 /// The oldest settled version this build serves under.
 const MIN_PROTOCOL_VERSION: u32 = 1;
@@ -103,6 +103,25 @@ pub enum Down {
         /// The protocol version the control plane settled on.
         v: u32,
     },
+    /// Version 2: mutate the hosted member's own delegation record.
+    Delegate {
+        /// Request identifier.
+        id: u32,
+        /// Generic delegation operation.
+        mutation: crate::delegates::Mutation,
+    },
+    /// Version 3: list sockets as the hosted member.
+    SocketList { id: u32, origin: String },
+    /// Version 3: open an opaque duplex socket stream.
+    SocketOpen {
+        id: u32,
+        origin: String,
+        socket: String,
+    },
+    /// Return one output-frame credit.
+    SocketAck { id: u32 },
+    /// Half-close the input after all queued bytes.
+    SocketEof { id: u32 },
     /// Open a write of exactly `size` bytes.
     Put {
         /// The request id.
@@ -187,6 +206,31 @@ pub enum Up {
         sig: String,
         /// The device key that produced it, z-base-32.
         key: String,
+    },
+    /// The requested delegation mutation has been published.
+    Delegated {
+        /// Request identifier.
+        id: u32,
+    },
+    /// Socket listing and the actual calling identity.
+    SocketList {
+        id: u32,
+        controller: String,
+        origin: String,
+        sockets: serde_json::Value,
+    },
+    /// The remote socket admitted this connection; one input credit.
+    SocketOpened {
+        id: u32,
+        controller: String,
+        origin: String,
+    },
+    /// The remote byte stream reached EOF.
+    SocketEof { id: u32 },
+    /// Both directions finished.
+    SocketClosed {
+        id: u32,
+        status: synch_core::SockStatus,
     },
     /// A write may begin.
     Opened {
@@ -693,6 +737,10 @@ where
 
     let mut in_flight: HashMap<u32, Write> = HashMap::new();
     let mut requests: usize = 0;
+    let mut sockets = crate::socket_gateway::Gateway::new();
+    // One deferred rejection bounds memory without evicting admitted streams.
+    // Pause incoming frames while it waits; writer failures and heartbeats still run.
+    let mut pending_refusal = None;
     let mut beat = tokio::time::interval_at(tokio::time::Instant::now() + HEARTBEAT, HEARTBEAT);
     beat.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     let mut unanswered = 0u32;
@@ -721,7 +769,11 @@ where
                 unanswered += 1;
                 let _ = writes.try_send(text(&Up::Ping)?);
             }
-            incoming = stream.next() => {
+            permit = writes.reserve(), if pending_refusal.is_some() => {
+                let permit = permit.map_err(|_| crate::DpError::Control("tunnel writer closed".into()))?;
+                permit.send(pending_refusal.take().expect("guarded pending refusal"));
+            }
+            incoming = stream.next(), if pending_refusal.is_none() => {
                 let Some(incoming) = incoming else { return Ok(()) };
                 let incoming = incoming
                     .map_err(|e| crate::DpError::Control(format!("the tunnel read failed: {e}")))?;
@@ -731,11 +783,36 @@ where
                         let frame: Down = serde_json::from_str(&body).map_err(|e| {
                             crate::DpError::Control(format!("malformed tunnel frame: {e}"))
                         })?;
-                        handle(node, session, limits, &writes, &internal, &mut in_flight, &mut requests, frame)?;
+                        match frame {
+                            Down::SocketList { id, origin } => pending_refusal = sockets.open(node, &writes, id, origin, None)?,
+                            Down::SocketOpen { id, origin, socket } => pending_refusal = sockets.open(node, &writes, id, origin, Some(socket))?,
+                            Down::SocketAck { id } => {
+                                if let Err(error) = sockets.ack(id) {
+                                    sockets.cancel(id);
+                                    refuse(&writes, id, "invalid", error.to_string());
+                                }
+                            }
+                            Down::SocketEof { id } => sockets.eof(id),
+                            Down::Cancel { id } => {
+                                sockets.cancel(id);
+                                handle(node, session, limits, &writes, &internal, &mut in_flight, &mut requests, Down::Cancel { id })?;
+                            }
+                            frame => handle(node, session, limits, &writes, &internal, &mut in_flight, &mut requests, frame)?,
+                        }
                     }
                     Message::Binary(frame) => {
                         unanswered = 0;
-                        content(&writes, &mut in_flight, &frame)?;
+                        match decode_chunk(&frame) {
+                            Some((id, seq, data)) if sockets.contains(id) => {
+                                // A peer can complete while CP's valid input is in flight.
+                                // Per-invocation failure must never end the shared tunnel.
+                                if let Err(error) = sockets.chunk(id, seq, data) {
+                                    sockets.cancel(id);
+                                    refuse(&writes, id, "invalid", error.to_string());
+                                }
+                            }
+                            _ => content(&writes, &mut in_flight, &frame)?,
+                        }
                     }
                     Message::Close(_) => return Ok(()),
                     Message::Ping(_) | Message::Pong(_) | Message::Frame(_) => unanswered = 0,
@@ -887,6 +964,35 @@ fn handle(
                 },
             );
         }
+        Down::Delegate { id, mutation } => {
+            if over_capacity(writes, in_flight, *requests, id) {
+                return Ok(());
+            }
+            *requests += 1;
+            let node = node.clone();
+            let writes = writes.clone();
+            let internal = internal.clone();
+            tokio::spawn(async move {
+                let result =
+                    synch_core::offload(move || crate::delegates::apply(&node, mutation)).await;
+                let frame = match result {
+                    Ok(()) => Up::Delegated { id },
+                    Err(error) => Up::Err {
+                        id: Some(id),
+                        code: match &error {
+                            EngineError::Invalid(_) => "invalid",
+                            _ => "unavailable",
+                        }
+                        .into(),
+                        message: error.to_string(),
+                    },
+                };
+                if let Ok(message) = text(&frame) {
+                    let _ = writes.send(message).await;
+                }
+                let _ = internal.send(Internal::RequestDone).await;
+            });
+        }
         Down::Delete {
             id,
             space,
@@ -925,6 +1031,14 @@ fn handle(
             });
         }
         Down::Challenge { .. } | Down::Attached { .. } => {}
+        Down::SocketList { .. }
+        | Down::SocketOpen { .. }
+        | Down::SocketAck { .. }
+        | Down::SocketEof { .. } => {
+            return Err(crate::DpError::Control(
+                "socket frame outside gateway".into(),
+            ));
+        }
     }
     Ok(())
 }
@@ -1344,7 +1458,7 @@ fn unwrap_offload(e: EngineError) -> Refusal {
     e.into()
 }
 
-fn text(frame: &Up) -> crate::Result<Message> {
+pub(crate) fn text(frame: &Up) -> crate::Result<Message> {
     serde_json::to_string(frame)
         .map(Message::text)
         .map_err(|e| crate::DpError::Control(format!("could not encode a tunnel frame: {e}")))
@@ -1392,6 +1506,7 @@ where
 mod tests {
     use super::*;
     use synch_engine::NodeConfig;
+    include!("socket_gateway_tests.rs");
 
     fn down_msg(frame: &Down) -> Message {
         Message::text(serde_json::to_string(frame).unwrap())
@@ -1490,6 +1605,35 @@ mod tests {
             staging: StagingBudget::new(1 << 20),
             budget_bytes: 0,
         }
+    }
+
+    #[tokio::test(flavor = "multi_thread")]
+    async fn delegation_frames_publish_and_withdraw_existing_records() {
+        let _scope = synch_core::BlockingScope::enter();
+        let (_dir, node) = tenant().await;
+        let (down, mut up, task) = session(&node, limits());
+        let key = iroh_base::SecretKey::generate().public().to_z32();
+        down.send(down_msg(&Down::Delegate {
+            id: 1,
+            mutation: crate::delegates::Mutation::Put {
+                key: key.clone(),
+                spaces: vec!["docs".into()],
+                expires_at: synch_core::now_ns() / 1_000_000_000 + 600,
+            },
+        }))
+        .unwrap();
+        assert!(matches!(next_up(&mut up).await, Up::Delegated { id: 1 }));
+        assert_eq!(node.delegations().unwrap().len(), 1);
+        down.send(down_msg(&Down::Delegate {
+            id: 2,
+            mutation: crate::delegates::Mutation::Delete { key },
+        }))
+        .unwrap();
+        assert!(matches!(next_up(&mut up).await, Up::Delegated { id: 2 }));
+        assert!(node.delegations().unwrap().is_empty());
+        drop(down);
+        task.await.unwrap().unwrap();
+        node.shutdown().await.unwrap();
     }
 
     /// A whole write round-trips: `put`, frames under credit, `commit`, and

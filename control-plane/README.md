@@ -137,6 +137,17 @@ and RFC 8484 DoH — and gives organizations a dashboard to manage them.
   deployment and recorded nowhere here — is
   [docs/CLOUD-WRITES.md](../docs/CLOUD-WRITES.md).
 
+## Managed socket gateway
+
+Hosted networks expose socket discovery and duplex WebSocket connections through
+CP. Managed DP calls as its hosted-member identity; clients need an org API key,
+not a synch daemon. This permits whatever socket authority targets give that
+hosted member. Cookie-only access is not allowed.
+
+See [Socket gateway](../docs/SOCKET-GATEWAY.md) for endpoints, authority, credit,
+half-close, failure semantics, and the CP + DP tunnel-v3 rollout requirement.
+Customer browse tunnels are unchanged.
+
 ## API keys
 
 For scripts, CI and anything else that is not a person at a browser. Org
@@ -756,3 +767,16 @@ start: a credential that quietly does nothing is a lie. See
 
 Day-2 operations (replicas, key ceremony, backups) live in
 `ops/RUNBOOK.md`.
+
+## Hosted delegate registration
+
+The authenticated network delegation PUT/DELETE routes are thin proxies to
+the managed data plane. See [Hosted delegation API](../docs/HOSTED-DELEGATES.md)
+for the request contract, v2 compatibility and retry/revocation semantics.
+
+## Managed-data-only credentials
+
+Org admins can mint an immutable `managed_data` API-key kind for CP-mediated
+hosted data operations without org/device/network administration. See
+[managed-data key boundaries](../docs/MANAGED-DATA-KEYS.md) for the exact surface,
+verified hosted-only read routing, migration and revocation semantics.
