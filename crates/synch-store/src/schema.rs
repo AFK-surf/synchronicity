@@ -116,12 +116,29 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
 /// to strip markers to answer either would be one more place to get the
 /// boundary wrong.
 ///
-/// Nothing is backfilled, for v17's reason: the rows are a materialized view
-/// of `d:` leaves, and no record published before this version names a
-/// read-only space. `NULL` is the empty list, as it is for `spaces`.
+/// Nothing is backfilled from this database's own rows, for v17's reason:
+/// they are a materialized view of `d:` leaves. But the leaves themselves
+/// may be ahead of the rows. A member on an earlier build that met a record
+/// stamped past what it reads refused it — which is erasing its row while
+/// the leaf stays in a trie it holds complete — and materialization only
+/// ever applies deltas, so nothing would revisit that leaf until its issuer
+/// changed it. The step therefore leaves a durable marker that
+/// [`Store::open`](crate::Store::open) consumes by rebuilding every origin
+/// whose `d:` leaves have no row (`rematerialize_unheld_delegations`). A
+/// marker rather than the rebuild itself, because the rebuild is the Lean
+/// materializer running over the whole store, and a step of this chain is
+/// one SQL transaction; a marker survives a crash between the two, so the
+/// rebuild runs until it has run once. `NULL` is the empty list, as it is
+/// for `spaces`.
 const V30_READ_ONLY_DELEGATIONS: &str = r#"
 ALTER TABLE bindings ADD COLUMN read_only TEXT; -- delegated: newline-separated read-only space ids
+INSERT INTO config (key, value) VALUES ('rematerialize_delegations', '1')
+  ON CONFLICT(key) DO UPDATE SET value = excluded.value;
 "#;
+
+/// The config key v30 leaves for [`Store::open`](crate::Store::open): the
+/// `d:` leaves of every held trie must be re-read once.
+pub(crate) const REMATERIALIZE_DELEGATIONS: &str = "rematerialize_delegations";
 
 /// v29 — a socket is a name, and the path it used to be is its program
 /// (`docs/SOCKET-PROGRAMS.md` §8).

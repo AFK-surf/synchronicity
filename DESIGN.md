@@ -540,7 +540,12 @@ meant to withhold writes from as merely unmentioned. Stamped, the older build
 refuses the record whole, which is what a delegation it cannot read must do
 (§4.2). A record naming no read-only space keeps `v: 1`, byte-identical to what
 every build has always published, so a rolling upgrade changes nothing for
-the grants already in force.
+the grants already in force. Refusing a record is erasing its row while the
+leaf stays in a trie the member holds complete, and materialization applies
+deltas — so a member upgraded *after* meeting such a record would never revisit
+the leaf. The upgrade therefore rebuilds, once, every origin whose `d:` leaves
+have no row (§10), and the delegate is admitted from the first start of the
+build that reads the grant.
 
 **A delegation binds `OriginId::Key` only.** If it could name a `Named` origin, any
 member could delegate `nas@cluster.example.com` and squat a label the DNS zone

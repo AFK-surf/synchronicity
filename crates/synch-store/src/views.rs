@@ -7,10 +7,10 @@
 use crate::{
     db::{hash_column, origin_column, Store, Txn},
     error::{Result, StoreError},
+    Slot,
 };
 use rusqlite::{params, OptionalExtension};
 use synch_core::{AdState, BlobAd, EntryKind, FileEntry, Hash, OriginId, MAX_PROVIDER_ADS};
-#[cfg(test)]
 use synch_mpt::Trie;
 
 /// One row of the `entries` view.
@@ -619,6 +619,79 @@ impl Store {
             txn.delete_origin_delegations(origin)?;
             txn.materialize_diff(origin, Hash::EMPTY, root)
         })
+    }
+
+    /// Rebuilds the derived views of every foreign origin whose complete
+    /// trie holds a `d:` leaf this store has no binding row for (§3.5).
+    ///
+    /// The repair the v30 upgrade asks for, once. A member that predates
+    /// read-only delegations refused a `d:` record stamped past what it
+    /// reads, and refusing it is erasing its row while the leaf stays in a
+    /// trie the member already holds complete. Materialization applies
+    /// deltas, so after the upgrade nothing revisits that leaf until its
+    /// issuer changes it — and the subject stays unadmitted here for as long
+    /// as the grant stands. Rebuilding the origins where a leaf and its row
+    /// disagree closes that: the rebuild reads every leaf under the build
+    /// that now understands it, through the same materializer a fresh fetch
+    /// would, and an origin whose leaves all have rows is left alone.
+    ///
+    /// A leaf with no row is also what a malformed record leaves behind, so
+    /// the rebuild may find nothing to add; that costs one re-materialization
+    /// of that origin, once. An origin that cannot be walked or rebuilt is
+    /// skipped with a warning rather than keeping the store from opening:
+    /// `repair rebuild-views` is the operator's tool for that, and the
+    /// origins that can be repaired still are. Returns how many were rebuilt.
+    pub fn rematerialize_unheld_delegations(&self) -> Result<usize> {
+        let own = self.self_origin()?;
+        let mut rebuilt = 0;
+        for stored in self.all_heads(Slot::Complete)? {
+            let origin = &stored.head.origin;
+            if own.as_ref() == Some(origin) {
+                continue;
+            }
+            let root = stored.head.root;
+            let leaves = match Trie::new(self).scan(root, b"d:", None, None) {
+                Ok(leaves) => leaves,
+                Err(error) => {
+                    tracing::warn!(
+                        origin = %origin.canonical(),
+                        %error,
+                        "could not walk an origin's delegations after the upgrade"
+                    );
+                    continue;
+                }
+            };
+            let issuer = origin.canonical();
+            let mut unheld = false;
+            for (key, _) in &leaves {
+                let Ok(subject) = synch_core::parse_delegation_key(key) else {
+                    continue;
+                };
+                let held: bool = self.conn().query_row(
+                    "SELECT EXISTS(
+                       SELECT 1 FROM bindings
+                        WHERE source = 'delegated' AND issuer = ?1 AND node_id = ?2)",
+                    params![issuer, subject.as_bytes().to_vec()],
+                    |row| row.get(0),
+                )?;
+                if !held {
+                    unheld = true;
+                    break;
+                }
+            }
+            if !unheld {
+                continue;
+            }
+            match self.rematerialize(origin, root) {
+                Ok(_) => rebuilt += 1,
+                Err(error) => tracing::warn!(
+                    origin = %issuer,
+                    %error,
+                    "could not rebuild an origin's derived views after the upgrade"
+                ),
+            }
+        }
+        Ok(rebuilt)
     }
 
     // ---- local roles ------------------------------------------------------
@@ -1700,6 +1773,118 @@ mod tests {
             find(&future).is_none(),
             "a record past the stamp this build reads granted something"
         );
+    }
+
+    /// The v30 upgrade re-reads the `d:` leaves an older build refused
+    /// (§3.5). A member that predates read-only delegations met a stamped
+    /// record, erased its row, and kept the leaf in a trie it holds
+    /// complete; nothing changes that leaf afterwards, so a delta
+    /// materialization would leave the subject unadmitted for as long as the
+    /// grant stands. Opening the upgraded database rebuilds that origin,
+    /// clears the marker, and leaves an origin whose rows are whole alone.
+    #[test]
+    fn upgrading_to_v30_rebuilds_delegations_an_older_build_refused() {
+        use crate::schema::REMATERIALIZE_DELEGATIONS;
+        use synch_core::{SignedHead, MIN_TRUSTED_NS};
+
+        let dir = tempfile::tempdir().unwrap();
+        let now = MIN_TRUSTED_NS + 1;
+        let refusing = origin_named("nas");
+        let whole = origin_named("vps");
+        let refused = iroh_base::SecretKey::generate().public();
+        let materialized = iroh_base::SecretKey::generate().public();
+        let record = |read_only: Vec<String>| {
+            postcard::to_stdvec(&synch_core::Delegation {
+                v: synch_core::Delegation::version_for(&read_only),
+                spaces: vec!["photos".to_string()],
+                not_after: MIN_TRUSTED_NS + 86_400_000_000_000,
+                note: None,
+                read_only,
+            })
+            .unwrap()
+        };
+        {
+            let store = Store::open(dir.path()).unwrap();
+            store.set_self_origin(&origin_named("self")).unwrap();
+            for issuer in [&refusing, &whole] {
+                let key = iroh_base::SecretKey::generate();
+                store
+                    .put_binding(&crate::Binding {
+                        origin: issuer.clone(),
+                        node_id: key.public(),
+                        source: crate::BindingSource::Static,
+                        domain: None,
+                        issuer: None,
+                        spaces: Vec::new(),
+                        read_only: Vec::new(),
+                        note: None,
+                        added_at: 0,
+                        expires_at: None,
+                    })
+                    .unwrap();
+                let (subject, leaf, materialize) = match issuer == &refusing {
+                    true => (refused, record(vec!["docs".to_string()]), false),
+                    false => (materialized, record(Vec::new()), true),
+                };
+                let trie = Trie::new(&store);
+                let root = trie
+                    .insert(Hash::EMPTY, &synch_core::delegation_key(&subject), &leaf)
+                    .unwrap();
+                let head = SignedHead::sign(&key, issuer.clone(), 1, root, now);
+                store
+                    .transaction(|txn| -> Result<()> {
+                        txn.put_head(Slot::Complete, &head, now, now)?;
+                        // What the older build stored: the head complete, the
+                        // leaf in the trie, and — for the stamped record it
+                        // could not read — no row.
+                        if materialize {
+                            txn.materialize_diff(issuer, Hash::EMPTY, root)?;
+                        }
+                        Ok(())
+                    })
+                    .unwrap();
+            }
+            assert!(!store.is_trusted_key(&refused, now).unwrap());
+            assert!(store.is_trusted_key(&materialized, now).unwrap());
+            let whole_row_added_at = store.bindings_for_key(&materialized).unwrap()[0].added_at;
+
+            // Wind the database back to the shape v29 left it in.
+            store
+                .conn()
+                .execute_batch(
+                    "ALTER TABLE bindings DROP COLUMN read_only;
+                     UPDATE config SET value = '29' WHERE key = 'schema_version';",
+                )
+                .unwrap();
+            assert_eq!(store.config(REMATERIALIZE_DELEGATIONS).unwrap(), None);
+            drop(store);
+
+            let store = Store::open(dir.path()).unwrap();
+            let grant = store
+                .bindings_for_key(&refused)
+                .unwrap()
+                .into_iter()
+                .find(|b| b.source == crate::BindingSource::Delegated)
+                .expect("the upgrade re-read the leaf the older build refused");
+            assert_eq!(grant.spaces, ["photos"]);
+            assert_eq!(grant.read_only, ["docs"]);
+            assert!(store.is_trusted_key(&refused, now).unwrap());
+            assert_eq!(
+                store.bindings_for_key(&materialized).unwrap()[0].added_at,
+                whole_row_added_at,
+                "an origin whose rows were whole was rebuilt"
+            );
+            assert_eq!(
+                store.config(REMATERIALIZE_DELEGATIONS).unwrap(),
+                None,
+                "the marker outlived the rebuild"
+            );
+            assert_eq!(store.rematerialize_unheld_delegations().unwrap(), 0);
+        }
+        // A fresh database carries the marker only until its first open.
+        let fresh = tempfile::tempdir().unwrap();
+        let store = Store::open(fresh.path()).unwrap();
+        assert_eq!(store.config(REMATERIALIZE_DELEGATIONS).unwrap(), None);
     }
 
     #[test]

@@ -36,6 +36,7 @@ async fn socket_gateway_streams_remote_bytes_and_cancels_on_tunnel_loss() {
                 domain: None,
                 issuer: None,
                 spaces: vec![],
+                read_only: vec![],
                 note: None,
                 added_at: 0,
                 expires_at: None,

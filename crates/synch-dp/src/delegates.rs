@@ -40,7 +40,10 @@ pub fn apply(node: &Node, mutation: Mutation) -> Result<(), EngineError> {
             let until = expires_at
                 .checked_mul(1_000_000_000)
                 .ok_or_else(|| EngineError::invalid("expiry overflows Unix nanoseconds"))?;
-            node.delegate_add(subject, &spaces, until, None)?
+            // Hosted grants are read-write; the control plane has no
+            // read-only surface yet, and a mutation that named none would
+            // keep the version-1 record every member reads.
+            node.delegate_add(subject, &spaces, &[], until, None)?
         }
         Mutation::Delete { .. } => match node.delegate_remove(&subject) {
             Ok(change) => change,

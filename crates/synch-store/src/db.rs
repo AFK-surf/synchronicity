@@ -439,23 +439,47 @@ impl Store {
     }
 
     fn init(&self, options: StoreOptions) -> Result<()> {
-        let mut conn = self.conn();
-        conn.pragma_update(None, "foreign_keys", "ON")?;
-        // WAL keeps readers off the writer's back; NORMAL is the §10 setting.
-        let _: String = conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
-        conn.pragma_update(None, "synchronous", "NORMAL")?;
-        if options.checkpointing == Checkpointing::Embedder {
-            // Zero disables it. Set before `migrate` runs, so not one frame of
-            // this store's life is recycled by anybody but the embedder.
-            conn.pragma_update(None, "wal_autocheckpoint", 0)?;
+        {
+            let mut conn = self.conn();
+            conn.pragma_update(None, "foreign_keys", "ON")?;
+            // WAL keeps readers off the writer's back; NORMAL is the §10 setting.
+            let _: String = conn.query_row("PRAGMA journal_mode=WAL", [], |row| row.get(0))?;
+            conn.pragma_update(None, "synchronous", "NORMAL")?;
+            if options.checkpointing == Checkpointing::Embedder {
+                // Zero disables it. Set before `migrate` runs, so not one frame of
+                // this store's life is recycled by anybody but the embedder.
+                conn.pragma_update(None, "wal_autocheckpoint", 0)?;
+            }
+            // Litestream checkpoints in a second process. A trie GC transaction
+            // can legitimately hold the write lock beyond SQLite's old five
+            // second wait, so give replication and daemon writers room to queue
+            // instead of surfacing transient SQLITE_BUSY as an engine fault.
+            conn.pragma_update(None, "busy_timeout", 30_000)?;
+            migrate(&mut conn, MIGRATIONS)?;
         }
-        // Litestream checkpoints in a second process. A trie GC transaction
-        // can legitimately hold the write lock beyond SQLite's old five
-        // second wait, so give replication and daemon writers room to queue
-        // instead of surfacing transient SQLITE_BUSY as an engine fault.
-        conn.pragma_update(None, "busy_timeout", 30_000)?;
-        migrate(&mut conn, MIGRATIONS)?;
-        Ok(())
+        self.finish_upgrade()
+    }
+
+    /// The part of an upgrade a migration step cannot do on its own (§10).
+    ///
+    /// A step is one SQL transaction; work that needs the store — the Lean
+    /// materializer over held tries — runs here, off a marker the step left
+    /// in `config`, and clears the marker only once it has run. A crash in
+    /// between leaves the marker, so the next open finishes the job; a
+    /// database that never needed it carries no marker and does nothing.
+    fn finish_upgrade(&self) -> Result<()> {
+        use crate::schema::REMATERIALIZE_DELEGATIONS;
+        if self.config(REMATERIALIZE_DELEGATIONS)?.is_none() {
+            return Ok(());
+        }
+        let rebuilt = self.rematerialize_unheld_delegations()?;
+        if rebuilt > 0 {
+            tracing::info!(
+                origins = rebuilt,
+                "rebuilt the derived views of origins whose delegations an earlier build could not read"
+            );
+        }
+        self.clear_config(REMATERIALIZE_DELEGATIONS)
     }
 
     /// The data directory.
