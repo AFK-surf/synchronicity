@@ -129,6 +129,31 @@ async fn socket_gateway_streams_remote_bytes_and_cancels_on_tunnel_loss() {
         next_up(&mut up).await,
         Up::SocketOpened { id: 4, .. }
     ));
+    // The peer ends its invocation while CP still owns one input credit.
+    // Input already in flight must not take down the shared managed tunnel.
+    assert!(remote.socket_kill(remote.socket_ps(None)[0].id));
+    assert!(matches!(next_up(&mut up).await, Up::SocketEof { id: 4 }));
+    assert!(matches!(
+        next_up(&mut up).await,
+        Up::SocketClosed { id: 4, .. }
+    ));
+    down.send(Message::Binary(
+        encode_chunk(4, 0, b"late valid input").into(),
+    ))
+    .unwrap();
+    down.send(down_msg(&Down::SocketOpen {
+        id: 5,
+        origin: remote.origin().canonical(),
+        socket: "echo".into(),
+    }))
+    .unwrap();
+    loop {
+        match next_up(&mut up).await {
+            Up::Err { id: Some(4), .. } => continue,
+            Up::SocketOpened { id: 5, .. } => break,
+            other => panic!("late input damaged a different request: {other:?}"),
+        }
+    }
     drop(down);
     task.await.unwrap().unwrap();
     tokio::time::timeout(Duration::from_secs(5), async {

@@ -779,7 +779,12 @@ where
                         match frame {
                             Down::SocketList { id, origin } => sockets.open(node, &writes, id, origin, None)?,
                             Down::SocketOpen { id, origin, socket } => sockets.open(node, &writes, id, origin, Some(socket))?,
-                            Down::SocketAck { id } => sockets.ack(id)?,
+                            Down::SocketAck { id } => {
+                                if let Err(error) = sockets.ack(id) {
+                                    sockets.cancel(id);
+                                    refuse(&writes, id, "invalid", error.to_string());
+                                }
+                            }
                             Down::SocketEof { id } => sockets.eof(id),
                             Down::Cancel { id } => {
                                 sockets.cancel(id);
@@ -791,7 +796,14 @@ where
                     Message::Binary(frame) => {
                         unanswered = 0;
                         match decode_chunk(&frame) {
-                            Some((id, seq, data)) if sockets.contains(id) => sockets.chunk(id, seq, data)?,
+                            Some((id, seq, data)) if sockets.contains(id) => {
+                                // A peer can complete while CP's valid input is in flight.
+                                // Per-invocation failure must never end the shared tunnel.
+                                if let Err(error) = sockets.chunk(id, seq, data) {
+                                    sockets.cancel(id);
+                                    refuse(&writes, id, "invalid", error.to_string());
+                                }
+                            }
                             _ => content(&writes, &mut in_flight, &frame)?,
                         }
                     }
