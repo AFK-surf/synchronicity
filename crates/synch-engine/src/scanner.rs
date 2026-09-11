@@ -793,7 +793,7 @@ impl Node {
             );
             crate::blocking::offload(move || {
                 let (_, (root, normalized)) = node.adoption_target_checked(&space_id, &path)?;
-                node.refuse_git_adoption(&space_id, &root, &normalized, Some(&origin))
+                node.refuse_git_adoption(&space_id, &root, &normalized, &origin)
             })
             .await?;
         }
@@ -865,8 +865,10 @@ impl Node {
             )?]);
             return Ok(previous.map(|_| PathBuf::from(format!("{space_id}/{normalized}"))));
         }
-        let (target, (root, normalized)) = self.adoption_target_checked(space_id, path)?;
-        self.refuse_git_adoption(space_id, &root, &normalized, None)?;
+        // No git gate here: a deletion is idempotent and is how a stray file
+        // gets cleaned up, and S3 `DELETE` reaches this path (`docs/GIT.md`
+        // §8.3).
+        let target = self.adoption_target(space_id, path)?;
         // `symlink_metadata`, so a symlink is removed as the link it is rather
         // than followed to whatever it points at.
         if std::fs::symlink_metadata(&target).is_err() {
@@ -1089,14 +1091,13 @@ impl Node {
     /// of a peer's content until something adopts it, and a single ref is
     /// never the thing to adopt first.
     ///
-    /// `origin` is the publisher whose version is being adopted, or `None`
-    /// for a deletion, which names no objects.
+    /// `origin` is the publisher whose version is being adopted.
     pub(crate) fn refuse_git_adoption(
         &self,
         space_id: &str,
         root: &Path,
         normalized: &str,
-        origin: Option<&synch_core::OriginId>,
+        origin: &synch_core::OriginId,
     ) -> Result<()> {
         let Some(git) = synch_core::git::classify(normalized) else {
             return Ok(());
@@ -1110,9 +1111,6 @@ impl Node {
                 markers.join(", ")
             )));
         }
-        let Some(origin) = origin else {
-            return Ok(());
-        };
         let size = self
             .store()
             .entry(origin, space_id, normalized)?
@@ -1121,27 +1119,41 @@ impl Node {
         if !git.names_objects(size) {
             return Ok(());
         }
-        let missing = self
+        let missing = self.missing_git_objects(space_id, root, git.root, origin)?;
+        if missing > 0 {
+            let repository = git.root.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("");
+            return Err(EngineError::invalid(format!(
+                "{space_id}/{normalized} names objects, and {missing} of the object files {origin} \
+                 publishes for {} are not here by that path; `synch adopt tree \
+                 {space_id}/{repository}` adopts the repository objects first. The check is by \
+                 path, so a repository repacked locally is adopted whole too (docs/GIT.md §8.1)",
+                git.root
+            )));
+        }
+        Ok(())
+    }
+
+    /// How many of the object files `origin` publishes in the git directory
+    /// `git_root` are not on this node's disk at the same path (`docs/GIT.md`
+    /// §7.2, §8.1). By path, not by object name: the engine reads no packs.
+    pub(crate) fn missing_git_objects(
+        &self,
+        space_id: &str,
+        root: &Path,
+        git_root: &str,
+        origin: &synch_core::OriginId,
+    ) -> Result<usize> {
+        Ok(self
             .store()
             .published_paths(origin, space_id)?
             .into_iter()
             .filter(|path| {
                 synch_core::git::classify(path).is_some_and(|other| {
-                    other.root == git.root && other.class == synch_core::GitClass::Object
+                    other.root == git_root && other.class == synch_core::GitClass::Object
                 })
             })
             .filter(|path| root.join(path).symlink_metadata().is_err())
-            .count();
-        if missing > 0 {
-            let repository = git.root.rsplit_once('/').map(|(dir, _)| dir).unwrap_or("");
-            return Err(EngineError::invalid(format!(
-                "{space_id}/{normalized} names objects, and {missing} object(s) {origin} publishes \
-                 for {} are not here yet; `synch adopt tree {space_id}/{repository}` adopts the \
-                 repository objects first (docs/GIT.md §8.1)",
-                git.root
-            )));
-        }
-        Ok(())
+            .count())
     }
 
     /// Where a path lives locally, refusing anything outside a configured
@@ -2452,7 +2464,7 @@ fn walk(
     // scan, every object a captured ref value needs; in name order (`HEAD` <
     // `objects` < `refs`) a commit landing mid-walk puts the ref in one head
     // and its objects in the next.
-    sorted.sort_by(|(_, a), (_, b)| scan_rank(a).cmp(&scan_rank(b)).then_with(|| a.cmp(b)));
+    sorted.sort_by_cached_key(|(_, rel)| (scan_rank(rel), rel.clone()));
 
     for (path, rel) in sorted {
         let metadata = match std::fs::symlink_metadata(&path) {

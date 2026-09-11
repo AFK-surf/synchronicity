@@ -263,38 +263,20 @@ impl Node {
             let ignore = IgnoreSet::for_space(&root_dir)?;
             let listing = node.unified_listing(&space, &prefix, None, None)?;
             let (report, wanted, links, pending_objects) = decide(
-                &node, &space, &root_dir, &listing, &policy, &ignore, options,
+                &node, &space, &prefix, &root_dir, &listing, &policy, &ignore, options,
             )?;
-            // Nothing is written into a git directory while git is mid-way
-            // in it (`docs/GIT.md` §8.3): a lock means git is running now
-            // and a write under it is a race git loses; a merge or rebase in
-            // progress means replacing `index`, `HEAD` or `ORIG_HEAD` is how
-            // it gets finished against the wrong base. `--replace` does not
-            // override this; finishing or aborting the operation does. The
-            // *local* directory only — adopting another member's mid-merge
-            // state onto an idle repository is how a merge is carried to
-            // another machine.
-            let mut roots: Vec<&str> = wanted
-                .iter()
-                .filter_map(|w| w.git.as_ref().map(|g| g.root.as_str()))
-                .chain(
-                    links
-                        .iter()
-                        .filter_map(|l| synch_core::git::classify(&l.path).map(|g| g.root)),
-                )
-                .collect();
-            roots.sort_unstable();
-            roots.dedup();
-            for root in roots {
-                let markers = crate::gitdir::in_progress_markers(&root_dir.join(root));
-                if !markers.is_empty() {
-                    return Err(EngineError::invalid(format!(
-                        "a git operation is in progress in {space}/{root} ({}); finish or \
-                         abort it, then adopt again (docs/GIT.md §8.3)",
-                        markers.join(", ")
-                    )));
-                }
-            }
+            // The git directories this run would write into, for the
+            // in-progress guard the write half takes.
+            let mut git_roots: Vec<String> =
+                wanted
+                    .iter()
+                    .filter_map(|w| w.git.as_ref().map(|g| g.root.clone()))
+                    .chain(links.iter().filter_map(|l| {
+                        synch_core::git::classify(&l.path).map(|g| g.root.to_string())
+                    }))
+                    .collect();
+            git_roots.sort_unstable();
+            git_roots.dedup();
             Ok(AdoptTreePlan {
                 space,
                 root_dir,
@@ -303,6 +285,7 @@ impl Node {
                 wanted,
                 links,
                 pending_objects,
+                git_roots,
             })
         })
         .await
@@ -318,6 +301,7 @@ impl Node {
             mut wanted,
             links,
             mut pending_objects,
+            git_roots,
         } = plan;
         if options.dry_run {
             // The plan *is* the answer: everything it decided is already in the
@@ -336,6 +320,26 @@ impl Node {
                     ),
             );
             return Ok(report);
+        }
+
+        // Nothing is written into a git directory while git is mid-way in it
+        // (`docs/GIT.md` §8.3): a lock means git is running now and a write
+        // under it is a race git loses; a merge or rebase in progress means
+        // replacing `index`, `HEAD` or `ORIG_HEAD` is how it gets finished
+        // against the wrong base. `--replace` does not override this;
+        // finishing or aborting the operation does. The *local* directory
+        // only — adopting another member's mid-merge state onto an idle
+        // repository is how a merge is carried to another machine. After the
+        // dry run above, which writes nothing and so has nothing to refuse.
+        for root in &git_roots {
+            let markers = crate::gitdir::in_progress_markers(&root_dir.join(root));
+            if !markers.is_empty() {
+                return Err(EngineError::invalid(format!(
+                    "a git operation is in progress in {space_id}/{root} ({}); finish or \
+                     abort it, then adopt again (docs/GIT.md §8.3)",
+                    markers.join(", ")
+                )));
+            }
         }
 
         // Links first, and cheaply: they need no fetch, so nothing is gained by
@@ -458,7 +462,10 @@ impl Node {
             // that was never given `--replace`. Re-stat, and refuse.
             let (root, guarded) = (root_dir.clone(), path.clone());
             let stat_target = target.clone();
-            let git_root = git.as_ref().map(|git| root_dir.join(&git.root));
+            let git_root = git
+                .as_ref()
+                .filter(|git| !git.worktree_private)
+                .map(|git| root_dir.join(&git.root));
             let ready = crate::blocking::offload(move || {
                 if let Some(reason) = root_is_gone(&root) {
                     return Ok(Ready::RootGone(reason));
@@ -745,6 +752,8 @@ pub(crate) struct AdoptTreePlan {
     /// Git objects the plan will write, per repository and publishing origin,
     /// which the hold rule counts down as they land.
     pending_objects: PendingObjects,
+    /// The git directories the plan writes into, for the in-progress guard.
+    git_roots: Vec<String>,
 }
 
 /// A symbolic link the plan decided to write.
@@ -772,6 +781,7 @@ struct PendingLink {
 fn decide(
     node: &Node,
     space_id: &str,
+    prefix: &str,
     root_dir: &Path,
     listing: &[VersionSet],
     policy: &VersionPolicy,
@@ -896,7 +906,8 @@ fn decide(
                     git.class,
                     synch_core::GitClass::Ref | synch_core::GitClass::WorktreeState
                 )
-            }) && std::fs::symlink_metadata(&target).is_ok()
+            }) && !ignore.excludes_path(&set.path)
+                && std::fs::symlink_metadata(&target).is_ok()
             {
                 report.deleted.push(set.path.clone());
             }
@@ -1064,9 +1075,31 @@ fn decide(
             }
         };
         let attestors = attestors_of(set, &selected);
-        let git_want = git.map(|git| GitWant::of(&git, selected.size, &attestors));
+        let git_want = GitWant::of(git.as_ref(), selected.size, &attestors);
         if let Some(git) = git.filter(|git| git.class == synch_core::GitClass::Object) {
             note_pending_object(&mut pending_objects, git.root, &attestors);
+        }
+        // A prefix inside a git directory lists none of its objects, so the
+        // hold would have nothing to wait on. What is on disk answers
+        // instead, once per repository and origin: the objects the origin
+        // publishes that are not here by path (`docs/GIT.md` §8.1).
+        if let Some(git) = git_want
+            .as_ref()
+            .filter(|git| git.hold.is_some() && !git.root.starts_with(prefix.trim_end_matches('/')))
+        {
+            for origin in &attestors {
+                let key = (git.root.clone(), origin.clone());
+                if pending_objects.contains_key(&key) {
+                    continue;
+                }
+                let missing = match origin.parse::<synch_core::OriginId>() {
+                    Ok(origin) => {
+                        node.missing_git_objects(space_id, root_dir, &git.root, &origin)?
+                    }
+                    Err(_) => usize::MAX,
+                };
+                pending_objects.insert(key, missing);
+            }
         }
         let was_ref = git
             .filter(|git| git.class == synch_core::GitClass::Ref && on_disk.is_some())

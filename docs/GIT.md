@@ -150,7 +150,10 @@ A **git directory root** is any of:
   for bare repositories (`repo.git/`);
 - `modules/<name>` directly under a git directory root — a submodule's
   git directory, classified recursively (`modules/<name>/objects/…` is an
-  object of that inner repository);
+  object of that inner repository). A submodule's name may contain slashes
+  (`git submodule add ../lib lib/foo` names it `lib/foo`), so the root runs
+  until the first component that is a name git keeps at the top of a git
+  directory (`objects`, `refs`, `HEAD`, `config`, …);
 - `worktrees/<name>` directly under a git directory root — a linked
   worktree's private directory, which holds refs and worktree state but no
   objects.
@@ -390,9 +393,13 @@ When a Refs-class path under `refs/` is divergent, the checkout writes the
 selected version at the path and every other *live* version at
 `refs/synch/<origin>/<path without refs/>` — `refs/synch/nas/heads/main` for
 `nas`'s copy of `refs/heads/main`, named by the origin's short form
-(`OriginId::short`). These are Transient-class paths: never published (the scanner
-never sees a checkout, and a source with the same layout ignores them), never
-swept, and removed by the pass when the divergence ends.
+(`OriginId::short`), one per origin asserting a losing version. This holds
+when the selected version is a deletion too: the branch is gone from
+`refs/heads/`, and the other machine's copy of it, with whatever commits
+only it had, stands under `refs/synch/` until that machine agrees. These
+are Transient-class paths: never published (the scanner never sees a
+checkout, and a source with the same layout ignores them), never swept, and
+removed by the pass when the divergence ends.
 
 This is the git-native rendering of the `☂n` mark. It costs a few bytes, and
 it buys the guarantee in the first paragraph of this document: a commit any
@@ -458,7 +465,9 @@ under them is how a rebase gets finished against the wrong base. `--replace`
 does not override the guard; finishing or aborting the operation does. The
 guard reads the *local* directory only: adopting another member's mid-merge
 state onto an idle repository is legitimate and is how a merge is carried to
-another machine.
+another machine. Two things it does not gate: a `--dry-run`, which writes
+nothing, and the adoption of a *deletion*, which is idempotent, is how a
+stray file gets cleaned up, and is the path an S3 `DELETE` takes.
 
 This is the one place the design touches the working copy's staged changes.
 `index` is worktree state, `--replace` replaces it, and staged-but-uncommitted
@@ -536,11 +545,13 @@ them.
 ### 10.4 Deleting a branch
 
 `git branch -d feature` on the laptop tombstones `refs/heads/feature`. Under
-§6.2 the tombstone is the newest version; the NAS removes the file, the
-desktop's `adopt tree` lists it under `deleted`, and `synch adopt path
-app/.git/refs/heads/feature` there applies it. The desktop's copy was a stale
-cache, not a competing opinion, which is the whole difference between this
-class and a document.
+§6.2 the tombstone is the newest version; the NAS removes the file and keeps
+the desktop's copy as `refs/synch/<desktop>/heads/feature` (§7.4) until the
+desktop agrees, the desktop's `adopt tree` lists it under `deleted`, and
+`synch adopt path app/.git/refs/heads/feature` there applies it. The
+desktop's copy was a stale cache, not a competing opinion, which is the
+whole difference between this class and a document — and the mirror is
+what keeps that judgement from ever costing a commit.
 
 ### 10.5 A fresh machine, and worktrees
 
@@ -563,6 +574,12 @@ worktree's files, and `git worktree repair <path>` rewrites both pointers.
   then partially gc'd locally and never re-adopted — a sequence the
   in-progress guard does not see. `git fsck` is the tool for that, as it is
   for any repository.
+- **By path, not by object name.** The same rule judges presence by the
+  object *files* an origin publishes, because the engine reads no packs. A
+  source that has repacked locally holds every object and none of the peer's
+  paths, so `adopt path` of a single ref is refused there and the error says
+  to adopt the repository whole; `adopt tree` then writes the peer's pack
+  beside the local one, which git handles.
 - **Alternates.** A repository whose `objects/info/alternates` names another
   store on the same machine has objects synchronicity never sees. The scan
   says so; `git repack -a -d` and removing the file make it self-contained.
@@ -676,7 +693,13 @@ in the test and skipped where the binary is absent:
   `adopt tree`; `adopt tree` into a repository mid-rebase is refused naming
   `rebase-merge/`, proceeds once it is gone, and names the moved ref's
   values.
-- A branch the publisher deleted is listed under `deleted` and left on disk.
+- A branch the publisher deleted is listed under `deleted` and left on disk;
+  `adopt path` of the deletion then removes it.
+- A submodule named `lib/foo`: the pointer file is published and written as
+  a file, the nested git directory is a repository in the checkout and in
+  an adopted copy, and git resolves the submodule's HEAD in both.
+- A lock an earlier release materialized goes once the tree tombstones it;
+  a lock git itself left, unknown to the tree, stays.
 
 `crates/synch-store/src/unified.rs` covers the selection rules on rows
 alone: object identity by name, tombstones dropped while a copy is live and

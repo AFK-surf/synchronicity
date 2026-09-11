@@ -227,7 +227,11 @@ impl Node {
             let path = want.path.clone();
             let written_target = want.target.clone();
             let target = want.target.clone();
-            let git_root = want.git.as_ref().map(|git| root.join(&git.root));
+            let git_root = want
+                .git
+                .as_ref()
+                .filter(|git| !git.worktree_private)
+                .map(|git| root.join(&git.root));
             let ready = crate::blocking::offload(move || {
                 if escapes_via_symlink(&root, &path) {
                     return Ok(false);
@@ -472,13 +476,24 @@ pub(crate) struct GitWant {
     pub(crate) releases: Vec<String>,
     /// True for another origin's divergent ref written under `refs/synch/`.
     pub(crate) mirror: bool,
+    /// True when the root is a linked worktree's private directory, which
+    /// git never gives an `objects/` of its own.
+    pub(crate) worktree_private: bool,
 }
 
 impl GitWant {
     /// The facts for the selected version of one path, given the origins
-    /// asserting that version.
-    pub(crate) fn of(git: &synch_core::GitPath<'_>, size: u64, attestors: &[String]) -> GitWant {
-        GitWant {
+    /// asserting that version. `None` outside a git directory — and for the
+    /// `.git` pointer file, whose "root" is the file itself: it is an
+    /// ordinary file of the outer tree, and treating it as a repository would
+    /// put `objects/` and `refs/` where the file has to go.
+    pub(crate) fn of(
+        git: Option<&synch_core::GitPath<'_>>,
+        size: u64,
+        attestors: &[String],
+    ) -> Option<GitWant> {
+        let git = git.filter(|git| git.class != synch_core::GitClass::Pointer)?;
+        Some(GitWant {
             root: git.root.to_string(),
             rank: git.materialize_rank(),
             hold: git.names_objects(size).then(|| attestors.to_vec()),
@@ -488,7 +503,8 @@ impl GitWant {
                 Vec::new()
             },
             mirror: false,
-        }
+            worktree_private: git.in_worktree_private_dir(),
+        })
     }
 
     /// Whether the hold rule releases this write: some asserting origin has
@@ -609,8 +625,21 @@ fn plan_pass(
         let git = synch_core::git::classify(&set.path);
         // A lock file or a machine-local pointer published by a member
         // running older software: never written (`docs/GIT.md` §2), and the
-        // sweep leaves whatever git itself has at the path alone.
+        // sweep leaves whatever git itself has at the path alone. What *is*
+        // removed is a copy an earlier release of this checkout materialized
+        // before the class existed, once the tree's newest assertion about
+        // the path is that it is gone — otherwise the `index.lock` this
+        // design exists to keep out of a checkout would stay forever.
         if git.is_some_and(|git| git.class.is_excluded()) {
+            let gone = match set.select(&VersionPolicy::Newest, now) {
+                synch_store::Selection::Absent => true,
+                synch_store::Selection::Selected(entry) => entry.kind == EntryKind::Tombstone,
+                synch_store::Selection::Divergent => false,
+            };
+            if gone && unsafe_name(&set.path).is_none() && !escapes_via_symlink(root_dir, &set.path)
+            {
+                pass.report.removed += remove_if_present(&root_dir.join(&set.path))?;
+            }
             continue;
         }
         pass.known.insert(set.path.clone());
@@ -656,6 +685,19 @@ fn plan_pass(
             synch_store::Selection::Divergent => unreachable!("newest always selects"),
         };
 
+        // A divergent ref is every origin's ref (`docs/GIT.md` §7.4): the
+        // live versions `newest` did not select are written under
+        // `refs/synch/<origin>/`, so no commit any member published is
+        // unreachable in the checkout and `git log --all` shows the whole
+        // cluster's state — including when the selected version is a
+        // deletion, which is exactly when the other copies' commits would
+        // otherwise have nothing holding them. Local-only: the class is
+        // transient, so a scan never publishes them and the sweep only
+        // removes the stale ones.
+        if let Some(git) = git.filter(|_| set.is_divergent()) {
+            plan_mirrors(node, &mut pass, root_dir, set, &git, &selected);
+        }
+
         // A path leaves the checkout when newest is a tombstone — the
         // deletion is the assertion this checkout follows.
         if selected.kind == EntryKind::Tombstone {
@@ -693,7 +735,7 @@ fn plan_pass(
         // The origins asserting the selected version: what an object's
         // landing releases, and what a ref's hold waits on.
         let attestors = attestors_of(set, &selected);
-        let git_want = git.map(|git| GitWant::of(&git, selected.size, &attestors));
+        let git_want = GitWant::of(git.as_ref(), selected.size, &attestors);
         let planned = plan_file(
             node,
             &mut pass,
@@ -709,74 +751,75 @@ fn plan_pass(
                 note_pending_object(&mut pass.pending_objects, git.root, &attestors);
             }
         }
-
-        // A divergent ref is every origin's ref (`docs/GIT.md` §7.4): the
-        // versions `newest` did not select are written under
-        // `refs/synch/<origin>/`, so no commit any member published is
-        // unreachable in the checkout and `git log --all` shows the whole
-        // cluster's state. Local-only: the class is transient, so a scan
-        // never publishes them and the sweep only removes the stale ones.
-        let Some(git) = git else {
-            continue;
-        };
-        let Some(name) = git.loose_ref() else {
-            continue;
-        };
-        if !set.is_divergent() {
-            continue;
-        }
-        for version in set.versions.iter().filter(|v| !v.is_tombstone()) {
-            for origin in version
-                .attestors
-                .iter()
-                .filter(|origin| **origin != selected.origin)
-            {
-                let Some(entry) = set.entries.iter().find(|e| &e.origin == origin) else {
-                    continue;
-                };
-                let Some(content) = entry.content else {
-                    continue;
-                };
-                let mirror = format!(
-                    "{}/{}",
-                    git.root,
-                    synch_core::git::mirror_ref_path(&origin.short(), name)
-                );
-                let Some(mirror_rank) =
-                    synch_core::git::classify(&mirror).map(|m| m.class.materialize_rank())
-                else {
-                    continue;
-                };
-                if !pass.mirrors.insert(mirror.clone()) {
-                    continue;
-                }
-                let target = root_dir.join(&mirror);
-                let names_objects = git.names_objects(entry.size);
-                let before = pass.report.current;
-                let planned = plan_file(
-                    node,
-                    &mut pass,
-                    mirror,
-                    target,
-                    content,
-                    entry.size,
-                    Metadata::of(entry),
-                    Some(GitWant {
-                        root: git.root.to_string(),
-                        rank: (mirror_rank, 1),
-                        hold: names_objects.then(|| vec![origin.canonical()]),
-                        releases: Vec::new(),
-                        mirror: true,
-                    }),
-                );
-                if planned == Planned::Current && pass.report.current > before {
-                    pass.report.mirrored += 1;
-                }
-            }
-        }
     }
 
     Ok(pass)
+}
+
+/// Plans the `refs/synch/<origin>/` mirrors of a divergent loose ref
+/// (`docs/GIT.md` §7.4): one per origin asserting a live version other than
+/// the selected one. A co-attestor of the selected version holds the same
+/// value the ref itself will, so it gets no mirror.
+fn plan_mirrors(
+    node: &Node,
+    pass: &mut CheckoutPass,
+    root_dir: &Path,
+    set: &synch_store::VersionSet,
+    git: &synch_core::GitPath<'_>,
+    selected: &EntryRow,
+) {
+    let Some(name) = git.loose_ref() else {
+        return;
+    };
+    let losing = set
+        .versions
+        .iter()
+        .filter(|v| !v.is_tombstone() && !v.attestors.contains(&selected.origin));
+    for version in losing {
+        for origin in &version.attestors {
+            let Some(entry) = set.entries.iter().find(|e| &e.origin == origin) else {
+                continue;
+            };
+            let Some(content) = entry.content else {
+                continue;
+            };
+            let mirror = format!(
+                "{}/{}",
+                git.root,
+                synch_core::git::mirror_ref_path(&origin.short(), name)
+            );
+            let Some(rank) = synch_core::git::classify(&mirror).map(|m| m.class.materialize_rank())
+            else {
+                continue;
+            };
+            if !pass.mirrors.insert(mirror.clone()) {
+                continue;
+            }
+            let target = root_dir.join(&mirror);
+            let planned = plan_file(
+                node,
+                pass,
+                mirror,
+                target,
+                content,
+                entry.size,
+                Metadata::of(entry),
+                Some(GitWant {
+                    root: git.root.to_string(),
+                    rank: (rank, 1),
+                    hold: git
+                        .names_objects(entry.size)
+                        .then(|| vec![origin.canonical()]),
+                    releases: Vec::new(),
+                    mirror: true,
+                    worktree_private: git.in_worktree_private_dir(),
+                }),
+            );
+            if planned == Planned::Current {
+                pass.report.mirrored += 1;
+            }
+        }
+    }
 }
 
 /// What phase 1 decided about one file.

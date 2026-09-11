@@ -390,18 +390,31 @@ async fn two_encodings_of_one_object_are_one_version() {
         .into_iter()
         .cloned()
         .collect();
-    let object = objects.first().expect("a committed repository has objects");
-    // The same object, differently compressed: the bytes differ, the name
-    // does not.
-    let path = b.space.path().join(object);
-    let mut bytes = std::fs::read(&path).unwrap();
-    bytes.push(0);
-    std::fs::write(&path, bytes).unwrap();
+    // The README blob, written again by git under a different compression
+    // level: the bytes differ, the name does not, and both are valid.
+    let repo_b = b.space.path().join(REPO);
+    let blob = git(&repo_b, &["rev-parse", "HEAD:README"]);
+    let object = format!("app/.git/objects/{}/{}", &blob[..2], &blob[2..]);
+    assert!(objects.contains(&object), "{objects:?}");
+    let path = b.space.path().join(&object);
+    let before = std::fs::read(&path).unwrap();
+    std::fs::remove_file(&path).unwrap();
+    git(
+        &repo_b,
+        &["-c", "core.compression=0", "hash-object", "-w", "README"],
+    );
+    assert_ne!(std::fs::read(&path).unwrap(), before, "a second encoding");
+    git(&repo_b, &["fsck", "--strict"]);
     b.node.scan_publish_push().await.unwrap();
     b.node.sync_with_peer(&a.node.node_id()).await.unwrap();
 
     let (node, object_path) = (b.node.clone(), object.clone());
     let set = off_runtime(move || node.versions(SPACE, &object_path).unwrap()).await;
+    assert_eq!(
+        set.git,
+        Some(synch_core::GitClass::Object),
+        "the listing carries the class it selects under"
+    );
     assert_eq!(set.version_count(), 1, "{:?}", set.describe());
     assert_eq!(set.versions[0].attestors.len(), 2);
     let report = b
@@ -457,6 +470,17 @@ async fn a_deleted_branch_leaves_the_checkout_and_a_later_write_wins_it_back() {
     assert!(
         checkout.join(REPO).join(".git/refs/heads/main").is_file(),
         "main is untouched"
+    );
+    assert!(
+        checkout
+            .join(REPO)
+            .join(".git")
+            .join(synch_core::git::mirror_ref_path(
+                &b.node.origin().short(),
+                "heads/feature"
+            ))
+            .is_file(),
+        "b's live copy stays reachable as a mirror while the deletion wins: {report:?}"
     );
 
     // Written after the deletion was noticed, so it is newer than the
@@ -525,7 +549,10 @@ async fn concurrent_commits_are_both_reachable_in_a_checkout() {
     git(&mirror, &["fsck", "--strict"]);
     let all = git(&mirror, &["rev-list", "--all"]);
     assert!(all.contains(&commit_a) && all.contains(&commit_b), "{all}");
-    git(&mirror, &["gc", "-q", "--prune=now"]);
+    // `prune` rather than `gc`: gc would pack the mirror ref into
+    // `packed-refs`, and the sweep assertion below would then pass for the
+    // wrong reason.
+    git(&mirror, &["prune", "--expire=now"]);
     git(&mirror, &["cat-file", "-e", &commit_a]);
     git(&mirror, &["cat-file", "-e", &commit_b]);
 
@@ -566,6 +593,12 @@ async fn adoption_writes_a_whole_repository_and_refuses_one_mid_operation() {
         .await
         .expect_err("a ref before its objects");
     assert!(refused.to_string().contains("adopt tree"), "{refused}");
+    let refused = {
+        let node = b.node.clone();
+        off_runtime(move || node.adopt(SPACE, "app/.git/index.lock", b"")).await
+    }
+    .expect_err("a write at a transient path");
+    assert!(refused.to_string().contains("never"), "{refused}");
 
     let report = adopt(&b.node, &a.node, AdoptTreeOptions::default()).await;
     assert!(report.skipped.is_empty(), "{report:?}");
@@ -668,5 +701,144 @@ async fn adoption_names_refs_the_publisher_deleted() {
         b.space.path().join("app/.git/refs/heads/feature").is_file(),
         "a tree adoption removes nothing"
     );
+    // §10.4: `adopt path` of the deletion applies it.
+    let removed = {
+        let node = b.node.clone();
+        off_runtime(move || {
+            node.adopt_deletion(SPACE, "app/.git/refs/heads/feature")
+                .unwrap()
+        })
+        .await
+    };
+    assert!(removed.is_some());
+    assert!(!b.space.path().join("app/.git/refs/heads/feature").exists());
     shutdown(&[&a.node, &b.node]).await;
+}
+
+/// A repository with a submodule: the portable `.git` pointer file is
+/// published and written as the file it is, the submodule's git directory
+/// under `modules/<name with a slash>` is classified as a repository, and
+/// git can use both in a checkout and in an adopted copy.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_submodule_syncs_as_a_pointer_file_and_a_nested_git_directory() {
+    if !have_git() {
+        return;
+    }
+    let _blocking = synch_core::BlockingScope::enter();
+    let a = spawn("a").await;
+    let b = spawn("b").await;
+    let replica = spawn("replica").await;
+    introduce(&[&a, &b, &replica]);
+    let repo = init_repo(a.space.path());
+    let upstream = tempfile::tempdir().unwrap();
+    let lib = upstream.path().join("lib");
+    std::fs::create_dir_all(&lib).unwrap();
+    git(&lib, &["init", "-q"]);
+    std::fs::write(lib.join("lib.txt"), b"lib\n").unwrap();
+    git(&lib, &["add", "lib.txt"]);
+    git(&lib, &["commit", "-q", "-m", "lib"]);
+    git(
+        &repo,
+        &["submodule", "add", "-q", lib.to_str().unwrap(), "lib/foo"],
+    );
+    git(&repo, &["commit", "-q", "-m", "add submodule"]);
+    let pointer = std::fs::read_to_string(repo.join("lib/foo/.git")).unwrap();
+    assert!(
+        pointer.starts_with("gitdir: ../../.git/modules/lib/foo"),
+        "{pointer}"
+    );
+    let sub_head = git(&repo.join("lib/foo"), &["rev-parse", "HEAD"]);
+
+    a.node.add_filesystem_source(SPACE, a.space.path()).unwrap();
+    a.node.scan_publish_push().await.unwrap();
+    let paths = published(&a.node).await;
+    assert!(paths.iter().any(|p| p == "app/lib/foo/.git"), "{paths:?}");
+    assert!(
+        paths
+            .iter()
+            .any(|p| p.starts_with("app/.git/modules/lib/foo/objects/")),
+        "{paths:?}"
+    );
+
+    let checkout = add_checkout(&replica).await;
+    converge(&replica.node, &[&a.node]).await;
+    let report = replica.node.sync_checkout(SPACE).await.unwrap();
+    assert_eq!(report.written, 0, "the second pass is quiet: {report:?}");
+    let mirror = checkout.join(REPO);
+    assert!(
+        mirror.join("lib/foo/.git").is_file(),
+        "the pointer is a file"
+    );
+    assert!(mirror.join(".git/modules/lib/foo/objects").is_dir());
+    assert!(!mirror
+        .join(".git/modules/lib/foo/objects")
+        .join("objects")
+        .exists());
+    git(&mirror, &["fsck", "--strict"]);
+    assert_eq!(
+        git(&mirror.join("lib/foo"), &["rev-parse", "HEAD"]),
+        sub_head
+    );
+    git(&mirror.join("lib/foo"), &["fsck", "--strict"]);
+
+    b.node.add_filesystem_source(SPACE, b.space.path()).unwrap();
+    let report = adopt(&b.node, &a.node, AdoptTreeOptions::default()).await;
+    assert!(report.skipped.is_empty(), "{report:?}");
+    let repo_b = b.space.path().join(REPO);
+    assert!(repo_b.join("lib/foo/.git").is_file());
+    assert_eq!(
+        git(&repo_b.join("lib/foo"), &["rev-parse", "HEAD"]),
+        sub_head
+    );
+    assert_eq!(git(&repo_b, &["status", "--porcelain"]), "");
+    shutdown(&[&a.node, &b.node, &replica.node]).await;
+}
+
+/// A lock file an earlier release materialized into a checkout goes once
+/// the tree's newest assertion about it is a deletion; one git left there
+/// itself, with no assertion in the tree, is not the checkout's to remove.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_stale_lock_in_a_checkout_goes_with_its_tombstone() {
+    if !have_git() {
+        return;
+    }
+    let _blocking = synch_core::BlockingScope::enter();
+    let publisher = spawn("publisher").await;
+    let replica = spawn("replica").await;
+    introduce(&[&publisher, &replica]);
+    init_repo(publisher.space.path());
+    publisher
+        .node
+        .add_filesystem_source(SPACE, publisher.space.path())
+        .unwrap();
+    publisher.node.scan_publish_push().await.unwrap();
+    let checkout = add_checkout(&replica).await;
+    converge(&replica.node, &[&publisher.node]).await;
+    let git_dir = checkout.join(REPO).join(".git");
+    std::fs::write(git_dir.join("index.lock"), b"").unwrap();
+    std::fs::write(git_dir.join("HEAD.lock"), b"").unwrap();
+    // What an older release's scan would have left in the tree: a tombstone
+    // for the lock it once published.
+    let (store, origin) = (
+        replica.node.store().clone(),
+        publisher.node.origin().clone(),
+    );
+    off_runtime(move || {
+        store
+            .put_entry(
+                &origin,
+                SPACE,
+                "app/.git/index.lock",
+                &synch_core::FileEntry::tombstone(synch_core::now_ns(), 99, None),
+            )
+            .unwrap();
+    })
+    .await;
+    let report = replica.node.sync_checkout(SPACE).await.unwrap();
+    assert!(!git_dir.join("index.lock").exists(), "{report:?}");
+    assert!(
+        git_dir.join("HEAD.lock").exists(),
+        "a lock nobody published belongs to git"
+    );
+    shutdown(&[&publisher.node, &replica.node]).await;
 }

@@ -151,10 +151,15 @@ pub struct VersionSet {
     /// `select` filters tombstones out of the running and this order does not,
     /// so a deletion dated after every live version sorts last and is still not
     /// what `newest` returns. Tombstones stay in the list because every
-    /// surface that shows a version list has to show them.
+    /// surface that shows a version list has to show them. A git ref or
+    /// worktree-state path is the exception (`docs/GIT.md` §6.2): there the
+    /// deletion competes, and the last version *is* what `newest` returns.
     pub versions: Vec<Version>,
     /// Every origin's entry for the path, canonically ordered.
     pub entries: Vec<EntryRow>,
+    /// The path's class inside a git directory, if any — derived from the
+    /// path once, here, because selection consults it.
+    pub git: Option<GitClass>,
 }
 
 impl VersionSet {
@@ -209,6 +214,7 @@ impl VersionSet {
             path: path.to_string(),
             versions,
             entries,
+            git,
         }
     }
 
@@ -229,15 +235,10 @@ impl VersionSet {
     /// (`docs/GIT.md` §6.2), so the path exists iff the *newest* assertion
     /// about it is live — the version `newest` would select.
     pub fn exists(&self) -> bool {
-        if deletion_is_an_update(git_class(&self.path)) {
+        if deletion_is_an_update(self.git) {
             return self.versions.last().is_some_and(|v| !v.is_tombstone());
         }
         self.versions.iter().any(|v| !v.is_tombstone())
-    }
-
-    /// The git class of this path, if it lies inside a git directory.
-    pub fn git_class(&self) -> Option<GitClass> {
-        git_class(&self.path)
     }
 
     /// Applies a version policy (§8).
@@ -261,7 +262,7 @@ impl VersionSet {
     /// versions under the same order, and a selected tombstone means the
     /// path is deleted.
     pub fn select(&self, policy: &VersionPolicy, now: i64) -> Selection {
-        let git = git_class(&self.path);
+        let git = self.git;
         match policy {
             VersionPolicy::Origin(origin) => {
                 match self.entries.iter().find(|e| &e.origin == origin) {
@@ -310,6 +311,11 @@ impl VersionSet {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Selection {
     /// The policy chose this origin's assertion.
+    ///
+    /// The entry may be a tombstone: under `origin=` a pinned origin's
+    /// deletion is the answer, and for a git ref or worktree-state path
+    /// (`docs/GIT.md` §6.2) a deletion newer than every live copy is what
+    /// `newest` selects. A caller that wants bytes checks the kind.
     ///
     /// Boxed because it is by far the largest variant and the other two carry
     /// nothing: every `Absent` and `Divergent` would otherwise pay for a whole

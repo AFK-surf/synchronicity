@@ -119,6 +119,17 @@ impl GitPath<'_> {
         }
     }
 
+    /// True if this path's root is a linked worktree's private directory
+    /// (`worktrees/<name>`), which holds refs and worktree state but no
+    /// objects — git keeps those in the common directory.
+    pub fn in_worktree_private_dir(&self) -> bool {
+        self.root
+            .rsplit_once('/')
+            .and_then(|(parent, _)| parent.rsplit_once('/'))
+            .is_some_and(|(_, dir)| dir == "worktrees")
+            || self.root.starts_with("worktrees/")
+    }
+
     /// The ref name under `refs/` this path is, if it is a loose ref there.
     pub fn loose_ref(&self) -> Option<&str> {
         match self.class {
@@ -127,6 +138,43 @@ impl GitPath<'_> {
         }
     }
 }
+
+/// The names git itself keeps at the top level of a git directory. A
+/// submodule's git directory lives at `modules/<name>` where the name may
+/// contain slashes (`git submodule add ../lib lib/foo` names it `lib/foo`),
+/// so the classifier extends a `modules/` root until it meets one of these.
+const TOP_LEVEL_NAMES: &[&str] = &[
+    "HEAD",
+    "ORIG_HEAD",
+    "FETCH_HEAD",
+    "MERGE_HEAD",
+    "REBASE_HEAD",
+    "CHERRY_PICK_HEAD",
+    "REVERT_HEAD",
+    "COMMIT_EDITMSG",
+    "config",
+    "index",
+    "packed-refs",
+    "shallow",
+    "description",
+    "objects",
+    "refs",
+    "logs",
+    "info",
+    "hooks",
+    "worktrees",
+    "modules",
+    "branches",
+    "remotes",
+    "lfs",
+    "rr-cache",
+    "sequencer",
+    "rebase-merge",
+    "rebase-apply",
+    "reftable",
+    "gc.pid",
+    "gc.log",
+];
 
 /// Classifies a normalized trie path (`docs/GIT.md` §4).
 ///
@@ -138,7 +186,7 @@ impl GitPath<'_> {
 pub fn classify(path: &str) -> Option<GitPath<'_>> {
     let n = path.len();
     // Byte offsets of each component's start and end.
-    let mut components: Vec<(usize, usize)> = Vec::new();
+    let mut components: Vec<(usize, usize)> = Vec::with_capacity(8);
     let mut start = 0;
     for (i, byte) in path.bytes().enumerate() {
         if byte == b'/' {
@@ -174,13 +222,22 @@ pub fn classify(path: &str) -> Option<GitPath<'_>> {
                 // The first component inside a root may open a nested one:
                 // `modules/<name>` (a submodule's git directory) or
                 // `worktrees/<name>` (a linked worktree's private directory).
+                // A worktree's name is one component; a submodule's may be
+                // several, so it runs until a name git keeps at the top of a
+                // git directory, leaving at least that one component inside.
                 let first_inside = components[i].0 == end + 1;
-                if first_inside
-                    && (component == "modules" || component == "worktrees")
-                    && i + 2 <= last
-                {
+                if first_inside && component == "worktrees" && i + 2 <= last {
                     root_end = Some(components[i + 1].1);
                     i += 2;
+                    continue;
+                }
+                if first_inside && component == "modules" && i + 2 <= last {
+                    let mut name_end = i + 1;
+                    while name_end + 1 < last && !TOP_LEVEL_NAMES.contains(&name(name_end + 1)) {
+                        name_end += 1;
+                    }
+                    root_end = Some(components[name_end].1);
+                    i = name_end + 1;
                     continue;
                 }
             }
@@ -197,11 +254,18 @@ pub fn classify(path: &str) -> Option<GitPath<'_>> {
     })
 }
 
+/// True if `inner` is `prefix` or lies under it.
+fn under(inner: &str, prefix: &str) -> bool {
+    inner
+        .strip_prefix(prefix)
+        .is_some_and(|rest| rest.is_empty() || rest.starts_with('/'))
+}
+
 /// The class of a path inside a git directory. Directory paths classify as
 /// the class of what they hold, so a walk can order `objects/` after `refs/`.
 fn class_of(inner: &str) -> GitClass {
     let last = inner.rsplit('/').next().unwrap_or(inner);
-    let starts = |prefix: &str| inner == prefix || inner.starts_with(&format!("{prefix}/"));
+    let starts = |prefix: &str| under(inner, prefix);
 
     // Transient first: a lock at any depth, git's temporary object and pack
     // names, the gc and fsmonitor droppings, LFS scratch, and this node's own
@@ -235,7 +299,9 @@ fn class_of(inner: &str) -> GitClass {
             (Some("pack"), Some(b), None) if b.starts_with("multi-pack-index") => {
                 return GitClass::ObjectCache
             }
-            (Some("info"), Some("alternates"), None) => return GitClass::MachineLocal,
+            (Some("info"), Some("alternates" | "http-alternates"), None) => {
+                return GitClass::MachineLocal
+            }
             (Some("info"), Some(_), _) => return GitClass::ObjectCache,
             _ => {}
         }
@@ -267,6 +333,7 @@ fn class_of(inner: &str) -> GitClass {
                 | "MERGE_MODE"
                 | "MERGE_RR"
                 | "MERGE_AUTOSTASH"
+                | "REBASE_HEAD"
                 | "CHERRY_PICK_HEAD"
                 | "REVERT_HEAD"
                 | "COMMIT_EDITMSG"
@@ -414,6 +481,32 @@ mod tests {
             "a nested root needs something inside it"
         );
         assert_eq!(
+            class("app/.git/modules/lib/foo/objects/ab/0123456789012345678901234567890123456789"),
+            Some((
+                "app/.git/modules/lib/foo",
+                "objects/ab/0123456789012345678901234567890123456789",
+                GitClass::Object
+            )),
+            "a submodule name may contain slashes"
+        );
+        assert_eq!(
+            class("app/.git/modules/lib/foo/refs/heads/main"),
+            Some(("app/.git/modules/lib/foo", "refs/heads/main", GitClass::Ref))
+        );
+        assert_eq!(
+            class("app/.git/modules/lib/foo/modules/bar/HEAD"),
+            Some((
+                "app/.git/modules/lib/foo/modules/bar",
+                "HEAD",
+                GitClass::Ref
+            )),
+            "and nest"
+        );
+        assert!(classify("app/.git/worktrees/feature/HEAD")
+            .unwrap()
+            .in_worktree_private_dir());
+        assert!(!classify("app/.git/HEAD").unwrap().in_worktree_private_dir());
+        assert_eq!(
             class("app/.git/worktrees/feature/gitdir"),
             Some((
                 "app/.git/worktrees/feature",
@@ -451,6 +544,8 @@ mod tests {
             ("lfs/tmp/x", GitClass::Transient),
             ("refs/synch/nas/heads/main", GitClass::Transient),
             ("objects/info/alternates", GitClass::MachineLocal),
+            ("objects/info/http-alternates", GitClass::MachineLocal),
+            ("REBASE_HEAD", GitClass::WorktreeState),
             (
                 "objects/ab/0123456789012345678901234567890123456789",
                 GitClass::Object,
