@@ -16,6 +16,7 @@ pub mod compare;
 pub mod config;
 pub mod error;
 pub mod fetcher;
+mod gitdir;
 pub mod ignore;
 mod join;
 pub mod lifecycle;

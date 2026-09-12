@@ -54,7 +54,10 @@ use synch_core::{EntryKind, Hash};
 use synch_store::{Donor, EntryRow, VersionPolicy, VersionSet};
 
 use crate::{
-    checkout::{apply_metadata, escapes_via_symlink, materialize_symlink, Metadata},
+    checkout::{
+        apply_metadata, attestors_of, escapes_via_symlink, materialize_symlink, GitWant, Metadata,
+        PendingObjects, HELD,
+    },
     error::{EngineError, Result},
     ignore::IgnoreSet,
     node::Node,
@@ -125,6 +128,16 @@ pub struct AdoptTreeReport {
     /// selects nothing for and a tombstoned one are both passed over in
     /// silence.
     pub considered: usize,
+    /// Git refs and worktree state whose selected version is a deletion
+    /// (`docs/GIT.md` §8.2): the newest assertion about the ref is that it is
+    /// gone, and `synch adopt path` of that version applies it. Named, unlike
+    /// other tombstones, because for a ref the deletion is the current state
+    /// rather than one origin stepping aside.
+    pub deleted: Vec<String>,
+    /// Git refs `--replace` moved, as `(path, value before, value after)` —
+    /// object names, or `ref: <name>` for a symbolic ref. "Replaced
+    /// `refs/heads/main`" is a sentence that should name what was there.
+    pub replaced_refs: Vec<(String, String, String)>,
 }
 
 impl Node {
@@ -249,9 +262,21 @@ impl Node {
             // writes.
             let ignore = IgnoreSet::for_space(&root_dir)?;
             let listing = node.unified_listing(&space, &prefix, None, None)?;
-            let (report, wanted, links) = decide(
+            let (report, wanted, links, pending_objects) = decide(
                 &node, &space, &root_dir, &listing, &policy, &ignore, options,
             )?;
+            // The git directories this run would write into, for the
+            // in-progress guard the write half takes.
+            let mut git_roots: Vec<String> =
+                wanted
+                    .iter()
+                    .filter_map(|w| w.git.as_ref().map(|g| g.root.clone()))
+                    .chain(links.iter().filter_map(|l| {
+                        synch_core::git::classify(&l.path).map(|g| g.root.to_string())
+                    }))
+                    .collect();
+            git_roots.sort_unstable();
+            git_roots.dedup();
             Ok(AdoptTreePlan {
                 space,
                 root_dir,
@@ -259,6 +284,8 @@ impl Node {
                 report,
                 wanted,
                 links,
+                pending_objects,
+                git_roots,
             })
         })
         .await
@@ -271,8 +298,10 @@ impl Node {
             root_dir,
             options,
             mut report,
-            wanted,
+            mut wanted,
             links,
+            mut pending_objects,
+            git_roots,
         } = plan;
         if options.dry_run {
             // The plan *is* the answer: everything it decided is already in the
@@ -291,6 +320,26 @@ impl Node {
                     ),
             );
             return Ok(report);
+        }
+
+        // Nothing is written into a git directory while git is mid-way in it
+        // (`docs/GIT.md` §8.3): a lock means git is running now and a write
+        // under it is a race git loses; a merge or rebase in progress means
+        // replacing `index`, `HEAD` or `ORIG_HEAD` is how it gets finished
+        // against the wrong base. `--replace` does not override this;
+        // finishing or aborting the operation does. The *local* directory
+        // only — adopting another member's mid-merge state onto an idle
+        // repository is how a merge is carried to another machine. After the
+        // dry run above, which writes nothing and so has nothing to refuse.
+        for root in &git_roots {
+            let markers = crate::gitdir::in_progress_markers(&root_dir.join(root));
+            if !markers.is_empty() {
+                return Err(EngineError::invalid(format!(
+                    "a git operation is in progress in {space_id}/{root} ({}); finish or \
+                     abort it, then adopt again (docs/GIT.md §8.3)",
+                    markers.join(", ")
+                )));
+            }
         }
 
         // Links first, and cheaply: they need no fetch, so nothing is gained by
@@ -341,6 +390,13 @@ impl Node {
         // Phase 2: fetch what phase 1 could not satisfy locally — building each
         // object out of a donor where the descent can — and write it as it
         // lands.
+        //
+        // Listing order outside git directories, and inside each one the
+        // order a repository has to be written in: objects before the refs
+        // that name them, `index` last (`docs/GIT.md` §7.1, §8.1).
+        wanted.sort_by(|a, b| {
+            GitWant::order(a.git.as_ref(), &a.path).cmp(&GitWant::order(b.git.as_ref(), &b.path))
+        });
         for want in wanted {
             let Wanted {
                 path,
@@ -351,7 +407,19 @@ impl Node {
                 donors,
                 replacing,
                 was,
+                git,
+                was_ref,
             } = want;
+            // The hold rule (`docs/GIT.md` §7.2), against what this same run
+            // has written so far: a ref that names objects waits until every
+            // object one of its publishers has in this repository is here.
+            if git
+                .as_ref()
+                .is_some_and(|git| !git.released(&pending_objects))
+            {
+                report.skipped.push((path, HELD.into()));
+                continue;
+            }
             // A failure here is this path's, not the run's. A one-shot tree adoption has
             // no second pass to repair what an early `?` would abandon, and by
             // now some of these files are already on disk — so the run finishes
@@ -394,12 +462,22 @@ impl Node {
             // that was never given `--replace`. Re-stat, and refuse.
             let (root, guarded) = (root_dir.clone(), path.clone());
             let stat_target = target.clone();
+            let git_root = git
+                .as_ref()
+                .filter(|git| !git.worktree_private)
+                .map(|git| root_dir.join(&git.root));
             let ready = crate::blocking::offload(move || {
                 if let Some(reason) = root_is_gone(&root) {
                     return Ok(Ready::RootGone(reason));
                 }
                 if escapes_via_symlink(&root, &guarded) {
                     return Ok(Ready::Escaped);
+                }
+                // The first write into a git directory makes it a
+                // repository: git requires `objects/` and `refs/` to exist,
+                // and empty directories are never published.
+                if let Some(git_root) = git_root {
+                    crate::gitdir::ensure_required_dirs(&git_root)?;
                 }
                 Ok(match std::fs::symlink_metadata(&stat_target) {
                     // Planned as a replacement, and still the very file the
@@ -427,17 +505,17 @@ impl Node {
             // `stale` rides along: dropping the scanner's row is bookkeeping
             // done in the same blocking step as the stamp, and its failure is a
             // report line rather than the end of the run.
-            let (outcome, stale) = if let Ready::RootGone(reason) = ready {
-                (Written::Failed(reason), None)
+            let outcome = if let Ready::RootGone(reason) = ready {
+                (Written::Failed(reason), None, None)
             } else if let Ready::Escaped = ready {
-                (Written::Escaped, None)
+                (Written::Escaped, None, None)
             } else if let Ready::Appeared = ready {
-                (Written::Appeared, None)
+                (Written::Appeared, None, None)
             } else {
                 // A materialization that fails takes its path down with it and
                 // nothing else: the target is untouched.
                 match self.materialize_blob(&content, size, target.clone()).await {
-                    Err(e) => (Written::Failed(e.to_string()), None),
+                    Err(e) => (Written::Failed(e.to_string()), None, None),
                     Ok(kind) => {
                         // The bytes are the file; the metadata is stamped right
                         // after, and a filesystem that refuses the stamp is
@@ -445,11 +523,15 @@ impl Node {
                         // cosmetic here: the stamped mtime is the one the next
                         // scan publishes.
                         let (node, space, relpath) = (self.clone(), space_id.clone(), path.clone());
+                        let read_ref = was_ref.is_some();
                         crate::blocking::offload(move || {
                             let written = match apply_metadata(&target, meta) {
                                 Ok(()) => Written::Fully(kind),
                                 Err(e) => Written::WithoutMetadata(kind, e.to_string()),
                             };
+                            let now_ref = read_ref
+                                .then(|| crate::gitdir::ref_value(&target))
+                                .flatten();
                             // The scanner skips a file whose `(size, mtime_ns,
                             // file_id)` still matches its `local_files` row, and
                             // this path's row describes bytes that are gone.
@@ -483,14 +565,18 @@ impl Node {
                                 .remove_local_file(&space, &relpath)
                                 .err()
                                 .map(|e| e.to_string());
-                            Ok((written, stale))
+                            Ok((written, stale, now_ref))
                         })
                         .await?
                     }
                 }
             };
+            let (outcome, stale, now_ref) = outcome;
             match outcome {
                 Written::Fully(kind) | Written::WithoutMetadata(kind, _) => {
+                    if let Some(git) = &git {
+                        git.landed(&mut pending_objects);
+                    }
                     report.adopted += 1;
                     report.reflinked += usize::from(kind == crate::CloneKind::Reflink);
                     // Counted here rather than at the fetch, so the pair
@@ -500,6 +586,13 @@ impl Node {
                     report.reused_bytes += crate::checkout::bytes_of(&fetched.promoted, size);
                     if over {
                         report.replaced.push(path.clone());
+                        if let Some(before) = was_ref {
+                            report.replaced_refs.push((
+                                path.clone(),
+                                before,
+                                now_ref.unwrap_or_else(|| "(unreadable)".into()),
+                            ));
+                        }
                     }
                     if let Some(why) = stale {
                         report.warnings.push((
@@ -590,6 +683,12 @@ struct Wanted {
     /// overwrites the file the operator was shown and not whatever the path
     /// became while the object was being fetched.
     was: Option<(u64, i64, Option<Vec<u8>>)>,
+    /// What this path is to the git directory it lies in, if any: its write
+    /// order, and the hold it waits under.
+    git: Option<GitWant>,
+    /// For a git ref being replaced: the value on disk before, for the
+    /// report's `replaced_refs`.
+    was_ref: Option<String>,
 }
 
 /// The stat signature the plan records for a target, and the write re-checks.
@@ -650,6 +749,11 @@ pub(crate) struct AdoptTreePlan {
     /// as everything else, so that deciding stays free of side effects and a
     /// dry run is a dry run all the way down.
     links: Vec<PendingLink>,
+    /// Git objects the plan will write, per repository and publishing origin,
+    /// which the hold rule counts down as they land.
+    pending_objects: PendingObjects,
+    /// The git directories the plan writes into, for the in-progress guard.
+    git_roots: Vec<String>,
 }
 
 /// A symbolic link the plan decided to write.
@@ -682,7 +786,12 @@ fn decide(
     policy: &VersionPolicy,
     ignore: &IgnoreSet,
     options: AdoptTreeOptions,
-) -> Result<(AdoptTreeReport, Vec<Wanted>, Vec<PendingLink>)> {
+) -> Result<(
+    AdoptTreeReport,
+    Vec<Wanted>,
+    Vec<PendingLink>,
+    PendingObjects,
+)> {
     // One clock reading for the pass, and the store's rather than the bare
     // clock, so every path selects against the same instant (`plan_pass`,
     // checkout.rs).
@@ -693,6 +802,7 @@ fn decide(
     };
     let mut wanted: Vec<Wanted> = Vec::new();
     let mut links: Vec<PendingLink> = Vec::new();
+    let mut pending_objects = PendingObjects::new();
     // Paths this pass will make into symbolic links, so that what they shadow
     // is judged against the tree the tree adoption is about to create rather than the
     // one it started with.
@@ -706,6 +816,12 @@ fn decide(
     let mut claimed: HashMap<String, String> = HashMap::new();
 
     for set in listing {
+        let git = synch_core::git::classify(&set.path);
+        // A lock file or a machine-local pointer published by a member
+        // running older software: never written (`docs/GIT.md` §2).
+        if git.is_some_and(|git| git.class.is_excluded()) {
+            continue;
+        }
         // A checkout refuses these names on every platform, so that one projection of
         // one tree is the same directory everywhere. A tree adoption has the opposite
         // obligation: it writes into *this* machine's directory, where this
@@ -778,7 +894,25 @@ fn decide(
         // A tree adoption adds. A tombstone asks for a removal, which is the one thing
         // it will not do — `synch adopt path` of that version is how a deletion is
         // adopted, deliberately and one path at a time (§8).
-        if selected.kind == EntryKind::Tombstone || selected.kind == EntryKind::Dir {
+        //
+        // For a git ref the selected tombstone is the ref's current state
+        // rather than one origin stepping aside (`docs/GIT.md` §6.2), so it
+        // is named: still not removed, but the operator is told which refs
+        // the repository they adopted from no longer has.
+        if selected.kind == EntryKind::Tombstone {
+            if git.is_some_and(|git| {
+                matches!(
+                    git.class,
+                    synch_core::GitClass::Ref | synch_core::GitClass::WorktreeState
+                )
+            }) && !ignore.excludes_path(&set.path)
+                && std::fs::symlink_metadata(&target).is_ok()
+            {
+                report.deleted.push(set.path.clone());
+            }
+            continue;
+        }
+        if selected.kind == EntryKind::Dir {
             continue;
         }
 
@@ -806,6 +940,15 @@ fn decide(
                 set.path.clone(),
                 "a directory stands here, and a tree adoption does not remove things".into(),
             ));
+            continue;
+        }
+        // A git object here is the object: its name is its content
+        // (`docs/GIT.md` §6.1), so a file at the path is current whatever its
+        // bytes, and `--replace` never touches it.
+        if git.is_some_and(|git| git.class == synch_core::GitClass::Object)
+            && on_disk.as_ref().is_some_and(|m| m.is_file())
+        {
+            report.current += 1;
             continue;
         }
 
@@ -930,6 +1073,33 @@ fn decide(
                 continue;
             }
         };
+        let attestors = attestors_of(set, &selected);
+        let git_want = GitWant::of(git.as_ref(), selected.size, &attestors);
+        // What a held ref waits on is seeded from the disk, once per
+        // repository and publishing origin: every object file that origin
+        // publishes and that is not here by path (`docs/GIT.md` §8.1). Not
+        // from what this run plans to write — an object the plan passes over
+        // (excluded by `.syncignore`, a directory in its way, no donor, or
+        // simply outside a narrowed prefix) is exactly one the ref must keep
+        // waiting for, and only a successful write releases it.
+        if let Some(git) = git_want.as_ref().filter(|git| git.hold.is_some()) {
+            for origin in &attestors {
+                let key = (git.root.clone(), origin.clone());
+                if pending_objects.contains_key(&key) {
+                    continue;
+                }
+                let missing = match origin.parse::<synch_core::OriginId>() {
+                    Ok(origin) => {
+                        node.missing_git_objects(space_id, root_dir, &git.root, &origin)?
+                    }
+                    Err(_) => usize::MAX,
+                };
+                pending_objects.insert(key, missing);
+            }
+        }
+        let was_ref = git
+            .filter(|git| git.class == synch_core::GitClass::Ref && on_disk.is_some())
+            .and_then(|_| crate::gitdir::ref_value(&target));
         wanted.push(Wanted {
             path: set.path.clone(),
             target,
@@ -939,10 +1109,12 @@ fn decide(
             donors,
             replacing: on_disk.is_some(),
             was: on_disk.as_ref().map(signature),
+            git: git_want,
+            was_ref,
         });
     }
 
-    Ok((report, wanted, links))
+    Ok((report, wanted, links, pending_objects))
 }
 
 /// The content root the scanner recorded for a path, when the stat on disk

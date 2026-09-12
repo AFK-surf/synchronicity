@@ -6,6 +6,7 @@
 pub mod blocking;
 pub mod civil;
 pub mod fs;
+pub mod git;
 pub mod hash;
 pub mod head;
 pub mod json;
@@ -16,6 +17,7 @@ pub mod sock;
 pub mod wire;
 
 pub use blocking::{assert_off_runtime, blocking_is_allowed, offload, BlockingScope, TaskLost};
+pub use git::{GitClass, GitPath};
 pub use hash::{group_cv, hash_reader, join_cvs, join_root, Cv, Hash};
 pub use head::{head_signing_input, HeadSummary, SignedHead};
 pub use origin::{NodeId, OriginId};

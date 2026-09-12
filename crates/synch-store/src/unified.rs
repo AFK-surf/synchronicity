@@ -14,7 +14,7 @@
 use std::str::FromStr;
 
 use rusqlite::params;
-use synch_core::{EntryKind, Hash, OriginId};
+use synch_core::{EntryKind, GitClass, Hash, OriginId};
 
 use crate::{
     db::Store,
@@ -151,10 +151,15 @@ pub struct VersionSet {
     /// `select` filters tombstones out of the running and this order does not,
     /// so a deletion dated after every live version sorts last and is still not
     /// what `newest` returns. Tombstones stay in the list because every
-    /// surface that shows a version list has to show them.
+    /// surface that shows a version list has to show them. A git ref or
+    /// worktree-state path is the exception (`docs/GIT.md` §6.2): there the
+    /// deletion competes, and the last version *is* what `newest` returns.
     pub versions: Vec<Version>,
     /// Every origin's entry for the path, canonically ordered.
     pub entries: Vec<EntryRow>,
+    /// The path's class inside a git directory, if any — derived from the
+    /// path once, here, because selection consults it.
+    pub git: Option<GitClass>,
 }
 
 impl VersionSet {
@@ -170,10 +175,14 @@ impl VersionSet {
         now: i64,
     ) -> VersionSet {
         entries.sort_by_key(|entry| entry.origin.canonical());
+        let git = git_class(path);
         let mut versions: Vec<Version> = Vec::new();
         for entry in &entries {
-            let key = identity(entry);
-            match versions.iter_mut().find(|v| identity_of_version(v) == key) {
+            let key = identity(git, entry);
+            match versions
+                .iter_mut()
+                .find(|v| identity_of_version(git, v) == key)
+            {
                 Some(version) => {
                     version.mtime_ns = version.mtime_ns.max(entry.mtime_ns);
                     version.seq = version.seq.max(entry.seq);
@@ -190,12 +199,22 @@ impl VersionSet {
                 }),
             }
         }
-        versions.sort_by_key(|version| version_key(version, now));
+        // A git object is a set member, not a document: a tombstone for one
+        // says nothing about the object — an origin packed or pruned its
+        // copy — so while any origin still publishes it, the deletion is
+        // neither a version nor a reason to mark anything (`docs/GIT.md`
+        // §6.1). With no live copy left the tombstones stay, so the path
+        // still reads as "deleted at seq N" rather than as nothing.
+        if git == Some(GitClass::Object) && versions.iter().any(|v| !v.is_tombstone()) {
+            versions.retain(|v| !v.is_tombstone());
+        }
+        versions.sort_by_key(|version| version_key(git, version, now));
         VersionSet {
             space: space.to_string(),
             path: path.to_string(),
             versions,
             entries,
+            git,
         }
     }
 
@@ -211,7 +230,14 @@ impl VersionSet {
 
     /// True if the path exists in the unified tree: at least one origin
     /// currently publishes a live (non-tombstone) entry for it (§8).
+    ///
+    /// For a git ref or worktree-state path a deletion is an update
+    /// (`docs/GIT.md` §6.2), so the path exists iff the *newest* assertion
+    /// about it is live — the version `newest` would select.
     pub fn exists(&self) -> bool {
+        if deletion_is_an_update(self.git) {
+            return self.versions.last().is_some_and(|v| !v.is_tombstone());
+        }
         self.versions.iter().any(|v| !v.is_tombstone())
     }
 
@@ -228,7 +254,15 @@ impl VersionSet {
     /// path stays visible until every publisher tombstones it. Pinned to an
     /// origin the deletion is the answer — an origin-selected read follows one origin's
     /// view, deletions included.
+    ///
+    /// A git ref or worktree-state path is the one exception (`docs/GIT.md`
+    /// §6.2): `git branch -d` on one machine *is* the branch being deleted,
+    /// and another machine's copy of the ref is a stale cache rather than a
+    /// competing opinion. There `newest` ranks tombstones with the live
+    /// versions under the same order, and a selected tombstone means the
+    /// path is deleted.
     pub fn select(&self, policy: &VersionPolicy, now: i64) -> Selection {
+        let git = self.git;
         match policy {
             VersionPolicy::Origin(origin) => {
                 match self.entries.iter().find(|e| &e.origin == origin) {
@@ -238,11 +272,12 @@ impl VersionSet {
             }
             VersionPolicy::Strict if self.is_divergent() => Selection::Divergent,
             VersionPolicy::Strict | VersionPolicy::Newest => {
+                let deletions_compete = deletion_is_an_update(git);
                 match self
                     .entries
                     .iter()
-                    .filter(|entry| entry.kind != EntryKind::Tombstone)
-                    .max_by(|a, b| entry_key(a, now).cmp(&entry_key(b, now)))
+                    .filter(|entry| deletions_compete || entry.kind != EntryKind::Tombstone)
+                    .max_by(|a, b| entry_key(git, a, now).cmp(&entry_key(git, b, now)))
                 {
                     Some(entry) => Selection::Selected(Box::new(entry.clone())),
                     None => Selection::Absent,
@@ -276,6 +311,11 @@ impl VersionSet {
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Selection {
     /// The policy chose this origin's assertion.
+    ///
+    /// The entry may be a tombstone: under `origin=` a pinned origin's
+    /// deletion is the answer, and for a git ref or worktree-state path
+    /// (`docs/GIT.md` §6.2) a deletion newer than every live copy is what
+    /// `newest` selects. A caller that wants bytes checks the kind.
     ///
     /// Boxed because it is by far the largest variant and the other two carry
     /// nothing: every `Absent` and `Divergent` would otherwise pay for a whole
@@ -319,7 +359,16 @@ fn content_of(entry: &EntryRow) -> Option<Hash> {
 /// The one derivation, over the three fields any version carries, so an
 /// `EntryRow` and a `Version` cannot come to different answers about the same
 /// assertion.
+///
+/// `git` is the path's class inside a git directory, if any. For a git
+/// object the *name* is the identity (`docs/GIT.md` §6.1): a loose object's
+/// path is the hash of its inflated content and a pack's name is the pack's
+/// own checksum, so two live files at one object path decode to the same
+/// object or one of them is corrupt — and git verifies on every read, so a
+/// corrupt copy fails loudly on the machine that has it. Every live copy is
+/// therefore one version, and two zlib encodings are not a divergence.
 fn identity_of(
+    git: Option<GitClass>,
     kind: EntryKind,
     content: Option<Hash>,
     symlink_target: &Option<String>,
@@ -327,16 +376,31 @@ fn identity_of(
     match kind {
         EntryKind::Tombstone => (kind, None, None),
         EntryKind::Symlink => (kind, None, Some(symlink_target.clone().unwrap_or_default())),
+        _ if git == Some(GitClass::Object) => (kind, None, None),
         _ => (kind, content.map(|h| *h.as_bytes()), None),
     }
 }
 
-fn identity(entry: &EntryRow) -> Identity {
-    identity_of(entry.kind, entry.content, &entry.symlink_target)
+fn identity(git: Option<GitClass>, entry: &EntryRow) -> Identity {
+    identity_of(git, entry.kind, entry.content, &entry.symlink_target)
 }
 
-fn identity_of_version(version: &Version) -> Identity {
-    identity_of(version.kind, version.content, &version.symlink_target)
+fn identity_of_version(git: Option<GitClass>, version: &Version) -> Identity {
+    identity_of(git, version.kind, version.content, &version.symlink_target)
+}
+
+/// The git class of a path, computed from the path alone: the one thing
+/// selection may depend on beyond the row, because every node derives it from
+/// the same key.
+fn git_class(path: &str) -> Option<GitClass> {
+    synch_core::git::classify(path).map(|git| git.class)
+}
+
+/// The classes for which a tombstone competes with live versions under
+/// `newest` rather than stepping only its own origin aside (`docs/GIT.md`
+/// §6.2).
+fn deletion_is_an_update(git: Option<GitClass>) -> bool {
+    matches!(git, Some(GitClass::Ref) | Some(GitClass::WorktreeState))
 }
 
 /// The deterministic total order `newest` maximizes: `(mtime_ns, content_root,
@@ -362,8 +426,12 @@ fn identity_of_version(version: &Version) -> Identity {
 /// Clamped here rather than on the way in, because the row is the leaf: the
 /// same trie has to materialize identically on every node and after a rebuild,
 /// so the time-dependence belongs to the reading and not to the data.
-fn entry_key(entry: &EntryRow, now: i64) -> (i64, Option<[u8; 32]>, Option<String>, String) {
-    let (_, content, target) = identity(entry);
+fn entry_key(
+    git: Option<GitClass>,
+    entry: &EntryRow,
+    now: i64,
+) -> (i64, Option<[u8; 32]>, Option<String>, String) {
+    let (_, content, target) = identity(git, entry);
     (
         entry.mtime_ns.min(now),
         content,
@@ -373,8 +441,12 @@ fn entry_key(entry: &EntryRow, now: i64) -> (i64, Option<[u8; 32]>, Option<Strin
 }
 
 /// The same order at version granularity, for presenting a version list.
-fn version_key(version: &Version, now: i64) -> (i64, Option<[u8; 32]>, Option<String>, String) {
-    let (_, content, target) = identity_of_version(version);
+fn version_key(
+    git: Option<GitClass>,
+    version: &Version,
+    now: i64,
+) -> (i64, Option<[u8; 32]>, Option<String>, String) {
+    let (_, content, target) = identity_of_version(git, version);
     (
         version.mtime_ns.min(now),
         content,
@@ -867,10 +939,167 @@ mod tests {
                 .iter()
                 .find(|e| e.origin == origin(name))
                 .expect("the entry");
-            entry_key(entry, now)
+            entry_key(None, entry, now)
         };
         assert_eq!(key_of("liar").0, now, "read as of now, never past it");
         assert_eq!(key_of("nas").0, 1_000, "an honest stamp is left alone");
+    }
+
+    /// A git object is one version whatever its bytes: two zlib encodings of the same object at the same path collapse, a tombstone for it neither counts nor marks while any copy is live, and with every copy gone the deletion is still on record (`docs/GIT.md` §6.1).
+    #[test]
+    fn git_objects_are_identified_by_name() {
+        let (_d, store) = testutil::store();
+        let path = "app/.git/objects/ab/0123456789012345678901234567890123456789";
+        put(
+            &store,
+            "src",
+            "nas",
+            path,
+            &FileEntry::file(9, 100, Hash::new(b"zlib level 6"), 1),
+        );
+        put(
+            &store,
+            "src",
+            "laptop",
+            path,
+            &FileEntry::file(9, 200, Hash::new(b"zlib level 1"), 1),
+        );
+        put(
+            &store,
+            "src",
+            "desktop",
+            path,
+            &FileEntry::tombstone(9_000, 2, None),
+        );
+        let set = store.versions_for("src", path).unwrap();
+        assert_eq!(set.version_count(), 1, "{:?}", set.describe());
+        assert!(!set.is_divergent());
+        assert!(set.exists());
+        assert_eq!(set.versions[0].attestors.len(), 2);
+        let selected = set
+            .select(&VersionPolicy::Newest, READ_AT)
+            .entry()
+            .unwrap()
+            .clone();
+        assert_ne!(selected.kind, EntryKind::Tombstone);
+        assert!(
+            set.select(&VersionPolicy::Strict, READ_AT)
+                .entry()
+                .is_some(),
+            "strict never refuses an object"
+        );
+        // Every copy gone: the deletion is what remains on record.
+        for name in ["nas", "laptop"] {
+            put(
+                &store,
+                "src",
+                name,
+                path,
+                &FileEntry::tombstone(9_000, 3, None),
+            );
+        }
+        let set = store.versions_for("src", path).unwrap();
+        assert_eq!(set.version_count(), 1);
+        assert!(!set.exists());
+        assert_eq!(
+            set.select(&VersionPolicy::Newest, READ_AT),
+            Selection::Absent
+        );
+        // The same bytes outside a git directory are two versions.
+        for (name, bytes, mtime) in [("nas", b"a" as &[u8], 100), ("laptop", b"b", 200)] {
+            put(
+                &store,
+                "src",
+                name,
+                "notes/objects/ab/0123456789012345678901234567890123456789",
+                &FileEntry::file(1, mtime, Hash::new(bytes), 1),
+            );
+        }
+        assert!(store
+            .versions_for(
+                "src",
+                "notes/objects/ab/0123456789012345678901234567890123456789"
+            )
+            .unwrap()
+            .is_divergent());
+    }
+
+    /// For a git ref a deletion is an update (`docs/GIT.md` §6.2): a tombstone newer than every live copy is what `newest` selects and the path has left the tree, while a live ref written after the deletion wins it back.
+    #[test]
+    fn a_git_ref_deletion_is_an_update() {
+        let (_d, store) = testutil::store();
+        let path = "app/.git/refs/heads/feature";
+        put(
+            &store,
+            "src",
+            "laptop",
+            path,
+            &FileEntry::file(41, 100, Hash::new(b"stale"), 1),
+        );
+        put(
+            &store,
+            "src",
+            "nas",
+            path,
+            &FileEntry::tombstone(500, 2, None),
+        );
+        let set = store.versions_for("src", path).unwrap();
+        assert_eq!(set.version_count(), 2);
+        assert!(!set.exists(), "the newest assertion is the deletion");
+        let selected = set
+            .select(&VersionPolicy::Newest, READ_AT)
+            .entry()
+            .unwrap()
+            .clone();
+        assert_eq!(selected.kind, EntryKind::Tombstone);
+        assert_eq!(selected.origin, origin("nas"));
+        assert_eq!(
+            set.select(&VersionPolicy::Strict, READ_AT),
+            Selection::Divergent,
+            "strict still refuses a divergent ref"
+        );
+        put(
+            &store,
+            "src",
+            "laptop",
+            path,
+            &FileEntry::file(41, 900, Hash::new(b"reborn"), 3),
+        );
+        let set = store.versions_for("src", path).unwrap();
+        assert!(set.exists());
+        assert_eq!(
+            set.select(&VersionPolicy::Newest, READ_AT)
+                .entry()
+                .unwrap()
+                .content,
+            Some(Hash::new(b"reborn")),
+            "a ref written after the deletion wins it back"
+        );
+        // A document beside the repository keeps the §8 rule: the live
+        // version outranks a later tombstone.
+        put(
+            &store,
+            "src",
+            "laptop",
+            "app/README",
+            &FileEntry::file(1, 100, Hash::new(b"doc"), 1),
+        );
+        put(
+            &store,
+            "src",
+            "nas",
+            "app/README",
+            &FileEntry::tombstone(500, 2, None),
+        );
+        let set = store.versions_for("src", "app/README").unwrap();
+        assert!(set.exists());
+        assert_ne!(
+            set.select(&VersionPolicy::Newest, READ_AT)
+                .entry()
+                .unwrap()
+                .kind,
+            EntryKind::Tombstone
+        );
     }
 
     /// A reader whose clock lags the cluster still selects the newer edit. The clamp bounds an inflated stamp, but a raw local clock cuts the other way: honest entries stamped above the reading collapse to it, the primary component ties, and selection falls through to the content hash — so a snapshot-restored node would pick the *older* edit. The trust floor is the persisted, monotonic record of how far the cluster has got: a floor ahead of the local clock is exactly that shape.
