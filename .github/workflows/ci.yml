@@ -217,7 +217,7 @@ jobs:
           done
       - name: Create provider namespaces
         run: |
-          docker run --rm --network host --entrypoint=/bin/sh minio/mc -c '
+          docker run --rm --network host --entrypoint=/bin/sh quay.io/minio/mc -c '
             mc alias set local http://127.0.0.1:9000 minioadmin minioadmin
             mc mb --ignore-existing local/synch-s3
           '
