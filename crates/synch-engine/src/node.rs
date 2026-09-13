@@ -242,6 +242,7 @@ struct NodeInner {
     /// commit exactly as it races an S3 `PUT`, and that race is documented
     /// rather than closed.
     tree_write_lock: tokio::sync::Mutex<()>,
+    source_scan_lock: std::sync::Mutex<()>,
     /// Rung when a space is added or removed, so the watcher re-registers
     /// without waiting for the next filesystem hint (§7.1).
     spaces_changed: Arc<tokio::sync::Notify>,
@@ -920,6 +921,7 @@ impl Node {
                 pending_wake,
                 checkout_lock: tokio::sync::Mutex::new(()),
                 tree_write_lock: tokio::sync::Mutex::new(()),
+                source_scan_lock: std::sync::Mutex::new(()),
                 spaces_changed: Arc::new(tokio::sync::Notify::new()),
                 cloud: std::sync::Mutex::new(Default::default()),
             }),
@@ -1474,6 +1476,52 @@ impl Node {
         Ok(())
     }
 
+    pub(crate) fn source_scan_guard(&self) -> std::sync::MutexGuard<'_, ()> {
+        self.inner
+            .source_scan_lock
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Local scanner preference; missing configuration preserves existing sources.
+    pub fn source_paused(&self, id: &str) -> Result<bool> {
+        Ok(self
+            .store()
+            .config(&format!("source.paused.{id}"))?
+            .as_deref()
+            == Some("true"))
+    }
+
+    /// Stop scanning without withdrawing records or changing the local binding.
+    /// Wait for scans already in progress and publish their accepted work first.
+    pub async fn set_source_paused(&self, id: &str, paused: bool) -> Result<()> {
+        let node = self.clone();
+        let id = id.to_owned();
+        crate::blocking::offload(move || {
+            let _scan = node.source_scan_guard();
+            let source = node
+                .store()
+                .source(&id)?
+                .ok_or_else(|| EngineError::not_found(format!("no source {id}")))?;
+            if source.local_path.is_none() {
+                return Err(EngineError::invalid(
+                    "only filesystem sources can be paused",
+                ));
+            }
+            node.store().set_config(
+                &format!("source.paused.{id}"),
+                if paused { "true" } else { "false" },
+            )?;
+            node.spaces_changed();
+            Ok(())
+        })
+        .await?;
+        if paused {
+            self.flush_staged().await?;
+        }
+        Ok(())
+    }
+
     /// Plans removal of a source's published entries.
     ///
     /// Staging the removal is half of a publish, so it takes the same recovery
@@ -1512,6 +1560,7 @@ impl Node {
         if !self.store().remove_source(id)? {
             return Err(EngineError::NotFound(format!("no source {id}")));
         }
+        self.store().clear_config(&format!("source.paused.{id}"))?;
         for path in self.store().local_files(id)? {
             self.store().remove_local_file(id, &path)?;
         }

@@ -357,6 +357,52 @@ async fn trust_a_silent_peer(
     (silent, accepting)
 }
 
+#[tokio::test]
+async fn source_pause_round_trip_keeps_files_and_published_records() {
+    let (data, daemon, source, _) = daemon_with_space(&[("keep.txt", b"before")]).await;
+    lines(
+        data.path(),
+        Command::SourceSetPaused(pb::SourceSetPaused {
+            space: "media".into(),
+            paused: true,
+        }),
+    )
+    .await;
+    let mut client = Client::connect(data.path()).await.unwrap();
+    let spaces = client.list_spaces().await.unwrap();
+    assert_eq!(spaces[0].source_paused, Some(true));
+    assert_eq!(
+        spaces[0].source_path.as_deref(),
+        Some(source.path().canonicalize().unwrap().to_str().unwrap())
+    );
+    std::fs::write(source.path().join("keep.txt"), b"after pause").unwrap();
+    lines(data.path(), source_scan()).await;
+    assert_eq!(
+        read(data.path(), cat("media/keep.txt", None, None)).await,
+        b"before"
+    );
+    daemon.shutdown().await;
+    let daemon = Daemon::reopen(data.path()).await;
+    let mut client = Client::connect(data.path()).await.unwrap();
+    assert_eq!(
+        client.list_spaces().await.unwrap()[0].source_paused,
+        Some(true)
+    );
+    lines(
+        data.path(),
+        Command::SourceSetPaused(pb::SourceSetPaused {
+            space: "media".into(),
+            paused: false,
+        }),
+    )
+    .await;
+    assert_eq!(
+        read(data.path(), cat("media/keep.txt", None, None)).await,
+        b"after pause"
+    );
+    daemon.shutdown().await;
+}
+
 /// Runs a command and asserts its output contains `needle`.
 async fn says(data_dir: &Path, command: Command, needle: &str) -> String {
     let out = lines(data_dir, command).await;

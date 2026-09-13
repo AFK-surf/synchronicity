@@ -457,9 +457,10 @@ impl Node {
             }
         };
 
-        // Publication is part of the completion promise, especially for a
-        // API source with no watcher to repair it later.
-        self.scan_publish_push().await?;
+        if !api_source {
+            self.stage_written_file(space, path).await?;
+        }
+        self.flush_staged().await?;
 
         let (node, upload_id) = (self.clone(), upload.to_string());
         crate::blocking::offload(move || {
@@ -956,6 +957,46 @@ fn cloud_part_key(upload: &str, file: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn completing_a_paused_source_upload_publishes_only_the_uploaded_file() {
+        let (_data, source, node) = crate::testkit::node_with_space().await;
+        node.set_source_paused("media", true).await.unwrap();
+        std::fs::write(source.path().join("private.txt"), b"not uploaded").unwrap();
+        let target = node.upload_target("media", "manual.txt").unwrap();
+        let upload = node
+            .create_upload("media", "manual.txt", None, &target)
+            .unwrap();
+        let staging = node
+            .open_part(&upload, "media", "manual.txt", None, 1)
+            .unwrap();
+        let mut adoption = Adoption::at(&staging.path).unwrap();
+        adoption.write(b"explicit upload").unwrap();
+        node.commit_part_durable(staging, adoption).await.unwrap();
+        let completed = node
+            .complete_upload(&upload, "media", "manual.txt", None, &[(1, None)])
+            .await
+            .unwrap();
+        assert_eq!(
+            node.store()
+                .entry(node.origin(), "media", "manual.txt")
+                .unwrap()
+                .unwrap()
+                .content,
+            Some(completed.root)
+        );
+        assert_eq!(
+            node.store().read_all(&completed.root).unwrap(),
+            b"explicit upload"
+        );
+        assert!(node
+            .store()
+            .entry(node.origin(), "media", "private.txt")
+            .unwrap()
+            .is_none());
+        assert!(node.source_paused("media").unwrap());
+        node.shutdown().await.unwrap();
+    }
 
     #[tokio::test]
     async fn cloud_parts_are_durable_before_rows_and_complete_an_api_source() {

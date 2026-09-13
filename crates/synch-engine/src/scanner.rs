@@ -131,6 +131,9 @@ impl Node {
                 "source {space_id} is API-only and cannot be scanned"
             ))
         })?;
+        if self.source_paused(space_id)? {
+            return Ok(ScanReport::default());
+        }
         let root_dir = PathBuf::from(local_path);
         let seq = self.next_seq()?;
 
@@ -690,6 +693,7 @@ impl Node {
         let node = self.clone();
         let backend = self.cas_backend().clone();
         crate::blocking::offload(move || {
+            let _scan = node.source_scan_guard();
             node.ensure_publishable()?;
             let runtime = tokio::runtime::Handle::current();
             let mut spaces = Vec::new();
@@ -713,6 +717,7 @@ impl Node {
         let backend = self.cas_backend().clone();
         let space = space.to_string();
         crate::blocking::offload(move || {
+            let _scan = node.source_scan_guard();
             node.ensure_publishable()?;
             let runtime = tokio::runtime::Handle::current();
             let mut report = node.scan_space_with_ingest(&space, &mut |path| {
@@ -723,6 +728,41 @@ impl Node {
             node.stage(report.staged.iter().cloned());
             report.staged.clear();
             Ok(report)
+        })
+        .await
+    }
+
+    /// Indexes one explicitly written file without resuming its source or
+    /// scanning neighboring paths. Uploads must publish even while automatic
+    /// filesystem synchronization is paused.
+    pub async fn stage_written_file(&self, space_id: &str, path: &str) -> Result<()> {
+        let (node, space, path) = (self.clone(), space_id.to_string(), path.to_string());
+        let backend = self.cas_backend().clone();
+        crate::blocking::offload(move || {
+            let _scan = node.source_scan_guard();
+            node.ensure_adoptable(&space, &path)?;
+            let (target, (_, normalized)) = node.adoption_target_checked(&space, &path)?;
+            let metadata = std::fs::symlink_metadata(&target)?;
+            if !metadata.is_file() && !metadata.is_symlink() {
+                return Err(EngineError::invalid(
+                    "an explicit file write cannot index a directory",
+                ));
+            }
+            let mut report = ScanReport::default();
+            let runtime = tokio::runtime::Handle::current();
+            node.index_file(
+                &space,
+                &(target, normalized, metadata.is_symlink(), None),
+                node.next_seq()?,
+                &mut report,
+                &mut |path| {
+                    let ingested =
+                        runtime.block_on(backend.ingest_file(path.to_path_buf(), now_ns()))?;
+                    Ok((ingested.root, ingested.size))
+                },
+            )?;
+            node.stage(report.staged);
+            Ok(())
         })
         .await
     }
@@ -2758,6 +2798,55 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             assert_eq!(metadata.permissions().mode() & 0o7777, 0o755);
         }
+    }
+
+    #[tokio::test]
+    async fn paused_source_preserves_records_and_resumes_after_restart() {
+        let (data, dir, node) = crate::testkit::node_with_space().await;
+        let path = dir.path().join("keep.txt");
+        std::fs::write(&path, b"before").unwrap();
+        node.scan_and_stage_async().await.unwrap();
+        node.set_source_paused("media", true).await.unwrap();
+        let before = published(&node, "media", "keep.txt");
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(dir.path().join("later.txt"), b"while paused").unwrap();
+        node.scan_and_stage_async().await.unwrap();
+        node.flush_staged().await.unwrap();
+        assert_eq!(
+            published(&node, "media", "keep.txt").content,
+            before.content
+        );
+        assert!(node
+            .store()
+            .entry(node.origin(), "media", "later.txt")
+            .unwrap()
+            .is_none());
+        assert!(crate::watcher::SpaceWatcher::configured_spaces(&node)
+            .unwrap()
+            .is_empty());
+        node.shutdown().await.unwrap();
+        drop(node);
+        let node = crate::testkit::reopen(data.path()).await;
+        assert!(node.source_paused("media").unwrap());
+        node.scan_and_stage_async().await.unwrap();
+        node.flush_staged().await.unwrap();
+        assert_eq!(
+            published(&node, "media", "keep.txt").content,
+            before.content
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("later.txt")).unwrap(),
+            b"while paused"
+        );
+        node.set_source_paused("media", false).await.unwrap();
+        node.scan_and_stage_async().await.unwrap();
+        node.flush_staged().await.unwrap();
+        assert_eq!(
+            published(&node, "media", "keep.txt").kind,
+            synch_core::EntryKind::Tombstone
+        );
+        assert_eq!(published(&node, "media", "later.txt").size, 12);
+        node.shutdown().await.unwrap();
     }
 
     #[tokio::test]

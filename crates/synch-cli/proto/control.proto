@@ -221,6 +221,7 @@ message Command {
     SocketLog socket_log = 55;
     SourceAdd source_add = 56;
     SourceLs source_ls = 57;
+    SourceSetPaused source_set_paused = 72;
     SourceRm source_rm = 58;
     SourceScan source_scan = 59;
     ReplicaAdd replica_add = 60;
@@ -343,6 +344,11 @@ message SourceAdd {
   string space = 1;
   string path = 2;
   bool api = 3;
+}
+
+message SourceSetPaused {
+  string space = 1;
+  bool paused = 2;
 }
 
 message SourceLs {
@@ -661,6 +667,7 @@ message SpaceInfo {
   optional uint64 wanted = 7;
   optional string source_kind = 8;
   optional string checkout_path = 9;
+  optional bool source_paused = 10;
 }
 
 message GetConfigRequest {

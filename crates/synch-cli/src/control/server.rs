@@ -1034,15 +1034,20 @@ impl Control for ControlService {
                             .replica_coverage(&row.holder(), UNREACHABLE_ATTEMPTS)
                     })
                     .transpose()?;
-                out.push((name, source, replica, coverage));
+                let paused = source
+                    .as_ref()
+                    .map(|_| n.source_paused(&name))
+                    .transpose()?;
+                out.push((name, source, replica, coverage, paused));
             }
             Ok(out)
         })
         .await?;
-        let stream =
-            tokio_stream::iter(spaces.into_iter().map(|(id, source, replica, coverage)| {
+        let stream = tokio_stream::iter(spaces.into_iter().map(
+            |(id, source, replica, coverage, paused)| {
                 Ok(pb::SpaceInfo {
                     id,
+                    source_paused: paused,
                     source_path: source.as_ref().and_then(|row| row.local_path.clone()),
                     source_kind: source.as_ref().map(|row| row.kind.render().to_string()),
                     retention: replica.as_ref().map(|row| row.retention.to_string()),
@@ -1052,7 +1057,8 @@ impl Control for ControlService {
                     wanted: coverage.as_ref().map(|c| c.wanted),
                     checkout_path: replica.and_then(|row| row.checkout_path),
                 })
-            }));
+            },
+        ));
         Ok(Response::new(Box::pin(stream)))
     }
 
@@ -2403,6 +2409,19 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
             }
         }
 
+        Command::SourceSetPaused(pb::SourceSetPaused { space, paused }) => {
+            node.set_source_paused(&space, paused).await?;
+            if !paused {
+                node.scan_source_and_stage_async(&space).await?;
+                node.flush_staged().await?;
+            }
+            out.line(format!(
+                "{space}: {}",
+                if paused { "paused" } else { "active" }
+            ))
+            .await?;
+        }
+
         Command::SourceLs(pb::SourceLs { space }) => {
             let sources = read(node, move |n| {
                 if space.is_empty() {
@@ -3737,13 +3756,13 @@ async fn receive(
         result?;
         format!("{}/{}", header.space, header.path)
     } else {
+        node.stage_written_file(&header.space, &header.path).await?;
         target.display().to_string()
     };
 
-    // Filesystem-source writes enter through the scanner; API-source writes already
-    // staged their CAS-direct `f:`/`b:` pair above. `scan_publish_push` skips
-    // API sources but flushes the shared batch in either case.
-    node.scan_publish_push().await?;
+    // The explicit upload stages its own path; it does not depend on the
+    // automatic scanner or publish other local edits while sync is paused.
+    node.flush_staged().await?;
     let ours = VersionPolicy::Origin(node.origin().clone());
     let (set, now) = {
         let (space, path) = (header.space.clone(), header.path.clone());

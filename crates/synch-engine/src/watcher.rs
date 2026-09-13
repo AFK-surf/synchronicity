@@ -76,12 +76,15 @@ impl SpaceWatcher {
     /// read it on the blocking pool: this is a `spaces` query and the loop
     /// runs on a runtime worker (§10).
     pub(crate) fn configured_spaces(node: &Node) -> Result<HashSet<PathBuf>> {
-        Ok(node
-            .store()
-            .sources()?
-            .into_iter()
-            .filter_map(|space| space.local_path.map(PathBuf::from))
-            .collect())
+        let mut paths = HashSet::new();
+        for source in node.store().sources()? {
+            if !node.source_paused(&source.space)? {
+                if let Some(path) = source.local_path {
+                    paths.insert(PathBuf::from(path));
+                }
+            }
+        }
+        Ok(paths)
     }
 
     /// Registers spaces added since the last pass and drops ones removed,

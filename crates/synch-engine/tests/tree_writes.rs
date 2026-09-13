@@ -140,6 +140,25 @@ async fn a_socket_write_publishes_this_nodes_own_version() {
         std::fs::read(space.path().join("inbox/drop.bin")).unwrap(),
         payload
     );
+    node.set_source_paused("code", true).await.unwrap();
+    write(space.path(), "private.txt", b"not explicitly uploaded");
+    let replacement = b"explicit replacement while paused";
+    let (status, _) = drive(&node, "drop", replacement).await;
+    assert_eq!(status, SockStatus::Ok(0));
+    assert_eq!(
+        node.store()
+            .entry(node.origin(), "code", "inbox/drop.bin")
+            .unwrap()
+            .unwrap()
+            .content,
+        Some(Hash::new(replacement))
+    );
+    assert!(node
+        .store()
+        .entry(node.origin(), "code", "private.txt")
+        .unwrap()
+        .is_none());
+    assert!(node.source_paused("code").unwrap());
     node.shutdown().await.unwrap();
 }
 
