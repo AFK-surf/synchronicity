@@ -1338,6 +1338,12 @@ behavior with zero kernel dependencies:
   stages nothing (republishing one every scan would defeat the "unchanged tree
   publishes no head" property), a retargeted one stages an update, and a deleted
   one is swept into a tombstone like any other path.
+- **Pause**: `synch source pause <id>` preserves local files and published records,
+  flushes accepted changes, and stops source scans, including explicit scans.
+  The setting survives restarts. `synch source resume <id>` scans and publishes
+  current local changes. Explicit uploads, deletions, and adoptions still publish
+  while paused, without scanning neighboring paths. Replica retention and
+  checkout settings are independent.
 - **Publisher**: staged changes are batched (default: quiesce 2 s or 1000 entries) into
   a single new trie root: bump `seq`, sign, store, and hand to the pusher, which sends
   `HeadPush` to the membership. One save in an editor costs one head; a 100k-file initial
@@ -1364,9 +1370,9 @@ selection policy: `--select newest` (default), `--select origin=<id>`, or
   path and publishes that deletion.
 - `synch adopt tree` does the same additively for a subtree. Existing differing
   files are reported unless `--replace` is explicit; `--dry-run` is a complete
-  preview. It never infers removal from absence. A successful non-dry run scans,
-  publishes before returning, and offers the head to the pusher — whether peers
-  have it yet is not something the command waits for (§5.3).
+  preview. It never infers removal from absence. A successful non-dry run indexes
+  only the paths it wrote and publishes before returning, even while the source
+  is paused. It offers the head to the pusher without waiting for peers (§5.3).
 
 A replica may also have `--checkout <path>`. That directory is only a view of
 content the replica already holds: checkout never creates retention demand and
@@ -1452,11 +1458,12 @@ content.** What it does do is aggregate:
   selection (§7.2, §9.4).
 - **Adoption is explicit — and deletions are adoptable**: `synch adopt path
   <space>/<path> --select origin=<id>` makes that origin's version our own. For a live
-  version, it fetches the content, writes it into the local space, and thereby
-  (via the filesystem-source scan) publishes it as the local node's own new entry.
-  For a **tombstone** version, it deletes our local copy from the space, and the
-  next scan publishes our own tombstone — adopting the deletion exactly as one
-  adopts content. Adoption is how *all* divergence ends, deletion divergence
+  version, it fetches the content, writes it into the local space, and indexes
+  that path as the local node's own new entry.
+  For a **tombstone** version, it deletes our local copy and stages our own
+  tombstone, even if the file was already absent. The command publishes before
+  it returns, including when automatic source scanning is paused. It does not
+  scan neighboring paths. Adoption is how *all* divergence ends, deletion divergence
   included: as publishers converge on one identity, their assertions collapse
   back into a single unanimous version. `prev` is set to the replaced local
   content root, recording 1-step lineage so UIs can distinguish "adopted theirs
@@ -1534,6 +1541,7 @@ synch peer ls|sync                           inspect peers or exchange metadata 
 
 synch source add <id> <path>|--api           configure this node to publish a space
 synch source ls|scan|rm [<id>]               inspect, scan, or stop a publisher
+synch source pause|resume <id>              stop or resume filesystem-source scans
 synch replica add|set|rm <id> [options]      configure independent durable retention
 synch replica ls|sync [<id>]                 coverage or an immediate content pass
 

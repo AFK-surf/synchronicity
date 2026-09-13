@@ -2043,7 +2043,8 @@ async fn a_failed_put_publishes_nothing() {
 /// answer is the gateway's `DeleteObject` path, exercised where a peer exists.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn delete_publishes_a_tombstone() {
-    let (dir, daemon, _space, _scan) = daemon_with_space(&[("gone.txt", b"bytes")]).await;
+    let (dir, daemon, space, _scan) =
+        daemon_with_space(&[("gone.txt", b"bytes"), ("absent.txt", b"old bytes")]).await;
     let data_dir = dir.path();
     assert_eq!(
         read(data_dir, cat("media/gone.txt", None, None)).await,
@@ -2064,6 +2065,46 @@ async fn delete_publishes_a_tombstone() {
             .unwrap_err(),
         ErrorCode::NotFound
     );
+
+    // A paused delete must publish even when both the file and scanner row
+    // are already gone. It must not scan the neighboring new file.
+    lines(
+        data_dir,
+        Command::SourceSetPaused(pb::SourceSetPaused {
+            space: "media".into(),
+            paused: true,
+        }),
+    )
+    .await;
+    std::fs::remove_file(space.path().join("absent.txt")).unwrap();
+    std::fs::write(space.path().join("private.txt"), b"unpublished").unwrap();
+    let node = daemon.node.clone();
+    off_runtime(move || {
+        node.store()
+            .remove_local_file("media", "absent.txt")
+            .unwrap()
+    })
+    .await;
+    synch_cli::write::delete(data_dir, "media/absent.txt")
+        .await
+        .unwrap();
+    let node = daemon.node.clone();
+    off_runtime(move || {
+        let deleted = node
+            .store()
+            .entry(node.origin(), "media", "absent.txt")
+            .unwrap()
+            .unwrap();
+        assert_eq!(deleted.kind, synch_core::EntryKind::Tombstone);
+        assert_eq!(deleted.prev, Some(synch_core::Hash::new(b"old bytes")));
+        assert!(node
+            .store()
+            .entry(node.origin(), "media", "private.txt")
+            .unwrap()
+            .is_none());
+        assert!(node.source_paused("media").unwrap());
+    })
+    .await;
 
     // A delete names one file: a directory, an origin-qualified reference, or
     // no path at all is refused before the daemon is asked.
@@ -2297,6 +2338,163 @@ async fn adopt_path_adopts_a_peers_deletion_over_the_socket() {
     assert!(!space.path().join("shared.txt").exists());
 
     daemon.shutdown().await;
+}
+
+async fn paused_adoption_publishes_selected_path(tree: bool, deletion: bool) {
+    let (dir, daemon, space, _) = daemon_with_space(&[("shared.txt", b"ours")]).await;
+    let data_dir = dir.path();
+    let peer = OriginId::named("laptop", "cluster.example").unwrap();
+    let node = daemon.node.clone();
+    let bound_peer = peer.clone();
+    off_runtime(move || {
+        node.store()
+            .put_binding(&synch_store::Binding {
+                origin: bound_peer,
+                node_id: SecretKey::generate().public(),
+                source: synch_store::BindingSource::Static,
+                domain: None,
+                issuer: None,
+                spaces: Vec::new(),
+                read_only: Vec::new(),
+                note: None,
+                added_at: 0,
+                expires_at: None,
+            })
+            .unwrap();
+    })
+    .await;
+    if deletion {
+        daemon
+            .peer_entry(
+                &peer,
+                "media",
+                "shared.txt",
+                synch_core::FileEntry::tombstone(synch_core::now_ns() + 1_000_000_000, 4, None),
+            )
+            .await;
+    } else {
+        daemon
+            .peer_file(
+                &peer,
+                "media",
+                "shared.txt",
+                b"theirs",
+                synch_core::now_ns() + 1_000_000_000,
+                4,
+            )
+            .await;
+    }
+    lines(
+        data_dir,
+        Command::SourceSetPaused(pb::SourceSetPaused {
+            space: "media".into(),
+            paused: true,
+        }),
+    )
+    .await;
+    std::fs::write(space.path().join("private.txt"), b"not explicitly adopted").unwrap();
+    if tree {
+        daemon
+            .peer_file(&peer, "media", "new.txt", b"new", 1_000_000_000, 4)
+            .await;
+        #[cfg(unix)]
+        {
+            let mut link = synch_core::FileEntry::tombstone(1_000_000_000, 4, None);
+            link.kind = synch_core::EntryKind::Symlink;
+            link.symlink_target = Some("new.txt".into());
+            link.size = 7;
+            daemon.peer_entry(&peer, "media", "link", link).await;
+        }
+        lines(
+            data_dir,
+            adopt_tree("media", Some("laptop@cluster.example"), true, true),
+        )
+        .await;
+        assert_eq!(
+            std::fs::read(space.path().join("shared.txt")).unwrap(),
+            b"ours"
+        );
+        assert!(!space.path().join("new.txt").exists());
+    }
+    let command = if tree {
+        adopt_tree("media", Some("laptop@cluster.example"), true, false)
+    } else {
+        adopt_path("laptop@cluster.example:media/shared.txt")
+    };
+    lines(data_dir, command).await;
+    let local = std::fs::read(space.path().join("shared.txt")).ok();
+    let node = daemon.node.clone();
+    let (published, neighbor) = off_runtime(move || {
+        (
+            node.store()
+                .entry(node.origin(), "media", "shared.txt")
+                .unwrap()
+                .unwrap(),
+            node.store()
+                .entry(node.origin(), "media", "private.txt")
+                .unwrap(),
+        )
+    })
+    .await;
+    if tree {
+        let node = daemon.node.clone();
+        off_runtime(move || {
+            assert_eq!(
+                node.store()
+                    .entry(node.origin(), "media", "new.txt")
+                    .unwrap()
+                    .unwrap()
+                    .content,
+                Some(synch_core::Hash::new(b"new"))
+            );
+            #[cfg(unix)]
+            assert_eq!(
+                node.store()
+                    .entry(node.origin(), "media", "link")
+                    .unwrap()
+                    .unwrap()
+                    .symlink_target
+                    .as_deref(),
+                Some("new.txt")
+            );
+        })
+        .await;
+    }
+    daemon.shutdown().await;
+    if deletion {
+        assert!(
+            local.is_none(),
+            "explicit deletion must remove the local file"
+        );
+        assert_eq!(
+            published.kind,
+            synch_core::EntryKind::Tombstone,
+            "explicit deletion must publish our tombstone before success"
+        );
+    } else {
+        assert_eq!(local.as_deref(), Some(b"theirs".as_slice()));
+        assert_eq!(
+            published.content,
+            Some(synch_core::Hash::new(b"theirs")),
+            "explicit adoption must publish our selected bytes before success"
+        );
+    }
+    assert!(neighbor.is_none(), "unrelated local edits must stay paused");
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn paused_path_adoption_publishes_selected_content() {
+    paused_adoption_publishes_selected_path(false, false).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn paused_path_adoption_publishes_selected_deletion() {
+    paused_adoption_publishes_selected_path(false, true).await;
+}
+
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn paused_tree_adoption_publishes_selected_content() {
+    paused_adoption_publishes_selected_path(true, false).await;
 }
 
 /// A daemon starts and stops with a trusted peer that answers nothing.

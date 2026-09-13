@@ -2815,17 +2815,19 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
                 let path = node
                     .adopt_from(&origin, &reference.space, &reference.path)
                     .await?;
+                let space = reference.space.clone();
+                if !read(node, move |n| Ok(n.is_api_source(&space)?)).await? {
+                    node.stage_written_file(&reference.space, &reference.path)
+                        .await?;
+                }
                 out.line(format!("adopted into {}", path.display())).await?;
             }
             // Path adoption publishes before it answers, for the same reason
             // `source scan` does: the seq it prints has to be a real one (§7.1)
             // — the head's, not a claim that a peer has it (§5.3).
-            match node.scan_publish_push().await? {
+            match node.flush_staged().await? {
                 Some(head) => out.line(format!("published seq {}", head.seq)).await?,
-                None => {
-                    out.line("nothing to publish: this node had no version of that path")
-                        .await?
-                }
+                None => out.line("adopted content was already published").await?,
             }
         }
 
@@ -3029,7 +3031,10 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
                 .await?;
             }
             if report.adopted > 0 && !report.dry_run {
-                match node.scan_publish_push().await? {
+                for path in &report.written {
+                    node.stage_written_file(&reference.space, path).await?;
+                }
+                match node.flush_staged().await? {
                     Some(head) => out.line(format!("published seq {}", head.seq)).await?,
                     None => out.line("adopted content was already published").await?,
                 }

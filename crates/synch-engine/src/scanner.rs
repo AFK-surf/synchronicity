@@ -909,8 +909,8 @@ impl Node {
     /// Adopts a peer's *deletion* of a path as our own (§8, `synch adopt path`).
     ///
     /// Deletions are adoptable exactly as content is: our local copy goes, and
-    /// the next scan publishes our own tombstone through the ordinary indexing
-    /// pipeline — the same path a deletion made with `rm` takes. Adoption is
+    /// a tombstone is staged without scanning the source. The caller must
+    /// flush before reporting success, including while the source is paused. Adoption is
     /// how all divergence ends, deletion divergence included: once every
     /// publisher tombstones the path, it leaves the unified tree.
     ///
@@ -918,47 +918,59 @@ impl Node {
     /// here to remove — which is not an error: the assertion being adopted is
     /// "this path is gone", and it already is.
     pub fn adopt_deletion(&self, space_id: &str, path: &str) -> Result<Option<PathBuf>> {
+        let _scan = self.source_scan_guard();
         // The publishability half only: an excluded path is exactly the stray
         // file a deletion is here to clear up (`refuse_if_ignored`).
         self.ensure_publishable()?;
-        if self.is_api_source(space_id)? {
-            let normalized = normalized_adoption_path(path)?;
-            let previous = self
-                .store()
-                .entry(self.origin(), space_id, &normalized)?
-                .and_then(|entry| entry.content);
-            let tombstone = FileEntry::tombstone(now_ns(), self.next_seq()?, previous);
-            let encoded = synch_core::record::encode(&tombstone)?;
-            self.stage([StagedChange::record(
-                file_key(space_id, &normalized)?,
-                Some(encoded),
-            )?]);
-            return Ok(previous.map(|_| PathBuf::from(format!("{space_id}/{normalized}"))));
-        }
-        // No git gate here: a deletion is idempotent and is how a stray file
-        // gets cleaned up, and S3 `DELETE` reaches this path (`docs/GIT.md`
-        // §8.3).
-        let target = self.adoption_target(space_id, path)?;
-        // `symlink_metadata`, so a symlink is removed as the link it is rather
-        // than followed to whatever it points at.
-        if std::fs::symlink_metadata(&target).is_err() {
-            return Ok(None);
-        }
-        if target.is_dir() {
-            // The path stays in the log and out of the message. This error
-            // reaches an S3 client verbatim, and the daemon's on-disk layout —
-            // the operator's home, the space roots — is not something a client
-            // that guessed a key is owed.
-            tracing::warn!(
-                target = %target.display(),
-                "refusing to remove a directory as if it were an object"
-            );
-            return Err(EngineError::invalid(format!(
-                "{space_id}/{path} is a directory here; refusing to remove it"
-            )));
-        }
-        std::fs::remove_file(&target)?;
-        Ok(Some(target))
+        let normalized = normalized_adoption_path(path)?;
+        let previous = self
+            .store()
+            .entry(self.origin(), space_id, &normalized)?
+            .and_then(|entry| entry.content);
+        let removed = if self.is_api_source(space_id)? {
+            previous.map(|_| PathBuf::from(format!("{space_id}/{normalized}")))
+        } else {
+            // No git gate here: a deletion is idempotent and is how a stray file
+            // gets cleaned up, and S3 `DELETE` reaches this path (`docs/GIT.md`
+            // §8.3).
+            let target = self.adoption_target(space_id, path)?;
+            // `symlink_metadata`, so a symlink is removed as the link it is rather
+            // than followed to whatever it points at.
+            let metadata = match std::fs::symlink_metadata(&target) {
+                Ok(metadata) => Some(metadata),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error.into()),
+            };
+            if metadata.as_ref().is_some_and(|metadata| metadata.is_dir()) {
+                // The path stays in the log and out of the message. This error
+                // reaches an S3 client verbatim, and the daemon's on-disk layout —
+                // the operator's home, the space roots — is not something a client
+                // that guessed a key is owed.
+                tracing::warn!(
+                    target = %target.display(),
+                    "refusing to remove a directory as if it were an object"
+                );
+                return Err(EngineError::invalid(format!(
+                    "{space_id}/{path} is a directory here; refusing to remove it"
+                )));
+            }
+            if metadata.is_some() {
+                std::fs::remove_file(&target)?;
+                Some(target)
+            } else {
+                None
+            }
+        };
+        // The trie supplies lineage even if the file or scanner row is gone.
+        // Stage the selected deletion only. A source scan would also publish
+        // unrelated edits and cannot run while the source is paused.
+        let tombstone = FileEntry::tombstone(now_ns(), self.next_seq()?, previous);
+        self.stage([StagedChange::record(
+            file_key(space_id, &normalized)?,
+            Some(synch_core::record::encode(&tombstone)?),
+        )?]);
+        self.store().remove_local_file(space_id, &normalized)?;
+        Ok(removed)
     }
 
     /// Opens a streamed write into a local space (§9.4).
