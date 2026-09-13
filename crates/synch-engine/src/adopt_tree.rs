@@ -18,10 +18,10 @@
 //! `--replace`'s own-origin guard, which needs this node to publish something,
 //! would be inert while it wrote. `synch recover` first (§3.4).
 //!
-//! Nothing here publishes. The files land in an indexed directory, so the next
-//! scan — the watcher's, or an explicit `synch source scan` — stages and publishes
-//! them as this node's own view (§7.1), exactly as it would files copied in by
-//! hand.
+//! The report names each written path. The control command indexes those paths
+//! and flushes before it returns, including while automatic scanning is paused.
+//! Other callers can index the reported paths or let a later source scan publish
+//! them as this node's own view (§7.1).
 //!
 //! Which is why a adopted file carries the selected version's metadata as well
 //! as its bytes. The mtime that scan publishes is then the one the origin
@@ -84,6 +84,9 @@ pub struct AdoptTreeReport {
     /// Files and symlinks written: the ones that were missing, plus whatever
     /// `--replace` replaced.
     pub adopted: usize,
+    /// Paths actually written, in write order, for explicit indexing before
+    /// publication. Empty for a dry run.
+    pub written: Vec<String>,
     /// Paths already holding the selected version's bytes.
     pub current: usize,
     /// The paths `--replace` overwrote — the subset of `adopted` that had
@@ -165,17 +168,16 @@ impl Node {
         //
         // A recovering node holds no complete head of its own (§3.4), which is
         // exactly the state an operator reaches for a tree adoption in: the checkout is
-        // gone and the cluster has the content. But a scan refuses in recovery
-        // too, so everything adopted would sit unpublished and the closing line
-        // of the command — "the next scan publishes what was adopted" — would be
-        // false. Worse, `--replace`'s own-origin guard is *inert* here: it fires
+        // gone and the cluster has the content. Publication refuses in recovery
+        // too, so the command could not publish what it wrote before returning.
+        // Worse, `--replace`'s own-origin guard is *inert* here: it fires
         // when the selected version is this node's own, and a recovering node
         // publishes nothing under its own origin, so every path selects a
         // peer's version and every local file that differs is overwritten with
         // no version, no `prev` and no trace. The guard against silent loss is
         // missing precisely where the danger is greatest.
         //
-        // `synch recover` first, then tree adoption, then scan. The error names it.
+        // `synch recover` first, then tree adoption and publication. The error names it.
         {
             let node = self.clone();
             crate::blocking::offload(move || node.ensure_publishable()).await?;
@@ -378,6 +380,7 @@ impl Node {
             match outcome {
                 Ok(over) => {
                     report.adopted += 1;
+                    report.written.push(path.clone());
                     if over {
                         report.replaced.push(path);
                     }
@@ -578,6 +581,7 @@ impl Node {
                         git.landed(&mut pending_objects);
                     }
                     report.adopted += 1;
+                    report.written.push(path.clone());
                     report.reflinked += usize::from(kind == crate::CloneKind::Reflink);
                     // Counted here rather than at the fetch, so the pair
                     // describes the bytes behind the files this tree adoption wrote

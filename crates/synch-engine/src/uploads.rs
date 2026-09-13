@@ -457,9 +457,10 @@ impl Node {
             }
         };
 
-        // Publication is part of the completion promise, especially for a
-        // API source with no watcher to repair it later.
-        self.scan_publish_push().await?;
+        if !api_source {
+            self.stage_written_file(space, path).await?;
+        }
+        self.flush_staged().await?;
 
         let (node, upload_id) = (self.clone(), upload.to_string());
         crate::blocking::offload(move || {
@@ -515,75 +516,9 @@ impl Node {
         })
         .await?;
 
-        // Unconditionally, and not only when a file was removed. The tombstone
-        // comes from the scanner's deletion sweep, which walks `local_files`
-        // rows, so a path whose file was already gone — removed out of band
-        // while the daemon was down — would otherwise never be published as
-        // deleted at all. An unchanged tree stages nothing, so being wrong here
-        // costs one stat pass.
-        self.scan_publish_push().await?;
-
-        // The sweep tombstones what it can see, and what it can see is
-        // `local_files`. If our own entry is *still live* after that, the sweep
-        // never saw the path — so the tombstone is staged here, from the trie
-        // rather than from the row that is missing. A row goes missing more
-        // easily than it looks: `reconcile_local_files` drops any the current
-        // head does not corroborate, and the control socket answers before the
-        // startup scan has finished. Without this the delete returns `204` and
-        // leaves this node asserting the key, signed, to every peer, with no
-        // later scan or restart able to notice.
-        let mine = synch_store::VersionPolicy::Origin(self.origin().clone());
-        // `now` comes back from the same trip as the listing: it touches the
-        // connection, and selecting every version against one instant is what
-        // keeps a tombstone that expires mid-read from reading two ways.
-        let (set, now) = {
-            let (node, space_owned, path_owned) =
-                (self.clone(), space.to_string(), path.to_string());
-            crate::blocking::offload(move || {
-                Ok((
-                    node.versions(&space_owned, &path_owned)?,
-                    node.store().read_instant()?,
-                ))
-            })
-            .await?
-        };
-        if self
-            .resolve_set(&set, &mine, now)
-            .is_ok_and(|row| row.kind != synch_core::EntryKind::Tombstone)
-        {
-            tracing::warn!(
-                space,
-                path,
-                "no local record backed this path; tombstoning it from the trie"
-            );
-            // The same tombstone the sweep would have staged: a *record*, not a
-            // removal. Staging `None` retires the key outright, which is what
-            // expiring a tombstone means — the path would read as "never
-            // existed" rather than "deleted at seq N", and peers would lose the
-            // assertion that tells them to stop serving their own copies.
-            let tombstone = {
-                let (node, space_owned, path_owned) =
-                    (self.clone(), space.to_string(), path.to_string());
-                crate::blocking::offload(move || {
-                    let previous = node
-                        .store()
-                        .entry(node.origin(), &space_owned, &path_owned)?
-                        .and_then(|entry| entry.content);
-                    Ok(synch_core::FileEntry::tombstone(
-                        synch_core::now_ns(),
-                        node.next_seq()?,
-                        previous,
-                    ))
-                })
-                .await?
-            };
-            let encoded = synch_core::record::encode(&tombstone)?;
-            self.stage([crate::node::StagedChange::record(
-                synch_core::file_key(space, path)?,
-                Some(encoded),
-            )?]);
-            self.flush_staged().await?;
-        }
+        // Adoption stages the selected tombstone even if the local file or
+        // scanner row was already absent. Flush it without scanning neighbors.
+        self.flush_staged().await?;
 
         // Whether the key survives is a question about *other* origins. Our own
         // entry is a tombstone by now, or was never there; counting it would
@@ -956,6 +891,46 @@ fn cloud_part_key(upload: &str, file: &str) -> String {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test]
+    async fn completing_a_paused_source_upload_publishes_only_the_uploaded_file() {
+        let (_data, source, node) = crate::testkit::node_with_space().await;
+        node.set_source_paused("media", true).await.unwrap();
+        std::fs::write(source.path().join("private.txt"), b"not uploaded").unwrap();
+        let target = node.upload_target("media", "manual.txt").unwrap();
+        let upload = node
+            .create_upload("media", "manual.txt", None, &target)
+            .unwrap();
+        let staging = node
+            .open_part(&upload, "media", "manual.txt", None, 1)
+            .unwrap();
+        let mut adoption = Adoption::at(&staging.path).unwrap();
+        adoption.write(b"explicit upload").unwrap();
+        node.commit_part_durable(staging, adoption).await.unwrap();
+        let completed = node
+            .complete_upload(&upload, "media", "manual.txt", None, &[(1, None)])
+            .await
+            .unwrap();
+        assert_eq!(
+            node.store()
+                .entry(node.origin(), "media", "manual.txt")
+                .unwrap()
+                .unwrap()
+                .content,
+            Some(completed.root)
+        );
+        assert_eq!(
+            node.store().read_all(&completed.root).unwrap(),
+            b"explicit upload"
+        );
+        assert!(node
+            .store()
+            .entry(node.origin(), "media", "private.txt")
+            .unwrap()
+            .is_none());
+        assert!(node.source_paused("media").unwrap());
+        node.shutdown().await.unwrap();
+    }
 
     #[tokio::test]
     async fn cloud_parts_are_durable_before_rows_and_complete_an_api_source() {

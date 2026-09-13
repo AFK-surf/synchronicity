@@ -877,6 +877,14 @@ fn to_command(cli: &Cli) -> Result<Cmd> {
         },
 
         Command::Source { command } => match command {
+            SourceCommand::Pause { space } => Cmd::SourceSetPaused(pb::SourceSetPaused {
+                space: space.clone(),
+                paused: true,
+            }),
+            SourceCommand::Resume { space } => Cmd::SourceSetPaused(pb::SourceSetPaused {
+                space: space.clone(),
+                paused: false,
+            }),
             // The daemon's working directory is its own; a relative path is
             // resolved against the caller's before it crosses the socket.
             SourceCommand::Add { space, path, api } => Cmd::SourceAdd(pb::SourceAdd {

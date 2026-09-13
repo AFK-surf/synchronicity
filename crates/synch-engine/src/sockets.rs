@@ -976,9 +976,8 @@ fn evaluate_delete_condition(
 /// A re-composition of what the control-service `Put` handler does, gate for
 /// gate: bytes stream into an [`Adoption`](crate::Adoption) beside the target
 /// — or the daemon's scratch, for an API source — and a commit is the
-/// adoption's rename plus the ordinary publish path (`scan_publish_push` for
-/// a filesystem source, `commit_api_file` plus a flush for an API-source
-/// one). Dropping it uncommitted drops the adoption, whose own `Drop` removes
+/// adoption's rename plus indexing of that file and a flush (`stage_written_file`
+/// for a filesystem source, `commit_api_file` for an API source). Dropping it uncommitted drops the adoption, whose own `Drop` removes
 /// the staging file.
 pub struct TreeWriter {
     node: Node,
@@ -1278,7 +1277,11 @@ impl SocketWriter for TreeWriter {
             })
             .await
             .map_err(write_refusal)?;
-            self.node.scan_publish_push().await.map_err(write_refusal)?;
+            self.node
+                .stage_written_file(&self.space, &self.path)
+                .await
+                .map_err(write_refusal)?;
+            self.node.flush_staged().await.map_err(write_refusal)?;
             (root, size)
         };
         tracing::info!(

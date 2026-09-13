@@ -333,6 +333,7 @@ impl Client {
             out.push(SpaceInfo {
                 id: space.id,
                 source_path: space.source_path,
+                source_paused: space.source_paused,
                 source_kind: space.source_kind,
                 retention: space.retention,
                 grace_secs: space.grace_secs,
@@ -708,6 +709,8 @@ pub struct SpaceInfo {
     pub id: String,
     /// The filesystem root, when this node has a filesystem source.
     pub source_path: Option<String>,
+    /// Whether the local filesystem scanner is paused.
+    pub source_paused: Option<bool>,
     /// `filesystem` or `api`, when this node has a source.
     pub source_kind: Option<String>,
     /// `current` or `forever`, when this node has a replica.

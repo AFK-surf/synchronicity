@@ -131,6 +131,9 @@ impl Node {
                 "source {space_id} is API-only and cannot be scanned"
             ))
         })?;
+        if self.source_paused(space_id)? {
+            return Ok(ScanReport::default());
+        }
         let root_dir = PathBuf::from(local_path);
         let seq = self.next_seq()?;
 
@@ -690,6 +693,7 @@ impl Node {
         let node = self.clone();
         let backend = self.cas_backend().clone();
         crate::blocking::offload(move || {
+            let _scan = node.source_scan_guard();
             node.ensure_publishable()?;
             let runtime = tokio::runtime::Handle::current();
             let mut spaces = Vec::new();
@@ -713,6 +717,7 @@ impl Node {
         let backend = self.cas_backend().clone();
         let space = space.to_string();
         crate::blocking::offload(move || {
+            let _scan = node.source_scan_guard();
             node.ensure_publishable()?;
             let runtime = tokio::runtime::Handle::current();
             let mut report = node.scan_space_with_ingest(&space, &mut |path| {
@@ -723,6 +728,41 @@ impl Node {
             node.stage(report.staged.iter().cloned());
             report.staged.clear();
             Ok(report)
+        })
+        .await
+    }
+
+    /// Indexes one explicitly written file without resuming its source or
+    /// scanning neighboring paths. Uploads must publish even while automatic
+    /// filesystem synchronization is paused.
+    pub async fn stage_written_file(&self, space_id: &str, path: &str) -> Result<()> {
+        let (node, space, path) = (self.clone(), space_id.to_string(), path.to_string());
+        let backend = self.cas_backend().clone();
+        crate::blocking::offload(move || {
+            let _scan = node.source_scan_guard();
+            node.ensure_adoptable(&space, &path)?;
+            let (target, (_, normalized)) = node.adoption_target_checked(&space, &path)?;
+            let metadata = std::fs::symlink_metadata(&target)?;
+            if !metadata.is_file() && !metadata.is_symlink() {
+                return Err(EngineError::invalid(
+                    "an explicit file write cannot index a directory",
+                ));
+            }
+            let mut report = ScanReport::default();
+            let runtime = tokio::runtime::Handle::current();
+            node.index_file(
+                &space,
+                &(target, normalized, metadata.is_symlink(), None),
+                node.next_seq()?,
+                &mut report,
+                &mut |path| {
+                    let ingested =
+                        runtime.block_on(backend.ingest_file(path.to_path_buf(), now_ns()))?;
+                    Ok((ingested.root, ingested.size))
+                },
+            )?;
+            node.stage(report.staged);
+            Ok(())
         })
         .await
     }
@@ -869,8 +909,8 @@ impl Node {
     /// Adopts a peer's *deletion* of a path as our own (§8, `synch adopt path`).
     ///
     /// Deletions are adoptable exactly as content is: our local copy goes, and
-    /// the next scan publishes our own tombstone through the ordinary indexing
-    /// pipeline — the same path a deletion made with `rm` takes. Adoption is
+    /// a tombstone is staged without scanning the source. The caller must
+    /// flush before reporting success, including while the source is paused. Adoption is
     /// how all divergence ends, deletion divergence included: once every
     /// publisher tombstones the path, it leaves the unified tree.
     ///
@@ -878,47 +918,59 @@ impl Node {
     /// here to remove — which is not an error: the assertion being adopted is
     /// "this path is gone", and it already is.
     pub fn adopt_deletion(&self, space_id: &str, path: &str) -> Result<Option<PathBuf>> {
+        let _scan = self.source_scan_guard();
         // The publishability half only: an excluded path is exactly the stray
         // file a deletion is here to clear up (`refuse_if_ignored`).
         self.ensure_publishable()?;
-        if self.is_api_source(space_id)? {
-            let normalized = normalized_adoption_path(path)?;
-            let previous = self
-                .store()
-                .entry(self.origin(), space_id, &normalized)?
-                .and_then(|entry| entry.content);
-            let tombstone = FileEntry::tombstone(now_ns(), self.next_seq()?, previous);
-            let encoded = synch_core::record::encode(&tombstone)?;
-            self.stage([StagedChange::record(
-                file_key(space_id, &normalized)?,
-                Some(encoded),
-            )?]);
-            return Ok(previous.map(|_| PathBuf::from(format!("{space_id}/{normalized}"))));
-        }
-        // No git gate here: a deletion is idempotent and is how a stray file
-        // gets cleaned up, and S3 `DELETE` reaches this path (`docs/GIT.md`
-        // §8.3).
-        let target = self.adoption_target(space_id, path)?;
-        // `symlink_metadata`, so a symlink is removed as the link it is rather
-        // than followed to whatever it points at.
-        if std::fs::symlink_metadata(&target).is_err() {
-            return Ok(None);
-        }
-        if target.is_dir() {
-            // The path stays in the log and out of the message. This error
-            // reaches an S3 client verbatim, and the daemon's on-disk layout —
-            // the operator's home, the space roots — is not something a client
-            // that guessed a key is owed.
-            tracing::warn!(
-                target = %target.display(),
-                "refusing to remove a directory as if it were an object"
-            );
-            return Err(EngineError::invalid(format!(
-                "{space_id}/{path} is a directory here; refusing to remove it"
-            )));
-        }
-        std::fs::remove_file(&target)?;
-        Ok(Some(target))
+        let normalized = normalized_adoption_path(path)?;
+        let previous = self
+            .store()
+            .entry(self.origin(), space_id, &normalized)?
+            .and_then(|entry| entry.content);
+        let removed = if self.is_api_source(space_id)? {
+            previous.map(|_| PathBuf::from(format!("{space_id}/{normalized}")))
+        } else {
+            // No git gate here: a deletion is idempotent and is how a stray file
+            // gets cleaned up, and S3 `DELETE` reaches this path (`docs/GIT.md`
+            // §8.3).
+            let target = self.adoption_target(space_id, path)?;
+            // `symlink_metadata`, so a symlink is removed as the link it is rather
+            // than followed to whatever it points at.
+            let metadata = match std::fs::symlink_metadata(&target) {
+                Ok(metadata) => Some(metadata),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => None,
+                Err(error) => return Err(error.into()),
+            };
+            if metadata.as_ref().is_some_and(|metadata| metadata.is_dir()) {
+                // The path stays in the log and out of the message. This error
+                // reaches an S3 client verbatim, and the daemon's on-disk layout —
+                // the operator's home, the space roots — is not something a client
+                // that guessed a key is owed.
+                tracing::warn!(
+                    target = %target.display(),
+                    "refusing to remove a directory as if it were an object"
+                );
+                return Err(EngineError::invalid(format!(
+                    "{space_id}/{path} is a directory here; refusing to remove it"
+                )));
+            }
+            if metadata.is_some() {
+                std::fs::remove_file(&target)?;
+                Some(target)
+            } else {
+                None
+            }
+        };
+        // The trie supplies lineage even if the file or scanner row is gone.
+        // Stage the selected deletion only. A source scan would also publish
+        // unrelated edits and cannot run while the source is paused.
+        let tombstone = FileEntry::tombstone(now_ns(), self.next_seq()?, previous);
+        self.stage([StagedChange::record(
+            file_key(space_id, &normalized)?,
+            Some(synch_core::record::encode(&tombstone)?),
+        )?]);
+        self.store().remove_local_file(space_id, &normalized)?;
+        Ok(removed)
     }
 
     /// Opens a streamed write into a local space (§9.4).
@@ -2758,6 +2810,55 @@ mod tests {
             use std::os::unix::fs::PermissionsExt;
             assert_eq!(metadata.permissions().mode() & 0o7777, 0o755);
         }
+    }
+
+    #[tokio::test]
+    async fn paused_source_preserves_records_and_resumes_after_restart() {
+        let (data, dir, node) = crate::testkit::node_with_space().await;
+        let path = dir.path().join("keep.txt");
+        std::fs::write(&path, b"before").unwrap();
+        node.scan_and_stage_async().await.unwrap();
+        node.set_source_paused("media", true).await.unwrap();
+        let before = published(&node, "media", "keep.txt");
+        std::fs::remove_file(&path).unwrap();
+        std::fs::write(dir.path().join("later.txt"), b"while paused").unwrap();
+        node.scan_and_stage_async().await.unwrap();
+        node.flush_staged().await.unwrap();
+        assert_eq!(
+            published(&node, "media", "keep.txt").content,
+            before.content
+        );
+        assert!(node
+            .store()
+            .entry(node.origin(), "media", "later.txt")
+            .unwrap()
+            .is_none());
+        assert!(crate::watcher::SpaceWatcher::configured_spaces(&node)
+            .unwrap()
+            .is_empty());
+        node.shutdown().await.unwrap();
+        drop(node);
+        let node = crate::testkit::reopen(data.path()).await;
+        assert!(node.source_paused("media").unwrap());
+        node.scan_and_stage_async().await.unwrap();
+        node.flush_staged().await.unwrap();
+        assert_eq!(
+            published(&node, "media", "keep.txt").content,
+            before.content
+        );
+        assert_eq!(
+            std::fs::read(dir.path().join("later.txt")).unwrap(),
+            b"while paused"
+        );
+        node.set_source_paused("media", false).await.unwrap();
+        node.scan_and_stage_async().await.unwrap();
+        node.flush_staged().await.unwrap();
+        assert_eq!(
+            published(&node, "media", "keep.txt").kind,
+            synch_core::EntryKind::Tombstone
+        );
+        assert_eq!(published(&node, "media", "later.txt").size, 12);
+        node.shutdown().await.unwrap();
     }
 
     #[tokio::test]

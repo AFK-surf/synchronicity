@@ -276,7 +276,7 @@ at commit when it already does.
 
 Success means what an S3 `PutObject` response means, and a little more: the
 bytes are durably staged, the entry is folded into a signed head, and the head
-was flushed and offered to the pusher (`scan_publish_push` — §6), which dials
+was flushed and offered to the pusher (`flush_staged`, §6), which dials
 the membership behind the commit rather than holding it open. The returned root is
 therefore immediately readable back through `sy_open` of the same path, and
 citable to the caller. The cost is symmetric: **one commit is one head**. A
@@ -324,12 +324,15 @@ cloud data plane's write tunnel, which opens one through the public
   re-checked; then `Adoption::commit` (fsync + rename);
   then API source → `commit_api_file` (CAS ingest,
   `stage_api_reference` with `prev` and the `b:` ad) plus a
-  `flush_staged`, filesystem source → `scan_publish_push`. The reported root is
+  `flush_staged`, filesystem source → `stage_written_file` plus `flush_staged`.
+  Explicit writes publish while source scanning is paused, without scanning
+  neighboring paths. The reported root is
   taken from the staged bytes (`hash_staged`), describing what this call
   assembled rather than whatever the tree holds by the time a scan reaches
   it — the multipart completion's answer semantics.
-- delete: `adopt_deletion` + `scan_publish_push`, with the same
-  tombstone-record fallback `delete_object` carries.
+- delete: `adopt_deletion` stages the selected tombstone, then `flush_staged`
+  publishes it. The published trie supplies lineage even if the local file or
+  scanner record is absent.
 - `ensure_publishable` is re-taken inside the commit like everywhere else on
   this path (a node in recovery refuses at open *and* at commit, `SY_EPERM`),
   because the socket worker checked it in a different task at a different time.

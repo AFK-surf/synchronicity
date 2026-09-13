@@ -770,6 +770,16 @@ pub enum DomainCommand {
 /// `synch source ...`
 #[derive(Debug, Subcommand)]
 pub enum SourceCommand {
+    /// Pause scanning, keeping published records and local files.
+    Pause {
+        /// The filesystem source namespace.
+        space: String,
+    },
+    /// Resume scanning and publish changes made while paused.
+    Resume {
+        /// The filesystem source namespace.
+        space: String,
+    },
     /// Add a filesystem or API-only publisher.
     Add {
         /// The space namespace.
