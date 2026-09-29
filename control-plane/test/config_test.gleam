@@ -2,7 +2,7 @@ import config
 import controlplane
 import dns/name
 import envoy
-import gleam/option.{None, Some}
+import gleam/option.{None}
 
 fn primary_env() -> Nil {
   envoy.set("CP_ROLE", "primary")
@@ -29,6 +29,9 @@ fn primary_env() -> Nil {
   envoy.unset("CP_COMMA_PROVISIONING_SECRET")
   envoy.unset("CP_COMMA_OIDC_PROVIDER_ID")
   envoy.unset("CP_COMMA_TARGET_ORG_ID")
+  envoy.unset("CP_COMMA_ENVIRONMENTS")
+  envoy.unset("CP_COMMA_PRODUCTION_PROVISIONING_SECRET")
+  envoy.unset("CP_COMMA_PRODUCTION_OIDC_PROVIDER_ID")
 }
 
 fn comma_enabled() -> Nil {
@@ -150,7 +153,7 @@ pub fn a_ceremony_names_the_configured_apex_test() {
 pub fn comma_provisioning_is_off_by_default_test() {
   primary_env()
   let assert Ok(cfg) = config.load()
-  assert cfg.comma_provisioning == None
+  assert cfg.comma_provisioning == []
 }
 
 pub fn comma_provisioning_loads_when_enabled_test() {
@@ -158,10 +161,80 @@ pub fn comma_provisioning_loads_when_enabled_test() {
   comma_enabled()
   let assert Ok(cfg) = config.load()
   assert cfg.comma_provisioning
-    == Some(config.CommaProvisioning(
-      "0123456789abcdef0123456789abcdef",
-      "oidcp-comma",
-    ))
+    == [
+      config.CommaProvisioning(
+        "",
+        "0123456789abcdef0123456789abcdef",
+        "oidcp-comma",
+      ),
+    ]
+}
+
+fn production_enabled() -> Nil {
+  envoy.set("CP_COMMA_ENVIRONMENTS", "production")
+  envoy.set(
+    "CP_COMMA_PRODUCTION_PROVISIONING_SECRET",
+    "fedcba9876543210fedcba9876543210",
+  )
+  envoy.set("CP_COMMA_PRODUCTION_OIDC_PROVIDER_ID", "oidcp-production")
+}
+
+pub fn comma_named_environment_loads_beside_the_default_test() {
+  primary_env()
+  comma_enabled()
+  production_enabled()
+  let assert Ok(cfg) = config.load()
+  assert cfg.comma_provisioning
+    == [
+      config.CommaProvisioning(
+        "",
+        "0123456789abcdef0123456789abcdef",
+        "oidcp-comma",
+      ),
+      config.CommaProvisioning(
+        "production",
+        "fedcba9876543210fedcba9876543210",
+        "oidcp-production",
+      ),
+    ]
+}
+
+pub fn comma_environments_cannot_share_a_secret_test() {
+  primary_env()
+  comma_enabled()
+  production_enabled()
+  envoy.set(
+    "CP_COMMA_PRODUCTION_PROVISIONING_SECRET",
+    "0123456789abcdef0123456789abcdef",
+  )
+  let assert Error(message) = config.load()
+  assert message == "every Comma environment needs its own provisioning secret"
+}
+
+pub fn comma_environments_cannot_share_a_provider_test() {
+  primary_env()
+  comma_enabled()
+  production_enabled()
+  envoy.set("CP_COMMA_PRODUCTION_OIDC_PROVIDER_ID", "oidcp-comma")
+  let assert Error(message) = config.load()
+  assert message == "every Comma environment needs its own OIDC provider"
+}
+
+pub fn comma_named_environment_requires_its_secret_test() {
+  primary_env()
+  comma_enabled()
+  production_enabled()
+  envoy.unset("CP_COMMA_PRODUCTION_PROVISIONING_SECRET")
+  let assert Error(message) = config.load()
+  assert message == "CP_COMMA_PRODUCTION_PROVISIONING_SECRET is required"
+}
+
+pub fn comma_environments_need_the_integration_enabled_test() {
+  primary_env()
+  production_enabled()
+  let assert Error(message) = config.load()
+  assert message
+    == "CP_COMMA_ENVIRONMENTS needs CP_COMMA_PROVISIONING_ENABLED=true"
 }
 
 pub fn comma_provisioning_requires_a_secret_test() {

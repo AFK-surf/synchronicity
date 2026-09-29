@@ -45,6 +45,7 @@ import config.{type CommaProvisioning}
 import dns/name
 import gleam/dynamic/decode
 import gleam/json.{type Json}
+import gleam/list
 import gleam/option.{type Option, None, Some}
 import gleam/result
 import gleam/string
@@ -78,9 +79,9 @@ pub fn provision_workspace(
   comma_workspace_id: String,
 ) -> Response {
   case ctx.comma_provisioning {
-    None -> not_configured()
-    Some(cfg) -> {
-      use <- authorized(req, cfg)
+    [] -> not_configured()
+    environments -> {
+      use cfg <- authorized(req, environments)
       use <- valid_id(comma_workspace_id, "invalid_workspace")
       let decoder = {
         use ws_name <- decode.field("name", decode.string)
@@ -121,7 +122,7 @@ fn converge(
 
   zone_mutation(conn, ctx, who, publish.Widening, fn() {
     // Resolve the mapping under the writer lock, including concurrent creates.
-    case find_workspace_org(conn, comma_workspace_id) {
+    case find_workspace_org(conn, cfg, comma_workspace_id) {
       Error(response) -> Error(response)
       Ok(Some(#(org_id, network_id))) -> {
         use sync_user_id <- result.try(ensure_owner(conn, cfg, org_id, owner))
@@ -138,6 +139,7 @@ fn converge(
         use sync_user_id <- result.try(ensure_owner(conn, cfg, org_id, owner))
         use _ <- result.try(insert_mapping(
           conn,
+          cfg,
           comma_workspace_id,
           org_id,
           network_id,
@@ -181,18 +183,24 @@ fn enable_cloud_features(
   result.map_error(work, constraint_response)
 }
 
-/// The provisioning secret, compared in constant time (SHA-256 of each side).
+/// The environment whose provisioning secret the caller presented. Secrets
+/// are compared as SHA-256 digests, so a comparison does not reveal where a
+/// guess first differs; every configured environment is compared.
 fn authorized(
   req: Request,
-  cfg: CommaProvisioning,
-  next: fn() -> Response,
+  environments: List(CommaProvisioning),
+  next: fn(CommaProvisioning) -> Response,
 ) -> Response {
   case presented(req.headers) {
-    Bearer(token) ->
-      case id.hash_token(token) == id.hash_token(cfg.secret) {
-        True -> next()
-        False -> unauthorized()
+    Bearer(token) -> {
+      let presented = id.hash_token(token)
+      let matches =
+        list.filter(environments, fn(e) { id.hash_token(e.secret) == presented })
+      case matches {
+        [environment] -> next(environment)
+        _ -> unauthorized()
       }
+    }
     _ -> unauthorized()
   }
 }
@@ -238,15 +246,19 @@ fn hub_provider_exists(
   }
 }
 
+/// The Workspace's org in the caller's environment. A Workspace another
+/// environment provisioned is not visible here.
 fn find_workspace_org(
   conn: Connection,
+  cfg: CommaProvisioning,
   comma_workspace_id: String,
 ) -> Result(Option(#(String, String)), Response) {
   case
     sqlite.query(
       conn,
-      "SELECT org_id, network_id FROM comma_workspace_orgs WHERE comma_workspace_id = ?",
-      [Text(comma_workspace_id)],
+      "SELECT org_id, network_id FROM comma_workspace_orgs
+       WHERE environment = ? AND comma_workspace_id = ?",
+      [Text(cfg.environment), Text(comma_workspace_id)],
     )
   {
     Ok([[Text(org_id), Text(network_id)]]) -> Ok(Some(#(org_id, network_id)))
@@ -326,6 +338,7 @@ fn insert_network(
 
 fn insert_mapping(
   conn: Connection,
+  cfg: CommaProvisioning,
   comma_workspace_id: String,
   org_id: String,
   network_id: String,
@@ -333,9 +346,11 @@ fn insert_mapping(
   case
     sqlite.exec(
       conn,
-      "INSERT INTO comma_workspace_orgs (comma_workspace_id, org_id, network_id, created_at)
-       VALUES (?, ?, ?, ?)",
+      "INSERT INTO comma_workspace_orgs
+         (environment, comma_workspace_id, org_id, network_id, created_at)
+       VALUES (?, ?, ?, ?, ?)",
       [
+        Text(cfg.environment),
         Text(comma_workspace_id),
         Text(org_id),
         Text(network_id),
@@ -535,9 +550,9 @@ pub fn enroll_device(
   comma_workspace_id: String,
 ) -> Response {
   case ctx.comma_provisioning {
-    None -> not_configured()
-    Some(cfg) -> {
-      use <- authorized(req, cfg)
+    [] -> not_configured()
+    environments -> {
+      use cfg <- authorized(req, environments)
       use <- valid_id(comma_workspace_id, "invalid_workspace")
       let decoder = {
         use nk <- decode.field("nk", decode.string)
@@ -569,7 +584,7 @@ pub fn enroll_device(
                 case hub_provider_exists(conn, cfg) {
                   Error(response) -> response
                   Ok(Nil) ->
-                    case find_workspace_org(conn, comma_workspace_id) {
+                    case find_workspace_org(conn, cfg, comma_workspace_id) {
                       Error(response) -> response
                       Ok(None) -> not_provisioned()
                       Ok(Some(#(org_id, network_id))) ->
@@ -868,9 +883,9 @@ pub fn mint_api_key(
   comma_workspace_id: String,
 ) -> Response {
   case ctx.comma_provisioning {
-    None -> not_configured()
-    Some(cfg) -> {
-      use <- authorized(req, cfg)
+    [] -> not_configured()
+    environments -> {
+      use cfg <- authorized(req, environments)
       use <- valid_id(comma_workspace_id, "invalid_workspace")
       let decoder = {
         use name <- decode.optional_field(
@@ -898,7 +913,7 @@ pub fn mint_api_key(
             case hub_provider_exists(conn, cfg) {
               Error(response) -> response
               Ok(Nil) ->
-                case find_workspace_org(conn, comma_workspace_id) {
+                case find_workspace_org(conn, cfg, comma_workspace_id) {
                   Error(response) -> response
                   Ok(None) -> not_provisioned()
                   Ok(Some(#(org_id, _network_id))) ->
@@ -992,13 +1007,13 @@ pub fn revoke_api_key(
   key_id: String,
 ) -> Response {
   case ctx.comma_provisioning {
-    None -> not_configured()
-    Some(cfg) -> {
-      use <- authorized(req, cfg)
+    [] -> not_configured()
+    environments -> {
+      use cfg <- authorized(req, environments)
       use <- valid_id(comma_workspace_id, "invalid_workspace")
       use <- valid_id(key_id, "invalid_key")
       with_db(ctx, fn(conn) {
-        case find_workspace_org(conn, comma_workspace_id) {
+        case find_workspace_org(conn, cfg, comma_workspace_id) {
           Error(response) -> response
           Ok(None) -> not_provisioned()
           Ok(Some(#(org_id, _network_id))) -> revoke(conn, org_id, key_id)

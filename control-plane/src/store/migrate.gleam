@@ -62,8 +62,28 @@ fn apply(conn: Connection, sql: String, to: Int) -> Result(Int, MigrateError) {
 }
 
 fn migrations() -> List(String) {
-  [v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16]
+  [v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16, v17]
 }
+
+/// V17: the Workspace map is scoped by Comma environment. One control plane
+/// serves several Comma environments, each with its own provisioning secret,
+/// and a secret may reach only the orgs its own environment provisioned. The
+/// default environment is `''`; every mapping made before V17 belongs to it.
+const v17 = "
+CREATE TABLE comma_workspace_orgs_v17 (
+  environment        TEXT NOT NULL,
+  comma_workspace_id TEXT NOT NULL,
+  org_id             TEXT NOT NULL UNIQUE REFERENCES orgs(id),
+  network_id         TEXT NOT NULL REFERENCES networks(id),
+  created_at         INTEGER NOT NULL,
+  PRIMARY KEY (environment, comma_workspace_id)
+);
+INSERT INTO comma_workspace_orgs_v17
+  SELECT '', comma_workspace_id, org_id, network_id, created_at
+  FROM comma_workspace_orgs;
+DROP TABLE comma_workspace_orgs;
+ALTER TABLE comma_workspace_orgs_v17 RENAME TO comma_workspace_orgs;
+"
 
 /// V16: the integration was renamed to Comma; its Workspace map follows.
 /// Only the names change: rows, keys and the foreign keys stay as V12 made them.

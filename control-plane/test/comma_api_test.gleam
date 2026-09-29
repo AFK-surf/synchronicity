@@ -29,7 +29,7 @@ const hub_org = "org-hub"
 const hub_provider = "oidcp-hub"
 
 fn comma_cfg() -> config.CommaProvisioning {
-  config.CommaProvisioning(secret, hub_provider)
+  config.CommaProvisioning("", secret, hub_provider)
 }
 
 type Env {
@@ -37,22 +37,20 @@ type Env {
 }
 
 fn setup() -> Env {
-  setup_full(
-    Some(comma_cfg()),
-    fn(_conn) { Nil },
-    fn(_conn, _now, _actor, _change) { Ok(1) },
-  )
+  setup_full([comma_cfg()], fn(_conn) { Nil }, fn(_conn, _now, _actor, _change) {
+    Ok(1)
+  })
 }
 
 fn setup_seeded(seed: fn(sqlite.Connection) -> Nil) -> Env {
-  setup_full(Some(comma_cfg()), seed, fn(_conn, _now, _actor, _change) { Ok(1) })
+  setup_full([comma_cfg()], seed, fn(_conn, _now, _actor, _change) { Ok(1) })
 }
 
 /// A migrated database carrying the shared hub org + its OIDC provider (every
 /// Comma identity anchors to this one provider); `seed` adds any extra rows,
 /// before the pool opens so no second writer contends for the file.
 fn setup_full(
-  comma: Option(config.CommaProvisioning),
+  comma: List(config.CommaProvisioning),
   seed: fn(sqlite.Connection) -> Nil,
   publish_in_tx: fn(sqlite.Connection, Int, String, publish.Change) ->
     Result(Int, publish.PublishError),
@@ -218,8 +216,24 @@ pub fn provision_is_idempotent_test() {
   assert count(env, "SELECT count(*) FROM org_members", []) == 1
 }
 
-/// A Workspace provisioned before the V16 rename keeps its org and network:
-/// the next provisioning call finds the renamed mapping and creates nothing.
+/// The Workspace map as V12 made it and V15 left it, rows kept.
+const v15_workspace_map = "
+CREATE TABLE cue_workspace_orgs (
+  cue_workspace_id TEXT PRIMARY KEY,
+  org_id           TEXT NOT NULL UNIQUE REFERENCES orgs(id),
+  network_id       TEXT NOT NULL REFERENCES networks(id),
+  created_at       INTEGER NOT NULL
+);
+INSERT INTO cue_workspace_orgs
+  SELECT comma_workspace_id, org_id, network_id, created_at
+  FROM comma_workspace_orgs;
+DROP TABLE comma_workspace_orgs;
+PRAGMA user_version = 15;
+"
+
+/// A Workspace provisioned before the V16 rename and the V17 environment
+/// scope keeps its org and network in the default environment: the next
+/// provisioning call finds the mapping and creates nothing.
 pub fn workspace_provisioned_before_rename_keeps_its_org_test() {
   let env = setup()
   let first =
@@ -229,14 +243,8 @@ pub fn workspace_provisioned_before_rename_keeps_its_org_test() {
 
   // Put the mapping back into its V15 shape, then migrate forward.
   let assert Ok(conn) = db.open_primary(env.db_path)
-  let assert Ok(_) =
-    sqlite.script(
-      conn,
-      "ALTER TABLE comma_workspace_orgs RENAME COLUMN comma_workspace_id TO cue_workspace_id;
-       ALTER TABLE comma_workspace_orgs RENAME TO cue_workspace_orgs;
-       PRAGMA user_version = 15;",
-    )
-  let assert Ok(16) = migrate.migrate(conn)
+  let assert Ok(_) = sqlite.script(conn, v15_workspace_map)
+  let assert Ok(17) = migrate.migrate(conn)
   sqlite.close(conn)
 
   let again =
@@ -245,6 +253,96 @@ pub fn workspace_provisioned_before_rename_keeps_its_org_test() {
   assert string.contains(simulate.read_body(again), "\"created\":false")
   assert workspace_mapping(env, "wsp_old") == before
   assert count(env, "SELECT count(*) FROM networks", []) == 1
+}
+
+const production_secret = "comma-production-provisioning-secret-0123456"
+
+const production_hub_provider = "oidcp-hub-production"
+
+/// Two environments on one control plane: the default one and "production",
+/// each with its own secret and hub provider.
+fn setup_two_environments() -> Env {
+  setup_full(
+    [
+      comma_cfg(),
+      config.CommaProvisioning(
+        "production",
+        production_secret,
+        production_hub_provider,
+      ),
+    ],
+    fn(conn) {
+      let assert Ok(_) =
+        sqlite.exec(
+          conn,
+          "INSERT INTO orgs VALUES ('org-hub-production', 'hub-production', 'Hub', 0)",
+          [],
+        )
+      let assert Ok(_) =
+        sqlite.exec(
+          conn,
+          "INSERT INTO oidc_providers
+           VALUES (?, 'org-hub-production', 'https://comma-production.test',
+                   'cid', 'csec', 'https://comma-production.test/authorize',
+                   'https://comma-production.test/token', NULL, 0)",
+          [sqlite.Text(production_hub_provider)],
+        )
+      Nil
+    },
+    fn(_conn, _now, _actor, _change) { Ok(1) },
+  )
+}
+
+/// The same Workspace id in two environments is two Workspaces: each
+/// environment's secret provisions its own org, and the owner's identity
+/// anchors to that environment's hub.
+pub fn environments_provision_separate_orgs_test() {
+  let env = setup_two_environments()
+  let staging =
+    put(env, "wsp_same", Some(secret), body("S", "usr_same", "s@comma.test"))
+  assert staging.status == 200
+  let production =
+    put(
+      env,
+      "wsp_same",
+      Some(production_secret),
+      body("P", "usr_same", "s@comma.test"),
+    )
+  assert production.status == 200
+  assert string.contains(simulate.read_body(production), "\"created\":true")
+  assert count(
+      env,
+      "SELECT count(DISTINCT org_id) FROM comma_workspace_orgs
+       WHERE comma_workspace_id = 'wsp_same'",
+      [],
+    )
+    == 2
+  assert count(
+      env,
+      "SELECT count(*) FROM auth_identities
+       WHERE subject = 'usr_same' AND oidc_provider_id = ?",
+      [sqlite.Text(production_hub_provider)],
+    )
+    == 1
+}
+
+/// One environment's secret cannot reach another environment's Workspace:
+/// minting a key there answers "not provisioned" and mints nothing.
+pub fn environment_secret_cannot_reach_another_environments_workspace_test() {
+  let env = setup_two_environments()
+  let staging =
+    put(env, "wsp_only", Some(secret), body("S", "usr_o", "o@comma.test"))
+  assert staging.status == 200
+
+  let key =
+    post_key(
+      env,
+      "wsp_only",
+      Some(production_secret),
+      key_body("usr_o", "o@comma.test"),
+    )
+  assert key.status == 404
+  assert count(env, "SELECT count(*) FROM api_keys", []) == 0
 }
 
 pub fn same_owner_two_workspaces_reuses_identity_test() {
@@ -374,9 +472,7 @@ pub fn absent_secret_is_unauthenticated_test() {
 
 pub fn disabled_provisioning_is_unavailable_test() {
   let env =
-    setup_full(None, fn(_conn) { Nil }, fn(_conn, _now, _actor, _change) {
-      Ok(1)
-    })
+    setup_full([], fn(_conn) { Nil }, fn(_conn, _now, _actor, _change) { Ok(1) })
   let resp =
     put(env, "wsp_g", Some(secret), body("G", "usr_grace", "g@comma.test"))
   assert resp.status == 503
@@ -389,7 +485,7 @@ pub fn disabled_provisioning_is_unavailable_test() {
 pub fn unknown_hub_provider_is_unavailable_test() {
   let env =
     setup_full(
-      Some(config.CommaProvisioning(secret, "no-such-provider")),
+      [config.CommaProvisioning("", secret, "no-such-provider")],
       fn(_conn) { Nil },
       fn(_conn, _now, _actor, _change) { Ok(1) },
     )
@@ -537,7 +633,7 @@ pub fn concurrent_provisioning_reuses_the_winning_mapping_test() {
 
   let env =
     setup_full(
-      Some(comma_cfg()),
+      [comma_cfg()],
       fn(_conn) { Nil },
       fn(_conn, _now, _actor, _change) {
         // A subject can only be received by the process that created it. Each

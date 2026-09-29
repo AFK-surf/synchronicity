@@ -47,10 +47,10 @@ pub type AuthContext {
     /// is publication), the reconciler poke in external mode. Never inside
     /// the transaction: provider calls must not hold the write lock.
     published: fn() -> Nil,
-    /// Comma's S2S provisioning configuration, or `None` when the integration
-    /// is off. Only the primary carries a writable AuthContext, which is also
+    /// Comma's S2S provisioning, one entry per environment; empty when the
+    /// integration is off. Only the primary carries a writable AuthContext, which is also
     /// the only node that may provision.
-    comma_provisioning: Option(CommaProvisioning),
+    comma_provisioning: List(CommaProvisioning),
   )
 }
 

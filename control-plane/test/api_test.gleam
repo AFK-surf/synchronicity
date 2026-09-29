@@ -86,7 +86,7 @@ fn harness_sized(pool_size: Int) -> Harness {
         publish.publish_in_tx(conn, csk, now, actor, change)
       },
       fn() { Nil },
-      None,
+      [],
     )
   let agents = process.new_name("cp_agents_test_" <> id.new())
   let assert Ok(_) = agent.start(agents)
@@ -4690,15 +4690,21 @@ pub fn managed_key_migration_preserves_existing_tokens_and_kind_is_fixed_test() 
   let assert Ok(before) =
     sqlite.query(conn, "SELECT * FROM api_keys ORDER BY id", [])
   // Exercise the v14→v15 table rebuild over real token/scope/expiry rows.
-  // V16 is replayed too, so its rename is undone first.
+  // V16 and V17 are replayed too, so the Workspace map goes back to the
+  // shape V14 left (it holds no rows here).
   let assert Ok(_) =
     sqlite.script(
       conn,
-      "ALTER TABLE comma_workspace_orgs RENAME COLUMN comma_workspace_id TO cue_workspace_id;
-       ALTER TABLE comma_workspace_orgs RENAME TO cue_workspace_orgs;
+      "DROP TABLE comma_workspace_orgs;
+       CREATE TABLE cue_workspace_orgs (
+         cue_workspace_id TEXT PRIMARY KEY,
+         org_id           TEXT NOT NULL UNIQUE REFERENCES orgs(id),
+         network_id       TEXT NOT NULL REFERENCES networks(id),
+         created_at       INTEGER NOT NULL
+       );
        PRAGMA user_version = 14;",
     )
-  let assert Ok(16) = migrate.migrate(conn)
+  let assert Ok(17) = migrate.migrate(conn)
   let assert Ok(after) =
     sqlite.query(conn, "SELECT * FROM api_keys ORDER BY id", [])
   assert after == before
