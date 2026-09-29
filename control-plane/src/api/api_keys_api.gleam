@@ -7,8 +7,8 @@
 //// answers `api_key_refused` to an org key or `join_key_refused` to a join
 //// key, each naming what that kind may do instead. A key that could mint keys
 //// could mint one that never expires, and revoking the key you knew about
-//// would not have ended the access. The one other minter is `api/cue_api`,
-//// under the Cue provisioning secret — not a key, and an authority that
+//// would not have ended the access. The one other minter is `api/comma_api`,
+//// under the Comma provisioning secret — not a key, and an authority that
 //// already creates those orgs; its module note says what keeps that trail
 //// whole.
 ////
@@ -456,8 +456,8 @@ pub fn delete_key(
 
 // -- validation --------------------------------------------------------------
 
-/// Public because the Cue integration mints keys of its own
-/// (`api/cue_api.mint_api_key`) and a name refused there should read the
+/// Public because the Comma integration mints keys of its own
+/// (`api/comma_api.mint_api_key`) and a name refused there should read the
 /// same as one refused here.
 pub fn check_name(name: String) -> Result(Nil, Response) {
   let size = string.byte_size(name)
@@ -582,7 +582,7 @@ fn check_expiry(expires_in: Int) -> Result(Expiry, Response) {
 
 /// `check_expiry` for a caller that has no row to leave alone: the absolute
 /// `expires_at` to store, `None` for a key that does not expire. The shape
-/// `api_key.create` takes, exposed for the Cue integration's mint.
+/// `api_key.create` takes, exposed for the Comma integration's mint.
 pub fn expires_at_from(expires_in: Int) -> Result(Option(Int), Response) {
   check_expiry(expires_in) |> result.map(expires_at_of)
 }

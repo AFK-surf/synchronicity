@@ -123,4 +123,4 @@ proof of the new HTTP routing or stream lifecycle.
   Runs in Linux CP CI with websockets 15.0.1.
 
 The HTTP test substitutes the managed actor; the Rust test exercises the
-managed tunnel and real engine/peer. This is not a deployed Cue-to-user SSH test.
+managed tunnel and real engine/peer. This is not a deployed Comma-to-user SSH test.

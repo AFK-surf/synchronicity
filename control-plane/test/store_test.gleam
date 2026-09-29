@@ -292,7 +292,7 @@ pub fn migrate_adds_the_rollover_slot_to_an_existing_zone_test() {
   // shape of problem as re-adding a column.
   let assert Ok(_) =
     sqlite.exec(conn, "DELETE FROM users WHERE id = 'system-dataplane'", [])
-  let assert Ok(_) = sqlite.exec(conn, "DROP TABLE cue_workspace_orgs", [])
+  let assert Ok(_) = sqlite.exec(conn, "DROP TABLE comma_workspace_orgs", [])
   let assert Ok(v) = migrate.migrate(conn)
   assert v == migrate.build_version()
 

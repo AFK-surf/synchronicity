@@ -62,8 +62,15 @@ fn apply(conn: Connection, sql: String, to: Int) -> Result(Int, MigrateError) {
 }
 
 fn migrations() -> List(String) {
-  [v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15]
+  [v1, v2, v3, v4, v5, v6, v7, v8, v9, v10, v11, v12, v13, v14, v15, v16]
 }
+
+/// V16: the integration was renamed to Comma; its Workspace map follows.
+/// Only the names change: rows, keys and the foreign keys stay as V12 made them.
+const v16 = "
+ALTER TABLE cue_workspace_orgs RENAME TO comma_workspace_orgs;
+ALTER TABLE comma_workspace_orgs RENAME COLUMN cue_workspace_id TO comma_workspace_id;
+"
 
 /// V14: data planes are named, and this service decides what each one hosts
 /// (docs/CLOUD-DATAPLANE.md §7.2).

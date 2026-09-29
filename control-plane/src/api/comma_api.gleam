@@ -1,25 +1,25 @@
-//// Cue integration: server-to-server per-Workspace provisioning.
+//// Comma integration: server-to-server per-Workspace provisioning.
 ////
-//// Each Cue Workspace maps to one org and one default network here. When a
-//// Workspace is created on the Cue side its convergence calls this endpoint,
+//// Each Comma Workspace maps to one org and one default network here. When a
+//// Workspace is created on the Comma side its convergence calls this endpoint,
 //// which creates the org + network, ensures the owner's OIDC identity, and
-//// makes the owner a member — so a later dashboard sign-in over Cue OIDC lands
+//// makes the owner a member — so a later dashboard sign-in over Comma OIDC lands
 //// on the pre-created account inside the Workspace's org.
 ////
 //// Authenticated by a shared provisioning secret alone. The OIDC provider is
-//// a single shared "hub" (`CP_CUE_OIDC_PROVIDER_ID`) that every Cue user's
+//// a single shared "hub" (`CP_COMMA_OIDC_PROVIDER_ID`) that every Comma user's
 //// identity anchors to; the org and network are created per Workspace and the
 //// role is the owner's own.
 ////
-//// Idempotent by workspace mapping. Every call enforces Cue's managed-network
+//// Idempotent by workspace mapping. Every call enforces Comma's managed-network
 //// policy: browsing and cloud hosting are on, even after an admin disabled
 //// them. Creation and reuse both publish through the widening gate in one
 //// transaction; a retry also cancels pending collection and preserves placement.
-//// The paired remote/local retry lifecycle is modeled in the Cue repository at
-//// `tla/cue_synchronicity/WorkspaceProvisioning.tla`.
+//// The paired remote/local retry lifecycle is modeled in the Comma repository at
+//// `tla/comma_synchronicity/WorkspaceProvisioning.tla`.
 ////
 //// The same secret also mints and revokes **member org keys** for a
-//// Workspace's org (`mint_api_key`, `revoke_api_key`), which is how Cue's
+//// Workspace's org (`mint_api_key`, `revoke_api_key`), which is how Comma's
 //// backend reaches the org API — above all the network's file surface,
 //// `…/browse/{ls,stat,file}` — on the Workspace's behalf with no person
 //// signed in. `api/api_keys_api` refuses to let a key mint a key, because
@@ -28,7 +28,7 @@
 //// these orgs (it creates them and enrolls their devices), so minting under
 //// it widens nothing. What keeps the trail whole: every key minted here is
 //// an ordinary row in the org's key list, revocable by its admins in the
-//// dashboard, and its `apikey.create` audit row names `cue:provisioning` as
+//// dashboard, and its `apikey.create` audit row names `comma:provisioning` as
 //// the actor — so an operator rotating the secret can find what it minted.
 
 import api/api_keys_api
@@ -41,7 +41,7 @@ import api/middleware.{Bearer, error_json, now_unix, presented}
 import auth/api_key
 import auth/principal
 import cloud/dataplane
-import config.{type CueProvisioning}
+import config.{type CommaProvisioning}
 import dns/name
 import gleam/dynamic/decode
 import gleam/json.{type Json}
@@ -61,27 +61,27 @@ type Owner {
 /// Every Workspace org holds exactly one network, and this is its name.
 const default_network = "default"
 
-/// The name a minted key carries when the caller gives none. Cue's backend is
+/// The name a minted key carries when the caller gives none. Comma's backend is
 /// the one holder, so the name only has to say which key this is in the
 /// org's list beside keys people minted.
-const default_key_name = "cue-backend"
+const default_key_name = "comma-backend"
 
-/// The one role a Cue-minted key may hold. The file surface is `member`
+/// The one role a Comma-minted key may hold. The file surface is `member`
 /// floor everywhere, and `member` is what a Workspace member already has, so
 /// a wider key would be authority nobody asked for.
 const minted_role = "member"
 
-/// `PUT /internal/v1/integrations/cue/workspaces/<cue_workspace_id>`.
+/// `PUT /internal/v1/integrations/comma/workspaces/<comma_workspace_id>`.
 pub fn provision_workspace(
   req: Request,
   ctx: AuthContext,
-  cue_workspace_id: String,
+  comma_workspace_id: String,
 ) -> Response {
-  case ctx.cue_provisioning {
+  case ctx.comma_provisioning {
     None -> not_configured()
     Some(cfg) -> {
       use <- authorized(req, cfg)
-      use <- valid_id(cue_workspace_id, "invalid_workspace")
+      use <- valid_id(comma_workspace_id, "invalid_workspace")
       let decoder = {
         use ws_name <- decode.field("name", decode.string)
         use owner <- decode.field("owner", owner_decoder())
@@ -97,7 +97,7 @@ pub fn provision_workspace(
             case hub_provider_exists(conn, cfg) {
               Error(response) -> response
               Ok(Nil) ->
-                converge(conn, ctx, cfg, cue_workspace_id, ws_name, owner)
+                converge(conn, ctx, cfg, comma_workspace_id, ws_name, owner)
             }
           })
       }
@@ -105,13 +105,13 @@ pub fn provision_workspace(
   }
 }
 
-/// Create or refresh a Cue-managed network under the same writer lock and
+/// Create or refresh a Comma-managed network under the same writer lock and
 /// transparency gate. The caller reads the nested result in either case.
 fn converge(
   conn: Connection,
   ctx: AuthContext,
-  cfg: CueProvisioning,
-  cue_workspace_id: String,
+  cfg: CommaProvisioning,
+  comma_workspace_id: String,
   ws_name: String,
   owner: Owner,
 ) -> Response {
@@ -121,7 +121,7 @@ fn converge(
 
   zone_mutation(conn, ctx, who, publish.Widening, fn() {
     // Resolve the mapping under the writer lock, including concurrent creates.
-    case find_workspace_org(conn, cue_workspace_id) {
+    case find_workspace_org(conn, comma_workspace_id) {
       Error(response) -> Error(response)
       Ok(Some(#(org_id, network_id))) -> {
         use sync_user_id <- result.try(ensure_owner(conn, cfg, org_id, owner))
@@ -138,7 +138,7 @@ fn converge(
         use sync_user_id <- result.try(ensure_owner(conn, cfg, org_id, owner))
         use _ <- result.try(insert_mapping(
           conn,
-          cue_workspace_id,
+          comma_workspace_id,
           org_id,
           network_id,
         ))
@@ -184,7 +184,7 @@ fn enable_cloud_features(
 /// The provisioning secret, compared in constant time (SHA-256 of each side).
 fn authorized(
   req: Request,
-  cfg: CueProvisioning,
+  cfg: CommaProvisioning,
   next: fn() -> Response,
 ) -> Response {
   case presented(req.headers) {
@@ -220,7 +220,7 @@ fn valid_email(email: String) -> Bool {
 /// misconfiguration, answered 503 like an absent configuration.
 fn hub_provider_exists(
   conn: Connection,
-  cfg: CueProvisioning,
+  cfg: CommaProvisioning,
 ) -> Result(Nil, Response) {
   case
     sqlite.query(conn, "SELECT 1 FROM oidc_providers WHERE id = ?", [
@@ -232,7 +232,7 @@ fn hub_provider_exists(
       Error(error_json(
         503,
         "provisioning_not_configured",
-        "the configured cue oidc provider does not exist",
+        "the configured comma oidc provider does not exist",
       ))
     Error(_) -> Error(db_error())
   }
@@ -240,13 +240,13 @@ fn hub_provider_exists(
 
 fn find_workspace_org(
   conn: Connection,
-  cue_workspace_id: String,
+  comma_workspace_id: String,
 ) -> Result(Option(#(String, String)), Response) {
   case
     sqlite.query(
       conn,
-      "SELECT org_id, network_id FROM cue_workspace_orgs WHERE cue_workspace_id = ?",
-      [Text(cue_workspace_id)],
+      "SELECT org_id, network_id FROM comma_workspace_orgs WHERE comma_workspace_id = ?",
+      [Text(comma_workspace_id)],
     )
   {
     Ok([[Text(org_id), Text(network_id)]]) -> Ok(Some(#(org_id, network_id)))
@@ -262,8 +262,8 @@ fn insert_org(
   org_id: String,
   ws_name: String,
 ) -> Result(String, Response) {
-  // The slug is DNS-label safe by construction (`cue-` + lowercase hex).
-  let slug = "cue-" <> id.new()
+  // The slug is DNS-label safe by construction (`comma-` + lowercase hex).
+  let slug = "comma-" <> id.new()
 
   case
     sqlite.exec(
@@ -286,7 +286,7 @@ fn org_slug(conn: Connection, org_id: String) -> Result(String, Response) {
   scalar_text(conn, "SELECT slug FROM orgs WHERE id = ?", [Text(org_id)])
 }
 
-/// The owner every internal route carries: the Cue subject that anchors the
+/// The owner every internal route carries: the Comma subject that anchors the
 /// identity under the hub provider, and the email the trusted caller asserts
 /// for it.
 fn owner_decoder() -> decode.Decoder(Owner) {
@@ -304,7 +304,7 @@ fn owner_decoder() -> decode.Decoder(Owner) {
 /// secret has already authenticated the caller, so this names the service in
 /// the audit trail and the zone's publish rows, never a person.
 fn provisioning_principal() -> principal.Principal {
-  principal.Principal("cue:provisioning", principal.Cookie(""))
+  principal.Principal("comma:provisioning", principal.Cookie(""))
 }
 
 fn insert_network(
@@ -326,16 +326,21 @@ fn insert_network(
 
 fn insert_mapping(
   conn: Connection,
-  cue_workspace_id: String,
+  comma_workspace_id: String,
   org_id: String,
   network_id: String,
 ) -> Result(Nil, Response) {
   case
     sqlite.exec(
       conn,
-      "INSERT INTO cue_workspace_orgs (cue_workspace_id, org_id, network_id, created_at)
+      "INSERT INTO comma_workspace_orgs (comma_workspace_id, org_id, network_id, created_at)
        VALUES (?, ?, ?, ?)",
-      [Text(cue_workspace_id), Text(org_id), Text(network_id), VInt(now_unix())],
+      [
+        Text(comma_workspace_id),
+        Text(org_id),
+        Text(network_id),
+        VInt(now_unix()),
+      ],
     )
   {
     Ok(_) -> Ok(Nil)
@@ -345,12 +350,12 @@ fn insert_mapping(
 
 /// Ensures the owner's OIDC identity (under the hub provider) and their
 /// membership of the org, returning the Synchronicity user id. The shared-secret
-/// authenticated Cue service is trusted to assert its owner's email: an unbound
-/// Cue identity reuses the existing account for that email. Existing subject
+/// authenticated Comma service is trusted to assert its owner's email: an unbound
+/// Comma identity reuses the existing account for that email. Existing subject
 /// bindings take precedence; ordinary custom-OIDC login stays explicit-link only.
 fn ensure_owner(
   conn: Connection,
-  cfg: CueProvisioning,
+  cfg: CommaProvisioning,
   org_id: String,
   owner: Owner,
 ) -> Result(String, Response) {
@@ -361,7 +366,7 @@ fn ensure_owner(
 
 fn ensure_identity(
   conn: Connection,
-  cfg: CueProvisioning,
+  cfg: CommaProvisioning,
   owner: Owner,
 ) -> Result(String, Response) {
   case find_identity(conn, cfg, owner.subject) {
@@ -399,7 +404,7 @@ fn ensure_identity(
 
 fn find_identity(
   conn: Connection,
-  cfg: CueProvisioning,
+  cfg: CommaProvisioning,
   subject: String,
 ) -> Result(Option(String), Response) {
   case
@@ -453,7 +458,7 @@ fn insert_identity(
   conn: Connection,
   identity_id: String,
   user_id: String,
-  cfg: CueProvisioning,
+  cfg: CommaProvisioning,
   subject: String,
 ) -> Result(Nil, Response) {
   case
@@ -514,7 +519,7 @@ fn provisioned(
   ])
 }
 
-/// `POST /internal/v1/integrations/cue/workspaces/<cue_workspace_id>/devices`.
+/// `POST /internal/v1/integrations/comma/workspaces/<comma_workspace_id>/devices`.
 ///
 /// Joins a device (its public node key `nk`) to the Workspace's assigned
 /// network. The network is resolved server-side from the workspace mapping; the
@@ -527,13 +532,13 @@ fn provisioned(
 pub fn enroll_device(
   req: Request,
   ctx: AuthContext,
-  cue_workspace_id: String,
+  comma_workspace_id: String,
 ) -> Response {
-  case ctx.cue_provisioning {
+  case ctx.comma_provisioning {
     None -> not_configured()
     Some(cfg) -> {
       use <- authorized(req, cfg)
-      use <- valid_id(cue_workspace_id, "invalid_workspace")
+      use <- valid_id(comma_workspace_id, "invalid_workspace")
       let decoder = {
         use nk <- decode.field("nk", decode.string)
         use label <- decode.field("label", decode.string)
@@ -564,7 +569,7 @@ pub fn enroll_device(
                 case hub_provider_exists(conn, cfg) {
                   Error(response) -> response
                   Ok(Nil) ->
-                    case find_workspace_org(conn, cue_workspace_id) {
+                    case find_workspace_org(conn, comma_workspace_id) {
                       Error(response) -> response
                       Ok(None) -> not_provisioned()
                       Ok(Some(#(org_id, network_id))) ->
@@ -591,7 +596,7 @@ pub fn enroll_device(
 fn enroll(
   conn: Connection,
   ctx: AuthContext,
-  cfg: CueProvisioning,
+  cfg: CommaProvisioning,
   org_id: String,
   network_id: String,
   owner: Owner,
@@ -667,7 +672,7 @@ fn ensure_member(
 fn create_device(
   conn: Connection,
   ctx: AuthContext,
-  cfg: CueProvisioning,
+  cfg: CommaProvisioning,
   org_id: String,
   network_id: String,
   owner: Owner,
@@ -843,7 +848,7 @@ fn enrolled(
 
 // --- API keys ----------------------------------------------------------------
 
-/// `POST /internal/v1/integrations/cue/workspaces/<cue_workspace_id>/api-keys`.
+/// `POST /internal/v1/integrations/comma/workspaces/<comma_workspace_id>/api-keys`.
 ///
 /// Mints a `member` org key for the Workspace's org and returns the token —
 /// the only time it exists anywhere but the caller's hands, as with every
@@ -860,13 +865,13 @@ fn enrolled(
 pub fn mint_api_key(
   req: Request,
   ctx: AuthContext,
-  cue_workspace_id: String,
+  comma_workspace_id: String,
 ) -> Response {
-  case ctx.cue_provisioning {
+  case ctx.comma_provisioning {
     None -> not_configured()
     Some(cfg) -> {
       use <- authorized(req, cfg)
-      use <- valid_id(cue_workspace_id, "invalid_workspace")
+      use <- valid_id(comma_workspace_id, "invalid_workspace")
       let decoder = {
         use name <- decode.optional_field(
           "name",
@@ -893,7 +898,7 @@ pub fn mint_api_key(
             case hub_provider_exists(conn, cfg) {
               Error(response) -> response
               Ok(Nil) ->
-                case find_workspace_org(conn, cue_workspace_id) {
+                case find_workspace_org(conn, comma_workspace_id) {
                   Error(response) -> response
                   Ok(None) -> not_provisioned()
                   Ok(Some(#(org_id, _network_id))) ->
@@ -911,7 +916,7 @@ pub fn mint_api_key(
 /// key with no `apikey.create` row is a credential nobody knows exists.
 fn mint(
   conn: Connection,
-  cfg: CueProvisioning,
+  cfg: CommaProvisioning,
   org_id: String,
   owner: Owner,
   name: String,
@@ -972,7 +977,7 @@ fn mint(
   }
 }
 
-/// `DELETE /internal/v1/integrations/cue/workspaces/<cue_workspace_id>/api-keys/<key_id>`.
+/// `DELETE /internal/v1/integrations/comma/workspaces/<comma_workspace_id>/api-keys/<key_id>`.
 ///
 /// Revokes a key of the Workspace's org, which is deleting its row: the token
 /// authenticates by the hash there, and the audit rows that minted and ended
@@ -983,17 +988,17 @@ fn mint(
 pub fn revoke_api_key(
   req: Request,
   ctx: AuthContext,
-  cue_workspace_id: String,
+  comma_workspace_id: String,
   key_id: String,
 ) -> Response {
-  case ctx.cue_provisioning {
+  case ctx.comma_provisioning {
     None -> not_configured()
     Some(cfg) -> {
       use <- authorized(req, cfg)
-      use <- valid_id(cue_workspace_id, "invalid_workspace")
+      use <- valid_id(comma_workspace_id, "invalid_workspace")
       use <- valid_id(key_id, "invalid_key")
       with_db(ctx, fn(conn) {
-        case find_workspace_org(conn, cue_workspace_id) {
+        case find_workspace_org(conn, comma_workspace_id) {
           Error(response) -> response
           Ok(None) -> not_provisioned()
           Ok(Some(#(org_id, _network_id))) -> revoke(conn, org_id, key_id)
@@ -1051,7 +1056,7 @@ fn not_configured() -> Response {
   error_json(
     503,
     "provisioning_not_configured",
-    "cue provisioning is not enabled on this control plane",
+    "comma provisioning is not enabled on this control plane",
   )
 }
 

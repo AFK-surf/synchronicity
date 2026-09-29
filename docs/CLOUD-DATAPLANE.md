@@ -77,7 +77,7 @@ docs/REPLICATION.md, `CP README` is control-plane/README.md.
 
 The tenant contract, end to end:
 
-Cue-managed networks also enable hosting and file browsing through the
+Comma-managed networks also enable hosting and file browsing through the
 shared-secret-authenticated Workspace provisioning endpoint. Each initialization
 or backfill forces both switches on, including a previous administrative disable.
 The same transaction cancels pending collection and preserves existing placement.

@@ -4690,8 +4690,15 @@ pub fn managed_key_migration_preserves_existing_tokens_and_kind_is_fixed_test() 
   let assert Ok(before) =
     sqlite.query(conn, "SELECT * FROM api_keys ORDER BY id", [])
   // Exercise the v14→v15 table rebuild over real token/scope/expiry rows.
-  let assert Ok(_) = sqlite.exec(conn, "PRAGMA user_version = 14", [])
-  let assert Ok(15) = migrate.migrate(conn)
+  // V16 is replayed too, so its rename is undone first.
+  let assert Ok(_) =
+    sqlite.script(
+      conn,
+      "ALTER TABLE comma_workspace_orgs RENAME COLUMN comma_workspace_id TO cue_workspace_id;
+       ALTER TABLE comma_workspace_orgs RENAME TO cue_workspace_orgs;
+       PRAGMA user_version = 14;",
+    )
+  let assert Ok(16) = migrate.migrate(conn)
   let assert Ok(after) =
     sqlite.query(conn, "SELECT * FROM api_keys ORDER BY id", [])
   assert after == before

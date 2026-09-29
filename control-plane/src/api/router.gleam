@@ -45,7 +45,7 @@
 import api/api_keys_api
 import api/auth_api.{type AuthContext}
 import api/browse_api.{type Browse}
-import api/cue_api
+import api/comma_api
 import api/dataplane_api
 import api/delegates_api
 import api/devices_api
@@ -525,47 +525,54 @@ fn write_routes(req: Request, auth: AuthContext, browse: Browse) -> Response {
 }
 
 /// The server-to-server routes. Each verifies its own shared-secret bearer
-/// rather than going through `with_principal`: the caller is Cue's backend,
+/// rather than going through `with_principal`: the caller is Comma's backend,
 /// not a person or an API key, so there is no `Principal` to resolve.
 fn internal_routes(req: Request, auth: AuthContext) -> Response {
   case wisp.path_segments(req), req.method {
-    ["internal", "v1", "integrations", "cue", "workspaces", cue_workspace_id],
-      Put
-    -> cue_api.provision_workspace(req, auth, cue_workspace_id)
     [
       "internal",
       "v1",
       "integrations",
-      "cue",
+      "comma",
       "workspaces",
-      cue_workspace_id,
+      comma_workspace_id,
+    ],
+      Put
+    -> comma_api.provision_workspace(req, auth, comma_workspace_id)
+    [
+      "internal",
+      "v1",
+      "integrations",
+      "comma",
+      "workspaces",
+      comma_workspace_id,
       "devices",
     ],
       Post
-    -> cue_api.enroll_device(req, auth, cue_workspace_id)
+    -> comma_api.enroll_device(req, auth, comma_workspace_id)
     [
       "internal",
       "v1",
       "integrations",
-      "cue",
+      "comma",
       "workspaces",
-      cue_workspace_id,
+      comma_workspace_id,
       "api-keys",
     ],
       Post
-    -> cue_api.mint_api_key(req, auth, cue_workspace_id)
+    -> comma_api.mint_api_key(req, auth, comma_workspace_id)
     [
       "internal",
       "v1",
       "integrations",
-      "cue",
+      "comma",
       "workspaces",
-      cue_workspace_id,
+      comma_workspace_id,
       "api-keys",
       key_id,
     ],
       Delete
-    -> cue_api.revoke_api_key(req, auth, cue_workspace_id, key_id)
+    -> comma_api.revoke_api_key(req, auth, comma_workspace_id, key_id)
     _, _ -> wisp.not_found()
   }
 }
