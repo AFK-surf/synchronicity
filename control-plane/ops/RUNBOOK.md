@@ -150,6 +150,9 @@ a download.
 | `CP_SMTP_HOST/PORT/USER/PASS/FROM` | primary | magic-link and invitation mail (absent = log-only); `FROM` is the header, display name and all |
 | `CP_GOOGLE_CLIENT_ID/SECRET` | primary | Google sign-in (absent = disabled) |
 | `CP_GITHUB_CLIENT_ID/SECRET` | primary | GitHub sign-in (absent = disabled) |
+| `CP_COMMA_PROVISIONING_ENABLED` | primary | `true` turns on the Comma integration (`/internal/v1/integrations/comma/...`) |
+| `CP_COMMA_PROVISIONING_SECRET`, `CP_COMMA_OIDC_PROVIDER_ID` | primary | the default Comma environment: its provisioning secret (at least 32 characters) and the id of its hub OIDC provider |
+| `CP_COMMA_ENVIRONMENTS` | primary | further Comma environments, comma-separated names (`production`). Each needs `CP_COMMA_<NAME>_PROVISIONING_SECRET` and `CP_COMMA_<NAME>_OIDC_PROVIDER_ID`. Secrets and hub providers must differ between environments; a secret reaches only the Workspaces its own environment provisioned |
 | `CP_REKOR_URL` | primary | zone-key transparency log; unset, the shard in service is read from the stored `trusted_root.json` |
 | `CP_REKOR_KEY` | primary | file pinning the log's verification key — exactly one, PEM or base64 SPKI; unset, it comes from the same trusted-root entry as the endpoint |
 | `CP_REKOR_REQUIRE` | primary | `true` refuses to publish a zone whose key has no verified log record |

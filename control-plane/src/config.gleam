@@ -54,12 +54,21 @@ pub type Listen {
   Listen(address: String, port: Int)
 }
 
-/// Cue's server-to-server per-Workspace provisioning, when enabled. The secret
-/// authenticates Cue's backend; the OIDC provider is a single shared hub every
-/// Cue identity anchors to. The org and network are created per Workspace, so
-/// there is no fixed target org. Absent means the integration is off.
-pub type CueProvisioning {
-  CueProvisioning(secret: String, oidc_provider_id: String)
+/// One Comma environment's server-to-server per-Workspace provisioning. The
+/// secret authenticates that environment's backend; the OIDC provider is the
+/// shared hub every identity of that environment anchors to. The org and
+/// network are created per Workspace, so there is no fixed target org.
+///
+/// `environment` scopes the Workspace map: a secret reaches only the orgs its
+/// own environment provisioned. The default environment (`""`) is the one
+/// `CP_COMMA_PROVISIONING_*` configures, and owns every mapping made before
+/// environments existed; `CP_COMMA_ENVIRONMENTS` names the others.
+pub type CommaProvisioning {
+  CommaProvisioning(
+    environment: String,
+    secret: String,
+    oidc_provider_id: String,
+  )
 }
 
 pub type Config {
@@ -105,8 +114,9 @@ pub type Config {
     /// The control-plane endpoints the apex record names, in publication
     /// order: this node's own first, then `CP_ENDPOINTS`.
     endpoints: List(String),
-    /// Cue integration provisioning, or `None` when disabled.
-    cue_provisioning: Option(CueProvisioning),
+    /// Comma integration provisioning, one entry per environment; empty when
+    /// the integration is off.
+    comma_provisioning: List(CommaProvisioning),
   )
 }
 
@@ -175,7 +185,7 @@ pub fn load() -> Result(Config, String) {
   use primary_url <- result.try(primary_url(role))
   use smtp <- result.try(smtp_config())
   use endpoints <- result.try(validated_endpoints(role))
-  use cue_provisioning <- result.try(cue_provisioning())
+  use comma_provisioning <- result.try(comma_provisioning())
   Ok(Config(
     role,
     base_domain,
@@ -193,29 +203,116 @@ pub fn load() -> Result(Config, String) {
     dns_mode,
     primary_url,
     endpoints,
-    cue_provisioning,
+    comma_provisioning,
   ))
 }
 
-/// `CP_CUE_PROVISIONING_*`: Cue's server-to-server user provisioning. Off
-/// unless `CP_CUE_PROVISIONING_ENABLED=true`, and enabling it requires the
-/// secret, the OIDC provider id and the target org id — an endpoint that mints
-/// users and memberships does not come up half-configured.
-fn cue_provisioning() -> Result(Option(CueProvisioning), String) {
-  case envoy.get("CP_CUE_PROVISIONING_ENABLED") {
+/// `CP_COMMA_PROVISIONING_*`: Comma's server-to-server user provisioning. Off
+/// unless `CP_COMMA_PROVISIONING_ENABLED=true`, and enabling it requires the
+/// secret and the OIDC provider id — an endpoint that mints users and
+/// memberships does not come up half-configured. That pair is the default
+/// environment. `CP_COMMA_ENVIRONMENTS` (comma-separated names of lowercase
+/// letters, digits and `-`) adds named environments, each with
+/// `CP_COMMA_<NAME>_PROVISIONING_SECRET` and `CP_COMMA_<NAME>_OIDC_PROVIDER_ID`
+/// (`<NAME>` upper-cased, `-` as `_`). Every environment needs its own secret
+/// and its own hub provider: a shared secret could not say which Workspace map
+/// it may reach.
+fn comma_provisioning() -> Result(List(CommaProvisioning), String) {
+  case envoy.get("CP_COMMA_PROVISIONING_ENABLED") {
     Ok("true") -> {
-      use secret <- result.try(required("CP_CUE_PROVISIONING_SECRET"))
-      use Nil <- result.try(case string.length(secret) >= 32 {
-        True -> Ok(Nil)
-        False ->
-          Error("CP_CUE_PROVISIONING_SECRET must be at least 32 characters")
-      })
-      use provider_id <- result.try(required("CP_CUE_OIDC_PROVIDER_ID"))
-      Ok(Some(CueProvisioning(secret, provider_id)))
+      use default <- result.try(comma_environment(
+        "",
+        "CP_COMMA_PROVISIONING_SECRET",
+        "CP_COMMA_OIDC_PROVIDER_ID",
+      ))
+      use named <- result.try(named_comma_environments())
+      let all = [default, ..named]
+      use Nil <- result.try(distinct(
+        list.map(all, fn(e) { e.secret }),
+        "every Comma environment needs its own provisioning secret",
+      ))
+      use Nil <- result.try(distinct(
+        list.map(all, fn(e) { e.oidc_provider_id }),
+        "every Comma environment needs its own OIDC provider",
+      ))
+      Ok(all)
     }
-    Ok("false") | Error(Nil) -> Ok(None)
+    Ok("false") | Error(Nil) ->
+      case envoy.get("CP_COMMA_ENVIRONMENTS") {
+        Ok(names) ->
+          case string.trim(names) {
+            "" -> Ok([])
+            _ ->
+              Error(
+                "CP_COMMA_ENVIRONMENTS needs CP_COMMA_PROVISIONING_ENABLED=true",
+              )
+          }
+        Error(Nil) -> Ok([])
+      }
     Ok(other) ->
-      Error("CP_CUE_PROVISIONING_ENABLED must be true or false, got " <> other)
+      Error(
+        "CP_COMMA_PROVISIONING_ENABLED must be true or false, got " <> other,
+      )
+  }
+}
+
+fn named_comma_environments() -> Result(List(CommaProvisioning), String) {
+  let names = case envoy.get("CP_COMMA_ENVIRONMENTS") {
+    Ok(value) ->
+      string.split(value, ",")
+      |> list.map(string.trim)
+      |> list.filter(fn(name) { name != "" })
+    Error(Nil) -> []
+  }
+  use Nil <- result.try(distinct(
+    names,
+    "CP_COMMA_ENVIRONMENTS names an environment twice",
+  ))
+  list.try_map(names, fn(name) {
+    use Nil <- result.try(case valid_environment_name(name) {
+      True -> Ok(Nil)
+      False ->
+        Error(
+          "CP_COMMA_ENVIRONMENTS: "
+          <> name
+          <> " must be lowercase letters, digits and -",
+        )
+    })
+    let key = string.uppercase(string.replace(name, "-", "_"))
+    comma_environment(
+      name,
+      "CP_COMMA_" <> key <> "_PROVISIONING_SECRET",
+      "CP_COMMA_" <> key <> "_OIDC_PROVIDER_ID",
+    )
+  })
+}
+
+fn comma_environment(
+  name: String,
+  secret_key: String,
+  provider_key: String,
+) -> Result(CommaProvisioning, String) {
+  use secret <- result.try(required(secret_key))
+  use Nil <- result.try(case string.length(secret) >= 32 {
+    True -> Ok(Nil)
+    False -> Error(secret_key <> " must be at least 32 characters")
+  })
+  use provider_id <- result.try(required(provider_key))
+  Ok(CommaProvisioning(name, secret, provider_id))
+}
+
+fn valid_environment_name(name: String) -> Bool {
+  string.byte_size(name) <= 32
+  && string.to_graphemes(name)
+  |> list.all(fn(c) {
+    string.contains("abcdefghijklmnopqrstuvwxyz0123456789-", c)
+  })
+}
+
+fn distinct(values: List(String), message: String) -> Result(Nil, String) {
+  case list.length(list.unique(values)) == list.length(values) {
+    True -> Ok(Nil)
+    False -> Error(message)
   }
 }
 

@@ -1,8 +1,8 @@
-# Cue Integration Review Fixes
+# Comma Integration Review Fixes
 
 ## Goal
 
-Keep Cue Workspace provisioning idempotent under concurrent retries and keep
+Keep Comma Workspace provisioning idempotent under concurrent retries and keep
 device enrollment inside the Synchronicity org that owns the device.
 
 ## Current state
@@ -26,7 +26,7 @@ device enrollment inside the Synchronicity org that owns the device.
 
 ## If unchanged
 
-A benign concurrent retry can become a terminal Cue provisioning failure, and
+A benign concurrent retry can become a terminal Comma provisioning failure, and
 a user can attach a public node key owned by another tenant to their own
 Workspace network, leaving ownership, management, publication, and deletion
 semantics inconsistent.
@@ -44,7 +44,7 @@ and a live node key can only be reused inside its owning org.
 - Cross-org enrollment returns 409 and creates no cross-org membership.
 - `gleam test`, formatting, and `git diff --check` pass.
 - A manual paired-request smoke confirms the response/status contracts consumed
-  by Cue.
+  by Comma.
 
 ## Implementation order
 

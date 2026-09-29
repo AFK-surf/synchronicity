@@ -1,5 +1,5 @@
-//// Cue per-Workspace provisioning:
-//// `PUT /internal/v1/integrations/cue/workspaces/<cue_workspace_id>`.
+//// Comma per-Workspace provisioning:
+//// `PUT /internal/v1/integrations/comma/workspaces/<comma_workspace_id>`.
 
 import api/auth_api
 import api/browse_api
@@ -22,14 +22,14 @@ import wisp
 import wisp/simulate
 import zone/publish
 
-const secret = "cue-provisioning-shared-secret-0123456789"
+const secret = "comma-provisioning-shared-secret-0123456789"
 
 const hub_org = "org-hub"
 
 const hub_provider = "oidcp-hub"
 
-fn cue_cfg() -> config.CueProvisioning {
-  config.CueProvisioning(secret, hub_provider)
+fn comma_cfg() -> config.CommaProvisioning {
+  config.CommaProvisioning("", secret, hub_provider)
 }
 
 type Env {
@@ -37,22 +37,20 @@ type Env {
 }
 
 fn setup() -> Env {
-  setup_full(
-    Some(cue_cfg()),
-    fn(_conn) { Nil },
-    fn(_conn, _now, _actor, _change) { Ok(1) },
-  )
+  setup_full([comma_cfg()], fn(_conn) { Nil }, fn(_conn, _now, _actor, _change) {
+    Ok(1)
+  })
 }
 
 fn setup_seeded(seed: fn(sqlite.Connection) -> Nil) -> Env {
-  setup_full(Some(cue_cfg()), seed, fn(_conn, _now, _actor, _change) { Ok(1) })
+  setup_full([comma_cfg()], seed, fn(_conn, _now, _actor, _change) { Ok(1) })
 }
 
 /// A migrated database carrying the shared hub org + its OIDC provider (every
-/// Cue identity anchors to this one provider); `seed` adds any extra rows,
+/// Comma identity anchors to this one provider); `seed` adds any extra rows,
 /// before the pool opens so no second writer contends for the file.
 fn setup_full(
-  cue: Option(config.CueProvisioning),
+  comma: List(config.CommaProvisioning),
   seed: fn(sqlite.Connection) -> Nil,
   publish_in_tx: fn(sqlite.Connection, Int, String, publish.Change) ->
     Result(Int, publish.PublishError),
@@ -71,8 +69,8 @@ fn setup_full(
     sqlite.exec(
       conn,
       "INSERT INTO oidc_providers
-       VALUES (?, ?, 'https://cue.test', 'cid', 'csec',
-               'https://cue.test/authorize', 'https://cue.test/token', NULL, 0)",
+       VALUES (?, ?, 'https://comma.test', 'cid', 'csec',
+               'https://comma.test/authorize', 'https://comma.test/token', NULL, 0)",
       [sqlite.Text(hub_provider), sqlite.Text(hub_org)],
     )
   seed(conn)
@@ -89,13 +87,13 @@ fn setup_full(
       // serial) so the create path exercises the whole transaction.
       publish_in_tx,
       fn() { Nil },
-      cue,
+      comma,
     )
   let browse =
     browse_api.Browse(
-      process.new_name("cue_test_agents_" <> id.new()),
+      process.new_name("comma_test_agents_" <> id.new()),
       "https://cp.test/agent/v1/attach",
-      process.new_name("cue_test_writers_" <> id.new()),
+      process.new_name("comma_test_writers_" <> id.new()),
       "https://cp.test/dp/v1/attach",
     )
   let ctx =
@@ -132,7 +130,7 @@ fn put(
   let base =
     simulate.request(
       Put,
-      "/internal/v1/integrations/cue/workspaces/" <> workspace_id,
+      "/internal/v1/integrations/comma/workspaces/" <> workspace_id,
     )
     |> simulate.json_body(payload)
   let req = case token {
@@ -154,8 +152,8 @@ fn workspace_mapping(env: Env, workspace_id: String) -> #(String, String) {
   let assert Ok([[sqlite.Text(org_id), sqlite.Text(network_id)]]) =
     sqlite.query(
       conn,
-      "SELECT org_id, network_id FROM cue_workspace_orgs
-       WHERE cue_workspace_id = ?",
+      "SELECT org_id, network_id FROM comma_workspace_orgs
+       WHERE comma_workspace_id = ?",
       [sqlite.Text(workspace_id)],
     )
   sqlite.close(conn)
@@ -165,7 +163,7 @@ fn workspace_mapping(env: Env, workspace_id: String) -> #(String, String) {
 pub fn create_provisions_org_network_identity_membership_test() {
   let env = setup()
   let resp =
-    put(env, "wsp_1", Some(secret), body("WS One", "usr_alice", "a@cue.test"))
+    put(env, "wsp_1", Some(secret), body("WS One", "usr_alice", "a@comma.test"))
   assert resp.status == 200
   let out = simulate.read_body(resp)
   assert string.contains(out, "\"created\":true")
@@ -174,7 +172,7 @@ pub fn create_provisions_org_network_identity_membership_test() {
   // default network, one identity under the hub provider, one owner membership.
   assert count(
       env,
-      "SELECT count(*) FROM cue_workspace_orgs WHERE cue_workspace_id = ?",
+      "SELECT count(*) FROM comma_workspace_orgs WHERE comma_workspace_id = ?",
       [
         sqlite.Text("wsp_1"),
       ],
@@ -189,8 +187,8 @@ pub fn create_provisions_org_network_identity_membership_test() {
   assert count(
       env,
       "SELECT count(*) FROM org_members m
-       JOIN cue_workspace_orgs w ON w.org_id = m.org_id
-       WHERE w.cue_workspace_id = ? AND m.role = 'owner'",
+       JOIN comma_workspace_orgs w ON w.org_id = m.org_id
+       WHERE w.comma_workspace_id = ? AND m.role = 'owner'",
       [sqlite.Text("wsp_1")],
     )
     == 1
@@ -199,17 +197,17 @@ pub fn create_provisions_org_network_identity_membership_test() {
 pub fn provision_is_idempotent_test() {
   let env = setup()
   let first =
-    put(env, "wsp_2", Some(secret), body("WS Two", "usr_bob", "b@cue.test"))
+    put(env, "wsp_2", Some(secret), body("WS Two", "usr_bob", "b@comma.test"))
   assert first.status == 200
   assert string.contains(simulate.read_body(first), "\"created\":true")
 
   let second =
-    put(env, "wsp_2", Some(secret), body("WS Two", "usr_bob", "b@cue.test"))
+    put(env, "wsp_2", Some(secret), body("WS Two", "usr_bob", "b@comma.test"))
   assert second.status == 200
   assert string.contains(simulate.read_body(second), "\"created\":false")
 
   // No duplicates on repeat.
-  assert count(env, "SELECT count(*) FROM cue_workspace_orgs", []) == 1
+  assert count(env, "SELECT count(*) FROM comma_workspace_orgs", []) == 1
   assert count(env, "SELECT count(*) FROM networks", []) == 1
   assert count(env, "SELECT count(*) FROM auth_identities WHERE subject = ?", [
       sqlite.Text("usr_bob"),
@@ -218,19 +216,150 @@ pub fn provision_is_idempotent_test() {
   assert count(env, "SELECT count(*) FROM org_members", []) == 1
 }
 
+/// The Workspace map as V12 made it and V15 left it, rows kept.
+const v15_workspace_map = "
+CREATE TABLE cue_workspace_orgs (
+  cue_workspace_id TEXT PRIMARY KEY,
+  org_id           TEXT NOT NULL UNIQUE REFERENCES orgs(id),
+  network_id       TEXT NOT NULL REFERENCES networks(id),
+  created_at       INTEGER NOT NULL
+);
+INSERT INTO cue_workspace_orgs
+  SELECT comma_workspace_id, org_id, network_id, created_at
+  FROM comma_workspace_orgs;
+DROP TABLE comma_workspace_orgs;
+PRAGMA user_version = 15;
+"
+
+/// A Workspace provisioned before the V16 rename and the V17 environment
+/// scope keeps its org and network in the default environment: the next
+/// provisioning call finds the mapping and creates nothing.
+pub fn workspace_provisioned_before_rename_keeps_its_org_test() {
+  let env = setup()
+  let first =
+    put(env, "wsp_old", Some(secret), body("Old", "usr_dan", "d@comma.test"))
+  assert first.status == 200
+  let before = workspace_mapping(env, "wsp_old")
+
+  // Put the mapping back into its V15 shape, then migrate forward.
+  let assert Ok(conn) = db.open_primary(env.db_path)
+  let assert Ok(_) = sqlite.script(conn, v15_workspace_map)
+  let assert Ok(17) = migrate.migrate(conn)
+  sqlite.close(conn)
+
+  let again =
+    put(env, "wsp_old", Some(secret), body("Old", "usr_dan", "d@comma.test"))
+  assert again.status == 200
+  assert string.contains(simulate.read_body(again), "\"created\":false")
+  assert workspace_mapping(env, "wsp_old") == before
+  assert count(env, "SELECT count(*) FROM networks", []) == 1
+}
+
+const production_secret = "comma-production-provisioning-secret-0123456"
+
+const production_hub_provider = "oidcp-hub-production"
+
+/// Two environments on one control plane: the default one and "production",
+/// each with its own secret and hub provider.
+fn setup_two_environments() -> Env {
+  setup_full(
+    [
+      comma_cfg(),
+      config.CommaProvisioning(
+        "production",
+        production_secret,
+        production_hub_provider,
+      ),
+    ],
+    fn(conn) {
+      let assert Ok(_) =
+        sqlite.exec(
+          conn,
+          "INSERT INTO orgs VALUES ('org-hub-production', 'hub-production', 'Hub', 0)",
+          [],
+        )
+      let assert Ok(_) =
+        sqlite.exec(
+          conn,
+          "INSERT INTO oidc_providers
+           VALUES (?, 'org-hub-production', 'https://comma-production.test',
+                   'cid', 'csec', 'https://comma-production.test/authorize',
+                   'https://comma-production.test/token', NULL, 0)",
+          [sqlite.Text(production_hub_provider)],
+        )
+      Nil
+    },
+    fn(_conn, _now, _actor, _change) { Ok(1) },
+  )
+}
+
+/// The same Workspace id in two environments is two Workspaces: each
+/// environment's secret provisions its own org, and the owner's identity
+/// anchors to that environment's hub.
+pub fn environments_provision_separate_orgs_test() {
+  let env = setup_two_environments()
+  let staging =
+    put(env, "wsp_same", Some(secret), body("S", "usr_same", "s@comma.test"))
+  assert staging.status == 200
+  let production =
+    put(
+      env,
+      "wsp_same",
+      Some(production_secret),
+      body("P", "usr_same", "s@comma.test"),
+    )
+  assert production.status == 200
+  assert string.contains(simulate.read_body(production), "\"created\":true")
+  assert count(
+      env,
+      "SELECT count(DISTINCT org_id) FROM comma_workspace_orgs
+       WHERE comma_workspace_id = 'wsp_same'",
+      [],
+    )
+    == 2
+  assert count(
+      env,
+      "SELECT count(*) FROM auth_identities
+       WHERE subject = 'usr_same' AND oidc_provider_id = ?",
+      [sqlite.Text(production_hub_provider)],
+    )
+    == 1
+}
+
+/// One environment's secret cannot reach another environment's Workspace:
+/// minting a key there answers "not provisioned" and mints nothing.
+pub fn environment_secret_cannot_reach_another_environments_workspace_test() {
+  let env = setup_two_environments()
+  let staging =
+    put(env, "wsp_only", Some(secret), body("S", "usr_o", "o@comma.test"))
+  assert staging.status == 200
+
+  let key =
+    post_key(
+      env,
+      "wsp_only",
+      Some(production_secret),
+      key_body("usr_o", "o@comma.test"),
+    )
+  assert key.status == 404
+  assert count(env, "SELECT count(*) FROM api_keys", []) == 0
+}
+
 pub fn same_owner_two_workspaces_reuses_identity_test() {
   let env = setup()
-  let a = put(env, "wsp_a", Some(secret), body("A", "usr_carol", "c@cue.test"))
+  let a =
+    put(env, "wsp_a", Some(secret), body("A", "usr_carol", "c@comma.test"))
   assert a.status == 200
-  let b = put(env, "wsp_b", Some(secret), body("B", "usr_carol", "c@cue.test"))
+  let b =
+    put(env, "wsp_b", Some(secret), body("B", "usr_carol", "c@comma.test"))
   assert b.status == 200
 
   // Two workspace orgs + networks, but ONE identity/user reused across both,
   // with a membership in each org.
-  assert count(env, "SELECT count(*) FROM cue_workspace_orgs", []) == 2
+  assert count(env, "SELECT count(*) FROM comma_workspace_orgs", []) == 2
   assert count(env, "SELECT count(*) FROM networks", []) == 2
   assert count(env, "SELECT count(*) FROM users WHERE email = ?", [
-      sqlite.Text("c@cue.test"),
+      sqlite.Text("c@comma.test"),
     ])
     == 1
   assert count(env, "SELECT count(*) FROM auth_identities WHERE subject = ?", [
@@ -240,27 +369,27 @@ pub fn same_owner_two_workspaces_reuses_identity_test() {
   assert count(env, "SELECT count(*) FROM org_members", []) == 2
 }
 
-pub fn trusted_cue_email_links_existing_account_idempotently_test() {
+pub fn trusted_comma_email_links_existing_account_idempotently_test() {
   let env =
     setup_seeded(fn(conn) {
       let assert Ok(_) =
         sqlite.exec(
           conn,
-          "INSERT INTO users VALUES ('seed-dave', 'dave@cue.test', 'D', 0)",
+          "INSERT INTO users VALUES ('seed-dave', 'dave@comma.test', 'D', 0)",
           [],
         )
       Nil
     })
-  // The trusted Cue request binds its identity to the existing account.
+  // The trusted Comma request binds its identity to the existing account.
   let resp =
-    put(env, "wsp_d", Some(secret), body("D", "usr_dave", "dave@cue.test"))
+    put(env, "wsp_d", Some(secret), body("D", "usr_dave", "dave@comma.test"))
   assert resp.status == 200
   let retry =
-    put(env, "wsp_d", Some(secret), body("D", "usr_dave", "dave@cue.test"))
+    put(env, "wsp_d", Some(secret), body("D", "usr_dave", "dave@comma.test"))
   assert retry.status == 200
-  assert count(env, "SELECT count(*) FROM cue_workspace_orgs", []) == 1
+  assert count(env, "SELECT count(*) FROM comma_workspace_orgs", []) == 1
   assert count(env, "SELECT count(*) FROM users WHERE email = ?", [
-      sqlite.Text("dave@cue.test"),
+      sqlite.Text("dave@comma.test"),
     ])
     == 1
   assert count(
@@ -277,9 +406,9 @@ pub fn trusted_cue_email_links_existing_account_idempotently_test() {
       sqlite.Text("seed-dave"),
     ])
     == 1
-  // A later email change must not move the already-bound Cue subject.
+  // A later email change must not move the already-bound Comma subject.
   let changed_email =
-    put(env, "wsp_d", Some(secret), body("D", "usr_dave", "changed@cue.test"))
+    put(env, "wsp_d", Some(secret), body("D", "usr_dave", "changed@comma.test"))
   assert changed_email.status == 200
   assert count(
       env,
@@ -291,18 +420,18 @@ pub fn trusted_cue_email_links_existing_account_idempotently_test() {
     )
     == 1
   assert count(env, "SELECT count(*) FROM users WHERE email = ?", [
-      sqlite.Text("changed@cue.test"),
+      sqlite.Text("changed@comma.test"),
     ])
     == 0
 }
 
-pub fn untrusted_cue_request_cannot_link_existing_account_test() {
+pub fn untrusted_comma_request_cannot_link_existing_account_test() {
   let env =
     setup_seeded(fn(conn) {
       let assert Ok(_) =
         sqlite.exec(
           conn,
-          "INSERT INTO users VALUES ('seed-dave', 'dave@cue.test', 'D', 0)",
+          "INSERT INTO users VALUES ('seed-dave', 'dave@comma.test', 'D', 0)",
           [],
         )
       Nil
@@ -312,14 +441,14 @@ pub fn untrusted_cue_request_cannot_link_existing_account_test() {
       env,
       "wsp_d",
       Some("wrong-secret"),
-      body("D", "usr_dave", "dave@cue.test"),
+      body("D", "usr_dave", "dave@comma.test"),
     )
   assert resp.status == 401
   assert count(env, "SELECT count(*) FROM auth_identities WHERE subject = ?", [
       sqlite.Text("usr_dave"),
     ])
     == 0
-  assert count(env, "SELECT count(*) FROM cue_workspace_orgs", []) == 0
+  assert count(env, "SELECT count(*) FROM comma_workspace_orgs", []) == 0
 }
 
 pub fn wrong_secret_is_unauthenticated_test() {
@@ -329,25 +458,23 @@ pub fn wrong_secret_is_unauthenticated_test() {
       env,
       "wsp_e",
       Some("not-the-secret"),
-      body("E", "usr_eve", "e@cue.test"),
+      body("E", "usr_eve", "e@comma.test"),
     )
   assert resp.status == 401
-  assert count(env, "SELECT count(*) FROM cue_workspace_orgs", []) == 0
+  assert count(env, "SELECT count(*) FROM comma_workspace_orgs", []) == 0
 }
 
 pub fn absent_secret_is_unauthenticated_test() {
   let env = setup()
-  let resp = put(env, "wsp_f", None, body("F", "usr_frank", "f@cue.test"))
+  let resp = put(env, "wsp_f", None, body("F", "usr_frank", "f@comma.test"))
   assert resp.status == 401
 }
 
 pub fn disabled_provisioning_is_unavailable_test() {
   let env =
-    setup_full(None, fn(_conn) { Nil }, fn(_conn, _now, _actor, _change) {
-      Ok(1)
-    })
+    setup_full([], fn(_conn) { Nil }, fn(_conn, _now, _actor, _change) { Ok(1) })
   let resp =
-    put(env, "wsp_g", Some(secret), body("G", "usr_grace", "g@cue.test"))
+    put(env, "wsp_g", Some(secret), body("G", "usr_grace", "g@comma.test"))
   assert resp.status == 503
   assert string.contains(
     simulate.read_body(resp),
@@ -358,12 +485,12 @@ pub fn disabled_provisioning_is_unavailable_test() {
 pub fn unknown_hub_provider_is_unavailable_test() {
   let env =
     setup_full(
-      Some(config.CueProvisioning(secret, "no-such-provider")),
+      [config.CommaProvisioning("", secret, "no-such-provider")],
       fn(_conn) { Nil },
       fn(_conn, _now, _actor, _change) { Ok(1) },
     )
   let resp =
-    put(env, "wsp_h", Some(secret), body("H", "usr_ivan", "i@cue.test"))
+    put(env, "wsp_h", Some(secret), body("H", "usr_ivan", "i@comma.test"))
   assert resp.status == 503
   assert string.contains(
     simulate.read_body(resp),
@@ -410,7 +537,9 @@ fn post_device(
   let base =
     simulate.request(
       Post,
-      "/internal/v1/integrations/cue/workspaces/" <> workspace_id <> "/devices",
+      "/internal/v1/integrations/comma/workspaces/"
+        <> workspace_id
+        <> "/devices",
     )
     |> simulate.json_body(payload)
   let req = case token {
@@ -423,7 +552,7 @@ fn post_device(
 /// Provisions a workspace and returns its owner subject/email, ready to enroll.
 fn provisioned_workspace(env: Env, workspace_id: String) -> #(String, String) {
   let subject = "usr_" <> id.new()
-  let email = id.new() <> "@cue.test"
+  let email = id.new() <> "@comma.test"
   let resp = put(env, workspace_id, Some(secret), body("WS", subject, email))
   assert resp.status == 200
   #(subject, email)
@@ -446,7 +575,7 @@ pub fn enroll_device_creates_device_key_membership_test() {
   assert string.contains(out, "\"created\":true")
   assert string.contains(out, "\"device_id\"")
   // The domain is <network>.<org-slug>.<apex>; the apex is the booted zone.
-  assert string.contains(out, "default.cue-")
+  assert string.contains(out, "default.comma-")
   assert string.contains(out, ".sync.test")
 
   // One device, one active key, one membership of the workspace's network.
@@ -460,8 +589,8 @@ pub fn enroll_device_creates_device_key_membership_test() {
   assert count(
       env,
       "SELECT count(*) FROM network_devices nd
-       JOIN cue_workspace_orgs w ON w.network_id = nd.network_id
-       WHERE w.cue_workspace_id = ?",
+       JOIN comma_workspace_orgs w ON w.network_id = nd.network_id
+       WHERE w.comma_workspace_id = ?",
       [sqlite.Text("wsp_dev")],
     )
     == 1
@@ -504,7 +633,7 @@ pub fn concurrent_provisioning_reuses_the_winning_mapping_test() {
 
   let env =
     setup_full(
-      Some(cue_cfg()),
+      [comma_cfg()],
       fn(_conn) { Nil },
       fn(_conn, _now, _actor, _change) {
         // A subject can only be received by the process that created it. Each
@@ -516,7 +645,7 @@ pub fn concurrent_provisioning_reuses_the_winning_mapping_test() {
         Ok(1)
       },
     )
-  let payload = body("Concurrent", "usr_race", "race@cue.test")
+  let payload = body("Concurrent", "usr_race", "race@comma.test")
 
   process.spawn_unlinked(fn() {
     process.send(responses, put(env, "wsp_race", Some(secret), payload))
@@ -552,14 +681,14 @@ pub fn concurrent_provisioning_reuses_the_winning_mapping_test() {
   assert string.contains(first_body, "\"network_id\":\"" <> network_id <> "\"")
   assert string.contains(second_body, "\"org_id\":\"" <> org_id <> "\"")
   assert string.contains(second_body, "\"network_id\":\"" <> network_id <> "\"")
-  assert count(env, "SELECT count(*) FROM cue_workspace_orgs", []) == 1
+  assert count(env, "SELECT count(*) FROM comma_workspace_orgs", []) == 1
   assert count(env, "SELECT count(*) FROM networks", []) == 1
 }
 
 pub fn existing_device_key_cannot_cross_workspace_orgs_test() {
   let env = setup()
   let subject = "usr_cross_org"
-  let email = "cross-org@cue.test"
+  let email = "cross-org@comma.test"
   let a = put(env, "wsp_org_a", Some(secret), body("A", subject, email))
   let b = put(env, "wsp_org_b", Some(secret), body("B", subject, email))
   assert a.status == 200
@@ -596,7 +725,7 @@ pub fn enroll_unprovisioned_workspace_is_not_found_test() {
       env,
       "wsp_absent",
       Some(secret),
-      device_body(nk, "laptop", "usr_k", "k@cue.test"),
+      device_body(nk, "laptop", "usr_k", "k@comma.test"),
     )
   assert resp.status == 404
   assert string.contains(simulate.read_body(resp), "workspace_not_provisioned")
@@ -639,7 +768,7 @@ pub fn provisioning_enables_cloud_features_and_places_new_network_test() {
       let assert Ok(_) =
         sqlite.exec(
           conn,
-          "INSERT INTO data_planes (id, created_at) VALUES ('dp-cue', 0)",
+          "INSERT INTO data_planes (id, created_at) VALUES ('dp-comma', 0)",
           [],
         )
       Nil
@@ -649,12 +778,12 @@ pub fn provisioning_enables_cloud_features_and_places_new_network_test() {
       env,
       "wsp_cloud",
       Some(secret),
-      body("Cloud", "usr_cloud", "cloud@cue.test"),
+      body("Cloud", "usr_cloud", "cloud@comma.test"),
     )
   assert resp.status == 200
   assert count(
       env,
-      "SELECT count(*) FROM networks WHERE browse_enabled = 1 AND cloud_hosted = 1 AND cloud_dp_id = 'dp-cue'",
+      "SELECT count(*) FROM networks WHERE browse_enabled = 1 AND cloud_hosted = 1 AND cloud_dp_id = 'dp-comma'",
       [],
     )
     == 1
@@ -666,25 +795,25 @@ pub fn backfill_reenables_features_preserves_placement_and_cancels_collection_te
       let assert Ok(_) =
         sqlite.exec(
           conn,
-          "INSERT INTO data_planes (id, created_at) VALUES ('dp-cue', 0)",
+          "INSERT INTO data_planes (id, created_at) VALUES ('dp-comma', 0)",
           [],
         )
       Nil
     })
-  let payload = body("Cloud", "usr_cloud", "cloud@cue.test")
+  let payload = body("Cloud", "usr_cloud", "cloud@comma.test")
   assert put(env, "wsp_cloud", Some(secret), payload).status == 200
   let assert Ok(conn) = db.open_primary(env.db_path)
   // Represent a previously provisioned network whose admin disabled both flags.
   let assert Ok(_) =
     sqlite.exec(
       conn,
-      "UPDATE networks SET browse_enabled = 0, cloud_hosted = 0, cloud_dp_id = 'dp-cue'",
+      "UPDATE networks SET browse_enabled = 0, cloud_hosted = 0, cloud_dp_id = 'dp-comma'",
       [],
     )
   let assert Ok(_) =
     sqlite.exec(
       conn,
-      "INSERT INTO cloud_collect_queue (org_slug, network_name, disabled_at, dp_id) SELECT o.slug, n.name, 0, 'dp-cue' FROM networks n JOIN orgs o ON o.id = n.org_id",
+      "INSERT INTO cloud_collect_queue (org_slug, network_name, disabled_at, dp_id) SELECT o.slug, n.name, 0, 'dp-comma' FROM networks n JOIN orgs o ON o.id = n.org_id",
       [],
     )
   let assert Ok(_) =
@@ -698,12 +827,12 @@ pub fn backfill_reenables_features_preserves_placement_and_cancels_collection_te
   assert put(env, "wsp_cloud", Some(secret), payload).status == 200
   assert count(
       env,
-      "SELECT count(*) FROM networks WHERE browse_enabled = 1 AND cloud_hosted = 1 AND cloud_dp_id = 'dp-cue'",
+      "SELECT count(*) FROM networks WHERE browse_enabled = 1 AND cloud_hosted = 1 AND cloud_dp_id = 'dp-comma'",
       [],
     )
     == 1
   assert count(env, "SELECT count(*) FROM cloud_collect_queue", []) == 0
-  assert count(env, "SELECT count(*) FROM cue_workspace_orgs", []) == 1
+  assert count(env, "SELECT count(*) FROM comma_workspace_orgs", []) == 1
 }
 
 pub fn provisioning_without_fleet_enables_flags_but_does_not_invent_placement_test() {
@@ -712,7 +841,7 @@ pub fn provisioning_without_fleet_enables_flags_but_does_not_invent_placement_te
       env,
       "wsp_cloud",
       Some(secret),
-      body("Cloud", "usr_cloud", "cloud@cue.test"),
+      body("Cloud", "usr_cloud", "cloud@comma.test"),
     ).status
     == 200
   assert count(
@@ -729,12 +858,12 @@ pub fn rejected_backfill_rolls_back_flags_placement_and_collection_test() {
       let assert Ok(_) =
         sqlite.exec(
           conn,
-          "INSERT INTO data_planes (id, created_at) VALUES ('dp-cue', 0)",
+          "INSERT INTO data_planes (id, created_at) VALUES ('dp-comma', 0)",
           [],
         )
       Nil
     })
-  let payload = body("Cloud", "usr_cloud", "cloud@cue.test")
+  let payload = body("Cloud", "usr_cloud", "cloud@comma.test")
   assert put(env, "wsp_cloud", Some(secret), payload).status == 200
   let assert Ok(conn) = db.open_primary(env.db_path)
   let assert Ok(_) =
@@ -746,7 +875,7 @@ pub fn rejected_backfill_rolls_back_flags_placement_and_collection_test() {
   let assert Ok(_) =
     sqlite.exec(
       conn,
-      "INSERT INTO cloud_collect_queue (org_slug, network_name, disabled_at, dp_id) SELECT o.slug, n.name, 0, 'dp-cue' FROM networks n JOIN orgs o ON o.id = n.org_id",
+      "INSERT INTO cloud_collect_queue (org_slug, network_name, disabled_at, dp_id) SELECT o.slug, n.name, 0, 'dp-comma' FROM networks n JOIN orgs o ON o.id = n.org_id",
       [],
     )
   sqlite.close(conn)
@@ -812,7 +941,9 @@ fn post_key(
   let base =
     simulate.request(
       Post,
-      "/internal/v1/integrations/cue/workspaces/" <> workspace_id <> "/api-keys",
+      "/internal/v1/integrations/comma/workspaces/"
+        <> workspace_id
+        <> "/api-keys",
     )
     |> simulate.json_body(payload)
   let req = case token {
@@ -831,7 +962,7 @@ fn delete_key(
   let base =
     simulate.request(
       Delete,
-      "/internal/v1/integrations/cue/workspaces/"
+      "/internal/v1/integrations/comma/workspaces/"
         <> workspace_id
         <> "/api-keys/"
         <> key_id,
@@ -843,7 +974,7 @@ fn delete_key(
   router.handle(req, env.ctx)
 }
 
-/// A request carrying the minted key and no cookie — what Cue's backend sends.
+/// A request carrying the minted key and no cookie — what Comma's backend sends.
 fn keyed(env: Env, token: String, path: String) -> wisp.Response {
   simulate.request(Get, path)
   |> simulate.header("authorization", "Bearer " <> token)
@@ -869,16 +1000,16 @@ fn minted_of(resp: wisp.Response) -> Minted {
 pub fn provisioning_reports_org_slug_and_network_test() {
   let env = setup()
   let created =
-    put(env, "wsp_slug", Some(secret), body("S", "usr_slug", "s@cue.test"))
+    put(env, "wsp_slug", Some(secret), body("S", "usr_slug", "s@comma.test"))
   assert created.status == 200
   let out = simulate.read_body(created)
-  assert string.contains(out, "\"org_slug\":\"cue-")
+  assert string.contains(out, "\"org_slug\":\"comma-")
   assert string.contains(out, "\"network\":\"default\"")
 
   let reused =
-    put(env, "wsp_slug", Some(secret), body("S", "usr_slug", "s@cue.test"))
+    put(env, "wsp_slug", Some(secret), body("S", "usr_slug", "s@comma.test"))
   assert reused.status == 200
-  assert string.contains(simulate.read_body(reused), "\"org_slug\":\"cue-")
+  assert string.contains(simulate.read_body(reused), "\"org_slug\":\"comma-")
 }
 
 pub fn minted_key_is_a_member_key_that_reaches_the_org_api_test() {
@@ -889,11 +1020,11 @@ pub fn minted_key_is_a_member_key_that_reaches_the_org_api_test() {
   assert resp.status == 200
   let out = simulate.read_body(resp)
   assert string.contains(out, "\"role\":\"member\"")
-  assert string.contains(out, "\"name\":\"cue-backend\"")
+  assert string.contains(out, "\"name\":\"comma-backend\"")
   assert string.contains(out, "\"network\":\"default\"")
   let minted = minted_of(resp)
   assert string.starts_with(minted.token, "synch_")
-  assert string.starts_with(minted.org_slug, "cue-")
+  assert string.starts_with(minted.org_slug, "comma-")
   assert minted.expires_at == 0
 
   // The token reaches the Workspace's org at the member floor ...
@@ -913,9 +1044,9 @@ pub fn minted_key_is_a_member_key_that_reaches_the_org_api_test() {
   assert count(
       env,
       "SELECT count(*) FROM api_keys k
-       JOIN cue_workspace_orgs w ON w.org_id = k.org_id
+       JOIN comma_workspace_orgs w ON w.org_id = k.org_id
        JOIN auth_identities i ON i.user_id = k.created_by
-       WHERE w.cue_workspace_id = ? AND k.role = 'member'
+       WHERE w.comma_workspace_id = ? AND k.role = 'member'
          AND k.network_id IS NULL AND i.subject = ?",
       [sqlite.Text("wsp_key"), sqlite.Text(subject)],
     )
@@ -923,7 +1054,7 @@ pub fn minted_key_is_a_member_key_that_reaches_the_org_api_test() {
   assert count(
       env,
       "SELECT count(*) FROM audit_log
-       WHERE action = 'apikey.create' AND actor = 'cue:provisioning'",
+       WHERE action = 'apikey.create' AND actor = 'comma:provisioning'",
       [],
     )
     == 1
@@ -994,7 +1125,7 @@ pub fn mint_refuses_a_bad_name_or_expiry_test() {
 pub fn mint_for_unprovisioned_workspace_is_not_found_test() {
   let env = setup()
   let resp =
-    post_key(env, "wsp_none", Some(secret), key_body("usr_n", "n@cue.test"))
+    post_key(env, "wsp_none", Some(secret), key_body("usr_n", "n@comma.test"))
   assert resp.status == 404
   assert string.contains(simulate.read_body(resp), "workspace_not_provisioned")
   assert count(env, "SELECT count(*) FROM api_keys", []) == 0
@@ -1052,7 +1183,7 @@ pub fn revoke_ends_access_and_stays_inside_the_workspace_org_test() {
   assert count(
       env,
       "SELECT count(*) FROM audit_log
-       WHERE action = 'apikey.delete' AND actor = 'cue:provisioning'",
+       WHERE action = 'apikey.delete' AND actor = 'comma:provisioning'",
       [],
     )
     == 1
