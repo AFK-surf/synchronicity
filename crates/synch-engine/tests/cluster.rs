@@ -205,6 +205,78 @@ async fn api_source_adoption_promotes_to_cloud_before_publishing_its_own_referen
     shutdown(&[&source.node, &adopter.node]).await;
 }
 
+/// A transient read streams a peer's object through and keeps nothing: the
+/// bytes match, ranged and whole, across more than one slice window, and the
+/// reader's store has no row, payload or bitmap for the object afterwards.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_transient_read_keeps_no_copy_of_a_peers_object() {
+    use synch_engine::TransientRead;
+    let _blocking = synch_core::BlockingScope::enter();
+    let nas = spawn("nas").await;
+    let gateway = spawn("gateway").await;
+    introduce(&[&nas, &gateway]);
+
+    // Larger than one slice window, so the reader walks more than one.
+    let payload = big_payload(9 * 1024 * 1024 + 4321);
+    nas.node
+        .add_filesystem_source("media", nas.space.path())
+        .unwrap();
+    std::fs::write(nas.space.path().join("snapshot.tar"), &payload).unwrap();
+    nas.node.scan_publish_push().await.unwrap().unwrap();
+    gateway
+        .node
+        .sync_with_peer(&nas.node.node_id())
+        .await
+        .unwrap();
+
+    async fn read_all(node: &Node, start: u64, len: Option<u64>) -> (bool, Vec<u8>) {
+        match node
+            .prepare_transient("media", "snapshot.tar", &VersionPolicy::Newest, start, len)
+            .await
+            .unwrap()
+        {
+            TransientRead::Local(range) => (
+                true,
+                node.cas_backend()
+                    .read_range(range.root, range.start, range.len())
+                    .await
+                    .unwrap(),
+            ),
+            TransientRead::Peers(mut reader) => {
+                let mut out = Vec::new();
+                while let Some(piece) = reader.next().await.unwrap() {
+                    out.extend_from_slice(&piece);
+                }
+                (false, out)
+            }
+        }
+    }
+
+    let (local, whole) = read_all(&gateway.node, 0, None).await;
+    assert!(!local, "the gateway holds nothing of the object");
+    assert!(whole == payload, "the whole object streams through intact");
+    let (_, ranged) = read_all(&gateway.node, 8 * 1024 * 1024 - 100, Some(70_000)).await;
+    assert!(
+        ranged == payload[8 * 1024 * 1024 - 100..8 * 1024 * 1024 - 100 + 70_000],
+        "a range straddling two windows streams through intact"
+    );
+
+    let root = gateway
+        .node
+        .resolve("media", "snapshot.tar", &VersionPolicy::Newest)
+        .unwrap()
+        .content
+        .unwrap();
+    assert!(
+        gateway.node.store().blob(&root).unwrap().is_none(),
+        "a transient read leaves no copy behind"
+    );
+    // The publisher holds the object, so its own transient read is local.
+    assert!(read_all(&nas.node, 0, Some(10)).await.0);
+
+    shutdown(&[&nas.node, &gateway.node]).await;
+}
+
 /// The §14 walkthrough: scan-publish-push, pull, a verified partial range
 /// read, and a milestone ad (§6.3) turning a fetcher into a provider.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]

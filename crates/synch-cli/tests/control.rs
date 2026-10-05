@@ -417,6 +417,7 @@ fn cat(reference: &str, range: Option<&str>, origin: Option<&str>) -> Command {
         range: range.map(String::from),
         root: None,
         select: origin.map(|origin| format!("origin={origin}")),
+        no_cache: false,
     })
 }
 
@@ -649,6 +650,7 @@ fn read_req(space: &str, path: &str, start: u64, len: Option<u64>) -> pb::ReadRe
         policy: None,
         start,
         len,
+        no_cache: false,
     }
 }
 
@@ -710,6 +712,12 @@ async fn every_command_variant_round_trips() {
         read(data_dir, cat("media/notes.txt", Some("1..3"), None)).await,
         b"el"
     );
+    // `--no-cache` on content this node holds reads it straight from the CAS.
+    let mut uncached = cat("media/notes.txt", Some("1..3"), None);
+    if let Command::Cat(cat) = &mut uncached {
+        cat.no_cache = true;
+    }
+    assert_eq!(read(data_dir, uncached).await, b"el");
     says(data_dir, log("media/notes.txt"), "seq 1").await;
 
     // Membership. The key is the identity: static trust names nobody (§3.2).

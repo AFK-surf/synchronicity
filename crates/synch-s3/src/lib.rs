@@ -822,7 +822,14 @@ async fn get_object(
     // gigabyte object costs a chunk of memory here and a chunk in the daemon.
     let body = gateway
         .daemon
-        .read(&bucket.space, key, &policy, start, Some(length))
+        .read(
+            &bucket.space,
+            key,
+            &policy,
+            start,
+            Some(length),
+            bucket.no_cache,
+        )
         .await
         .map_err(|e| e.with_key(key))?;
     Ok((status, response_headers, body).into_response())

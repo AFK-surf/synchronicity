@@ -1047,6 +1047,46 @@ impl Store {
         Ok(buffer)
     }
 
+    /// Verifies a received bao slice of one contiguous run of groups against
+    /// the object root and returns the run's bytes, writing nothing.
+    ///
+    /// The transient read path: a gateway asked not to cache streams a peer's
+    /// object through this node, and every byte it forwards has been checked
+    /// against the root exactly as [`Store::write_slice`] checks it, without
+    /// the payload, the outboard or the bitmap that would make the object a
+    /// local copy (§6.4). The slice carries its own path from the root, so
+    /// each window verifies on its own and nothing is kept between them.
+    pub fn verify_slice(
+        root: &Hash,
+        size: u64,
+        served: &GroupRange,
+        encoded: &[u8],
+    ) -> Result<Vec<u8>> {
+        let group = synch_core::CHUNK_GROUP_SIZE;
+        let start = served.start.saturating_mul(group).min(size);
+        let end = served.end.saturating_mul(group).min(size);
+        let len = usize::try_from(end - start)
+            .map_err(|_| StoreError::invalid("a slice window must fit in memory"))?;
+        let mut window = Window {
+            start,
+            bytes: vec![0u8; len],
+        };
+        decode_ranges(
+            std::io::Cursor::new(encoded),
+            &to_bao_ranges(&ChunkRanges::from_ranges([*served])),
+            &mut window,
+            Discard {
+                root: blake3::Hash::from_bytes(root.0),
+                tree: Self::tree(size),
+            },
+        )
+        .map_err(|e| StoreError::Verification {
+            root: *root,
+            reason: e.to_string(),
+        })?;
+        Ok(window.bytes)
+    }
+
     /// The file half of the Bao slice service: decode `encoded`, a slice of
     /// exactly `served`, against the root into the object's sparse payload and
     /// outboard, created as needed and left unflushed.
@@ -1150,6 +1190,70 @@ impl bao_tree::io::sync::Size for DataFile {
     }
 }
 
+/// The byte window a transient read verifies into; a leaf outside it is a
+/// decoder fault, not something to grow for.
+struct Window {
+    start: u64,
+    bytes: Vec<u8>,
+}
+
+impl bao_tree::io::sync::WriteAt for &mut Window {
+    fn write_at(&mut self, pos: u64, buf: &[u8]) -> std::io::Result<usize> {
+        let offset = pos
+            .checked_sub(self.start)
+            .and_then(|offset| usize::try_from(offset).ok())
+            .filter(|offset| offset + buf.len() <= self.bytes.len())
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidData,
+                    "a verified leaf fell outside the requested window",
+                )
+            })?;
+        self.bytes[offset..offset + buf.len()].copy_from_slice(buf);
+        Ok(buf.len())
+    }
+
+    fn flush(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
+/// An outboard that keeps nothing: a transient read needs the parents only to
+/// verify the leaves beneath them, and the decoder checks them on the way.
+struct Discard {
+    root: blake3::Hash,
+    tree: BaoTree,
+}
+
+impl bao_tree::io::sync::Outboard for Discard {
+    fn root(&self) -> blake3::Hash {
+        self.root
+    }
+    fn tree(&self) -> BaoTree {
+        self.tree
+    }
+    fn load(
+        &self,
+        _node: bao_tree::TreeNode,
+    ) -> std::io::Result<Option<(blake3::Hash, blake3::Hash)>> {
+        Ok(None)
+    }
+}
+
+impl bao_tree::io::sync::OutboardMut for Discard {
+    fn save(
+        &mut self,
+        _node: bao_tree::TreeNode,
+        _pair: &(blake3::Hash, blake3::Hash),
+    ) -> std::io::Result<()> {
+        Ok(())
+    }
+
+    fn sync(&mut self) -> std::io::Result<()> {
+        Ok(())
+    }
+}
+
 /// An outboard that discards writes, for single-group objects whose outboard is
 /// empty by construction.
 struct MemOutboard(PreOrderOutboard<Vec<u8>>);
@@ -1220,6 +1324,29 @@ pub(crate) fn compute_outboard(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A transient read accepts exactly the provider's honest bytes: the
+    /// window verifies against the root, and one flipped bit anywhere in the
+    /// encoding is refused rather than forwarded.
+    #[test]
+    fn a_slice_verifies_in_memory_and_a_tampered_one_is_refused() {
+        let (_dir, store) = crate::testutil::store();
+        let size = 40 * CHUNK_GROUP_SIZE + 77;
+        let bytes: Vec<u8> = (0..size).map(|i| (i % 251) as u8).collect();
+        let root = store.ingest_bytes(&bytes, 1).unwrap();
+        let window = GroupRange::new(3, group_count(size));
+        let (encoded, served) = store
+            .encode_slice(&root, &ChunkRanges::from_ranges([window]))
+            .unwrap();
+        assert_eq!(served, ChunkRanges::from_ranges([window]));
+        let verified = Store::verify_slice(&root, size, &window, &encoded).unwrap();
+        assert!(verified == bytes[(3 * CHUNK_GROUP_SIZE) as usize..]);
+        for at in [0, encoded.len() / 2, encoded.len() - 1] {
+            let mut tampered = encoded.clone();
+            tampered[at] ^= 1;
+            assert!(Store::verify_slice(&root, size, &window, &tampered).is_err());
+        }
+    }
 
     #[test]
     fn integer_metadata_reports_text_type_before_invalid_utf8() {

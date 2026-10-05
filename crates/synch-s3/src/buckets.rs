@@ -6,7 +6,8 @@
 //!
 //! The map lives in the daemon's `s3.buckets` config value, reached over the
 //! control socket, and it is an **append-only log of records**: four
-//! tab-separated fields add or replace a bucket, one field removes it, and the
+//! tab-separated fields add or replace a bucket (a fifth, `no-cache`, marks a
+//! bucket whose reads keep no copy of peers' objects), one field removes it, and the
 //! last record naming a bucket wins. Nothing rewrites the list in place,
 //! because a read-modify-write of the whole list drops whichever concurrent
 //! edit commits first — and there is deliberately no limit on how many gateway
@@ -19,6 +20,9 @@ use crate::{
 
 /// The config value holding the bucket map.
 pub(crate) const BUCKETS_CONFIG: &str = "s3.buckets";
+
+/// The record field marking a bucket that keeps no copy of peers' objects.
+const NO_CACHE: &str = "no-cache";
 
 /// Which version of each key a bucket's reads serve (§8).
 ///
@@ -120,18 +124,27 @@ pub struct Bucket {
     pub access: Access,
     /// Which version of each path reads return (§8).
     pub policy: Policy,
+    /// Serve peers' objects without keeping a copy (§6.4): content this node
+    /// does not already hold is verified in memory and streamed through.
+    pub no_cache: bool,
 }
 
 impl Bucket {
     /// The record that adds or replaces this mapping.
     fn record(&self) -> String {
-        format!(
+        let record = format!(
             "{}\t{}\t{}\t{}",
             self.name,
             self.space,
             self.access.render(),
             self.policy.render()
-        )
+        );
+        // Appended rather than placed earlier, so a gateway that predates the
+        // field still reads the four it knows and serves the bucket cached.
+        match self.no_cache {
+            true => format!("{record}\t{NO_CACHE}"),
+            false => record,
+        }
     }
 
     /// Refuses a mutation before its body is consumed.
@@ -180,9 +193,10 @@ pub fn fold(records: &[String]) -> Vec<Bucket> {
         records,
         |bucket: &Bucket| &bucket.name,
         |name, rest| {
-            let [space, access, policy, ..] = rest else {
+            let [space, access, policy, options @ ..] = rest else {
                 return None;
             };
+            let no_cache = options.first().is_some_and(|field| *field == NO_CACHE);
             let (access, policy) = Access::parse(access).ok().zip(Policy::parse(policy).ok())?;
             if matches!((&access, &policy), (Access::ReadWrite, Policy::Own))
                 || matches!((&access, &policy), (Access::ReadOnly, p) if !matches!(p, Policy::Own))
@@ -192,6 +206,7 @@ pub fn fold(records: &[String]) -> Vec<Bucket> {
                     space: space.to_string(),
                     access,
                     policy,
+                    no_cache,
                 })
             } else {
                 None
@@ -225,6 +240,7 @@ pub async fn add(
     space: &str,
     access: Access,
     select: Option<&str>,
+    no_cache: bool,
 ) -> S3Result<Bucket> {
     validate_name(name)?;
     synch_core::validate_space(space).map_err(|e| S3Error::invalid(e.to_string()))?;
@@ -253,6 +269,7 @@ pub async fn add(
         space: space.to_string(),
         access,
         policy,
+        no_cache,
     };
     // The daemon is the authority on what a space id and an origin are, so the
     // mapping is offered to it before it is stored: an empty listing under this
@@ -324,6 +341,22 @@ mod tests {
         assert_eq!(Policy::default(), Policy::Newest);
     }
 
+    /// The no-cache marker rides as a fifth field: it round-trips, and a
+    /// record without it reads as an ordinary cached bucket.
+    #[test]
+    fn a_no_cache_bucket_round_trips_through_its_record() {
+        let bucket = Bucket {
+            name: "peers".into(),
+            space: "media".into(),
+            access: Access::ReadOnly,
+            policy: Policy::Newest,
+            no_cache: true,
+        };
+        assert_eq!(fold(&[bucket.record()]), vec![bucket]);
+        let plain = fold(&records(&["photos\tmedia\tread-only\tnewest"]));
+        assert!(!plain[0].no_cache);
+    }
+
     #[test]
     fn only_read_write_buckets_accept_mutations() {
         let mut bucket = Bucket {
@@ -331,6 +364,7 @@ mod tests {
             space: "media".into(),
             access: Access::ReadOnly,
             policy: Policy::Newest,
+            no_cache: false,
         };
         assert!(bucket.require_writable().is_err());
         bucket.access = Access::ReadWrite;

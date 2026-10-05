@@ -43,7 +43,7 @@ pub use config::{
     default_data_dir, NodeConfig, DEFAULT_REPLICA_CONCURRENCY, MAX_REPLICA_CONCURRENCY,
 };
 pub use error::{EngineError, Result};
-pub use fetcher::{PreparedRange, Provider};
+pub use fetcher::{PeerReader, PreparedRange, Provider, TransientRead};
 pub use lifecycle::{LifecycleLock, LIFECYCLE_FILE};
 pub use membership::{DomainHealth, DomainRefresh, ResolverStatus};
 pub use node::{Node, StagedChange};

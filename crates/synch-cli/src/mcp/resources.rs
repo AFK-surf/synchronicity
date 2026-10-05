@@ -439,6 +439,7 @@ pub(crate) async fn read(ctx: &Context, uri_text: &str) -> Result<Value, ToolErr
                 policy: None,
                 start: 0,
                 len: Some(MAX_RESOURCE_BYTES),
+                no_cache: false,
             };
             async move {
                 let mut chunks = client.read(request).await?;

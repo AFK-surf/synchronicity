@@ -1042,11 +1042,13 @@ fn to_command(cli: &Cli) -> Result<Cmd> {
             range,
             select,
             root,
+            no_cache,
         } => Cmd::Cat(pb::Cat {
             reference: reference.clone().unwrap_or_default(),
             range: range.clone(),
             root: root.clone(),
             select: select.clone(),
+            no_cache: *no_cache,
         }),
         Command::Get {
             reference,
