@@ -81,6 +81,8 @@ pub type Config {
     key_file: String,
     http_listen: Listen,
     dns_listen: Listen,
+    /// Optional UDP override; TCP continues using dns_listen.
+    dns_udp_listen: Listen,
     /// (hostname, ipv4, ipv6) — hostname relative to apex unless dotted.
     ns_hosts: List(#(String, String, String)),
     public_url: String,
@@ -160,7 +162,16 @@ pub fn load() -> Result(Config, String) {
       }
     Serve -> Ok(Nil)
   })
+  use _ <- result.try(case dns_mode, envoy.get("CP_DNS_UDP_LISTEN") {
+    External(..), Ok(_) ->
+      Error("CP_DNS_UDP_LISTEN must NOT be set with CP_DNS_MODE=external")
+    _, _ -> Ok(Nil)
+  })
   use dns_listen <- result.try(listen_from("CP_DNS_LISTEN", "0.0.0.0:53"))
+  use dns_udp_listen <- result.try(case envoy.get("CP_DNS_UDP_LISTEN") {
+    Ok(text) -> parse_listen("CP_DNS_UDP_LISTEN", text)
+    Error(Nil) -> Ok(dns_listen)
+  })
   use ns_hosts <- result.try(case dns_mode {
     External(..) ->
       case envoy.get("CP_NS_HOSTS") {
@@ -193,6 +204,7 @@ pub fn load() -> Result(Config, String) {
     key_file,
     http_listen,
     dns_listen,
+    dns_udp_listen,
     ns_hosts,
     public_url,
     entry_url,

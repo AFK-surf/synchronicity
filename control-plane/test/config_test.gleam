@@ -16,6 +16,7 @@ fn primary_env() -> Nil {
   envoy.unset("CP_DNS_PORT")
   envoy.unset("CP_HTTP_LISTEN")
   envoy.unset("CP_DNS_LISTEN")
+  envoy.unset("CP_DNS_UDP_LISTEN")
   envoy.unset("CP_NS_HOSTS")
   // Required now: every node publishes an attach endpoint at the apex, and
   // the record names this.
@@ -269,4 +270,30 @@ pub fn comma_provisioning_rejects_a_bad_enabled_flag_test() {
   let assert Error(message) = config.load()
   assert message
     == "CP_COMMA_PROVISIONING_ENABLED must be true or false, got maybe"
+}
+
+pub fn udp_override_preserves_tcp_binding_test() {
+  primary_env()
+  envoy.set("CP_DNS_LISTEN", "0.0.0.0:53")
+  envoy.set("CP_DNS_UDP_LISTEN", "172.19.0.2:53")
+  let assert Ok(cfg) = config.load()
+  assert cfg.dns_listen == config.Listen("0.0.0.0", 53)
+  assert cfg.dns_udp_listen == config.Listen("172.19.0.2", 53)
+  envoy.unset("CP_DNS_UDP_LISTEN")
+  let assert Ok(cfg) = config.load()
+  assert cfg.dns_udp_listen == cfg.dns_listen
+}
+
+pub fn external_mode_rejects_udp_override_test() {
+  primary_env()
+  envoy.unset("CP_KEY_FILE")
+  envoy.set("CP_DNS_MODE", "external")
+  envoy.set("CP_DNS_PROVIDER", "log-only")
+  envoy.set("CP_DNS_UDP_LISTEN", "127.0.0.1:53")
+  let loaded = config.load()
+  envoy.unset("CP_DNS_MODE")
+  envoy.unset("CP_DNS_PROVIDER")
+  envoy.unset("CP_DNS_UDP_LISTEN")
+  assert loaded
+    == Error("CP_DNS_UDP_LISTEN must NOT be set with CP_DNS_MODE=external")
 }

@@ -736,6 +736,7 @@ start: a credential that quietly does nothing is a lie. See
 | `CP_KEY_FILE` | primary | Required on the primary in serve mode (zone CSK). Must live outside the database's directory. **Must be unset on replicas** and with `CP_DNS_MODE=external` — there is no zone CSK to hold. |
 | `CP_HTTP_LISTEN` | both | HTTP / DoH bind as `address:port`. Default `0.0.0.0:8080`. |
 | `CP_DNS_LISTEN` | both | Authoritative DNS (UDP + TCP) bind as `address:port`. Default `0.0.0.0:53`. Must be unset with `CP_DNS_MODE=external` — the provider answers. |
+| `CP_DNS_UDP_LISTEN` | both | Optional UDP-only bind override, with the same IP-literal syntax as `CP_DNS_LISTEN`; TCP continues to use `CP_DNS_LISTEN`. Unset, UDP uses `CP_DNS_LISTEN` too. Refused in external mode. Fly deployments resolve `fly-global-services` to an IPv4 address in their entrypoint and pass it here. |
 | `CP_NS_HOSTS` | primary | Semicolon-separated `host=ipv4[,ipv6]` NS glue, e.g. `ns1=192.0.2.1;ns2=192.0.2.53,2001:db8::53`. Hostnames without dots are relative to the apex. Must be unset with `CP_DNS_MODE=external`. |
 | `CP_DNS_MODE` | both | `serve` (default) or `external`; `external` is primary-only. See "Two DNS modes" above. |
 | `CP_DNS_PROVIDER` | primary | Required with `CP_DNS_MODE=external`: `cloudflare`, `bunny` or `log-only` (no credentials — prints the change set instead of applying it). |

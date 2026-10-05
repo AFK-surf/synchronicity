@@ -489,3 +489,36 @@ What differs operationally:
 - A prolonged control-plane outage degrades clusters toward their cached
   bindings and then toward static-only trust — synchronicity fails
   closed, and so does this service: better no answer than an unsigned one.
+
+## Converting an existing external zone to serve mode
+
+Stop the external primary and all other writers; take a consistent database
+backup and retain the old provider records for rollback. Generate and separately
+back up a new key with `controlplane keygen <apex> <keyfile>`. Configure a
+serve-mode primary with the **same** `CP_BASE_DOMAIN` and database, remove the
+external provider environment and credentials (including `CP_SIGNING_ZONE`), and
+set `CP_KEY_FILE` and `CP_NS_HOSTS`. For UDP ingress on a different local IP,
+set `CP_DNS_UDP_LISTEN`; TCP still binds `CP_DNS_LISTEN`.
+
+Run `controlplane dns-mode adopt-serve` against the stopped database. This is
+an explicit offline operation, never a boot-time migration. It requires existing
+external metadata and a nonempty nameserver set; it refuses a different apex,
+a fresh database, or an already converted database. It atomically sets the key,
+replaces nameservers, removes provider reconciliation/cache state and signs the
+zone. Invalid zone contents roll everything back. Product data and historical
+Rekor records are preserved. Normal external and serve boot identity checks
+remain strict. The command does not stop a running primary for you.
+
+Start the authoritative servers, establish the child NS/DS delegation, and run
+`controlplane rekor-publish <keyfile>` once its public DNSSEC chain is reachable.
+Keep `CP_REKOR_REQUIRE=true`: boot/conversion can sign existing data to bootstrap
+DNSKEY availability, but widening API writes still require the new key's verified
+Rekor record. Existing clients can reject answers until that proof is published;
+schedule a maintenance window and rehearse the sequence rather than assuming a
+zero-downtime transition. Validate through public recursive resolvers and clients.
+
+Rollback before resuming writes means restoring the **pre-conversion** database,
+restoring external config, and undoing the child delegation and DS together;
+allow for cached delegation and signed answers. Do not switch an adopted database
+back by changing environment variables. After new writes, restoring the old
+backup would lose them: preserve/reconcile those writes before rollback.

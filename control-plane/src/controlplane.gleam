@@ -93,6 +93,7 @@ pub fn main() {
       run_or_die(fn() { zone_key_stage(apex, key_file, incoming_key_file) })
     ["zone-key", "promote", apex, key_file] ->
       run_or_die(fn() { zone_key_promote(apex, key_file) })
+    ["dns-mode", "adopt-serve"] -> run_or_die(adopt_serve)
     ["provider-sync"] -> run_or_die(provider_sync_once)
     ["migrate-check"] -> migrate_check()
     ["seed"] -> run_or_die(run_seed)
@@ -115,7 +116,7 @@ pub fn main() {
     ["serve"] -> run_or_die(serve)
     _ -> {
       io.println_error(
-        "usage: controlplane serve | keygen <apex> <keyfile> | ds <apex> <keyfile> | rekor-publish <keyfile> | rekor-retire <keyfile> | zone-key stage <apex> <keyfile> <incoming-keyfile> | zone-key promote <apex> <keyfile> | provider-sync | seed | seed-admin <email> | dataplane register <dp-id> | dataplane list | dataplane assign <org> <network> <dp-id> | dataplane-key mint <name> --dp <dp-id> [--expires-in <secs>] | migrate-check",
+        "usage: controlplane serve | keygen <apex> <keyfile> | ds <apex> <keyfile> | rekor-publish <keyfile> | rekor-retire <keyfile> | zone-key stage <apex> <keyfile> <incoming-keyfile> | zone-key promote <apex> <keyfile> | dns-mode adopt-serve | provider-sync | seed | seed-admin <email> | dataplane register <dp-id> | dataplane list | dataplane assign <org> <network> <dp-id> | dataplane-key mint <name> --dp <dp-id> [--expires-in <secs>] | migrate-check",
       )
       halt(2)
     }
@@ -299,6 +300,25 @@ fn open_primary_db(cfg: Config) -> Result(sqlite.Connection, String) {
   Ok(conn)
 }
 
+/// Offline conversion only: the operator must stop the old writer first.
+fn adopt_serve() -> Result(Nil, String) {
+  use cfg <- result.try(config.load())
+  use Nil <- result.try(case cfg.role, cfg.dns_mode {
+    Primary, config.Serve -> Ok(Nil)
+    _, _ -> Error("dns-mode adopt-serve requires a serve-mode primary")
+  })
+  use csk <- result.try(keys.load(cfg.key_file))
+  use conn <- result.try(open_primary_db(cfg))
+  let converted =
+    publish.adopt_serve(conn, cfg.base_domain, csk, cfg.ns_hosts, now_unix())
+  sqlite.close(conn)
+  use _ <- result.try(converted)
+  io.println(
+    "Converted external DNS metadata and signed the zone. Publish the child DS and log the new key before client cutover; back up the key separately.",
+  )
+  Ok(Nil)
+}
+
 fn prepare_primary(cfg: Config) -> Result(keys.Csk, String) {
   use conn <- result.try(open_primary_db(cfg))
   use csk <- result.try(keys.load(cfg.key_file))
@@ -439,8 +459,8 @@ fn serve_replica(cfg: Config) -> Result(Nil, String) {
     ))
     |> sup.add(server_udp.supervised(
       udp_name,
-      cfg.dns_listen.address,
-      cfg.dns_listen.port,
+      cfg.dns_udp_listen.address,
+      cfg.dns_udp_listen.port,
       serving,
     ))
     |> sup.add(server_tcp.supervised(
@@ -464,8 +484,10 @@ fn serve_replica(cfg: Config) -> Result(Nil, String) {
   io.println(
     "replica serving "
     <> cfg.base_domain
-    <> " — dns "
+    <> " — dns-tcp "
     <> endpoint(cfg.dns_listen)
+    <> " dns-udp "
+    <> endpoint(cfg.dns_udp_listen)
     <> " http "
     <> endpoint(cfg.http_listen)
     <> " — read-only dashboard, writes at "
@@ -558,8 +580,8 @@ fn serve_primary(cfg: Config) -> Result(Nil, String) {
     ))
     |> sup.add(server_udp.supervised(
       udp_name,
-      cfg.dns_listen.address,
-      cfg.dns_listen.port,
+      cfg.dns_udp_listen.address,
+      cfg.dns_udp_listen.port,
       serving,
     ))
     |> sup.add(server_tcp.supervised(
@@ -577,8 +599,10 @@ fn serve_primary(cfg: Config) -> Result(Nil, String) {
   io.println(
     "serving "
     <> cfg.base_domain
-    <> " — dns "
+    <> " — dns-tcp "
     <> endpoint(cfg.dns_listen)
+    <> " dns-udp "
+    <> endpoint(cfg.dns_udp_listen)
     <> " http "
     <> endpoint(cfg.http_listen),
   )

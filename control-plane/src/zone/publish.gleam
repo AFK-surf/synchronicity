@@ -13,6 +13,7 @@ import gleam/crypto
 import gleam/int
 import gleam/list
 import gleam/result
+import gleam/string
 import rekor/gate
 import store/sqlite.{type Connection, Blob, Int as VInt, Text}
 import zone/build.{type Rrset}
@@ -402,17 +403,78 @@ pub fn set_ns_hosts(
   conn: Connection,
   hosts: List(#(String, String, String)),
 ) -> Result(Nil, sqlite.Error) {
-  sqlite.transaction(conn, fn(e) { e }, fn() {
-    use _ <- result.try(sqlite.exec(conn, "DELETE FROM zone_ns", []))
-    list.try_fold(hosts, Nil, fn(_, host) {
-      let #(hostname, ipv4, ipv6) = host
-      sqlite.exec(conn, "INSERT INTO zone_ns VALUES (?, ?, ?)", [
-        Text(hostname),
-        sqlite.text_or_null(ipv4),
-        sqlite.text_or_null(ipv6),
-      ])
-      |> result.replace(Nil)
-    })
+  sqlite.transaction(conn, fn(e) { e }, fn() { set_ns_hosts_in_tx(conn, hosts) })
+}
+
+fn set_ns_hosts_in_tx(
+  conn: Connection,
+  hosts: List(#(String, String, String)),
+) -> Result(Nil, sqlite.Error) {
+  use _ <- result.try(sqlite.exec(conn, "DELETE FROM zone_ns", []))
+  list.try_fold(hosts, Nil, fn(_, host) {
+    let #(hostname, ipv4, ipv6) = host
+    sqlite.exec(conn, "INSERT INTO zone_ns VALUES (?, ?, ?)", [
+      Text(hostname),
+      sqlite.text_or_null(ipv4),
+      sqlite.text_or_null(ipv6),
+    ])
+    |> result.replace(Nil)
+  })
+}
+
+/// Explicit offline external -> serve conversion. Product data and historical
+/// transparency evidence remain intact. Identity, NS set, and signed answers
+/// commit together; an invalid zone rolls the entire conversion back.
+/// Never called by normal boot. A second conversion is refused.
+pub fn adopt_serve(
+  conn: Connection,
+  base_domain: String,
+  csk: Csk,
+  hosts: List(#(String, String, String)),
+  now: Int,
+) -> Result(Int, String) {
+  sqlite.transaction(conn, fn(e) { string.inspect(e) }, fn() {
+    use meta <- result.try(
+      model.read_meta(conn)
+      |> result.map_error(fn(e) { string.inspect(e) }),
+    )
+    use Nil <- result.try(
+      case
+        name.to_string(meta.apex) == base_domain <> ".",
+        meta.dnskey_public == <<>>,
+        hosts != []
+      {
+        True, True, True -> Ok(Nil)
+        False, _, _ -> Error("configured apex does not match the existing zone")
+        _, False, _ -> Error("adopt-serve requires an external-mode database")
+        _, _, False -> Error("adopt-serve requires CP_NS_HOSTS")
+      },
+    )
+    use _ <- result.try(
+      sqlite.exec(
+        conn,
+        "UPDATE zone_meta SET dnskey_public = ?, key_tag = ?,
+       dnskey_incoming = X'', key_tag_incoming = 0 WHERE id = 1",
+        [Blob(csk.public), VInt(keys.key_tag(keys.dnskey_rdata(csk)))],
+      )
+      |> result.map_error(fn(e) { string.inspect(e) }),
+    )
+    use Nil <- result.try(
+      set_ns_hosts_in_tx(conn, hosts)
+      |> result.map_error(fn(e) { string.inspect(e) }),
+    )
+    use _ <- result.try(
+      sqlite.exec(conn, "DELETE FROM provider_sync_state", [])
+      |> result.map_error(fn(e) { string.inspect(e) }),
+    )
+    use _ <- result.try(
+      sqlite.exec(conn, "DELETE FROM observed_zone_keys", [])
+      |> result.map_error(fn(e) { string.inspect(e) }),
+    )
+    // As at boot, signing existing membership allows DNSKEY/DS bootstrap.
+    // Normal API writes retain their transparency gate.
+    emit(conn, csk, now, "system:dns-mode:adopt-serve", False)
+    |> result.map_error(fn(e) { string.inspect(e) })
   })
 }
 
