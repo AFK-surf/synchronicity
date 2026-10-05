@@ -67,7 +67,6 @@ a directory holding `synch`, `synch-s3`, `synch-monitor` and the docs:
 | --- | --- | --- |
 | Linux, x86-64 | `x86_64-unknown-linux-musl` | `.tar.gz` |
 | Linux, arm64 | `aarch64-unknown-linux-musl` | `.tar.gz` |
-| macOS, Intel | `x86_64-apple-darwin` | `.tar.gz` |
 | macOS, Apple silicon | `aarch64-apple-darwin` | `.tar.gz` |
 | Windows, x86-64 | `x86_64-pc-windows-msvc` | `.zip` |
 
@@ -81,7 +80,6 @@ tag=$(curl -fsSL https://api.github.com/repos/AFK-surf/synchronicity/releases/la
 case "$(uname -s)-$(uname -m)" in
   Linux-x86_64)  target=x86_64-unknown-linux-musl ;;
   Linux-aarch64) target=aarch64-unknown-linux-musl ;;
-  Darwin-x86_64) target=x86_64-apple-darwin ;;
   Darwin-arm64)  target=aarch64-apple-darwin ;;
 esac
 
