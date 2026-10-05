@@ -193,12 +193,9 @@ jobs:
       - uses: dtolnay/rust-toolchain@stable
       - uses: ./.github/actions/setup-lean-core
       - uses: Swatinem/rust-cache@v2
-      - name: Start MinIO, fake-gcs-server, and Azurite
+      - uses: ./.github/actions/setup-minio
+      - name: Start fake-gcs-server and Azurite
         run: |
-          docker run -d --name synch-minio --network host \
-            -e MINIO_ROOT_USER=minioadmin \
-            -e MINIO_ROOT_PASSWORD=minioadmin \
-            quay.io/minio/minio server /data
           mkdir -p "$RUNNER_TEMP/fake-gcs/synch-gcs"
           docker run -d --name synch-fake-gcs --network host \
             -v "$RUNNER_TEMP/fake-gcs:/data" \
@@ -209,18 +206,14 @@ jobs:
             azurite-blob --blobHost 0.0.0.0 --skipApiVersionCheck \
             --disableProductStyleUrl --disableTelemetry
           for attempt in $(seq 1 60); do
-            curl -fsS http://127.0.0.1:9000/minio/health/ready >/dev/null \
-              && curl -fsS http://127.0.0.1:4443/storage/v1/b >/dev/null \
+            curl -fsS http://127.0.0.1:4443/storage/v1/b >/dev/null \
               && curl -sS http://127.0.0.1:10000/devstoreaccount1 >/dev/null \
               && break
             sleep 1
           done
       - name: Create provider namespaces
         run: |
-          docker run --rm --network host --entrypoint=/bin/sh quay.io/minio/mc -c '
-            mc alias set local http://127.0.0.1:9000 minioadmin minioadmin
-            mc mb --ignore-existing local/synch-s3
-          '
+          mc mb --ignore-existing local/synch-s3
           docker run --rm --network host mcr.microsoft.com/azure-cli \
             az storage container create --name synch-azblob \
             --connection-string "DefaultEndpointsProtocol=http;AccountName=${AZURITE_ACCOUNT};AccountKey=${AZURITE_KEY};BlobEndpoint=http://127.0.0.1:10000/${AZURITE_ACCOUNT};"

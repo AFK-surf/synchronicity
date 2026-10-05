@@ -160,6 +160,9 @@ impl TreeSftp {
         path: String,
         capability: &synch_core::TreeWriteCapability,
     ) -> Result<(Box<dyn SocketWriter>, WriterPermit), StatusCode> {
+        // `fetch_update` is deprecated in favour of `try_update`, which is
+        // unstable on the workspace MSRV (1.91).
+        #[allow(deprecated)]
         if self
             .writer_count
             .fetch_update(
@@ -214,6 +217,9 @@ impl TreeSftp {
             .map_err(host_error)
     }
 
+    // `fetch_update` is deprecated in favour of `try_update`, which is
+    // unstable on the workspace MSRV (1.91).
+    #[allow(deprecated)]
     fn reserve_commits(&self, count: u32) -> Result<(), StatusCode> {
         self.commits
             .fetch_update(
