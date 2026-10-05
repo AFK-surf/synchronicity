@@ -420,6 +420,7 @@ synch status media/talks/keynote.mp4       # every version, side by side
 synch cat media/talks/keynote.mp4 --range 0..1048576
 synch cat media/notes.txt --select origin=nas@cluster.example.com  # pin one origin
 synch cat media/notes.txt --select strict  # refuse a divergent path, list its versions
+synch cat media/talks/keynote.mp4 --no-cache  # stream a peer's copy, keep none here
 synch get media/notes.txt -o notes.txt
 synch adopt path nas@cluster.example.com:media/notes.txt  # adopt their version as ours
 synch adopt path nas@cluster.example.com:media/gone.txt  # …including their deletion

@@ -180,6 +180,7 @@ synch cat media/notes.txt
 synch cat media/talks/keynote.mp4 --range 0..1048576
 synch cat media/notes.txt --select origin=nas@cluster.acme.example.com
 synch cat media/notes.txt --select strict # refuse divergence, list versions
+synch cat media/talks/keynote.mp4 --no-cache # stream a peer's copy, keep none
 synch get media/notes.txt -o notes.txt
 synch log media/notes.txt            # per-origin publish history
 synch compare media --to nas@cluster.acme.example.com          # name-status diff, no bytes fetched

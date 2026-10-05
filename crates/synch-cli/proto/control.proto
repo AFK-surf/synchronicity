@@ -417,6 +417,8 @@ message Cat {
   optional string root = 5;
   // `--select newest|origin=<id>|strict`.
   optional string select = 6;
+  // `--no-cache`: stream a peer's object through without keeping a copy.
+  bool no_cache = 7;
 }
 
 message Get {

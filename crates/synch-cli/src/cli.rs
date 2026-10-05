@@ -386,6 +386,12 @@ pub enum Command {
         /// (§8).
         #[arg(long, value_name = "HEX", conflicts_with = "select")]
         root: Option<String>,
+        /// Keep no copy of a peer's object: bytes this node does not already
+        /// hold are verified against the root in memory and written to stdout,
+        /// and nothing is stored locally. Without it, a read fetches into the
+        /// local store as always.
+        #[arg(long, conflicts_with = "root")]
+        no_cache: bool,
     },
     /// Fetch to a file.
     Get {

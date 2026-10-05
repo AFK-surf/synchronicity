@@ -764,19 +764,7 @@ impl Control for ControlService {
         tokio::spawn(async move {
             let read = async {
                 let mut out = Bytes::Chunks(&tx);
-                match range {
-                    synch_engine::TransientRead::Local(range) => {
-                        stream_range(&node, &mut out, range).await
-                    }
-                    synch_engine::TransientRead::Peers(mut reader) => {
-                        while let Some(piece) = reader.next().await? {
-                            for chunk in piece.chunks(CHUNK_SIZE) {
-                                out.chunk(chunk.to_vec()).await?;
-                            }
-                        }
-                        Ok(())
-                    }
-                }
+                stream_read(&node, &mut out, range).await
             };
             if let Err(error) = until_stopped(stopping, read).await {
                 let _ = tx.send(Err(error.into())).await;
@@ -2754,6 +2742,7 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
             range,
             root,
             select,
+            no_cache,
         }) => {
             let range = match &range {
                 Some(text) => crate::cli::ByteRange::parse(text)
@@ -2764,24 +2753,38 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
                 },
             };
             let prepared = match &root {
-                Some(root) => {
-                    node.prepare_root_range(&parse_root(root)?, range.start, range.length())
-                        .await?
+                Some(_) if no_cache => {
+                    return Err(ControlError::invalid(
+                        "--no-cache reads a path, not a bare --root",
+                    ))
                 }
+                Some(root) => synch_engine::TransientRead::Local(
+                    node.prepare_root_range(&parse_root(root)?, range.start, range.length())
+                        .await?,
+                ),
                 None => {
                     let reference = parse_reference(&reference)?;
                     let policy = policy_for_select(&reference, select.as_deref())?;
-                    node.prepare_range(
-                        &reference.space,
-                        &reference.path,
-                        &policy,
-                        range.start,
-                        range.length(),
-                    )
-                    .await?
+                    let (space, path) = (&reference.space, &reference.path);
+                    match no_cache {
+                        true => {
+                            node.prepare_transient(
+                                space,
+                                path,
+                                &policy,
+                                range.start,
+                                range.length(),
+                            )
+                            .await?
+                        }
+                        false => synch_engine::TransientRead::Local(
+                            node.prepare_range(space, path, &policy, range.start, range.length())
+                                .await?,
+                        ),
+                    }
                 }
             };
-            stream_range(node, &mut Bytes::Frames(out), prepared).await?;
+            stream_read(node, &mut Bytes::Frames(out), prepared).await?;
         }
 
         Command::Get(pb::Get {
@@ -3890,6 +3893,22 @@ fn gateway_config_key(key: &str) -> Result<&str, ControlError> {
 /// The fetch has already run, so every byte is verified against the object's
 /// bao tree before it is committed; the read then walks the window in
 /// [`CHUNK_SIZE`] pieces, so neither process ever holds the whole payload.
+/// Streams a read prepared with or without a local copy: out of the CAS, or
+/// piece by piece from peers as each slice verifies.
+async fn stream_read(node: &Node, out: &mut Bytes<'_>, read: synch_engine::TransientRead) -> Done {
+    match read {
+        synch_engine::TransientRead::Local(range) => stream_range(node, out, range).await,
+        synch_engine::TransientRead::Peers(mut reader) => {
+            while let Some(piece) = reader.next().await? {
+                for chunk in piece.chunks(CHUNK_SIZE) {
+                    out.chunk(chunk.to_vec()).await?;
+                }
+            }
+            Ok(())
+        }
+    }
+}
+
 async fn stream_range(
     node: &Node,
     out: &mut Bytes<'_>,
