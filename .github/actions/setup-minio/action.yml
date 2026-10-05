@@ -1,0 +1,40 @@
+name: Start MinIO
+description: Build the pinned MinIO server and client from source and serve S3 on 127.0.0.1:9000
+# MinIO no longer publishes container images (quay.io and Docker Hub both
+# refuse anonymous pulls), so the server and `mc` come from the Go module
+# proxy at pinned commits. Bump both versions together.
+runs:
+  using: composite
+  steps:
+    - uses: actions/setup-go@v5
+      with:
+        go-version: "1.24"
+        cache: false
+    - id: cache
+      uses: actions/cache@v4
+      with:
+        path: ${{ runner.temp }}/minio-bin
+        key: minio-${{ runner.os }}-v0.0.0-20260212201848-7aac2a2c5b7c-mc-v0.0.0-20251106162529-77f82e18b540
+    - if: steps.cache.outputs.cache-hit != 'true'
+      shell: bash
+      env:
+        GOBIN: ${{ runner.temp }}/minio-bin
+      run: |
+        go install github.com/minio/minio@v0.0.0-20260212201848-7aac2a2c5b7c
+        go install github.com/minio/mc@v0.0.0-20251106162529-77f82e18b540
+    - shell: bash
+      run: |
+        echo "$RUNNER_TEMP/minio-bin" >> "$GITHUB_PATH"
+        mkdir -p "$RUNNER_TEMP/minio-data"
+        MINIO_ROOT_USER=minioadmin MINIO_ROOT_PASSWORD=minioadmin \
+          nohup "$RUNNER_TEMP/minio-bin/minio" server "$RUNNER_TEMP/minio-data" \
+          --address 127.0.0.1:9000 >"$RUNNER_TEMP/minio.log" 2>&1 &
+        # The health probe turns ready before the server accepts credentials,
+        # so wait on the alias itself.
+        for attempt in $(seq 1 60); do
+          "$RUNNER_TEMP/minio-bin/mc" alias set local http://127.0.0.1:9000 \
+            minioadmin minioadmin >/dev/null 2>&1 && exit 0
+          sleep 1
+        done
+        cat "$RUNNER_TEMP/minio.log"
+        exit 1

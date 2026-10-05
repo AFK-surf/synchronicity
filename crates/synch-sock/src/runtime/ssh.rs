@@ -799,6 +799,9 @@ impl SshState {
             .remove(&fd);
     }
 
+    // `fetch_update` is deprecated in favour of `try_update`, which is
+    // unstable on the workspace MSRV (1.91).
+    #[allow(deprecated)]
     pub(crate) fn reserve_channel(&self) -> bool {
         self.channel_slots
             .fetch_update(Ordering::AcqRel, Ordering::Acquire, |open| {
@@ -807,6 +810,9 @@ impl SshState {
             .is_ok()
     }
 
+    // `fetch_update` is deprecated in favour of `try_update`, which is
+    // unstable on the workspace MSRV (1.91).
+    #[allow(deprecated)]
     pub(crate) fn release_channel(&self) {
         let _ = self
             .channel_slots

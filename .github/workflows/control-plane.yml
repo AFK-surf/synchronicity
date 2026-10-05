@@ -221,20 +221,11 @@ jobs:
       - run: cd control-plane && make -C csqlite && gleam deps download && gleam export erlang-shipment
       - run: cargo build --release -p synch-cli -p synch-dp
       - name: Start the production-compatible S3 service
+        uses: ./.github/actions/setup-minio
+      - name: Create the public data-plane bucket
         run: |
-          docker run -d --name synch-dp-minio --network host \
-            -e MINIO_ROOT_USER=minioadmin \
-            -e MINIO_ROOT_PASSWORD=minioadmin \
-            quay.io/minio/minio server /data
-          for attempt in $(seq 1 60); do
-            curl -fsS http://127.0.0.1:9000/minio/health/ready >/dev/null && break
-            sleep 1
-          done
-          docker run --rm --network host --entrypoint=/bin/sh quay.io/minio/mc -c '
-            mc alias set local http://127.0.0.1:9000 minioadmin minioadmin
-            mc mb --ignore-existing local/synch-dp-e2e
-            mc anonymous set public local/synch-dp-e2e
-          '
+          mc mb --ignore-existing local/synch-dp-e2e
+          mc anonymous set public local/synch-dp-e2e
       - name: Run real control-plane, customer, and data-plane processes
         run: cd control-plane && ./e2e/cloud-dataplane.sh
         env:

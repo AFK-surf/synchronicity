@@ -3200,6 +3200,9 @@ fn h_put_open(
         );
         return ret(errno::EPERM);
     }
+    // `fetch_update` is deprecated in favour of `try_update`, which is
+    // unstable on the workspace MSRV (1.91).
+    #[allow(deprecated)]
     if inner
         .put_writers
         .fetch_update(
@@ -3450,6 +3453,9 @@ fn put_op(
             }
         }
     }
+    // `fetch_update` is deprecated in favour of `try_update`, which is
+    // unstable on the workspace MSRV (1.91).
+    #[allow(deprecated)]
     if inner
         .put_commits
         .fetch_update(
