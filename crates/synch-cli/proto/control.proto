@@ -613,6 +613,10 @@ message ReadRequest {
   uint64 start = 4;
   // How many bytes, or unset to the end of the object.
   optional uint64 len = 5;
+  // Serve a peer's object without keeping a copy: bytes this node does not
+  // already hold are verified in memory and forwarded, and nothing is written
+  // to the CAS. Unset reads through the CAS as always.
+  bool no_cache = 6;
 }
 
 message PutRequest {

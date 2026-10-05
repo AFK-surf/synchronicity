@@ -738,8 +738,8 @@ impl Control for ControlService {
         // Resolved before the response opens, so "no provider for the content"
         // or a strict policy's refusal is the call's own answer rather than a
         // stream that dies after the caller has committed to a success.
-        let range = node
-            .prepare_range(
+        let range = if request.no_cache {
+            node.prepare_transient(
                 &request.space,
                 &request.path,
                 &policy,
@@ -747,13 +747,36 @@ impl Control for ControlService {
                 request.len,
             )
             .await
-            .map_err(ControlError::from)?;
+        } else {
+            node.prepare_range(
+                &request.space,
+                &request.path,
+                &policy,
+                request.start,
+                request.len,
+            )
+            .await
+            .map(synch_engine::TransientRead::Local)
+        }
+        .map_err(ControlError::from)?;
         let (tx, rx) = mpsc::channel(SEND_AHEAD);
         let stopping = self.stop.subscribe();
         tokio::spawn(async move {
             let read = async {
                 let mut out = Bytes::Chunks(&tx);
-                stream_range(&node, &mut out, range).await
+                match range {
+                    synch_engine::TransientRead::Local(range) => {
+                        stream_range(&node, &mut out, range).await
+                    }
+                    synch_engine::TransientRead::Peers(mut reader) => {
+                        while let Some(piece) = reader.next().await? {
+                            for chunk in piece.chunks(CHUNK_SIZE) {
+                                out.chunk(chunk.to_vec()).await?;
+                            }
+                        }
+                        Ok(())
+                    }
+                }
             };
             if let Err(error) = until_stopped(stopping, read).await {
                 let _ = tx.send(Err(error.into())).await;

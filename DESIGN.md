@@ -1661,7 +1661,9 @@ through both directions **without either process buffering more than a chunk**.
   (default `newest`; `synch-s3 bucket add <bucket> <origin>:<space>` is shorthand
   for the origin pin). Reads serve the policy-selected version of each path (§8);
   content flows through the normal verified path (local CAS first, then peer
-  fetch). A `strict` bucket answers a divergent key with `409 Conflict` naming the
+  fetch). A bucket added with `--no-cache` streams what the CAS lacks straight
+  from providers instead, verifying each slice in memory and committing
+  nothing, so serving a peer's object leaves no local copy (§6.4). A `strict` bucket answers a divergent key with `409 Conflict` naming the
   versions. Writes are always publishes of the *local* node's own view — the
   version model (§8) forbids publishing someone else's — so every bucket is
   writable, and a write simply adds/updates our assertion for that path (under an

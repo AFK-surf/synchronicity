@@ -1370,6 +1370,7 @@ async fn read(ctx: &Context, args: &Value) -> Result<Outcome, ToolError> {
                     policy: policy.clone(),
                     start: offset,
                     len: Some(length),
+                    no_cache: false,
                 };
                 async move {
                     let mut chunks = client.read(request).await?;

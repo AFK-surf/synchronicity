@@ -1138,6 +1138,7 @@ synch-s3 bucket add media media --read-only                 # newest
 synch-s3 bucket add nas-media media --read-only \
   --select origin=nas@cluster.acme.example.com
 synch-s3 bucket add safe-media media --read-only --select strict
+synch-s3 bucket add peer-media media --read-only --no-cache  # keeps no copy
 synch-s3 bucket add uploads uploads --read-write            # needs a local source
 synch-s3 access-key add AKIAEXAMPLE                         # prompts for the secret
 synch-s3 access-key add ROBOT --secret-file /run/secrets/synch-s3
@@ -1156,6 +1157,11 @@ through a read-write bucket publish this node's
 view. Multipart upload is supported, which is what makes the gateway writable
 from Mountpoint for Amazon S3. Secrets are never positional: read one from the
 terminal prompt, a file, or standard input.
+
+A read through a bucket fetches peer content into this node's store, as any
+read does. A `--no-cache` bucket passes peers' objects through instead: what
+this node does not already hold is verified against the root in memory and
+streamed to the client, and nothing is written locally.
 
 ## Where to look next
 

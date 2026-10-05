@@ -187,6 +187,7 @@ impl Daemon {
         policy: &str,
         start: u64,
         len: Option<u64>,
+        no_cache: bool,
     ) -> S3Result<Body> {
         let mut client = self.connect().await?;
         let mut chunks = client
@@ -196,6 +197,7 @@ impl Daemon {
                 policy: Some(policy.to_string()),
                 start,
                 len,
+                no_cache,
             })
             .await?;
 

@@ -77,6 +77,11 @@ enum BucketCommand {
         /// `origin=<id>`, or `strict`.
         #[arg(long, requires = "read_only")]
         select: Option<String>,
+        /// Serve peers' objects without keeping a copy here: bytes this node
+        /// does not already hold are verified in memory and streamed through,
+        /// and nothing is written to the local store.
+        #[arg(long)]
+        no_cache: bool,
     },
     /// Remove a bucket mapping.
     Rm {
@@ -145,6 +150,7 @@ async fn dispatch(daemon: &Daemon, command: Command) -> Result<()> {
                 read_only,
                 read_write: _,
                 select,
+                no_cache,
             } => {
                 let access = if read_only {
                     Access::ReadOnly
@@ -152,13 +158,15 @@ async fn dispatch(daemon: &Daemon, command: Command) -> Result<()> {
                     Access::ReadWrite
                 };
                 let bucket =
-                    buckets::add(daemon, &bucket, &space, access, select.as_deref()).await?;
+                    buckets::add(daemon, &bucket, &space, access, select.as_deref(), no_cache)
+                        .await?;
                 println!(
-                    "{} -> {} ({}; {})",
+                    "{} -> {} ({}; {}{})",
                     bucket.name,
                     bucket.space,
                     bucket.access.render(),
-                    bucket.policy
+                    bucket.policy,
+                    if bucket.no_cache { "; no-cache" } else { "" }
                 );
                 // Mapping a bucket before its space first syncs is legal;
                 // mapping one onto a typo would otherwise look the same.
@@ -182,11 +190,12 @@ async fn dispatch(daemon: &Daemon, command: Command) -> Result<()> {
                 }
                 for bucket in buckets {
                     println!(
-                        "{:<24} {:<20} {:<10} {}",
+                        "{:<24} {:<20} {:<10} {}{}",
                         bucket.name,
                         bucket.space,
                         bucket.access.render(),
-                        bucket.policy
+                        bucket.policy,
+                        if bucket.no_cache { " no-cache" } else { "" }
                     );
                 }
             }

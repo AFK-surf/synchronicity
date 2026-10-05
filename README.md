@@ -535,6 +535,7 @@ live on the same data directory for any `synch-s3` command to work:
 synch-s3 bucket add media media --read-write
 synch-s3 bucket add nas-media media --read-only --select origin=nas@cluster.example.com
 synch-s3 bucket add safe-media media --read-only --select strict
+synch-s3 bucket add peer-media media --read-only --no-cache
 printf '%s' "$S3_SECRET" | synch-s3 access-key add AKIAEXAMPLE --secret-stdin
 synch-s3 serve --listen 127.0.0.1:9000
 # or, for local development only:
@@ -547,6 +548,11 @@ A bucket is explicitly read-only or read-write. Read-only buckets may select
 own view, following its current origin across identity adoption, so a successful
 mutation is immediately visible through that bucket.
 ETags are the selected version's quoted BLAKE3 root.
+
+Reads fetch peer content into the local store, as any read does. Add
+`--no-cache` to a bucket that should pass peers' objects through instead:
+bytes this node does not already hold are verified against the root in memory
+and streamed to the client, and nothing is written locally.
 
 On a read-write bucket, `DELETE` removes this node's copy and publishes a
 tombstone, the same thing an `rm` in the source directory does.

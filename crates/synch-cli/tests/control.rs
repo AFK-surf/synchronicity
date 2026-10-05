@@ -649,6 +649,7 @@ fn read_req(space: &str, path: &str, start: u64, len: Option<u64>) -> pb::ReadRe
         policy: None,
         start,
         len,
+        no_cache: false,
     }
 }
 

@@ -51,6 +51,7 @@ impl Harness {
             "media",
             buckets::Access::ReadWrite,
             None,
+            false,
         )
         .await
         .unwrap();
@@ -60,6 +61,7 @@ impl Harness {
             "media",
             buckets::Access::ReadOnly,
             Some("origin=nas@cluster.example"),
+            false,
         )
         .await
         .unwrap();
@@ -69,6 +71,7 @@ impl Harness {
             "media",
             buckets::Access::ReadOnly,
             Some("strict"),
+            false,
         )
         .await
         .unwrap();
@@ -78,6 +81,7 @@ impl Harness {
             "media",
             buckets::Access::ReadOnly,
             Some("newest"),
+            false,
         )
         .await
         .unwrap();

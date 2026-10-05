@@ -1238,26 +1238,17 @@ impl Node {
         self.read_range(space, path, policy, 0, None).await
     }
 
-    /// Selects a version under a policy, fetches whatever of the requested
-    /// range is missing, and reports where the bytes now live locally.
-    ///
-    /// Every byte is verified against the object's bao tree before it is
-    /// committed to the CAS, so a subsequent
-    /// [`Store::read_range`](synch_store::Store::read_range) over the returned
-    /// window reads only verified content.
-    pub async fn prepare_range(
+    /// Selects a version under a policy and bounds the requested window by
+    /// its size: the part of a read that is the same whether or not the bytes
+    /// are kept.
+    async fn resolve_window(
         &self,
         space: &str,
         path: &str,
         policy: &VersionPolicy,
         start: u64,
         len: Option<u64>,
-    ) -> Result<PreparedRange> {
-        // Resolving the entry is a `versions_for` query and a policy decision
-        // over it, and the donor lineage below is another; both are store work
-        // and this runs on a runtime worker for every gateway read (§10). They
-        // go over together, after the window is known, so a read costs one
-        // handoff rather than three.
+    ) -> Result<(EntryRow, Hash, u64)> {
         let entry = {
             let node = self.clone();
             let (space, path, policy) = (space.to_string(), path.to_string(), policy.clone());
@@ -1283,6 +1274,82 @@ impl Node {
                 entry.size
             )));
         }
+        Ok((entry, root, end))
+    }
+
+    /// Prepares a read that leaves no copy behind (§6.4).
+    ///
+    /// A window this node already holds whole is read from the CAS as
+    /// [`Node::prepare_range`] would. Anything else is served straight from
+    /// peers by the returned [`TransientRead`]: each window is verified
+    /// against the root in memory and handed to the caller, and nothing —
+    /// payload, outboard, bitmap or `b:` advertisement — is written, so the
+    /// read does not turn a peer's object into local storage. Providers are
+    /// resolved here, so "nobody can serve this" is the call's own answer
+    /// rather than a stream that dies after the caller committed to success.
+    pub async fn prepare_transient(
+        &self,
+        space: &str,
+        path: &str,
+        policy: &VersionPolicy,
+        start: u64,
+        len: Option<u64>,
+    ) -> Result<TransientRead> {
+        let (entry, root, end) = self.resolve_window(space, path, policy, start, len).await?;
+        let prepared = PreparedRange {
+            root,
+            size: entry.size,
+            start,
+            end,
+        };
+        let wanted = ChunkRanges::from_ranges([groups_for_byte_range(start, end)])
+            .intersect(&ChunkRanges::single(0, group_count(entry.size)));
+        if entry.size == 0
+            || wanted
+                .difference(&self.local_groups_off_runtime(&root).await?)
+                .is_empty()
+        {
+            return Ok(TransientRead::Local(prepared));
+        }
+        let mut providers = self.providers_off_runtime(&root, entry.size).await?;
+        if providers.is_empty() {
+            providers = self.ask_peers_for_providers(&root, entry.size).await?;
+        }
+        if providers.is_empty() {
+            return Err(EngineError::not_found(format!(
+                "no provider could serve bytes {start}..{end} of {root}"
+            )));
+        }
+        Ok(TransientRead::Peers(PeerReader {
+            node: self.clone(),
+            range: prepared,
+            offset: start,
+            providers,
+            client: None,
+        }))
+    }
+
+    /// Selects a version under a policy, fetches whatever of the requested
+    /// range is missing, and reports where the bytes now live locally.
+    ///
+    /// Every byte is verified against the object's bao tree before it is
+    /// committed to the CAS, so a subsequent
+    /// [`Store::read_range`](synch_store::Store::read_range) over the returned
+    /// window reads only verified content.
+    pub async fn prepare_range(
+        &self,
+        space: &str,
+        path: &str,
+        policy: &VersionPolicy,
+        start: u64,
+        len: Option<u64>,
+    ) -> Result<PreparedRange> {
+        // Resolving the entry is a `versions_for` query and a policy decision
+        // over it, and the donor lineage below is another; both are store work
+        // and this runs on a runtime worker for every gateway read (§10). They
+        // go over together, after the window is known, so a read costs one
+        // handoff rather than three.
+        let (entry, root, end) = self.resolve_window(space, path, policy, start, len).await?;
         let wanted = ChunkRanges::from_ranges([groups_for_byte_range(start, end)])
             .intersect(&ChunkRanges::single(0, group_count(entry.size)));
         // Every read path resolved an entry to get here, which means the
@@ -1441,6 +1508,110 @@ impl Node {
 /// with 1 byte. A whole-object fetch always descends — that is the case delta
 /// exists for — and a ranged one only when the range is worth a span.
 const DESCENT_MIN_RANGE: u64 = synch_core::AD_SPAN_GRANULARITY;
+/// How a read that keeps no copy is served (see [`Node::prepare_transient`]).
+#[derive(Debug)]
+pub enum TransientRead {
+    /// The window is held here whole; read it out of the CAS.
+    Local(PreparedRange),
+    /// The window is streamed from peers and verified in memory.
+    Peers(PeerReader),
+}
+
+/// Streams a window of an object from peers, one verified slice at a time,
+/// writing nothing locally.
+///
+/// Providers are tried in rank order; one that fails or serves nothing at the
+/// current offset is dropped and the next is asked, as a fetch would (§6.4).
+#[derive(Debug)]
+pub struct PeerReader {
+    node: Node,
+    range: PreparedRange,
+    offset: u64,
+    providers: Vec<Provider>,
+    client: Option<synch_net::BlobClient>,
+}
+
+impl PeerReader {
+    /// The next verified piece of the window, or `None` once it is complete.
+    pub async fn next(&mut self) -> Result<Option<Vec<u8>>> {
+        let PreparedRange {
+            root, size, end, ..
+        } = self.range;
+        if self.offset >= end {
+            return Ok(None);
+        }
+        let first = self.offset / synch_core::CHUNK_GROUP_SIZE;
+        let last = group_count(size).min(groups_for_byte_range(self.offset, end).end);
+        let window =
+            synch_core::GroupRange::new(first, last.min(first + synch_core::MAX_SLICE_GROUPS));
+        loop {
+            let Some(provider) = self.providers.first().cloned() else {
+                return Err(EngineError::not_found(format!(
+                    "no provider could serve bytes {}..{end} of {root}",
+                    self.offset
+                )));
+            };
+            match self.slice_from(&provider, root, size, window).await {
+                Ok(Some(bytes)) => {
+                    let skip = (self.offset - window.start * synch_core::CHUNK_GROUP_SIZE) as usize;
+                    let take = ((end - self.offset) as usize).min(bytes.len().saturating_sub(skip));
+                    let piece = bytes[skip..skip + take].to_vec();
+                    self.offset += piece.len() as u64;
+                    return Ok(Some(piece));
+                }
+                Ok(None) => {
+                    tracing::debug!(origin = %provider.origin, "provider did not serve the next window");
+                }
+                Err(error) => {
+                    tracing::debug!(origin = %provider.origin, %error, "provider failed a transient read");
+                }
+            }
+            self.providers.remove(0);
+            self.client = None;
+        }
+    }
+
+    /// Asks one provider for a window and verifies what it served from the
+    /// window's start; `None` when it served nothing usable there.
+    async fn slice_from(
+        &mut self,
+        provider: &Provider,
+        root: Hash,
+        size: u64,
+        window: synch_core::GroupRange,
+    ) -> Result<Option<Vec<u8>>> {
+        if self.client.is_none() {
+            self.client = Some(self.node.dial_provider(provider).await?);
+        }
+        let client = self.client.as_ref().expect("dialled above");
+        let slice = client
+            .get_slice(root, &ChunkRanges::from_ranges([window]))
+            .await?;
+        // Only the run that starts where the read stands is any use: a later
+        // run would leave a hole the stream cannot skip.
+        let Some(run) = slice
+            .served
+            .ranges
+            .first()
+            .copied()
+            .filter(|run| run.start == window.start && !run.is_empty())
+        else {
+            return Ok(None);
+        };
+        if slice.served.ranges.len() != 1 {
+            return Ok(None);
+        }
+        let encoded = slice.encoded;
+        let bytes = crate::blocking::offload(move || {
+            Ok(synch_store::Store::verify_slice(
+                &root, size, &run, &encoded,
+            )?)
+        })
+        .await?;
+        Ok(Some(bytes))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
