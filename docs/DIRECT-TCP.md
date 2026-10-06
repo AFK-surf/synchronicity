@@ -7,8 +7,8 @@ provider for the rest of the read as one streamed run (`GetStream`, DESIGN.md
 §6.4) and verifies each 2 MiB window as it arrives. Today that run always
 travels on a `sync/blob/1` QUIC stream. This document adds an **opt-in** path on
 which the same run travels over a plain TCP connection between the two nodes,
-encrypted under a key used for exactly one run and derived from the QUIC
-session that asked for it.
+encrypted under a key used for exactly one run, which the provider sends to the
+requester as a message on the QUIC stream that asked for the run.
 
 Nothing about *what* is served changes: the run is the same sequence of
 windows, encoded by the same `encode_slice`, admitted by the same per-window
@@ -38,7 +38,8 @@ Goals:
 - Higher throughput for large transient reads between directly reachable
   nodes, with no change to what a read can return.
 - Confidentiality and integrity of the TCP bytes against everyone but the two
-  QUIC endpoints, with a fresh key per run that is never written on any wire.
+  QUIC endpoints, with a fresh key per run that only ever travels inside the
+  authenticated QUIC session.
 - No weakening of the provider's existing bounds (§12): memory per run, request
   concurrency, progress deadlines, and revocation mid-run.
 - Silent fallback: any reason the direct path cannot be used ends in the
@@ -61,10 +62,11 @@ Non-goals (for now):
 ```text
 requester                                             provider
    │  QUIC sync/blob/1 stream (control)                  │
-   │── GetDirect { root, run, nonce_r } ───────────────▶ │ opted in? path ok?
-   │◀─────────────── DirectOffer { port, ticket, nonce_p }│ ticket → table
+   │── GetDirect { root, run } ────────────────────────▶ │ opted in? path ok?
+   │                                                     │ fresh secret, ticket
+   │◀────────────── DirectOffer { port, ticket, secret } │ ticket → table
    │                                                     │
-   │  both: key = TLS exporter(label, context(...))      │
+   │  both: subkeys = BLAKE3 derive_key(secret, …)       │
    │                                                     │
    │  TCP to <QUIC path IP>:port                         │
    │── Hello { magic, ticket, mac } ───────────────────▶ │ verify, consume ticket
@@ -86,14 +88,15 @@ Two messages are appended to `BlobMessage` after `GetStream` (postcard numbers
 variants by position):
 
 ```rust
-GetDirect   { root: Hash, run: GroupRange, nonce: [u8; 32] }
-DirectOffer { port: u16, ticket: [u8; 16], nonce: [u8; 32] }
+GetDirect   { root: Hash, run: GroupRange }
+DirectOffer { port: u16, ticket: [u8; 16], secret: DirectSecret }
+
+struct DirectSecret([u8; 32]);   // the run's key; see "Run key" below
 ```
 
-The requester opens a `sync/blob/1` stream and sends `GetDirect`, with `nonce`
-fresh from the OS RNG. The provider answers `DirectOffer` — its listener port, a
-random 16-byte ticket id, and its own fresh nonce — only when all of these
-hold:
+The requester opens a `sync/blob/1` stream and sends `GetDirect`. The provider
+answers `DirectOffer` — its listener port, a random 16-byte ticket id, and the
+run's secret, both fresh from the OS RNG — only when all of these hold:
 
 - it was started with a direct listener (opt-in, below);
 - the connection's selected path is a direct IP path
@@ -110,51 +113,67 @@ remembers the refusal for the life of its `BlobClient`, so a provider without
 direct TCP costs one extra round trip per connection, not per read.
 
 On sending the offer the provider inserts the ticket into an in-memory table
-owned by the listener, holding the derived keys and a oneshot channel back to
+owned by the listener, holding the run's subkeys and a oneshot channel back to
 the control stream's task, and waits up to `DIRECT_ACCEPT_TIMEOUT` (10 s) for
 the authenticated TCP connection to be handed over. If none arrives, the ticket
 is removed and the control stream finishes without a byte past the offer,
 which the requester reads as "fall back".
 
-## Key schedule
+## Run key
 
-The key is never sent, not even inside QUIC. Both sides derive it from the QUIC
-session's TLS 1.3 secrets with the RFC 5705 exporter iroh already exposes
-(`Connection::export_keying_material`):
+The key travels as a message: the provider draws a 32-byte secret for every
+offer it makes and sends it in `DirectOffer`, on the QUIC stream that asked for
+the run.
+
+**Who draws it.** The provider, because the secret should exist only once a
+transfer is actually going to happen. A requester-drawn key would be sent to
+providers that predate `GetDirect`, are not opted in, or decline — none of
+which would use it. The provider is also the side that registers the ticket and
+encrypts the records, so all of a run's fresh material comes from one place,
+and the request stays free of secrets.
+
+**How it is protected in transit.** `DirectOffer` is carried inside QUIC's
+1-RTT packet protection, keyed by a TLS 1.3 handshake that authenticated both
+device keys and that the binding check (§3.2) admitted. Only the two endpoints
+of that connection can read it, and because the handshake's key exchange is
+ephemeral, a later compromise of either device key reveals no past offer. The
+run's confidentiality is therefore exactly the QUIC session's.
+
+**Subkeys.** One secret is sent and three keys are derived from it, so no key
+ever serves two algorithms. The derivation also binds them to the ticket and
+to what was asked for:
 
 ```text
-label   = "synch direct-tcp v1"
-context = postcard(root, run, ticket, nonce_r, nonce_p)
-okm     = export_keying_material(128 bytes, label, context)
-k_data  = okm[0..32]    // provider → requester records (AES-256-GCM)
-k_hello = okm[32..64]   // requester's Hello MAC (keyed BLAKE3)
-iv_data = okm[64..76]   // record nonce base
-(okm[76..128] reserved; derived so a later version can add a reverse channel
- without changing the split above)
+input   = secret || ticket || postcard(root, run)
+k_data  = BLAKE3 derive_key("synch direct-tcp v1 data",  input)  // AES-256-GCM, provider → requester
+k_hello = BLAKE3 derive_key("synch direct-tcp v1 hello", input)  // requester's Hello MAC (keyed BLAKE3)
+iv_data = BLAKE3 derive_key("synch direct-tcp v1 iv",    input)[0..12]  // record nonce base
 ```
 
-Why the exporter rather than a key carried in `DirectOffer`:
+Binding to `(root, run)` means decrypted bytes are only ever interpreted as the
+run that was asked for. Bao verification would catch a substituted run anyway;
+the binding makes a mix-up a decryption failure rather than a verification one.
 
-- **Bound to the authenticated session.** Only the two endpoints of this QUIC
-  connection — whose device keys the handshake already authenticated and the
-  binding check admitted — can compute it. A key in a message would be just as
-  secret on the wire, but would then live in a decoded frame, in logs a
-  `Debug` print reaches, and in any code that handles `BlobMessage`.
-- **Forward secrecy for free.** Exporter secrets descend from the handshake's
-  ephemeral key exchange, so a later compromise of a device key reveals no
-  past run.
-- **Once-use by construction.** Both nonces and the ticket are in the context,
-  so no two runs — even two of the same object and range on the same
-  connection — share a key. That is what lets the record nonce be a plain
-  counter from zero.
+**Once-use.** A secret is drawn per offer and never reused for another ticket,
+another run, or a retry; a retry asks for a new offer. The ticket table forgets
+the entry on the first authenticated Hello, on expiry, or when the control
+stream is reset, and both sides discard the subkeys when the run ends. Because
+every key encrypts exactly one run, the record nonce can be a plain counter
+from zero.
 
-The context also binds the key to `(root, run)`: decrypted bytes are only ever
-interpreted as the run that was asked for. (Bao verification would catch a
-substituted run anyway; the binding makes a mix-up a decryption failure rather
-than a verification one.)
+**Handling.** A key in a message lives in places a derived key would not, so
+the type does the work:
 
-Keys are held by the ticket table and the reader only, and are zeroed when the
-run ends.
+- `DirectSecret` has a redacting `Debug` (`DirectSecret(..)`), no `Clone`, no
+  `Display`, and zeroes itself on drop. `BlobMessage` derives `Debug`, and
+  tracing a decoded message must not print the key.
+- The requester reads `DirectOffer` through a helper that zeroes the frame's
+  receive buffer after decoding, and the provider zeroes the buffer it
+  serialized the offer into after writing it. The QUIC stack's own send and
+  retransmit buffers cannot be zeroed from here, so this is hygiene, not a
+  guarantee: process memory is already inside the trust boundary.
+- The subkeys are derived immediately and the secret is dropped; nothing
+  persists any of them.
 
 ## TCP protocol
 
@@ -298,11 +317,15 @@ re-asks only for what was not yet handed out.
   is still held to the object root by bao verification. AEAD exists to keep
   third parties out; bao exists to keep the provider honest. Neither replaces
   the other.
-- **Requester authentication:** the Hello MAC under an exporter-derived key.
-- **Provider authentication:** implicit — only the QUIC peer could have sealed
-  a record that opens under `k_data`.
-- **Replay:** a ticket authenticates one TCP connection; every key is unique
-  to its ticket and nonces; records are counter-sequenced.
+- **Key secrecy:** the secret is only ever on the wire inside the QUIC
+  session's packet protection, so it is as confidential as that session —
+  forward secrecy included — and is never logged or persisted.
+- **Requester authentication:** the Hello MAC under `k_hello`, which only the
+  holder of the offer can compute.
+- **Provider authentication:** implicit — only the QUIC peer that sent the
+  offer could have sealed a record that opens under `k_data`.
+- **Replay:** a ticket authenticates one TCP connection; every secret is drawn
+  for one offer; records are counter-sequenced.
 - **Downgrade:** blocking TCP only forces the QUIC path, which carries the same
   guarantees. An attacker can cost throughput, not confidentiality.
 - **Redirection:** the requester dials only the validated QUIC path's IP.
@@ -331,8 +354,8 @@ forward, which is why it is opt-in rather than automatic.
 
 1. `synch-core/src/wire.rs`: append `GetDirect` and `DirectOffer`; constants
    `DIRECT_RECORD_LEN`, `DIRECT_MAX_RUN_BYTES`, `DIRECT_MIN_BYTES`.
-2. `synch-net/src/direct.rs` (new): key schedule, record sealer and opener,
-   Hello, listener with ticket table and pre-auth bounds, `DirectSource`.
+2. `synch-net/src/direct.rs` (new): `DirectSecret`, subkey derivation, record
+   sealer and opener, Hello, listener with ticket table and pre-auth bounds, `DirectSource`.
 3. `synch-net/src/blob.rs`: `RunSource` over `RunStream` and the window
    readers; `serve_run` generic over its sink; the `GetDirect` arm;
    `BlobClient::stream_run_direct` with the per-client refusal memo.
@@ -366,8 +389,8 @@ Behavior to cover, named as tests would be:
 - `a_requester_that_stops_reading_is_cut_off_by_the_stream_deadline`.
 - `a_silent_tcp_dialer_is_dropped_before_any_store_access` — pre-auth cap and
   Hello deadline.
-- Key schedule: both sides derive equal keys; distinct nonces give distinct
-  keys (one unit test, not one per field).
+- `a_direct_offer_never_prints_its_secret` — `Debug` of a decoded
+  `DirectOffer`, the one place the key could leak into a log.
 
 ## Rollout
 
