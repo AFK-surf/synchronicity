@@ -316,33 +316,6 @@ pub struct Net {
     dialed: Arc<Dialed>,
 }
 
-/// The longest a peer may hold back an acknowledgement, asked of it through
-/// QUIC's acknowledgement-frequency extension.
-///
-/// A receiver acknowledges every second packet at once and may hold a lone
-/// one back for its `max_ack_delay`, 25 ms by default. With several slice
-/// streams in flight on one connection — two or more transient reads sharing
-/// a provider — the sender kept running into its windows and waiting on
-/// exactly such an acknowledgement: both ends sat idle in 25–50 ms gaps, and
-/// the reads together moved at half the speed of one alone. Asked for 5 ms,
-/// they did not. It is asked on every connection this endpoint makes or
-/// accepts, whatever the ALPN; a peer without the extension ignores it.
-const MAX_ACK_DELAY: std::time::Duration = std::time::Duration::from_millis(5);
-
-/// iroh's transport defaults, with the acknowledgement delay above asked of
-/// every peer and nothing else about acknowledgements changed: every second
-/// packet and any reordering are still acknowledged at once, as without the
-/// extension.
-fn transport_config() -> iroh::endpoint::QuicTransportConfig {
-    let mut acks = iroh::endpoint::AckFrequencyConfig::default();
-    acks.ack_eliciting_threshold(iroh::endpoint::VarInt::from_u32(1))
-        .reordering_threshold(iroh::endpoint::VarInt::from_u32(1))
-        .max_ack_delay(Some(MAX_ACK_DELAY));
-    iroh::endpoint::QuicTransportConfig::builder()
-        .ack_frequency_config(Some(acks))
-        .build()
-}
-
 impl Net {
     /// Binds an endpoint under `secret` and mounts both protocol handlers.
     pub async fn bind(
@@ -389,7 +362,6 @@ impl Net {
                 builder = builder.relay_mode(parse_relay_mode(&options.relay_urls)?);
             }
         }
-        builder = builder.transport_config(transport_config());
         if let Some(addr) = options.bind_addr {
             builder = builder
                 .clear_ip_transports()
