@@ -42,6 +42,14 @@ pub(crate) fn node_config(cli: &Cli) -> Result<NodeConfig> {
     } else if cli.offline {
         config.net.bind_addr = Some("127.0.0.1:0".parse().expect("valid loopback address"));
     }
+    if let Some(listen) = &cli.direct_tcp_listen {
+        config.net.direct_listen = Some(
+            listen
+                .parse()
+                .context("--direct-tcp-listen wants HOST:PORT")?,
+        );
+    }
+    config.net.direct_dial = cli.direct_tcp;
     config.net.relay_urls = cli.relay.clone();
     config.net.discovery_url = cli.discovery.clone();
     config.net.dht = cli.dht;
@@ -1250,6 +1258,35 @@ mod tests {
     fn replica_concurrency_reaches_the_node_config() {
         let cli = Cli::parse_from(["synch", "--replica-concurrency", "23", "daemon", "run"]);
         assert_eq!(node_config(&cli).unwrap().replica_concurrency, 23);
+    }
+
+    #[test]
+    fn direct_tcp_is_off_unless_asked_for_and_names_a_bad_address() {
+        let config = node_config(&Cli::parse_from(["synch", "daemon", "run"])).unwrap();
+        assert_eq!(config.net.direct_listen, None);
+        assert!(!config.net.direct_dial);
+
+        let cli = Cli::parse_from([
+            "synch",
+            "--direct-tcp-listen",
+            "0.0.0.0:7443",
+            "--direct-tcp",
+            "daemon",
+            "run",
+        ]);
+        let config = node_config(&cli).unwrap();
+        assert_eq!(
+            config.net.direct_listen,
+            Some("0.0.0.0:7443".parse().unwrap())
+        );
+        assert!(config.net.direct_dial);
+
+        let bad = Cli::parse_from(["synch", "--direct-tcp-listen", "7443", "daemon", "run"]);
+        let error = node_config(&bad).unwrap_err();
+        assert!(
+            format!("{error:#}").contains("--direct-tcp-listen"),
+            "{error:#}"
+        );
     }
 
     #[test]

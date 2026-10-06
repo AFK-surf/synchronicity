@@ -674,7 +674,7 @@ impl ChunkRanges {
 
 /// A message on the `sync/blob/1` ALPN (§6.4) — nothing but these plus the raw
 /// bao slice and proof bytes (§5.3).
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum BlobMessage {
     /// Request a verified bao slice.
     GetSlice {
@@ -734,6 +734,84 @@ pub enum BlobMessage {
         /// The groups wanted, in order.
         run: GroupRange,
     },
+    /// Ask for a run to be streamed over a direct TCP connection instead of
+    /// this stream (`docs/DIRECT-TCP.md`).
+    ///
+    /// The answer is a [`BlobMessage::DirectOffer`], or — from a provider that
+    /// predates this message, was not started with a direct listener, or
+    /// declines — the stream ending without a byte, which tells the requester
+    /// to ask with [`BlobMessage::GetStream`] instead. The stream stays open
+    /// for as long as the run does: it is the run's identity on the provider,
+    /// and resetting it, or closing the connection under it, ends the run and
+    /// destroys its key. Appended after [`BlobMessage::GetStream`] because
+    /// postcard numbers variants by position.
+    GetDirect {
+        /// The object root.
+        root: Hash,
+        /// The groups wanted, in order.
+        run: GroupRange,
+    },
+    /// The provider's answer to [`BlobMessage::GetDirect`]: where to connect,
+    /// the ticket that names this run there, and the run's key.
+    DirectOffer {
+        /// The provider's direct listener port. The requester dials it on the
+        /// IP of the QUIC path it is already using, never an address the
+        /// provider names.
+        port: u16,
+        /// The single-use id the requester presents on the TCP connection.
+        ticket: [u8; DIRECT_TICKET_LEN],
+        /// The run's key, drawn for this offer alone.
+        secret: DirectSecret,
+    },
+}
+
+/// The length of a direct run's ticket id.
+pub const DIRECT_TICKET_LEN: usize = 16;
+
+/// The key of one direct-TCP run (`docs/DIRECT-TCP.md`), carried to the
+/// requester in [`BlobMessage::DirectOffer`] under QUIC's packet protection.
+///
+/// A key in a message lives wherever the message does, so the type keeps it
+/// out of the places a message ends up: it prints as `DirectSecret(..)`, has
+/// no `Clone` to multiply it, and zeroes itself when dropped.
+#[derive(Serialize, Deserialize)]
+pub struct DirectSecret([u8; 32]);
+
+impl DirectSecret {
+    /// Wraps freshly drawn key material.
+    pub fn from_bytes(bytes: [u8; 32]) -> Self {
+        DirectSecret(bytes)
+    }
+
+    /// The key material, for deriving the run's subkeys.
+    pub fn expose(&self) -> &[u8; 32] {
+        &self.0
+    }
+}
+
+impl std::fmt::Debug for DirectSecret {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.write_str("DirectSecret(..)")
+    }
+}
+
+impl PartialEq for DirectSecret {
+    /// Compares without an early exit, so a comparison cannot time the key.
+    fn eq(&self, other: &Self) -> bool {
+        self.0
+            .iter()
+            .zip(other.0.iter())
+            .fold(0u8, |acc, (a, b)| acc | (a ^ b))
+            == 0
+    }
+}
+
+impl Eq for DirectSecret {}
+
+impl Drop for DirectSecret {
+    fn drop(&mut self) {
+        zeroize::Zeroize::zeroize(&mut self.0);
+    }
 }
 
 #[cfg(test)]
@@ -832,10 +910,33 @@ mod tests {
                 root: Hash::new(b"o"),
                 run: GroupRange::new(3, 70_000),
             },
+            BlobMessage::GetDirect {
+                root: Hash::new(b"o"),
+                run: GroupRange::new(3, 70_000),
+            },
+            BlobMessage::DirectOffer {
+                port: 4242,
+                ticket: [7; DIRECT_TICKET_LEN],
+                secret: DirectSecret::from_bytes([9; 32]),
+            },
         ] {
             let bytes = postcard::to_stdvec(&m).unwrap();
             assert_eq!(postcard::from_bytes::<BlobMessage>(&bytes).unwrap(), m);
         }
+    }
+
+    /// A decoded offer is a message like any other, and messages get traced:
+    /// printing one must not print the run's key.
+    #[test]
+    fn a_direct_offer_never_prints_its_secret() {
+        let offer = BlobMessage::DirectOffer {
+            port: 4242,
+            ticket: [7; DIRECT_TICKET_LEN],
+            secret: DirectSecret::from_bytes([0xab; 32]),
+        };
+        let printed = format!("{offer:?} {offer:#?}");
+        assert!(printed.contains("DirectSecret(..)"), "{printed}");
+        assert!(!printed.contains("171"), "{printed}");
     }
 
     #[test]

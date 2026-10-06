@@ -1,6 +1,7 @@
 # Direct-TCP streamed runs
 
-Status: **proposed**, not implemented.
+Status: **implemented**, opt-in on both ends and off by default; not yet
+benchmarked (see [Rollout](#rollout)).
 
 A transient read (`synch cat --no-cache`, a `--no-cache` S3 bucket) asks a
 provider for the rest of the read as one streamed run (`GetStream`, DESIGN.md
@@ -109,13 +110,14 @@ Otherwise the provider finishes the stream without a byte. That is also what a
 provider that predates `GetDirect` does — it cannot decode the message — so one
 reply covers *unsupported*, *not opted in* and *declined*, and the requester's
 answer to all three is the same: fall back to `GetStream`. A requester
-remembers the refusal for the life of its `BlobClient`, so a provider without
-direct TCP costs one extra round trip per connection, not per read.
+remembers a refusal, or a direct path that broke, per peer for ten minutes,
+node-wide, so a provider without direct TCP costs one extra round trip — or
+one connect timeout — every ten minutes rather than on every read.
 
 On sending the offer the provider inserts the ticket into an in-memory table
-owned by the listener, holding the run's subkeys and a oneshot channel back to
-the control stream's task, and waits up to `DIRECT_ACCEPT_TIMEOUT` (10 s) for
-the authenticated TCP connection to be handed over. If none arrives, the ticket
+owned by the listener, holding the run's Hello key and a oneshot channel back
+to the control stream's task, and waits up to 10 s for the authenticated TCP
+connection to be handed over. If none arrives, the ticket
 is removed and the control stream finishes without a byte past the offer,
 which the requester reads as "fall back".
 
@@ -161,6 +163,23 @@ stream is reset, and both sides discard the subkeys when the run ends. Because
 every key encrypts exactly one run, the record nonce can be a plain counter
 from zero.
 
+**Lifetime: no longer than the QUIC connection.** The key reached the
+requester on one QUIC connection, and it never outlives that connection on
+either side:
+
+- On the provider, the ticket (with its Hello key) and the record key live
+  only in the future serving the control stream. That future races the run
+  against `Connection::closed()` and against the requester stopping the
+  stream, so the moment the connection closes — including a binding check
+  closing it on a lapsed binding — the future ends, the ticket is forgotten,
+  both keys are dropped and zeroed, and the TCP connection is closed. An offer
+  whose connection closed before its Hello arrived admits nothing.
+- On the requester, the record key sits behind a watcher task that awaits
+  `Connection::closed()` and destroys the key when it resolves, whether or
+  not a read is in progress; a read in progress is raced against the same
+  event. The next read after the connection closes fails as a direct-path
+  failure, and the read resumes over a new QUIC connection.
+
 **Handling.** A key in a message lives in places a derived key would not, so
 the type does the work:
 
@@ -183,9 +202,9 @@ A provider that opts in binds one TCP listener per process. Everything that
 reaches it before authentication is untrusted, so the pre-auth path does no
 store access and no allocation proportional to input:
 
-1. Accept, under a cap of `DIRECT_PREAUTH_MAX` (64) unauthenticated
-   connections; past it, new connections are closed immediately.
-2. Read exactly the fixed-size Hello within `DIRECT_HELLO_TIMEOUT` (5 s):
+1. Accept, under a cap of 64 unauthenticated connections; past it, new
+   connections are closed immediately.
+2. Read exactly the fixed-size Hello within 5 s:
 
    ```text
    magic   [8]   "SYNCHDT1"
@@ -210,10 +229,10 @@ The requester dials **the IP of the QUIC connection's selected direct path**,
 with the port from `DirectOffer`. The provider names only a port, never an
 address, so a provider cannot point a requester's TCP connect at a third host.
 If the selected path is a relay at the time of dialing, the requester does not
-try; when it gives up after an offer, it resets the control stream, which
-removes the ticket on the provider at once. Connect timeout: `DIRECT_CONNECT_TIMEOUT` (2 s) — a NAT'd provider with no
-port forward costs this once per `BlobClient` (the failure is remembered as a
-refusal is), then everything falls back.
+try; when it gives up after an offer, it drops the control stream, which
+stops it and removes the ticket on the provider at once. Connect timeout: 2 s
+— a NAT'd provider with no port forward costs this once per ten minutes (the
+failure is remembered as a refusal is), then everything falls back.
 
 ### Records
 
@@ -240,8 +259,8 @@ len    ≤ DIRECT_RECORD_LEN = 256 KiB
 - **Truncation is not a clean end.** The run ends with one `final` record
   (empty plaintext). A TCP FIN or RST before it — which an on-path attacker can
   forge — is a transport error, never the "stream ended cleanly" that
-  `read_window_len` treats as end-of-run on QUIC. Anything after `final` is an
-  error.
+  `read_window_len` treats as end-of-run on QUIC. The reader reads nothing
+  after `final`.
 - **Key-use ceiling.** `DIRECT_MAX_RUN_BYTES` = 64 GiB caps one key at
   2^18 full records, far inside AES-GCM's per-key limits. A longer read simply
   asks for another direct run where this one stopped, with a fresh ticket and
@@ -281,12 +300,11 @@ The transfer runs inside the control stream's dispatch future, so:
 ## Requester: reading a direct run
 
 `BlobClient::stream_run_direct(root, size, run, piece)` returns the same
-`RunStream` as `stream_run`, over a different byte source. `RunStream`,
-`read_window_len`, `read_window_answer` and `partial_window` become generic
-over a small `RunSource` trait (`read_exact`, `read_chunk`, clean-EOF
-detection) with two implementations: the QUIC `RecvStream`, and a
+`RunStream` as `stream_run`, over a different byte source: `RunStream` and the
+window readers read from a `Source` that is either the QUIC `RecvStream` or a
 `DirectSource` that reads and opens records. The streaming verifier, the piece
-layout, the partial-holder rule and the per-window deadline are unchanged code.
+layout, the partial-holder rule and the per-window deadline are the same code
+on both.
 
 `PeerReader::next_streamed` in `synch-engine` tries, per provider, in order:
 
@@ -302,7 +320,7 @@ Failure handling separates *transport* faults from *provider* faults:
 | What happened | Meaning | Reaction |
 | --- | --- | --- |
 | No offer, connect failed/timed out, Hello rejected | direct path unavailable | record refusal on the client; same provider over `GetStream` |
-| Record fails to open, truncated before `final`, TCP reset mid-run | the TCP bytes were damaged — possibly by a third party, not the provider | resume at the current offset over `GetStream` from the **same** provider; no more direct attempts on this client |
+| Record fails to open, truncated before `final`, TCP reset mid-run, a window stalls past the deadline, the QUIC connection closes | the TCP path failed — possibly because of a third party, not the provider | resume at the current offset over `GetStream` from the **same** provider; no more direct attempts on it for the rest of the read, and none for ten minutes after a broken record or connection |
 | Window decrypts but fails bao verification | the provider served bad bytes | provider failure, dropped from the plan, exactly as today |
 | Short window / run ends early | partial holder | as today |
 
@@ -350,20 +368,19 @@ shut down with the endpoint. The port must be reachable from peers; on a LAN
 that is usually true already, elsewhere it needs a firewall rule or port
 forward, which is why it is opt-in rather than automatic.
 
-## Implementation plan
+## Code map
 
-1. `synch-core/src/wire.rs`: append `GetDirect` and `DirectOffer`; constants
-   `DIRECT_RECORD_LEN`, `DIRECT_MAX_RUN_BYTES`, `DIRECT_MIN_BYTES`.
-2. `synch-net/src/direct.rs` (new): `DirectSecret`, subkey derivation, record
-   sealer and opener, Hello, listener with ticket table and pre-auth bounds, `DirectSource`.
-3. `synch-net/src/blob.rs`: `RunSource` over `RunStream` and the window
-   readers; `serve_run` generic over its sink; the `GetDirect` arm;
-   `BlobClient::stream_run_direct` with the per-client refusal memo.
-4. `synch-net/src/endpoint.rs`: `NetOptions` fields; listener lifecycle.
-5. `synch-engine/src/fetcher.rs`: the three-tier choice and the failure table
-   above in `PeerReader`.
-6. `synch-cli`: flags. DESIGN.md §6.4 and §12: describe the path and its
-   bounds once it lands.
+- `synch-core/src/wire.rs`: `GetDirect`, `DirectOffer`, `DirectSecret`.
+- `synch-net/src/direct.rs`: subkey derivation, the listener with its ticket
+  table and pre-auth bounds, Hello, `RecordWriter`/`RecordReader`,
+  `DirectSource` and its connection watcher, the per-peer refusal memo.
+- `synch-net/src/blob.rs`: the `GetDirect` arm (`serve_direct`), the run's
+  `Sink` and `Source`, `BlobClient::stream_run_direct`.
+- `synch-net/src/endpoint.rs`: `NetOptions::{direct_listen, direct_dial}`;
+  the listener's lifecycle.
+- `synch-engine/src/fetcher.rs`: the three-tier choice and the failure table
+  above, in `PeerReader`.
+- `synch-cli`: `--direct-tcp-listen`, `--direct-tcp`.
 
 No Lean change: which groups are served is still the `Cas/Serve` command's
 decision through the same `encode_slice` boundary; this changes only the host
@@ -372,29 +389,26 @@ outside the verified core.
 
 ## Tests
 
-Behavior to cover, named as tests would be:
-
-- `a_direct_run_yields_the_same_verified_bytes_as_a_quic_run` — honest
-  provider, whole and partial holders.
-- `a_provider_without_direct_tcp_falls_back_to_a_streamed_run` — old provider,
-  provider not opted in, relay path; the refusal is asked once per client.
-- `a_ticket_authenticates_one_connection` — second Hello with the same ticket
-  is refused.
-- `a_hello_without_the_key_leaves_the_ticket_usable`.
-- `an_unconsumed_ticket_expires_and_the_read_falls_back`.
-- `a_tampered_or_truncated_record_resumes_the_read_over_quic_from_the_same_provider`
-  — flipped ciphertext bit, FIN before `final`, data after `final`.
-- `a_window_that_opens_but_fails_verification_drops_the_provider`.
-- `a_revoked_binding_ends_a_direct_run_at_the_next_window`.
-- `a_requester_that_stops_reading_is_cut_off_by_the_stream_deadline`.
-- `a_silent_tcp_dialer_is_dropped_before_any_store_access` — pre-auth cap and
-  Hello deadline.
-- `a_direct_offer_never_prints_its_secret` — `Debug` of a decoded
-  `DirectOffer`, the one place the key could leak into a log.
+- `a_direct_run_yields_what_a_quic_run_does` — partial and whole holders,
+  window for window; the ticket is spent.
+- `a_run_without_a_direct_path_stays_on_quic` — no offer, no opt-in; the
+  refusal is remembered.
+- `a_direct_runs_key_and_ticket_end_with_its_quic_connection` — an
+  unpresented ticket dies with its connection and its key admits nothing; a
+  run under way loses its key when the connection closes and fails its next
+  read.
+- `a_ticket_admits_one_connection_and_only_with_its_key` — a wrong key does
+  not burn the ticket; a second Hello is refused.
+- `records_open_only_as_sealed_and_a_truncated_run_is_not_an_end` — flipped
+  bit, relabelled final record, missing final record.
+- `a_direct_offer_never_prints_its_secret`.
+- `a_large_transient_read_streams_intact_with_or_without_a_direct_path` — the
+  engine's transient read over TCP from a provider that offers, over QUIC
+  from one that does not.
 
 ## Rollout
 
-1. Land behind the two flags, off by default.
+1. Land behind the two flags, off by default. *(Done.)*
 2. Benchmark a 10 GiB `--no-cache` read on loopback, a 10 GbE LAN, and a
    cross-region pair, QUIC `GetStream` vs direct, reporting throughput and
    CPU per GB on both ends.

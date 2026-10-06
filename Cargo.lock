@@ -5893,6 +5893,7 @@ dependencies = [
  "tokio",
  "unicode-normalization",
  "windows-sys 0.61.2",
+ "zeroize",
 ]
 
 [[package]]
@@ -5999,6 +6000,7 @@ dependencies = [
  "async-trait",
  "aws-lc-rs",
  "base64 0.22.1",
+ "blake3",
  "ctor",
  "futures-core",
  "hex",
@@ -6025,6 +6027,7 @@ dependencies = [
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "zeroize",
 ]
 
 [[package]]

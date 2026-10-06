@@ -9,6 +9,7 @@
 pub mod blob;
 mod blocking;
 pub mod chain;
+mod direct;
 pub mod dns;
 pub mod endpoint;
 pub mod error;
@@ -34,6 +35,7 @@ pub mod x509;
 pub mod zonecert;
 
 pub use blob::{proof_window, BlobClient, Proof, ProofOutcome, RunStream};
+pub use direct::{DIRECT_MAX_RUN_BYTES, DIRECT_MIN_BYTES};
 pub use dns::{
     ControlPlaneRecord, DialHint, DnssecResolver, MemberResolver, MemberSet, RekorPolicy,
     ResolverOptions,

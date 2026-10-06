@@ -37,6 +37,15 @@ pub enum NetError {
     /// window at a time instead (§6.4).
     #[error("the provider does not serve streamed runs")]
     StreamUnsupported,
+    /// A direct-TCP run could not be set up, or its connection failed under
+    /// it (`docs/DIRECT-TCP.md`): no offer, an unreachable port, a damaged or
+    /// truncated record, or the QUIC connection that carried its key closing.
+    ///
+    /// Never the provider's verdict on the content — bytes that decrypt and
+    /// then fail verification are reported as what they are — so the caller
+    /// asks the same provider again over QUIC.
+    #[error("direct run: {0}")]
+    Direct(String),
     /// The peer is not a member: its device key has no live binding (§3.2).
     #[error("peer {0} has no live binding")]
     Untrusted(String),
