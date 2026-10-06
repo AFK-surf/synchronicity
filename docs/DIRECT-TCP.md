@@ -1,7 +1,7 @@
 # Direct-TCP streamed runs
 
-Status: **implemented**, opt-in on both ends and off by default; not yet
-benchmarked (see [Rollout](#rollout)).
+Status: **implemented**, opt-in on both ends and off by default; benchmarked
+on loopback only (see [Rollout](#rollout)).
 
 A transient read (`synch cat --no-cache`, a `--no-cache` S3 bucket) asks a
 provider for the rest of the read as one streamed run (`GetStream`, DESIGN.md
@@ -28,9 +28,10 @@ segmentation and acknowledgement (TSO/GRO, autotuned buffers), and the only
 userspace work left per byte is one AEAD pass and the BLAKE3 verification the
 read already pays for.
 
-The gain is an expectation, not a measurement. The feature ships behind an
-opt-in and is only worth keeping if the benchmark under [Rollout](#rollout)
-shows it.
+On loopback the direct path moves a run at 1.95× the throughput for a
+quarter of the requester's CPU and under half the provider's
+([results](#loopback-results)); over a real link it is still unmeasured, and
+the feature stays opt-in until it is.
 
 ## Goals and non-goals
 
@@ -409,13 +410,54 @@ outside the verified core.
 ## Rollout
 
 1. Land behind the two flags, off by default. *(Done.)*
-2. Benchmark a 10 GiB `--no-cache` read on loopback, a 10 GbE LAN, and a
-   cross-region pair, QUIC `GetStream` vs direct, reporting throughput and
-   CPU per GB on both ends.
+2. Benchmark a large `--no-cache` read, QUIC `GetStream` vs direct, reporting
+   throughput and CPU per GiB on both ends. *(Loopback done, below; LAN and
+   cross-region not yet.)*
 3. Keep it only if LAN throughput improves materially (target ≥ 1.5×) without
    costing more CPU per byte; otherwise remove it rather than carry an unused
    transport.
 4. If it pays, consider `fetch_into` and replica acquisition next.
+
+### Loopback results
+
+`cargo run --release -p synch-net --example direct_bench -- --mib 2048 --rounds 5`
+reads a 2 GiB object as one run, verifying every group, with the provider in a
+child process so each side's CPU is measured separately. Machine: 4-vCPU Xeon
+VM at 2.1 GHz with AES-NI, VAES and AVX-512, both processes on the same four
+vCPUs. Medians:
+
+| Path | Throughput | Requester CPU | Provider CPU |
+| --- | --- | --- | --- |
+| QUIC `GetStream` | 388 MiB/s | 3.01 s/GiB | 3.21 s/GiB |
+| Direct TCP | 757 MiB/s | 0.72 s/GiB | 1.25 s/GiB |
+
+Direct is 1.95× the throughput at 4.2× less requester CPU and 2.6× less
+provider CPU per byte. A 64 MiB read, twice the threshold, gets 1.91×. The
+QUIC path on this branch matches `main` within run-to-run noise.
+
+Where the time goes (`perf`, during the run):
+
+- **QUIC** spends it on per-packet work in userspace — packet building, ack
+  processing, `memmove`, scheduler wake-ups — spread over many functions;
+  packet encryption is a few percent.
+- **Direct, requester:** BLAKE3 verification ~21%, socket copy ~12%,
+  AES-GCM decryption ~12% (≈ 0.09 s/GiB, ~11 GB/s), buffer zero-fill ~6%.
+- **Direct, provider:** AES-GCM sealing ~17% (≈ 0.22 s/GiB) and the socket
+  copy ~10%; the rest is mostly kernel scheduling overhead. Sealing and
+  sending run on the one serving task, so the provider tops out near one
+  core: that, not encoding (3.5 GiB/s alone) or the network, is what bounds a
+  direct run here.
+
+AES-GCM is the hardware path — aws-lc-rs's VAES/VPCLMULQDQ code. On this CPU
+OpenSSL's AES-256-GCM runs at ~12.5 GB/s per core, ~0.22 GB/s with AES-NI
+masked off; a software cipher would cost ~5 s/GiB, several times the
+provider's whole budget.
+
+What loopback cannot show: propagation delay (which is where QUIC's 25 ms ack
+delay and window growth hurt), bandwidth limits, loss, and two machines'
+worth of cores. This container has no `netem`, so the LAN and cross-region
+numbers are still to be taken; until then the result is "cheaper per byte on
+both ends", not "faster on a real link".
 
 ## Open questions
 
