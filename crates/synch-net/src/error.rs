@@ -32,6 +32,11 @@ pub enum NetError {
     /// The peer sent a message that does not belong at this point.
     #[error("unexpected message: {0}")]
     Unexpected(String),
+    /// The provider ended a [`synch_core::BlobMessage::GetStream`] before
+    /// answering any of it: it predates the message, and is to be asked one
+    /// window at a time instead (§6.4).
+    #[error("the provider does not serve streamed runs")]
+    StreamUnsupported,
     /// The peer is not a member: its device key has no live binding (§3.2).
     #[error("peer {0} has no live binding")]
     Untrusted(String),

@@ -33,7 +33,7 @@ pub mod tuf;
 pub mod x509;
 pub mod zonecert;
 
-pub use blob::{proof_window, BlobClient, Proof, ProofOutcome};
+pub use blob::{proof_window, BlobClient, Proof, ProofOutcome, RunStream};
 pub use dns::{
     ControlPlaneRecord, DialHint, DnssecResolver, MemberResolver, MemberSet, RekorPolicy,
     ResolverOptions,

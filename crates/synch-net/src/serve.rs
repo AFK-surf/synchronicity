@@ -42,9 +42,13 @@ use synch_store::Store;
 /// as well, which bounds the same cost across the whole endpoint.
 pub(crate) const MAX_CONCURRENT_STREAMS: usize = 8;
 
-/// How long one request may take, start to finish.
+/// How long one request may go without progress.
 ///
-/// Covers the read as well as the work. iroh's transport already tears down a
+/// Covers the read as well as the work. For an exchange that answers once —
+/// every `sync/mpt/1` request, a blob slice or proof — that is how long it may
+/// take, start to finish. A streamed run ([`synch_core::BlobMessage::GetStream`])
+/// reports [`Progress`] after every window it sends, so it is cut off for
+/// stalling, not for being long. iroh's transport already tears down a
 /// peer that has crashed or been partitioned away — it keeps a 5 s keep-alive
 /// against a 15 s idle timeout — so what this bounds is a peer that holds its
 /// session open deliberately and sends nothing: without it that stream owns a
@@ -52,6 +56,44 @@ pub(crate) const MAX_CONCURRENT_STREAMS: usize = 8;
 /// above never comes round again. Generous, because one window of a large
 /// object is real disk work.
 pub(crate) const STREAM_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(120);
+
+/// What a stream has done lately, reported by its handler to the watchdog
+/// [`serve_connection`] runs it under.
+///
+/// A handler that answers once never touches it, and its stream is bounded
+/// by [`STREAM_TIMEOUT`] start to finish. One that keeps answering marks it
+/// each time it has sent something, which restarts the clock.
+#[derive(Debug, Clone, Default)]
+pub(crate) struct Progress(Arc<std::sync::atomic::AtomicU64>);
+
+impl Progress {
+    /// Records that the stream moved forward just now.
+    pub(crate) fn mark(&self) {
+        self.0.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+    }
+
+    fn count(&self) -> u64 {
+        self.0.load(std::sync::atomic::Ordering::Relaxed)
+    }
+}
+
+/// Runs `work` until it completes or goes `limit` without a [`Progress`]
+/// mark; `false` when it was cut off.
+pub(crate) async fn until_stalled<F: std::future::Future<Output = ()>>(
+    limit: std::time::Duration,
+    progress: &Progress,
+    work: F,
+) -> bool {
+    tokio::pin!(work);
+    loop {
+        let seen = progress.count();
+        match tokio::time::timeout(limit, &mut work).await {
+            Ok(()) => return true,
+            Err(_) if progress.count() == seen => return false,
+            Err(_) => continue,
+        }
+    }
+}
 
 /// The endpoint-wide in-flight gate, when the embedder asked for one.
 ///
@@ -86,7 +128,8 @@ pub(crate) async fn slot(
 /// sightings does its bookkeeping. `dispatch` handles one stream — under the
 /// peer's cryptographically established device key, which the handshake settled
 /// — reports its own failures to the peer in its own vocabulary, and finishes
-/// the send side.
+/// the send side. It runs until it has gone [`STREAM_TIMEOUT`] without marking
+/// the [`Progress`] it is handed.
 ///
 /// `inflight` is the endpoint-wide gate. It is taken around the admission
 /// check as well as around every dispatched stream, and that is deliberate:
@@ -103,7 +146,7 @@ pub(crate) async fn serve_connection<D, F, S, G>(
     dispatch: D,
 ) -> Result<(), AcceptError>
 where
-    D: Fn(NodeId, SendStream, RecvStream) -> F + Clone + Send + 'static,
+    D: Fn(NodeId, SendStream, RecvStream, Progress) -> F + Clone + Send + 'static,
     F: std::future::Future<Output = ()> + Send + 'static,
     G: FnMut(NodeId) -> S,
     S: std::future::Future<Output = ()>,
@@ -136,10 +179,9 @@ where
         tokio::spawn(async move {
             let _permit = permit;
             let _shared = shared;
-            if tokio::time::timeout(STREAM_TIMEOUT, dispatch(remote, send, recv))
-                .await
-                .is_err()
-            {
+            let progress = Progress::default();
+            let work = dispatch(remote, send, recv, progress.clone());
+            if !until_stalled(STREAM_TIMEOUT, &progress, work).await {
                 tracing::debug!(peer = %remote.fmt_short(), "stream timed out");
             }
         });
@@ -204,10 +246,39 @@ pub(crate) async fn still_admitted(
 /// A failure to reach the store is not a grant: anything but a definite `true`
 /// closes the connection, which is the same fail-closed reading the inline
 /// version had.
-async fn trusted(store: &Arc<Store>, remote: &NodeId) -> bool {
+pub(crate) async fn trusted(store: &Arc<Store>, remote: &NodeId) -> bool {
     let store = store.clone();
     let remote = *remote;
     let answer: Result<bool, crate::error::NetError> =
         crate::blocking::offload(move || Ok(store.is_trusted_key(&remote, now_ns())?)).await;
     matches!(answer, Ok(true))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// A stream is cut off for going quiet, not for running long: one that
+    /// keeps reporting progress outlives many limits, and one that reports
+    /// none is stopped at the first.
+    #[tokio::test(start_paused = true)]
+    async fn a_stream_is_cut_off_for_stalling_not_for_running_long() {
+        let limit = std::time::Duration::from_secs(10);
+
+        let progress = Progress::default();
+        let busy = progress.clone();
+        let steady = async move {
+            for _ in 0..20 {
+                tokio::time::sleep(limit / 2).await;
+                busy.mark();
+            }
+        };
+        assert!(until_stalled(limit, &progress, steady).await);
+
+        let started = tokio::time::Instant::now();
+        let silent = Progress::default();
+        let stalled = tokio::time::sleep(limit * 20);
+        assert!(!until_stalled(limit, &silent, stalled).await);
+        assert_eq!(started.elapsed(), limit);
+    }
 }

@@ -183,7 +183,7 @@ impl ProtocolHandler for MptProtocol {
             self.on_unknown_key.as_ref(),
             &self.inflight,
             sighting,
-            move |peer, mut send, mut recv| {
+            move |peer, mut send, mut recv, _progress| {
                 let handler = handler.clone();
                 async move {
                     if let Err(e) = handler.handle_stream(peer, &mut send, &mut recv).await {
