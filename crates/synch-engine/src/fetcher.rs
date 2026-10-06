@@ -1320,13 +1320,16 @@ impl Node {
                 "no provider could serve bytes {start}..{end} of {root}"
             )));
         }
-        Ok(TransientRead::Peers(PeerReader {
+        Ok(TransientRead::Peers(Box::new(PeerReader {
             node: self.clone(),
             range: prepared,
             offset: start,
             providers,
             client: None,
-        }))
+            inflight: std::collections::VecDeque::new(),
+            ready: std::collections::VecDeque::new(),
+            next_group: 0,
+        })))
     }
 
     /// Selects a version under a policy, fetches whatever of the requested
@@ -1514,14 +1517,37 @@ pub enum TransientRead {
     /// The window is held here whole; read it out of the CAS.
     Local(PreparedRange),
     /// The window is streamed from peers and verified in memory.
-    Peers(PeerReader),
+    Peers(Box<PeerReader>),
 }
 
-/// Streams a window of an object from peers, one verified slice at a time,
-/// writing nothing locally.
+/// How many windows a transient read keeps requested ahead of the one it is
+/// handing out.
+///
+/// One window at a time leaves both ends idle half the time: the provider
+/// encodes and sends while this node waits, then this node verifies and
+/// forwards while the provider waits. With several in flight the provider is
+/// always working on the next while this node verifies the last, and the
+/// connection carries them as concurrent streams.
+const TRANSIENT_DEPTH: usize = 4;
+
+/// The groups one transient window asks for: 2 MiB.
+///
+/// Smaller than a slice exchange may carry ([`synch_core::MAX_SLICE_GROUPS`])
+/// so that [`TRANSIENT_DEPTH`] of them in flight cost no more memory than one
+/// full window did, and so the first bytes reach the reader sooner.
+const TRANSIENT_WINDOW_GROUPS: u64 = 128;
+
+/// The size of the pieces a transient read hands out: 256 KiB, a whole number
+/// of groups, and the chunk the daemon's read stream forwards each one as.
+const TRANSIENT_PIECE: usize = 256 * 1024;
+
+/// Streams a window of an object from peers, verifying each slice as it
+/// arrives and writing nothing locally.
 ///
 /// Providers are tried in rank order; one that fails or serves nothing at the
 /// current offset is dropped and the next is asked, as a fetch would (§6.4).
+/// Several windows are kept in flight, and handed out strictly in
+/// order: a window is only ever the continuation of the bytes before it.
 #[derive(Debug)]
 pub struct PeerReader {
     node: Node,
@@ -1529,6 +1555,27 @@ pub struct PeerReader {
     offset: u64,
     providers: Vec<Provider>,
     client: Option<synch_net::BlobClient>,
+    /// Windows asked for and not yet handed out, in object order.
+    inflight: std::collections::VecDeque<InflightWindow>,
+    /// The verified pieces of the window being handed out, in order.
+    ready: std::collections::VecDeque<Vec<u8>>,
+    /// The group the next window asked for starts at.
+    next_group: u64,
+}
+
+/// One window requested from the current provider, verified by its own task.
+#[derive(Debug)]
+struct InflightWindow {
+    window: synch_core::GroupRange,
+    task: tokio::task::JoinHandle<Result<Option<Vec<Vec<u8>>>>>,
+}
+
+impl Drop for InflightWindow {
+    /// A read that ends early — the client hung up, a provider failed —
+    /// takes the windows it asked for ahead with it.
+    fn drop(&mut self) {
+        self.task.abort();
+    }
 }
 
 impl PeerReader {
@@ -1537,78 +1584,99 @@ impl PeerReader {
         let PreparedRange {
             root, size, end, ..
         } = self.range;
-        if self.offset >= end {
-            return Ok(None);
-        }
-        let first = self.offset / synch_core::CHUNK_GROUP_SIZE;
-        let last = group_count(size).min(groups_for_byte_range(self.offset, end).end);
-        let window =
-            synch_core::GroupRange::new(first, last.min(first + synch_core::MAX_SLICE_GROUPS));
         loop {
+            if self.offset >= end {
+                return Ok(None);
+            }
+            if let Some(mut piece) = self.ready.pop_front() {
+                // The window starts on a group boundary and the read need not:
+                // the first piece is trimmed to where the read stands, and the
+                // last to where it ends.
+                let skip = (self.offset % synch_core::CHUNK_GROUP_SIZE) as usize;
+                if skip > 0 && self.offset == self.range.start {
+                    piece.drain(..skip.min(piece.len()));
+                }
+                piece.truncate(((end - self.offset) as usize).min(piece.len()));
+                self.offset += piece.len() as u64;
+                if piece.is_empty() {
+                    continue;
+                }
+                return Ok(Some(piece));
+            }
             let Some(provider) = self.providers.first().cloned() else {
                 return Err(EngineError::not_found(format!(
                     "no provider could serve bytes {}..{end} of {root}",
                     self.offset
                 )));
             };
-            match self.slice_from(&provider, root, size, window).await {
-                Ok(Some(bytes)) => {
-                    let skip = (self.offset - window.start * synch_core::CHUNK_GROUP_SIZE) as usize;
-                    let take = ((end - self.offset) as usize).min(bytes.len().saturating_sub(skip));
-                    let piece = bytes[skip..skip + take].to_vec();
-                    self.offset += piece.len() as u64;
-                    return Ok(Some(piece));
-                }
-                Ok(None) => {
+            match self.next_window(&provider, root, size, end).await {
+                Ok(true) => continue,
+                Ok(false) => {
                     tracing::debug!(origin = %provider.origin, "provider did not serve the next window");
                 }
                 Err(error) => {
                     tracing::debug!(origin = %provider.origin, %error, "provider failed a transient read");
                 }
             }
+            self.inflight.clear();
             self.providers.remove(0);
             self.client = None;
         }
     }
 
-    /// Asks one provider for a window and verifies what it served from the
-    /// window's start; `None` when it served nothing usable there.
-    async fn slice_from(
+    /// Tops the windows in flight back up and waits for the oldest, whose
+    /// pieces become ready; `false` when the provider served nothing usable
+    /// where the read stands.
+    async fn next_window(
         &mut self,
         provider: &Provider,
         root: Hash,
         size: u64,
-        window: synch_core::GroupRange,
-    ) -> Result<Option<Vec<u8>>> {
+        end: u64,
+    ) -> Result<bool> {
         if self.client.is_none() {
             self.client = Some(self.node.dial_provider(provider).await?);
         }
         let client = self.client.as_ref().expect("dialled above");
-        let slice = client
-            .get_slice(root, &ChunkRanges::from_ranges([window]))
-            .await?;
-        // Only the run that starts where the read stands is any use: a later
-        // run would leave a hole the stream cannot skip.
-        let Some(run) = slice
-            .served
-            .ranges
-            .first()
-            .copied()
-            .filter(|run| run.start == window.start && !run.is_empty())
-        else {
-            return Ok(None);
-        };
-        if slice.served.ranges.len() != 1 {
-            return Ok(None);
+        if self.inflight.is_empty() {
+            self.next_group = self.offset / synch_core::CHUNK_GROUP_SIZE;
         }
-        let encoded = slice.encoded;
-        let bytes = crate::blocking::offload(move || {
-            Ok(synch_store::Store::verify_slice(
-                &root, size, &run, &encoded,
-            )?)
-        })
-        .await?;
-        Ok(Some(bytes))
+        let last = group_count(size).min(groups_for_byte_range(self.offset, end).end);
+        while self.inflight.len() < TRANSIENT_DEPTH && self.next_group < last {
+            let window = synch_core::GroupRange::new(
+                self.next_group,
+                last.min(self.next_group + TRANSIENT_WINDOW_GROUPS),
+            );
+            self.next_group = window.end;
+            let client = client.clone();
+            self.inflight.push_back(InflightWindow {
+                window,
+                task: tokio::spawn(async move {
+                    Ok(client
+                        .read_window(root, size, window, TRANSIENT_PIECE)
+                        .await?)
+                }),
+            });
+        }
+        let Some(mut head) = self.inflight.pop_front() else {
+            return Ok(false);
+        };
+        let pieces = (&mut head.task)
+            .await
+            .map_err(|e| EngineError::Blocking(format!("a transient window task failed: {e}")))??;
+        let Some(pieces) = pieces else {
+            return Ok(false);
+        };
+        let got: u64 = pieces.iter().map(|piece| piece.len() as u64).sum();
+        let window_start = head.window.start * synch_core::CHUNK_GROUP_SIZE;
+        let window_end = (head.window.end * synch_core::CHUNK_GROUP_SIZE).min(size);
+        if window_start + got < window_end {
+            // A partial holder's short answer: the windows behind it no longer
+            // continue where this one stops, so they are asked again from there.
+            self.inflight.clear();
+        }
+        self.ready.extend(pieces);
+        Ok(got > 0)
     }
 }
 

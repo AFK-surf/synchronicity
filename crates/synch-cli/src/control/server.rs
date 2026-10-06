@@ -31,7 +31,8 @@ use crate::{
                 control_server::{Control, ControlServer},
             },
             tokens_match, Command, ControlError, EntryInfo, ErrorCode, PutPart, UploadPartPart,
-            CHUNK_SIZE, CONTROL_VERSION, MAX_MESSAGE_LEN, TOKEN_HEADER, VERSION_HEADER,
+            CHUNK_SIZE, CONNECTION_WINDOW, CONTROL_VERSION, MAX_FRAME_SIZE, MAX_MESSAGE_LEN,
+            STREAM_WINDOW, TOKEN_HEADER, VERSION_HEADER,
         },
         transport::{self, Accepted, Listener},
     },
@@ -315,6 +316,9 @@ impl Server {
         // in a send nobody will ever read.
         let served = {
             let serving = tonic::transport::Server::builder()
+                .initial_stream_window_size(STREAM_WINDOW)
+                .initial_connection_window_size(CONNECTION_WINDOW)
+                .max_frame_size(MAX_FRAME_SIZE)
                 .add_service(service)
                 .serve_with_incoming_shutdown(ReceiverStream::new(incoming), async move {
                     let _ = stopping.recv().await;
@@ -3900,6 +3904,12 @@ async fn stream_read(node: &Node, out: &mut Bytes<'_>, read: synch_engine::Trans
         synch_engine::TransientRead::Local(range) => stream_range(node, out, range).await,
         synch_engine::TransientRead::Peers(mut reader) => {
             while let Some(piece) = reader.next().await? {
+                // The reader's pieces are already chunk-sized, and go out as
+                // they are; anything larger is split.
+                if piece.len() <= CHUNK_SIZE {
+                    out.chunk(piece).await?;
+                    continue;
+                }
                 for chunk in piece.chunks(CHUNK_SIZE) {
                     out.chunk(chunk.to_vec()).await?;
                 }

@@ -260,6 +260,12 @@ async fn a_transient_read_keeps_no_copy_of_a_peers_object() {
         ranged == payload[8 * 1024 * 1024 - 100..8 * 1024 * 1024 - 100 + 70_000],
         "a range straddling two windows streams through intact"
     );
+    let (start, len) = (12_345usize, 7 * 1024 * 1024 + 777);
+    let (_, spanning) = read_all(&gateway.node, start as u64, Some(len as u64)).await;
+    assert!(
+        spanning == payload[start..start + len],
+        "a range across several windows in flight, on no group boundary, streams through intact"
+    );
 
     let root = gateway
         .node

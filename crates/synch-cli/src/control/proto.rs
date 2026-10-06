@@ -71,6 +71,25 @@ pub const CONTROL_VERSION: u32 = 6;
 /// process, large enough that the per-message cost stays negligible.
 pub const CHUNK_SIZE: usize = 256 * 1024;
 
+/// The HTTP/2 flow-control window each control stream opens with.
+///
+/// The protocol default is 64 KiB — a quarter of a chunk — so on a socket
+/// whose far end is in the same machine every chunk cost four window updates,
+/// each a wakeup of both processes. Sixteen chunks in flight per stream keeps
+/// a read moving while bounding what one call can buffer.
+pub(crate) const STREAM_WINDOW: u32 = 16 * CHUNK_SIZE as u32;
+
+/// The HTTP/2 flow-control window of the whole control connection: room for
+/// two streams' windows, so one call cannot starve another of its first chunk.
+pub(crate) const CONNECTION_WINDOW: u32 = 2 * STREAM_WINDOW;
+
+/// The largest HTTP/2 frame either end accepts: room for a whole chunk
+/// message, its framing included.
+///
+/// At the protocol's 16 KiB default every chunk was sixteen frames, and
+/// sixteen socket writes.
+pub(crate) const MAX_FRAME_SIZE: u32 = 4 * CHUNK_SIZE as u32;
+
 /// The largest message either side will encode or accept.
 ///
 /// A chunk is [`CHUNK_SIZE`] and nothing else in the protocol is close, so the

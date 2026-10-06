@@ -341,6 +341,15 @@ impl<E> crate::host::Output for ReadOutput<E> {
         let count = usize::try_from(count).unwrap_or(usize::MAX);
         self.bytes.truncate(self.bytes.len().saturating_sub(count));
     }
+    /// A served slice is the sink's only content, so the encoding becomes the
+    /// result as it is rather than being copied into an empty buffer.
+    fn append_owned(&mut self, bytes: Vec<u8>) -> Result<(), Self::Error> {
+        if self.bytes.is_empty() {
+            self.bytes = bytes;
+            return Ok(());
+        }
+        self.append(&bytes)
+    }
 }
 
 /// The private output is released only on a successful terminal whose count

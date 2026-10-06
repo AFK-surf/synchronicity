@@ -21,12 +21,15 @@ use synch_core::{
     now_ns, proof_nodes_upper_bound, BlobMessage, ChunkRanges, Hash, MAX_PROOF_NODES, MAX_RANGES,
     MAX_SLICE_GROUPS,
 };
-use synch_store::{Proven, Store};
+use synch_store::{
+    cas::{Expect, SliceVerifier},
+    Proven, Store,
+};
 
 use crate::{
     endpoint::{under_deadline, REQUEST_TIMEOUT},
     error::NetError,
-    frame::{read_answer, read_bytes, read_frame, write_bytes, write_frame},
+    frame::{read_answer, read_bytes, read_frame, write_bytes, write_frame, write_owned},
 };
 
 impl crate::frame::Answer for BlobMessage {
@@ -221,6 +224,11 @@ impl BlobProtocol {
 impl ProtocolHandler for BlobProtocol {
     async fn accept(&self, connection: Connection) -> Result<(), AcceptError> {
         let handler = self.clone();
+        // Answers go out in the order they were asked for. A requester with
+        // several windows in flight hands them on in order, so a stream
+        // round-robined against the ones behind it would only finish later —
+        // and with it the read waiting on it — while costing the same to send.
+        let asked = Arc::new(std::sync::atomic::AtomicI64::new(0));
         crate::serve::serve_connection(
             &self.store.clone(),
             connection,
@@ -229,6 +237,8 @@ impl ProtocolHandler for BlobProtocol {
             |_| std::future::ready(()),
             move |peer, mut send, mut recv| {
                 let handler = handler.clone();
+                let order = asked.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                let _ = send.set_priority(i32::try_from(-order).unwrap_or(i32::MIN));
                 async move {
                     if let Err(e) = handler.handle_stream(peer, &mut send, &mut recv).await {
                         tracing::debug!(error = %e, "blob stream ended");
@@ -329,7 +339,7 @@ impl BlobProtocol {
                     }
                     Err(e) => return Err(e.into()),
                 };
-                write_bytes(send, &encoded).await?;
+                write_owned(send, encoded).await?;
                 write_frame(send, &BlobMessage::SliceEnd { served }).await?;
                 Ok(())
             }
@@ -449,6 +459,151 @@ impl BlobClient {
             Ok(Slice { encoded, served })
         })
         .await
+    }
+
+    /// Streams one window of an object and verifies it as it arrives, writing
+    /// nothing (§6.4): the transient read's half of a slice exchange.
+    ///
+    /// Each parent node and each group is checked against the root by a
+    /// [`SliceVerifier`] the moment it is off the stream, and the payload
+    /// lands in pieces of `piece` bytes rounded up to whole groups, the last
+    /// one shorter, so the window costs one copy
+    /// of its bytes rather than a buffered encoding and a decode out of it. A
+    /// group is hashed where it lands, on this task: 16 KiB at a time, the
+    /// same scale of work as the stream's own decryption, with a cooperative
+    /// yield between groups so a window that has already arrived whole cannot
+    /// hold the worker (§10).
+    ///
+    /// The streaming walk needs the layout up front, and the layout is the
+    /// request's when the provider holds the whole window — which its length
+    /// prefix says before a byte of the body. Any other answer is a partial
+    /// holder's (`SliceEnd` names what it had), and is read whole and verified
+    /// as [`Store::verify_slice`] does. Either way the answer is the verified
+    /// run starting at `window.start`, or `None` when the provider served
+    /// nothing usable there.
+    pub async fn read_window(
+        &self,
+        root: Hash,
+        size: u64,
+        window: synch_core::GroupRange,
+        piece: usize,
+    ) -> Result<Option<Vec<Vec<u8>>>, NetError> {
+        // Pieces end on group boundaries, so no group is split between two.
+        let group = synch_core::CHUNK_GROUP_SIZE as usize;
+        let piece = piece.max(1).div_ceil(group) * group;
+        under_deadline(self.deadline, "a slice request", async {
+            let requested = ChunkRanges::from_ranges([window]);
+            let request = BlobMessage::GetSlice {
+                root,
+                ranges: requested.clone(),
+            };
+            let mut recv = crate::frame::request(&self.connection, &request).await?;
+            let mut header = [0u8; 4];
+            recv.read_exact(&mut header).await?;
+            let len = u32::from_le_bytes(header) as usize;
+            if len > synch_core::MAX_FRAME_LEN {
+                return Err(NetError::FrameTooLarge(len));
+            }
+            if len as u64 != SliceVerifier::encoded_len(size, &window) {
+                return self
+                    .partial_window(&mut recv, root, size, window, len, piece)
+                    .await;
+            }
+            let mut verifier = SliceVerifier::new(&root, size, &window);
+            let mut pieces = Vec::new();
+            let mut current: Vec<u8> = Vec::new();
+            while let Some(expect) = verifier.expect() {
+                match expect {
+                    Expect::Parent => {
+                        let mut pair = [0u8; synch_core::PROOF_NODE_LEN];
+                        recv.read_exact(&mut pair).await?;
+                        verifier.parent(&pair)?;
+                    }
+                    Expect::Leaf(len) => {
+                        if current.len() + len > piece {
+                            pieces.push(std::mem::take(&mut current));
+                        }
+                        if current.is_empty() {
+                            current.reserve_exact(piece);
+                        }
+                        let at = current.len();
+                        while current.len() < at + len {
+                            let want = at + len - current.len();
+                            match recv
+                                .read_chunk(want)
+                                .await
+                                .map_err(|e| NetError::Read(e.to_string()))?
+                            {
+                                Some(chunk) => current.extend_from_slice(&chunk),
+                                None => {
+                                    return Err(NetError::Read(
+                                        "the slice ended before its window did".into(),
+                                    ))
+                                }
+                            }
+                        }
+                        verifier.leaf(&current[at..])?;
+                        // A window already on the socket would otherwise
+                        // be hashed end to end without this task yielding.
+                        tokio::task::consume_budget().await;
+                    }
+                }
+            }
+            if !current.is_empty() {
+                pieces.push(current);
+            }
+
+            // The body was the whole window and every byte of it verified, so
+            // whatever `SliceEnd` says cannot unverify it; it is still read, so
+            // a provider that breaks the exchange is still a failed request.
+            match read_answer::<BlobMessage>(&mut recv).await? {
+                BlobMessage::SliceEnd { served } => {
+                    check_served(served, &requested)?;
+                }
+                _ => return Err(NetError::Unexpected("expected SliceEnd".into())),
+            }
+            Ok(Some(pieces))
+        })
+        .await
+    }
+
+    /// The rest of a [`BlobClient::read_window`] exchange whose body is not
+    /// the whole window: read it, learn what it covers, and verify the run
+    /// that starts where the window does.
+    async fn partial_window(
+        &self,
+        recv: &mut iroh::endpoint::RecvStream,
+        root: Hash,
+        size: u64,
+        window: synch_core::GroupRange,
+        len: usize,
+        piece: usize,
+    ) -> Result<Option<Vec<Vec<u8>>>, NetError> {
+        let mut encoded = vec![0u8; len];
+        recv.read_exact(&mut encoded).await?;
+        let served = match read_answer::<BlobMessage>(recv).await? {
+            BlobMessage::SliceEnd { served } => {
+                check_served(served, &ChunkRanges::from_ranges([window]))?
+            }
+            _ => return Err(NetError::Unexpected("expected SliceEnd".into())),
+        };
+        // Only the run that starts where the read stands is any use: a later
+        // run would leave a hole the stream cannot skip.
+        let Some(run) = served
+            .ranges
+            .first()
+            .copied()
+            .filter(|run| run.start == window.start && !run.is_empty())
+        else {
+            return Ok(None);
+        };
+        if served.ranges.len() != 1 {
+            return Ok(None);
+        }
+        let bytes =
+            crate::blocking::offload(move || Ok(Store::verify_slice(&root, size, &run, &encoded)?))
+                .await?;
+        Ok(Some(bytes.chunks(piece).map(<[u8]>::to_vec).collect()))
     }
 
     /// Requests the tree over a range, without its bytes.
@@ -640,6 +795,109 @@ mod tests {
 
         dialer.close().await;
         peer.shutdown().await;
+    }
+
+    /// A transient window yields only bytes that verified on their way in: an
+    /// honest provider's window arrives whole and in pieces, a partial
+    /// holder's answer yields the run it had from where the window starts, an
+    /// answer starting anywhere else yields nothing, and one flipped bit —
+    /// in a parent node, in a group, at the very end — fails the request.
+    #[tokio::test]
+    async fn a_streamed_window_yields_only_verified_bytes() {
+        let (_dir, store) = test_store();
+        let g = CHUNK_GROUP_SIZE;
+        let size = 20 * g + 99;
+        let bytes: Vec<u8> = (0..size).map(|i| (i % 241) as u8).collect();
+        let root = store.ingest_bytes(&bytes, now_ns()).unwrap();
+        let window = GroupRange::new(2, 18);
+        let encode = |run: GroupRange| {
+            let served = ChunkRanges::from_ranges([run]);
+            (store.encode_slice(&root, &served).unwrap().0, served)
+        };
+        let honest = encode(window);
+        let flipped = |at: usize| {
+            let (mut encoded, served) = honest.clone();
+            encoded[at] ^= 1;
+            (encoded, served)
+        };
+        // The provider's answers, one per request, in the order asked.
+        let answers = vec![
+            honest.clone(),
+            encode(GroupRange::new(2, 7)),
+            encode(GroupRange::new(3, 18)),
+            flipped(0),
+            flipped(honest.0.len() / 2),
+            flipped(honest.0.len() - 1),
+        ];
+
+        let endpoint = bare_endpoint(ALPN_BLOB).await;
+        let addr = crate::testing::direct_addr(&endpoint);
+        let serving = endpoint.clone();
+        let peer = tokio::spawn(async move {
+            let mut answers = answers.into_iter();
+            while let Some(incoming) = serving.accept().await {
+                let Ok(connection) = incoming.await else {
+                    continue;
+                };
+                while let Ok((mut send, mut recv)) = connection.accept_bi().await {
+                    let Ok(BlobMessage::GetSlice { .. }) = read_frame(&mut recv).await else {
+                        break;
+                    };
+                    let (encoded, served) = answers.next().expect("one answer per request");
+                    write_bytes(&mut send, &encoded).await.unwrap();
+                    write_frame(&mut send, &BlobMessage::SliceEnd { served })
+                        .await
+                        .unwrap();
+                    let _ = send.finish();
+                }
+            }
+        });
+
+        let dialer = bare_endpoint(ALPN_BLOB).await;
+        let client = BlobClient::new(dialer.connect(addr, ALPN_BLOB).await.unwrap());
+        let piece = 4 * g as usize;
+        let span = |from: u64, to: u64| &bytes[(from * g) as usize..(to * g) as usize];
+
+        let pieces = client
+            .read_window(root, size, window, piece)
+            .await
+            .unwrap()
+            .expect("an honest window");
+        assert!(
+            pieces.iter().all(|p| p.len() == piece),
+            "whole pieces of whole groups"
+        );
+        assert!(pieces.concat() == span(2, 18));
+
+        let prefix = client
+            .read_window(root, size, window, piece)
+            .await
+            .unwrap()
+            .expect("a partial holder's run from the window's start");
+        assert!(prefix.concat() == span(2, 7));
+
+        assert!(client
+            .read_window(root, size, window, piece)
+            .await
+            .unwrap()
+            .is_none());
+
+        for at in ["a parent node", "a group", "the last byte"] {
+            let refused = client.read_window(root, size, window, piece).await;
+            assert!(
+                matches!(
+                    refused,
+                    Err(NetError::Store(
+                        synch_store::StoreError::Verification { .. }
+                    ))
+                ),
+                "a flipped bit in {at} is refused: {refused:?}"
+            );
+        }
+
+        peer.abort();
+        dialer.close().await;
+        endpoint.close().await;
     }
 
     /// A provider dribbling one group per answer cannot hold a descent open.

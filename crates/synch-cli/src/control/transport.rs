@@ -24,6 +24,8 @@ use iroh_base::SecretKey;
 use tokio::io::{AsyncRead, AsyncWrite, ReadBuf};
 use tonic::transport::{server::Connected, Channel, Endpoint, Uri};
 
+use super::proto::{CONNECTION_WINDOW, MAX_FRAME_SIZE, STREAM_WINDOW};
+
 /// The Unix socket file inside the data directory.
 pub(crate) const SOCKET_FILE: &str = "control.sock";
 
@@ -443,6 +445,9 @@ pub async fn connect(data_dir: &Path) -> io::Result<Channel> {
         async move { Ok::<_, io::Error>(TokioIo::new(dial(&data_dir).await?)) }
     });
     Endpoint::from_static(LOCAL_AUTHORITY)
+        .initial_stream_window_size(STREAM_WINDOW)
+        .initial_connection_window_size(CONNECTION_WINDOW)
+        .max_frame_size(MAX_FRAME_SIZE)
         .connect_with_connector(connector)
         .await
         .map_err(unwrap_io)

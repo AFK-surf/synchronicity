@@ -1312,6 +1312,23 @@ The fetcher:
    still survives restarts, because verified groups are committed to the CAS as
    they arrive and a re-issued fetch skips whatever is already held.
 
+A **transient read** (`synch cat --no-cache`, a `--no-cache` S3 bucket) commits
+nothing, so it has no reason to wait for a window to land before asking for the
+next. It keeps four 2 MiB windows in flight from one provider, as concurrent
+streams on one connection, and hands them out strictly in order. Each window is
+verified as it streams in: the requester knows the encoding's layout from the
+request alone, so every parent node and every group is checked against the root
+the moment it is off the stream and lands, once, in the piece forwarded to the
+reader — no buffered encoding, no decode out of it. The provider's length prefix
+says up front whether it is answering the whole window; a partial holder's
+answer is read whole and verified against the run `SliceEnd` names, and the
+windows behind a short one are asked again from where it stopped. The provider
+answers a connection's streams in the order they were asked for, and every
+endpoint asks its peers (through QUIC's acknowledgement-frequency extension) to
+hold an acknowledgement back at most 5 ms rather than the default 25: with
+several reads sharing a provider's connection, a sender that has run into its
+windows waits for exactly that acknowledgement.
+
 This is intentionally the same shape as iroh-blobs' protocol; we keep our own ALPN and
 message frame so the availability semantics (partial serving, `SliceEnd`) stay under
 our control, but the heavy machinery (bao verification) is shared code.
@@ -1654,7 +1671,8 @@ and bucket/access-key configuration is stored by the daemon (config namespace
 `s3.*`) through `GetConfig`/`AppendConfig` — so `synch-s3 bucket add`/`key add`
 are control clients too, and the daemon remains the only writer and the only
 endpoint. Objects of any size flow
-through both directions **without either process buffering more than a chunk**.
+through both directions **without either process buffering more than a few
+chunks** — a bounded queue on each side and a 4 MiB HTTP/2 window between them.
 
 - **Bucket mapping**: a bucket names a space of the unified tree plus a version
   policy — `synch-s3 bucket add <bucket> <space> [--policy newest|origin=<id>|strict]`
@@ -1662,7 +1680,7 @@ through both directions **without either process buffering more than a chunk**.
   for the origin pin). Reads serve the policy-selected version of each path (§8);
   content flows through the normal verified path (local CAS first, then peer
   fetch). A bucket added with `--no-cache` streams what the CAS lacks straight
-  from providers instead, verifying each slice in memory and committing
+  from providers instead, verifying each group as it arrives and committing
   nothing, so serving a peer's object leaves no local copy (§6.4). A `strict` bucket answers a divergent key with `409 Conflict` naming the
   versions. Writes are always publishes of the *local* node's own view — the
   version model (§8) forbids publishing someone else's — so every bucket is
