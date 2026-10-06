@@ -1323,11 +1323,11 @@ reader — no buffered encoding, no decode out of it. The provider's length pref
 says up front whether it is answering the whole window; a partial holder's
 answer is read whole and verified against the run `SliceEnd` names, and the
 windows behind a short one are asked again from where it stopped. The provider
-answers a connection's streams in the order they were asked for, and every
-endpoint asks its peers (through QUIC's acknowledgement-frequency extension) to
-hold an acknowledgement back at most 5 ms rather than the default 25: with
-several reads sharing a provider's connection, a sender that has run into its
-windows waits for exactly that acknowledgement.
+answers a connection's streams in the order they were asked for. Endpoints keep
+QUIC's default acknowledgement delay (25 ms): asking peers for less through the
+acknowledgement-frequency extension made noq-proto 1.1.1 panic encoding the
+frame into a full packet (#161), so several reads sharing a provider's
+connection can still stall waiting for an acknowledgement.
 
 This is intentionally the same shape as iroh-blobs' protocol; we keep our own ALPN and
 message frame so the availability semantics (partial serving, `SliceEnd`) stay under
