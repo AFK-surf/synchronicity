@@ -560,8 +560,15 @@ impl BlobClient {
     }
 
     /// Streams one window of an object and verifies it as it arrives, writing
-    /// nothing (§6.4): one slice exchange, read as [`read_window_answer`]
-    /// describes.
+    /// nothing (§6.4): the transient read's half of a slice exchange.
+    ///
+    /// Each parent node and each group is checked against the root the moment
+    /// it is off the stream, and the payload lands in pieces of `piece` bytes
+    /// rounded up to whole groups. A provider holding the whole window says so
+    /// in its length prefix; any other answer is a partial holder's, read whole
+    /// and verified against the run its `SliceEnd` names. Either way the answer
+    /// is the verified run starting at `window.start`, or `None` when the
+    /// provider served nothing usable there.
     pub async fn read_window(
         &self,
         root: Hash,

@@ -1551,7 +1551,7 @@ const TRANSIENT_PIECE: usize = 256 * 1024;
 /// current offset is dropped and the next is asked, as a fetch would (§6.4).
 /// The rest of the read is asked of a provider as one streamed run
 /// ([`synch_net::BlobClient::stream_run`]), verified by a task of its own up
-/// to [`TRANSIENT_DEPTH`] windows ahead of the caller. A provider that
+/// to four windows ahead of the caller. A provider that
 /// predates streamed runs is asked window by window instead, with several
 /// windows in flight. Either way windows are handed out strictly in order: a
 /// window is only ever the continuation of the bytes before it.
