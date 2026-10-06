@@ -18,10 +18,12 @@ use bao_tree::{
     BaoTree, BlockSize, ChunkNum,
 };
 use rusqlite::{params, OptionalExtension};
-use synch_core::{BlobAd, ChunkRanges, GroupRange, Hash, CHUNK_GROUP_LOG2};
+use synch_core::{
+    BlobAd, ChunkRanges, GroupRange, Hash, CHUNK_GROUP_LOG2, CHUNK_GROUP_SIZE, PROOF_NODE_LEN,
+};
 
 #[cfg(test)]
-use synch_core::{group_count, CHUNK_GROUP_SIZE};
+use synch_core::group_count;
 
 use crate::{
     db::{hash_column, Store, Txn},
@@ -1056,35 +1058,40 @@ impl Store {
     /// the payload, the outboard or the bitmap that would make the object a
     /// local copy (§6.4). The slice carries its own path from the root, so
     /// each window verifies on its own and nothing is kept between them.
+    ///
+    /// The whole-buffer form of [`SliceVerifier`], for an answer that has
+    /// already arrived in full.
     pub fn verify_slice(
         root: &Hash,
         size: u64,
         served: &GroupRange,
         encoded: &[u8],
     ) -> Result<Vec<u8>> {
-        let group = synch_core::CHUNK_GROUP_SIZE;
-        let start = served.start.saturating_mul(group).min(size);
-        let end = served.end.saturating_mul(group).min(size);
-        let len = usize::try_from(end - start)
-            .map_err(|_| StoreError::invalid("a slice window must fit in memory"))?;
-        let mut window = Window {
-            start,
-            bytes: vec![0u8; len],
-        };
-        decode_ranges(
-            std::io::Cursor::new(encoded),
-            &to_bao_ranges(&ChunkRanges::from_ranges([*served])),
-            &mut window,
-            Discard {
-                root: blake3::Hash::from_bytes(root.0),
-                tree: Self::tree(size),
-            },
-        )
-        .map_err(|e| StoreError::Verification {
-            root: *root,
-            reason: e.to_string(),
-        })?;
-        Ok(window.bytes)
+        let mut verifier = SliceVerifier::new(root, size, served);
+        let mut bytes = Vec::with_capacity(verifier.payload_len() as usize);
+        let mut rest = encoded;
+        while let Some(expect) = verifier.expect() {
+            let len = match expect {
+                Expect::Parent => PROOF_NODE_LEN,
+                Expect::Leaf(len) => len,
+            };
+            if rest.len() < len {
+                return Err(verifier.fault("the encoding ends before the window does"));
+            }
+            let (item, tail) = rest.split_at(len);
+            rest = tail;
+            match expect {
+                Expect::Parent => verifier.parent(item)?,
+                Expect::Leaf(_) => {
+                    verifier.leaf(item)?;
+                    bytes.extend_from_slice(item);
+                }
+            }
+        }
+        if !rest.is_empty() {
+            return Err(verifier.fault("the encoding runs past the window"));
+        }
+        Ok(bytes)
     }
 
     /// The file half of the Bao slice service: decode `encoded`, a slice of
@@ -1190,67 +1197,227 @@ impl bao_tree::io::sync::Size for DataFile {
     }
 }
 
-/// The byte window a transient read verifies into; a leaf outside it is a
-/// decoder fault, not something to grow for.
-struct Window {
+/// The pre-order walk of a slice of `ranges`, canonicalized for the object's
+/// size exactly as the encoder and `decode_ranges` canonicalize it, so the
+/// walk is the provider's.
+fn slice_items(size: u64, ranges: &ChunkRanges) -> bao_tree::iter::ResponseIter {
+    let requested = to_bao_ranges(ranges);
+    let ranges = bao_tree::ChunkRanges::new_unchecked(
+        bao_tree::io::sync::truncate_ranges(&requested, size)
+            .boundaries()
+            .iter()
+            .copied()
+            .collect(),
+    );
+    bao_tree::iter::ResponseIter::new(Store::tree(size), ranges)
+}
+
+/// How many bytes the slice encoding of `ranges` takes, parent nodes and
+/// groups together.
+pub(crate) fn slice_encoded_len(size: u64, ranges: &ChunkRanges) -> u64 {
+    slice_items(size, ranges)
+        .map(|item| match item {
+            bao_tree::iter::BaoChunk::Parent { .. } => PROOF_NODE_LEN as u64,
+            bao_tree::iter::BaoChunk::Leaf { size, .. } => size as u64,
+        })
+        .sum()
+}
+
+/// Encodes the slice of `ranges` onto `out` in the walk a [`SliceVerifier`]
+/// checks: each parent node copied from the outboard, each group read from
+/// the payload straight into `out`.
+///
+/// The same bytes bao's `encode_ranges` writes, without staging every group
+/// in a buffer of its own first: a served window is megabytes, and that copy
+/// was most of what encoding it cost (§6.4). Like `encode_ranges` it checks
+/// nothing — the requester verifies every byte against the root.
+pub(crate) fn encode_slice_into<D: bao_tree::io::sync::ReadAt>(
+    size: u64,
+    ranges: &ChunkRanges,
+    data: &D,
+    outboard: &impl bao_tree::io::sync::Outboard,
+    out: &mut Vec<u8>,
+) -> std::io::Result<()> {
+    for item in slice_items(size, ranges) {
+        match item {
+            bao_tree::iter::BaoChunk::Parent { node, .. } => {
+                let (left, right) = outboard.load(node)?.ok_or_else(|| {
+                    std::io::Error::new(
+                        std::io::ErrorKind::UnexpectedEof,
+                        format!("the outboard holds no node {node:?}"),
+                    )
+                })?;
+                out.extend_from_slice(left.as_bytes());
+                out.extend_from_slice(right.as_bytes());
+            }
+            bao_tree::iter::BaoChunk::Leaf {
+                start_chunk, size, ..
+            } => {
+                let at = out.len();
+                out.resize(at + size, 0);
+                data.read_exact_at(start_chunk.to_bytes(), &mut out[at..])?;
+            }
+        }
+    }
+    Ok(())
+}
+
+/// What a [`SliceVerifier`] needs next from the encoding.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Expect {
+    /// One parent node: the two child chaining values,
+    /// [`PROOF_NODE_LEN`] bytes.
+    Parent,
+    /// One chunk group of payload, this many bytes long.
+    Leaf(usize),
+}
+
+/// Verifies a bao slice of one contiguous run of groups as it arrives, a
+/// node or a group at a time, against the object root (§6.4).
+///
+/// The streaming form of [`Store::verify_slice`]: a transient read checks
+/// every group on its way through and holds none of the encoding, so a
+/// window costs one copy of its payload and no buffer of its own. The walk
+/// is bao's: the pre-order of the run's subtrees, each parent checked against
+/// the chaining value its own parent vouched for, each group hashed at its
+/// place in the object. Nothing a caller is handed has been accepted until
+/// [`SliceVerifier::leaf`] or [`SliceVerifier::parent`] said so.
+pub struct SliceVerifier {
+    root: Hash,
+    items: bao_tree::iter::ResponseIter,
+    /// The chaining values still owed a check, innermost last.
+    owed: Vec<[u8; 32]>,
+    current: Option<bao_tree::iter::BaoChunk>,
+    /// The run's bytes within the object: no group outside them is accepted.
     start: u64,
-    bytes: Vec<u8>,
+    end: u64,
 }
 
-impl bao_tree::io::sync::WriteAt for &mut Window {
-    fn write_at(&mut self, pos: u64, buf: &[u8]) -> std::io::Result<usize> {
-        let offset = pos
-            .checked_sub(self.start)
-            .and_then(|offset| usize::try_from(offset).ok())
-            .filter(|offset| offset + buf.len() <= self.bytes.len())
-            .ok_or_else(|| {
-                std::io::Error::new(
-                    std::io::ErrorKind::InvalidData,
-                    "a verified leaf fell outside the requested window",
-                )
-            })?;
-        self.bytes[offset..offset + buf.len()].copy_from_slice(buf);
-        Ok(buf.len())
+impl std::fmt::Debug for SliceVerifier {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("SliceVerifier")
+            .field("root", &self.root)
+            .finish_non_exhaustive()
+    }
+}
+
+impl SliceVerifier {
+    /// A verifier for the encoding of `run`, groups of the object `root`
+    /// whose size is `size`, exactly as [`Store::encode_slice`] lays it out.
+    pub fn new(root: &Hash, size: u64, run: &GroupRange) -> SliceVerifier {
+        let start = run.start.saturating_mul(CHUNK_GROUP_SIZE).min(size);
+        let end = run.end.saturating_mul(CHUNK_GROUP_SIZE).min(size);
+        SliceVerifier {
+            root: *root,
+            items: slice_items(size, &ChunkRanges::from_ranges([*run])),
+            owed: vec![root.0],
+            current: None,
+            start,
+            end,
+        }
     }
 
-    fn flush(&mut self) -> std::io::Result<()> {
+    /// How many payload bytes the run holds, which is how many the leaves
+    /// add up to.
+    pub fn payload_len(&self) -> u64 {
+        self.end - self.start
+    }
+
+    /// How long the run's whole encoding is, parents and leaves together:
+    /// what an honest provider's answer for exactly this run measures.
+    pub fn encoded_len(size: u64, run: &GroupRange) -> u64 {
+        slice_encoded_len(size, &ChunkRanges::from_ranges([*run]))
+    }
+
+    /// What the encoding must carry next, or `None` once the run is complete.
+    pub fn expect(&mut self) -> Option<Expect> {
+        self.current = self.items.next();
+        match self.current.as_ref()? {
+            bao_tree::iter::BaoChunk::Parent { .. } => Some(Expect::Parent),
+            bao_tree::iter::BaoChunk::Leaf { size, .. } => Some(Expect::Leaf(*size)),
+        }
+    }
+
+    /// Checks a parent node against the chaining value its own parent vouched
+    /// for, and owes its children's checks in turn.
+    pub fn parent(&mut self, pair: &[u8]) -> Result<()> {
+        let Some(bao_tree::iter::BaoChunk::Parent {
+            is_root,
+            left,
+            right,
+            ..
+        }) = self.current.take()
+        else {
+            return Err(self.fault("a parent node where the walk expects none"));
+        };
+        let (Ok(l), Ok(r)) = (
+            <[u8; 32]>::try_from(&pair[..pair.len().min(32)]),
+            <[u8; 32]>::try_from(&pair[pair.len().min(32)..]),
+        ) else {
+            return Err(self.fault("a parent node is not two chaining values"));
+        };
+        let owed = self
+            .owed
+            .pop()
+            .ok_or_else(|| self.fault("nothing vouches for this parent"))?;
+        let actual = match is_root {
+            true => synch_core::join_root(&l.into(), &r.into()).0,
+            false => synch_core::join_cvs(&l.into(), &r.into()).0,
+        };
+        if actual != owed {
+            return Err(self.fault("a parent node does not hash to its chaining value"));
+        }
+        // Owed in reverse, so the left child is checked first, as it arrives.
+        if right {
+            self.owed.push(r);
+        }
+        if left {
+            self.owed.push(l);
+        }
         Ok(())
     }
-}
 
-/// An outboard that keeps nothing: a transient read needs the parents only to
-/// verify the leaves beneath them, and the decoder checks them on the way.
-struct Discard {
-    root: blake3::Hash,
-    tree: BaoTree,
-}
-
-impl bao_tree::io::sync::Outboard for Discard {
-    fn root(&self) -> blake3::Hash {
-        self.root
-    }
-    fn tree(&self) -> BaoTree {
-        self.tree
-    }
-    fn load(
-        &self,
-        _node: bao_tree::TreeNode,
-    ) -> std::io::Result<Option<(blake3::Hash, blake3::Hash)>> {
-        Ok(None)
-    }
-}
-
-impl bao_tree::io::sync::OutboardMut for Discard {
-    fn save(
-        &mut self,
-        _node: bao_tree::TreeNode,
-        _pair: &(blake3::Hash, blake3::Hash),
-    ) -> std::io::Result<()> {
+    /// Checks one group's bytes against the chaining value its parent vouched
+    /// for — the root itself for an object of one group.
+    pub fn leaf(&mut self, data: &[u8]) -> Result<()> {
+        let Some(bao_tree::iter::BaoChunk::Leaf {
+            start_chunk,
+            size,
+            is_root,
+            ..
+        }) = self.current.take()
+        else {
+            return Err(self.fault("a group where the walk expects a parent node"));
+        };
+        if data.len() != size {
+            return Err(self.fault("a group of the wrong length"));
+        }
+        // Bao reads a run past the object's end as a request for its last
+        // group: honest for a size proof, but not bytes of the run asked for.
+        let offset = start_chunk.to_bytes();
+        if offset < self.start || offset + size as u64 > self.end {
+            return Err(self.fault("a group outside the requested run"));
+        }
+        let owed = self
+            .owed
+            .pop()
+            .ok_or_else(|| self.fault("nothing vouches for this group"))?;
+        let actual = match is_root {
+            true => Hash::new(data).0,
+            false => synch_core::group_cv(start_chunk.to_bytes(), data).0,
+        };
+        if actual != owed {
+            return Err(self.fault("a group does not hash to its chaining value"));
+        }
         Ok(())
     }
 
-    fn sync(&mut self) -> std::io::Result<()> {
-        Ok(())
+    /// A verification failure against this object.
+    pub fn fault(&self, reason: &str) -> StoreError {
+        StoreError::Verification {
+            root: self.root,
+            reason: reason.to_string(),
+        }
     }
 }
 
@@ -1346,6 +1513,95 @@ mod tests {
             tampered[at] ^= 1;
             assert!(Store::verify_slice(&root, size, &window, &tampered).is_err());
         }
+    }
+
+    /// Every shape of object and window verifies, measures exactly what the
+    /// provider encodes, and refuses an encoding that stops short, runs long,
+    /// or belongs to another window.
+    #[test]
+    fn slice_verification_follows_the_providers_layout_for_every_shape() {
+        let (_dir, store) = crate::testutil::store();
+        let g = CHUNK_GROUP_SIZE;
+        for size in [g + 1, 2 * g, 2 * g + 1, 7 * g + 5, 33 * g] {
+            let bytes: Vec<u8> = (0..size).map(|i| (i % 253) as u8 ^ (size as u8)).collect();
+            let root = store.ingest_bytes(&bytes, 1).unwrap();
+            let groups = group_count(size);
+            let mut windows = vec![
+                GroupRange::new(0, 1),
+                GroupRange::new(0, groups),
+                GroupRange::new(groups - 1, groups),
+                GroupRange::new(1, groups),
+            ];
+            if groups > 4 {
+                windows.push(GroupRange::new(1, groups - 2));
+                windows.push(GroupRange::new(2, 3));
+            }
+            for window in windows {
+                let (encoded, _) = store
+                    .encode_slice(&root, &ChunkRanges::from_ranges([window]))
+                    .unwrap();
+                assert_eq!(
+                    encoded.len() as u64,
+                    SliceVerifier::encoded_len(size, &window),
+                    "size {size} window {window:?}"
+                );
+                // Byte for byte what bao itself encodes for the same request.
+                let mut reference = Vec::new();
+                bao_tree::io::sync::encode_ranges(
+                    &bytes[..],
+                    bao_tree::io::outboard::PreOrderMemOutboard::create(&bytes, BLOCK_SIZE),
+                    &to_bao_ranges(&ChunkRanges::from_ranges([window])),
+                    &mut reference,
+                )
+                .unwrap();
+                assert!(encoded == reference, "size {size} window {window:?}");
+                let start = (window.start * g) as usize;
+                let end = ((window.end * g) as usize).min(bytes.len());
+                let verified = Store::verify_slice(&root, size, &window, &encoded).unwrap();
+                assert!(
+                    verified == bytes[start..end],
+                    "size {size} window {window:?}"
+                );
+
+                assert!(
+                    Store::verify_slice(&root, size, &window, &encoded[..encoded.len() - 1])
+                        .is_err()
+                );
+                let mut long = encoded.clone();
+                long.push(0);
+                assert!(Store::verify_slice(&root, size, &window, &long).is_err());
+                if window.end - window.start > 1 {
+                    let shorter = GroupRange::new(window.start, window.end - 1);
+                    assert!(Store::verify_slice(&root, size, &shorter, &encoded).is_err());
+                }
+            }
+        }
+    }
+
+    /// A run past the object's end yields no bytes, never its last group.
+    #[test]
+    fn a_run_past_the_end_is_not_answered_with_the_last_group() {
+        let (_dir, store) = crate::testutil::store();
+        let size = 3 * CHUNK_GROUP_SIZE + 5;
+        let bytes = vec![4u8; size as usize];
+        let root = store.ingest_bytes(&bytes, 1).unwrap();
+        let last = GroupRange::new(3, 4);
+        let (encoded, _) = store
+            .encode_slice(&root, &ChunkRanges::from_ranges([last]))
+            .unwrap();
+        assert!(Store::verify_slice(&root, size, &GroupRange::new(5, 9), &encoded).is_err());
+    }
+
+    /// A walk fed out of order is refused rather than misread.
+    #[test]
+    fn a_verifier_refuses_bytes_of_the_wrong_kind() {
+        let (_dir, store) = crate::testutil::store();
+        let size = 4 * CHUNK_GROUP_SIZE;
+        let bytes = vec![9u8; size as usize];
+        let root = store.ingest_bytes(&bytes, 1).unwrap();
+        let mut verifier = SliceVerifier::new(&root, size, &GroupRange::new(0, 4));
+        assert_eq!(verifier.expect(), Some(Expect::Parent));
+        assert!(verifier.leaf(&bytes[..CHUNK_GROUP_SIZE as usize]).is_err());
     }
 
     #[test]

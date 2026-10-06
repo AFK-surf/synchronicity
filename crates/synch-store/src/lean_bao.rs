@@ -7,12 +7,12 @@
 
 use std::fs::File;
 
-use bao_tree::io::{outboard::PreOrderOutboard, sync::encode_ranges};
+use bao_tree::io::outboard::PreOrderOutboard;
 use synch_core::{ChunkRanges, Cv, GroupRange, Hash, PROOF_NODE_LEN};
 use synch_verified::host;
 
 use crate::{
-    cas::{to_bao_ranges, DataFile},
+    cas::{encode_slice_into, DataFile},
     proof::{load_from_outboard, walk_proof, Promotion},
     Result, Store, StoreError,
 };
@@ -59,8 +59,10 @@ impl host::Bao for Bao<'_> {
     ) -> Result<Vec<u8>> {
         let root = root_of(root)?;
         let tree = Store::tree(size);
-        let bao_ranges = to_bao_ranges(&ranges_of(spans));
-        let mut encoded = Vec::new();
+        let ranges = ranges_of(spans);
+        // Sized once: grown by doubling, a window's encoding would be copied
+        // across a dozen reallocations on its way to its final megabytes.
+        let mut encoded = Vec::with_capacity(crate::cas::slice_encoded_len(size, &ranges) as usize);
         let root_hash = blake3::Hash::from_bytes(root.0);
         match inline {
             Some(data) => {
@@ -69,7 +71,7 @@ impl host::Bao for Bao<'_> {
                     tree,
                     data: Vec::<u8>::new(),
                 };
-                encode_ranges(data, outboard, &bao_ranges, &mut encoded)
+                encode_slice_into(size, &ranges, &data, &outboard, &mut encoded)
             }
             None => {
                 // Both files are read positionally, never slurped. An outboard
@@ -77,13 +79,13 @@ impl host::Bao for Bao<'_> {
                 // 10 GB object, and this runs once per served window (§6.4).
                 // What each call actually touches is the sibling hashes on the
                 // path to the requested groups.
-                let data = File::open(self.store.blob_path(&root))?;
+                let data = DataFile(File::open(self.store.blob_path(&root))?);
                 let outboard = PreOrderOutboard {
                     root: root_hash,
                     tree,
                     data: DataFile(File::open(self.store.outboard_path(&root))?),
                 };
-                encode_ranges(DataFile(data), outboard, &bao_ranges, &mut encoded)
+                encode_slice_into(size, &ranges, &data, &outboard, &mut encoded)
             }
         }
         .map_err(|error| StoreError::invalid(format!("encode slice: {error}")))?;

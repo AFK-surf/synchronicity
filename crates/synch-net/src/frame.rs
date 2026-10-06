@@ -97,6 +97,18 @@ pub(crate) async fn write_bytes(send: &mut SendStream, bytes: &[u8]) -> Result<(
     Ok(())
 }
 
+/// Writes one length-framed raw payload the caller hands over, giving the
+/// buffer to the stream rather than copying it in: a slice body is megabytes,
+/// and the stream would otherwise hold a second copy of every one (§6.4).
+pub(crate) async fn write_owned(send: &mut SendStream, bytes: Vec<u8>) -> Result<(), NetError> {
+    if bytes.len() > MAX_FRAME_LEN {
+        return Err(NetError::FrameTooLarge(bytes.len()));
+    }
+    send.write_all(&(bytes.len() as u32).to_le_bytes()).await?;
+    send.write_chunk(bytes.into()).await?;
+    Ok(())
+}
+
 /// Reads one length-framed postcard message.
 pub async fn read_frame<T: DeserializeOwned>(recv: &mut RecvStream) -> Result<T, NetError> {
     let bytes = read_bytes(recv).await?;

@@ -719,7 +719,7 @@ fn sink_reply<E, A: EncodeReply>(
     wrap: impl FnOnce(u64) -> Option<A>,
 ) -> Vec<u8> {
     let count = encoded.len() as u64;
-    match output.append(&encoded) {
+    match output.append_owned(encoded) {
         Ok(()) => match wrap(count) {
             Some(value) => reply(tag, Ok::<A, E>(value), errors, EncodeReply::encode),
             None => {
