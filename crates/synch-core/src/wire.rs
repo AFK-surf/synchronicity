@@ -87,6 +87,15 @@ pub const MAX_FRAME_LEN: usize = 16 * 1024 * 1024;
 /// Requests are therefore served a window at a time and the requester loops.
 pub const MAX_SLICE_GROUPS: u64 = 512;
 
+/// The groups one window of a [`BlobMessage::GetStream`] answer carries: 2 MiB.
+///
+/// Fixed by the protocol rather than chosen by either side, because the
+/// requester verifies each window as it streams in and needs its layout before
+/// the first byte. Smaller than [`MAX_SLICE_GROUPS`] so a provider encoding
+/// one window ahead of the one it is sending holds little more than one full
+/// slice exchange did.
+pub const STREAM_WINDOW_GROUPS: u64 = 128;
+
 /// The most interior tree nodes one proof exchange carries — 512 KiB of hashes.
 ///
 /// A proof is a slice with the payload left out, bounded for the same reason
@@ -707,6 +716,24 @@ pub enum BlobMessage {
         /// The ranges the proof covers.
         served: ChunkRanges,
     },
+    /// Request one contiguous run of an object as a single stream (§6.4).
+    ///
+    /// The answer is the run cut into windows of [`STREAM_WINDOW_GROUPS`]
+    /// from `run.start`, back to back on the stream, each exactly the answer
+    /// to a [`BlobMessage::GetSlice`] for that window: the length-prefixed
+    /// encoding, then its [`BlobMessage::SliceEnd`]. The provider stops after
+    /// the last window of the run or after the first window it did not hold
+    /// whole, so a requester learns where a partial holder's run ends without
+    /// a round trip per window. A provider that predates this message cannot
+    /// decode it and ends the stream without a byte, which is how a requester
+    /// tells it to fall back to [`BlobMessage::GetSlice`]. Appended after
+    /// [`BlobMessage::ProofEnd`] because postcard numbers variants by position.
+    GetStream {
+        /// The object root.
+        root: Hash,
+        /// The groups wanted, in order.
+        run: GroupRange,
+    },
 }
 
 #[cfg(test)]
@@ -800,6 +827,10 @@ mod tests {
             },
             BlobMessage::ProofEnd {
                 served: ChunkRanges::single(0, 1024),
+            },
+            BlobMessage::GetStream {
+                root: Hash::new(b"o"),
+                run: GroupRange::new(3, 70_000),
             },
         ] {
             let bytes = postcard::to_stdvec(&m).unwrap();

@@ -44,6 +44,7 @@ pub use wire::{
     proof_nodes_upper_bound, BlobMessage, ChunkRanges, DeclaredScope, GroupRange, MptMessage,
     ALPN_BLOB, ALPN_MPT, MAX_BATCH, MAX_BATCH_PATH_BYTES, MAX_FRAME_LEN, MAX_HEADS_PER_MESSAGE,
     MAX_PROOF_NODES, MAX_PROVIDER_ADS, MAX_RANGES, MAX_SLICE_GROUPS, PROOF_NODE_LEN, PROTO_VERSION,
+    STREAM_WINDOW_GROUPS,
 };
 
 /// The software identification string published in [`NodeManifest::software`].

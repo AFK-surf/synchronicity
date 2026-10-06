@@ -1326,6 +1326,8 @@ impl Node {
             offset: start,
             providers,
             client: None,
+            stream: None,
+            windowed: false,
             inflight: std::collections::VecDeque::new(),
             ready: std::collections::VecDeque::new(),
             next_group: 0,
@@ -1520,22 +1522,23 @@ pub enum TransientRead {
     Peers(Box<PeerReader>),
 }
 
-/// How many windows a transient read keeps requested ahead of the one it is
-/// handing out.
+/// How many verified windows a transient read keeps ready ahead of the one it
+/// is handing out — or, from a provider asked window by window, how many it
+/// keeps requested.
 ///
 /// One window at a time leaves both ends idle half the time: the provider
 /// encodes and sends while this node waits, then this node verifies and
-/// forwards while the provider waits. With several in flight the provider is
-/// always working on the next while this node verifies the last, and the
-/// connection carries them as concurrent streams.
+/// forwards while the provider waits. With several ahead the provider is
+/// always working on the next while this node hands out the last.
 const TRANSIENT_DEPTH: usize = 4;
 
-/// The groups one transient window asks for: 2 MiB.
+/// The groups one transient window asks for from a provider asked window by
+/// window: 2 MiB, the same window a streamed run is cut into.
 ///
 /// Smaller than a slice exchange may carry ([`synch_core::MAX_SLICE_GROUPS`])
 /// so that [`TRANSIENT_DEPTH`] of them in flight cost no more memory than one
 /// full window did, and so the first bytes reach the reader sooner.
-const TRANSIENT_WINDOW_GROUPS: u64 = 128;
+const TRANSIENT_WINDOW_GROUPS: u64 = synch_core::STREAM_WINDOW_GROUPS;
 
 /// The size of the pieces a transient read hands out: 256 KiB, a whole number
 /// of groups, and the chunk the daemon's read stream forwards each one as.
@@ -1546,8 +1549,12 @@ const TRANSIENT_PIECE: usize = 256 * 1024;
 ///
 /// Providers are tried in rank order; one that fails or serves nothing at the
 /// current offset is dropped and the next is asked, as a fetch would (§6.4).
-/// Several windows are kept in flight, and handed out strictly in
-/// order: a window is only ever the continuation of the bytes before it.
+/// The rest of the read is asked of a provider as one streamed run
+/// ([`synch_net::BlobClient::stream_run`]), verified by a task of its own up
+/// to [`TRANSIENT_DEPTH`] windows ahead of the caller. A provider that
+/// predates streamed runs is asked window by window instead, with several
+/// windows in flight. Either way windows are handed out strictly in order: a
+/// window is only ever the continuation of the bytes before it.
 #[derive(Debug)]
 pub struct PeerReader {
     node: Node,
@@ -1555,12 +1562,33 @@ pub struct PeerReader {
     offset: u64,
     providers: Vec<Provider>,
     client: Option<synch_net::BlobClient>,
+    /// The run streaming from the current provider.
+    stream: Option<StreamedRun>,
+    /// Whether the current provider is asked window by window, because it
+    /// does not serve streamed runs.
+    windowed: bool,
     /// Windows asked for and not yet handed out, in object order.
     inflight: std::collections::VecDeque<InflightWindow>,
     /// The verified pieces of the window being handed out, in order.
     ready: std::collections::VecDeque<Vec<u8>>,
     /// The group the next window asked for starts at.
     next_group: u64,
+}
+
+/// A run streaming from one provider, read and verified by its own task.
+#[derive(Debug)]
+struct StreamedRun {
+    /// Each window's verified pieces, in order.
+    windows: tokio::sync::mpsc::Receiver<Vec<Vec<u8>>>,
+    /// How the run ended, once `windows` closes.
+    task: tokio::task::JoinHandle<Result<()>>,
+}
+
+impl Drop for StreamedRun {
+    /// A read that ends early takes the run it was streaming with it.
+    fn drop(&mut self) {
+        self.task.abort();
+    }
 }
 
 /// One window requested from the current provider, verified by its own task.
@@ -1609,19 +1637,84 @@ impl PeerReader {
                     self.offset
                 )));
             };
-            match self.next_window(&provider, root, size, end).await {
+            let step = match self.windowed {
+                true => self.next_window(&provider, root, size, end).await,
+                false => self.next_streamed(&provider, root, size, end).await,
+            };
+            match step {
                 Ok(true) => continue,
                 Ok(false) => {
                     tracing::debug!(origin = %provider.origin, "provider did not serve the next window");
+                }
+                Err(EngineError::Net(synch_net::NetError::StreamUnsupported)) => {
+                    tracing::debug!(origin = %provider.origin, "provider predates streamed runs; asking window by window");
+                    self.windowed = true;
+                    continue;
                 }
                 Err(error) => {
                     tracing::debug!(origin = %provider.origin, %error, "provider failed a transient read");
                 }
             }
             self.inflight.clear();
+            self.stream = None;
+            self.windowed = false;
             self.providers.remove(0);
             self.client = None;
         }
+    }
+
+    /// The client for the current provider, dialled on first use.
+    async fn client(&mut self, provider: &Provider) -> Result<synch_net::BlobClient> {
+        if self.client.is_none() {
+            self.client = Some(self.node.dial_provider(provider).await?);
+        }
+        Ok(self.client.clone().expect("dialled above"))
+    }
+
+    /// Asks the current provider for the rest of the read as one streamed run,
+    /// if it is not already streaming, and waits for its next window, whose
+    /// pieces become ready; `false` when the run ended without reaching the
+    /// read's end — the provider served what it had.
+    async fn next_streamed(
+        &mut self,
+        provider: &Provider,
+        root: Hash,
+        size: u64,
+        end: u64,
+    ) -> Result<bool> {
+        if self.stream.is_none() {
+            let client = self.client(provider).await?;
+            let run = synch_core::GroupRange::new(
+                self.offset / synch_core::CHUNK_GROUP_SIZE,
+                group_count(size).min(groups_for_byte_range(self.offset, end).end),
+            );
+            let mut stream = client.stream_run(root, size, run, TRANSIENT_PIECE).await?;
+            let (windows, receiver) = tokio::sync::mpsc::channel(TRANSIENT_DEPTH);
+            self.stream = Some(StreamedRun {
+                windows: receiver,
+                task: tokio::spawn(async move {
+                    while let Some(pieces) = stream.next_window().await? {
+                        if windows.send(pieces).await.is_err() {
+                            break;
+                        }
+                    }
+                    Ok(())
+                }),
+            });
+        }
+        let run = self.stream.as_mut().expect("started above");
+        if let Some(pieces) = run.windows.recv().await {
+            let got: u64 = pieces.iter().map(|piece| piece.len() as u64).sum();
+            self.ready.extend(pieces);
+            return Ok(got > 0);
+        }
+        // Every window it sent has been handed on, and the read is not over.
+        let ended = (&mut run.task)
+            .await
+            .map_err(|e| EngineError::Blocking(format!("a streamed run's task failed: {e}")));
+        self.stream = None;
+        ended??;
+        Ok(false)
     }
 
     /// Tops the windows in flight back up and waits for the oldest, whose
@@ -1634,10 +1727,7 @@ impl PeerReader {
         size: u64,
         end: u64,
     ) -> Result<bool> {
-        if self.client.is_none() {
-            self.client = Some(self.node.dial_provider(provider).await?);
-        }
-        let client = self.client.as_ref().expect("dialled above");
+        let client = self.client(provider).await?;
         if self.inflight.is_empty() {
             self.next_group = self.offset / synch_core::CHUNK_GROUP_SIZE;
         }

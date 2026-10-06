@@ -1007,7 +1007,8 @@ are rolled back to it everywhere.
 - **On-connect**: an mpt session (`sync/mpt/1`) begins with a `Hello` exchange, and
   each ALPN's session is held open and reused across requests for as long as it is
   live. The two are independent: `Hello` exists only on the mpt ALPN, and the blob
-  ALPN carries nothing but `GetSlice`/`SliceEnd` and `GetProof`/`ProofEnd`, so a
+  ALPN carries nothing but `GetSlice`/`SliceEnd`, `GetStream` (a run of slice
+  answers) and `GetProof`/`ProofEnd`, so a
   blob fetch neither opens nor needs an mpt session.
 
 Expected staleness with push + pull-gossip is `O(log N)` rounds after any partition
@@ -1285,6 +1286,8 @@ ALPN: `sync/blob/1`.
 GetSlice   { root: Hash, ranges: ChunkRanges }   // ChunkRanges in 16 KiB group units
 // response: bao slice stream, verified incrementally by the requester
 SliceEnd   { served: ChunkRanges }               // what the provider actually had
+GetStream  { root: Hash, run: GroupRange }       // response: the run as 2 MiB windows,
+                                                 // each a GetSlice answer, until short
 ```
 
 A slice is encoded into memory whole and travels in one framed message, so one
@@ -1314,17 +1317,33 @@ The fetcher:
 
 A **transient read** (`synch cat --no-cache`, a `--no-cache` S3 bucket) commits
 nothing, so it has no reason to wait for a window to land before asking for the
-next. It keeps four 2 MiB windows in flight from one provider, as concurrent
-streams on one connection, and hands them out strictly in order. Each window is
-verified as it streams in: the requester knows the encoding's layout from the
-request alone, so every parent node and every group is checked against the root
-the moment it is off the stream and lands, once, in the piece forwarded to the
-reader — no buffered encoding, no decode out of it. The provider's length prefix
-says up front whether it is answering the whole window; a partial holder's
-answer is read whole and verified against the run `SliceEnd` names, and the
-windows behind a short one are asked again from where it stopped. The provider
-answers a connection's streams in the order they were asked for. Endpoints keep
-QUIC's default acknowledgement delay (25 ms): asking peers for less through the
+next — or to ask for windows one at a time at all. It asks a provider for the
+rest of the read as one **streamed run** (`GetStream`): one request, answered
+on one stream as a sequence of 2 MiB windows (`STREAM_WINDOW_GROUPS`), each
+exactly what a `GetSlice` for that window would have answered — its
+length-prefixed encoding, then its `SliceEnd`. The provider encodes the next
+window while it sends the current one and is held back by nothing but QUIC's
+flow control, so a run costs it at most two encoded windows of memory whatever
+its length; it stops after the run's last window or after the first one it did
+not hold whole, so a partial holder's run ends without a request per window.
+Every window is a fresh decision of the serve command and meets the checks a
+request of its own would — the peer's binding (§3.2) and content scope (§3.5)
+— so a binding revoked mid-run ends the run at the next window. The serve-side
+stream deadline is a deadline on progress rather than on the whole exchange: a
+run is cut off for stalling, not for being long.
+
+The requester verifies each window as it streams in: the window's layout is
+known from the request alone, so every parent node and every group is checked
+against the root the moment it is off the stream and lands, once, in the piece
+forwarded to the reader — no buffered encoding, no decode out of it. The
+provider's length prefix says up front whether it is answering the whole
+window; a partial holder's answer is read whole and verified against the run
+`SliceEnd` names. A task of the reader's own reads and verifies up to four
+windows ahead of the caller. A provider that predates `GetStream` cannot decode
+it and ends the stream without a byte; it is asked window by window instead,
+four 2 MiB `GetSlice` windows in flight as concurrent streams on one
+connection, answered in the order they were asked for. Endpoints keep QUIC's
+default acknowledgement delay (25 ms): asking peers for less through the
 acknowledgement-frequency extension made noq-proto 1.1.1 panic encoding the
 frame into a full packet (#161), so several reads sharing a provider's
 connection can still stall waiting for an acknowledgement.
@@ -2316,7 +2335,11 @@ CI (GitHub Actions):
   both axes: at
   most 512 groups are encoded per exchange (§6.4), and at most 4 096 ranges are
   accepted in one request, because the range set operations are quadratic in the
-  number of ranges. Trust does not extend to the *shape* of replicated
+  number of ranges. A `GetStream` names one range, and its answer is encoded a
+  2 MiB window at a time with at most one window ahead, so a run of any length
+  holds a provider to two windows of memory; it is bounded in time by the same
+  stream deadline as any request, applied to progress, so a requester that
+  stops reading holds the stream no longer than one that never asked. Trust does not extend to the *shape* of replicated
   structure, because a member gets it wrong by accident as readily as on
   purpose: nothing canonicalizes the node graph a peer serves, so every walk
   over it — the promotion diff above all — keeps its frames on the heap and
