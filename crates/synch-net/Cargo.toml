@@ -22,6 +22,7 @@ sim = []
 [dependencies]
 aws-lc-rs.workspace = true
 base64.workspace = true
+blake3.workspace = true
 ctor.workspace = true
 futures-core.workspace = true
 hex.workspace = true
@@ -47,6 +48,7 @@ time.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
+zeroize.workspace = true
 
 [dev-dependencies]
 synch-verified.workspace = true

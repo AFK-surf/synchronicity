@@ -178,6 +178,14 @@ pub struct NetOptions {
     /// changed, and any checkout materializing it should look again.
     /// The endpoint only rings the bell.
     pub heads: Option<Arc<dyn crate::HeadSink>>,
+    /// Listen for direct-TCP runs on this address and offer them to peers
+    /// that ask (`docs/DIRECT-TCP.md`). Off by default: the port has to be
+    /// reachable from peers, which is a firewall decision this node cannot
+    /// make for its operator.
+    pub direct_listen: Option<SocketAddr>,
+    /// Ask providers for large transient reads as direct-TCP runs where the
+    /// connection has a direct path (`docs/DIRECT-TCP.md`). Off by default.
+    pub direct_dial: bool,
 }
 
 impl NetOptions {
@@ -314,6 +322,11 @@ pub struct Net {
     /// endpoint drowned in its own churn. Streams are what a request costs
     /// here; the session is held open and shared.
     dialed: Arc<Dialed>,
+    /// The direct-TCP listener, when this node offers direct runs.
+    direct: Option<Arc<crate::direct::DirectListener>>,
+    /// Peers whose direct path lately failed, when this node asks for direct
+    /// runs.
+    direct_memo: Option<Arc<crate::direct::DirectMemo>>,
 }
 
 impl Net {
@@ -332,6 +345,12 @@ impl Net {
         // compiled-in Mozilla bundle, so a self-hosted relay behind a private
         // CA — or any node behind a TLS-inspecting proxy — needs the operator
         // to install a root, not to rebuild synchronicity (`crate::tls`).
+        // First, so a port already taken fails the bind before the endpoint
+        // exists rather than leaving one bound behind the error.
+        let direct = match options.direct_listen {
+            Some(addr) => Some(Arc::new(crate::direct::DirectListener::bind(addr).await?)),
+            None => None,
+        };
         let mut builder = Endpoint::builder(presets::N0)
             .secret_key(secret)
             .ca_tls_config(CaTlsConfig::system());
@@ -420,7 +439,8 @@ impl Net {
                     }),
                 )
                 .on_unknown_key(options.on_unknown_key.clone())
-                .inflight(inflight.clone()),
+                .inflight(inflight.clone())
+                .direct(direct.clone()),
             );
         let sockets = options.sockets.clone().map(|service| {
             crate::sock::SockProtocol::new(
@@ -444,6 +464,10 @@ impl Net {
             store,
             sockets,
             dialed: Arc::new(std::sync::Mutex::new(HashMap::new())),
+            direct,
+            direct_memo: options
+                .direct_dial
+                .then(|| Arc::new(crate::direct::DirectMemo::default())),
         })
     }
 
@@ -531,7 +555,8 @@ impl Net {
         &self,
         addr: impl Into<EndpointAddr>,
     ) -> Result<BlobClient, NetError> {
-        Ok(BlobClient::new(self.connect(addr, ALPN_BLOB).await?))
+        Ok(BlobClient::new(self.connect(addr, ALPN_BLOB).await?)
+            .with_direct(self.direct_memo.clone()))
     }
 
     /// Connects to a peer on the socket ALPN.
@@ -639,11 +664,22 @@ impl Net {
             .unwrap_or_else(std::sync::PoisonError::into_inner)
     }
 
+    /// How many offered direct-run tickets are waiting for their connection.
+    #[cfg(test)]
+    pub(crate) fn direct_pending(&self) -> usize {
+        self.direct
+            .as_ref()
+            .map_or(0, |listener| listener.pending())
+    }
+
     /// Shuts the router and endpoint down cleanly.
     pub async fn shutdown(&self) -> Result<(), NetError> {
         // The held sessions go first: the endpoint closes them anyway, and
         // dropping them here means a shutdown does not race its own cache.
         self.dialed().clear();
+        if let Some(listener) = &self.direct {
+            listener.stop();
+        }
         self.router
             .shutdown()
             .await

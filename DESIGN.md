@@ -1348,6 +1348,19 @@ acknowledgement-frequency extension made noq-proto 1.1.1 panic encoding the
 frame into a full packet (#161), so several reads sharing a provider's
 connection can still stall waiting for an acknowledgement.
 
+A node may also opt in to **direct-TCP runs** (`docs/DIRECT-TCP.md`): a
+transient read with at least 32 MiB left asks with `GetDirect`, and a provider
+started with a direct listener answers with a `DirectOffer` — its port, a
+single-use ticket and a key drawn for that run alone, carried under the QUIC
+connection's protection. The requester dials that port on the IP of the QUIC
+path it already uses, proves the key, and reads the same windows, sealed in
+AES-256-GCM records ending in a final record, through the same verifier. The
+QUIC stream that asked stays open as the run's identity on the provider, so
+the run keeps its stream's concurrency slot, progress deadline and per-window
+checks, and the key lives no longer than the QUIC connection on either side.
+A provider that makes no offer, a port that does not accept, a damaged record
+or a stall sends the read back to `GetStream` from the same provider.
+
 This is intentionally the same shape as iroh-blobs' protocol; we keep our own ALPN and
 message frame so the availability semantics (partial serving, `SliceEnd`) stay under
 our control, but the heavy machinery (bao verification) is shared code.
@@ -2339,7 +2352,11 @@ CI (GitHub Actions):
   2 MiB window at a time with at most one window ahead, so a run of any length
   holds a provider to two windows of memory; it is bounded in time by the same
   stream deadline as any request, applied to progress, so a requester that
-  stops reading holds the stream no longer than one that never asked. Trust does not extend to the *shape* of replicated
+  stops reading holds the stream no longer than one that never asked. A
+  direct-TCP run is the same run on the same stream's budget, and its listener
+  is open to anyone who can reach the port, so what an unauthenticated dialer
+  gets is bounded separately: 64 connections awaiting a Hello, 5 s each, a
+  fixed 56-byte read and an in-memory ticket lookup, never a store call. Trust does not extend to the *shape* of replicated
   structure, because a member gets it wrong by accident as readily as on
   purpose: nothing canonicalizes the node graph a peer serves, so every walk
   over it — the promotion diff above all — keeps its frames on the heap and

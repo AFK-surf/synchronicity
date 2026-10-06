@@ -116,6 +116,26 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub offline: bool,
 
+    /// Listen for direct-TCP runs on this address and offer them to peers
+    /// that ask for large uncached reads (docs/DIRECT-TCP.md). The port must
+    /// be reachable from peers. Takes effect where the endpoint is bound:
+    /// `synch daemon run`.
+    #[arg(
+        long,
+        global = true,
+        env = "SYNCH_DIRECT_TCP_LISTEN",
+        value_name = "HOST:PORT"
+    )]
+    pub direct_tcp_listen: Option<String>,
+
+    /// Ask providers for large uncached reads (`cat --no-cache`, a
+    /// `--no-cache` bucket) over a direct TCP connection, encrypted under a
+    /// single-use key sent over QUIC, falling back to QUIC wherever that path
+    /// is not there (docs/DIRECT-TCP.md). Takes effect where the endpoint is
+    /// bound: `synch daemon run`.
+    #[arg(long, global = true, env = "SYNCH_DIRECT_TCP")]
+    pub direct_tcp: bool,
+
     /// The DNS-over-HTTP(S) endpoint membership TXT records resolve
     /// through; defaults to https://1.1.1.1/dns-query. http:// is accepted —
     /// answers are DNSSEC-validated in process either way.

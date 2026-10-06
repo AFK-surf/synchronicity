@@ -19,8 +19,8 @@ use iroh::{
     protocol::{AcceptError, ProtocolHandler},
 };
 use synch_core::{
-    now_ns, proof_nodes_upper_bound, BlobMessage, ChunkRanges, GroupRange, Hash, MAX_PROOF_NODES,
-    MAX_RANGES, MAX_SLICE_GROUPS, STREAM_WINDOW_GROUPS,
+    now_ns, proof_nodes_upper_bound, BlobMessage, ChunkRanges, DirectSecret, GroupRange, Hash,
+    MAX_PROOF_NODES, MAX_RANGES, MAX_SLICE_GROUPS, STREAM_WINDOW_GROUPS,
 };
 use synch_store::{
     cas::{Expect, SliceVerifier},
@@ -28,6 +28,7 @@ use synch_store::{
 };
 
 use crate::{
+    direct::{DirectListener, DirectMemo, DirectSource, RecordWriter, RunKeys},
     endpoint::{under_deadline, REQUEST_TIMEOUT},
     error::NetError,
     frame::{read_answer, read_bytes, read_frame, write_bytes, write_frame, write_owned},
@@ -193,6 +194,9 @@ pub(crate) struct BlobProtocol {
     /// The endpoint-wide in-flight gate, shared with every other ALPN mounted
     /// on this endpoint (`crate::serve::Inflight`).
     inflight: crate::serve::Inflight,
+    /// The direct-TCP listener, when this node was started with one
+    /// (`docs/DIRECT-TCP.md`).
+    direct: Option<Arc<DirectListener>>,
 }
 
 impl BlobProtocol {
@@ -206,7 +210,14 @@ impl BlobProtocol {
             backend,
             on_unknown_key: None,
             inflight: None,
+            direct: None,
         }
+    }
+
+    /// Answers `GetDirect` with offers on `listener`.
+    pub(crate) fn direct(mut self, listener: Option<Arc<DirectListener>>) -> Self {
+        self.direct = listener;
+        self
     }
 
     /// Gates this handler on the endpoint-wide in-flight semaphore.
@@ -230,6 +241,9 @@ impl ProtocolHandler for BlobProtocol {
         // round-robined against the ones behind it would only finish later —
         // and with it the read waiting on it — while costing the same to send.
         let asked = Arc::new(std::sync::atomic::AtomicI64::new(0));
+        // A direct run's key lives no longer than the connection it was
+        // offered on, so its stream's handler watches the connection.
+        let held = connection.clone();
         crate::serve::serve_connection(
             &self.store.clone(),
             connection,
@@ -238,11 +252,12 @@ impl ProtocolHandler for BlobProtocol {
             |_| std::future::ready(()),
             move |peer, mut send, mut recv, progress| {
                 let handler = handler.clone();
+                let connection = held.clone();
                 let order = asked.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 let _ = send.set_priority(i32::try_from(-order).unwrap_or(i32::MIN));
                 async move {
                     if let Err(e) = handler
-                        .handle_stream(peer, &mut send, &mut recv, &progress)
+                        .handle_stream(peer, &connection, &mut send, &mut recv, &progress)
                         .await
                     {
                         tracing::debug!(error = %e, "blob stream ended");
@@ -308,13 +323,19 @@ impl BlobProtocol {
     async fn handle_stream(
         &self,
         peer: synch_core::NodeId,
+        connection: &Connection,
         send: &mut iroh::endpoint::SendStream,
         recv: &mut iroh::endpoint::RecvStream,
         progress: &crate::serve::Progress,
     ) -> Result<(), NetError> {
         match read_frame::<BlobMessage>(recv).await? {
             BlobMessage::GetStream { root, run } => {
-                self.serve_run(peer, send, root, run, progress).await
+                self.serve_run(peer, &mut Sink::Quic(send), root, run, progress)
+                    .await
+            }
+            BlobMessage::GetDirect { root, run } => {
+                self.serve_direct(peer, connection, send, root, run, progress)
+                    .await
             }
             BlobMessage::GetSlice { root, ranges } => {
                 self.check_content_scope(peer, root).await?;
@@ -386,9 +407,11 @@ impl BlobProtocol {
                 write_frame(send, &BlobMessage::ProofEnd { served }).await?;
                 Ok(())
             }
-            BlobMessage::SliceEnd { .. } | BlobMessage::ProofEnd { .. } => Err(
-                NetError::Unexpected("an End message is a response, not a request".into()),
-            ),
+            BlobMessage::SliceEnd { .. }
+            | BlobMessage::ProofEnd { .. }
+            | BlobMessage::DirectOffer { .. } => Err(NetError::Unexpected(
+                "an End message or an offer is a response, not a request".into(),
+            )),
         }
     }
 
@@ -408,7 +431,7 @@ impl BlobProtocol {
     async fn serve_run(
         &self,
         peer: synch_core::NodeId,
-        send: &mut iroh::endpoint::SendStream,
+        sink: &mut Sink<'_>,
         root: Hash,
         run: GroupRange,
         progress: &crate::serve::Progress,
@@ -435,12 +458,90 @@ impl BlobProtocol {
                 self.admit_window(peer, root).await?;
                 ahead = Some(self.encode_ahead(root, following));
             }
-            write_owned(send, encoded).await?;
-            write_frame(send, &BlobMessage::SliceEnd { served }).await?;
+            sink.write_owned(encoded).await?;
+            sink.write_frame(&BlobMessage::SliceEnd { served }).await?;
             progress.mark();
             window = following;
         }
         Ok(())
+    }
+
+    /// Answers a [`BlobMessage::GetDirect`] (`docs/DIRECT-TCP.md`): offers a
+    /// ticket and a fresh key, waits for the requester's TCP connection, and
+    /// serves the run over it exactly as [`BlobProtocol::serve_run`] serves
+    /// one on QUIC.
+    ///
+    /// Declines — ends the stream without a byte, which sends the requester
+    /// to `GetStream` — when this node has no listener, the run is empty or
+    /// longer than one key may carry, or the connection is relayed, so there
+    /// is no direct path for the requester to dial.
+    ///
+    /// The key and the ticket live in this future and nowhere else that
+    /// outlasts it, and it ends when the run does, when the requester stops
+    /// the stream, or when the QUIC connection closes — whichever is first.
+    /// That is what ties the key to the connection: a binding revoked
+    /// mid-run closes the connection (`serve::still_admitted`), and the key
+    /// and the TCP connection go with it, not at the next window.
+    async fn serve_direct(
+        &self,
+        peer: synch_core::NodeId,
+        connection: &Connection,
+        send: &mut iroh::endpoint::SendStream,
+        root: Hash,
+        run: GroupRange,
+        progress: &crate::serve::Progress,
+    ) -> Result<(), NetError> {
+        let Some(listener) = self.direct.clone() else {
+            return Ok(());
+        };
+        if run.is_empty()
+            || !crate::direct::within_key_limit(run)
+            || crate::direct::direct_path(connection).is_none()
+        {
+            return Ok(());
+        }
+        self.admit_window(peer, root).await?;
+        let ticket = crate::direct::draw()?;
+        let secret = DirectSecret::from_bytes(crate::direct::draw()?);
+        let (hello, key) = RunKeys::derive(&secret, &ticket, root, run).split()?;
+        let (ticket_held, delivered) = listener.register(ticket, hello);
+        crate::direct::write_offer(
+            send,
+            &BlobMessage::DirectOffer {
+                port: listener.port(),
+                ticket,
+                secret,
+            },
+        )
+        .await?;
+
+        let stopped = send.stopped();
+        tokio::pin!(stopped);
+        let closed = connection.closed();
+        tokio::pin!(closed);
+        let socket = tokio::select! {
+            delivered = tokio::time::timeout(crate::direct::accept_timeout(), delivered) => {
+                match delivered {
+                    Ok(Ok(socket)) => socket,
+                    _ => return Ok(()),
+                }
+            }
+            _ = &mut stopped => return Ok(()),
+            _ = &mut closed => return Ok(()),
+        };
+        drop(ticket_held);
+        let mut writer = RecordWriter::new(socket, key);
+        let mut sink = Sink::Direct(&mut writer);
+        tokio::select! {
+            served = self.serve_run(peer, &mut sink, root, run, progress) => served?,
+            _ = &mut stopped => {
+                return Err(NetError::Direct("the requester stopped the run".into()))
+            }
+            _ = &mut closed => {
+                return Err(NetError::Direct("the QUIC connection closed under the run".into()))
+            }
+        }
+        writer.finish().await
     }
 
     /// The checks a window of a streamed run meets before it is encoded,
@@ -483,12 +584,96 @@ impl Drop for Encoding {
     }
 }
 
+/// Where a streamed run's answer goes: the QUIC stream that asked for it, or
+/// a direct run's TCP connection. The bytes are the same either way.
+enum Sink<'a> {
+    Quic(&'a mut iroh::endpoint::SendStream),
+    Direct(&'a mut RecordWriter),
+}
+
+impl Sink<'_> {
+    async fn write_owned(&mut self, bytes: Vec<u8>) -> Result<(), NetError> {
+        match self {
+            Sink::Quic(send) => write_owned(send, bytes).await,
+            Sink::Direct(writer) => {
+                if bytes.len() > synch_core::MAX_FRAME_LEN {
+                    return Err(NetError::FrameTooLarge(bytes.len()));
+                }
+                writer
+                    .write((bytes.len() as u32).to_le_bytes().to_vec())
+                    .await?;
+                writer.write(bytes).await
+            }
+        }
+    }
+
+    async fn write_frame(&mut self, msg: &BlobMessage) -> Result<(), NetError> {
+        match self {
+            Sink::Quic(send) => write_frame(send, msg).await,
+            Sink::Direct(writer) => {
+                let body = postcard::to_stdvec(msg).map_err(|e| NetError::Encode(e.to_string()))?;
+                let mut framed = Vec::with_capacity(4 + body.len());
+                framed.extend_from_slice(&(body.len() as u32).to_le_bytes());
+                framed.extend_from_slice(&body);
+                writer.write(framed).await
+            }
+        }
+    }
+}
+
+/// Where a streamed run's answer comes from: the QUIC stream it was asked
+/// on, or a direct run's TCP connection.
+#[derive(Debug)]
+enum Source {
+    Quic(iroh::endpoint::RecvStream),
+    Direct(Box<DirectSource>),
+}
+
+impl Source {
+    /// Fills `buf`, or `false` when the answer ended cleanly before its
+    /// first byte.
+    async fn read_or_end(&mut self, buf: &mut [u8]) -> Result<bool, NetError> {
+        match self {
+            Source::Quic(recv) => match recv.read_exact(buf).await {
+                Ok(()) => Ok(true),
+                Err(iroh::endpoint::ReadExactError::FinishedEarly(0)) => Ok(false),
+                Err(e) => Err(e.into()),
+            },
+            Source::Direct(source) => source.read_or_end(buf).await,
+        }
+    }
+
+    async fn read_exact(&mut self, buf: &mut [u8]) -> Result<(), NetError> {
+        match self.read_or_end(buf).await? {
+            true => Ok(()),
+            false if buf.is_empty() => Ok(()),
+            false => Err(NetError::Read("the answer ended early".into())),
+        }
+    }
+
+    /// Reads one length-framed message.
+    async fn read_message(&mut self) -> Result<BlobMessage, NetError> {
+        let mut prefix = [0u8; 4];
+        self.read_exact(&mut prefix).await?;
+        let len = u32::from_le_bytes(prefix) as usize;
+        if len > synch_core::MAX_FRAME_LEN {
+            return Err(NetError::FrameTooLarge(len));
+        }
+        let mut body = vec![0u8; len];
+        self.read_exact(&mut body).await?;
+        postcard::from_bytes(&body).map_err(|e| NetError::Decode(e.to_string()))
+    }
+}
+
 /// A client for the `sync/blob/1` ALPN, over one established connection.
 #[derive(Debug, Clone)]
 pub struct BlobClient {
     connection: Connection,
     /// How long any one exchange on this connection may wait for its answer.
     deadline: std::time::Duration,
+    /// Present when this node asks for direct runs, with the peers whose
+    /// direct path did not work (`docs/DIRECT-TCP.md`).
+    direct: Option<Arc<DirectMemo>>,
 }
 
 /// A received slice, together with what the provider actually served.
@@ -526,6 +711,22 @@ impl BlobClient {
         BlobClient {
             connection,
             deadline: REQUEST_TIMEOUT,
+            direct: None,
+        }
+    }
+
+    /// The same client, asking for direct runs where it can.
+    pub(crate) fn with_direct(mut self, memo: Option<Arc<DirectMemo>>) -> Self {
+        self.direct = memo;
+        self
+    }
+
+    /// Whether a direct run is worth asking this provider for: this node
+    /// opted in, and the provider's direct path has not lately failed.
+    pub fn direct_enabled(&self) -> bool {
+        match &self.direct {
+            Some(memo) => !memo.refused(&self.connection.remote_id()),
+            None => false,
         }
     }
 
@@ -581,11 +782,12 @@ impl BlobClient {
                 root,
                 ranges: ChunkRanges::from_ranges([window]),
             };
-            let mut recv = crate::frame::request(&self.connection, &request).await?;
-            let len = read_window_len(&mut recv)
+            let recv = crate::frame::request(&self.connection, &request).await?;
+            let mut source = Source::Quic(recv);
+            let len = read_window_len(&mut source)
                 .await?
                 .ok_or_else(|| NetError::Read("the slice ended before it began".into()))?;
-            read_window_answer(&mut recv, root, size, window, len, piece).await
+            read_window_answer(&mut source, root, size, window, len, piece).await
         })
         .await
     }
@@ -611,17 +813,92 @@ impl BlobClient {
             crate::frame::request(&self.connection, &request),
         )
         .await?;
-        Ok(RunStream {
-            recv,
+        Ok(RunStream::over(
+            Source::Quic(recv),
             root,
             size,
-            next: run.start,
-            end: run.end,
+            run,
             piece,
-            deadline: self.deadline,
-            started: false,
-            done: false,
+            self.deadline,
+        ))
+    }
+
+    /// Asks for one contiguous run of an object over a direct TCP connection
+    /// (`docs/DIRECT-TCP.md`), read exactly as a [`BlobClient::stream_run`]
+    /// is.
+    ///
+    /// Fails with [`NetError::Direct`] when the path is not there — this node
+    /// did not opt in, the connection is relayed, the provider makes no
+    /// offer, its port does not accept — and the caller asks with
+    /// [`BlobClient::stream_run`] instead. A provider whose path did not
+    /// work is not asked again for a while.
+    ///
+    /// The run's key arrives in the offer, on this connection, and lives no
+    /// longer than it: closing the connection destroys the key and fails
+    /// the next read.
+    pub async fn stream_run_direct(
+        &self,
+        root: Hash,
+        size: u64,
+        run: GroupRange,
+        piece: usize,
+    ) -> Result<RunStream, NetError> {
+        let Some(memo) = self.direct.clone() else {
+            return Err(NetError::Direct(
+                "this node does not ask for direct runs".into(),
+            ));
+        };
+        let peer = self.connection.remote_id();
+        if memo.refused(&peer) {
+            return Err(NetError::Direct(
+                "the provider's direct path failed lately".into(),
+            ));
+        }
+        let Some(mut addr) = crate::direct::direct_path(&self.connection) else {
+            return Err(NetError::Direct("the connection has no direct path".into()));
+        };
+        let (control, offer) = under_deadline(self.deadline, "a direct run offer", async {
+            let mut recv =
+                crate::frame::request(&self.connection, &BlobMessage::GetDirect { root, run })
+                    .await?;
+            let offer = crate::direct::read_offer(&mut recv).await?;
+            Ok((recv, offer))
         })
+        .await?;
+        let (port, ticket, secret) = match offer {
+            Some(BlobMessage::DirectOffer {
+                port,
+                ticket,
+                secret,
+            }) => (port, ticket, secret),
+            Some(_) => return Err(NetError::Unexpected("expected DirectOffer".into())),
+            None => {
+                memo.refuse(peer);
+                return Err(NetError::Direct(
+                    "the provider makes no direct offer".into(),
+                ));
+            }
+        };
+        let (hello, key) = RunKeys::derive(&secret, &ticket, root, run).split()?;
+        drop(secret);
+        addr.set_port(port);
+        let socket = match crate::direct::dial(addr, &ticket, &hello).await {
+            Ok(socket) => socket,
+            Err(error) => {
+                memo.refuse(peer);
+                return Err(error);
+            }
+        };
+        drop(hello);
+        let source = DirectSource::new(socket, key, self.connection.clone(), control, memo);
+        Ok(RunStream::over(
+            Source::Direct(Box::new(source)),
+            root,
+            size,
+            run,
+            piece,
+            self.deadline,
+        ))
     }
 
     /// Requests the tree over a range, without its bytes.
@@ -780,7 +1057,7 @@ impl BlobClient {
 /// (see [`BlobClient::stream_run`]).
 #[derive(Debug)]
 pub struct RunStream {
-    recv: iroh::endpoint::RecvStream,
+    source: Source,
     root: Hash,
     size: u64,
     /// The group the next window starts at.
@@ -796,6 +1073,32 @@ pub struct RunStream {
 }
 
 impl RunStream {
+    fn over(
+        source: Source,
+        root: Hash,
+        size: u64,
+        run: GroupRange,
+        piece: usize,
+        deadline: std::time::Duration,
+    ) -> RunStream {
+        RunStream {
+            source,
+            root,
+            size,
+            next: run.start,
+            end: run.end,
+            piece,
+            deadline,
+            started: false,
+            done: false,
+        }
+    }
+
+    /// Whether this run travels over a direct TCP connection.
+    pub fn is_direct(&self) -> bool {
+        matches!(self.source, Source::Direct(_))
+    }
+
     /// The next window's verified pieces, or `None` once the run is over —
     /// complete, or ended by the provider at a window it did not hold whole.
     ///
@@ -815,17 +1118,27 @@ impl RunStream {
             self.end.min(self.next.saturating_add(STREAM_WINDOW_GROUPS)),
         );
         let (root, size, piece, started) = (self.root, self.size, self.piece, self.started);
-        let recv = &mut self.recv;
+        let direct = self.is_direct();
+        let source = &mut self.source;
         let answer = under_deadline(self.deadline, "a streamed window", async move {
-            match read_window_len(recv).await? {
-                Some(len) => read_window_answer(recv, root, size, window, len, piece).await,
+            match read_window_len(source).await? {
+                Some(len) => read_window_answer(source, root, size, window, len, piece).await,
                 None if started => {
                     Err(NetError::Read("the stream ended before its run did".into()))
                 }
+                None if direct => Err(NetError::Direct(
+                    "the run ended before its first window".into(),
+                )),
                 None => Err(NetError::StreamUnsupported),
             }
         })
         .await;
+        // A direct run that stalls is the TCP path's failure until shown
+        // otherwise: the same provider is asked again over QUIC.
+        let answer = match answer {
+            Err(NetError::Endpoint(stalled)) if direct => Err(NetError::Direct(stalled)),
+            answer => answer,
+        };
         self.started = true;
         let answer = match answer {
             Ok(answer) => answer,
@@ -851,12 +1164,10 @@ impl RunStream {
 
 /// Reads the length prefix of one window's encoding, or `None` when the
 /// stream ended cleanly before a byte of it.
-async fn read_window_len(recv: &mut iroh::endpoint::RecvStream) -> Result<Option<usize>, NetError> {
+async fn read_window_len(source: &mut Source) -> Result<Option<usize>, NetError> {
     let mut header = [0u8; 4];
-    match recv.read_exact(&mut header).await {
-        Ok(()) => {}
-        Err(iroh::endpoint::ReadExactError::FinishedEarly(0)) => return Ok(None),
-        Err(e) => return Err(NetError::Read(e.to_string())),
+    if !source.read_or_end(&mut header).await? {
+        return Ok(None);
     }
     let len = u32::from_le_bytes(header) as usize;
     if len > synch_core::MAX_FRAME_LEN {
@@ -885,7 +1196,7 @@ async fn read_window_len(recv: &mut iroh::endpoint::RecvStream) -> Result<Option
 /// starting at `window.start`, or `None` when the provider served nothing
 /// usable there.
 async fn read_window_answer(
-    recv: &mut iroh::endpoint::RecvStream,
+    source: &mut Source,
     root: Hash,
     size: u64,
     window: GroupRange,
@@ -897,7 +1208,7 @@ async fn read_window_answer(
     let piece = piece.max(1).div_ceil(group) * group;
     let requested = ChunkRanges::from_ranges([window]);
     if len as u64 != SliceVerifier::encoded_len(size, &window) {
-        return partial_window(recv, root, size, window, len, piece).await;
+        return partial_window(source, root, size, window, len, piece).await;
     }
     let mut verifier = SliceVerifier::new(&root, size, &window);
     let mut pieces = Vec::new();
@@ -906,7 +1217,7 @@ async fn read_window_answer(
         match expect {
             Expect::Parent => {
                 let mut pair = [0u8; synch_core::PROOF_NODE_LEN];
-                recv.read_exact(&mut pair).await?;
+                source.read_exact(&mut pair).await?;
                 verifier.parent(&pair)?;
             }
             Expect::Leaf(len) => {
@@ -917,21 +1228,8 @@ async fn read_window_answer(
                     current.reserve_exact(piece);
                 }
                 let at = current.len();
-                while current.len() < at + len {
-                    let want = at + len - current.len();
-                    match recv
-                        .read_chunk(want)
-                        .await
-                        .map_err(|e| NetError::Read(e.to_string()))?
-                    {
-                        Some(chunk) => current.extend_from_slice(&chunk),
-                        None => {
-                            return Err(NetError::Read(
-                                "the slice ended before its window did".into(),
-                            ))
-                        }
-                    }
-                }
+                current.resize(at + len, 0);
+                source.read_exact(&mut current[at..]).await?;
                 verifier.leaf(&current[at..])?;
                 // A window already on the socket would otherwise be hashed
                 // end to end without this task yielding.
@@ -946,7 +1244,7 @@ async fn read_window_answer(
     // The body was the whole window and every byte of it verified, so
     // whatever `SliceEnd` says cannot unverify it; it is still read, so a
     // provider that breaks the exchange is still a failed request.
-    match read_answer::<BlobMessage>(recv).await? {
+    match source.read_message().await? {
         BlobMessage::SliceEnd { served } => {
             check_served(served, &requested)?;
         }
@@ -959,7 +1257,7 @@ async fn read_window_answer(
 /// it, learn what it covers, and verify the run that starts where the window
 /// does.
 async fn partial_window(
-    recv: &mut iroh::endpoint::RecvStream,
+    source: &mut Source,
     root: Hash,
     size: u64,
     window: GroupRange,
@@ -967,8 +1265,8 @@ async fn partial_window(
     piece: usize,
 ) -> Result<Option<Vec<Vec<u8>>>, NetError> {
     let mut encoded = vec![0u8; len];
-    recv.read_exact(&mut encoded).await?;
-    let served = match read_answer::<BlobMessage>(recv).await? {
+    source.read_exact(&mut encoded).await?;
+    let served = match source.read_message().await? {
         BlobMessage::SliceEnd { served } => {
             check_served(served, &ChunkRanges::from_ranges([window]))?
         }
@@ -1488,5 +1786,191 @@ mod tests {
         peer.abort();
         dialer.close().await;
         endpoint.close().await;
+    }
+
+    /// Options for a provider that offers direct runs on loopback.
+    fn direct_provider() -> crate::endpoint::NetOptions {
+        crate::endpoint::NetOptions {
+            direct_listen: Some("127.0.0.1:0".parse().unwrap()),
+            ..crate::endpoint::NetOptions::loopback()
+        }
+    }
+
+    /// Waits up to five seconds for `done` to hold.
+    async fn eventually(mut done: impl FnMut() -> bool) -> bool {
+        for _ in 0..500 {
+            if done() {
+                return true;
+            }
+            tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+        }
+        done()
+    }
+
+    /// A direct run answers exactly as a QUIC run does — the windows a
+    /// partial holder has and nothing past them, the whole run once it holds
+    /// it — and its ticket is spent once the run is under way.
+    #[tokio::test]
+    async fn a_direct_run_yields_what_a_quic_run_does() {
+        let g = CHUNK_GROUP_SIZE;
+        let w = synch_core::STREAM_WINDOW_GROUPS;
+        let size = (2 * w + 40) * g + 777;
+        let bytes: Vec<u8> = (0..size).map(|i| (i % 239) as u8).collect();
+        let groups = synch_core::group_count(size);
+        let (_source_dir, source) = test_store();
+        let root = source.ingest_bytes(&bytes, now_ns()).unwrap();
+        let (_dir, store) = test_store();
+        let held = w + 50;
+        let hold = |to: u64| {
+            for start in (0..to).step_by(MAX_SLICE_GROUPS as usize) {
+                let run = ChunkRanges::single(start, to.min(start + MAX_SLICE_GROUPS));
+                let (encoded, served) = source.encode_slice(&root, &run).unwrap();
+                store
+                    .write_slice(&root, size, &served, &encoded, now_ns())
+                    .unwrap();
+            }
+        };
+        hold(held);
+        let (server, client, _client_dir) = trusting_pair(store.clone(), direct_provider()).await;
+        let blob = client
+            .connect_blob(server.direct_addr())
+            .await
+            .unwrap()
+            .with_direct(Some(Arc::new(DirectMemo::default())));
+        let piece = 64 * g as usize;
+
+        let compare = |run: GroupRange| {
+            let blob = blob.clone();
+            async move {
+                let mut direct = blob
+                    .stream_run_direct(root, size, run, piece)
+                    .await
+                    .unwrap();
+                assert!(direct.is_direct());
+                let mut quic = blob.stream_run(root, size, run, piece).await.unwrap();
+                let over_tcp = read_run(&mut direct).await.unwrap();
+                assert!(over_tcp == read_run(&mut quic).await.unwrap());
+                over_tcp
+            }
+        };
+        let partial = compare(GroupRange::new(0, groups)).await;
+        assert!(partial.concat() == bytes[..(held * g) as usize]);
+        hold(groups);
+        let whole = compare(GroupRange::new(5, groups)).await;
+        assert!(whole.concat() == bytes[(5 * g) as usize..]);
+        assert_eq!(server.direct_pending(), 0);
+
+        client.shutdown().await.unwrap();
+        server.shutdown().await.unwrap();
+    }
+
+    /// A provider that makes no offer, and a node that never asked for
+    /// direct runs, both leave the read on QUIC — and a refusal is
+    /// remembered, so the next read does not pay for asking again.
+    #[tokio::test]
+    async fn a_run_without_a_direct_path_stays_on_quic() {
+        let (_dir, store) = test_store();
+        let bytes = vec![7u8; 3 * CHUNK_GROUP_SIZE as usize];
+        let root = store.ingest_bytes(&bytes, now_ns()).unwrap();
+        let size = bytes.len() as u64;
+        let run = GroupRange::new(0, 3);
+        let (server, client, _client_dir) =
+            trusting_pair(store.clone(), crate::endpoint::NetOptions::loopback()).await;
+
+        let not_asking = client.connect_blob(server.direct_addr()).await.unwrap();
+        assert!(!not_asking.direct_enabled());
+        assert!(matches!(
+            not_asking.stream_run_direct(root, size, run, 1 << 20).await,
+            Err(NetError::Direct(_))
+        ));
+
+        let asking = not_asking.with_direct(Some(Arc::new(DirectMemo::default())));
+        assert!(asking.direct_enabled());
+        assert!(matches!(
+            asking.stream_run_direct(root, size, run, 1 << 20).await,
+            Err(NetError::Direct(_))
+        ));
+        assert!(!asking.direct_enabled(), "the refusal is remembered");
+        let mut quic = asking.stream_run(root, size, run, 1 << 20).await.unwrap();
+        assert!(read_run(&mut quic).await.unwrap().concat() == bytes);
+
+        client.shutdown().await.unwrap();
+        server.shutdown().await.unwrap();
+    }
+
+    /// A direct run's key and ticket live no longer than the QUIC
+    /// connection that carried the offer: closing it forgets an unpresented
+    /// ticket on the provider, so the key in that offer admits nothing, and
+    /// destroys the key of a run under way on the requester, so its next
+    /// read fails rather than carrying on over TCP.
+    #[tokio::test]
+    async fn a_direct_runs_key_and_ticket_end_with_its_quic_connection() {
+        let g = CHUNK_GROUP_SIZE;
+        let w = synch_core::STREAM_WINDOW_GROUPS;
+        let size = 4 * w * g;
+        let bytes: Vec<u8> = (0..size).map(|i| (i % 233) as u8).collect();
+        let (_dir, store) = test_store();
+        let root = store.ingest_bytes(&bytes, now_ns()).unwrap();
+        let run = GroupRange::new(0, 4 * w);
+        let (server, client, _client_dir) = trusting_pair(store.clone(), direct_provider()).await;
+
+        // The provider's half: an offer whose connection closes before the
+        // ticket is presented.
+        let blob = client.connect_blob(server.direct_addr()).await.unwrap();
+        let mut control =
+            crate::frame::request(&blob.connection, &BlobMessage::GetDirect { root, run })
+                .await
+                .unwrap();
+        let Some(BlobMessage::DirectOffer {
+            port,
+            ticket,
+            secret,
+        }) = crate::direct::read_offer(&mut control).await.unwrap()
+        else {
+            panic!("a direct provider makes an offer");
+        };
+        assert_eq!(server.direct_pending(), 1);
+        blob.connection.close(0u32.into(), b"done");
+        assert!(eventually(|| server.direct_pending() == 0).await);
+        let (hello, _) = RunKeys::derive(&secret, &ticket, root, run)
+            .split()
+            .unwrap();
+        let mut late = crate::direct::dial(([127, 0, 0, 1], port).into(), &ticket, &hello)
+            .await
+            .unwrap();
+        let mut byte = [0u8; 1];
+        let answer = tokio::time::timeout(
+            std::time::Duration::from_secs(5),
+            tokio::io::AsyncReadExt::read(&mut late, &mut byte),
+        )
+        .await
+        .expect("a dead ticket's connection is closed, not held");
+        assert!(matches!(answer, Ok(0) | Err(_)));
+
+        // The requester's half: a run under way whose connection closes.
+        let blob = client
+            .connect_blob(server.direct_addr())
+            .await
+            .unwrap()
+            .with_direct(Some(Arc::new(DirectMemo::default())));
+        let mut stream = blob
+            .stream_run_direct(root, size, run, 1 << 20)
+            .await
+            .unwrap();
+        assert!(stream.next_window().await.unwrap().is_some());
+        let holds_key = |stream: &RunStream| match &stream.source {
+            Source::Direct(source) => source.holds_key(),
+            Source::Quic(_) => false,
+        };
+        assert!(holds_key(&stream));
+        blob.connection.close(0u32.into(), b"done");
+        assert!(eventually(|| !holds_key(&stream)).await);
+        assert!(matches!(
+            stream.next_window().await,
+            Err(NetError::Direct(_))
+        ));
+
+        client.shutdown().await.unwrap();
+        server.shutdown().await.unwrap();
     }
 }

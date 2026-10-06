@@ -1328,6 +1328,7 @@ impl Node {
             client: None,
             stream: None,
             windowed: false,
+            direct_failed: false,
             inflight: std::collections::VecDeque::new(),
             ready: std::collections::VecDeque::new(),
             next_group: 0,
@@ -1551,7 +1552,11 @@ const TRANSIENT_PIECE: usize = 256 * 1024;
 /// current offset is dropped and the next is asked, as a fetch would (§6.4).
 /// The rest of the read is asked of a provider as one streamed run
 /// ([`synch_net::BlobClient::stream_run`]), verified by a task of its own up
-/// to four windows ahead of the caller. A provider that
+/// to four windows ahead of the caller — over a direct TCP connection when
+/// this node asks for them and enough of the read is left
+/// ([`synch_net::BlobClient::stream_run_direct`], `docs/DIRECT-TCP.md`),
+/// falling back to the QUIC stream when that path is not there or breaks.
+/// A provider that
 /// predates streamed runs is asked window by window instead, with several
 /// windows in flight. Either way windows are handed out strictly in order: a
 /// window is only ever the continuation of the bytes before it.
@@ -1567,6 +1572,9 @@ pub struct PeerReader {
     /// Whether the current provider is asked window by window, because it
     /// does not serve streamed runs.
     windowed: bool,
+    /// Whether a direct run from the current provider broke, so the rest of
+    /// the read is asked of it over QUIC.
+    direct_failed: bool,
     /// Windows asked for and not yet handed out, in object order.
     inflight: std::collections::VecDeque<InflightWindow>,
     /// The verified pieces of the window being handed out, in order.
@@ -1651,6 +1659,15 @@ impl PeerReader {
                     self.windowed = true;
                     continue;
                 }
+                // The TCP path broke, not the provider: every window handed
+                // on was verified, so the same provider is asked for the rest
+                // over QUIC from where the read stands.
+                Err(EngineError::Net(synch_net::NetError::Direct(reason))) => {
+                    tracing::debug!(origin = %provider.origin, %reason, "direct run failed; resuming over QUIC");
+                    self.stream = None;
+                    self.direct_failed = true;
+                    continue;
+                }
                 Err(error) => {
                     tracing::debug!(origin = %provider.origin, %error, "provider failed a transient read");
                 }
@@ -1658,6 +1675,7 @@ impl PeerReader {
             self.inflight.clear();
             self.stream = None;
             self.windowed = false;
+            self.direct_failed = false;
             self.providers.remove(0);
             self.client = None;
         }
@@ -1688,7 +1706,26 @@ impl PeerReader {
                 self.offset / synch_core::CHUNK_GROUP_SIZE,
                 group_count(size).min(groups_for_byte_range(self.offset, end).end),
             );
-            let mut stream = client.stream_run(root, size, run, TRANSIENT_PIECE).await?;
+            let mut direct = None;
+            if !self.direct_failed
+                && client.direct_enabled()
+                && end - self.offset >= synch_net::DIRECT_MIN_BYTES
+            {
+                match client
+                    .stream_run_direct(root, size, run, TRANSIENT_PIECE)
+                    .await
+                {
+                    Ok(stream) => direct = Some(stream),
+                    Err(synch_net::NetError::Direct(reason)) => {
+                        tracing::debug!(origin = %provider.origin, %reason, "no direct run; streaming over QUIC");
+                    }
+                    Err(error) => return Err(error.into()),
+                }
+            }
+            let mut stream = match direct {
+                Some(stream) => stream,
+                None => client.stream_run(root, size, run, TRANSIENT_PIECE).await?,
+            };
             let (windows, receiver) = tokio::sync::mpsc::channel(TRANSIENT_DEPTH);
             self.stream = Some(StreamedRun {
                 windows: receiver,

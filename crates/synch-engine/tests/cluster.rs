@@ -283,6 +283,54 @@ async fn a_transient_read_keeps_no_copy_of_a_peers_object() {
     shutdown(&[&nas.node, &gateway.node]).await;
 }
 
+/// A transient read large enough for a direct run streams through intact
+/// whether its provider offers one or not — over TCP from one that does, over
+/// QUIC from one that does not — from a requester that asks for them.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_large_transient_read_streams_intact_with_or_without_a_direct_path() {
+    use synch_engine::TransientRead;
+    let _blocking = synch_core::BlockingScope::enter();
+    let offering = spawn_with("nas", |config| {
+        config.net.direct_listen = Some("127.0.0.1:0".parse().unwrap());
+    })
+    .await;
+    let quiet = spawn("vault").await;
+    let gateway = spawn_with("gateway", |config| config.net.direct_dial = true).await;
+    introduce(&[&offering, &quiet, &gateway]);
+
+    let large = synch_net::DIRECT_MIN_BYTES as usize + 3 * 1024 * 1024 + 99;
+    for (peer, space, len) in [(&offering, "media", large), (&quiet, "archive", large + 1)] {
+        peer.node
+            .add_filesystem_source(space, peer.space.path())
+            .unwrap();
+        std::fs::write(peer.space.path().join("disk.img"), big_payload(len)).unwrap();
+        peer.node.scan_publish_push().await.unwrap().unwrap();
+        gateway
+            .node
+            .sync_with_peer(&peer.node.node_id())
+            .await
+            .unwrap();
+    }
+
+    for (space, len) in [("media", large), ("archive", large + 1)] {
+        let TransientRead::Peers(mut reader) = gateway
+            .node
+            .prepare_transient(space, "disk.img", &VersionPolicy::Newest, 0, None)
+            .await
+            .unwrap()
+        else {
+            panic!("the gateway holds nothing of {space}");
+        };
+        let mut out = Vec::with_capacity(len);
+        while let Some(piece) = reader.next().await.unwrap() {
+            out.extend_from_slice(&piece);
+        }
+        assert!(out == big_payload(len), "{space} streams through intact");
+    }
+
+    shutdown(&[&offering.node, &quiet.node, &gateway.node]).await;
+}
+
 /// The §14 walkthrough: scan-publish-push, pull, a verified partial range
 /// read, and a milestone ad (§6.3) turning a fetcher into a provider.
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
