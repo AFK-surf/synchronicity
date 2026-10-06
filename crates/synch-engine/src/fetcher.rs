@@ -1546,7 +1546,7 @@ const TRANSIENT_PIECE: usize = 256 * 1024;
 ///
 /// Providers are tried in rank order; one that fails or serves nothing at the
 /// current offset is dropped and the next is asked, as a fetch would (§6.4).
-/// [`TRANSIENT_DEPTH`] windows are kept in flight, and handed out strictly in
+/// Several windows are kept in flight, and handed out strictly in
 /// order: a window is only ever the continuation of the bytes before it.
 #[derive(Debug)]
 pub struct PeerReader {
