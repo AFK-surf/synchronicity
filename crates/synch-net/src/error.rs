@@ -37,9 +37,10 @@ pub enum NetError {
     /// window at a time instead (§6.4).
     #[error("the provider does not serve streamed runs")]
     StreamUnsupported,
-    /// A direct-TCP run could not be set up, or its connection failed under
-    /// it (`docs/DIRECT-TCP.md`): no offer, an unreachable port, a damaged or
-    /// truncated record, or the QUIC connection that carried its key closing.
+    /// A direct-TCP run or socket stream could not be set up, or its
+    /// connection failed under it (`docs/DIRECT-TCP.md`): no offer, an
+    /// unreachable port, a damaged or truncated record, or the QUIC connection
+    /// that carried its key closing.
     ///
     /// Never the provider's verdict on the content — bytes that decrypt and
     /// then fail verification are reported as what they are — so the caller

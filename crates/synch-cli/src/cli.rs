@@ -116,10 +116,10 @@ pub struct Cli {
     #[arg(long, global = true)]
     pub offline: bool,
 
-    /// Listen for direct-TCP runs on this address and offer them to peers
-    /// that ask for large uncached reads (docs/DIRECT-TCP.md). The port must
-    /// be reachable from peers. Takes effect where the endpoint is bound:
-    /// `synch daemon run`.
+    /// Listen for direct-TCP connections on this address and offer them to
+    /// peers that ask, for large uncached reads and socket invocations
+    /// (docs/DIRECT-TCP.md). The port must be reachable from peers. Takes
+    /// effect where the endpoint is bound: `synch daemon run`.
     #[arg(
         long,
         global = true,
@@ -129,10 +129,11 @@ pub struct Cli {
     pub direct_tcp_listen: Option<String>,
 
     /// Ask providers for large uncached reads (`cat --no-cache`, a
-    /// `--no-cache` bucket) over a direct TCP connection, encrypted under a
-    /// single-use key sent over QUIC, falling back to QUIC wherever that path
-    /// is not there (docs/DIRECT-TCP.md). Takes effect where the endpoint is
-    /// bound: `synch daemon run`.
+    /// `--no-cache` bucket), and callees for socket invocations (`socket
+    /// connect`), over a direct TCP connection, encrypted under a single-use
+    /// key sent over QUIC, falling back to QUIC wherever that path is not
+    /// there (docs/DIRECT-TCP.md). Takes effect where the endpoint is bound:
+    /// `synch daemon run`.
     #[arg(long, global = true, env = "SYNCH_DIRECT_TCP")]
     pub direct_tcp: bool,
 

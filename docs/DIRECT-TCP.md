@@ -1,7 +1,8 @@
-# Direct-TCP streamed runs
+# Direct-TCP streamed runs and socket streams
 
 Status: **implemented**, opt-in on both ends and off by default; benchmarked
-on loopback only (see [Rollout](#rollout)).
+on loopback only (see [Rollout](#rollout)). Socket invocations use the same
+path under the same flags ([Sockets](#sockets)).
 
 A transient read (`synch cat --no-cache`, a `--no-cache` S3 bucket) asks a
 provider for the rest of the read as one streamed run (`GetStream`, DESIGN.md
@@ -328,6 +329,87 @@ Failure handling separates *transport* faults from *provider* faults:
 A run already resumes from where the read stands, so a fall back mid-run
 re-asks only for what was not yet handed out.
 
+## Sockets
+
+A socket invocation (`docs/SOCKETS.md` §4) is the other long, bulk-capable
+byte stream between two members, and a proxy or an SSH session over one pays
+the same per-packet userspace cost a streamed run did. It takes the same path,
+under the same two flags, with the differences a bidirectional stream needs.
+
+**Negotiation.** A caller that opted in, whose connection's selected path is
+a direct IP path, sends `SockRequest::OpenDirect(open)` — appended after `List`
+— instead of `Open(open)`. The callee admits it exactly as it admits `Open`;
+nothing about which program runs, or for whom, depends on the transport. Then:
+
+- with a listener and a direct path, it answers `SockOpened::Direct { program,
+  program_path, invocation, port, ticket, secret }` — `Ok`'s fields plus an
+  offer — written and read through zeroed buffers like `DirectOffer`;
+- otherwise it answers a plain `Ok`, and the bytes travel on the QUIC stream,
+  as for `Open`. No round trip is lost: the callee decides, in its one answer.
+
+A callee that predates `OpenDirect` cannot decode it and refuses it as a
+malformed frame, under `NoSuchPath`. A caller refused with that code asks
+again with `Open`; if *that* is admitted, the callee is remembered as not
+offering, per peer for ten minutes (a memo of its own, apart from the runs').
+A socket that really does not exist is refused both ways, costing one extra
+round trip and no memo. Every other refusal is final at once.
+
+**Keys.** Five, derived as a run's are, from `secret || ticket ||
+postcard(open, invocation)` — bound to the `Open` that asked and the
+invocation that answered — under labels of their own, so a socket's keys are
+never a run's and the two directions' are never each other's:
+
+```text
+k_hello   = derive_key("synch direct-tcp v1 sock hello",   input)
+k_up      = derive_key("synch direct-tcp v1 sock up",      input)  // caller → callee
+iv_up     = derive_key("synch direct-tcp v1 sock up iv",   input)[0..12]
+k_down    = derive_key("synch direct-tcp v1 sock down",    input)  // callee → caller
+iv_down   = derive_key("synch direct-tcp v1 sock down iv", input)[0..12]
+```
+
+The Hello, the ticket table, the pre-auth bounds and the dialing rule are the
+run's, unchanged: one listener serves both.
+
+**Records, both ways.** Each direction is a sequence of records under its own
+key and counter, in the run's format. A half-close is that direction's `final`
+record followed by a TCP write shutdown; a FIN or reset before it is an error
+on the reading side, never an EOF a program could take for its peer's
+half-close. A write returns once the record it sealed is on the socket, so
+nothing waits on a flush the runtime and the bridges never make. Records carry
+at most 256 KiB, and a write of less goes out at once as a shorter record:
+interactive traffic is not held back to fill one.
+
+**Confirmation.** Once the callee has the authenticated connection, the first
+thing it sends is an empty data record. The caller waits up to 5 s for it
+before handing the stream to anyone. Only the holder of `k_down` can seal it,
+so it proves the far end is the callee rather than whatever else accepted a
+TCP connection on that port — a stale forward, a middlebox — which would
+otherwise leave the caller on a stream nothing will ever write to.
+
+**Fallback.** A port that does not accept, a Hello not taken, or a missing
+confirmation sends the caller back to `Open` on QUIC, remembering the peer for
+ten minutes. It drops the `OpenDirect` stream first, and the callee, which was
+holding the admission while it waited, drops it with nothing run — or, when
+its confirmation was sent and not received in time, ends the invocation it had
+started as one whose caller left. A stream that
+breaks mid-invocation cannot fall back — the program has already seen its
+bytes — and ends as a failed stream does on QUIC.
+
+**Lifetime.** The `OpenDirect` stream stays open, carrying nothing, as the
+invocation's identity; `SockClosed` names it as before. On the callee, the
+connection closing or the caller stopping that stream is the caller having
+gone: it ends the invocation (`Closed{Deadline}`), and a watcher destroys both
+keys and shuts the TCP connection down at once. On the caller, the same
+watcher acts when the QUIC connection closes, so a read waiting on the socket
+fails immediately rather than at the next record. Both halves of a stream must
+be dropped before its QUIC stream is, so a caller that has read the program's
+output to the end can keep writing.
+
+**What is unchanged.** Admission, scope, the concurrency cap, the idle
+deadline, the teardown drain, `List` and the control stream. The runtime sees
+a byte stream, as it did; the bridges (`synch socket connect`, the managed
+gateway) see one too.
+
 ## Security summary
 
 - **Who can read the bytes:** only the two QUIC endpoints. A TCP observer
@@ -353,6 +435,10 @@ re-asks only for what was not yet handed out.
   stream, which `MAX_CONCURRENT_STREAMS` and the binding already bound.
 - **Revocation:** unchanged — per-window checks, and the transfer dies with its
   QUIC stream and connection.
+- **Sockets:** the same properties per direction. Each direction has its own
+  key and counter, a direction ends only at its `final` record, and the
+  callee's confirmation authenticates it to the caller before any byte is
+  trusted to the path.
 
 ## Configuration
 
@@ -360,8 +446,8 @@ Both ends opt in; neither changes behavior for peers that did not.
 
 | Side | Flag | Env | Effect |
 | --- | --- | --- | --- |
-| Provider | `--direct-tcp-listen HOST:PORT` | `SYNCH_DIRECT_TCP_LISTEN` | bind the listener; answer `GetDirect` |
-| Requester | `--direct-tcp` | `SYNCH_DIRECT_TCP` | try the direct path for large transient reads |
+| Provider, callee | `--direct-tcp-listen HOST:PORT` | `SYNCH_DIRECT_TCP_LISTEN` | bind the listener; answer `GetDirect` and `OpenDirect` |
+| Requester, caller | `--direct-tcp` | `SYNCH_DIRECT_TCP` | try the direct path for large transient reads and socket invocations |
 
 Both land in `NetOptions` (`direct_listen: Option<SocketAddr>`,
 `direct_dial: bool`), off by default. The listener is bound in `Net::bind` and
@@ -372,9 +458,14 @@ forward, which is why it is opt-in rather than automatic.
 ## Code map
 
 - `synch-core/src/wire.rs`: `GetDirect`, `DirectOffer`, `DirectSecret`.
+- `synch-core/src/sock.rs`: `SockRequest::OpenDirect`, `SockOpened::Direct`.
 - `synch-net/src/direct.rs`: subkey derivation, the listener with its ticket
   table and pre-auth bounds, Hello, `RecordWriter`/`RecordReader`,
   `DirectSource` and its connection watcher, the per-peer refusal memo.
+- `synch-net/src/direct/stream.rs`: a socket's keys, and the two record halves
+  (`DirectRead`, `DirectWrite`) with their shared watcher and confirmation.
+- `synch-net/src/sock.rs`: `OpenDirect` on both sides; `SockSend`/`SockRecv`,
+  the caller's halves on either path.
 - `synch-net/src/blob.rs`: the `GetDirect` arm (`serve_direct`), the run's
   `Sink` and `Source`, `BlobClient::stream_run_direct`.
 - `synch-net/src/endpoint.rs`: `NetOptions::{direct_listen, direct_dial}`;
@@ -406,6 +497,15 @@ outside the verified core.
 - `a_large_transient_read_streams_intact_with_or_without_a_direct_path` — the
   engine's transient read over TCP from a provider that offers, over QUIC
   from one that does not.
+- `a_direct_stream_carries_both_ways_and_ends_only_at_a_final_record` — both
+  directions with independent half-closes; a FIN without the final record and
+  a flipped bit are failures.
+- `a_socket_stream_goes_direct_where_the_callee_offers_and_on_quic_where_not`.
+- `a_direct_offer_that_cannot_be_taken_up_opens_on_quic` — the untaken
+  admission runs nothing; the peer is remembered.
+- `a_callee_that_cannot_read_open_direct_is_asked_with_open` — and an unknown
+  socket is refused both ways without being remembered.
+- `a_direct_stream_ends_with_its_quic_connection`.
 
 ## Rollout
 
@@ -417,6 +517,9 @@ outside the verified core.
    costing more CPU per byte; otherwise remove it rather than carry an unused
    transport.
 4. If it pays, consider `fetch_into` and replica acquisition next.
+
+Socket streams are not benchmarked separately: per byte they do the run's
+work minus the verification, and an interactive stream's records are small.
 
 ### Loopback results
 

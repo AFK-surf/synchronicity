@@ -1,11 +1,16 @@
 //! Direct-TCP streamed runs (`docs/DIRECT-TCP.md`).
 //!
-//! A [`BlobMessage::GetDirect`] asks for a streamed run to travel over a TCP
-//! connection between the two nodes rather than on the QUIC stream that asked
-//! for it. The provider answers with a [`BlobMessage::DirectOffer`] carrying a
-//! port, a single-use ticket and the run's key; the requester dials that port
-//! on the IP of the QUIC path it already uses, proves it holds the key, and
-//! reads the run as AEAD records.
+//! A [`GetDirect`](synch_core::BlobMessage::GetDirect) asks for a streamed run
+//! to travel over a TCP connection between the two nodes rather than on the
+//! QUIC stream that asked for it. The provider answers with a
+//! [`DirectOffer`](synch_core::BlobMessage::DirectOffer) carrying a port, a
+//! single-use ticket and the run's key; the requester dials that port on the
+//! IP of the QUIC path it already uses, proves it holds the key, and reads the
+//! run as AEAD records.
+//!
+//! A socket invocation asks the same way, in an
+//! [`OpenDirect`](synch_core::SockRequest::OpenDirect), and its bytes then
+//! travel both ways over the connection as records ([`stream`]).
 //!
 //! The key lives exactly as long as the QUIC connection that carried it, and
 //! no longer than the run. On the provider it is held by the control stream's
@@ -28,9 +33,8 @@ use iroh::{
     endpoint::{Connection, RecvStream, SendStream},
     TransportAddr,
 };
-use synch_core::{
-    BlobMessage, DirectSecret, GroupRange, Hash, NodeId, CHUNK_GROUP_SIZE, DIRECT_TICKET_LEN,
-};
+use serde::{de::DeserializeOwned, Serialize};
+use synch_core::{DirectSecret, GroupRange, Hash, NodeId, CHUNK_GROUP_SIZE, DIRECT_TICKET_LEN};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
     net::{TcpListener, TcpStream},
@@ -38,6 +42,8 @@ use tokio::{
 use zeroize::Zeroizing;
 
 use crate::error::NetError;
+
+pub(crate) mod stream;
 
 /// The most plaintext one record carries: 256 KiB, the piece a transient read
 /// hands out, so a record buffer costs what a piece already does.
@@ -80,9 +86,9 @@ const HEADER_LEN: usize = 5;
 const KIND_DATA: u8 = 0;
 const KIND_FINAL: u8 = 1;
 
-/// Room for one framed `DirectOffer`: a length prefix, a variant tag, a port
-/// and the two fixed arrays, with slack for postcard's varints.
-const OFFER_FRAME_MAX: usize = 128;
+/// Room for one `DirectOffer`: a variant tag, a port and the two fixed
+/// arrays, with slack for postcard's varints.
+pub(crate) const OFFER_FRAME_MAX: usize = 124;
 
 const DATA_CONTEXT: &str = "synch direct-tcp v1 data";
 const HELLO_CONTEXT: &str = "synch direct-tcp v1 hello";
@@ -105,6 +111,28 @@ pub(crate) struct RunKeys {
     iv: Zeroizing<[u8; NONCE_LEN]>,
 }
 
+/// What every key of one offer is derived from: its secret, bound to its
+/// ticket and to what was asked for.
+fn key_input(
+    secret: &DirectSecret,
+    ticket: &[u8; DIRECT_TICKET_LEN],
+    asked: &[u8],
+) -> Zeroizing<Vec<u8>> {
+    let mut input = Zeroizing::new(Vec::with_capacity(32 + DIRECT_TICKET_LEN + asked.len()));
+    input.extend_from_slice(secret.expose());
+    input.extend_from_slice(ticket);
+    input.extend_from_slice(asked);
+    input
+}
+
+/// A record nonce base, derived under `context`.
+fn derive_iv(context: &str, input: &[u8]) -> Zeroizing<[u8; NONCE_LEN]> {
+    let iv = Zeroizing::new(blake3::derive_key(context, input));
+    let mut nonce = Zeroizing::new([0u8; NONCE_LEN]);
+    nonce.copy_from_slice(&iv[..NONCE_LEN]);
+    nonce
+}
+
 impl RunKeys {
     pub(crate) fn derive(
         secret: &DirectSecret,
@@ -113,17 +141,11 @@ impl RunKeys {
         run: GroupRange,
     ) -> RunKeys {
         let asked = postcard::to_stdvec(&(root, run)).expect("a hash and a range encode");
-        let mut input = Zeroizing::new(Vec::with_capacity(32 + DIRECT_TICKET_LEN + asked.len()));
-        input.extend_from_slice(secret.expose());
-        input.extend_from_slice(ticket);
-        input.extend_from_slice(&asked);
-        let iv = Zeroizing::new(blake3::derive_key(IV_CONTEXT, &input));
-        let mut nonce = [0u8; NONCE_LEN];
-        nonce.copy_from_slice(&iv[..NONCE_LEN]);
+        let input = key_input(secret, ticket, &asked);
         RunKeys {
             data: Zeroizing::new(blake3::derive_key(DATA_CONTEXT, &input)),
             hello: Zeroizing::new(blake3::derive_key(HELLO_CONTEXT, &input)),
-            iv: Zeroizing::new(nonce),
+            iv: derive_iv(IV_CONTEXT, &input),
         }
     }
 
@@ -209,18 +231,20 @@ pub(crate) fn direct_path(connection: &Connection) -> Option<SocketAddr> {
         })
 }
 
-/// Writes a `DirectOffer` as one frame, serialized into a buffer that is
-/// zeroed afterwards rather than one left to the allocator.
+/// Writes a message carrying an offer as one frame of at most `max` bytes,
+/// serialized into a buffer that is zeroed afterwards rather than one left to
+/// the allocator.
 ///
 /// The QUIC stack's own send and retransmit buffers hold a copy until the
 /// peer acknowledges it, and those are beyond reach from here: this is
 /// hygiene, not a guarantee. The process's memory is inside the trust
 /// boundary either way.
-pub(crate) async fn write_offer(
+pub(crate) async fn write_offer<T: Serialize>(
     send: &mut SendStream,
-    offer: &BlobMessage,
+    offer: &T,
+    max: usize,
 ) -> Result<(), NetError> {
-    let mut frame = Zeroizing::new([0u8; OFFER_FRAME_MAX]);
+    let mut frame = Zeroizing::new(vec![0u8; 4 + max]);
     let len = postcard::to_slice(offer, &mut frame[4..])
         .map_err(|e| NetError::Encode(e.to_string()))?
         .len();
@@ -229,10 +253,13 @@ pub(crate) async fn write_offer(
     Ok(())
 }
 
-/// Reads the answer to a `GetDirect`: the offer, or `None` when the provider
-/// ended the stream without one. Decoded out of a buffer that is zeroed
-/// afterwards, like the one it was written from.
-pub(crate) async fn read_offer(recv: &mut RecvStream) -> Result<Option<BlobMessage>, NetError> {
+/// Reads the answer to a request for an offer, at most `max` bytes, or `None`
+/// when the peer ended the stream without one. Decoded out of a buffer that
+/// is zeroed afterwards, like the one it was written from.
+pub(crate) async fn read_offer<T: DeserializeOwned>(
+    recv: &mut RecvStream,
+    max: usize,
+) -> Result<Option<T>, NetError> {
     let mut prefix = [0u8; 4];
     match recv.read_exact(&mut prefix).await {
         Ok(()) => {}
@@ -240,12 +267,12 @@ pub(crate) async fn read_offer(recv: &mut RecvStream) -> Result<Option<BlobMessa
         Err(e) => return Err(e.into()),
     }
     let len = u32::from_le_bytes(prefix) as usize;
-    if len > OFFER_FRAME_MAX - 4 {
+    if len > max {
         return Err(NetError::FrameTooLarge(len));
     }
-    let mut frame = Zeroizing::new([0u8; OFFER_FRAME_MAX]);
-    recv.read_exact(&mut frame[..len]).await?;
-    postcard::from_bytes(&frame[..len])
+    let mut frame = Zeroizing::new(vec![0u8; len]);
+    recv.read_exact(&mut frame).await?;
+    postcard::from_bytes(&frame)
         .map(Some)
         .map_err(|e| NetError::Decode(e.to_string()))
 }

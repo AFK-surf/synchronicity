@@ -1359,7 +1359,12 @@ QUIC stream that asked stays open as the run's identity on the provider, so
 the run keeps its stream's concurrency slot, progress deadline and per-window
 checks, and the key lives no longer than the QUIC connection on either side.
 A provider that makes no offer, a port that does not accept, a damaged record
-or a stall sends the read back to `GetStream` from the same provider.
+or a stall sends the read back to `GetStream` from the same provider. Socket
+invocations take the same path under the same flags: an `OpenDirect` is
+admitted as an `Open` is, answered with an offer in its `Opened`, and its
+bytes travel both ways as records under a key per direction, confirmed by the
+callee before the caller uses them; a callee without the path answers a plain
+`Ok` on QUIC.
 
 This is intentionally the same shape as iroh-blobs' protocol; we keep our own ALPN and
 message frame so the availability semantics (partial serving, `SliceEnd`) stay under
