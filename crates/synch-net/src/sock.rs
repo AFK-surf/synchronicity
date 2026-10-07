@@ -22,8 +22,16 @@
 //! the handshake is covered by the shared accept path's per-stream timeout
 //! and per-connection in-flight cap, and the bound ends the moment the
 //! invocation is admitted.
+//!
+//! Where both nodes opted in, an invocation's bytes travel over a direct TCP
+//! connection rather than its QUIC stream (`docs/DIRECT-TCP.md`, "Sockets"):
+//! the caller asks with `OpenDirect`, the callee offers a ticket and a key in
+//! its answer, and the QUIC stream stays open, carrying nothing, as the
+//! invocation's identity. Everything else here — admission, the control
+//! stream, the caller's departure — is the same on either path.
 
 use std::{
+    net::SocketAddr,
     sync::{
         atomic::{AtomicBool, AtomicUsize, Ordering},
         Arc,
@@ -36,13 +44,25 @@ use iroh::{
     protocol::{AcceptError, ProtocolHandler},
 };
 use synch_core::{
-    NodeId, RefuseCode, SockClosed, SockEntry, SockListed, SockOpen, SockOpened, SockRequest,
-    SockStatus, MAX_OPEN_FRAME_LEN,
+    DirectSecret, NodeId, RefuseCode, SockClosed, SockEntry, SockListed, SockOpen, SockOpened,
+    SockRequest, SockStatus, MAX_OPENED_FRAME_LEN, MAX_OPEN_FRAME_LEN,
 };
 use synch_sock::{Admission, DuplexStream};
 use synch_store::Store;
+use tokio::{
+    io::{AsyncRead, AsyncWrite, ReadBuf},
+    net::TcpStream,
+};
 
-use crate::{error::NetError, frame, serve::MAX_CONCURRENT_STREAMS};
+use crate::{
+    direct::{
+        stream::{DirectRead, DirectWrite, SockKeys, CONFIRM_TIMEOUT},
+        DirectListener, DirectMemo, RecordKey,
+    },
+    error::NetError,
+    frame,
+    serve::MAX_CONCURRENT_STREAMS,
+};
 
 /// Makes the control uni-stream observable before the first invocation ends.
 /// QUIC does not announce an opened uni-stream to its receiver until bytes are
@@ -117,6 +137,17 @@ pub(crate) struct SockProtocol {
     /// requests. What the gate is for is the unbounded thing — the store call
     /// an unauthenticated dialer reaches by completing a handshake.
     inflight: crate::serve::Inflight,
+    /// The direct-TCP listener, when this node offers direct streams
+    /// (`docs/DIRECT-TCP.md`).
+    direct: Option<Arc<DirectListener>>,
+}
+
+/// An invocation's TCP connection, authenticated and handed over, with the
+/// keys it reads and writes under.
+struct Accepted {
+    socket: TcpStream,
+    read: RecordKey,
+    write: RecordKey,
 }
 
 #[derive(Debug, Default)]
@@ -212,7 +243,14 @@ impl SockProtocol {
             state: Arc::new(ProtocolState::default()),
             open_timeout,
             inflight: None,
+            direct: None,
         }
+    }
+
+    /// Answers `OpenDirect` with offers on `listener`.
+    pub(crate) fn direct(mut self, listener: Option<Arc<DirectListener>>) -> Self {
+        self.direct = listener;
+        self
     }
 
     /// Gates this handler's accept path on the endpoint-wide semaphore.
@@ -348,14 +386,16 @@ impl ProtocolHandler for SockProtocol {
                 // dropped after `open_timeout`, permit and all. What is
                 // dropped is a stream that was never an invocation — nothing
                 // is on the control stream for it, and nothing is owed.
-                let admission = match tokio::time::timeout(
+                let (admission, direct) = match tokio::time::timeout(
                     handler.open_timeout,
-                    handler.open_stream(remote, addr, this_index, &mut send, &mut recv),
+                    handler.open_stream(remote, addr, this_index, &conn, &mut send, &mut recv),
                 )
                 .await
                 {
-                    Ok(Some(admission)) => admission,
-                    Ok(None) => return, // a refusal is already on the wire
+                    Ok(Some(admitted)) => admitted,
+                    // A refusal is already on the wire, or an offer the
+                    // caller did not take up.
+                    Ok(None) => return,
                     Err(_) => {
                         tracing::debug!(
                             peer = %remote.fmt_short(),
@@ -373,15 +413,47 @@ impl ProtocolHandler for SockProtocol {
                 // watcher only sends: the invocation's ending status is the
                 // same non-fault `Deadline` a failed stream produces, and the
                 // receiver lives or dies with the run below.
+                //
+                // On the direct path the QUIC stream carries nothing, so the
+                // caller stopping it is the other way it says it has gone, and
+                // the same event destroys the stream's keys.
+                let peer_gone = caller_gone(conn.clone(), direct.is_some().then(|| send.stopped()));
+                let stream = match direct {
+                    Some(accepted) => {
+                        let stream_gone = caller_gone(conn.clone(), Some(send.stopped()));
+                        let split = crate::direct::stream::split(
+                            accepted.socket,
+                            accepted.read,
+                            accepted.write,
+                            stream_gone,
+                            (send, recv),
+                        );
+                        let confirmed = match split {
+                            Ok((read, mut write)) => match write.confirm().await {
+                                Ok(()) => Ok((read, write)),
+                                Err(e) => Err(NetError::Direct(format!("confirming: {e}"))),
+                            },
+                            Err(e) => Err(e),
+                        };
+                        match confirmed {
+                            Ok((read, write)) => DuplexStream::new(read, write),
+                            Err(e) => {
+                                tracing::debug!(
+                                    peer = %remote.fmt_short(),
+                                    "direct socket stream failed: {e}"
+                                );
+                                return;
+                            }
+                        }
+                    }
+                    None => DuplexStream::new(recv, send),
+                };
                 let (peer_gone_tx, peer_gone_rx) = tokio::sync::oneshot::channel();
                 let watcher = tokio::spawn(async move {
-                    let _ = conn.closed().await;
+                    peer_gone.await;
                     let _ = peer_gone_tx.send(SockStatus::Deadline);
                 });
-                let status = handler
-                    .service
-                    .run(admission, DuplexStream::new(recv, send), peer_gone_rx)
-                    .await;
+                let status = handler.service.run(admission, stream, peer_gone_rx).await;
                 watcher.abort();
                 let mut control = control.lock().await;
                 let _ = frame::write_frame(&mut control, &SockClosed { stream_id, status }).await;
@@ -402,11 +474,13 @@ impl SockProtocol {
     /// The request handshake: read the frame, then admit and answer, or list
     /// and answer.
     ///
-    /// Returns the admission, or `None` when the stream never became an
-    /// invocation — a refusal, or a `List` reply, is already on the wire in
-    /// its own frame, and repeating it as a status would say the same thing
-    /// twice in two vocabularies. This is the phase the caller's timeout and
-    /// in-flight permit cover: a stream that never completes it has no
+    /// Returns the admission, with its TCP connection when its bytes travel
+    /// over one, or `None` when the stream never became an invocation — a
+    /// refusal, or a `List` reply, is already on the wire in its own frame,
+    /// and repeating it as a status would say the same thing twice in two
+    /// vocabularies. So is a direct offer the caller never took up: nothing
+    /// ran, and the caller asks again. This is the phase the caller's timeout
+    /// and in-flight permit cover: a stream that never completes it has no
     /// runtime of its own, so it must not own a task for as long as the peer
     /// likes.
     async fn open_stream(
@@ -414,9 +488,10 @@ impl SockProtocol {
         peer: NodeId,
         addr: String,
         index: u64,
+        connection: &Connection,
         send: &mut iroh::endpoint::SendStream,
         recv: &mut iroh::endpoint::RecvStream,
-    ) -> Option<Admission> {
+    ) -> Option<(Admission, Option<Accepted>)> {
         let request = match tokio::select! {
             _ = self.state.cancelled() => {
                 let _ = frame::write_frame(
@@ -446,8 +521,9 @@ impl SockProtocol {
                 return None;
             }
         };
-        let open = match request {
-            SockRequest::Open(open) => open,
+        let (open, wants_direct) = match request {
+            SockRequest::Open(open) => (open, false),
+            SockRequest::OpenDirect(open) => (open, true),
             SockRequest::List => {
                 let sockets = tokio::select! {
                     _ = self.state.cancelled() => Vec::new(),
@@ -486,6 +562,17 @@ impl SockProtocol {
             }
         };
 
+        if wants_direct {
+            if let Some(listener) = &self.direct {
+                if crate::direct::direct_path(connection).is_some() {
+                    let accepted = self
+                        .offer_direct(listener, connection, send, &open, &admission)
+                        .await;
+                    return accepted.map(|accepted| (admission, Some(accepted)));
+                }
+            }
+        }
+
         let accepted = SockOpened::Ok {
             program: admission.program_root,
             program_path: admission.program_path.clone(),
@@ -494,7 +581,79 @@ impl SockProtocol {
         if frame::write_frame(send, &accepted).await.is_err() {
             return None;
         }
-        Some(admission)
+        Some((admission, None))
+    }
+
+    /// Answers an admitted `OpenDirect` with an offer and waits for the
+    /// caller's TCP connection, as a streamed run's provider does.
+    ///
+    /// `None` when the caller did not take the offer up — its connection
+    /// never came, it stopped the stream, the QUIC connection closed, the
+    /// node began shutting down — and then the admission is dropped with
+    /// nothing run. The key and the ticket live in this future until the
+    /// connection is handed over, and are dropped with it otherwise.
+    async fn offer_direct(
+        &self,
+        listener: &DirectListener,
+        connection: &Connection,
+        send: &mut iroh::endpoint::SendStream,
+        open: &SockOpen,
+        admission: &Admission,
+    ) -> Option<Accepted> {
+        let drawn = crate::direct::draw().and_then(|ticket| {
+            let secret = DirectSecret::from_bytes(crate::direct::draw()?);
+            let keys = SockKeys::derive(&secret, &ticket, open, admission.id)?;
+            Ok((ticket, secret, keys))
+        });
+        let (ticket, secret, keys) = match drawn {
+            Ok(drawn) => drawn,
+            Err(e) => {
+                tracing::warn!("no direct offer for a socket: {e}");
+                return None;
+            }
+        };
+        let (ticket_held, delivered) = listener.register(ticket, keys.hello);
+        let offer = SockOpened::Direct {
+            program: admission.program_root,
+            program_path: admission.program_path.clone(),
+            invocation: admission.id,
+            port: listener.port(),
+            ticket,
+            secret,
+        };
+        crate::direct::write_offer(send, &offer, MAX_OPENED_FRAME_LEN)
+            .await
+            .ok()?;
+        drop(offer);
+
+        let socket = tokio::select! {
+            delivered = tokio::time::timeout(crate::direct::accept_timeout(), delivered) => {
+                delivered.ok()?.ok()?
+            }
+            _ = send.stopped() => return None,
+            _ = connection.closed() => return None,
+            _ = self.state.cancelled() => return None,
+        };
+        drop(ticket_held);
+        Some(Accepted {
+            socket,
+            read: keys.up,
+            write: keys.down,
+        })
+    }
+}
+
+/// Resolves when the caller has gone: its connection closed, or — when given
+/// the invocation's stream being stopped — it dropped that stream.
+async fn caller_gone<F: std::future::Future>(connection: Connection, stopped: Option<F>) {
+    match stopped {
+        Some(stopped) => tokio::select! {
+            _ = connection.closed() => {}
+            _ = stopped => {}
+        },
+        None => {
+            connection.closed().await;
+        }
     }
 }
 
@@ -519,6 +678,9 @@ async fn read_request(recv: &mut iroh::endpoint::RecvStream) -> Result<SockReque
 #[derive(Debug)]
 pub struct SockClient {
     connection: Connection,
+    /// Present when this node asks for direct streams, with the peers whose
+    /// direct path did not work (`docs/DIRECT-TCP.md`).
+    direct: Option<Arc<DirectMemo>>,
 }
 
 /// A live invocation on the caller's side.
@@ -533,9 +695,107 @@ pub struct SockStream {
     /// The callee's id for this invocation.
     pub invocation: u64,
     /// Bytes to the program.
-    pub send: iroh::endpoint::SendStream,
+    pub send: SockSend,
     /// Bytes from the program.
-    pub recv: iroh::endpoint::RecvStream,
+    pub recv: SockRecv,
+}
+
+impl SockStream {
+    /// Whether the bytes travel over a direct TCP connection rather than the
+    /// QUIC stream (`docs/DIRECT-TCP.md`).
+    pub fn is_direct(&self) -> bool {
+        matches!(self.recv, SockRecv::Direct(_))
+    }
+}
+
+/// Bytes to the program: the invocation's QUIC stream, or its direct TCP
+/// connection. Shutting it down is the half-close the program reads as EOF.
+#[derive(Debug)]
+pub enum SockSend {
+    /// On the QUIC stream.
+    Quic(iroh::endpoint::SendStream),
+    /// Sealed into records on the direct connection.
+    Direct(DirectSend),
+}
+
+/// Bytes from the program: the invocation's QUIC stream, or its direct TCP
+/// connection.
+#[derive(Debug)]
+pub enum SockRecv {
+    /// On the QUIC stream.
+    Quic(iroh::endpoint::RecvStream),
+    /// Opened from records on the direct connection.
+    Direct(DirectRecv),
+}
+
+/// The writing half of a direct socket stream.
+#[derive(Debug)]
+pub struct DirectSend(Box<DirectWrite>);
+
+/// The reading half of a direct socket stream.
+#[derive(Debug)]
+pub struct DirectRecv(Box<DirectRead>);
+
+impl AsyncWrite for SockSend {
+    fn poll_write(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &[u8],
+    ) -> std::task::Poll<std::io::Result<usize>> {
+        match self.get_mut() {
+            // The trait's, not the stream's own `poll_write`, which reports
+            // a QUIC error rather than an I/O one.
+            SockSend::Quic(send) => AsyncWrite::poll_write(std::pin::Pin::new(send), cx, buf),
+            SockSend::Direct(DirectSend(send)) => {
+                std::pin::Pin::new(&mut **send).poll_write(cx, buf)
+            }
+        }
+    }
+
+    fn poll_flush(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            SockSend::Quic(send) => std::pin::Pin::new(send).poll_flush(cx),
+            SockSend::Direct(DirectSend(send)) => std::pin::Pin::new(&mut **send).poll_flush(cx),
+        }
+    }
+
+    fn poll_shutdown(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            SockSend::Quic(send) => std::pin::Pin::new(send).poll_shutdown(cx),
+            SockSend::Direct(DirectSend(send)) => std::pin::Pin::new(&mut **send).poll_shutdown(cx),
+        }
+    }
+}
+
+impl AsyncRead for SockRecv {
+    fn poll_read(
+        self: std::pin::Pin<&mut Self>,
+        cx: &mut std::task::Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> std::task::Poll<std::io::Result<()>> {
+        match self.get_mut() {
+            SockRecv::Quic(recv) => AsyncRead::poll_read(std::pin::Pin::new(recv), cx, buf),
+            SockRecv::Direct(DirectRecv(recv)) => {
+                std::pin::Pin::new(&mut **recv).poll_read(cx, buf)
+            }
+        }
+    }
+}
+
+/// How an `OpenDirect` went.
+enum Direct {
+    /// An invocation, over TCP or — when the callee could not offer — QUIC.
+    Opened(SockStream),
+    /// The callee refused it, or could not read it.
+    Refused(Refused),
+    /// The callee offered, and its offer could not be taken up.
+    Unreachable(NetError),
 }
 
 /// Why an `Open` did not become an invocation.
@@ -551,13 +811,61 @@ pub struct Refused {
 impl SockClient {
     /// Wraps an established connection on this ALPN.
     pub fn new(connection: Connection) -> Self {
-        SockClient { connection }
+        SockClient {
+            connection,
+            direct: None,
+        }
+    }
+
+    /// The same client, asking for direct streams where it can.
+    pub(crate) fn with_direct(mut self, memo: Option<Arc<DirectMemo>>) -> Self {
+        self.direct = memo;
+        self
     }
 
     /// Opens one invocation.
+    ///
+    /// Over a direct TCP connection when this node asks for them, the callee
+    /// offers one, and the connection has a direct path to dial
+    /// (`docs/DIRECT-TCP.md`); on the QUIC stream otherwise. A callee whose
+    /// offer could not be taken up, or that predates direct streams, is asked
+    /// again on QUIC, and not asked for a direct stream for a while.
     pub async fn open(&self, open: &SockOpen) -> Result<Result<SockStream, Refused>, NetError> {
         open.validate()
             .map_err(|e| NetError::Unexpected(e.to_string()))?;
+        let peer = self.connection.remote_id();
+        let direct = self
+            .direct
+            .as_ref()
+            .filter(|memo| !memo.refused(&peer))
+            .and_then(|memo| Some((memo, crate::direct::direct_path(&self.connection)?)));
+        let Some((memo, addr)) = direct else {
+            return self.open_quic(open).await;
+        };
+        match self.open_direct(open, addr).await? {
+            Direct::Opened(stream) => Ok(Ok(stream)),
+            // A callee that cannot decode `OpenDirect` refuses it as a
+            // malformed frame, under the code an unknown socket gets. Asking
+            // again with `Open` tells the two apart: a callee that admits
+            // the same socket that way is one to stop asking.
+            Direct::Refused(refused) if refused.code == RefuseCode::NoSuchPath => {
+                let answer = self.open_quic(open).await?;
+                if answer.is_ok() {
+                    memo.refuse(peer);
+                }
+                Ok(answer)
+            }
+            Direct::Refused(refused) => Ok(Err(refused)),
+            Direct::Unreachable(error) => {
+                tracing::debug!(peer = %peer.fmt_short(), "no direct socket stream: {error}");
+                memo.refuse(peer);
+                self.open_quic(open).await
+            }
+        }
+    }
+
+    /// Opens one invocation on its QUIC stream.
+    async fn open_quic(&self, open: &SockOpen) -> Result<Result<SockStream, Refused>, NetError> {
         let (mut send, mut recv) = self
             .connection
             .open_bi()
@@ -575,11 +883,100 @@ impl SockClient {
                 program,
                 program_path,
                 invocation,
-                send,
-                recv,
+                send: SockSend::Quic(send),
+                recv: SockRecv::Quic(recv),
             })),
             SockOpened::Refused { code, message } => Ok(Err(Refused { code, message })),
+            SockOpened::Direct { .. } => Err(NetError::Unexpected(
+                "the callee offered a direct stream that was not asked for".into(),
+            )),
         }
+    }
+
+    /// Asks for one invocation over a direct TCP connection to `addr`'s IP,
+    /// and takes up the offer if one comes.
+    ///
+    /// The offer's key arrives on this connection and lives no longer than
+    /// it: closing the connection, or the callee dropping the invocation's
+    /// stream, destroys the key and fails the stream.
+    async fn open_direct(&self, open: &SockOpen, mut addr: SocketAddr) -> Result<Direct, NetError> {
+        let (mut send, mut recv) = self
+            .connection
+            .open_bi()
+            .await
+            .map_err(|e| NetError::Unexpected(e.to_string()))?;
+        frame::write_frame(&mut send, &SockRequest::OpenDirect(open.clone())).await?;
+
+        let answer = crate::direct::read_offer(&mut recv, MAX_OPENED_FRAME_LEN)
+            .await?
+            .ok_or_else(|| NetError::Read("the callee answered nothing".into()))?;
+        let (program, program_path, invocation, port, ticket, secret) = match answer {
+            SockOpened::Ok {
+                program,
+                program_path,
+                invocation,
+            } => {
+                return Ok(Direct::Opened(SockStream {
+                    program,
+                    program_path,
+                    invocation,
+                    send: SockSend::Quic(send),
+                    recv: SockRecv::Quic(recv),
+                }))
+            }
+            SockOpened::Refused { code, message } => {
+                return Ok(Direct::Refused(Refused { code, message }))
+            }
+            SockOpened::Direct {
+                program,
+                program_path,
+                invocation,
+                port,
+                ticket,
+                secret,
+            } => (program, program_path, invocation, port, ticket, secret),
+        };
+        let keys = SockKeys::derive(&secret, &ticket, open, invocation)?;
+        drop(secret);
+        addr.set_port(port);
+        // Dropping the stream on the way out stops it, which drops the
+        // admission on the callee before anything runs.
+        let socket = match crate::direct::dial(addr, &ticket, &keys.hello).await {
+            Ok(socket) => socket,
+            Err(error) => return Ok(Direct::Unreachable(error)),
+        };
+        let gone = {
+            let connection = self.connection.clone();
+            async move {
+                connection.closed().await;
+            }
+        };
+        let (mut read, write) =
+            match crate::direct::stream::split(socket, keys.down, keys.up, gone, (send, recv)) {
+                Ok(halves) => halves,
+                Err(error) => return Ok(Direct::Unreachable(error)),
+            };
+        match tokio::time::timeout(CONFIRM_TIMEOUT, read.confirmed()).await {
+            Ok(Ok(())) => {}
+            Ok(Err(error)) => {
+                return Ok(Direct::Unreachable(NetError::Direct(format!(
+                    "the stream was not confirmed: {error}"
+                ))))
+            }
+            Err(_) => {
+                return Ok(Direct::Unreachable(NetError::Direct(format!(
+                    "the stream was not confirmed within {}s",
+                    CONFIRM_TIMEOUT.as_secs()
+                ))))
+            }
+        }
+        Ok(Direct::Opened(SockStream {
+            program,
+            program_path,
+            invocation,
+            send: SockSend::Direct(DirectSend(Box::new(write))),
+            recv: SockRecv::Direct(DirectRecv(Box::new(read))),
+        }))
     }
 
     /// Asks which sockets this caller may open (`docs/SOCKET-PROGRAMS.md` §5).
@@ -676,6 +1073,28 @@ mod tests {
         release: tokio::sync::Notify,
     }
 
+    fn admission(peer: NodeId, addr: String, stream_index: u64, open: &SockOpen) -> Admission {
+        Admission {
+            program: Arc::new(Vec::new()),
+            program_root: Hash::EMPTY,
+            program_path: "code/hold.o".into(),
+            socket: SocketId::new(&open.socket),
+            peer: PeerIdentity {
+                origin: OriginId::Key(peer),
+                device_key: peer,
+                spaces: None,
+                addr,
+                stream_index,
+            },
+            policy: EffectivePolicy::default(),
+            meta: open.meta.clone(),
+            self_origin: open.origin.clone(),
+            host: Arc::new(NoTree),
+            id: 7,
+            slot: None,
+        }
+    }
+
     #[async_trait::async_trait]
     impl SocketService for ShutdownService {
         async fn admit(
@@ -685,25 +1104,7 @@ mod tests {
             stream_index: u64,
             open: &SockOpen,
         ) -> Result<Admission, (RefuseCode, String)> {
-            Ok(Admission {
-                program: Arc::new(Vec::new()),
-                program_root: Hash::EMPTY,
-                program_path: "code/hold.o".into(),
-                socket: SocketId::new(&open.socket),
-                peer: PeerIdentity {
-                    origin: OriginId::Key(peer),
-                    device_key: peer,
-                    spaces: None,
-                    addr,
-                    stream_index,
-                },
-                policy: EffectivePolicy::default(),
-                meta: open.meta.clone(),
-                self_origin: open.origin.clone(),
-                host: Arc::new(NoTree),
-                id: 7,
-                slot: None,
-            })
+            Ok(admission(peer, addr, stream_index, open))
         }
 
         async fn list(&self, _peer: NodeId) -> Vec<synch_core::SockEntry> {
@@ -764,6 +1165,250 @@ mod tests {
 
         drop(stream);
         drop(control);
+        drop(socket);
+        client.shutdown().await.unwrap();
+        server.shutdown().await.unwrap();
+    }
+
+    /// Echoes what it reads until EOF, then half-closes; or ends when its
+    /// caller goes. Refuses its first `refuse` admissions as an unknown
+    /// socket, as a callee that cannot read `OpenDirect` refuses that.
+    #[derive(Debug, Default)]
+    struct EchoService {
+        refuse: AtomicUsize,
+        admitted: AtomicUsize,
+        ended: AtomicUsize,
+    }
+
+    #[async_trait::async_trait]
+    impl SocketService for EchoService {
+        async fn admit(
+            &self,
+            peer: NodeId,
+            addr: String,
+            stream_index: u64,
+            open: &SockOpen,
+        ) -> Result<Admission, (RefuseCode, String)> {
+            let refuse = self
+                .refuse
+                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1));
+            if refuse.is_ok() {
+                return Err((RefuseCode::NoSuchPath, "malformed request".into()));
+            }
+            self.admitted.fetch_add(1, Ordering::AcqRel);
+            Ok(admission(peer, addr, stream_index, open))
+        }
+
+        async fn list(&self, _peer: NodeId) -> Vec<synch_core::SockEntry> {
+            Vec::new()
+        }
+
+        async fn run(
+            &self,
+            _admission: Admission,
+            stream: DuplexStream,
+            peer_gone: tokio::sync::oneshot::Receiver<SockStatus>,
+        ) -> SockStatus {
+            use tokio::io::AsyncWriteExt;
+            let DuplexStream {
+                mut reader,
+                mut writer,
+            } = stream;
+            let status = tokio::select! {
+                copied = tokio::io::copy(&mut reader, &mut writer) => match copied {
+                    Ok(n) => match writer.shutdown().await {
+                        Ok(()) => SockStatus::Ok(n as i64),
+                        Err(_) => SockStatus::Deadline,
+                    },
+                    Err(_) => SockStatus::Deadline,
+                },
+                gone = peer_gone => gone.unwrap_or(SockStatus::Deadline),
+            };
+            self.ended.fetch_add(1, Ordering::AcqRel);
+            status
+        }
+    }
+
+    /// A callee serving `service`, offering direct streams when `offers`,
+    /// and a caller connected to it that asks for them.
+    async fn direct_pair(
+        service: Arc<EchoService>,
+        offers: bool,
+    ) -> (
+        crate::endpoint::Net,
+        crate::endpoint::Net,
+        tempfile::TempDir,
+        tempfile::TempDir,
+        SockClient,
+        Arc<DirectMemo>,
+    ) {
+        let (server_dir, store) = test_store();
+        let options = NetOptions {
+            sockets: Some(service),
+            direct_listen: offers.then(|| "127.0.0.1:0".parse().unwrap()),
+            ..NetOptions::loopback()
+        };
+        let (server, client, client_dir) = trusting_pair(store, options).await;
+        let memo = Arc::new(DirectMemo::default());
+        let socket = client
+            .connect_sock(server.direct_addr())
+            .await
+            .unwrap()
+            .with_direct(Some(memo.clone()));
+        (server, client, server_dir, client_dir, socket, memo)
+    }
+
+    /// Writes `sent` and half-closes while reading everything back.
+    async fn echo(stream: SockStream, sent: &[u8]) -> Vec<u8> {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let SockStream {
+            mut send, mut recv, ..
+        } = stream;
+        let (written, echoed) = tokio::join!(
+            async {
+                send.write_all(sent).await?;
+                send.shutdown().await
+            },
+            async {
+                let mut echoed = Vec::new();
+                recv.read_to_end(&mut echoed).await.map(|_| echoed)
+            }
+        );
+        written.unwrap();
+        echoed.unwrap()
+    }
+
+    /// Waits up to five seconds for `done` to hold.
+    async fn eventually(mut done: impl FnMut() -> bool) -> bool {
+        for _ in 0..500 {
+            if done() {
+                return true;
+            }
+            tokio::time::sleep(Duration::from_millis(10)).await;
+        }
+        done()
+    }
+
+    /// An invocation's bytes go over TCP where the callee offers it, and on
+    /// the QUIC stream where it does not — the same bytes, the same
+    /// half-close, the same status either way, and a callee that answers on
+    /// QUIC is asked again next time.
+    #[tokio::test]
+    async fn a_socket_stream_goes_direct_where_the_callee_offers_and_on_quic_where_not() {
+        let sent: Vec<u8> = (0..crate::direct::RECORD_LEN * 3 + 1000)
+            .map(|i| (i % 251) as u8)
+            .collect();
+        for offers in [true, false] {
+            let (server, client, _server_dir, _client_dir, socket, memo) =
+                direct_pair(Arc::new(EchoService::default()), offers).await;
+            let mut control = socket.control().await.unwrap();
+            let open = SockOpen::new(OriginId::Key(server.id()), "echo", vec![]);
+            let stream = socket.open(&open).await.unwrap().unwrap();
+            assert_eq!(stream.is_direct(), offers);
+            assert_eq!(stream.program_path, "code/hold.o");
+
+            assert!(echo(stream, &sent).await == sent);
+            let closed = socket.next_closed(&mut control).await.unwrap();
+            assert_eq!(closed.status, SockStatus::Ok(sent.len() as i64));
+            assert!(!memo.refused(&server.id()));
+
+            drop(control);
+            drop(socket);
+            client.shutdown().await.unwrap();
+            server.shutdown().await.unwrap();
+        }
+    }
+
+    /// An offer the caller cannot take up — the port does not accept — costs
+    /// one try: the admission it held is dropped with nothing run, the same
+    /// socket opens on QUIC, and the caller stops asking that callee.
+    #[tokio::test]
+    async fn a_direct_offer_that_cannot_be_taken_up_opens_on_quic() {
+        let service = Arc::new(EchoService::default());
+        let (server, client, _server_dir, _client_dir, socket, memo) =
+            direct_pair(service.clone(), true).await;
+        let port = server.direct_port().unwrap();
+        server.stop_direct();
+        assert!(
+            eventually(|| std::net::TcpStream::connect(("127.0.0.1", port)).is_err()).await,
+            "the stopped listener still accepts"
+        );
+
+        let open = SockOpen::new(OriginId::Key(server.id()), "echo", vec![]);
+        let stream = socket.open(&open).await.unwrap().unwrap();
+        assert!(!stream.is_direct());
+        assert!(echo(stream, b"over quic").await == b"over quic");
+        assert!(memo.refused(&server.id()));
+        assert_eq!(service.admitted.load(Ordering::Acquire), 2);
+        assert!(
+            eventually(|| service.ended.load(Ordering::Acquire) == 1).await,
+            "only the invocation that was taken up ran"
+        );
+        assert_eq!(server.direct_pending(), 0);
+
+        drop(socket);
+        client.shutdown().await.unwrap();
+        server.shutdown().await.unwrap();
+    }
+
+    /// A callee that cannot read `OpenDirect` refuses it as a malformed
+    /// frame, under the code an unknown socket gets: asked again with `Open`,
+    /// it admits the socket, and is not asked for a direct stream again. A
+    /// socket that really is unknown is refused both ways, and that is no
+    /// reason to stop asking.
+    #[tokio::test]
+    async fn a_callee_that_cannot_read_open_direct_is_asked_with_open() {
+        let service = Arc::new(EchoService::default());
+        let (server, client, _server_dir, _client_dir, socket, memo) =
+            direct_pair(service.clone(), true).await;
+        let open = SockOpen::new(OriginId::Key(server.id()), "echo", vec![]);
+
+        service.refuse.store(2, Ordering::Release);
+        let refused = socket.open(&open).await.unwrap().unwrap_err();
+        assert_eq!(refused.code, RefuseCode::NoSuchPath);
+        assert!(!memo.refused(&server.id()));
+
+        service.refuse.store(1, Ordering::Release);
+        let stream = socket.open(&open).await.unwrap().unwrap();
+        assert!(!stream.is_direct());
+        assert!(echo(stream, b"old callee").await == b"old callee");
+        assert!(memo.refused(&server.id()));
+
+        drop(socket);
+        client.shutdown().await.unwrap();
+        server.shutdown().await.unwrap();
+    }
+
+    /// A direct stream lives no longer than the QUIC connection that carried
+    /// its keys: when it closes, a read waiting on the TCP connection fails
+    /// at once — never an EOF the caller could take for the program's — and
+    /// the callee's invocation ends.
+    #[tokio::test]
+    async fn a_direct_stream_ends_with_its_quic_connection() {
+        use tokio::io::AsyncReadExt;
+        let service = Arc::new(EchoService::default());
+        let (server, client, _server_dir, _client_dir, socket, _memo) =
+            direct_pair(service.clone(), true).await;
+        let open = SockOpen::new(OriginId::Key(server.id()), "echo", vec![]);
+        let stream = socket.open(&open).await.unwrap().unwrap();
+        assert!(stream.is_direct());
+        let SockStream {
+            send: _send,
+            mut recv,
+            ..
+        } = stream;
+
+        socket.connection().close(0u32.into(), b"done");
+        let mut byte = [0u8; 1];
+        let read = tokio::time::timeout(Duration::from_secs(5), recv.read(&mut byte))
+            .await
+            .expect("the read ends with the connection");
+        assert!(read.is_err(), "a closed connection is not an EOF: {read:?}");
+        assert!(
+            eventually(|| service.ended.load(Ordering::Acquire) == 1).await,
+            "the callee's invocation ends with the connection"
+        );
+
         drop(socket);
         client.shutdown().await.unwrap();
         server.shutdown().await.unwrap();

@@ -512,6 +512,7 @@ impl BlobProtocol {
                 ticket,
                 secret,
             },
+            crate::direct::OFFER_FRAME_MAX,
         )
         .await?;
 
@@ -861,7 +862,8 @@ impl BlobClient {
             let mut recv =
                 crate::frame::request(&self.connection, &BlobMessage::GetDirect { root, run })
                     .await?;
-            let offer = crate::direct::read_offer(&mut recv).await?;
+            let offer =
+                crate::direct::read_offer(&mut recv, crate::direct::OFFER_FRAME_MAX).await?;
             Ok((recv, offer))
         })
         .await?;
@@ -1925,7 +1927,9 @@ mod tests {
             port,
             ticket,
             secret,
-        }) = crate::direct::read_offer(&mut control).await.unwrap()
+        }) = crate::direct::read_offer(&mut control, crate::direct::OFFER_FRAME_MAX)
+            .await
+            .unwrap()
         else {
             panic!("a direct provider makes an offer");
         };
