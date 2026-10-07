@@ -13,7 +13,7 @@ use std::{
 use synch_engine::{AdoptTreeOptions, Node, VersionPolicy};
 use synch_store::{PinHolder, ReplicaPolicy};
 
-mod common;
+use crate::common;
 use common::{off_runtime, shutdown, spawn_node as spawn, trust_all as introduce, Peer};
 
 /// The space every test publishes into, and the repository's directory in it.

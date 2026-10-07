@@ -9,7 +9,7 @@ use synch_engine::{locks::Lost, Acquired, EngineError, HoldMode, LockFailure, Lo
 use synch_net::LockService;
 use synch_store::BindingSource;
 
-mod common;
+use crate::common;
 use common::{off_runtime, shutdown, spawn_node, trust, Peer};
 
 fn lock() -> LockName {

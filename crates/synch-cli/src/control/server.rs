@@ -541,6 +541,39 @@ impl ControlService {
     }
 }
 
+/// Runs one `Run` command on its own task, its frames going to `tx`.
+///
+/// A free function, not inline in [`Control::run`], for the compiler's sake.
+/// `tokio::spawn` needs the task `Send`, and the task holds `dispatch`'s
+/// future: one `match` over every command, a very large state machine.
+/// Inside a `#[tonic::async_trait]` method that proof runs under the
+/// lifetime bounds the macro adds, where rustc cannot reuse its trait cache,
+/// and redoing it cost this crate a third of its compile time. Here there
+/// are no bounds, and it is proven once.
+fn spawn_command(
+    served: Served,
+    stopping: broadcast::Receiver<()>,
+    command: Command,
+    tx: mpsc::Sender<Result<pb::Frame, Status>>,
+) {
+    tokio::spawn(async move {
+        let failed = {
+            let mut out = Frames { tx: tx.clone() };
+            match &served {
+                Served::Named(node) => {
+                    until_stopped(stopping, dispatch(node, command, &mut out)).await
+                }
+                Served::Pending(pending) => {
+                    until_stopped(stopping, dispatch_pending(pending, command, &mut out)).await
+                }
+            }
+        };
+        if let Err(error) = failed {
+            let _ = tx.send(Err(error.into())).await;
+        }
+    });
+}
+
 #[tonic::async_trait]
 impl Control for ControlService {
     type RunStream = RunStream;
@@ -561,24 +594,7 @@ impl Control for ControlService {
         // triggers are wired together rather than raced.
         let stops = matches!(command, Command::DaemonStop(_));
         let (tx, rx) = mpsc::channel(SEND_AHEAD);
-        let served = self.served.clone();
-        let stopping = self.stop.subscribe();
-        tokio::spawn(async move {
-            let failed = {
-                let mut out = Frames { tx: tx.clone() };
-                match &served {
-                    Served::Named(node) => {
-                        until_stopped(stopping, dispatch(node, command, &mut out)).await
-                    }
-                    Served::Pending(pending) => {
-                        until_stopped(stopping, dispatch_pending(pending, command, &mut out)).await
-                    }
-                }
-            };
-            if let Err(error) = failed {
-                let _ = tx.send(Err(error.into())).await;
-            }
-        });
+        spawn_command(self.served.clone(), self.stop.subscribe(), command, tx);
         Ok(Response::new(RunStream {
             inner: ReceiverStream::new(rx),
             stop: stops.then(|| StopOnDrop(self.stop.clone())),

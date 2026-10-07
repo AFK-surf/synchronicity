@@ -6,7 +6,7 @@ use synch_engine::{reconcile::HeadOutcome, FetchOutcome, Syncer};
 use synch_mpt::{NodeStore, Trie, TrieNode};
 use synch_store::Slot;
 
-mod common;
+use crate::common;
 use common::wire::{connect, trust as trust_static, WireNode};
 
 fn delegation(subject: &NodeId, spaces: &[&str]) -> (Vec<u8>, Vec<u8>) {

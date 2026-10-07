@@ -5,7 +5,7 @@ use iroh_base::SecretKey;
 use synch_core::OriginId;
 use synch_net::{sim::SimZone, DnssecResolver, RekorPolicy, ResolverOptions};
 
-mod common;
+use crate::common;
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
 async fn validated_records_become_bindings_and_outages_keep_them() {

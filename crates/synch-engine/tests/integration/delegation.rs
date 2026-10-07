@@ -10,7 +10,7 @@ use synch_engine::Syncer;
 use synch_mpt::Trie;
 use synch_store::{Slot, StoreError};
 
-mod common;
+use crate::common;
 use common::wire::{connect, connect_blob, trust as trust_static, WireNode};
 
 #[tokio::test]

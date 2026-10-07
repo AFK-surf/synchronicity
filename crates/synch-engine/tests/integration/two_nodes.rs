@@ -6,7 +6,7 @@ use synch_engine::{FetchOutcome, Syncer};
 use synch_mpt::Trie;
 use synch_store::{Slot, Store};
 
-mod common;
+use crate::common;
 use common::wire::{connect, connect_blob, shutdown_all, trust, trust_all, WireNode};
 
 /// Publishes `files` under the fixed `media` space this suite writes into.

@@ -6,7 +6,7 @@
 //! binds, who a scope admits, and what a deployment moves. The runtime's own
 //! end-to-end tests live in `synch-sock`.
 
-mod common;
+use crate::common;
 
 use std::path::Path;
 
@@ -399,7 +399,7 @@ async fn a_self_connection_runs_the_activated_program() {
 
     let (_data, space, node) = node_with_space().await;
     let elf = synch_cc::compile(
-        include_str!("../../synch-sock/examples/echo.c"),
+        include_str!("../../../synch-sock/examples/echo.c"),
         "echo.c",
         &[("synch.h", synch_sock::sdk::HEADER)],
         &[],
@@ -662,7 +662,7 @@ fn a_daemon_style_runtime_can_activate_and_run_a_self_socket() {
     // handler already offloads them. Here setup happens outside any runtime.
     node.add_filesystem_source("code", space.path()).unwrap();
     let elf = synch_cc::compile(
-        include_str!("../../synch-sock/examples/echo.c"),
+        include_str!("../../../synch-sock/examples/echo.c"),
         "echo.c",
         &[("synch.h", synch_sock::sdk::HEADER)],
         &[],
@@ -713,7 +713,7 @@ async fn a_discovery_only_peer_can_connect_to_a_socket_and_list_them() {
     let (_server_data, server_space, server) = node_with_space().await;
     let (_client_data, _client_space, client) = node_with_space().await;
     let elf = synch_cc::compile(
-        include_str!("../../synch-sock/examples/echo.c"),
+        include_str!("../../../synch-sock/examples/echo.c"),
         "echo.c",
         &[("synch.h", synch_sock::sdk::HEADER)],
         &[],

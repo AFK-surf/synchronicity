@@ -16,7 +16,7 @@ Install Lean 4.33.1 through elan, then from the repository root:
 ```sh
 cargo test -p synch-verified
 cargo test -p synch-mpt -p synch-store
-cargo test -p synch-engine --test delegation
+cargo test -p synch-engine --test integration -- delegation::
 cargo build --release --bin synch
 cargo run --release -p synch-verified --example decisions
 cd specs/lean && lake build --wfail

@@ -11,7 +11,7 @@ use synch_core::OriginId;
 use synch_engine::{Node, NodeConfig, RecoveryOptions};
 use synch_store::BindingSource;
 
-mod common;
+use crate::common;
 use common::{shutdown, spawn_node as spawn, trust, trust_all, Peer};
 
 async fn open(data_dir: &std::path::Path, id: Option<OriginId>) -> Node {
