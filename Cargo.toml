@@ -120,6 +120,15 @@ unicode-normalization = "0.1.25"
 windows-sys = "0.61.2"
 zeroize = "1.9.0"
 
+# Dependencies are optimized even in dev and test builds; this workspace's
+# own crates are not, so an edit still rebuilds at debug speed. The tests
+# spend most of their time inside dependencies — SQLite, BLAKE3, the TLS and
+# QUIC stacks — and unoptimized they ran several times slower. Dependencies
+# build once and stay cached, so the cost is one slower first build. Debug
+# assertions and overflow checks are untouched.
+[profile.dev.package."*"]
+opt-level = 2
+
 [profile.release]
 opt-level = 3
 lto = "thin"

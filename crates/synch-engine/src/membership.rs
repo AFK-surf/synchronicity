@@ -749,6 +749,20 @@ impl Node {
         domains: &[String],
         now: i64,
     ) -> Result<Vec<DomainOutcome>> {
+        self.refresh_these_within(resolver, domains, now, REFRESH_DEADLINE)
+            .await
+    }
+
+    /// [`Node::refresh_these`] with each domain bounded by `deadline` rather
+    /// than [`REFRESH_DEADLINE`], so a test can watch a stall be abandoned
+    /// without waiting ninety seconds for it.
+    async fn refresh_these_within(
+        &self,
+        resolver: &dyn MemberResolver,
+        domains: &[String],
+        now: i64,
+        deadline: Duration,
+    ) -> Result<Vec<DomainOutcome>> {
         let mut out = Vec::new();
         for domain in domains {
             // Stamped before the lookup runs, so a resolver that hangs or fails
@@ -771,15 +785,14 @@ impl Node {
             // and nothing else. Timing out is an ordinary refresh failure:
             // cached bindings keep their expiry and only the retry moves.
             let result = match tokio::time::timeout(
-                REFRESH_DEADLINE,
+                deadline,
                 self.refresh_domain(resolver, domain, now),
             )
             .await
             .unwrap_or_else(|_| {
                 Err(synch_net::NetError::Dns(format!(
-                    "{domain}: membership refresh exceeded {}s and was abandoned so the \
-                     other domains due in this pass could run; cached bindings are kept",
-                    REFRESH_DEADLINE.as_secs()
+                    "{domain}: membership refresh exceeded {deadline:?} and was abandoned so \
+                     the other domains due in this pass could run; cached bindings are kept"
                 ))
                 .into())
             }) {
@@ -1591,12 +1604,17 @@ mod tests {
             MIN_TTL,
             Some(("slow.example".to_string(), Duration::from_secs(86_400))),
         );
+        // The rule under test is that the deadline is per domain, not how
+        // long it is: a short one shows a stall being abandoned without
+        // waiting out the production ninety seconds.
+        let deadline = Duration::from_millis(500);
         let started = tokio::time::Instant::now();
         let outcomes = node
-            .refresh_these(
+            .refresh_these_within(
                 &resolver,
                 &["slow.example".to_string(), "fast.example".to_string()],
                 now_ns(),
+                deadline,
             )
             .await
             .expect("the pass itself must not fail");
@@ -1620,6 +1638,8 @@ mod tests {
             .find(|o| o.domain == "fast.example")
             .unwrap();
         assert!(fast.result.is_ok(), "{:?}", fast.result);
-        assert!(started.elapsed() < REFRESH_DEADLINE * 2);
+        let elapsed = started.elapsed();
+        assert!(elapsed >= deadline, "{elapsed:?}");
+        assert!(elapsed < Duration::from_secs(30), "{elapsed:?}");
     }
 }
