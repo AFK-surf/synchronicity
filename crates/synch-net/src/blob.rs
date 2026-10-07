@@ -1186,7 +1186,7 @@ impl RunStream {
     /// its own would have.
     ///
     /// Windows are read ahead of the one handed out and verified up to
-    /// [`VERIFY_AHEAD`] at once, but handed out strictly in order, and a
+    /// four (`VERIFY_AHEAD`) at once, but handed out strictly in order, and a
     /// failure — of the stream or of a window's verification — is handed out
     /// in its place, after every window before it.
     pub async fn next_window(&mut self) -> Result<Option<Vec<Vec<u8>>>, NetError> {
