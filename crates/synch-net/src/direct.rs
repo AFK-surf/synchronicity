@@ -37,13 +37,37 @@ use serde::{de::DeserializeOwned, Serialize};
 use synch_core::{DirectSecret, GroupRange, Hash, NodeId, CHUNK_GROUP_SIZE, DIRECT_TICKET_LEN};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
+    net::{TcpListener, TcpSocket, TcpStream},
 };
 use zeroize::Zeroizing;
 
 use crate::error::NetError;
 
 pub(crate) mod stream;
+
+/// The send and receive buffer of every direct-run socket: 4 MiB, two
+/// windows.
+///
+/// The kernel's default is 128 KiB on macOS — half a record — and on a fast
+/// link autotuning does not grow it, because the round trip is too short to
+/// ask for more. With that little in flight the two ends take turns: the
+/// provider seals a record while the requester waits, then the requester
+/// decrypts and hashes while the provider waits. Room for two windows lets
+/// each end work on its own window while the other works on its.
+const SOCKET_BUFFER: u32 = 4 << 20;
+
+/// A TCP socket of the address's family, with [`SOCKET_BUFFER`] set before it
+/// connects or listens, so the window it advertises from the first segment
+/// reflects it (a listener's accepted sockets inherit it).
+fn buffered_socket(addr: SocketAddr) -> std::io::Result<TcpSocket> {
+    let socket = match addr {
+        SocketAddr::V4(_) => TcpSocket::new_v4()?,
+        SocketAddr::V6(_) => TcpSocket::new_v6()?,
+    };
+    socket.set_send_buffer_size(SOCKET_BUFFER)?;
+    socket.set_recv_buffer_size(SOCKET_BUFFER)?;
+    Ok(socket)
+}
 
 /// The most plaintext one record carries: 256 KiB, the piece a transient read
 /// hands out, so a record buffer costs what a piece already does.
@@ -174,7 +198,9 @@ impl HelloKey {
 /// The raw key bytes are zeroed when this is dropped; the expanded schedule
 /// belongs to aws-lc-rs.
 pub(crate) struct RecordKey {
-    key: LessSafeKey,
+    /// Shared with the blocking-pool tasks sealing a window ahead of the one
+    /// being sent; they hold it only while they seal.
+    key: Arc<LessSafeKey>,
     iv: Zeroizing<[u8; NONCE_LEN]>,
     seq: u64,
 }
@@ -184,26 +210,38 @@ impl RecordKey {
         let key = UnboundKey::new(&AES_256_GCM, data)
             .map_err(|_| NetError::Direct("the run key was rejected".into()))?;
         Ok(RecordKey {
-            key: LessSafeKey::new(key),
+            key: Arc::new(LessSafeKey::new(key)),
             iv,
             seq: 0,
         })
     }
 
-    /// The next record's nonce: the IV with the counter XORed into its low
-    /// eight bytes. Every key encrypts exactly one run, so a counter from zero
-    /// never repeats a nonce.
+    /// The next record's nonce. Every key encrypts exactly one run, so a
+    /// counter from zero never repeats a nonce.
     fn next_nonce(&mut self) -> Result<Nonce, NetError> {
-        let seq = self.seq;
-        self.seq = seq
-            .checked_add(1)
-            .ok_or_else(|| NetError::Direct("the record counter is exhausted".into()))?;
-        let mut nonce = *self.iv;
-        for (byte, count) in nonce[NONCE_LEN - 8..].iter_mut().zip(seq.to_be_bytes()) {
-            *byte ^= count;
-        }
-        Ok(Nonce::assume_unique_for_key(nonce))
+        let seq = self.reserve(1)?;
+        Ok(nonce_at(&self.iv, seq))
     }
+
+    /// Takes the next `records` counter values, in the order their records
+    /// will be sent, and answers the first.
+    fn reserve(&mut self, records: u64) -> Result<u64, NetError> {
+        let first = self.seq;
+        self.seq = first
+            .checked_add(records)
+            .ok_or_else(|| NetError::Direct("the record counter is exhausted".into()))?;
+        Ok(first)
+    }
+}
+
+/// The nonce of record `seq`: the IV with the counter XORed into its low
+/// eight bytes.
+fn nonce_at(iv: &[u8; NONCE_LEN], seq: u64) -> Nonce {
+    let mut nonce = *iv;
+    for (byte, count) in nonce[NONCE_LEN - 8..].iter_mut().zip(seq.to_be_bytes()) {
+        *byte ^= count;
+    }
+    Nonce::assume_unique_for_key(nonce)
 }
 
 /// The record header, which is also its associated data: a forged length or
@@ -330,9 +368,15 @@ impl Drop for TicketGuard {
 impl DirectListener {
     /// Binds the listener and starts accepting.
     pub(crate) async fn bind(addr: SocketAddr) -> Result<DirectListener, NetError> {
-        let listener = TcpListener::bind(addr).await.map_err(|e| {
-            NetError::Endpoint(format!("could not bind direct listener {addr}: {e}"))
-        })?;
+        let listener = buffered_socket(addr)
+            .and_then(|socket| {
+                socket.set_reuseaddr(true)?;
+                socket.bind(addr)?;
+                socket.listen(1024)
+            })
+            .map_err(|e| {
+                NetError::Endpoint(format!("could not bind direct listener {addr}: {e}"))
+            })?;
         let port = listener
             .local_addr()
             .map_err(|e| NetError::Endpoint(e.to_string()))?
@@ -451,7 +495,8 @@ pub(crate) async fn dial(
     ticket: &[u8; DIRECT_TICKET_LEN],
     hello: &HelloKey,
 ) -> Result<TcpStream, NetError> {
-    let mut socket = match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await {
+    let connect = async { buffered_socket(addr)?.connect(addr).await };
+    let mut socket = match tokio::time::timeout(CONNECT_TIMEOUT, connect).await {
         Ok(Ok(socket)) => socket,
         Ok(Err(e)) => return Err(NetError::Direct(format!("connecting to {addr}: {e}"))),
         Err(_) => {
@@ -504,12 +549,42 @@ impl RecordWriter {
         RecordWriter { socket, key }
     }
 
-    /// Seals and sends `bytes`, in place, a record at a time.
-    pub(crate) async fn write(&mut self, mut bytes: Vec<u8>) -> Result<(), NetError> {
-        for chunk in bytes.chunks_mut(RECORD_LEN) {
-            self.seal(KIND_DATA, chunk).await?;
+    /// Seals `parts` — the plaintext of one window, in order — as records on
+    /// the blocking pool, to be sent by [`RecordWriter::write_sealed`].
+    ///
+    /// The records' counter values are taken now, so windows must be sealed
+    /// in the order they are sent; sealing itself may then run beside the
+    /// sending of the window before, on another core. Sealing a record costs
+    /// about what sending it does, so a provider that sealed on the task that
+    /// sends spent one core on both and sent at half the rate.
+    pub(crate) fn seal_ahead(&mut self, parts: Vec<Vec<u8>>) -> Result<Sealing, NetError> {
+        let records: u64 = parts
+            .iter()
+            .map(|part| part.len().div_ceil(RECORD_LEN) as u64)
+            .sum();
+        let first = self.key.reserve(records)?;
+        let (key, iv) = (self.key.key.clone(), self.key.iv.clone());
+        Ok(Sealing(tokio::spawn(crate::blocking::offload(move || {
+            seal_parts(&key, &iv, first, parts)
+        }))))
+    }
+
+    /// Sends a window sealed by [`RecordWriter::seal_ahead`], header to tag,
+    /// in one vectored write.
+    pub(crate) async fn write_sealed(&mut self, mut sealing: Sealing) -> Result<(), NetError> {
+        let sealed = match (&mut sealing.0).await {
+            Ok(sealed) => sealed?,
+            Err(e) => return Err(NetError::Blocking(e.to_string())),
+        };
+        let mut slices = Vec::with_capacity(3 * sealed.records.len());
+        for record in &sealed.records {
+            slices.push(&record.header[..]);
+            slices.push(&sealed.parts[record.part][record.start..record.end]);
+            slices.push(record.tag.as_ref());
         }
-        Ok(())
+        write_all_vectored(&mut self.socket, &slices)
+            .await
+            .map_err(|e| NetError::Direct(format!("sending a record: {e}")))
     }
 
     /// Ends the run: the final record, then the end of the stream. A
@@ -534,6 +609,68 @@ impl RecordWriter {
             .await
             .map_err(|e| NetError::Direct(format!("sending a record: {e}")))
     }
+}
+
+/// One window's records being sealed off the serving task.
+///
+/// A run that ends early takes the sealing it started with it.
+pub(crate) struct Sealing(tokio::task::JoinHandle<Result<SealedWindow, NetError>>);
+
+impl std::fmt::Debug for Sealing {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        f.debug_struct("Sealing").finish_non_exhaustive()
+    }
+}
+
+impl Drop for Sealing {
+    fn drop(&mut self) {
+        self.0.abort();
+    }
+}
+
+/// A window's plaintext parts, sealed in place, and each record's header and
+/// tag around its slice of them.
+pub(crate) struct SealedWindow {
+    parts: Vec<Vec<u8>>,
+    records: Vec<SealedRecord>,
+}
+
+struct SealedRecord {
+    part: usize,
+    start: usize,
+    end: usize,
+    header: [u8; HEADER_LEN],
+    tag: aws_lc_rs::aead::Tag,
+}
+
+/// Seals `parts` in place as data records of at most [`RECORD_LEN`] bytes,
+/// numbered from `first`.
+fn seal_parts(
+    key: &LessSafeKey,
+    iv: &[u8; NONCE_LEN],
+    first: u64,
+    mut parts: Vec<Vec<u8>>,
+) -> Result<SealedWindow, NetError> {
+    let mut records = Vec::new();
+    let mut seq = first;
+    for (index, part) in parts.iter_mut().enumerate() {
+        for (k, chunk) in part.chunks_mut(RECORD_LEN).enumerate() {
+            let header = header(chunk.len(), KIND_DATA);
+            let tag = key
+                .seal_in_place_separate_tag(nonce_at(iv, seq), Aad::from(header), chunk)
+                .map_err(|_| NetError::Direct("sealing a record failed".into()))?;
+            seq += 1;
+            let start = k * RECORD_LEN;
+            records.push(SealedRecord {
+                part: index,
+                start,
+                end: start + chunk.len(),
+                header,
+                tag,
+            });
+        }
+    }
+    Ok(SealedWindow { parts, records })
 }
 
 async fn write_all_vectored(socket: &mut TcpStream, parts: &[&[u8]]) -> std::io::Result<()> {
@@ -875,8 +1012,9 @@ mod tests {
         }
     }
 
-    /// Records open only as they were sealed, and only the final record ends
-    /// a run: a flipped bit, a data record relabelled as final, or a
+    /// Records open only as they were sealed, in the order they were sealed
+    /// even when a window is sealed ahead of the one being sent, and only the
+    /// final record ends a run: a flipped bit, a data record relabelled as final, or a
     /// connection that ends before the final record is a failure — never a
     /// short run the reader could take for a complete one.
     #[tokio::test]
@@ -888,9 +1026,15 @@ mod tests {
         let (to_wire, mut wire) = tcp_pair().await;
         let (_, key) = keys(5, ticket);
         let mut writer = RecordWriter::new(to_wire, key);
-        let sending = plaintext.clone();
+        // Two windows, the second sealed before the first is sent, as a
+        // provider sends them: their records still open in order.
+        let (first, second) = plaintext.split_at(RECORD_LEN + 500);
+        let (first, second) = (first.to_vec(), second.to_vec());
         let sent = tokio::spawn(async move {
-            writer.write(sending).await.unwrap();
+            let one = writer.seal_ahead(vec![first[..4].to_vec(), first[4..].to_vec()]);
+            let two = writer.seal_ahead(vec![second]);
+            writer.write_sealed(one.unwrap()).await.unwrap();
+            writer.write_sealed(two.unwrap()).await.unwrap();
             writer.finish().await.unwrap();
         });
         let mut sealed = Vec::new();

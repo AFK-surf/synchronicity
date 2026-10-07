@@ -283,10 +283,13 @@ The `GetDirect` arm of `BlobProtocol::handle_stream`:
 3. Wait for the authenticated socket (or the accept timeout, or the control
    stream being reset by the requester).
 4. Run the **existing** `serve_run` loop with a sink that seals records onto
-   the TCP socket instead of writing to the QUIC send stream: `admit_window`
-   before every window, one window encoded ahead, `progress.mark()` after each
-   window sent. TCP's flow control now plays the role QUIC's did, so a run
-   still holds at most two encoded windows in memory.
+   the TCP socket instead of writing to the QUIC send stream: up to four
+   windows encoded ahead, each read off disk in one call; `admit_window`
+   before every window is sent; each window sealed on the blocking pool —
+   its records' counter values taken in send order — while the window before
+   it is written; `progress.mark()` after each window handed on. TCP's flow
+   control now plays the role QUIC's did, so a run holds at most six windows
+   in memory: four encoding, one sealing, one being written.
 5. Write the `final` record, shut down the socket, finish the control stream.
 
 The transfer runs inside the control stream's dispatch future, so:
@@ -304,9 +307,16 @@ The transfer runs inside the control stream's dispatch future, so:
 `BlobClient::stream_run_direct(root, size, run, piece)` returns the same
 `RunStream` as `stream_run`, over a different byte source: `RunStream` and the
 window readers read from a `Source` that is either the QUIC `RecvStream` or a
-`DirectSource` that reads and opens records. The streaming verifier, the piece
-layout, the partial-holder rule and the per-window deadline are the same code
-on both.
+`DirectSource` that reads and opens records. The verifier, the piece layout,
+the partial-holder rule and the per-window deadline are the same code on both.
+`RunStream` reads each window's encoding off the source and verifies it on
+the blocking pool, up to four windows at once, handing them out in order.
+
+Every direct-run socket asks for 4 MiB send and receive buffers before it
+connects or listens. macOS defaults to 128 KiB, half a record, and on a link
+whose round trip is tens of microseconds autotuning does not grow it, so the
+two ends otherwise take turns: the provider seals while the requester waits,
+then the requester opens and hashes while the provider waits.
 
 `PeerReader::next_streamed` in `synch-engine` tries, per provider, in order:
 
@@ -561,6 +571,59 @@ delay and window growth hurt), bandwidth limits, loss, and two machines'
 worth of cores. This container has no `netem`, so the LAN and cross-region
 numbers are still to be taken; until then the result is "cheaper per byte on
 both ends", not "faster on a real link".
+
+### Thunderbolt ring results
+
+Mac mini M2 (8 cores, 8 GB) CI hosts on a routed Thunderbolt ring, MTU
+65518, TSO on; `iperf3` gives 25–29 Gbit/s at any hop count. `synch cat
+--no-cache` of a 4 GiB object piped into `wc -c`, two hops, CI load on both
+hosts:
+
+| Build | MB/s |
+| --- | --- |
+| 0.1.17 | 285–414 |
+| + 4 MiB direct socket buffers | 463–471 |
+| + run task yields after each window | 794–819 |
+| + windows verified on the blocking pool | 777–785 |
+| + 1 MiB control-socket buffers | 991–1002 (1075–1314 into `/dev/null`) |
+
+Parallel verification gained nothing on its own — the control socket was
+already the limit — but takes BLAKE3 (about 1.9 GB/s on one M2 core) off the
+path for whatever comes after it. The other steps each removed a hand-off where one side waited for the other while
+neither was busy (every worker thread under ~25%, measured with `sample`):
+
+- the 128 KiB TCP buffers above;
+- the run's task handing a window to the reader: tokio runs the woken
+  reader next on the same worker, in a slot no other worker may take, so
+  while the socket had data the reader waited for the run's task to finish
+  its next window — verifying and forwarding in turn, not side by side;
+- the control socket: a unix stream socket on macOS buffers 8 KiB each way,
+  so each 256 KiB chunk crossed from the daemon to `synch cat` in 32 writes,
+  each waiting for the other process. A local read of a held object, which
+  never touches the network, went from ~790 to ~1220 MB/s with that alone.
+
+Two later steps, `/dev/null`, same hosts:
+
+| Build | 1 run | 2 runs at once | 4 runs at once |
+| --- | --- | --- | --- |
+| above | 1075–1314 | — | — |
+| + provider seals the next window while sending the last | 1497–1662 | 509 | 507 |
+| + a window's payload read in one call, encoded 4 ahead | 1318–1379 | 1501 | 1576 |
+
+Sealing on the serving task cost about as much as the socket write after it,
+so a run was held to roughly one core's worth of both. Concurrent runs then
+collapsed on the provider's disk: each 16 KiB group was its own `pread`, and
+two runs interleaving them defeated the kernel's read-ahead on a payload the
+page cache did not hold (an 8 GB host running CI VMs). The single-run numbers
+of the last two rows are within this shared host's run-to-run spread; the
+earlier, higher ones were taken right after the object was written, when more
+of it was cached (inferred).
+
+What bounds a run now, of a ~3 GB/s link, on these hosts: the requester's
+CPU per byte (about 1.3–1.5 CPU-s/GiB on an M2 in `direct_bench`, most of it
+BLAKE3, against four performance cores shared with CI), and delivering the
+bytes over gRPC on the control socket to the client process. On an idle Mac
+Studio `direct_bench` moves 5071 MiB/s over loopback.
 
 ## Open questions
 

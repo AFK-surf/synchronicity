@@ -2,7 +2,7 @@
 //! (`docs/DIRECT-TCP.md`).
 //!
 //! The provider runs in a child process of its own, so the CPU each side
-//! spends is measured separately, from `/proc`. Both ends are real `Net`
+//! spends is measured separately, from `/proc` or `ps`. Both ends are real `Net`
 //! endpoints on loopback with static trust, and the requester reads the whole
 //! object as one run through `BlobClient::stream_run` or
 //! `BlobClient::stream_run_direct`, verifying every group as it arrives, as a
@@ -16,7 +16,7 @@
 //!
 //! Loopback has no propagation delay and no bandwidth ceiling, so what this
 //! measures is each path's cost per byte — the work the design expects to
-//! differ — not how either behaves over a real link. Linux only (`/proc`).
+//! differ — not how either behaves over a real link.
 
 use std::{
     io::{BufRead, Read, Write},
@@ -337,13 +337,30 @@ fn median(mut values: Vec<f64>) -> f64 {
     values[values.len() / 2]
 }
 
-/// User plus system CPU time of every thread of a process, in seconds.
+/// User plus system CPU time of every thread of a process, in seconds:
+/// from `/proc` on Linux, from `ps` elsewhere.
 fn cpu_seconds(pid: &str) -> f64 {
-    let stat = std::fs::read_to_string(format!("/proc/{pid}/stat")).expect("/proc is readable");
-    // The command name may hold spaces; the fields after it do not.
-    let fields: Vec<&str> = stat[stat.rfind(')').unwrap() + 2..].split(' ').collect();
-    let ticks: u64 = fields[11].parse::<u64>().unwrap() + fields[12].parse::<u64>().unwrap();
-    ticks as f64 / CLOCK_TICKS
+    if let Ok(stat) = std::fs::read_to_string(format!("/proc/{pid}/stat")) {
+        // The command name may hold spaces; the fields after it do not.
+        let fields: Vec<&str> = stat[stat.rfind(')').unwrap() + 2..].split(' ').collect();
+        let ticks: u64 = fields[11].parse::<u64>().unwrap() + fields[12].parse::<u64>().unwrap();
+        return ticks as f64 / CLOCK_TICKS;
+    }
+    let pid = match pid {
+        "self" => std::process::id().to_string(),
+        pid => pid.to_string(),
+    };
+    let out = Command::new("ps")
+        .args(["-o", "time=", "-p", &pid])
+        .output()
+        .expect("ps runs");
+    // `[[hh:]mm:]ss.cc`
+    String::from_utf8_lossy(&out.stdout)
+        .trim()
+        .split(':')
+        .fold(0.0, |total, part| {
+            total * 60.0 + part.parse::<f64>().unwrap_or(0.0)
+        })
 }
 
 /// Writes `size` bytes no two groups of which are alike, so nothing

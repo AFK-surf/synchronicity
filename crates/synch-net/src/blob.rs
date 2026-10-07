@@ -28,7 +28,7 @@ use synch_store::{
 };
 
 use crate::{
-    direct::{DirectListener, DirectMemo, DirectSource, RecordWriter, RunKeys},
+    direct::{DirectListener, DirectMemo, DirectSource, RecordWriter, RunKeys, Sealing},
     endpoint::{under_deadline, REQUEST_TIMEOUT},
     error::NetError,
     frame::{read_answer, read_bytes, read_frame, write_bytes, write_frame, write_owned},
@@ -424,10 +424,13 @@ impl BlobProtocol {
     /// one is encoded it meets the checks a separate request would: the
     /// peer's binding (§3.2) and its content scope (§3.5). A binding revoked
     /// mid-run therefore ends the run at the next window rather than at its
-    /// end. The next window is encoded while the current one is being sent,
-    /// so the disk and the connection are busy at once; QUIC's flow control is
-    /// what keeps the provider from running further ahead than that, so a run
-    /// costs at most two encoded windows of memory whatever its length.
+    /// end. Windows are encoded up to [`ENCODE_AHEAD`] ahead of the one being
+    /// sent, so reading the payload off disk overlaps the sending; a window
+    /// is only checked when it is about to be sent, so nothing encoded ahead
+    /// reaches a peer whose binding lapsed in the meantime. The transport's
+    /// flow control keeps the provider from running further ahead than that,
+    /// so a run costs at most that many encoded windows, plus the one being
+    /// sent, whatever its length.
     async fn serve_run(
         &self,
         peer: synch_core::NodeId,
@@ -442,28 +445,40 @@ impl BlobProtocol {
                 run.end.min(start.saturating_add(STREAM_WINDOW_GROUPS)),
             )
         };
-        let mut window = window_at(run.start);
-        if window.is_empty() {
+        let mut next = window_at(run.start);
+        if next.is_empty() {
             return Ok(());
         }
+        // The first window is checked before any reading at all, so a peer
+        // that may not have the run costs no disk.
         self.admit_window(peer, root).await?;
-        let mut ahead = Some(self.encode_ahead(root, window));
-        while let Some(mut encoding) = ahead.take() {
+        let mut checked = true;
+        let mut ahead = std::collections::VecDeque::new();
+        loop {
+            while ahead.len() < ENCODE_AHEAD && !next.is_empty() {
+                ahead.push_back((next, self.encode_ahead(root, next)));
+                next = window_at(next.end);
+            }
+            let Some((window, mut encoding)) = ahead.pop_front() else {
+                break;
+            };
             let (encoded, served) = (&mut encoding.0)
                 .await
                 .map_err(|e| NetError::Blocking(e.to_string()))??;
-            let whole = served == ChunkRanges::from_ranges([window]);
-            let following = window_at(window.end);
-            if whole && !following.is_empty() {
+            if !checked {
                 self.admit_window(peer, root).await?;
-                ahead = Some(self.encode_ahead(root, following));
             }
-            sink.write_owned(encoded).await?;
-            sink.write_frame(&BlobMessage::SliceEnd { served }).await?;
+            checked = false;
+            let whole = served == ChunkRanges::from_ranges([window]);
+            sink.send_window(encoded, served).await?;
             progress.mark();
-            window = following;
+            if !whole {
+                // A partial holder's last word: what was encoded past it does
+                // not continue it.
+                break;
+            }
         }
-        Ok(())
+        sink.flush().await
     }
 
     /// Answers a [`BlobMessage::GetDirect`] (`docs/DIRECT-TCP.md`): offers a
@@ -532,7 +547,10 @@ impl BlobProtocol {
         };
         drop(ticket_held);
         let mut writer = RecordWriter::new(socket, key);
-        let mut sink = Sink::Direct(&mut writer);
+        let mut sink = Sink::Direct {
+            writer: &mut writer,
+            sealing: None,
+        };
         tokio::select! {
             served = self.serve_run(peer, &mut sink, root, run, progress) => served?,
             _ = &mut stopped => {
@@ -573,6 +591,14 @@ impl BlobProtocol {
     }
 }
 
+/// How many windows of a streamed run are encoded ahead of the one being
+/// sent.
+///
+/// Encoding a window is mostly reading its payload, and one window at a
+/// time leaves the run waiting on the disk's latency between windows
+/// whenever the payload is not cached.
+const ENCODE_AHEAD: usize = 4;
+
 /// A window of a streamed run being encoded ahead of the one being sent.
 ///
 /// A run that ends early — the requester hung up, a check failed — takes the
@@ -589,35 +615,52 @@ impl Drop for Encoding {
 /// a direct run's TCP connection. The bytes are the same either way.
 enum Sink<'a> {
     Quic(&'a mut iroh::endpoint::SendStream),
-    Direct(&'a mut RecordWriter),
+    Direct {
+        writer: &'a mut RecordWriter,
+        /// The window sealing while the one before it is sent.
+        sealing: Option<Sealing>,
+    },
 }
 
 impl Sink<'_> {
-    async fn write_owned(&mut self, bytes: Vec<u8>) -> Result<(), NetError> {
+    /// Sends one window's answer: its length-prefixed encoding, then its
+    /// `SliceEnd`. On a direct run the window is sealed off this task and
+    /// sent once the next one has been handed over, so sealing one window
+    /// and sending the one before it run side by side.
+    async fn send_window(&mut self, encoded: Vec<u8>, served: ChunkRanges) -> Result<(), NetError> {
+        let end = BlobMessage::SliceEnd { served };
         match self {
-            Sink::Quic(send) => write_owned(send, bytes).await,
-            Sink::Direct(writer) => {
-                if bytes.len() > synch_core::MAX_FRAME_LEN {
-                    return Err(NetError::FrameTooLarge(bytes.len()));
+            Sink::Quic(send) => {
+                write_owned(send, encoded).await?;
+                write_frame(send, &end).await
+            }
+            Sink::Direct { writer, sealing } => {
+                if encoded.len() > synch_core::MAX_FRAME_LEN {
+                    return Err(NetError::FrameTooLarge(encoded.len()));
                 }
-                writer
-                    .write((bytes.len() as u32).to_le_bytes().to_vec())
-                    .await?;
-                writer.write(bytes).await
+                let prefix = (encoded.len() as u32).to_le_bytes().to_vec();
+                let body =
+                    postcard::to_stdvec(&end).map_err(|e| NetError::Encode(e.to_string()))?;
+                let mut framed = Vec::with_capacity(4 + body.len());
+                framed.extend_from_slice(&(body.len() as u32).to_le_bytes());
+                framed.extend_from_slice(&body);
+                let next = writer.seal_ahead(vec![prefix, encoded, framed])?;
+                match sealing.replace(next) {
+                    Some(previous) => writer.write_sealed(previous).await,
+                    None => Ok(()),
+                }
             }
         }
     }
 
-    async fn write_frame(&mut self, msg: &BlobMessage) -> Result<(), NetError> {
+    /// Sends whatever window is still sealing.
+    async fn flush(&mut self) -> Result<(), NetError> {
         match self {
-            Sink::Quic(send) => write_frame(send, msg).await,
-            Sink::Direct(writer) => {
-                let body = postcard::to_stdvec(msg).map_err(|e| NetError::Encode(e.to_string()))?;
-                let mut framed = Vec::with_capacity(4 + body.len());
-                framed.extend_from_slice(&(body.len() as u32).to_le_bytes());
-                framed.extend_from_slice(&body);
-                writer.write(framed).await
-            }
+            Sink::Quic(_) => Ok(()),
+            Sink::Direct { writer, sealing } => match sealing.take() {
+                Some(last) => writer.write_sealed(last).await,
+                None => Ok(()),
+            },
         }
     }
 }
@@ -1055,6 +1098,17 @@ impl BlobClient {
     }
 }
 
+/// How many windows of a run are verified at once.
+///
+/// Verifying a window — BLAKE3 over every group — costs more per byte than
+/// reading it off the connection, and it is independent of every other
+/// window, since each carries its own path from the root. Done one at a time
+/// on the task reading the connection, it is one core's work and the reading
+/// stops while it runs; done on the blocking pool, several windows hash at
+/// once while the next ones are read. Each costs its encoding in memory until
+/// it is handed out.
+const VERIFY_AHEAD: usize = 4;
+
 /// One run of an object arriving on a single stream, a window at a time
 /// (see [`BlobClient::stream_run`]).
 #[derive(Debug)]
@@ -1062,7 +1116,7 @@ pub struct RunStream {
     source: Source,
     root: Hash,
     size: u64,
-    /// The group the next window starts at.
+    /// The group the next window read off the stream starts at.
     next: u64,
     /// Where the run ends.
     end: u64,
@@ -1070,8 +1124,25 @@ pub struct RunStream {
     deadline: std::time::Duration,
     /// Whether any window has been answered yet.
     started: bool,
-    /// Whether the provider has said its last word.
-    done: bool,
+    /// Whether nothing more is read off the stream: the run is complete, a
+    /// window came back short, or reading failed.
+    read_all: bool,
+    /// Windows read and being verified, in run order.
+    verifying: std::collections::VecDeque<Verifying>,
+    /// How reading failed, handed out once every window read before it has
+    /// been.
+    failed: Option<NetError>,
+}
+
+/// A window read off a run's stream, verifying on the blocking pool.
+#[derive(Debug)]
+struct Verifying(tokio::task::JoinHandle<Result<Option<Vec<Vec<u8>>>, NetError>>);
+
+impl Drop for Verifying {
+    /// A run that ends early takes the windows it was verifying with it.
+    fn drop(&mut self) {
+        self.0.abort();
+    }
 }
 
 impl RunStream {
@@ -1092,7 +1163,9 @@ impl RunStream {
             piece,
             deadline,
             started: false,
-            done: false,
+            read_all: false,
+            verifying: std::collections::VecDeque::new(),
+            failed: None,
         }
     }
 
@@ -1109,22 +1182,67 @@ impl RunStream {
     /// A provider that ends the stream before answering anything predates
     /// [`BlobMessage::GetStream`], and the error says so
     /// ([`NetError::StreamUnsupported`]) so the caller can ask it window by
-    /// window instead. Each window is under the deadline a request of its
-    /// own would have.
+    /// window instead. Each window is read under the deadline a request of
+    /// its own would have.
+    ///
+    /// Windows are read ahead of the one handed out and verified up to
+    /// four (`VERIFY_AHEAD`) at once, but handed out strictly in order, and a
+    /// failure — of the stream or of a window's verification — is handed out
+    /// in its place, after every window before it.
     pub async fn next_window(&mut self) -> Result<Option<Vec<Vec<u8>>>, NetError> {
-        if self.done || self.next >= self.end {
-            return Ok(None);
+        loop {
+            let hand_out = match self.verifying.front() {
+                Some(front) => {
+                    front.0.is_finished() || self.verifying.len() >= VERIFY_AHEAD || self.read_all
+                }
+                None => self.read_all,
+            };
+            if hand_out {
+                return self.hand_out().await;
+            }
+            self.read_ahead().await;
+        }
+    }
+
+    /// The oldest window's verification, or how reading failed once there is
+    /// none left.
+    async fn hand_out(&mut self) -> Result<Option<Vec<Vec<u8>>>, NetError> {
+        let Some(mut oldest) = self.verifying.pop_front() else {
+            return match self.failed.take() {
+                Some(error) => Err(error),
+                None => Ok(None),
+            };
+        };
+        let verified = match (&mut oldest.0).await {
+            Ok(verified) => verified,
+            Err(e) => Err(NetError::Blocking(e.to_string())),
+        };
+        if verified.is_err() {
+            // Nothing after a window that failed is the continuation of the
+            // bytes handed out, so the rest of the run goes with it.
+            self.verifying.clear();
+            self.failed = None;
+            self.read_all = true;
+        }
+        verified
+    }
+
+    /// Reads the next window off the stream and starts verifying it.
+    async fn read_ahead(&mut self) {
+        if self.next >= self.end {
+            self.read_all = true;
+            return;
         }
         let window = GroupRange::new(
             self.next,
             self.end.min(self.next.saturating_add(STREAM_WINDOW_GROUPS)),
         );
-        let (root, size, piece, started) = (self.root, self.size, self.piece, self.started);
+        let (root, size, started) = (self.root, self.size, self.started);
         let direct = self.is_direct();
         let source = &mut self.source;
-        let answer = under_deadline(self.deadline, "a streamed window", async move {
+        let body = under_deadline(self.deadline, "a streamed window", async move {
             match read_window_len(source).await? {
-                Some(len) => read_window_answer(source, root, size, window, len, piece).await,
+                Some(len) => read_window_body(source, size, window, len).await,
                 None if started => {
                     Err(NetError::Read("the stream ended before its run did".into()))
                 }
@@ -1137,30 +1255,30 @@ impl RunStream {
         .await;
         // A direct run that stalls is the TCP path's failure until shown
         // otherwise: the same provider is asked again over QUIC.
-        let answer = match answer {
+        let body = match body {
             Err(NetError::Endpoint(stalled)) if direct => Err(NetError::Direct(stalled)),
-            answer => answer,
+            body => body,
         };
         self.started = true;
-        let answer = match answer {
-            Ok(answer) => answer,
+        let body = match body {
+            Ok(body) => body,
             Err(error) => {
-                self.done = true;
-                return Err(error);
+                self.read_all = true;
+                self.failed = Some(error);
+                return;
             }
         };
-        let got: u64 = answer
-            .iter()
-            .flatten()
-            .map(|piece| piece.len() as u64)
-            .sum();
-        let window_bytes = (window.end * synch_core::CHUNK_GROUP_SIZE).min(self.size)
-            - (window.start * synch_core::CHUNK_GROUP_SIZE).min(self.size);
-        match got == window_bytes {
-            true => self.next = window.end,
-            false => self.done = true,
+        // A whole window is the run's continuation; anything else is a
+        // partial holder's last word.
+        match &body {
+            WindowBody::Whole(_) => self.next = window.end,
+            WindowBody::Partial { .. } => self.read_all = true,
         }
-        Ok(answer)
+        let piece = self.piece;
+        self.verifying
+            .push_back(Verifying(tokio::spawn(crate::blocking::offload(
+                move || verify_window_body(root, size, window, body, piece),
+            ))));
     }
 }
 
@@ -1178,25 +1296,9 @@ async fn read_window_len(source: &mut Source) -> Result<Option<usize>, NetError>
     Ok(Some(len))
 }
 
-/// The rest of one window's answer after its length prefix: the encoding,
-/// verified as it streams in, then its `SliceEnd`.
-///
-/// Each parent node and each group is checked against the root by a
-/// [`SliceVerifier`] the moment it is off the stream, and the payload lands
-/// in pieces of `piece` bytes rounded up to whole groups, the last one
-/// shorter, so the window costs one copy of its bytes rather than a buffered
-/// encoding and a decode out of it. A group is hashed where it lands, on this
-/// task: 16 KiB at a time, the same scale of work as the stream's own
-/// decryption, with a cooperative yield between groups so a window that has
-/// already arrived whole cannot hold the worker (§10).
-///
-/// The streaming walk needs the layout up front, and the layout is the
-/// window's when the provider holds all of it — which the length prefix says
-/// before a byte of the body. Any other answer is a partial holder's
-/// (`SliceEnd` names what it had), and is read whole and verified as
-/// [`Store::verify_slice`] does. Either way the answer is the verified run
-/// starting at `window.start`, or `None` when the provider served nothing
-/// usable there.
+/// The rest of one window's answer after its length prefix — its encoding
+/// and its `SliceEnd` — read and verified (see [`read_window_body`] and
+/// [`verify_window_body`]).
 async fn read_window_answer(
     source: &mut Source,
     root: Hash,
@@ -1205,23 +1307,106 @@ async fn read_window_answer(
     len: usize,
     piece: usize,
 ) -> Result<Option<Vec<Vec<u8>>>, NetError> {
+    let body = read_window_body(source, size, window, len).await?;
+    crate::blocking::offload(move || verify_window_body(root, size, window, body, piece)).await
+}
+
+/// One window's answer off the stream, not yet verified.
+#[derive(Debug)]
+enum WindowBody {
+    /// The encoding of the whole window.
+    Whole(Vec<u8>),
+    /// A partial holder's answer, and the groups its `SliceEnd` says it
+    /// covers.
+    Partial {
+        encoded: Vec<u8>,
+        served: ChunkRanges,
+    },
+}
+
+/// Reads the rest of one window's answer after its length prefix: the
+/// encoding, then its `SliceEnd`.
+///
+/// The layout is the window's when the provider holds all of it — which the
+/// length prefix says before a byte of the body. Any other answer is a
+/// partial holder's, and `SliceEnd` names what it had.
+async fn read_window_body(
+    source: &mut Source,
+    size: u64,
+    window: GroupRange,
+    len: usize,
+) -> Result<WindowBody, NetError> {
+    let requested = ChunkRanges::from_ranges([window]);
+    let mut encoded = vec![0u8; len];
+    source.read_exact(&mut encoded).await?;
+    let served = match source.read_message().await? {
+        BlobMessage::SliceEnd { served } => check_served(served, &requested)?,
+        _ => return Err(NetError::Unexpected("expected SliceEnd".into())),
+    };
+    if len as u64 == SliceVerifier::encoded_len(size, &window) {
+        // The body was the whole window and every byte of it will be
+        // verified, so whatever `SliceEnd` says cannot unverify it; it was
+        // still read, so a provider that breaks the exchange is still a
+        // failed request.
+        return Ok(WindowBody::Whole(encoded));
+    }
+    Ok(WindowBody::Partial { encoded, served })
+}
+
+/// Verifies one window's answer against the root: the verified run starting
+/// at `window.start`, in pieces of `piece` bytes rounded up to whole groups,
+/// the last one shorter; or `None` when the provider served nothing usable
+/// there.
+///
+/// A whole window is walked as a [`SliceVerifier`] checks it, each parent
+/// node and each group against the chaining value vouching for it, and each
+/// group is copied into its piece as it verifies, so the pieces are the only
+/// copy made. A partial holder's answer is verified as [`Store::verify_slice`]
+/// does, and only the run that starts where the window does is any use: a
+/// later run would leave a hole the stream cannot skip.
+fn verify_window_body(
+    root: Hash,
+    size: u64,
+    window: GroupRange,
+    body: WindowBody,
+    piece: usize,
+) -> Result<Option<Vec<Vec<u8>>>, NetError> {
     // Pieces end on group boundaries, so no group is split between two.
     let group = synch_core::CHUNK_GROUP_SIZE as usize;
     let piece = piece.max(1).div_ceil(group) * group;
-    let requested = ChunkRanges::from_ranges([window]);
-    if len as u64 != SliceVerifier::encoded_len(size, &window) {
-        return partial_window(source, root, size, window, len, piece).await;
-    }
+    let encoded = match body {
+        WindowBody::Whole(encoded) => encoded,
+        WindowBody::Partial { encoded, served } => {
+            let Some(run) = served
+                .ranges
+                .first()
+                .copied()
+                .filter(|run| run.start == window.start && !run.is_empty())
+            else {
+                return Ok(None);
+            };
+            if served.ranges.len() != 1 {
+                return Ok(None);
+            }
+            let bytes = Store::verify_slice(&root, size, &run, &encoded)?;
+            return Ok(Some(bytes.chunks(piece).map(<[u8]>::to_vec).collect()));
+        }
+    };
     let mut verifier = SliceVerifier::new(&root, size, &window);
+    let mut rest = encoded.as_slice();
+    let mut take = |len: usize| -> Result<&[u8], NetError> {
+        if rest.len() < len {
+            return Err(NetError::Read("a window's encoding ended early".into()));
+        }
+        let (head, tail) = rest.split_at(len);
+        rest = tail;
+        Ok(head)
+    };
     let mut pieces = Vec::new();
     let mut current: Vec<u8> = Vec::new();
     while let Some(expect) = verifier.expect() {
         match expect {
-            Expect::Parent => {
-                let mut pair = [0u8; synch_core::PROOF_NODE_LEN];
-                source.read_exact(&mut pair).await?;
-                verifier.parent(&pair)?;
-            }
+            Expect::Parent => verifier.parent(take(synch_core::PROOF_NODE_LEN)?)?,
             Expect::Leaf(len) => {
                 if current.len() + len > piece {
                     pieces.push(std::mem::take(&mut current));
@@ -1230,67 +1415,15 @@ async fn read_window_answer(
                     current.reserve_exact(piece);
                 }
                 let at = current.len();
-                current.resize(at + len, 0);
-                source.read_exact(&mut current[at..]).await?;
+                current.extend_from_slice(take(len)?);
                 verifier.leaf(&current[at..])?;
-                // A window already on the socket would otherwise be hashed
-                // end to end without this task yielding.
-                tokio::task::consume_budget().await;
             }
         }
     }
     if !current.is_empty() {
         pieces.push(current);
     }
-
-    // The body was the whole window and every byte of it verified, so
-    // whatever `SliceEnd` says cannot unverify it; it is still read, so a
-    // provider that breaks the exchange is still a failed request.
-    match source.read_message().await? {
-        BlobMessage::SliceEnd { served } => {
-            check_served(served, &requested)?;
-        }
-        _ => return Err(NetError::Unexpected("expected SliceEnd".into())),
-    }
     Ok(Some(pieces))
-}
-
-/// The rest of a window's answer whose body is not the whole window: read
-/// it, learn what it covers, and verify the run that starts where the window
-/// does.
-async fn partial_window(
-    source: &mut Source,
-    root: Hash,
-    size: u64,
-    window: GroupRange,
-    len: usize,
-    piece: usize,
-) -> Result<Option<Vec<Vec<u8>>>, NetError> {
-    let mut encoded = vec![0u8; len];
-    source.read_exact(&mut encoded).await?;
-    let served = match source.read_message().await? {
-        BlobMessage::SliceEnd { served } => {
-            check_served(served, &ChunkRanges::from_ranges([window]))?
-        }
-        _ => return Err(NetError::Unexpected("expected SliceEnd".into())),
-    };
-    // Only the run that starts where the read stands is any use: a later run
-    // would leave a hole the stream cannot skip.
-    let Some(run) = served
-        .ranges
-        .first()
-        .copied()
-        .filter(|run| run.start == window.start && !run.is_empty())
-    else {
-        return Ok(None);
-    };
-    if served.ranges.len() != 1 {
-        return Ok(None);
-    }
-    let bytes =
-        crate::blocking::offload(move || Ok(Store::verify_slice(&root, size, &run, &encoded)?))
-            .await?;
-    Ok(Some(bytes.chunks(piece).map(<[u8]>::to_vec).collect()))
 }
 
 #[cfg(test)]
@@ -1700,9 +1833,10 @@ mod tests {
         server.shutdown().await.unwrap();
     }
 
-    /// A streamed run yields only bytes that verified on their way in, and a
-    /// provider that cannot decode the request — one that predates it —
-    /// is told apart from one that answers.
+    /// A streamed run yields only bytes that verified, in order, failing at
+    /// the window that did not verify or where the stream ended early, and a
+    /// provider that cannot decode the request — one that predates it — is
+    /// told apart from one that answers.
     #[tokio::test]
     async fn a_streamed_run_yields_only_verified_bytes() {
         let (_dir, store) = test_store();
@@ -1720,9 +1854,10 @@ mod tests {
         let mut tampered = honest.clone();
         let middle = tampered[1].0.len() / 2;
         tampered[1].0[middle] ^= 1;
+        let truncated = honest[..1].to_vec();
         // The provider's answers, one run per request, in the order asked;
         // `None` is a provider that ends the stream without a byte.
-        let answers = vec![Some(honest), Some(tampered), None];
+        let answers = vec![Some(honest), Some(tampered), Some(truncated), None];
 
         let endpoint = bare_endpoint(ALPN_BLOB).await;
         let addr = crate::testing::direct_addr(&endpoint);
@@ -1777,6 +1912,14 @@ mod tests {
             stream.next_window().await.unwrap().is_none(),
             "and ends the run"
         );
+        drop(stream);
+
+        // A stream that ends mid-run fails there, after the window before
+        // it, however far ahead it was read.
+        let mut stream = client.stream_run(root, size, run, piece).await.unwrap();
+        assert!(stream.next_window().await.unwrap().unwrap().concat() == bytes[..(w * g) as usize]);
+        let cut = stream.next_window().await;
+        assert!(matches!(cut, Err(NetError::Read(_))), "{cut:?}");
         drop(stream);
 
         let mut stream = client.stream_run(root, size, run, piece).await.unwrap();
@@ -1903,17 +2046,21 @@ mod tests {
     /// A direct run's key and ticket live no longer than the QUIC
     /// connection that carried the offer: closing it forgets an unpresented
     /// ticket on the provider, so the key in that offer admits nothing, and
-    /// destroys the key of a run under way on the requester, so its next
-    /// read fails rather than carrying on over TCP.
+    /// destroys the key of a run under way on the requester, so the run
+    /// fails at the first window it had not read by then rather than
+    /// carrying on over TCP.
     #[tokio::test]
     async fn a_direct_runs_key_and_ticket_end_with_its_quic_connection() {
         let g = CHUNK_GROUP_SIZE;
         let w = synch_core::STREAM_WINDOW_GROUPS;
-        let size = 4 * w * g;
+        // Longer than the windows a run reads ahead, so some are still on
+        // the wire when the connection closes.
+        let windows = 4 * VERIFY_AHEAD as u64;
+        let size = windows * w * g;
         let bytes: Vec<u8> = (0..size).map(|i| (i % 233) as u8).collect();
         let (_dir, store) = test_store();
         let root = store.ingest_bytes(&bytes, now_ns()).unwrap();
-        let run = GroupRange::new(0, 4 * w);
+        let run = GroupRange::new(0, windows * w);
         let (server, client, _client_dir) = trusting_pair(store.clone(), direct_provider()).await;
 
         // The provider's half: an offer whose connection closes before the
@@ -1969,10 +2116,20 @@ mod tests {
         assert!(holds_key(&stream));
         blob.connection.close(0u32.into(), b"done");
         assert!(eventually(|| !holds_key(&stream)).await);
-        assert!(matches!(
-            stream.next_window().await,
-            Err(NetError::Direct(_))
-        ));
+        // Windows read before the close were opened and verified then; the
+        // first one after them fails.
+        let mut handed_out = 1;
+        let failed = loop {
+            match stream.next_window().await {
+                Ok(Some(_)) => handed_out += 1,
+                ended => break ended,
+            }
+        };
+        assert!(matches!(failed, Err(NetError::Direct(_))), "{failed:?}");
+        assert!(
+            handed_out < windows,
+            "the whole run arrived after the close"
+        );
 
         client.shutdown().await.unwrap();
         server.shutdown().await.unwrap();
