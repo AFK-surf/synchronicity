@@ -36,7 +36,7 @@ Use four-space indentation and let `rustfmt` own Rust layout. Follow Rust conven
 
 ## Testing Guidelines
 
-Place unit tests near implementation and integration tests in `<crate>/tests/*.rs`; frontend tests use `*.test.ts`. Name tests after observable behavior. Add regression coverage for bug fixes, especially trust boundaries and cross-platform behavior. The `synch-engine` and ignored `synch-mpt` stress tests are intentionally separated in CI; run targeted variants when touching those areas.
+Place unit tests near implementation and integration tests in `<crate>/tests/*.rs`; `synch-engine` and `synch-mpt` keep theirs as modules of one `tests/integration/` binary (add a module there, not a file in `tests/`), because every test binary relinks the whole dependency graph. Frontend tests use `*.test.ts`. Name tests after observable behavior. Add regression coverage for bug fixes, especially trust boundaries and cross-platform behavior. The `synch-engine` and ignored `synch-mpt` stress tests are intentionally separated in CI; run targeted variants when touching those areas.
 
 - Test meaningful behavior, not trivial properties or code that is correct by construction.
 - When proofs cover the same operation and assumptions, keep only the necessary native and host-boundary checks.
