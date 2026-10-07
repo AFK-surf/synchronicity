@@ -568,10 +568,11 @@ impl Control for ControlService {
                 let mut out = Frames { tx: tx.clone() };
                 match &served {
                     Served::Named(node) => {
-                        until_stopped(stopping, dispatch(node, command, &mut out)).await
+                        until_stopped(stopping, boxed(dispatch(node, command, &mut out))).await
                     }
                     Served::Pending(pending) => {
-                        until_stopped(stopping, dispatch_pending(pending, command, &mut out)).await
+                        until_stopped(stopping, boxed(dispatch_pending(pending, command, &mut out)))
+                            .await
                     }
                 }
             };
@@ -1433,6 +1434,19 @@ fn gone() -> ControlError {
 
 /// What a helper that only writes output returns.
 type Done = Result<(), ControlError>;
+
+/// A dispatch future behind a pointer, proven `Send` once, here.
+///
+/// `dispatch` is one `match` over every command, so its future is a very
+/// large state machine. Spawned as it is, every check that the spawned task
+/// is `Send` walks that whole type again, and that alone cost this crate
+/// about a quarter of its compile time. Boxed, `run` sees a trait object and
+/// the walk happens at this one coercion. One allocation per command.
+fn boxed<'a>(
+    dispatched: impl std::future::Future<Output = Done> + Send + 'a,
+) -> Pin<Box<dyn std::future::Future<Output = Done> + Send + 'a>> {
+    Box::pin(dispatched)
+}
 
 /// Serves the commands that mean something to a node with no name yet (§3.1).
 ///
