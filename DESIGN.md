@@ -1632,6 +1632,9 @@ synch pin add|rm|ls <root|space/path>        keep content in CAS regardless of p
                                              `ls` and `rm` name every holder, since a
                                              replica may hold it too)
 synch recover [--wait <dur>] [--gap <n>]     resume publishing after key/database loss (§3.4)
+synch lock run|acquire|renew|release|break   best-effort cluster locks: exclusive under
+synch lock ls|status                         bounded latency, split brain under partition
+                                             (docs/LOCKS.md; designed, not yet built)
 synch doctor                                 connectivity, DNSSEC, equivocation, GC stats,
                                              the trust policy in force and the clock it dates by
 ```
@@ -1802,6 +1805,10 @@ chunks** — a bounded queue on each side and a 4 MiB HTTP/2 window between them
   denylist and not an allowlist: it only has to name the headers whose absence
   produces a *wrong object*, which is a closed set, where an allowlist has to
   know every header every SDK sends before it can let a working client through.
+- **Lock keys**: keys a bucket declares with `--locks <glob>` are cluster locks
+  driven by conditional writes (`If-None-Match: *` to acquire, `DELETE` to
+  release), which is what Terraform's `use_lockfile` speaks; `x-synch-lock` makes
+  a write fenced. Designed in docs/LOCKS.md §11, not yet built.
 - **Not in v1**: `DeleteObjects` (the batch delete, which is its own API and its
   own body format), CopyObject and UploadPartCopy, DeleteBucket — a bucket is a
   mapping the operator made, not a thing HTTP may unmake — bucket versioning
