@@ -708,7 +708,7 @@ async fn a_discovery_only_peer_can_connect_to_a_socket_and_list_them() {
     use iroh::address_lookup::memory::MemoryLookup;
     use synch_core::SockStatus;
     use synch_engine::sockets::SocketConnection;
-    use tokio::io::AsyncWriteExt;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
     let (_server_data, server_space, server) = node_with_space().await;
     let (_client_data, _client_space, client) = node_with_space().await;
@@ -774,7 +774,8 @@ async fn a_discovery_only_peer_can_connect_to_a_socket_and_list_them() {
     } = stream;
     send.write_all(b"discovered").await.unwrap();
     send.shutdown().await.unwrap();
-    let echoed = recv.read_to_end(1024).await.unwrap();
+    let mut echoed = Vec::new();
+    recv.read_to_end(&mut echoed).await.unwrap();
     let closed = socket_client.next_closed(&mut control).await.unwrap();
 
     assert_eq!(echoed, b"discovered");

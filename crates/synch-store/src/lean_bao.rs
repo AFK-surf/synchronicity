@@ -8,7 +8,7 @@
 use std::fs::File;
 
 use bao_tree::io::outboard::PreOrderOutboard;
-use synch_core::{ChunkRanges, Cv, GroupRange, Hash, PROOF_NODE_LEN};
+use synch_core::{ChunkRanges, Cv, GroupRange, Hash, CHUNK_GROUP_SIZE, PROOF_NODE_LEN};
 use synch_verified::host;
 
 use crate::{
@@ -41,6 +41,54 @@ pub(crate) fn ranges_of(spans: &[(u64, u64)]) -> ChunkRanges {
 
 pub(crate) fn pairs_of(ranges: &ChunkRanges) -> Vec<(u64, u64)> {
     ranges.ranges.iter().map(|r| (r.start, r.end)).collect()
+}
+
+/// One contiguous run of an object's payload, read in a single call.
+///
+/// A slice is encoded a group at a time, and each group read from the file
+/// on its own is a 16 KiB `pread`: 128 of them for a 2 MiB window, each a
+/// separate request to the disk when the payload is not cached, and two runs
+/// served at once interleave theirs so that neither sees sequential reads.
+/// The groups of one run are adjacent in the file, so the run is read whole,
+/// once, and the groups are copied out of memory.
+struct Prefetched {
+    start: u64,
+    bytes: Vec<u8>,
+}
+
+impl Prefetched {
+    /// The payload under `ranges` when they are one run, bounded as a served
+    /// window is; `None` for any other shape, which is read group by group.
+    fn read(data: &DataFile, size: u64, ranges: &ChunkRanges) -> Result<Option<Prefetched>> {
+        let [run] = ranges.ranges.as_slice() else {
+            return Ok(None);
+        };
+        if run.end - run.start > synch_core::MAX_SLICE_GROUPS {
+            return Ok(None);
+        }
+        let start = run.start.saturating_mul(CHUNK_GROUP_SIZE).min(size);
+        let end = run.end.saturating_mul(CHUNK_GROUP_SIZE).min(size);
+        let mut bytes = vec![0u8; (end - start) as usize];
+        bao_tree::io::sync::ReadAt::read_exact_at(data, start, &mut bytes)?;
+        Ok(Some(Prefetched { start, bytes }))
+    }
+}
+
+impl bao_tree::io::sync::ReadAt for Prefetched {
+    fn read_at(&self, pos: u64, buf: &mut [u8]) -> std::io::Result<usize> {
+        let held = pos
+            .checked_sub(self.start)
+            .and_then(|at| self.bytes.get(at as usize..))
+            .ok_or_else(|| {
+                std::io::Error::new(
+                    std::io::ErrorKind::InvalidInput,
+                    "a read outside the prefetched run",
+                )
+            })?;
+        let n = buf.len().min(held.len());
+        buf[..n].copy_from_slice(&held[..n]);
+        Ok(n)
+    }
 }
 
 fn root_of(root: &[u8]) -> Result<Hash> {
@@ -85,7 +133,12 @@ impl host::Bao for Bao<'_> {
                     tree,
                     data: DataFile(File::open(self.store.outboard_path(&root))?),
                 };
-                encode_slice_into(size, &ranges, &data, &outboard, &mut encoded)
+                match Prefetched::read(&data, size, &ranges)? {
+                    Some(window) => {
+                        encode_slice_into(size, &ranges, &window, &outboard, &mut encoded)
+                    }
+                    None => encode_slice_into(size, &ranges, &data, &outboard, &mut encoded),
+                }
             }
         }
         .map_err(|error| StoreError::invalid(format!("encode slice: {error}")))?;

@@ -252,6 +252,7 @@ callee) pair; one bidirectional stream per invocation.
 enum SockRequest {
     Open(SockOpen),              // run a socket; the stream becomes the invocation's
     List,                        // the sockets this caller may open
+    OpenDirect(SockOpen),        // Open, its bytes over direct TCP if offered
 }
 
 struct SockOpen {
@@ -266,6 +267,8 @@ struct SockOpen {
 enum SockOpened {
     Ok { program: Hash, program_path: String, invocation: u64 },
     Refused { code: RefuseCode, message: String },
+    Direct { program: Hash, program_path: String, invocation: u64,  // answers OpenDirect:
+             port: u16, ticket: [u8; 16], secret: DirectSecret },   // bytes over TCP
 }
 
 // callee → caller, the answer to List, and the whole of that stream
@@ -308,12 +311,26 @@ and refuses likewise. Neither side misaddresses anything: the failure is at the
 handshake, before any policy runs, and §11's rollout order — **upgrade, then
 activate** — is the one that applies.
 
+`OpenDirect` is the opt-in direct-TCP path (`docs/DIRECT-TCP.md`, "Sockets"):
+where both nodes chose it and the connection has a direct IP path, the callee
+answers `Direct` with a port, a ticket and a key, and the bytes travel over a
+TCP connection sealed into records, both ways. The QUIC stream stays open and
+idle as the invocation's identity, and everything else in this section —
+admission, refusals, the control stream — is the same. A callee that cannot
+offer answers a plain `Ok`, and one that predates the request refuses it as
+malformed, which sends the caller back to `Open`.
+
 ### 4.1 Why the payload is unframed and the status is out of band
 
 After `Opened::Ok` the stream carries opaque bytes in both directions with no
 framing at all, and half-close maps to QUIC FIN in the obvious way. That is
 deliberate: framing the payload to make room for a trailer would put a length
 prefix on every proxied byte for the sake of a value that arrives once.
+
+On the direct path the payload *is* framed — into AEAD records, because TCP
+carries no authentication of its own — but the frames are the transport's,
+invisible to the program and to the caller, and half-close is a direction's
+final record. The status still rides the control stream.
 
 A QUIC `RESET_STREAM` would be the other cheap way to carry a status, and it is
 wrong here — a reset discards data the peer has not yet read, so a program that

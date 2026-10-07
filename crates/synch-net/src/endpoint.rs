@@ -178,13 +178,14 @@ pub struct NetOptions {
     /// changed, and any checkout materializing it should look again.
     /// The endpoint only rings the bell.
     pub heads: Option<Arc<dyn crate::HeadSink>>,
-    /// Listen for direct-TCP runs on this address and offer them to peers
-    /// that ask (`docs/DIRECT-TCP.md`). Off by default: the port has to be
-    /// reachable from peers, which is a firewall decision this node cannot
-    /// make for its operator.
+    /// Listen for direct-TCP runs and socket streams on this address and
+    /// offer them to peers that ask (`docs/DIRECT-TCP.md`). Off by default:
+    /// the port has to be reachable from peers, which is a firewall decision
+    /// this node cannot make for its operator.
     pub direct_listen: Option<SocketAddr>,
-    /// Ask providers for large transient reads as direct-TCP runs where the
-    /// connection has a direct path (`docs/DIRECT-TCP.md`). Off by default.
+    /// Ask providers for large transient reads, and callees for socket
+    /// streams, over direct TCP where the connection has a direct path
+    /// (`docs/DIRECT-TCP.md`). Off by default.
     pub direct_dial: bool,
     /// The cluster-lock service, mounted as `sync/lock/1` when present
     /// (`docs/LOCKS.md` §9.2). Absent means the ALPN is not offered, so a
@@ -332,6 +333,10 @@ pub struct Net {
     /// Peers whose direct path lately failed, when this node asks for direct
     /// runs.
     direct_memo: Option<Arc<crate::direct::DirectMemo>>,
+    /// The same for direct socket streams. Kept apart from the runs': a peer
+    /// can offer one and not the other, and only a path that failed is
+    /// worth sharing, which each records for itself at the cost of one try.
+    sock_direct_memo: Option<Arc<crate::direct::DirectMemo>>,
 }
 
 impl Net {
@@ -460,6 +465,7 @@ impl Net {
             )
             .on_unknown_key(options.on_unknown_key.clone())
             .inflight(inflight.clone())
+            .direct(direct.clone())
         });
         let router = match &sockets {
             Some(protocol) => router.accept(synch_core::ALPN_SOCK, protocol.clone()),
@@ -483,6 +489,9 @@ impl Net {
             dialed: Arc::new(std::sync::Mutex::new(HashMap::new())),
             direct,
             direct_memo: options
+                .direct_dial
+                .then(|| Arc::new(crate::direct::DirectMemo::default())),
+            sock_direct_memo: options
                 .direct_dial
                 .then(|| Arc::new(crate::direct::DirectMemo::default())),
         })
@@ -603,7 +612,7 @@ impl Net {
             .connect(addr, synch_core::ALPN_SOCK)
             .await
             .map_err(|e| NetError::Endpoint(e.to_string()))?;
-        Ok(crate::sock::SockClient::new(connection))
+        Ok(crate::sock::SockClient::new(connection).with_direct(self.sock_direct_memo.clone()))
     }
 
     async fn connect(
@@ -698,6 +707,20 @@ impl Net {
         self.direct
             .as_ref()
             .map_or(0, |listener| listener.pending())
+    }
+
+    /// The direct listener's port, when this node offers direct streams.
+    #[cfg(test)]
+    pub(crate) fn direct_port(&self) -> Option<u16> {
+        self.direct.as_ref().map(|listener| listener.port())
+    }
+
+    /// Stops the direct listener, as a node whose port became unreachable.
+    #[cfg(test)]
+    pub(crate) fn stop_direct(&self) {
+        if let Some(listener) = &self.direct {
+            listener.stop();
+        }
     }
 
     /// Shuts the router and endpoint down cleanly.

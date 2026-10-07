@@ -1321,25 +1321,28 @@ next — or to ask for windows one at a time at all. It asks a provider for the
 rest of the read as one **streamed run** (`GetStream`): one request, answered
 on one stream as a sequence of 2 MiB windows (`STREAM_WINDOW_GROUPS`), each
 exactly what a `GetSlice` for that window would have answered — its
-length-prefixed encoding, then its `SliceEnd`. The provider encodes the next
-window while it sends the current one and is held back by nothing but QUIC's
-flow control, so a run costs it at most two encoded windows of memory whatever
-its length; it stops after the run's last window or after the first one it did
+length-prefixed encoding, then its `SliceEnd`. The provider encodes up to
+four windows ahead of the one it sends, each read off disk in one call, and is
+held back by nothing but the transport's flow control, so a run costs it at
+most five encoded windows of memory whatever its length; it stops after the run's last window or after the first one it did
 not hold whole, so a partial holder's run ends without a request per window.
 Every window is a fresh decision of the serve command and meets the checks a
-request of its own would — the peer's binding (§3.2) and content scope (§3.5)
-— so a binding revoked mid-run ends the run at the next window. The serve-side
+request of its own would — the peer's binding (§3.2) and content scope (§3.5),
+made as it is about to be sent — so a binding revoked mid-run ends the run at
+the next window. The serve-side
 stream deadline is a deadline on progress rather than on the whole exchange: a
 run is cut off for stalling, not for being long.
 
-The requester verifies each window as it streams in: the window's layout is
-known from the request alone, so every parent node and every group is checked
-against the root the moment it is off the stream and lands, once, in the piece
-forwarded to the reader — no buffered encoding, no decode out of it. The
-provider's length prefix says up front whether it is answering the whole
-window; a partial holder's answer is read whole and verified against the run
-`SliceEnd` names. A task of the reader's own reads and verifies up to four
-windows ahead of the caller. A provider that predates `GetStream` cannot decode
+The requester reads each window's encoding whole and verifies it on the
+blocking pool, up to four windows at once while the next are read, and hands
+them on strictly in order: the window's layout is known from the request
+alone, so every parent node and every group is checked against the root and
+copied, once, into the piece forwarded to the reader. Hashing is the costliest
+per-byte work of a read, and each window carries its own path from the root,
+so windows verify independently on as many cores as are free. The provider's
+length prefix says up front whether it is answering the whole window; a
+partial holder's answer is verified against the run `SliceEnd` names. A task
+of the reader's own keeps up to four verified windows ahead of the caller. A provider that predates `GetStream` cannot decode
 it and ends the stream without a byte; it is asked window by window instead,
 four 2 MiB `GetSlice` windows in flight as concurrent streams on one
 connection, answered in the order they were asked for. Endpoints keep QUIC's
@@ -1359,7 +1362,12 @@ QUIC stream that asked stays open as the run's identity on the provider, so
 the run keeps its stream's concurrency slot, progress deadline and per-window
 checks, and the key lives no longer than the QUIC connection on either side.
 A provider that makes no offer, a port that does not accept, a damaged record
-or a stall sends the read back to `GetStream` from the same provider.
+or a stall sends the read back to `GetStream` from the same provider. Socket
+invocations take the same path under the same flags: an `OpenDirect` is
+admitted as an `Open` is, answered with an offer in its `Opened`, and its
+bytes travel both ways as records under a key per direction, confirmed by the
+callee before the caller uses them; a callee without the path answers a plain
+`Ok` on QUIC.
 
 This is intentionally the same shape as iroh-blobs' protocol; we keep our own ALPN and
 message frame so the availability semantics (partial serving, `SliceEnd`) stay under

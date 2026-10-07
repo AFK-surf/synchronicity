@@ -5,7 +5,11 @@
 //! [`Open`](SockRequest::Open) is answered with a length-framed [`SockOpened`]
 //! and the stream then carries **opaque bytes with no framing at all** in both
 //! directions until FIN; a [`List`](SockRequest::List) is answered with one
-//! [`SockListed`] and nothing more.
+//! [`SockListed`] and nothing more. An
+//! [`OpenDirect`](SockRequest::OpenDirect) is an `Open` that would rather its
+//! bytes travel over a direct TCP connection (`docs/DIRECT-TCP.md`); the callee
+//! answers it with [`SockOpened::Direct`] when it can, and with a plain
+//! [`SockOpened::Ok`] — bytes on the stream, as for `Open` — when it cannot.
 //!
 //! The payload is unframed deliberately. A trailer carrying the invocation's
 //! exit status would put a length prefix on every proxied byte for the sake of
@@ -17,7 +21,7 @@
 
 use serde::{Deserialize, Serialize};
 
-use crate::{hash::Hash, origin::OriginId};
+use crate::{hash::Hash, origin::OriginId, DirectSecret, DIRECT_TICKET_LEN};
 
 /// ALPN for socket invocation (`docs/SOCKETS.md` §4).
 pub const ALPN_SOCK: &[u8] = b"sync/sock/1";
@@ -109,16 +113,28 @@ pub fn validate_socket_name(name: &str) -> Result<(), SocketNameError> {
 
 /// What a caller asks for on a fresh bi-stream.
 ///
-/// One frame per stream, and the only two things a caller can ask: run a
-/// socket, or say which sockets it may run. `List` needs no runtime — a node
-/// that cannot serve sockets can still say which ones it has — and no new
+/// One frame per stream, and the only things a caller can ask: run a socket,
+/// or say which sockets it may run. `List` needs no runtime — a node that
+/// cannot serve sockets can still say which ones it has — and no new
 /// authorization: it applies the same scope rule `Open` does.
+///
+/// Appended to, never reordered: postcard numbers variants by position.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SockRequest {
     /// Run a socket; the stream becomes the invocation's.
     Open(SockOpen),
     /// The sockets this caller may open. Answered with one [`SockListed`].
     List,
+    /// Run a socket, its bytes over a direct TCP connection where the callee
+    /// can offer one (`docs/DIRECT-TCP.md`).
+    ///
+    /// Admitted exactly as [`Open`](Self::Open) is. The answer is
+    /// [`SockOpened::Direct`], or [`SockOpened::Ok`] when the callee has no
+    /// direct listener or the connection is relayed — and then the stream
+    /// carries the bytes, as for `Open`. A callee that predates this request
+    /// cannot decode it and refuses it as a malformed frame, which tells the
+    /// caller to ask with `Open`.
+    OpenDirect(SockOpen),
 }
 
 /// Opens one invocation. The caller's whole influence over what runs.
@@ -197,7 +213,10 @@ impl RefuseCode {
 }
 
 /// The callee's answer to a [`SockOpen`].
-#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+///
+/// Appended to, never reordered: postcard numbers variants by position. Not
+/// `Clone`, because [`SockOpened::Direct`] carries a key.
+#[derive(Debug, PartialEq, Eq, Serialize, Deserialize)]
 pub enum SockOpened {
     /// Accepted; raw bytes follow in both directions.
     Ok {
@@ -224,7 +243,35 @@ pub enum SockOpened {
         #[serde(deserialize_with = "bounded_message")]
         message: String,
     },
+    /// Accepted, answering a [`SockRequest::OpenDirect`]: the bytes travel
+    /// over a TCP connection to `port`, sealed under a key derived from
+    /// `secret` (`docs/DIRECT-TCP.md`), and this stream carries none. It stays
+    /// open for as long as the invocation does, and resetting it, or closing
+    /// the connection under it, ends the invocation and destroys its key.
+    Direct {
+        /// As in [`SockOpened::Ok`].
+        program: Hash,
+        /// As in [`SockOpened::Ok`].
+        program_path: String,
+        /// As in [`SockOpened::Ok`].
+        invocation: u64,
+        /// The callee's direct listener port. The caller dials it on the IP
+        /// of the QUIC path it is already using, never an address the callee
+        /// names.
+        port: u16,
+        /// The single-use id the caller presents on the TCP connection.
+        ticket: [u8; DIRECT_TICKET_LEN],
+        /// The invocation's key, drawn for this offer alone.
+        secret: DirectSecret,
+    },
 }
+
+/// The largest accepted [`SockOpened`] frame, in bytes.
+///
+/// Derived, like [`MAX_OPEN_FRAME_LEN`]: a program path bounded by the
+/// tree-key bound, a refusal message bounded by its own cap, and room for a
+/// root, an offer and postcard's varints.
+pub const MAX_OPENED_FRAME_LEN: usize = crate::MAX_KEY_LEN + MAX_REFUSE_MESSAGE_LEN + 256;
 
 /// The callee's answer to [`SockRequest::List`]: the sockets this caller may
 /// open (`docs/SOCKET-PROGRAMS.md` §5).
@@ -1277,6 +1324,7 @@ mod tests {
                 vec![("user".into(), "zoe".into())],
             )),
             SockRequest::List,
+            SockRequest::OpenDirect(open()),
         ] {
             let bytes = postcard::to_stdvec(&msg).unwrap();
             assert_eq!(postcard::from_bytes::<SockRequest>(&bytes).unwrap(), msg);
@@ -1291,6 +1339,14 @@ mod tests {
             SockOpened::Refused {
                 code: RefuseCode::OutOfScope,
                 message: "not in this socket's scope".into(),
+            },
+            SockOpened::Direct {
+                program: Hash::new(b"elf"),
+                program_path: "code/bin/gateway.o".into(),
+                invocation: 7,
+                port: 7443,
+                ticket: [3; DIRECT_TICKET_LEN],
+                secret: DirectSecret::from_bytes([9; 32]),
             },
         ] {
             let bytes = postcard::to_stdvec(&msg).unwrap();
@@ -1341,6 +1397,26 @@ mod tests {
             postcard::to_stdvec(&SockRequest::Open(big)).unwrap().len() <= MAX_OPEN_FRAME_LEN,
             "the largest legal Open does not fit MAX_OPEN_FRAME_LEN"
         );
+
+        // The largest answer to it fits too, offer and all.
+        let opened = SockOpened::Direct {
+            program: Hash::new(b"elf"),
+            program_path: "p".repeat(crate::MAX_KEY_LEN),
+            invocation: u64::MAX,
+            port: u16::MAX,
+            ticket: [0xff; DIRECT_TICKET_LEN],
+            secret: DirectSecret::from_bytes([0xff; 32]),
+        };
+        let refused = SockOpened::Refused {
+            code: RefuseCode::OutOfScope,
+            message: "m".repeat(MAX_REFUSE_MESSAGE_LEN),
+        };
+        for answer in [opened, refused] {
+            assert!(
+                postcard::to_stdvec(&answer).unwrap().len() <= MAX_OPENED_FRAME_LEN,
+                "the largest legal answer does not fit MAX_OPENED_FRAME_LEN"
+            );
+        }
 
         // And the largest legal `List` reply fits its own bound, so a node at
         // the activation bound can still answer a peer.

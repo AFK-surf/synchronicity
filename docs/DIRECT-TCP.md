@@ -1,7 +1,8 @@
-# Direct-TCP streamed runs
+# Direct-TCP streamed runs and socket streams
 
 Status: **implemented**, opt-in on both ends and off by default; benchmarked
-on loopback only (see [Rollout](#rollout)).
+on loopback only (see [Rollout](#rollout)). Socket invocations use the same
+path under the same flags ([Sockets](#sockets)).
 
 A transient read (`synch cat --no-cache`, a `--no-cache` S3 bucket) asks a
 provider for the rest of the read as one streamed run (`GetStream`, DESIGN.md
@@ -282,10 +283,13 @@ The `GetDirect` arm of `BlobProtocol::handle_stream`:
 3. Wait for the authenticated socket (or the accept timeout, or the control
    stream being reset by the requester).
 4. Run the **existing** `serve_run` loop with a sink that seals records onto
-   the TCP socket instead of writing to the QUIC send stream: `admit_window`
-   before every window, one window encoded ahead, `progress.mark()` after each
-   window sent. TCP's flow control now plays the role QUIC's did, so a run
-   still holds at most two encoded windows in memory.
+   the TCP socket instead of writing to the QUIC send stream: up to four
+   windows encoded ahead, each read off disk in one call; `admit_window`
+   before every window is sent; each window sealed on the blocking pool —
+   its records' counter values taken in send order — while the window before
+   it is written; `progress.mark()` after each window handed on. TCP's flow
+   control now plays the role QUIC's did, so a run holds at most six windows
+   in memory: four encoding, one sealing, one being written.
 5. Write the `final` record, shut down the socket, finish the control stream.
 
 The transfer runs inside the control stream's dispatch future, so:
@@ -303,9 +307,16 @@ The transfer runs inside the control stream's dispatch future, so:
 `BlobClient::stream_run_direct(root, size, run, piece)` returns the same
 `RunStream` as `stream_run`, over a different byte source: `RunStream` and the
 window readers read from a `Source` that is either the QUIC `RecvStream` or a
-`DirectSource` that reads and opens records. The streaming verifier, the piece
-layout, the partial-holder rule and the per-window deadline are the same code
-on both.
+`DirectSource` that reads and opens records. The verifier, the piece layout,
+the partial-holder rule and the per-window deadline are the same code on both.
+`RunStream` reads each window's encoding off the source and verifies it on
+the blocking pool, up to four windows at once, handing them out in order.
+
+Every direct-run socket asks for 4 MiB send and receive buffers before it
+connects or listens. macOS defaults to 128 KiB, half a record, and on a link
+whose round trip is tens of microseconds autotuning does not grow it, so the
+two ends otherwise take turns: the provider seals while the requester waits,
+then the requester opens and hashes while the provider waits.
 
 `PeerReader::next_streamed` in `synch-engine` tries, per provider, in order:
 
@@ -327,6 +338,87 @@ Failure handling separates *transport* faults from *provider* faults:
 
 A run already resumes from where the read stands, so a fall back mid-run
 re-asks only for what was not yet handed out.
+
+## Sockets
+
+A socket invocation (`docs/SOCKETS.md` §4) is the other long, bulk-capable
+byte stream between two members, and a proxy or an SSH session over one pays
+the same per-packet userspace cost a streamed run did. It takes the same path,
+under the same two flags, with the differences a bidirectional stream needs.
+
+**Negotiation.** A caller that opted in, whose connection's selected path is
+a direct IP path, sends `SockRequest::OpenDirect(open)` — appended after `List`
+— instead of `Open(open)`. The callee admits it exactly as it admits `Open`;
+nothing about which program runs, or for whom, depends on the transport. Then:
+
+- with a listener and a direct path, it answers `SockOpened::Direct { program,
+  program_path, invocation, port, ticket, secret }` — `Ok`'s fields plus an
+  offer — written and read through zeroed buffers like `DirectOffer`;
+- otherwise it answers a plain `Ok`, and the bytes travel on the QUIC stream,
+  as for `Open`. No round trip is lost: the callee decides, in its one answer.
+
+A callee that predates `OpenDirect` cannot decode it and refuses it as a
+malformed frame, under `NoSuchPath`. A caller refused with that code asks
+again with `Open`; if *that* is admitted, the callee is remembered as not
+offering, per peer for ten minutes (a memo of its own, apart from the runs').
+A socket that really does not exist is refused both ways, costing one extra
+round trip and no memo. Every other refusal is final at once.
+
+**Keys.** Five, derived as a run's are, from `secret || ticket ||
+postcard(open, invocation)` — bound to the `Open` that asked and the
+invocation that answered — under labels of their own, so a socket's keys are
+never a run's and the two directions' are never each other's:
+
+```text
+k_hello   = derive_key("synch direct-tcp v1 sock hello",   input)
+k_up      = derive_key("synch direct-tcp v1 sock up",      input)  // caller → callee
+iv_up     = derive_key("synch direct-tcp v1 sock up iv",   input)[0..12]
+k_down    = derive_key("synch direct-tcp v1 sock down",    input)  // callee → caller
+iv_down   = derive_key("synch direct-tcp v1 sock down iv", input)[0..12]
+```
+
+The Hello, the ticket table, the pre-auth bounds and the dialing rule are the
+run's, unchanged: one listener serves both.
+
+**Records, both ways.** Each direction is a sequence of records under its own
+key and counter, in the run's format. A half-close is that direction's `final`
+record followed by a TCP write shutdown; a FIN or reset before it is an error
+on the reading side, never an EOF a program could take for its peer's
+half-close. A write returns once the record it sealed is on the socket, so
+nothing waits on a flush the runtime and the bridges never make. Records carry
+at most 256 KiB, and a write of less goes out at once as a shorter record:
+interactive traffic is not held back to fill one.
+
+**Confirmation.** Once the callee has the authenticated connection, the first
+thing it sends is an empty data record. The caller waits up to 5 s for it
+before handing the stream to anyone. Only the holder of `k_down` can seal it,
+so it proves the far end is the callee rather than whatever else accepted a
+TCP connection on that port — a stale forward, a middlebox — which would
+otherwise leave the caller on a stream nothing will ever write to.
+
+**Fallback.** A port that does not accept, a Hello not taken, or a missing
+confirmation sends the caller back to `Open` on QUIC, remembering the peer for
+ten minutes. It drops the `OpenDirect` stream first, and the callee, which was
+holding the admission while it waited, drops it with nothing run — or, when
+its confirmation was sent and not received in time, ends the invocation it had
+started as one whose caller left. A stream that
+breaks mid-invocation cannot fall back — the program has already seen its
+bytes — and ends as a failed stream does on QUIC.
+
+**Lifetime.** The `OpenDirect` stream stays open, carrying nothing, as the
+invocation's identity; `SockClosed` names it as before. On the callee, the
+connection closing or the caller stopping that stream is the caller having
+gone: it ends the invocation (`Closed{Deadline}`), and a watcher destroys both
+keys and shuts the TCP connection down at once. On the caller, the same
+watcher acts when the QUIC connection closes, so a read waiting on the socket
+fails immediately rather than at the next record. Both halves of a stream must
+be dropped before its QUIC stream is, so a caller that has read the program's
+output to the end can keep writing.
+
+**What is unchanged.** Admission, scope, the concurrency cap, the idle
+deadline, the teardown drain, `List` and the control stream. The runtime sees
+a byte stream, as it did; the bridges (`synch socket connect`, the managed
+gateway) see one too.
 
 ## Security summary
 
@@ -353,6 +445,10 @@ re-asks only for what was not yet handed out.
   stream, which `MAX_CONCURRENT_STREAMS` and the binding already bound.
 - **Revocation:** unchanged — per-window checks, and the transfer dies with its
   QUIC stream and connection.
+- **Sockets:** the same properties per direction. Each direction has its own
+  key and counter, a direction ends only at its `final` record, and the
+  callee's confirmation authenticates it to the caller before any byte is
+  trusted to the path.
 
 ## Configuration
 
@@ -360,8 +456,8 @@ Both ends opt in; neither changes behavior for peers that did not.
 
 | Side | Flag | Env | Effect |
 | --- | --- | --- | --- |
-| Provider | `--direct-tcp-listen HOST:PORT` | `SYNCH_DIRECT_TCP_LISTEN` | bind the listener; answer `GetDirect` |
-| Requester | `--direct-tcp` | `SYNCH_DIRECT_TCP` | try the direct path for large transient reads |
+| Provider, callee | `--direct-tcp-listen HOST:PORT` | `SYNCH_DIRECT_TCP_LISTEN` | bind the listener; answer `GetDirect` and `OpenDirect` |
+| Requester, caller | `--direct-tcp` | `SYNCH_DIRECT_TCP` | try the direct path for large transient reads and socket invocations |
 
 Both land in `NetOptions` (`direct_listen: Option<SocketAddr>`,
 `direct_dial: bool`), off by default. The listener is bound in `Net::bind` and
@@ -372,9 +468,14 @@ forward, which is why it is opt-in rather than automatic.
 ## Code map
 
 - `synch-core/src/wire.rs`: `GetDirect`, `DirectOffer`, `DirectSecret`.
+- `synch-core/src/sock.rs`: `SockRequest::OpenDirect`, `SockOpened::Direct`.
 - `synch-net/src/direct.rs`: subkey derivation, the listener with its ticket
   table and pre-auth bounds, Hello, `RecordWriter`/`RecordReader`,
   `DirectSource` and its connection watcher, the per-peer refusal memo.
+- `synch-net/src/direct/stream.rs`: a socket's keys, and the two record halves
+  (`DirectRead`, `DirectWrite`) with their shared watcher and confirmation.
+- `synch-net/src/sock.rs`: `OpenDirect` on both sides; `SockSend`/`SockRecv`,
+  the caller's halves on either path.
 - `synch-net/src/blob.rs`: the `GetDirect` arm (`serve_direct`), the run's
   `Sink` and `Source`, `BlobClient::stream_run_direct`.
 - `synch-net/src/endpoint.rs`: `NetOptions::{direct_listen, direct_dial}`;
@@ -406,6 +507,15 @@ outside the verified core.
 - `a_large_transient_read_streams_intact_with_or_without_a_direct_path` — the
   engine's transient read over TCP from a provider that offers, over QUIC
   from one that does not.
+- `a_direct_stream_carries_both_ways_and_ends_only_at_a_final_record` — both
+  directions with independent half-closes; a FIN without the final record and
+  a flipped bit are failures.
+- `a_socket_stream_goes_direct_where_the_callee_offers_and_on_quic_where_not`.
+- `a_direct_offer_that_cannot_be_taken_up_opens_on_quic` — the untaken
+  admission runs nothing; the peer is remembered.
+- `a_callee_that_cannot_read_open_direct_is_asked_with_open` — and an unknown
+  socket is refused both ways without being remembered.
+- `a_direct_stream_ends_with_its_quic_connection`.
 
 ## Rollout
 
@@ -417,6 +527,9 @@ outside the verified core.
    costing more CPU per byte; otherwise remove it rather than carry an unused
    transport.
 4. If it pays, consider `fetch_into` and replica acquisition next.
+
+Socket streams are not benchmarked separately: per byte they do the run's
+work minus the verification, and an interactive stream's records are small.
 
 ### Loopback results
 
@@ -458,6 +571,59 @@ delay and window growth hurt), bandwidth limits, loss, and two machines'
 worth of cores. This container has no `netem`, so the LAN and cross-region
 numbers are still to be taken; until then the result is "cheaper per byte on
 both ends", not "faster on a real link".
+
+### Thunderbolt ring results
+
+Mac mini M2 (8 cores, 8 GB) CI hosts on a routed Thunderbolt ring, MTU
+65518, TSO on; `iperf3` gives 25–29 Gbit/s at any hop count. `synch cat
+--no-cache` of a 4 GiB object piped into `wc -c`, two hops, CI load on both
+hosts:
+
+| Build | MB/s |
+| --- | --- |
+| 0.1.17 | 285–414 |
+| + 4 MiB direct socket buffers | 463–471 |
+| + run task yields after each window | 794–819 |
+| + windows verified on the blocking pool | 777–785 |
+| + 1 MiB control-socket buffers | 991–1002 (1075–1314 into `/dev/null`) |
+
+Parallel verification gained nothing on its own — the control socket was
+already the limit — but takes BLAKE3 (about 1.9 GB/s on one M2 core) off the
+path for whatever comes after it. The other steps each removed a hand-off where one side waited for the other while
+neither was busy (every worker thread under ~25%, measured with `sample`):
+
+- the 128 KiB TCP buffers above;
+- the run's task handing a window to the reader: tokio runs the woken
+  reader next on the same worker, in a slot no other worker may take, so
+  while the socket had data the reader waited for the run's task to finish
+  its next window — verifying and forwarding in turn, not side by side;
+- the control socket: a unix stream socket on macOS buffers 8 KiB each way,
+  so each 256 KiB chunk crossed from the daemon to `synch cat` in 32 writes,
+  each waiting for the other process. A local read of a held object, which
+  never touches the network, went from ~790 to ~1220 MB/s with that alone.
+
+Two later steps, `/dev/null`, same hosts:
+
+| Build | 1 run | 2 runs at once | 4 runs at once |
+| --- | --- | --- | --- |
+| above | 1075–1314 | — | — |
+| + provider seals the next window while sending the last | 1497–1662 | 509 | 507 |
+| + a window's payload read in one call, encoded 4 ahead | 1318–1379 | 1501 | 1576 |
+
+Sealing on the serving task cost about as much as the socket write after it,
+so a run was held to roughly one core's worth of both. Concurrent runs then
+collapsed on the provider's disk: each 16 KiB group was its own `pread`, and
+two runs interleaving them defeated the kernel's read-ahead on a payload the
+page cache did not hold (an 8 GB host running CI VMs). The single-run numbers
+of the last two rows are within this shared host's run-to-run spread; the
+earlier, higher ones were taken right after the object was written, when more
+of it was cached (inferred).
+
+What bounds a run now, of a ~3 GB/s link, on these hosts: the requester's
+CPU per byte (about 1.3–1.5 CPU-s/GiB on an M2 in `direct_bench`, most of it
+BLAKE3, against four performance cores shared with CI), and delivering the
+bytes over gRPC on the control socket to the client process. On an idle Mac
+Studio `direct_bench` moves 5071 MiB/s over loopback.
 
 ## Open questions
 
