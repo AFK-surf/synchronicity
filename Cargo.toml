@@ -132,6 +132,14 @@ zeroize = "1.9.0"
 opt-level = 2
 debug = false
 
+# Test binaries link statically, so each of the sixty-odd carried its own
+# copy of the workspace's full debug info: tens of gigabytes of target/, and
+# link time on every rebuild. Line tables keep file:line in panics and
+# backtraces; `CARGO_PROFILE_TEST_DEBUG=full` restores the rest for a session
+# in a debugger. `cargo build` keeps the dev default.
+[profile.test]
+debug = "line-tables-only"
+
 [profile.release]
 opt-level = 3
 lto = "thin"
