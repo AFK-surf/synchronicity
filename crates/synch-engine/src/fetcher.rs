@@ -1734,6 +1734,10 @@ impl PeerReader {
                         if windows.send(pieces).await.is_err() {
                             break;
                         }
+                        // The send woke the reader, which tokio runs next on
+                        // this worker and no other may take; while the stream
+                        // has more on hand this task would never let it.
+                        tokio::task::yield_now().await;
                     }
                     Ok(())
                 }),

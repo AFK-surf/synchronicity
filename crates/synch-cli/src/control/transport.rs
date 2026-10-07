@@ -176,6 +176,24 @@ mod imp {
     /// The byte stream the daemon serves gRPC over.
     pub type Transport = UnixStream;
 
+    /// The send and receive buffer of each end of a control connection.
+    ///
+    /// A unix stream socket's default on macOS is 8 KiB each way, so a
+    /// [`crate::control::proto::CHUNK_SIZE`] chunk crossed the socket in
+    /// thirty-two writes, each waiting for the other process to read the last:
+    /// a read through the daemon ran at the speed of that hand-off, not of
+    /// either process. Room for a few chunks lets the two run side by side.
+    /// The kernel caps it (`kern.ipc.maxsockbuf`, `net.core.wmem_max`), and a
+    /// capped or refused size only leaves the default in place.
+    const SOCKET_BUFFER: usize = 1 << 20;
+
+    /// Widens a control connection's socket buffers to [`SOCKET_BUFFER`].
+    fn widen(stream: &UnixStream) {
+        let socket = socket2::SockRef::from(stream);
+        let _ = socket.set_send_buffer_size(SOCKET_BUFFER);
+        let _ = socket.set_recv_buffer_size(SOCKET_BUFFER);
+    }
+
     /// The longest socket path `bind` accepts: `sun_path` minus its NUL.
     const MAX_SOCKET_PATH: usize = 107;
 
@@ -244,6 +262,7 @@ mod imp {
         /// Accepts one connection.
         pub(crate) async fn accept(&mut self) -> io::Result<Transport> {
             let (stream, _addr) = self.inner.accept().await?;
+            widen(&stream);
             Ok(stream)
         }
     }
@@ -258,7 +277,10 @@ mod imp {
     pub async fn dial(data_dir: &Path) -> io::Result<Transport> {
         let path = socket_path(data_dir);
         match UnixStream::connect(&path).await {
-            Ok(stream) => Ok(stream),
+            Ok(stream) => {
+                widen(&stream);
+                Ok(stream)
+            }
             Err(e)
                 if matches!(
                     e.kind(),

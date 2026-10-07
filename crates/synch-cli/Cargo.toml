@@ -69,6 +69,10 @@ synch-store.workspace = true
 synch-sock.workspace = true
 tempfile.workspace = true
 
+[target.'cfg(unix)'.dependencies]
+# Socket buffer sizes on the control socket (`control::transport`).
+socket2.workspace = true
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { workspace = true, features = [
   "Win32_Foundation",

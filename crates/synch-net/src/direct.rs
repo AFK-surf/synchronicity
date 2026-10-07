@@ -37,13 +37,37 @@ use serde::{de::DeserializeOwned, Serialize};
 use synch_core::{DirectSecret, GroupRange, Hash, NodeId, CHUNK_GROUP_SIZE, DIRECT_TICKET_LEN};
 use tokio::{
     io::{AsyncReadExt, AsyncWriteExt},
-    net::{TcpListener, TcpStream},
+    net::{TcpListener, TcpSocket, TcpStream},
 };
 use zeroize::Zeroizing;
 
 use crate::error::NetError;
 
 pub(crate) mod stream;
+
+/// The send and receive buffer of every direct-run socket: 4 MiB, two
+/// windows.
+///
+/// The kernel's default is 128 KiB on macOS — half a record — and on a fast
+/// link autotuning does not grow it, because the round trip is too short to
+/// ask for more. With that little in flight the two ends take turns: the
+/// provider seals a record while the requester waits, then the requester
+/// decrypts and hashes while the provider waits. Room for two windows lets
+/// each end work on its own window while the other works on its.
+const SOCKET_BUFFER: u32 = 4 << 20;
+
+/// A TCP socket of the address's family, with [`SOCKET_BUFFER`] set before it
+/// connects or listens, so the window it advertises from the first segment
+/// reflects it (a listener's accepted sockets inherit it).
+fn buffered_socket(addr: SocketAddr) -> std::io::Result<TcpSocket> {
+    let socket = match addr {
+        SocketAddr::V4(_) => TcpSocket::new_v4()?,
+        SocketAddr::V6(_) => TcpSocket::new_v6()?,
+    };
+    socket.set_send_buffer_size(SOCKET_BUFFER)?;
+    socket.set_recv_buffer_size(SOCKET_BUFFER)?;
+    Ok(socket)
+}
 
 /// The most plaintext one record carries: 256 KiB, the piece a transient read
 /// hands out, so a record buffer costs what a piece already does.
@@ -330,9 +354,15 @@ impl Drop for TicketGuard {
 impl DirectListener {
     /// Binds the listener and starts accepting.
     pub(crate) async fn bind(addr: SocketAddr) -> Result<DirectListener, NetError> {
-        let listener = TcpListener::bind(addr).await.map_err(|e| {
-            NetError::Endpoint(format!("could not bind direct listener {addr}: {e}"))
-        })?;
+        let listener = buffered_socket(addr)
+            .and_then(|socket| {
+                socket.set_reuseaddr(true)?;
+                socket.bind(addr)?;
+                socket.listen(1024)
+            })
+            .map_err(|e| {
+                NetError::Endpoint(format!("could not bind direct listener {addr}: {e}"))
+            })?;
         let port = listener
             .local_addr()
             .map_err(|e| NetError::Endpoint(e.to_string()))?
@@ -451,7 +481,8 @@ pub(crate) async fn dial(
     ticket: &[u8; DIRECT_TICKET_LEN],
     hello: &HelloKey,
 ) -> Result<TcpStream, NetError> {
-    let mut socket = match tokio::time::timeout(CONNECT_TIMEOUT, TcpStream::connect(addr)).await {
+    let connect = async { buffered_socket(addr)?.connect(addr).await };
+    let mut socket = match tokio::time::timeout(CONNECT_TIMEOUT, connect).await {
         Ok(Ok(socket)) => socket,
         Ok(Err(e)) => return Err(NetError::Direct(format!("connecting to {addr}: {e}"))),
         Err(_) => {

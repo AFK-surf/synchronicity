@@ -1332,14 +1332,16 @@ request of its own would — the peer's binding (§3.2) and content scope (§3.5
 stream deadline is a deadline on progress rather than on the whole exchange: a
 run is cut off for stalling, not for being long.
 
-The requester verifies each window as it streams in: the window's layout is
-known from the request alone, so every parent node and every group is checked
-against the root the moment it is off the stream and lands, once, in the piece
-forwarded to the reader — no buffered encoding, no decode out of it. The
-provider's length prefix says up front whether it is answering the whole
-window; a partial holder's answer is read whole and verified against the run
-`SliceEnd` names. A task of the reader's own reads and verifies up to four
-windows ahead of the caller. A provider that predates `GetStream` cannot decode
+The requester reads each window's encoding whole and verifies it on the
+blocking pool, up to four windows at once while the next are read, and hands
+them on strictly in order: the window's layout is known from the request
+alone, so every parent node and every group is checked against the root and
+copied, once, into the piece forwarded to the reader. Hashing is the costliest
+per-byte work of a read, and each window carries its own path from the root,
+so windows verify independently on as many cores as are free. The provider's
+length prefix says up front whether it is answering the whole window; a
+partial holder's answer is verified against the run `SliceEnd` names. A task
+of the reader's own keeps up to four verified windows ahead of the caller. A provider that predates `GetStream` cannot decode
 it and ends the stream without a byte; it is asked window by window instead,
 four 2 MiB `GetSlice` windows in flight as concurrent streams on one
 connection, answered in the order they were asked for. Endpoints keep QUIC's
