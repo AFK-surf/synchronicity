@@ -28,7 +28,7 @@ use synch_store::{
 };
 
 use crate::{
-    direct::{DirectListener, DirectMemo, DirectSource, RecordWriter, RunKeys},
+    direct::{DirectListener, DirectMemo, DirectSource, RecordWriter, RunKeys, Sealing},
     endpoint::{under_deadline, REQUEST_TIMEOUT},
     error::NetError,
     frame::{read_answer, read_bytes, read_frame, write_bytes, write_frame, write_owned},
@@ -458,12 +458,11 @@ impl BlobProtocol {
                 self.admit_window(peer, root).await?;
                 ahead = Some(self.encode_ahead(root, following));
             }
-            sink.write_owned(encoded).await?;
-            sink.write_frame(&BlobMessage::SliceEnd { served }).await?;
+            sink.send_window(encoded, served).await?;
             progress.mark();
             window = following;
         }
-        Ok(())
+        sink.flush().await
     }
 
     /// Answers a [`BlobMessage::GetDirect`] (`docs/DIRECT-TCP.md`): offers a
@@ -532,7 +531,10 @@ impl BlobProtocol {
         };
         drop(ticket_held);
         let mut writer = RecordWriter::new(socket, key);
-        let mut sink = Sink::Direct(&mut writer);
+        let mut sink = Sink::Direct {
+            writer: &mut writer,
+            sealing: None,
+        };
         tokio::select! {
             served = self.serve_run(peer, &mut sink, root, run, progress) => served?,
             _ = &mut stopped => {
@@ -589,35 +591,52 @@ impl Drop for Encoding {
 /// a direct run's TCP connection. The bytes are the same either way.
 enum Sink<'a> {
     Quic(&'a mut iroh::endpoint::SendStream),
-    Direct(&'a mut RecordWriter),
+    Direct {
+        writer: &'a mut RecordWriter,
+        /// The window sealing while the one before it is sent.
+        sealing: Option<Sealing>,
+    },
 }
 
 impl Sink<'_> {
-    async fn write_owned(&mut self, bytes: Vec<u8>) -> Result<(), NetError> {
+    /// Sends one window's answer: its length-prefixed encoding, then its
+    /// `SliceEnd`. On a direct run the window is sealed off this task and
+    /// sent once the next one has been handed over, so sealing one window
+    /// and sending the one before it run side by side.
+    async fn send_window(&mut self, encoded: Vec<u8>, served: ChunkRanges) -> Result<(), NetError> {
+        let end = BlobMessage::SliceEnd { served };
         match self {
-            Sink::Quic(send) => write_owned(send, bytes).await,
-            Sink::Direct(writer) => {
-                if bytes.len() > synch_core::MAX_FRAME_LEN {
-                    return Err(NetError::FrameTooLarge(bytes.len()));
+            Sink::Quic(send) => {
+                write_owned(send, encoded).await?;
+                write_frame(send, &end).await
+            }
+            Sink::Direct { writer, sealing } => {
+                if encoded.len() > synch_core::MAX_FRAME_LEN {
+                    return Err(NetError::FrameTooLarge(encoded.len()));
                 }
-                writer
-                    .write((bytes.len() as u32).to_le_bytes().to_vec())
-                    .await?;
-                writer.write(bytes).await
+                let prefix = (encoded.len() as u32).to_le_bytes().to_vec();
+                let body =
+                    postcard::to_stdvec(&end).map_err(|e| NetError::Encode(e.to_string()))?;
+                let mut framed = Vec::with_capacity(4 + body.len());
+                framed.extend_from_slice(&(body.len() as u32).to_le_bytes());
+                framed.extend_from_slice(&body);
+                let next = writer.seal_ahead(vec![prefix, encoded, framed])?;
+                match sealing.replace(next) {
+                    Some(previous) => writer.write_sealed(previous).await,
+                    None => Ok(()),
+                }
             }
         }
     }
 
-    async fn write_frame(&mut self, msg: &BlobMessage) -> Result<(), NetError> {
+    /// Sends whatever window is still sealing.
+    async fn flush(&mut self) -> Result<(), NetError> {
         match self {
-            Sink::Quic(send) => write_frame(send, msg).await,
-            Sink::Direct(writer) => {
-                let body = postcard::to_stdvec(msg).map_err(|e| NetError::Encode(e.to_string()))?;
-                let mut framed = Vec::with_capacity(4 + body.len());
-                framed.extend_from_slice(&(body.len() as u32).to_le_bytes());
-                framed.extend_from_slice(&body);
-                writer.write(framed).await
-            }
+            Sink::Quic(_) => Ok(()),
+            Sink::Direct { writer, sealing } => match sealing.take() {
+                Some(last) => writer.write_sealed(last).await,
+                None => Ok(()),
+            },
         }
     }
 }
