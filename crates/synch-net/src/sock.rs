@@ -1175,7 +1175,7 @@ mod tests {
     /// socket, as a callee that cannot read `OpenDirect` refuses that.
     #[derive(Debug, Default)]
     struct EchoService {
-        refuse: AtomicUsize,
+        refuse: std::sync::Mutex<usize>,
         admitted: AtomicUsize,
         ended: AtomicUsize,
     }
@@ -1189,11 +1189,12 @@ mod tests {
             stream_index: u64,
             open: &SockOpen,
         ) -> Result<Admission, (RefuseCode, String)> {
-            let refuse = self
-                .refuse
-                .fetch_update(Ordering::AcqRel, Ordering::Acquire, |n| n.checked_sub(1));
-            if refuse.is_ok() {
-                return Err((RefuseCode::NoSuchPath, "malformed request".into()));
+            {
+                let mut refuse = self.refuse.lock().unwrap();
+                if *refuse > 0 {
+                    *refuse -= 1;
+                    return Err((RefuseCode::NoSuchPath, "malformed request".into()));
+                }
             }
             self.admitted.fetch_add(1, Ordering::AcqRel);
             Ok(admission(peer, addr, stream_index, open))
@@ -1363,12 +1364,12 @@ mod tests {
             direct_pair(service.clone(), true).await;
         let open = SockOpen::new(OriginId::Key(server.id()), "echo", vec![]);
 
-        service.refuse.store(2, Ordering::Release);
+        *service.refuse.lock().unwrap() = 2;
         let refused = socket.open(&open).await.unwrap().unwrap_err();
         assert_eq!(refused.code, RefuseCode::NoSuchPath);
         assert!(!memo.refused(&server.id()));
 
-        service.refuse.store(1, Ordering::Release);
+        *service.refuse.lock().unwrap() = 1;
         let stream = socket.open(&open).await.unwrap().unwrap();
         assert!(!stream.is_direct());
         assert!(echo(stream, b"old callee").await == b"old callee");
