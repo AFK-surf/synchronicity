@@ -599,10 +599,28 @@ neither was busy (every worker thread under ~25%, measured with `sample`):
   each waiting for the other process. A local read of a held object, which
   never touches the network, went from ~790 to ~1220 MB/s with that alone.
 
-What bounds a run at about 1.2 GB/s now, of a ~3 GB/s link: delivering the
-bytes over the control socket to the client process (the same ~1.2 GB/s for
-a local read), and on the provider the serving task sealing and sending
-every record on one core.
+Two later steps, `/dev/null`, same hosts:
+
+| Build | 1 run | 2 runs at once | 4 runs at once |
+| --- | --- | --- | --- |
+| above | 1075–1314 | — | — |
+| + provider seals the next window while sending the last | 1497–1662 | 509 | 507 |
+| + a window's payload read in one call, encoded 4 ahead | 1318–1379 | 1501 | 1576 |
+
+Sealing on the serving task cost about as much as the socket write after it,
+so a run was held to roughly one core's worth of both. Concurrent runs then
+collapsed on the provider's disk: each 16 KiB group was its own `pread`, and
+two runs interleaving them defeated the kernel's read-ahead on a payload the
+page cache did not hold (an 8 GB host running CI VMs). The single-run numbers
+of the last two rows are within this shared host's run-to-run spread; the
+earlier, higher ones were taken right after the object was written, when more
+of it was cached (inferred).
+
+What bounds a run now, of a ~3 GB/s link, on these hosts: the requester's
+CPU per byte (about 1.3–1.5 CPU-s/GiB on an M2 in `direct_bench`, most of it
+BLAKE3, against four performance cores shared with CI), and delivering the
+bytes over gRPC on the control socket to the client process. On an idle Mac
+Studio `direct_bench` moves 5071 MiB/s over loopback.
 
 ## Open questions
 

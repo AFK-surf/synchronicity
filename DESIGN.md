@@ -1321,14 +1321,15 @@ next — or to ask for windows one at a time at all. It asks a provider for the
 rest of the read as one **streamed run** (`GetStream`): one request, answered
 on one stream as a sequence of 2 MiB windows (`STREAM_WINDOW_GROUPS`), each
 exactly what a `GetSlice` for that window would have answered — its
-length-prefixed encoding, then its `SliceEnd`. The provider encodes the next
-window while it sends the current one and is held back by nothing but QUIC's
-flow control, so a run costs it at most two encoded windows of memory whatever
-its length; it stops after the run's last window or after the first one it did
+length-prefixed encoding, then its `SliceEnd`. The provider encodes up to
+four windows ahead of the one it sends, each read off disk in one call, and is
+held back by nothing but the transport's flow control, so a run costs it at
+most five encoded windows of memory whatever its length; it stops after the run's last window or after the first one it did
 not hold whole, so a partial holder's run ends without a request per window.
 Every window is a fresh decision of the serve command and meets the checks a
-request of its own would — the peer's binding (§3.2) and content scope (§3.5)
-— so a binding revoked mid-run ends the run at the next window. The serve-side
+request of its own would — the peer's binding (§3.2) and content scope (§3.5),
+made as it is about to be sent — so a binding revoked mid-run ends the run at
+the next window. The serve-side
 stream deadline is a deadline on progress rather than on the whole exchange: a
 run is cut off for stalling, not for being long.
 

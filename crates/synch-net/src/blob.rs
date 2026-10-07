@@ -424,10 +424,13 @@ impl BlobProtocol {
     /// one is encoded it meets the checks a separate request would: the
     /// peer's binding (§3.2) and its content scope (§3.5). A binding revoked
     /// mid-run therefore ends the run at the next window rather than at its
-    /// end. The next window is encoded while the current one is being sent,
-    /// so the disk and the connection are busy at once; QUIC's flow control is
-    /// what keeps the provider from running further ahead than that, so a run
-    /// costs at most two encoded windows of memory whatever its length.
+    /// end. Windows are encoded up to [`ENCODE_AHEAD`] ahead of the one being
+    /// sent, so reading the payload off disk overlaps the sending; a window
+    /// is only checked when it is about to be sent, so nothing encoded ahead
+    /// reaches a peer whose binding lapsed in the meantime. The transport's
+    /// flow control keeps the provider from running further ahead than that,
+    /// so a run costs at most that many encoded windows, plus the one being
+    /// sent, whatever its length.
     async fn serve_run(
         &self,
         peer: synch_core::NodeId,
@@ -442,25 +445,38 @@ impl BlobProtocol {
                 run.end.min(start.saturating_add(STREAM_WINDOW_GROUPS)),
             )
         };
-        let mut window = window_at(run.start);
-        if window.is_empty() {
+        let mut next = window_at(run.start);
+        if next.is_empty() {
             return Ok(());
         }
+        // The first window is checked before any reading at all, so a peer
+        // that may not have the run costs no disk.
         self.admit_window(peer, root).await?;
-        let mut ahead = Some(self.encode_ahead(root, window));
-        while let Some(mut encoding) = ahead.take() {
+        let mut checked = true;
+        let mut ahead = std::collections::VecDeque::new();
+        loop {
+            while ahead.len() < ENCODE_AHEAD && !next.is_empty() {
+                ahead.push_back((next, self.encode_ahead(root, next)));
+                next = window_at(next.end);
+            }
+            let Some((window, mut encoding)) = ahead.pop_front() else {
+                break;
+            };
             let (encoded, served) = (&mut encoding.0)
                 .await
                 .map_err(|e| NetError::Blocking(e.to_string()))??;
-            let whole = served == ChunkRanges::from_ranges([window]);
-            let following = window_at(window.end);
-            if whole && !following.is_empty() {
+            if !checked {
                 self.admit_window(peer, root).await?;
-                ahead = Some(self.encode_ahead(root, following));
             }
+            checked = false;
+            let whole = served == ChunkRanges::from_ranges([window]);
             sink.send_window(encoded, served).await?;
             progress.mark();
-            window = following;
+            if !whole {
+                // A partial holder's last word: what was encoded past it does
+                // not continue it.
+                break;
+            }
         }
         sink.flush().await
     }
@@ -574,6 +590,14 @@ impl BlobProtocol {
         }))
     }
 }
+
+/// How many windows of a streamed run are encoded ahead of the one being
+/// sent.
+///
+/// Encoding a window is mostly reading its payload, and one window at a
+/// time leaves the run waiting on the disk's latency between windows
+/// whenever the payload is not cached.
+const ENCODE_AHEAD: usize = 4;
 
 /// A window of a streamed run being encoded ahead of the one being sent.
 ///
