@@ -23,6 +23,7 @@ pub mod buckets;
 pub mod chunked;
 pub mod daemon;
 pub mod error;
+mod locks;
 mod record_log;
 pub mod xml;
 
@@ -168,6 +169,22 @@ async fn dispatch(gateway: &Gateway, request: Request) -> S3Result<Response> {
         bucket.require_writable()?;
     }
 
+    // A lock key is answered by its own handler whatever else the request
+    // says: it is not in the tree, and every operation on it means something
+    // else (docs/LOCKS.md §11.1).
+    if bucket.is_lock_key(key) {
+        return locks::lock_key(
+            gateway,
+            &bucket,
+            key,
+            &parts.method,
+            principal,
+            &headers,
+            body,
+        )
+        .await;
+    }
+
     // Multipart routing comes first, because every one of these requests would
     // otherwise land on an existing arm and be answered as something else: a
     // `GET /b?uploads` reads as a listing whose unknown parameter is ignored, a
@@ -258,7 +275,7 @@ async fn delete_object(
     key: &str,
     headers: &BTreeMap<String, String>,
 ) -> S3Result<Response> {
-    check_headers(headers)?;
+    check_write_headers(headers)?;
     let deleted = gateway
         .daemon
         .delete(&bucket.space, key)
@@ -300,10 +317,34 @@ const REFUSED_HEADERS: &[&str] = &[
 ];
 
 /// Refuses a request carrying a header that would make the answer a lie.
-fn check_headers(headers: &BTreeMap<String, String>) -> S3Result<()> {
+pub(crate) fn check_headers(headers: &BTreeMap<String, String>) -> S3Result<()> {
     for name in REFUSED_HEADERS {
         if headers.contains_key(*name) {
             return Err(S3Error::not_implemented(&format!("the {name} header")));
+        }
+    }
+    Ok(())
+}
+
+/// Preconditions on a write, which this gateway does not evaluate on an
+/// ordinary key (docs/LOCKS.md §11.2).
+///
+/// A conditional write is how S3 clients lock and commit: Terraform's
+/// `use_lockfile` creates its lock object with `If-None-Match: *`, and table
+/// formats commit with `If-Match`. Ignoring the condition answers `200` to a
+/// write that should have failed, so the client believes it holds a lock that
+/// excludes nobody — the same wrong-object failure [`REFUSED_HEADERS`] exists
+/// for. Keys a bucket declares as locks evaluate these headers instead.
+const CONDITIONAL_WRITE_HEADERS: &[&str] = &["if-none-match", "if-match"];
+
+/// Refuses a write to an ordinary key that carries a precondition.
+fn check_write_headers(headers: &BTreeMap<String, String>) -> S3Result<()> {
+    check_headers(headers)?;
+    for name in CONDITIONAL_WRITE_HEADERS {
+        if headers.contains_key(*name) {
+            return Err(S3Error::not_implemented(&format!(
+                "the {name} header on a key that is not a lock key"
+            )));
         }
     }
     Ok(())
@@ -313,7 +354,7 @@ fn check_headers(headers: &BTreeMap<String, String>) -> S3Result<()> {
 ///
 /// Both write paths take it, because both can receive one: mountpoint sends
 /// `--upload-checksums crc32c` by default, and every upload it makes is framed.
-fn payload(
+pub(crate) fn payload(
     headers: &BTreeMap<String, String>,
     body: Body,
 ) -> S3Result<(Body, chunked::DecodeFault)> {
@@ -388,7 +429,7 @@ async fn complete_upload(
     headers: &BTreeMap<String, String>,
     body: Body,
 ) -> S3Result<Response> {
-    check_headers(headers)?;
+    check_write_headers(headers)?;
     // Through the same unwrapping every other body takes. A completion body is
     // small, but nothing stops a client framing it — and a chunk boundary
     // landing mid-tag would corrupt the part list rather than fail.
@@ -414,9 +455,10 @@ async fn complete_upload(
     // Asking it first is also what makes a *retried* completion work — the
     // upload has no parts left to inspect by then, and the daemon answers from
     // the result it recorded.
+    let fence = locks::fence(bucket, headers)?;
     let completed = match gateway
         .daemon
-        .complete_upload(reference.clone(), &named)
+        .complete_upload(reference.clone(), &named, fence.as_ref())
         .await
     {
         Ok(completed) => completed,
@@ -695,7 +737,9 @@ async fn list_objects(
         // about a path that has a root and bytes — and it would hide it from
         // the operator without hiding it from anyone else, since every member
         // already reads those bytes out of the tree.
-        if !row.kind.has_content() {
+        // A lock key is not an object, and a tree file whose path a lock
+        // pattern matches is hidden behind the lock (docs/LOCKS.md §11.1).
+        if !row.kind.has_content() || bucket.is_lock_key(&row.path) {
             cursor = Some(row.path.clone());
             continue;
         }
@@ -844,17 +888,19 @@ async fn put_object(
 ) -> S3Result<Response> {
     // A header that says the payload is somewhere else makes reading the body
     // the wrong thing to do, so the request is refused rather than answered
-    // with an object built from the body it does not have.
-    check_headers(headers)?;
+    // with an object built from the body it does not have; so is a condition
+    // the write would otherwise ignore.
+    check_write_headers(headers)?;
     bucket.require_writable()?;
     // The body streams over the socket into the daemon's ingest pipeline —
     // filesystem-source directory, hash, CAS, stage, publish (§7.1) — and comes back as the
     // published entry, so the ETag is the root the daemon computed rather than
     // one this process hashed from a copy it kept.
+    let fence = locks::fence(bucket, headers)?;
     let (body, fault) = payload(headers, body)?;
     let published: EntryInfo = gateway
         .daemon
-        .put(&bucket.space, key, body)
+        .put_fenced(&bucket.space, key, body, fence.as_ref())
         .await
         // A body that died mid-stream reaches here as the daemon's account of
         // an abandoned write; the decoder's account, if it has one, is the more
@@ -882,7 +928,7 @@ pub fn etag(content: Option<&synch_core::Hash>) -> String {
     }
 }
 
-fn quoted(value: &str) -> String {
+pub(crate) fn quoted(value: &str) -> String {
     format!("\"{value}\"")
 }
 
@@ -1017,7 +1063,7 @@ fn percent_decode(text: &str) -> String {
     String::from_utf8_lossy(&out).into_owned()
 }
 
-fn insert(headers: &mut HeaderMap, name: header::HeaderName, value: &str) {
+pub(crate) fn insert(headers: &mut HeaderMap, name: header::HeaderName, value: &str) {
     if let Ok(value) = header::HeaderValue::from_str(value) {
         headers.insert(name, value);
     }

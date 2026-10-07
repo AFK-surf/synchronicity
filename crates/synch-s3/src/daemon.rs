@@ -13,7 +13,7 @@ use std::path::{Path, PathBuf};
 use axum::body::Body;
 use synch_cli::control::{
     proto::{pb, CHUNK_SIZE},
-    Client, Command, CompletedUpload, Deleted, EntryInfo, Frame, OpenUpload, RecordedPart,
+    Client, Command, CompletedUpload, Deleted, EntryInfo, Fence, Frame, OpenUpload, RecordedPart,
     StreamedWrite, UploadRef, WriteFamily,
 };
 use tokio_stream::{wrappers::ReceiverStream, StreamExt};
@@ -236,8 +236,20 @@ impl Daemon {
     /// node in recovery, say — arrives as the coded error it is (§3.4), before
     /// a byte of the body has been read.
     pub async fn put(&self, space: &str, path: &str, body: Body) -> S3Result<EntryInfo> {
+        self.put_fenced(space, path, body, None).await
+    }
+
+    /// As [`Daemon::put`], committed only under the hold `fence` names
+    /// (docs/LOCKS.md §7).
+    pub async fn put_fenced(
+        &self,
+        space: &str,
+        path: &str,
+        body: Body,
+        fence: Option<&Fence>,
+    ) -> S3Result<EntryInfo> {
         let mut client = self.connect().await?;
-        let put = client.put(space, path).await?;
+        let put = client.put_fenced(space, path, fence).await?;
         Ok(stream_body(put, body).await?.entry)
     }
 
@@ -280,8 +292,45 @@ impl Daemon {
         &self,
         upload: UploadRef,
         parts: &[(u32, Option<synch_core::Hash>)],
+        fence: Option<&Fence>,
     ) -> S3Result<CompletedUpload> {
-        Ok(self.connect().await?.complete_upload(upload, parts).await?)
+        Ok(self
+            .connect()
+            .await?
+            .complete_upload_fenced(upload, parts, fence)
+            .await?)
+    }
+
+    // ---- cluster locks (docs/LOCKS.md §11) ---------------------------------
+
+    /// Takes a lock that outlives this call — `sticky`, or a `lease` the
+    /// client renews — and returns its hold.
+    pub async fn lock(&self, request: pb::LockRequest) -> S3Result<pb::LockHold> {
+        Ok(self.connect().await?.lock(request).await?.0)
+    }
+
+    /// Renews a hold, replacing its payload.
+    pub async fn lock_renew(&self, request: pb::LockRenewRequest) -> S3Result<pb::LockHold> {
+        Ok(self.connect().await?.lock_renew(request).await?)
+    }
+
+    /// Releases this node's hold, or breaks other nodes' claims.
+    pub async fn lock_release(&self, request: pb::LockReleaseRequest) -> S3Result<Vec<String>> {
+        Ok(self.connect().await?.lock_release(request).await?)
+    }
+
+    /// The claims this node knows of on one lock.
+    pub async fn lock_claims(&self, space: &str, name: &str) -> S3Result<Vec<pb::LockClaim>> {
+        Ok(self
+            .connect()
+            .await?
+            .lock_status(pb::LockStatusRequest {
+                space: space.to_string(),
+                name: name.to_string(),
+                peers: false,
+            })
+            .await?
+            .claims)
     }
 
     /// Drops an upload and everything staged for it.

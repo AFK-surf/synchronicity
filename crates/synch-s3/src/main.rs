@@ -82,6 +82,12 @@ enum BucketCommand {
         /// and nothing is written to the local store.
         #[arg(long)]
         no_cache: bool,
+        /// Keys matching this glob are cluster locks, driven by conditional
+        /// writes — `*.tflock` for Terraform's `use_lockfile`
+        /// (docs/LOCKS.md §11). `*` matches any run of characters, `/`
+        /// included. Repeat for more patterns; needs --read-write.
+        #[arg(long = "locks", requires = "read_write")]
+        locks: Vec<String>,
     },
     /// Remove a bucket mapping.
     Rm {
@@ -141,6 +147,14 @@ async fn run(args: Cli) -> Result<()> {
     dispatch(&daemon, args.command).await
 }
 
+/// The lock globs as a listing shows them, or nothing.
+fn lock_suffix(locks: &[String], label: &str) -> String {
+    match locks.is_empty() {
+        true => String::new(),
+        false => format!("{label}{}", locks.join(",")),
+    }
+}
+
 async fn dispatch(daemon: &Daemon, command: Command) -> Result<()> {
     match command {
         Command::Bucket { command } => match command {
@@ -151,22 +165,31 @@ async fn dispatch(daemon: &Daemon, command: Command) -> Result<()> {
                 read_write: _,
                 select,
                 no_cache,
+                locks,
             } => {
                 let access = if read_only {
                     Access::ReadOnly
                 } else {
                     Access::ReadWrite
                 };
-                let bucket =
-                    buckets::add(daemon, &bucket, &space, access, select.as_deref(), no_cache)
-                        .await?;
+                let bucket = buckets::add_with_locks(
+                    daemon,
+                    &bucket,
+                    &space,
+                    access,
+                    select.as_deref(),
+                    no_cache,
+                    &locks,
+                )
+                .await?;
                 println!(
-                    "{} -> {} ({}; {}{})",
+                    "{} -> {} ({}; {}{}{})",
                     bucket.name,
                     bucket.space,
                     bucket.access.render(),
                     bucket.policy,
-                    if bucket.no_cache { "; no-cache" } else { "" }
+                    if bucket.no_cache { "; no-cache" } else { "" },
+                    lock_suffix(&bucket.locks, "; locks ")
                 );
                 // Mapping a bucket before its space first syncs is legal;
                 // mapping one onto a typo would otherwise look the same.
@@ -190,12 +213,13 @@ async fn dispatch(daemon: &Daemon, command: Command) -> Result<()> {
                 }
                 for bucket in buckets {
                     println!(
-                        "{:<24} {:<20} {:<10} {}{}",
+                        "{:<24} {:<20} {:<10} {}{}{}",
                         bucket.name,
                         bucket.space,
                         bucket.access.render(),
                         bucket.policy,
-                        if bucket.no_cache { " no-cache" } else { "" }
+                        if bucket.no_cache { " no-cache" } else { "" },
+                        lock_suffix(&bucket.locks, " locks=")
                     );
                 }
             }

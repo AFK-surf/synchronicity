@@ -5855,6 +5855,7 @@ dependencies = [
  "prost",
  "protox",
  "reqwest 0.13.4",
+ "rustix",
  "serde",
  "serde_json",
  "synch-cc",

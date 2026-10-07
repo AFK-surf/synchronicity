@@ -14,6 +14,7 @@ pub mod dns;
 pub mod endpoint;
 pub mod error;
 pub mod frame;
+pub mod lock;
 pub mod mpt;
 pub mod process;
 mod pubkey;
@@ -42,6 +43,7 @@ pub use dns::{
 };
 pub use endpoint::{Net, NetOptions};
 pub use error::{NetError, Result};
+pub use lock::{LockClient, LockService};
 pub use mpt::{HeadSink, MptClient};
 pub use rekor::{ProofError, RekorProof};
 pub use tuf::{PinState, TufError, TufMetadata};

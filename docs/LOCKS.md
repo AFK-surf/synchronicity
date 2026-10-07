@@ -1,6 +1,6 @@
 # Cluster locks — best-effort mutual exclusion without consensus
 
-Status: design, not yet built · 2026-10-07
+Status: built (phases 1 and 2 of §16) · 2026-10-07
 
 A cluster lock is a named lease that at most one node holds at a time **while the
 nodes that want it can talk to each other promptly**. When they cannot, because of a
@@ -165,12 +165,13 @@ To acquire lock `L`, node `A` does the following.
    claim.
 
    When `A` holds, it lists in `supersedes` every claim it knew of only as
-   *expired* (below). One more check comes before holding. If any answer shows an
-   *ended or expired* claim of `L` with a ticket above `A`'s, `A` withdraws and
-   re-claims above it. Withdrawing is always safe, and this keeps fencing tokens
-   monotone after a restart that lost the clock's last increments (§7). Live
-   claims are left out on purpose: re-claiming above them would make the least
-   ticket give way to its rivals, and simultaneous claimants could livelock.
+   *expired* (below). One more check comes before holding. If any answer shows a
+   claim of `L` that was *held* and has ended — released, broken or superseded —
+   with a ticket above `A`'s, `A` withdraws and re-claims above it. Withdrawing is
+   always safe, and this keeps fencing tokens monotone after a restart that lost
+   the clock's last increments (§7). Live claims, and rivals that merely withdrew,
+   are left out on purpose: re-claiming above them would make the least ticket
+   give way to its rivals, and simultaneous claimants could livelock.
 
 A withdrawn claimant with `--wait` time left re-claims with a fresh, higher ticket.
 It does this when an `End` for the blocking claim arrives, or after a jittered
@@ -294,9 +295,11 @@ expiry is never earlier than the holder's. ρ defaults to 10⁻³, far beyond wh
 working oscillator drifts. With that value the observer's margin on a 30 s lease is
 60 ms.
 
-**Renewal.** The holder sends `Renew` to every peer every ttl/3. It also sends one
-to any peer it newly connects to, so that a heal is detected at once and not up to
-ttl/3 later (§6). The answers have the same shape as claim answers. A renewal
+**Renewal.** The holder sends `Renew` to every peer every ttl/3, and once right
+after it wins, so peers that answered its claim before it held learn that it holds.
+A renewal carries the whole claim, so a peer that restarted relearns it. The answers
+have the same shape as claim answers, and a heal is detected at the first renewal
+that crosses the healed link (§6). A renewal
 answered with an end (`Broken`, or `Superseded` in §6) means the lock is lost. The
 holder stops renewing and reports the loss to its client.
 
@@ -354,8 +357,8 @@ The loser sends `End(Superseded)`, stops renewing, and reports the lock lost.
   (§10).
 - A sticky S3 lock simply changes hands. A `GET` of the lock key now returns the
   survivor's body.
-- Both nodes log the episode with both claims, and `synch doctor` counts contested
-  locks seen in the last 24 hours.
+- The losing node logs the loss with both claims' tokens, and `synch lock status`
+  shows a lock as contested while more than one claim on it is reported held.
 
 Healing does not undo what both holders did meanwhile. Writes they made to the same
 paths are two versions of each path. §8 of DESIGN.md shows them as divergent and
@@ -407,8 +410,8 @@ anti-entropy (DESIGN.md §5.3). So:
   8 releasers, for as long as the ended memory lasts. Every answer carries them.
 - **The next acquirer waits.** Before reporting the lock acquired to its client, the
   acquirer waits, up to the handoff window (default 10 s), until its *complete* head
-  for each watermark's origin reaches that seq. It asks for the head directly
-  (`HeadsWant`, then a fetch) instead of waiting for the next anti-entropy round.
+  for each watermark's origin reaches that seq. It runs an anti-entropy exchange
+  with the releaser's keys at once instead of waiting for the next round.
   Promotion in DESIGN.md §5.2 is what makes "complete" mean "readable".
 
 If the window passes first, the acquire fails with the retryable code
@@ -458,23 +461,26 @@ its own holds, for restarts (§5).
   come from trusted members (§13).
 
   ```rust
-  Claim   { claim: ClaimInfo }                           → Answer
-  Renew   { lock: LockName, id: ClaimId, ttl_ms: u32 }   → Answer
+  Claim   { lock: LockName, claim: Claim }               → Answer
+  Renew   { lock: LockName, claim: Claim }               → Answer
   End     { lock: LockName, id: ClaimId, reason: EndReason,
-            watermark: Option<(OriginId, u64)> }         → Ack
+            watermark: Option<Watermark> }               → Ack
   Inspect { lock: LockName }                             → Answer   // diagnostics only
-  Answer  { claims: Vec<(ClaimInfo, state: Live | Held | Expired, remaining_ms: u32)>,
+  Answer  { reports: Vec<Report { claim, state: Expired | Live | Held, remaining_ms }>,
             ended: Vec<(ClaimId, EndReason)>,
-            watermarks: Vec<(OriginId, u64)> }
+            watermarks: Vec<Watermark { origin, seq }> }
          | Refused { reason }  // not a writer of the space; over a limit (§14)
   ```
 
   A `Refused` answer from a peer that may not write the space counts as an answer:
   that peer cannot contend.
+  The schemas live in `synch-core` (`lock.rs`), the protocol handler and client in
+  `synch-net` (`lock.rs`), mounted when the engine supplies a `LockService`.
 - **`synch-engine`**: `locks.rs` holds the `LockManager`. It owns the table, the
-  clock, the node's own claims and the renewal loop. The pure parts are kept in one
-  dependency-free module, so they are the natural unit for a later Lean port (§15):
-  the decision in §3.3 step 3, the heal order in §6, and the lease arithmetic in §5.
+  clock, the node's own claims and the renewal loop. The pure parts are free
+  functions at the bottom of that file, so they are the natural unit for a later
+  Lean port (§15): the decision in §3.3 step 3 (`decide`), the heal order in §6
+  (`heal`), and the observer's lease in §5 (`observer_lease`).
 - **SQLite**: local tables, never replicated.
 
   ```sql
@@ -482,9 +488,10 @@ its own holds, for restarts (§5).
                            lamport INTEGER NOT NULL);
   CREATE TABLE lock_holds (
     space TEXT NOT NULL, name TEXT NOT NULL,
+    origin TEXT NOT NULL,           -- the ticket's origin; a changed identity drops it
     lamport INTEGER NOT NULL, nonce INTEGER NOT NULL,
     ttl_ms INTEGER NOT NULL,
-    mode TEXT NOT NULL CHECK (mode IN ('session', 'lease', 'sticky')),
+    mode TEXT NOT NULL CHECK (mode IN ('lease', 'sticky')),
     owner TEXT NOT NULL, payload BLOB NOT NULL, supersedes BLOB NOT NULL,
     acquired_at INTEGER NOT NULL,   -- wall clock, display only
     lease_until INTEGER,            -- wall clock; lease mode's restart check (§5)
@@ -494,9 +501,9 @@ its own holds, for restarts (§5).
   A `session` hold is not persisted. Its client's stream died with the daemon, and
   so did the hold.
 - **Local requesters.** A node has at most one claim per lock. Concurrent local
-  requests for the same lock are queued in the `LockManager` and served in arrival
-  order. A request that finds the lock held by another local owner waits like any
-  other waiter and never shares the hold.
+  attempts on the same lock are serialized in the `LockManager`. A request that
+  finds the lock held by another local owner fails with `lock-held`, or waits like
+  any other waiter within its `--wait`, and never shares the hold.
 
 ### 9.3 Control service
 
@@ -507,11 +514,14 @@ answers (DESIGN.md §9.3):
 rpc Lock(LockRequest) returns (stream LockEvent);  // acquire; `session` holds live on the stream
 rpc LockRenew(LockRenewRequest) returns (LockHold);
 rpc LockRelease(LockReleaseRequest) returns (LockReleased);  // release, or break with `force`
-rpc LockInspect(LockInspectRequest) returns (LockStatus);    // this node's view, or every peer's
+rpc LockStatus(LockStatusRequest) returns (LockStatusResponse);  // this node's view, or every peer's
 ```
 
-`LockEvent` is one of these: `acquired { token, valid_for_ms, handoff, waited_on }`,
-`renewed`, or `lost { reason }`. Closing a `session` stream releases the lock. Four
+`LockEvent` is `acquired { token, valid_for_ms, handoff, waited_on }` or
+`lost { reason }`. Closing a `session` stream releases the lock. `PutHeader` and
+`CompleteUploadRequest` gain `lock` and `lock_token` for fenced writes (§7), and the
+control version is 7, because a v6 daemon would ignore a fence and commit
+unconditionally. Four
 new `x-synch-error-code` values are added: `lock-held`, `lock-contended` (lost a
 simultaneous claim, retryable at once), `lock-lost` and `handoff-pending`.
 
@@ -568,20 +578,20 @@ A bucket declares which of its keys are locks:
 synch-s3 bucket add tf infra --read-write --locks '*.tflock'
 ```
 
-`--locks` takes one or more comma-separated globs matched against the whole key, and
-is stored as a sixth field of the bucket record (`buckets.rs`). A key that matches
+`--locks` takes a glob matched against the whole key — `*` is any run of characters,
+`/` included, and `?` any one — and may be repeated. It needs `--read-write`, and is
+stored as an option field of the bucket record after `no-cache` (`buckets.rs`). A key that matches
 is a **lock key** for every operation. It names the lock `<space>/<key>`, so
 `synch lock status infra/env/prod/terraform.tfstate.tflock` shows the same lock.
 Lock keys are virtual. They are never written into the tree and never listed, and a
 tree file whose path matches a pattern is hidden behind the lock through that bucket.
-`bucket add` warns if any such file exists.
 
 | Request | Meaning | Answers |
 |---|---|---|
 | `PUT` + `If-None-Match: *` | acquire, no wait; the body (≤ 16 KiB) becomes the claim's payload | `200`, ETag = token · `412 PreconditionFailed` if held · `409 ConditionalRequestConflict` if a simultaneous claim won · `503 SlowDown` on `handoff-pending` |
 | `PUT` + `If-Match: "<token>"` | renew, replacing the payload | `200` · `412` if that claim is not the current hold |
 | `PUT` with neither | refused | `400 InvalidRequest` |
-| `GET` / `HEAD` | the current hold | `200`: body = payload, ETag = token, `Last-Modified` = acquired-at, `x-amz-meta-synch-holder` / `-owner` / `-expires-in` · `404 NoSuchKey` if free |
+| `GET` / `HEAD` | the current hold | `200`: body = payload, ETag = token, `x-amz-meta-synch-holder` / `-owner` / `-expires-in` · `404 NoSuchKey` if free |
 | `DELETE` | release if this node holds it, otherwise break (§4) | `204` (idempotent) |
 | `DELETE` + `If-Match: "<token>"` | release or break that claim only | `204` · `412` if not current |
 
@@ -620,11 +630,12 @@ gateway does not offer today. The handoff in §8 is the guarantee such a view wo
 rely on. Until it exists, one gateway node per state file is the supported Terraform
 setup, and the lock protects concurrent runs through it.
 
-**This also closes an existing hole.** Today `put_object` ignores `If-None-Match`
+**This also closed an existing hole.** `put_object` used to ignore `If-None-Match`
 and `If-Match`, so a Terraform client configured with `use_lockfile` against
-synch-s3 believes it locked while excluding nothing. Phase 2 (§16) adds both headers
-to the refusal list for every key that is not a lock key: `501 NotImplemented`,
-naming the header. Conditional writes on ordinary keys come in Phase 3. A client
+synch-s3 believed it locked while excluding nothing. `PutObject`, `DeleteObject` and
+`CompleteMultipartUpload` on a key that is not a lock key now refuse both headers
+with `501 NotImplemented`, naming the header. Conditional writes on ordinary keys
+come in Phase 3. A client
 told "not implemented" fails loudly, and a client whose condition was ignored loses
 data.
 
@@ -649,7 +660,7 @@ at AWS: it fails open there because there is nothing to fence.
 | Holder daemon restarts within ttl | Restored unconfirmed, renewed, kept (§5) |
 | Holder daemon restarts after expiry and supersession | Renewal answers carry the superseding claim; reports `lock-lost` |
 | Network partition | Both sides may grant: split brain (§2) |
-| Partition heals | Detected on reconnect or within ttl/3; one survivor by §6; the other `lost` |
+| Partition heals | Detected at the next renewal, within ttl/3; one survivor by §6; the other `lost` |
 | Partial partition (A∤B, both reach C) | C relays claims; exclusion usually holds, not guaranteed |
 | `End` lost | Claim lingers until lease expiry: a delay, never a double grant |
 | Handoff head unreachable | `handoff-pending`, claim released; retry or `--allow-behind` |
@@ -669,7 +680,8 @@ at AWS: it fails open there because there is nothing to fence.
   delays locks and corrupts nothing, which is no worse than a member claiming every
   lock itself.
 - **Denial of service by a member.** A member can hold any lock indefinitely in
-  sticky mode, or break any lock. Both are logged on every node with the origin, and
+  sticky mode, or break any lock. A break is logged by the node that breaks and by
+  the holder it breaks, with the claim's token and origin, and
   the remedy is the same as for any misbehaving member: remove it. Per-origin limits
   (§14) bound memory, not intent.
 - **Payloads are opaque and bounded** (16 KiB). They are relayed to every peer of the
@@ -684,11 +696,11 @@ at AWS: it fails open there because there is nothing to fence.
 
 | Setting | Default | Bound |
 |---|---|---|
-| Claim window Δ (`lock.claim_window`) | 2 s | 250 ms – 30 s |
+| Claim window Δ (`NodeConfig::lock_claim_window`) | 2 s | — |
 | Lease ttl | 30 s | 5 s – 1 h |
 | Renewal interval | ttl/3 | — |
 | Clock-rate tolerance ρ | 10⁻³ | — |
-| Handoff window | 10 s | 0 – 5 min |
+| Handoff window (`NodeConfig::lock_handoff_window`) | 10 s | — |
 | Name / owner / payload | — | 512 B / 128 B / 16 KiB |
 | Live claims per origin, per node table | — | 1,024 / 65,536 |
 | Ended memory | 2 × longest ttl in force | 65,536 ids |
@@ -723,31 +735,35 @@ surfaces the refusal and does not hold on a table it could not fill.
   "under bounded latency, one node holds a lock at a time". The executions it
   covers need the claim exchange, which is the TLA+ model's job today. Proof
   ownership does not change with this design, so `docs/LEAN.md` is not amended.
-- **Native tests** on the `synch-net` simulator (`sim.rs`), named for behavior:
+- **Native tests** over real loopback endpoints (`synch-engine/tests/locks.rs`):
   - simultaneous claims grant exactly one;
   - a partitioned pair both grant, and on heal exactly one survives by §6's order;
-  - a crashed holder is superseded after its lease;
-  - a restarted holder keeps an unexpired lock;
-  - a late `Claim` after `End` is not revived;
-  - handoff waits for the releaser's head;
-  - a fenced commit is refused after a break.
-- **Gateway tests**: the §11.1 table row by row, and the refusal of conditional
-  headers on ordinary keys.
-- **End-to-end** (`control-plane/e2e` style): `terraform init` and `apply` with
-  `use_lockfile` against a gateway, then a concurrent apply that must fail with
-  Terraform's lock message, then `force-unlock`.
+  - a crashed holder is superseded after its lease, and the new claim names it;
+  - a sticky hold survives a daemon restart;
+  - a late renewal after `End` is not revived;
+  - a release hands the lock over with the releaser's head;
+  - a fenced commit is refused after a break;
+  - a node alone can lock.
+
+  The pure rules have unit tests beside them (`decide`, `heal`, the observer's
+  lease), and the control service has tests for a session hold's life and a
+  lease's renewal (`synch-cli/tests/control.rs`).
+- **Gateway tests** (`synch-s3/tests/gateway.rs`): the §11.1 table — acquire,
+  refusal, read-back, renew, delete, re-acquire — fenced writes, and the refusal
+  of conditional headers on ordinary keys.
+- **Not yet covered:** an end-to-end run of Terraform itself with `use_lockfile`
+  against a gateway. The request flow in §11.2 is what the gateway tests drive.
 
 ---
 
 ## 16. Phases
 
-1. **Protocol and CLI.** The protocol is `sync/lock/1` and the `LockManager`
-   (§3–§6, §8, §9). The CLI adds `synch lock`, `--lock` on `synch put`, and the TLA+
-   model in CI.
-2. **S3.** This adds lock keys (§11.1), fenced S3 writes (§11.3), and refusing
-   `If-None-Match`/`If-Match` on other keys. The refusal should ship first, on its
-   own, because it fixes a silent failure that exists today.
-3. **Conditional writes on ordinary keys.** `If-None-Match: *` and `If-Match` on any
+1. **Protocol and CLI** (built). The protocol is `sync/lock/1` and the
+   `LockManager` (§3–§6, §8, §9). The CLI adds `synch lock`, `--lock` on `synch
+   put`, and the TLA+ model in CI.
+2. **S3** (built). This adds lock keys (§11.1), fenced S3 writes (§11.3), and
+   refusing `If-None-Match`/`If-Match` on other keys.
+3. **Conditional writes on ordinary keys** (not built). `If-None-Match: *` and `If-Match` on any
    key become an implicit short lock on `<space>/<key>`:
    1. acquire;
    2. wait for the handoff;

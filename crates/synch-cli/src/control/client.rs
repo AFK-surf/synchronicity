@@ -139,6 +139,17 @@ impl Client {
     /// resolvable target — so a refusal arrives here, before a byte of the
     /// payload is sent.
     pub async fn put(&mut self, space: &str, path: &str) -> Result<Put, ControlError> {
+        self.put_fenced(space, path, None).await
+    }
+
+    /// As [`Client::put`], committed only while this node holds `fence`'s
+    /// lock with its token (`docs/LOCKS.md` §7).
+    pub async fn put_fenced(
+        &mut self,
+        space: &str,
+        path: &str,
+        fence: Option<&Fence>,
+    ) -> Result<Put, ControlError> {
         // Two messages of slack: enough that a writer is never blocked on the
         // daemon having taken the previous chunk, small enough that a stalled
         // daemon stops the writer within a chunk or two.
@@ -148,6 +159,8 @@ impl Client {
                 part: Some(super::proto::PutPart::Header(pb::PutHeader {
                     space: space.to_string(),
                     path: path.to_string(),
+                    lock: fence.map(|f| f.lock.clone()).unwrap_or_default(),
+                    lock_token: fence.map(|f| f.token.clone()).unwrap_or_default(),
                 })),
             })
             .await
@@ -237,6 +250,16 @@ impl Client {
         upload: UploadRef,
         parts: &[(u32, Option<Hash>)],
     ) -> Result<CompletedUpload, ControlError> {
+        self.complete_upload_fenced(upload, parts, None).await
+    }
+
+    /// As [`Client::complete_upload`], fenced like [`Client::put_fenced`].
+    pub async fn complete_upload_fenced(
+        &mut self,
+        upload: UploadRef,
+        parts: &[(u32, Option<Hash>)],
+        fence: Option<&Fence>,
+    ) -> Result<CompletedUpload, ControlError> {
         let response = self
             .inner
             .complete_upload(pb::CompleteUploadRequest {
@@ -248,6 +271,8 @@ impl Client {
                         root: root.map(|r| r.as_bytes().to_vec()).unwrap_or_default(),
                     })
                     .collect(),
+                lock: fence.map(|f| f.lock.clone()).unwrap_or_default(),
+                lock_token: fence.map(|f| f.token.clone()).unwrap_or_default(),
             })
             .await?
             .into_inner();
@@ -255,6 +280,48 @@ impl Client {
             etag: hash_from(&response.etag, "etag")?,
             size: response.size,
         })
+    }
+
+    /// Takes a cluster lock (`docs/LOCKS.md` §9.3). Returns once it is
+    /// acquired, with the hold and, for a session hold, the stream whose
+    /// life is the hold's: drop it to release, read it to learn of a loss.
+    pub async fn lock(
+        &mut self,
+        request: pb::LockRequest,
+    ) -> Result<(pb::LockHold, LockEvents), ControlError> {
+        let mut stream = self.inner.lock(request).await?.into_inner();
+        match stream.message().await? {
+            Some(pb::LockEvent {
+                kind: Some(pb::lock_event::Kind::Acquired(hold)),
+            }) => Ok((hold, LockEvents { stream })),
+            _ => Err(ControlError::internal(
+                "the daemon answered a lock request without a hold",
+            )),
+        }
+    }
+
+    /// Extends a lease-mode hold.
+    pub async fn lock_renew(
+        &mut self,
+        request: pb::LockRenewRequest,
+    ) -> Result<pb::LockHold, ControlError> {
+        Ok(self.inner.lock_renew(request).await?.into_inner())
+    }
+
+    /// Releases this node's hold, or breaks other nodes' claims.
+    pub async fn lock_release(
+        &mut self,
+        request: pb::LockReleaseRequest,
+    ) -> Result<Vec<String>, ControlError> {
+        Ok(self.inner.lock_release(request).await?.into_inner().tokens)
+    }
+
+    /// This node's view of its locks, or of one lock with its peers' views.
+    pub async fn lock_status(
+        &mut self,
+        request: pb::LockStatusRequest,
+    ) -> Result<pb::LockStatusResponse, ControlError> {
+        Ok(self.inner.lock_status(request).await?.into_inner())
     }
 
     /// Drops an upload and everything staged for it.
@@ -732,4 +799,36 @@ pub struct SpaceInfo {
 pub struct Deleted {
     /// Whether some origin still publishes a live entry for the path (§8).
     pub still_published: bool,
+}
+
+/// A fenced write's lock and token (`docs/LOCKS.md` §7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct Fence {
+    /// `<space>/<name>`.
+    pub lock: String,
+    /// The hold's token.
+    pub token: String,
+}
+
+/// What follows a session hold's acquisition: a loss, or nothing until the
+/// hold is released by dropping this.
+#[derive(Debug)]
+pub struct LockEvents {
+    stream: Streaming<pb::LockEvent>,
+}
+
+impl LockEvents {
+    /// Waits for the hold to be lost, returning why; `None` when the stream
+    /// ended without saying — the daemon went away.
+    pub async fn lost(&mut self) -> Option<String> {
+        loop {
+            match self.stream.message().await {
+                Ok(Some(pb::LockEvent {
+                    kind: Some(pb::lock_event::Kind::Lost(lost)),
+                })) => return Some(lost.reason),
+                Ok(Some(_)) => continue,
+                Ok(None) | Err(_) => return None,
+            }
+        }
+    }
 }

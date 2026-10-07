@@ -245,6 +245,26 @@ impl From<ControlError> for S3Error {
                 )
             }
             ErrorCode::Internal => S3Error::store(e.message),
+            // A lock key's conditional write lost its condition: the object
+            // exists — another claim holds the lock — or the `If-Match` names
+            // a hold that is no longer current (docs/LOCKS.md §11.1). A
+            // fenced write under a lost hold is refused the same way.
+            ErrorCode::LockHeld | ErrorCode::LockLost => S3Error::new(
+                StatusCode::PRECONDITION_FAILED,
+                "PreconditionFailed",
+                e.message,
+            ),
+            // S3's own answer to a conditional write that lost a race with a
+            // concurrent one; clients retry it.
+            ErrorCode::LockContended => S3Error::new(
+                StatusCode::CONFLICT,
+                "ConditionalRequestConflict",
+                e.message,
+            ),
+            // The last holder's writes have not arrived yet: retryable.
+            ErrorCode::HandoffPending => {
+                S3Error::new(StatusCode::SERVICE_UNAVAILABLE, "SlowDown", e.message)
+            }
         }
     }
 }

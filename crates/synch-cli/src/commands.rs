@@ -248,9 +248,24 @@ pub async fn run(cli: Cli) -> Result<()> {
         // The same typed write, fed from a file or stdin this process reads;
         // and its counterpart, the tombstone the S3 gateway's `DeleteObject`
         // publishes through. Neither needs the space to have a directory.
-        Command::Put { file, destination } => {
-            crate::write::run_put(&data_dir, file, destination).await
+        Command::Put {
+            file,
+            destination,
+            lock,
+            token,
+        } => {
+            let fence = match (lock, token) {
+                (Some(lock), Some(token)) => Some(crate::control::Fence {
+                    lock: lock.clone(),
+                    token: token.clone(),
+                }),
+                _ => None,
+            };
+            crate::write::run_put(&data_dir, file, destination, fence.as_ref()).await
         }
+        // Program calls, not `Run` commands: a hold outlives a rendered
+        // answer, and `run` owns a child process (docs/LOCKS.md §10).
+        Command::Lock { command } => crate::lock::run(&data_dir, command).await,
         Command::Delete { target } => crate::write::run_delete(&data_dir, target).await,
         // Not a `Run` command either: it owns this process's stdin and stdout
         // for its lifetime and answers a protocol of its own, translating each
@@ -808,7 +823,7 @@ fn to_command(cli: &Cli) -> Result<Cmd> {
         }
         Command::Mcp { .. } => unreachable!("handled before dispatch"),
         Command::Fetch { .. } => unreachable!("handled before dispatch"),
-        Command::Put { .. } => unreachable!("handled before dispatch"),
+        Command::Put { .. } | Command::Lock { .. } => unreachable!("handled before dispatch"),
         Command::Delete { .. } => unreachable!("handled before dispatch"),
         Command::Daemon {
             command: DaemonCommand::Run,

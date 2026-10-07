@@ -63,7 +63,11 @@ pub use pb::{
 /// meaning without changing type, and `SocketActivate` grows the program it
 /// binds. A client and a daemon on different sides of that would misaddress a
 /// socket rather than fail, so they must refuse each other instead.
-pub const CONTROL_VERSION: u32 = 6;
+///
+/// v7 adds cluster locks (`docs/LOCKS.md` §9.3) and fenced writes: a v6
+/// daemon would ignore a write's fence and commit it unconditionally, which
+/// is the one outcome a fence exists to prevent.
+pub const CONTROL_VERSION: u32 = 7;
 
 /// How many payload bytes one chunk carries.
 ///
@@ -136,6 +140,16 @@ pub enum ErrorCode {
     /// as protocol statuses owes this one "come back later", not "you asked
     /// wrong".
     Unavailable,
+    /// Another claim holds the cluster lock (`docs/LOCKS.md` §9.3).
+    LockHeld,
+    /// A simultaneous claim on the lock won; retrying at once may succeed.
+    LockContended,
+    /// The hold named is no longer this node's: released, broken, expired or
+    /// superseded. A fenced write under it was refused.
+    LockLost,
+    /// The last holder's writes did not arrive within the handoff window, so
+    /// the lock was released again (`docs/LOCKS.md` §8).
+    HandoffPending,
 }
 
 impl ErrorCode {
@@ -150,6 +164,10 @@ impl ErrorCode {
             ErrorCode::Internal => "internal",
             ErrorCode::Divergent => "divergent",
             ErrorCode::Unavailable => "unavailable",
+            ErrorCode::LockHeld => "lock-held",
+            ErrorCode::LockContended => "lock-contended",
+            ErrorCode::LockLost => "lock-lost",
+            ErrorCode::HandoffPending => "handoff-pending",
         }
     }
 
@@ -164,6 +182,10 @@ impl ErrorCode {
             "internal" => ErrorCode::Internal,
             "divergent" => ErrorCode::Divergent,
             "unavailable" => ErrorCode::Unavailable,
+            "lock-held" => ErrorCode::LockHeld,
+            "lock-contended" => ErrorCode::LockContended,
+            "lock-lost" => ErrorCode::LockLost,
+            "handoff-pending" => ErrorCode::HandoffPending,
             _ => return None,
         })
     }
@@ -181,7 +203,9 @@ impl ErrorCode {
             // version, which is what `Aborted` is for; it is not a malformed
             // request and not a fault.
             ErrorCode::Divergent => Code::Aborted,
-            ErrorCode::Unavailable => Code::Unavailable,
+            ErrorCode::Unavailable | ErrorCode::HandoffPending => Code::Unavailable,
+            ErrorCode::LockHeld | ErrorCode::LockLost => Code::FailedPrecondition,
+            ErrorCode::LockContended => Code::Aborted,
         }
     }
 
@@ -274,6 +298,12 @@ impl From<synch_engine::EngineError> for ControlError {
             // message says which command resolves it (§3.4).
             E::InRecovery { .. } => ErrorCode::Unavailable,
             E::Invalid(_) | E::Key(_) => ErrorCode::Invalid,
+            E::Lock { failure, .. } => match failure {
+                synch_engine::LockFailure::Held => ErrorCode::LockHeld,
+                synch_engine::LockFailure::Contended => ErrorCode::LockContended,
+                synch_engine::LockFailure::Lost => ErrorCode::LockLost,
+                synch_engine::LockFailure::HandoffPending => ErrorCode::HandoffPending,
+            },
             _ => ErrorCode::Internal,
         };
         ControlError::new(code, format!("{e}"))

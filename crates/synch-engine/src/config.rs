@@ -154,6 +154,15 @@ pub struct NodeConfig {
     /// How the DNSSEC resolver reaches the DNS: an optional DoH endpoint and
     /// an optional root-trust-anchor override (§3.2).
     pub dns: synch_net::ResolverOptions,
+    /// The cluster-lock claim window Δ (`docs/LOCKS.md` §2, default 2 s):
+    /// how long a claim, renewal or release waits for each peer. A peer
+    /// silent past it is treated as not running, which is exactly the
+    /// bounded-latency assumption exclusion rests on.
+    pub lock_claim_window: Duration,
+    /// How long an acquire waits to hold the last holder's published head
+    /// before it gives up with `handoff-pending` (`docs/LOCKS.md` §8,
+    /// default 10 s).
+    pub lock_handoff_window: Duration,
 }
 
 impl NodeConfig {
@@ -187,6 +196,8 @@ impl NodeConfig {
             seq_gap: crate::recovery::DEFAULT_SEQ_GAP,
             name: hostname(),
             dns: synch_net::ResolverOptions::default(),
+            lock_claim_window: Duration::from_secs(2),
+            lock_handoff_window: Duration::from_secs(10),
         }
     }
 

@@ -1263,6 +1263,44 @@ async fn headers_that_relocate_the_payload_are_refused() {
     harness.stop().await;
 }
 
+/// A precondition on an ordinary key is refused rather than ignored: a client
+/// creating a lock object with `If-None-Match: *` must not be told it won a
+/// race nothing ran (docs/LOCKS.md §11.2).
+#[tokio::test]
+async fn conditional_writes_to_ordinary_keys_are_refused() {
+    let harness = Harness::start(AuthMode::Anonymous).await;
+    harness.publish("state.tfstate", b"serial 1");
+    let http = client();
+
+    for (header, value) in [("if-none-match", "*"), ("if-match", "\"abc\"")] {
+        let response = http
+            .put(harness.url("/my-media/state.tfstate.tflock"))
+            .header(header, value)
+            .body("lock info")
+            .send()
+            .await
+            .unwrap();
+        assert_eq!(response.status(), 501, "{header} on PUT was not refused");
+        assert!(response.text().await.unwrap().contains("NotImplemented"));
+    }
+    let response = http
+        .delete(harness.url("/my-media/state.tfstate"))
+        .header("if-match", "\"abc\"")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(response.status(), 501, "if-match on DELETE was not refused");
+
+    // Neither write happened.
+    assert_eq!(
+        harness.get("/my-media/state.tfstate.tflock").await.status(),
+        404
+    );
+    let kept = harness.get("/my-media/state.tfstate").await;
+    assert_eq!(kept.bytes().await.unwrap().as_ref(), b"serial 1");
+    harness.stop().await;
+}
+
 // ---- DeleteObject (§8, §9.4) -----------------------------------------------
 
 /// A delete removes the local copy and publishes a tombstone, and the key
@@ -1559,5 +1597,182 @@ async fn uploads_are_scoped_to_the_key_that_opened_them() {
         .get(&format!("/my-media/alice.bin?uploadId={upload}"))
         .await;
     assert!(parts.contains("<ListPartsResult"), "{parts}");
+    harness.stop().await;
+}
+
+// ---- lock keys and fenced writes (docs/LOCKS.md §11) -----------------------
+
+/// Maps `tf-state` onto the harness's space with `*.tflock` as lock keys.
+async fn lock_bucket(harness: &Harness) {
+    buckets::add_with_locks(
+        &harness.daemon,
+        "tf-state",
+        "media",
+        buckets::Access::ReadWrite,
+        None,
+        false,
+        &["*.tflock".to_string()],
+    )
+    .await
+    .unwrap();
+}
+
+/// The flow Terraform's `use_lockfile` runs: create the lock object with
+/// `If-None-Match: *`, read the holder back on a 412, delete to unlock — and
+/// the lock key never appears in the tree or in a listing.
+#[tokio::test]
+async fn a_lock_key_is_a_lock_driven_by_conditional_writes() {
+    let harness = Harness::start(AuthMode::Anonymous).await;
+    lock_bucket(&harness).await;
+    let http = client();
+    let url = harness.url("/tf-state/env/state.tflock");
+
+    let taken = http
+        .put(&url)
+        .header("if-none-match", "*")
+        .body("{\"ID\":\"one\"}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(taken.status(), 200);
+    let etag = taken.headers()["etag"].to_str().unwrap().to_string();
+
+    let refused = http
+        .put(&url)
+        .header("if-none-match", "*")
+        .body("{\"ID\":\"two\"}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(refused.status(), 412);
+    assert!(refused.text().await.unwrap().contains("PreconditionFailed"));
+
+    let read = http.get(&url).send().await.unwrap();
+    assert_eq!(read.status(), 200);
+    assert_eq!(read.headers()["etag"].to_str().unwrap(), etag);
+    assert_eq!(read.bytes().await.unwrap().as_ref(), b"{\"ID\":\"one\"}");
+
+    // Renewing names the hold by its ETag, and may replace the body.
+    let stale = http
+        .put(&url)
+        .header("if-match", "\"1-0000000000000000-nobody@cluster.example\"")
+        .body("x")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(stale.status(), 412);
+    let renewed = http
+        .put(&url)
+        .header("if-match", &etag)
+        .body("{\"ID\":\"one\",\"Info\":\"renewed\"}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(renewed.status(), 200);
+    assert_eq!(
+        harness
+            .get("/tf-state/env/state.tflock")
+            .await
+            .bytes()
+            .await
+            .unwrap()
+            .as_ref(),
+        b"{\"ID\":\"one\",\"Info\":\"renewed\"}"
+    );
+
+    // Virtual: no file, and no listing entry.
+    assert!(!harness.space_path.join("env/state.tflock").exists());
+    let listing = harness
+        .get("/tf-state?list-type=2")
+        .await
+        .text()
+        .await
+        .unwrap();
+    assert!(!listing.contains("state.tflock"), "{listing}");
+
+    // An unconditional write would be a take-over: refused.
+    let plain = http.put(&url).body("mine now").send().await.unwrap();
+    assert_eq!(plain.status(), 400);
+
+    let wrong = http
+        .delete(&url)
+        .header("if-match", "\"not-it\"")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(wrong.status(), 412);
+    assert_eq!(http.delete(&url).send().await.unwrap().status(), 204);
+    assert_eq!(
+        harness.get("/tf-state/env/state.tflock").await.status(),
+        404
+    );
+    // Deleting a free lock is the idempotent no-op S3 promises.
+    assert_eq!(http.delete(&url).send().await.unwrap().status(), 204);
+    let again = http
+        .put(&url)
+        .header("if-none-match", "*")
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(again.status(), 200);
+    harness.stop().await;
+}
+
+/// A write fenced by a lock key commits while the hold is current and is
+/// refused once it is released, leaving the object as it was (§11.3).
+#[tokio::test]
+async fn a_fenced_write_commits_only_under_its_hold() {
+    let harness = Harness::start(AuthMode::Anonymous).await;
+    lock_bucket(&harness).await;
+    let http = client();
+    let lock = harness.url("/tf-state/state.tflock");
+    let taken = http
+        .put(&lock)
+        .header("if-none-match", "*")
+        .body("{}")
+        .send()
+        .await
+        .unwrap();
+    let etag = taken.headers()["etag"].to_str().unwrap().to_string();
+    let fence = format!("state.tflock; token={etag}");
+
+    let written = http
+        .put(harness.url("/tf-state/state.tfstate"))
+        .header("x-synch-lock", &fence)
+        .body("serial 1")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(written.status(), 200);
+
+    assert_eq!(http.delete(&lock).send().await.unwrap().status(), 204);
+    let late = http
+        .put(harness.url("/tf-state/state.tfstate"))
+        .header("x-synch-lock", &fence)
+        .body("serial 2")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(late.status(), 412);
+    assert_eq!(
+        harness
+            .get("/tf-state/state.tfstate")
+            .await
+            .bytes()
+            .await
+            .unwrap()
+            .as_ref(),
+        b"serial 1"
+    );
+    // A fence must name one of the bucket's lock keys.
+    let bogus = http
+        .put(harness.url("/tf-state/state.tfstate"))
+        .header("x-synch-lock", "state.tfstate; token=x")
+        .body("serial 3")
+        .send()
+        .await
+        .unwrap();
+    assert_eq!(bogus.status(), 400);
     harness.stop().await;
 }

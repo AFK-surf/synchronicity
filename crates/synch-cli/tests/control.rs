@@ -2994,3 +2994,134 @@ async fn the_live_surface_answers_when_nothing_is_running() {
 
     daemon.shutdown().await;
 }
+
+// ---- cluster locks (docs/LOCKS.md §9.3) ------------------------------------
+
+fn lock_request(mode: pb::LockMode) -> pb::LockRequest {
+    pb::LockRequest {
+        space: "media".into(),
+        name: "deploy".into(),
+        ttl_ms: 10_000,
+        wait_ms: 0,
+        owner: "test".into(),
+        payload: Vec::new(),
+        mode: mode as i32,
+        allow_behind: false,
+    }
+}
+
+/// A session hold lives exactly as long as its stream, a second claim is
+/// refused with its own code while it does, and a fenced write commits only
+/// under the hold it names.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_session_lock_lives_with_its_stream_and_fences_writes() {
+    let (dir, daemon, space, _scan) = daemon_with_space(&[]).await;
+    let data_dir = dir.path();
+    let mut client = Client::connect(data_dir).await.unwrap();
+    let (held, events) = client
+        .lock(lock_request(pb::LockMode::Session))
+        .await
+        .unwrap();
+
+    let refused = client
+        .lock(lock_request(pb::LockMode::Session))
+        .await
+        .unwrap_err();
+    assert_eq!(refused.code, ErrorCode::LockHeld, "{refused}");
+
+    let fence = |token: &str| synch_cli::control::Fence {
+        lock: "media/deploy".into(),
+        token: token.into(),
+    };
+    let mut put = client
+        .put_fenced("media", "fenced.txt", Some(&fence(&held.token)))
+        .await
+        .unwrap();
+    put.chunk(b"under the lock".to_vec()).await.unwrap();
+    put.finish().await.unwrap();
+    assert_eq!(
+        std::fs::read(space.path().join("fenced.txt")).unwrap(),
+        b"under the lock"
+    );
+
+    // Dropping the stream releases the hold; a write fenced by it is then
+    // refused and leaves nothing behind.
+    drop(events);
+    let mut released = false;
+    for _ in 0..50 {
+        let status = client
+            .lock_status(pb::LockStatusRequest {
+                space: "media".into(),
+                name: String::new(),
+                peers: false,
+            })
+            .await
+            .unwrap();
+        if status.claims.iter().all(|c| c.mode.is_empty()) {
+            released = true;
+            break;
+        }
+        tokio::time::sleep(std::time::Duration::from_millis(100)).await;
+    }
+    assert!(released, "the session hold outlived its stream");
+    let mut put = client
+        .put_fenced("media", "stale.txt", Some(&fence(&held.token)))
+        .await
+        .unwrap();
+    put.chunk(b"too late".to_vec()).await.unwrap();
+    let error = put.finish().await.unwrap_err();
+    assert_eq!(error.code, ErrorCode::LockLost, "{error}");
+    assert!(!space.path().join("stale.txt").exists());
+    daemon.shutdown().await;
+}
+
+/// A lease must be renewed by its client; a renewal names the hold by token,
+/// and release ends it.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_lease_is_renewed_by_token_and_released() {
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = Daemon::start(dir.path()).await;
+    let mut client = Client::connect(dir.path()).await.unwrap();
+    let (held, _events) = client
+        .lock(lock_request(pb::LockMode::Lease))
+        .await
+        .unwrap();
+    let renewed = client
+        .lock_renew(pb::LockRenewRequest {
+            space: "media".into(),
+            name: "deploy".into(),
+            token: held.token.clone(),
+            ttl_ms: Some(20_000),
+            payload: None,
+        })
+        .await
+        .unwrap();
+    assert!(renewed.valid_for_ms > 10_000, "{renewed:?}");
+    let wrong = client
+        .lock_renew(pb::LockRenewRequest {
+            space: "media".into(),
+            name: "deploy".into(),
+            token: held.token.replacen('-', "0-", 1),
+            ttl_ms: None,
+            payload: None,
+        })
+        .await
+        .unwrap_err();
+    assert_eq!(wrong.code, ErrorCode::LockLost, "{wrong}");
+    let ended = client
+        .lock_release(pb::LockReleaseRequest {
+            space: "media".into(),
+            name: "deploy".into(),
+            token: held.token.clone(),
+            force: false,
+            holder: String::new(),
+        })
+        .await
+        .unwrap();
+    assert_eq!(ended, vec![held.token]);
+    client
+        .lock(lock_request(pb::LockMode::Lease))
+        .await
+        .unwrap();
+    daemon.shutdown().await;
+}

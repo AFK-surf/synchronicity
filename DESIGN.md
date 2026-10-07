@@ -1634,7 +1634,7 @@ synch pin add|rm|ls <root|space/path>        keep content in CAS regardless of p
 synch recover [--wait <dur>] [--gap <n>]     resume publishing after key/database loss (§3.4)
 synch lock run|acquire|renew|release|break   best-effort cluster locks: exclusive under
 synch lock ls|status                         bounded latency, split brain under partition
-                                             (docs/LOCKS.md; designed, not yet built)
+                                             (docs/LOCKS.md)
 synch doctor                                 connectivity, DNSSEC, equivocation, GC stats,
                                              the trust policy in force and the clock it dates by
 ```
@@ -1808,11 +1808,13 @@ chunks** — a bounded queue on each side and a 4 MiB HTTP/2 window between them
 - **Lock keys**: keys a bucket declares with `--locks <glob>` are cluster locks
   driven by conditional writes (`If-None-Match: *` to acquire, `DELETE` to
   release), which is what Terraform's `use_lockfile` speaks; `x-synch-lock` makes
-  a write fenced. Designed in docs/LOCKS.md §11, not yet built.
+  a write fenced; on any other key those conditional headers are refused, not
+  ignored. See docs/LOCKS.md §11.
 - **Not in v1**: `DeleteObjects` (the batch delete, which is its own API and its
   own body format), CopyObject and UploadPartCopy, DeleteBucket — a bucket is a
   mapping the operator made, not a thing HTTP may unmake — bucket versioning
-  APIs, presigned URLs.
+  APIs, presigned URLs, and conditional writes on keys that are not lock keys
+  (docs/LOCKS.md §16, phase 3).
 
 ---
 
@@ -2160,6 +2162,27 @@ CREATE TABLE socket_activations (name TEXT PRIMARY KEY,
                       activated_at INTEGER NOT NULL);
 CREATE INDEX socket_activations_by_program
   ON socket_activations (program_space, program_path);
+
+-- ---- cluster locks (`docs/LOCKS.md` §9.2) ---------------------------------
+--
+-- Local state, never replicated. The Lamport clock lock tickets are taken
+-- from, persisted so fencing tokens stay monotone across a restart, and the
+-- holds this node itself has, so a restarted daemon still answers for a
+-- sticky lock. A `session` hold dies with its client's stream and is never
+-- written; observers' tables are soft state in memory.
+CREATE TABLE lock_clock (id INTEGER PRIMARY KEY CHECK (id = 0),
+                         lamport INTEGER NOT NULL);
+CREATE TABLE lock_holds (space TEXT NOT NULL, name TEXT NOT NULL,
+                         origin TEXT NOT NULL,      -- the ticket's origin
+                         lamport INTEGER NOT NULL, nonce INTEGER NOT NULL,
+                         ttl_ms INTEGER NOT NULL,
+                         mode TEXT NOT NULL CHECK (mode IN ('lease','sticky')),
+                         owner TEXT NOT NULL,
+                         payload BLOB NOT NULL,     -- opaque: an S3 lock body
+                         supersedes BLOB NOT NULL,  -- postcard Vec<ClaimId>
+                         acquired_at INTEGER NOT NULL,  -- wall clock, display only
+                         lease_until INTEGER,       -- lease mode's restart check
+                         PRIMARY KEY (space, name));
 ```
 
 The trie is authoritative; `entries` and `blob_providers` are derived caches and can

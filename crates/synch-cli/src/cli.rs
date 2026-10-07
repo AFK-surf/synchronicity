@@ -467,6 +467,13 @@ pub enum Command {
         /// Where the file lands: `<space>/<path>`, or a directory as
         /// `<space>/<dir>/` — the trailing slash keeps the file's own name.
         destination: String,
+        /// Commit only while this node holds the lock `<space>/<name>` with
+        /// `--token` — a fenced write (`docs/LOCKS.md` §7).
+        #[arg(long, requires = "token")]
+        lock: Option<String>,
+        /// The hold's token, as `synch lock acquire` printed it.
+        #[arg(long, requires = "lock")]
+        token: Option<String>,
     },
     /// Remove this node's copy of a path and publish its tombstone.
     ///
@@ -512,6 +519,13 @@ pub enum Command {
         /// The socket subcommand.
         #[command(subcommand)]
         command: SocketCommand,
+    },
+    /// Best-effort cluster locks: exclusive while nodes reach each other,
+    /// split brain under partition (`docs/LOCKS.md`).
+    Lock {
+        /// The lock subcommand.
+        #[command(subcommand)]
+        command: LockCommand,
     },
     /// Keep content in the local store regardless of policy.
     Pin {
@@ -1049,6 +1063,119 @@ pub enum PinCommand {
     Ls,
 }
 
+/// What `synch lock run` does to its command when the lock is lost.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, clap::ValueEnum)]
+pub enum OnLost {
+    /// Ask it to stop: SIGTERM (on Windows, terminate it).
+    Term,
+    /// Stop it outright.
+    Kill,
+    /// Leave it running and only report the loss.
+    Ignore,
+}
+
+/// `synch lock` (`docs/LOCKS.md` §10).
+#[derive(Debug, Subcommand)]
+pub enum LockCommand {
+    /// Hold a lock for the life of a command, renewing it until the command
+    /// exits; exits 75 if the lock was not acquired within `--wait`.
+    Run {
+        /// `<space>/<name>`.
+        lock: String,
+        /// The lease peers keep without a renewal.
+        #[arg(long, default_value = "30s")]
+        ttl: String,
+        /// How long to wait for a lock somebody else holds.
+        #[arg(long)]
+        wait: Option<String>,
+        /// Who is asking, as other nodes see it.
+        #[arg(long)]
+        owner: Option<String>,
+        /// What to do to the command if the lock is lost.
+        #[arg(long, value_enum, default_value_t = OnLost::Term)]
+        on_lost: OnLost,
+        /// Run even if the last holder's writes are not here yet.
+        #[arg(long)]
+        allow_behind: bool,
+        /// The command and its arguments, after `--`.
+        #[arg(last = true, required = true)]
+        command: Vec<std::ffi::OsString>,
+    },
+    /// Take a lock and print its token.
+    ///
+    /// By default the lock is a lease: held for `--ttl` unless renewed with
+    /// `synch lock renew`. `--sticky` has the daemon renew it until it is
+    /// released; `--hold` keeps this process attached and releases on exit.
+    Acquire {
+        /// `<space>/<name>`.
+        lock: String,
+        /// The lease.
+        #[arg(long, default_value = "30s")]
+        ttl: String,
+        /// How long to wait for a lock somebody else holds.
+        #[arg(long)]
+        wait: Option<String>,
+        /// Who is asking, as other nodes see it.
+        #[arg(long)]
+        owner: Option<String>,
+        /// The daemon renews until release.
+        #[arg(long, conflicts_with = "hold")]
+        sticky: bool,
+        /// Stay attached; the lock is released when this process exits.
+        #[arg(long)]
+        hold: bool,
+        /// Acquire even if the last holder's writes are not here yet.
+        #[arg(long)]
+        allow_behind: bool,
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// Extend a lease-mode hold.
+    Renew {
+        /// `<space>/<name>`.
+        lock: String,
+        /// The hold's token.
+        #[arg(long)]
+        token: String,
+        /// The new lease, from now; the hold's own by default.
+        #[arg(long)]
+        ttl: Option<String>,
+    },
+    /// Release this node's hold.
+    Release {
+        /// `<space>/<name>`.
+        lock: String,
+        /// Only this claim.
+        #[arg(long)]
+        token: Option<String>,
+    },
+    /// End other nodes' claims on a lock; logged on every node it reaches.
+    Break {
+        /// `<space>/<name>`.
+        lock: String,
+        /// Only this origin's claims.
+        #[arg(long)]
+        holder: Option<String>,
+    },
+    /// The claims this node knows of.
+    Ls {
+        /// Only this space.
+        space: Option<String>,
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+    /// One lock as this node and every reachable peer see it.
+    Status {
+        /// `<space>/<name>`.
+        lock: String,
+        /// Emit machine-readable JSON.
+        #[arg(long)]
+        json: bool,
+    },
+}
+
 /// Parses a `--wait` duration: bare seconds, or `<n>d<n>h<n>m<n>s` in any
 /// combination (`0`, `45`, `90m`, `1h`, `2h30m`).
 ///
@@ -1185,6 +1312,35 @@ mod tests {
 
     use super::*;
 
+    /// `lock run` takes its command after `--`, so the command's own flags
+    /// are never read as ours; a fenced put needs both halves of the fence.
+    #[test]
+    fn lock_run_takes_its_command_after_the_separator() {
+        let cli = Cli::try_parse_from([
+            "synch",
+            "lock",
+            "run",
+            "infra/deploy",
+            "--wait",
+            "1m",
+            "--",
+            "make",
+            "--jobs",
+            "4",
+        ])
+        .unwrap();
+        assert!(matches!(
+            cli.command,
+            Command::Lock {
+                command: LockCommand::Run { ref lock, ref command, on_lost: OnLost::Term, .. }
+            } if lock == "infra/deploy" && command.len() == 3
+        ));
+        assert!(Cli::try_parse_from(["synch", "lock", "run", "infra/deploy"]).is_err());
+        assert!(
+            Cli::try_parse_from(["synch", "put", "a", "media/a", "--lock", "media/l"]).is_err()
+        );
+    }
+
     #[test]
     fn the_command_surface_is_well_formed() {
         Cli::command().debug_assert();
@@ -1247,7 +1403,7 @@ mod tests {
         let cli = Cli::parse_from(["synch", "put", "notes.txt", "workspace/documents/"]);
         assert!(matches!(
             cli.command,
-            Command::Put { file, destination }
+            Command::Put { file, destination, .. }
                 if file == Path::new("notes.txt") && destination == "workspace/documents/"
         ));
         // `-` is an ordinary positional, not a flag: stdin.

@@ -21,15 +21,20 @@ use tokio::io::{AsyncRead, AsyncReadExt};
 
 use crate::control::{
     proto::{PutPart, CHUNK_SIZE},
-    Client, Deleted, StreamedWrite, Written,
+    Client, Deleted, Fence, StreamedWrite, Written,
 };
 
 /// The argument that names stdin instead of a file.
 const STDIN: &str = "-";
 
 /// Runs `synch put <file> <destination>`.
-pub async fn run_put(data_dir: &Path, file: &Path, destination: &str) -> Result<()> {
-    let written = put(data_dir, file, destination).await?;
+pub async fn run_put(
+    data_dir: &Path,
+    file: &Path,
+    destination: &str,
+    fence: Option<&Fence>,
+) -> Result<()> {
+    let written = put_with(data_dir, file, destination, fence).await?;
     println!(
         "wrote {}/{} ({} bytes)",
         written.entry.space, written.entry.path, written.entry.size
@@ -43,6 +48,17 @@ pub async fn run_put(data_dir: &Path, file: &Path, destination: &str) -> Result<
 /// Split from [`run_put`] so the tests get the published entry back rather
 /// than reading stdout.
 pub async fn put(data_dir: &Path, file: &Path, destination: &str) -> Result<Written> {
+    put_with(data_dir, file, destination, None).await
+}
+
+/// As [`put`], fenced by a lock hold when `fence` names one
+/// (`docs/LOCKS.md` §7).
+pub async fn put_with(
+    data_dir: &Path,
+    file: &Path,
+    destination: &str,
+    fence: Option<&Fence>,
+) -> Result<Written> {
     let destination = Destination::parse(destination)?;
     let from_stdin = file.as_os_str() == STDIN;
 
@@ -84,6 +100,7 @@ pub async fn put(data_dir: &Path, file: &Path, destination: &str) -> Result<Writ
                 &destination.space,
                 &path,
                 &file.display().to_string(),
+                fence,
             )
             .await
         }
@@ -94,6 +111,7 @@ pub async fn put(data_dir: &Path, file: &Path, destination: &str) -> Result<Writ
                 &destination.space,
                 &path,
                 "stdin",
+                fence,
             )
             .await
         }
@@ -120,7 +138,15 @@ pub async fn put_from<R: AsyncRead + Unpin>(
             destination.path
         );
     };
-    stream(data_dir, reader, &destination.space, &path, "the payload").await
+    stream(
+        data_dir,
+        reader,
+        &destination.space,
+        &path,
+        "the payload",
+        None,
+    )
+    .await
 }
 
 /// Opens the file to stream, refusing what could never be one payload.
@@ -155,12 +181,13 @@ async fn stream<R: AsyncRead + Unpin>(
     space: &str,
     path: &str,
     what: &str,
+    fence: Option<&Fence>,
 ) -> Result<Written> {
     // The daemon takes its gates — publishability, a resolvable target —
     // before `put` returns, so a destination it refuses fails here, before
     // a byte of the payload is read (§9.4).
     let mut client = Client::connect(data_dir).await?;
-    let mut put: StreamedWrite<PutPart> = client.put(space, path).await?;
+    let mut put: StreamedWrite<PutPart> = client.put_fenced(space, path, fence).await?;
 
     let mut ended = false;
     while !ended {
