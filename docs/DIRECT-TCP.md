@@ -283,10 +283,13 @@ The `GetDirect` arm of `BlobProtocol::handle_stream`:
 3. Wait for the authenticated socket (or the accept timeout, or the control
    stream being reset by the requester).
 4. Run the **existing** `serve_run` loop with a sink that seals records onto
-   the TCP socket instead of writing to the QUIC send stream: `admit_window`
-   before every window, one window encoded ahead, `progress.mark()` after each
-   window sent. TCP's flow control now plays the role QUIC's did, so a run
-   still holds at most two encoded windows in memory.
+   the TCP socket instead of writing to the QUIC send stream: up to four
+   windows encoded ahead, each read off disk in one call; `admit_window`
+   before every window is sent; each window sealed on the blocking pool —
+   its records' counter values taken in send order — while the window before
+   it is written; `progress.mark()` after each window handed on. TCP's flow
+   control now plays the role QUIC's did, so a run holds at most six windows
+   in memory: four encoding, one sealing, one being written.
 5. Write the `final` record, shut down the socket, finish the control stream.
 
 The transfer runs inside the control stream's dispatch future, so:
