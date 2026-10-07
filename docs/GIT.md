@@ -2,7 +2,7 @@
 
 Status: **implemented**. `synch-core::git` is the classifier, `synch-store`'s
 `unified.rs` the selection rules, `synch-engine`'s scanner, checkout and tree
-adoption the ordering, hold and guards, and `crates/synch-engine/tests/git.rs`
+adoption the ordering, hold and guards, and `crates/synch-engine/tests/integration/git.rs`
 drives all of it against repositories made by `git` itself. Where the built
 thing differs from the first draft of this design, the document says so at
 that point. The document describes what the engine did with a `.git`
@@ -694,7 +694,7 @@ What landed, and where:
 
 ## 14. Tests
 
-`crates/synch-engine/tests/git.rs`, against repositories built with `git`
+`crates/synch-engine/tests/integration/git.rs`, against repositories built with `git`
 in the test and skipped where the binary is absent:
 
 - A source containing a repository with a live `index.lock`, `tmp_obj_*`, a

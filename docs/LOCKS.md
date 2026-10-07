@@ -735,7 +735,7 @@ surfaces the refusal and does not hold on a table it could not fill.
   "under bounded latency, one node holds a lock at a time". The executions it
   covers need the claim exchange, which is the TLA+ model's job today. Proof
   ownership does not change with this design, so `docs/LEAN.md` is not amended.
-- **Native tests** over real loopback endpoints (`synch-engine/tests/locks.rs`):
+- **Native tests** over real loopback endpoints (`synch-engine/tests/integration/locks.rs`):
   - simultaneous claims grant exactly one;
   - a partitioned pair both grant, and on heal exactly one survives by §6's order;
   - a crashed holder is superseded after its lease, and the new claim names it;

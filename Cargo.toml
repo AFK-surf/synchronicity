@@ -121,6 +121,26 @@ unicode-normalization = "0.1.25"
 windows-sys = "0.61.2"
 zeroize = "1.9.0"
 
+# Dependencies are optimized even in dev and test builds, and carry no debug
+# info; this workspace's own crates keep the dev defaults, so an edit still
+# rebuilds at debug speed and stays debuggable. The tests spend most of
+# their time inside dependencies — SQLite, BLAKE3, the TLS and QUIC stacks —
+# and unoptimized they ran several times slower. Dependency debug info was
+# most of what every test binary linked, and most of `target/`. Dependencies
+# build once and stay cached, so the cost is one slower first build. Debug
+# assertions and overflow checks are untouched.
+[profile.dev.package."*"]
+opt-level = 2
+debug = false
+
+# Test binaries link statically, so each of the sixty-odd carried its own
+# copy of the workspace's full debug info: tens of gigabytes of target/, and
+# link time on every rebuild. Line tables keep file:line in panics and
+# backtraces; `CARGO_PROFILE_TEST_DEBUG=full` restores the rest for a session
+# in a debugger. `cargo build` keeps the dev default.
+[profile.test]
+debug = "line-tables-only"
+
 [profile.release]
 opt-level = 3
 lto = "thin"

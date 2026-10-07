@@ -10,7 +10,7 @@ use std::time::Duration;
 use synch_engine::{reconcile::HeadOutcome, replica::ViewState, Node};
 use synch_store::{PinHolder, ReplicaPolicy};
 
-mod common;
+use crate::common;
 use common::{off_runtime, shutdown, spawn_node as spawn, spawn_node_with, trust_all as introduce};
 
 fn holder() -> PinHolder {

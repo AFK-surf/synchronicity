@@ -5,7 +5,7 @@ use std::time::Duration;
 
 use synch_engine::{Node, VersionPolicy};
 
-mod common;
+use crate::common;
 use common::{
     big_payload, off_runtime, shutdown, spawn_node as spawn, spawn_node_with as spawn_with, trust,
     trust_all as introduce,

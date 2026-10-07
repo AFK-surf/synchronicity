@@ -6,7 +6,7 @@
 //! spent) refuses what it should with the errno a program can act on, and the
 //! poll integration behaves like every other handle. The engine's half — the
 //! real gates, the publish, the tombstone — lives in
-//! `crates/synch-engine/tests/tree_writes.rs`.
+//! `crates/synch-engine/tests/integration/tree_writes.rs`.
 
 #![cfg(all(
     any(target_os = "linux", target_os = "macos"),

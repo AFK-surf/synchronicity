@@ -202,13 +202,30 @@ impl NodeConfig {
     }
 
     /// Builds a configuration for a loopback-only, fully offline node.
+    ///
+    /// Offline includes DNS: a node named under a zone resolves that zone
+    /// when it opens, and with the default resolver that is a query to a
+    /// public DoH endpoint. Here the endpoint is a closed loopback port, so
+    /// the query fails at once, exactly as an unreachable resolver does,
+    /// instead of waiting out the network, and pin refresh is off for the
+    /// same reason. A test that serves its own zone sets `dns` itself.
     pub fn loopback(data_dir: impl Into<PathBuf>) -> Self {
         NodeConfig {
             net: NetOptions::loopback(),
+            dns: synch_net::ResolverOptions {
+                doh_url: Some(OFFLINE_DOH_URL.to_string()),
+                no_tuf: true,
+                ..Default::default()
+            },
             ..NodeConfig::new(data_dir)
         }
     }
 }
+
+/// The DoH endpoint of a [`NodeConfig::loopback`] node: port 1 on loopback,
+/// which nothing listens on, so a connection is refused without leaving the
+/// host. Loopback is exempt from proxies, so none intercepts it either.
+const OFFLINE_DOH_URL: &str = "http://127.0.0.1:1/dns-query";
 
 fn hostname() -> String {
     std::env::var("HOSTNAME")

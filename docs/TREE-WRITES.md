@@ -9,7 +9,7 @@ the draft, the text has been corrected to describe the built thing and says so
 at that point. The worked example ships as
 `crates/synch-sock/examples/drop-box.c`, compiled and run by the test suite on
 every build; the end-to-end engine tests are
-`crates/synch-engine/tests/tree_writes.rs`.
+`crates/synch-engine/tests/integration/tree_writes.rs`.
 
 A **tree write** is a socket program publishing a file version into the node's
 own origin trie: the same act as saving a file into a filesystem-source directory, an S3

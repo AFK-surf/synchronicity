@@ -20,7 +20,7 @@ use synch_core::{Hash, OriginId, SignedHead};
 use synch_engine::reconcile::{Syncer, MAX_RETAINED_FORKS};
 use synch_store::Store;
 
-mod common;
+use crate::common;
 use common::binding;
 
 /// xorshift64*, so a case is reproducible from its seed.
