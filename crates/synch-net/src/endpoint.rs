@@ -186,6 +186,11 @@ pub struct NetOptions {
     /// Ask providers for large transient reads as direct-TCP runs where the
     /// connection has a direct path (`docs/DIRECT-TCP.md`). Off by default.
     pub direct_dial: bool,
+    /// The cluster-lock service, mounted as `sync/lock/1` when present
+    /// (`docs/LOCKS.md` §9.2). Absent means the ALPN is not offered, so a
+    /// claimant's dial to this node fails at negotiation and counts as an
+    /// unanswered peer — which is what an endpoint with no lock table is.
+    pub locks: Option<Arc<dyn crate::lock::LockService>>,
 }
 
 impl NetOptions {
@@ -393,6 +398,9 @@ impl Net {
                 if options.sockets.is_some() {
                     alpns.push(synch_core::ALPN_SOCK.to_vec());
                 }
+                if options.locks.is_some() {
+                    alpns.push(synch_core::ALPN_LOCK.to_vec());
+                }
                 alpns
             })
             .bind()
@@ -455,6 +463,15 @@ impl Net {
         });
         let router = match &sockets {
             Some(protocol) => router.accept(synch_core::ALPN_SOCK, protocol.clone()),
+            None => router,
+        };
+        let router = match options.locks.clone() {
+            Some(service) => router.accept(
+                synch_core::ALPN_LOCK,
+                crate::lock::LockProtocol::new(store.clone(), service)
+                    .on_unknown_key(options.on_unknown_key.clone())
+                    .inflight(inflight.clone()),
+            ),
             None => router,
         };
         let router = router.spawn();
@@ -557,6 +574,17 @@ impl Net {
     ) -> Result<BlobClient, NetError> {
         Ok(BlobClient::new(self.connect(addr, ALPN_BLOB).await?)
             .with_direct(self.direct_memo.clone()))
+    }
+
+    /// Connects to a peer on the lock ALPN, reusing a live session
+    /// (`docs/LOCKS.md` §9.2).
+    pub async fn connect_lock(
+        &self,
+        addr: impl Into<EndpointAddr>,
+    ) -> Result<crate::lock::LockClient, NetError> {
+        Ok(crate::lock::LockClient::new(
+            self.connect(addr, synch_core::ALPN_LOCK).await?,
+        ))
     }
 
     /// Connects to a peer on the socket ALPN.

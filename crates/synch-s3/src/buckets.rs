@@ -24,6 +24,48 @@ pub(crate) const BUCKETS_CONFIG: &str = "s3.buckets";
 /// The record field marking a bucket that keeps no copy of peers' objects.
 const NO_CACHE: &str = "no-cache";
 
+/// The record field prefix carrying a bucket's lock-key globs.
+const LOCKS: &str = "locks=";
+
+/// Refuses a lock glob the record could not carry or a key could not match.
+fn validate_lock_glob(pattern: &str) -> S3Result<()> {
+    if pattern.is_empty()
+        || pattern.len() > synch_core::MAX_LOCK_NAME_BYTES
+        || pattern.contains(',')
+        || pattern.chars().any(char::is_control)
+    {
+        return Err(S3Error::invalid(format!(
+            "{pattern:?} is not a lock glob: one pattern per --locks, no commas"
+        )));
+    }
+    Ok(())
+}
+
+/// Matches `key` against a glob where `*` is any run of characters, `/`
+/// included, and `?` is any one character.
+fn glob(pattern: &str, key: &str) -> bool {
+    let (p, k): (Vec<char>, Vec<char>) = (pattern.chars().collect(), key.chars().collect());
+    let (mut pi, mut ki) = (0, 0);
+    let (mut star, mut mark) = (None, 0);
+    while ki < k.len() {
+        if pi < p.len() && (p[pi] == '?' || p[pi] == k[ki]) {
+            pi += 1;
+            ki += 1;
+        } else if pi < p.len() && p[pi] == '*' {
+            star = Some(pi);
+            mark = ki;
+            pi += 1;
+        } else if let Some(s) = star {
+            pi = s + 1;
+            mark += 1;
+            ki = mark;
+        } else {
+            return false;
+        }
+    }
+    p[pi..].iter().all(|c| *c == '*')
+}
+
 /// Which version of each key a bucket's reads serve (§8).
 ///
 /// The daemon owns what these *mean* — it is the one that resolves a path under
@@ -127,6 +169,8 @@ pub struct Bucket {
     /// Serve peers' objects without keeping a copy (§6.4): content this node
     /// does not already hold is verified in memory and streamed through.
     pub no_cache: bool,
+    /// Globs naming the keys that are cluster locks (docs/LOCKS.md §11.1).
+    pub locks: Vec<String>,
 }
 
 impl Bucket {
@@ -141,10 +185,21 @@ impl Bucket {
         );
         // Appended rather than placed earlier, so a gateway that predates the
         // field still reads the four it knows and serves the bucket cached.
-        match self.no_cache {
+        let mut record = match self.no_cache {
             true => format!("{record}\t{NO_CACHE}"),
             false => record,
+        };
+        // After `no-cache`, so a gateway that reads only the first option
+        // still finds it there.
+        if !self.locks.is_empty() {
+            record = format!("{record}\t{LOCKS}{}", self.locks.join(","));
         }
+        record
+    }
+
+    /// Whether `key` is one of this bucket's lock keys.
+    pub fn is_lock_key(&self, key: &str) -> bool {
+        !key.is_empty() && self.locks.iter().any(|pattern| glob(pattern, key))
     }
 
     /// Refuses a mutation before its body is consumed.
@@ -196,7 +251,18 @@ pub fn fold(records: &[String]) -> Vec<Bucket> {
             let [space, access, policy, options @ ..] = rest else {
                 return None;
             };
-            let no_cache = options.first().is_some_and(|field| *field == NO_CACHE);
+            let no_cache = options.contains(&NO_CACHE);
+            let locks: Vec<String> = options
+                .iter()
+                .find_map(|field| field.strip_prefix(LOCKS))
+                .map(|globs| {
+                    globs
+                        .split(',')
+                        .filter(|g| !g.is_empty())
+                        .map(str::to_string)
+                        .collect()
+                })
+                .unwrap_or_default();
             let (access, policy) = Access::parse(access).ok().zip(Policy::parse(policy).ok())?;
             if matches!((&access, &policy), (Access::ReadWrite, Policy::Own))
                 || matches!((&access, &policy), (Access::ReadOnly, p) if !matches!(p, Policy::Own))
@@ -207,6 +273,7 @@ pub fn fold(records: &[String]) -> Vec<Bucket> {
                     access,
                     policy,
                     no_cache,
+                    locks,
                 })
             } else {
                 None
@@ -242,7 +309,28 @@ pub async fn add(
     select: Option<&str>,
     no_cache: bool,
 ) -> S3Result<Bucket> {
+    add_with_locks(daemon, name, space, access, select, no_cache, &[]).await
+}
+
+/// As [`add`], declaring the keys matching `locks` cluster locks
+/// (docs/LOCKS.md §11.1). A lock is a write, so only a read-write bucket may
+/// declare them.
+pub async fn add_with_locks(
+    daemon: &Daemon,
+    name: &str,
+    space: &str,
+    access: Access,
+    select: Option<&str>,
+    no_cache: bool,
+    locks: &[String],
+) -> S3Result<Bucket> {
     validate_name(name)?;
+    for pattern in locks {
+        validate_lock_glob(pattern)?;
+    }
+    if !locks.is_empty() && access != Access::ReadWrite {
+        return Err(S3Error::invalid("--locks needs a read-write bucket"));
+    }
     synch_core::validate_space(space).map_err(|e| S3Error::invalid(e.to_string()))?;
     let policy = match access {
         Access::ReadOnly => {
@@ -270,6 +358,7 @@ pub async fn add(
         access,
         policy,
         no_cache,
+        locks: locks.to_vec(),
     };
     // The daemon is the authority on what a space id and an origin are, so the
     // mapping is offered to it before it is stored: an empty listing under this
@@ -351,6 +440,7 @@ mod tests {
             access: Access::ReadOnly,
             policy: Policy::Newest,
             no_cache: true,
+            locks: Vec::new(),
         };
         assert_eq!(fold(&[bucket.record()]), vec![bucket]);
         let plain = fold(&records(&["photos\tmedia\tread-only\tnewest"]));
@@ -365,10 +455,31 @@ mod tests {
             access: Access::ReadOnly,
             policy: Policy::Newest,
             no_cache: false,
+            locks: Vec::new(),
         };
         assert!(bucket.require_writable().is_err());
         bucket.access = Access::ReadWrite;
         assert!(bucket.require_writable().is_ok());
+    }
+
+    /// Lock globs ride after `no-cache`, round-trip, and match whole keys.
+    #[test]
+    fn lock_keys_round_trip_and_match_whole_keys() {
+        let bucket = Bucket {
+            name: "tf".into(),
+            space: "infra".into(),
+            access: Access::ReadWrite,
+            policy: Policy::Own,
+            no_cache: true,
+            locks: vec!["*.tflock".into(), "locks/?".into()],
+        };
+        assert_eq!(fold(&[bucket.record()]), vec![bucket.clone()]);
+        assert!(bucket.is_lock_key("env/prod/terraform.tfstate.tflock"));
+        assert!(bucket.is_lock_key("locks/a"));
+        assert!(!bucket.is_lock_key("locks/ab"));
+        assert!(!bucket.is_lock_key("terraform.tfstate"));
+        assert!(!bucket.is_lock_key("x.tflock.bak"));
+        assert!(validate_lock_glob("a,b").is_err());
     }
 
     #[test]

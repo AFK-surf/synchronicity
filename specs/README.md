@@ -29,3 +29,19 @@ intentional. `Recovery.cfg` runs the larger local bounds. Run it after changing
 recovery behavior. `RecoveryPartitioned.cfg` must report the documented
 `NoObservableFork` violation; CI expects that counterexample. The model does not
 establish eventual consistency of the actual mptsync implementation.
+
+## Lock model
+
+`Locks.tla` models the best-effort cluster lock exchange of
+[docs/LOCKS.md](../docs/LOCKS.md) §3 for one lock name. From the repository root:
+
+```sh
+java -jar tla2tools.jar -config specs/Locks.cfg -workers auto -deadlock specs/Locks.tla
+java -jar tla2tools.jar -config specs/LocksRetry.cfg -workers auto -deadlock specs/Locks.tla
+```
+
+Both must keep `MutualExclusion`: every message is delivered, which is the
+bounded-latency case. `LocksPartitioned.cfg` lets messages be lost and waits time
+out, and must report the `MutualExclusion` violation the design accepts as split
+brain; CI expects that counterexample. The model does not cover leases,
+split-brain healing or handoff.

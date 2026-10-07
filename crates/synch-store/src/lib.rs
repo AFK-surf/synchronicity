@@ -37,6 +37,7 @@ mod lean_sweep;
 mod lean_trie_collect;
 mod lean_trie_fetch;
 mod lean_trie_serve;
+pub mod locks;
 pub mod proof;
 pub mod recovery;
 pub mod replica;
@@ -58,6 +59,7 @@ pub use db::{
 pub use error::{Result, StoreError};
 pub use gc::{GcStats, TrieStats};
 pub use heads::{Equivocation, Slot};
+pub use locks::LockHoldRow;
 pub use proof::{Donor, Proven, ProvenSubtree};
 pub use replica::{ReplicaCoverage, WantRow};
 pub use sockets::SocketActivation;

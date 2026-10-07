@@ -18,6 +18,7 @@ pub mod connect;
 pub mod control;
 pub mod daemon;
 pub mod fetch;
+pub mod lock;
 pub mod mcp;
 pub mod render;
 pub mod write;

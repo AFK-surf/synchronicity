@@ -172,6 +172,11 @@ struct NodeInner {
     publisher: Publisher,
     /// New heads on their way to peers, off the publisher's path (§5.3).
     pusher: crate::pusher::Pusher,
+    /// The cluster-lock table, mounted on every endpoint this node binds
+    /// (`docs/LOCKS.md`).
+    locks: Arc<crate::locks::LockManager>,
+    /// The loop that renews this node's holds and sweeps the lock table.
+    lock_task: crate::locks::LockTask,
     ad_clock: std::sync::Mutex<std::collections::HashMap<Hash, i64>>,
     /// Serializes bounded repair rounds and retains their last completed peer.
     contact_cursor: tokio::sync::Mutex<Option<Vec<u8>>>,
@@ -800,6 +805,20 @@ impl Node {
             .on_replica(replica_wake.clone())
             .on_pending(pending_wake.clone());
         config.net.heads = Some(Arc::new(syncer.clone()) as Arc<dyn synch_net::HeadSink>);
+        // The lock table exists before the endpoint, which serves from it, and
+        // rides `config.net` so a rotation's second endpoint serves the same
+        // table (`docs/LOCKS.md` §9.2).
+        let locks = Arc::new(crate::locks::LockManager::new(
+            store.clone(),
+            origin.clone(),
+            config.lock_claim_window,
+            config.lock_handoff_window,
+        ));
+        {
+            let locks = locks.clone();
+            crate::blocking::offload(move || locks.restore()).await?;
+        }
+        config.net.locks = Some(locks.clone() as Arc<dyn synch_net::LockService>);
         let cas: Arc<dyn synch_store::backend::CasBackend> = match (cloud_cas, &config.cloud) {
             (Some(objects), Some(cloud)) => Arc::new(
                 synch_store::backend::Cloud::open(
@@ -905,6 +924,8 @@ impl Node {
                 config,
                 publisher,
                 pusher,
+                locks,
+                lock_task: Default::default(),
                 ad_clock: std::sync::Mutex::new(Default::default()),
                 contact_cursor: tokio::sync::Mutex::new(None),
                 provider_misses: std::sync::Mutex::new(Default::default()),
@@ -932,6 +953,10 @@ impl Node {
         // (`crate::pusher`). Started before the node is handed out, so a
         // publish that lands immediately still finds the pusher behind it.
         node.pusher().start(&node);
+        // Renewals of holds restored above start now, so a sticky lock a
+        // client still believes it holds is confirmed or reported lost
+        // within one tick of the daemon starting (`docs/LOCKS.md` §5).
+        node.inner.lock_task.start(&node);
         // The handler was mounted on the endpoint before the node existed;
         // this is where it learns what it dispatches to. Done before anything
         // else that can await, so the window in which a connection finds it
@@ -1032,6 +1057,11 @@ impl Node {
     /// The task that offers new heads to peers after a publish (§5.3).
     pub(crate) fn pusher(&self) -> &crate::pusher::Pusher {
         &self.inner.pusher
+    }
+
+    /// The cluster-lock manager (`docs/LOCKS.md`).
+    pub fn locks(&self) -> &Arc<crate::locks::LockManager> {
+        &self.inner.locks
     }
 
     /// The endpoint under the active device key.
@@ -1153,6 +1183,7 @@ impl Node {
         // abort drops is a push, never a publish — the head is durable, and
         // peers pick it up at the next anti-entropy round (§5.3).
         self.pusher().stop().await;
+        self.inner.lock_task.stop().await;
         let retiring = self.retiring_nets();
         let active = self.net();
 

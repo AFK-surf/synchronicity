@@ -102,6 +102,30 @@ pub enum EngineError {
         /// The seq the refused publish would have carried.
         would_publish: u64,
     },
+    /// A cluster lock could not be taken, or is no longer held
+    /// (`docs/LOCKS.md` §9.3).
+    #[error("{message}")]
+    Lock {
+        /// Which way the lock failed, for the surfaces that branch on it.
+        failure: LockFailure,
+        /// What happened, naming the lock and whoever holds it.
+        message: String,
+    },
+}
+
+/// How a lock operation failed (`docs/LOCKS.md` §9.3).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LockFailure {
+    /// Another claim holds the lock.
+    Held,
+    /// A simultaneous claim won; retrying at once may succeed.
+    Contended,
+    /// The hold named is no longer this node's: released, broken, expired
+    /// or superseded.
+    Lost,
+    /// The previous holder's writes could not be fetched within the handoff
+    /// window (§8).
+    HandoffPending,
 }
 
 impl EngineError {
@@ -113,6 +137,14 @@ impl EngineError {
     /// Builds a not-found error.
     pub fn not_found(msg: impl Into<String>) -> Self {
         EngineError::NotFound(msg.into())
+    }
+
+    /// Builds a lock failure.
+    pub fn lock(failure: LockFailure, msg: impl Into<String>) -> Self {
+        EngineError::Lock {
+            failure,
+            message: msg.into(),
+        }
     }
 }
 

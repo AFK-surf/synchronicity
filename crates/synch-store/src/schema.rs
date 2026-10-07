@@ -104,7 +104,37 @@ pub(crate) const MIGRATIONS: &[Migration] = &[
         run: v29_sockets_by_name,
     },
     Migration::Sql(V30_READ_ONLY_DELEGATIONS),
+    Migration::Sql(V31_LOCKS),
 ];
+
+/// v31 — cluster locks (`docs/LOCKS.md` §9.2).
+///
+/// Local state, never replicated: the node's Lamport clock for lock tickets,
+/// persisted so fencing tokens stay monotone across a restart (§7), and the
+/// holds this node itself has, so a restarted daemon answers for a sticky S3
+/// lock instead of releasing it behind a client that still holds it (§5).
+/// Observers' tables are soft state and live in memory only.
+const V31_LOCKS: &str = r#"
+CREATE TABLE lock_clock (
+  id       INTEGER PRIMARY KEY CHECK (id = 0),
+  lamport  INTEGER NOT NULL
+);
+CREATE TABLE lock_holds (
+  space        TEXT NOT NULL,
+  name         TEXT NOT NULL,
+  origin       TEXT NOT NULL,
+  lamport      INTEGER NOT NULL,
+  nonce        INTEGER NOT NULL,
+  ttl_ms       INTEGER NOT NULL,
+  mode         TEXT NOT NULL CHECK (mode IN ('lease','sticky')),
+  owner        TEXT NOT NULL,
+  payload      BLOB NOT NULL,
+  supersedes   BLOB NOT NULL,
+  acquired_at  INTEGER NOT NULL,
+  lease_until  INTEGER,
+  PRIMARY KEY (space, name)
+);
+"#;
 
 /// v30 — a delegation may grant a space read-only (§3.5).
 ///
@@ -1210,6 +1240,25 @@ CREATE TABLE socket_activations (
 );
 CREATE INDEX socket_activations_by_program
   ON socket_activations (program_space, program_path);
+CREATE TABLE lock_clock (
+  id       INTEGER PRIMARY KEY CHECK (id = 0),
+  lamport  INTEGER NOT NULL
+);
+CREATE TABLE lock_holds (
+  space        TEXT NOT NULL,
+  name         TEXT NOT NULL,
+  origin       TEXT NOT NULL,
+  lamport      INTEGER NOT NULL,
+  nonce        INTEGER NOT NULL,
+  ttl_ms       INTEGER NOT NULL,
+  mode         TEXT NOT NULL CHECK (mode IN ('lease','sticky')),
+  owner        TEXT NOT NULL,
+  payload      BLOB NOT NULL,
+  supersedes   BLOB NOT NULL,
+  acquired_at  INTEGER NOT NULL,
+  lease_until  INTEGER,
+  PRIMARY KEY (space, name)
+);
 "#;
 
 /// v14 — a DNS binding's identity includes the domain that published it.

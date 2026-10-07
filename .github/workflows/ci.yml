@@ -277,6 +277,22 @@ jobs:
             echo "::error::RecoveryPartitioned.cfg found no fork; §3.4's admitted limitation no longer matches the model"
             exit 1
           fi
+      # Cluster locks under bounded latency: mutual exclusion must hold.
+      - name: Check lock mutual exclusion
+        run: |
+          for cfg in Locks LocksRetry; do
+            java -XX:+UseParallelGC -jar tla2tools.jar \
+              -config specs/$cfg.cfg -workers auto -deadlock specs/Locks.tla
+          done
+      # Under a partition the design accepts split brain (docs/LOCKS.md §2);
+      # the model must still show it, or it no longer describes the protocol.
+      - name: Confirm lock split brain is still reachable
+        run: |
+          if java -XX:+UseParallelGC -jar tla2tools.jar \
+            -config specs/LocksPartitioned.cfg -workers auto -deadlock specs/Locks.tla; then
+            echo "::error::LocksPartitioned.cfg found no split brain; docs/LOCKS.md §2 no longer matches the model"
+            exit 1
+          fi
 
   lean:
     name: lean (core proofs)

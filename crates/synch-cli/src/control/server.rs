@@ -850,12 +850,14 @@ impl Control for ControlService {
             .await?
         };
 
+        let fence = fence_of(&header.lock, &header.lock_token)?;
         let node = self.served.node()?.clone();
         // A write the daemon gives up on is one it keeps nothing of: the
         // staging file goes with the dropped `Adoption`, exactly as an
         // abandoned upload's does.
-        let answer = self
-            .answer_or_stopped(async move { receive(&node, incoming, adoption, &header).await });
+        let answer = self.answer_or_stopped(async move {
+            receive(&node, incoming, adoption, &header, fence).await
+        });
         Ok(Response::new(answer))
     }
 
@@ -980,7 +982,19 @@ impl Control for ControlService {
             reference.path.clone(),
         );
         let principal = principal(&reference.principal);
+        // A fenced completion holds the fence for the whole assembly and
+        // publish, so the hold cannot end under it (docs/LOCKS.md §7).
+        let fence = match fence_of(&request.lock, &request.lock_token)? {
+            Some((lock, token)) => Some(
+                node.locks()
+                    .fence(&lock, &token)
+                    .await
+                    .map_err(ControlError::from)?,
+            ),
+            None => None,
+        };
         let completing = tokio::spawn(async move {
+            let _fence = fence;
             node.complete_upload(&upload_id, &space, &path, principal.as_deref(), &named)
                 .await
         });
@@ -1014,6 +1028,194 @@ impl Control for ControlService {
     }
 
     type ListSpacesStream = Pin<Box<dyn Stream<Item = Result<pb::SpaceInfo, Status>> + Send>>;
+
+    type LockStream = Items<pb::LockEvent>;
+
+    async fn lock(
+        &self,
+        request: Request<pb::LockRequest>,
+    ) -> Result<Response<Self::LockStream>, Status> {
+        let request = request.into_inner();
+        let node = self.served.node()?.clone();
+        let lock = lock_name(&request.space, &request.name)?;
+        let mode = match pb::LockMode::try_from(request.mode) {
+            Ok(pb::LockMode::Session) => synch_engine::HoldMode::Session,
+            Ok(pb::LockMode::Lease) => synch_engine::HoldMode::Lease,
+            Ok(pb::LockMode::Sticky) => synch_engine::HoldMode::Sticky,
+            Err(_) => return Err(ControlError::invalid("an unknown lock mode").into()),
+        };
+        let ttl = match request.ttl_ms {
+            0 => synch_engine::locks::DEFAULT_LOCK_TTL,
+            ms => std::time::Duration::from_millis(ms),
+        };
+        let acquired = node
+            .locks()
+            .acquire(
+                &node,
+                synch_engine::LockRequest {
+                    lock: lock.clone(),
+                    ttl,
+                    wait: std::time::Duration::from_millis(request.wait_ms),
+                    owner: request.owner,
+                    payload: request.payload,
+                    mode,
+                    allow_behind: request.allow_behind,
+                },
+            )
+            .await
+            .map_err(ControlError::from)?;
+        let (tx, rx) = mpsc::channel(2);
+        let hold = pb::LockHold {
+            token: acquired.id.token(),
+            valid_for_ms: acquired.valid_for.as_millis() as u64,
+            waited_on: acquired.waited_on.iter().map(|key| key.to_z32()).collect(),
+            handoff: acquired
+                .handoff
+                .iter()
+                .map(|mark| format!("{}@{}", mark.origin, mark.seq))
+                .collect(),
+        };
+        let _ = tx
+            .send(Ok(pb::LockEvent {
+                kind: Some(pb::lock_event::Kind::Acquired(hold)),
+            }))
+            .await;
+        if mode == synch_engine::HoldMode::Session {
+            // A session hold lives exactly as long as the stream: the client
+            // going away, or the daemon stopping, releases it; a loss is told
+            // to the client and ends the stream.
+            let mut stopping = self.stop.subscribe();
+            let mut lost = acquired.lost.clone();
+            tokio::spawn(async move {
+                let lost: Option<String> = tokio::select! {
+                    _ = tx.closed() => None,
+                    _ = stopping.recv() => None,
+                    changed = lost.wait_for(Option::is_some) => Some(match changed {
+                        Ok(why) => why.as_ref().map(ToString::to_string).unwrap_or_default(),
+                        Err(_) => "the lock manager stopped".to_string(),
+                    }),
+                };
+                if let Some(reason) = lost {
+                    let _ = tx
+                        .send(Ok(pb::LockEvent {
+                            kind: Some(pb::lock_event::Kind::Lost(pb::LockLost { reason })),
+                        }))
+                        .await;
+                } else {
+                    if let Err(e) = node.locks().release(&node, &lock, Some(&acquired.id)).await {
+                        tracing::debug!(error = %e, "a session lock was already gone at release");
+                    }
+                }
+            });
+        }
+        Ok(Response::new(ReceiverStream::new(rx)))
+    }
+
+    async fn lock_renew(
+        &self,
+        request: Request<pb::LockRenewRequest>,
+    ) -> Result<Response<pb::LockHold>, Status> {
+        let request = request.into_inner();
+        let node = self.served.node()?.clone();
+        let lock = lock_name(&request.space, &request.name)?;
+        let token = parse_token(&request.token)?;
+        let valid = node
+            .locks()
+            .renew(
+                &lock,
+                &token,
+                request.ttl_ms.map(std::time::Duration::from_millis),
+                request.payload,
+            )
+            .await
+            .map_err(ControlError::from)?;
+        Ok(Response::new(pb::LockHold {
+            token: token.token(),
+            valid_for_ms: valid.as_millis() as u64,
+            waited_on: Vec::new(),
+            handoff: Vec::new(),
+        }))
+    }
+
+    async fn lock_release(
+        &self,
+        request: Request<pb::LockReleaseRequest>,
+    ) -> Result<Response<pb::LockReleased>, Status> {
+        let request = request.into_inner();
+        let node = self.served.node()?.clone();
+        let lock = lock_name(&request.space, &request.name)?;
+        let ended = if request.force {
+            let holder = match request.holder.as_str() {
+                "" => None,
+                text => Some(parse_origin(text)?),
+            };
+            node.locks()
+                .break_lock(&node, &lock, holder.as_ref())
+                .await
+                .map_err(ControlError::from)?
+        } else {
+            let token = match request.token.as_str() {
+                "" => None,
+                text => Some(parse_token(text)?),
+            };
+            vec![node
+                .locks()
+                .release(&node, &lock, token.as_ref())
+                .await
+                .map_err(ControlError::from)?]
+        };
+        Ok(Response::new(pb::LockReleased {
+            tokens: ended.iter().map(synch_core::ClaimId::token).collect(),
+        }))
+    }
+
+    async fn lock_status(
+        &self,
+        request: Request<pb::LockStatusRequest>,
+    ) -> Result<Response<pb::LockStatusResponse>, Status> {
+        let request = request.into_inner();
+        let node = self.served.node()?.clone();
+        if request.name.is_empty() {
+            let space = Some(request.space.as_str()).filter(|s| !s.is_empty());
+            return Ok(Response::new(pb::LockStatusResponse {
+                claims: node.locks().list(space).iter().map(lock_claim).collect(),
+                peers: Vec::new(),
+                watermarks: Vec::new(),
+            }));
+        }
+        let lock = lock_name(&request.space, &request.name)?;
+        let status = node
+            .locks()
+            .status(&node, &lock, request.peers)
+            .await
+            .map_err(ControlError::from)?;
+        Ok(Response::new(pb::LockStatusResponse {
+            claims: status.views.iter().map(lock_claim).collect(),
+            peers: status
+                .peers
+                .iter()
+                .map(|peer| pb::PeerLocks {
+                    peer: peer.peer.to_z32(),
+                    error: peer.answer.as_ref().err().cloned().unwrap_or_default(),
+                    claims: peer
+                        .answer
+                        .as_ref()
+                        .map(|reports| {
+                            reports
+                                .iter()
+                                .map(|report| reported_claim(&lock, report))
+                                .collect()
+                        })
+                        .unwrap_or_default(),
+                })
+                .collect(),
+            watermarks: status
+                .watermarks
+                .iter()
+                .map(|mark| format!("{}@{}", mark.origin, mark.seq))
+                .collect(),
+        }))
+    }
 
     async fn list_spaces(
         &self,
@@ -3755,6 +3957,7 @@ async fn receive(
     incoming: Streaming<pb::PutRequest>,
     adoption: synch_engine::Adoption,
     header: &pb::PutHeader,
+    fence: Option<(synch_core::LockName, synch_core::ClaimId)>,
 ) -> Result<pb::Written, ControlError> {
     let adoption = drain(incoming, adoption, |request| match request.part {
         Some(PutPart::Chunk(bytes)) => Some(Piece::Chunk(bytes)),
@@ -3764,6 +3967,14 @@ async fn receive(
         None => None,
     })
     .await?;
+    // A fenced write takes the fence once its bytes are in and holds it
+    // through the commit and the publish: a hold that ended while the body
+    // streamed refuses the write, and none can end under it from here
+    // (docs/LOCKS.md §7).
+    let _fence = match fence {
+        Some((lock, token)) => Some(node.locks().fence(&lock, &token).await?),
+        None => None,
+    };
     // The commit fsyncs the payload and renames it into place — and re-takes
     // the gates first, since the write carries them (`Adoption`). The body
     // streams here for as long as the client cares to take, and an inbound
@@ -4160,6 +4371,85 @@ async fn refresh_domains(
         ));
     }
     Ok(())
+}
+
+fn lock_name(space: &str, name: &str) -> Result<synch_core::LockName, ControlError> {
+    synch_core::LockName::new(space, name).map_err(|e| ControlError::invalid(e.to_string()))
+}
+
+fn parse_token(text: &str) -> Result<synch_core::ClaimId, ControlError> {
+    synch_core::ClaimId::parse_token(text)
+        .ok_or_else(|| ControlError::invalid(format!("{text:?} is not a lock token")))
+}
+
+/// The fence a write names, or `None` for an unfenced one (docs/LOCKS.md §7).
+fn fence_of(
+    lock: &str,
+    token: &str,
+) -> Result<Option<(synch_core::LockName, synch_core::ClaimId)>, ControlError> {
+    match (lock, token) {
+        ("", "") => Ok(None),
+        ("", _) | (_, "") => Err(ControlError::invalid(
+            "a fenced write names both a lock and its token",
+        )),
+        (lock, token) => Ok(Some((
+            synch_core::LockName::parse(lock).map_err(|e| ControlError::invalid(e.to_string()))?,
+            parse_token(token)?,
+        ))),
+    }
+}
+
+fn claim_state(state: synch_core::ClaimState) -> &'static str {
+    match state {
+        synch_core::ClaimState::Held => "held",
+        synch_core::ClaimState::Live => "live",
+        synch_core::ClaimState::Expired => "expired",
+    }
+}
+
+fn lock_claim(view: &synch_engine::LockView) -> pb::LockClaim {
+    pb::LockClaim {
+        space: view.lock.space.clone(),
+        name: view.lock.name.clone(),
+        token: view.claim.id.token(),
+        origin: view.claim.id.ticket.origin.to_string(),
+        owner: view.claim.owner.clone(),
+        state: if view.contending {
+            "contending"
+        } else {
+            claim_state(view.state)
+        }
+        .to_string(),
+        mode: view
+            .mode
+            .map(|m| m.as_str().to_string())
+            .unwrap_or_default(),
+        remaining_ms: view.remaining.as_millis() as u64,
+        payload: view.claim.payload.clone(),
+        ttl_ms: view.claim.ttl_ms,
+        supersedes: view.claim.supersedes.iter().map(|id| id.token()).collect(),
+    }
+}
+
+fn reported_claim(lock: &synch_core::LockName, report: &synch_core::Report) -> pb::LockClaim {
+    pb::LockClaim {
+        space: lock.space.clone(),
+        name: lock.name.clone(),
+        token: report.claim.id.token(),
+        origin: report.claim.id.ticket.origin.to_string(),
+        owner: report.claim.owner.clone(),
+        state: claim_state(report.state).to_string(),
+        mode: String::new(),
+        remaining_ms: u64::from(report.remaining_ms),
+        payload: report.claim.payload.clone(),
+        ttl_ms: report.claim.ttl_ms,
+        supersedes: report
+            .claim
+            .supersedes
+            .iter()
+            .map(|id| id.token())
+            .collect(),
+    }
 }
 
 fn parse_key(text: &str) -> Result<NodeId, ControlError> {

@@ -1853,6 +1853,8 @@ mod tests {
                 .conn()
                 .execute_batch(
                     "ALTER TABLE bindings DROP COLUMN read_only;
+                     DROP TABLE lock_clock;
+                     DROP TABLE lock_holds;
                      UPDATE config SET value = '29' WHERE key = 'schema_version';",
                 )
                 .unwrap();

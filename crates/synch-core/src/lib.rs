@@ -10,6 +10,7 @@ pub mod git;
 pub mod hash;
 pub mod head;
 pub mod json;
+pub mod lock;
 pub mod origin;
 pub mod path;
 pub mod record;
@@ -20,6 +21,12 @@ pub use blocking::{assert_off_runtime, blocking_is_allowed, offload, BlockingSco
 pub use git::{GitClass, GitPath};
 pub use hash::{group_cv, hash_reader, join_cvs, join_root, Cv, Hash};
 pub use head::{head_signing_input, HeadSummary, SignedHead};
+pub use lock::{
+    Claim, ClaimId, ClaimState, EndReason, LockMessage, LockName, LockNameError, Report, Ticket,
+    Watermark, ALPN_LOCK, MAX_LOCK_ENDED, MAX_LOCK_NAME_BYTES, MAX_LOCK_OWNER_BYTES,
+    MAX_LOCK_PAYLOAD_BYTES, MAX_LOCK_REPORTS, MAX_LOCK_SUPERSEDES, MAX_LOCK_TTL_MS,
+    MAX_LOCK_WATERMARKS, MIN_LOCK_TTL_MS,
+};
 pub use origin::{NodeId, OriginId};
 pub use path::{normalize_native_path, normalize_path, MAX_KEY_LEN};
 pub use record::{

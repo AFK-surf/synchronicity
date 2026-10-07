@@ -20,6 +20,7 @@ mod gitdir;
 pub mod ignore;
 mod join;
 pub mod lifecycle;
+pub mod locks;
 pub mod membership;
 pub mod node;
 pub mod publisher;
@@ -42,9 +43,10 @@ pub use compare::{CompareChange, CompareReport, CompareStatus};
 pub use config::{
     default_data_dir, NodeConfig, DEFAULT_REPLICA_CONCURRENCY, MAX_REPLICA_CONCURRENCY,
 };
-pub use error::{EngineError, Result};
+pub use error::{EngineError, LockFailure, Result};
 pub use fetcher::{PeerReader, PreparedRange, Provider, TransientRead};
 pub use lifecycle::{LifecycleLock, LIFECYCLE_FILE};
+pub use locks::{Acquired, HoldMode, LockManager, LockRequest, LockStatus, LockView, PeerView};
 pub use membership::{DomainHealth, DomainRefresh, ResolverStatus};
 pub use node::{Node, StagedChange};
 pub use publisher::Publisher;
