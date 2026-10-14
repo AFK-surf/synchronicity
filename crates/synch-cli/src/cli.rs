@@ -55,6 +55,19 @@ pub struct Cli {
     )]
     pub replica_concurrency: usize,
 
+    /// How long old roots are kept, and with them content that no current
+    /// entry names and nothing read since (§5.4; 7 days when unset). A node
+    /// that serves no laggard peers and no history can keep less, so its disk
+    /// holds little more than what its entries name.
+    #[arg(
+        long,
+        global = true,
+        env = "SYNCH_ROOT_RETENTION",
+        value_name = "DUR",
+        value_parser = parse_duration
+    )]
+    pub root_retention: Option<std::time::Duration>,
+
     /// S3 bucket (also used by compatible endpoints such as MinIO).
     #[arg(long, global = true, env = "SYNCH_S3_BUCKET")]
     pub s3_bucket: Option<String>,
