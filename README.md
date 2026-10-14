@@ -217,6 +217,10 @@ on Unix, omitting it targets at least 20% free space.
 Replica convergence fetches 16 distinct CAS objects concurrently by default;
 set `SYNCH_REPLICA_CONCURRENCY` or `--replica-concurrency` to tune it from 1 to
 256.
+Old roots, and content that no current entry names and nothing has read since,
+are kept for 7 days. A node that serves no laggard peers and no history, such
+as a build cache, can set `SYNCH_ROOT_RETENTION` or `--root-retention` (for
+example `6h`) to keep less.
 
 For production deployment:
 

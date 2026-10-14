@@ -36,6 +36,9 @@ pub fn data_dir(cli: &Cli) -> Result<PathBuf> {
 pub(crate) fn node_config(cli: &Cli) -> Result<NodeConfig> {
     let mut config = NodeConfig::new(data_dir(cli)?);
     config.replica_concurrency = cli.replica_concurrency;
+    if let Some(retention) = cli.root_retention {
+        config.root_retention = retention;
+    }
     config.net.offline = cli.offline;
     if let Some(bind) = &cli.bind {
         config.net.bind_addr = Some(bind.parse().context("--bind wants HOST:PORT")?);
@@ -1273,6 +1276,20 @@ mod tests {
     fn replica_concurrency_reaches_the_node_config() {
         let cli = Cli::parse_from(["synch", "--replica-concurrency", "23", "daemon", "run"]);
         assert_eq!(node_config(&cli).unwrap().replica_concurrency, 23);
+    }
+
+    #[test]
+    fn root_retention_reaches_the_node_config() {
+        let default = node_config(&Cli::parse_from(["synch", "daemon", "run"])).unwrap();
+        assert_eq!(
+            default.root_retention,
+            std::time::Duration::from_secs(7 * 24 * 3600)
+        );
+        let cli = Cli::parse_from(["synch", "--root-retention", "6h", "daemon", "run"]);
+        assert_eq!(
+            node_config(&cli).unwrap().root_retention,
+            std::time::Duration::from_secs(6 * 3600)
+        );
     }
 
     #[test]
