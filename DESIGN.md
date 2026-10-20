@@ -280,7 +280,8 @@ A remote node is **trusted** iff at least one of the following holds:
 
    The lookup MUST be DNSSEC-validated end to end, and it travels one
    transport: DNS-over-HTTP(S), RFC 8484, against `--doh <url>` (`SYNCH_DOH`,
-   default `https://1.1.1.1/dns-query`). There is no UDP path and no system
+   default `https://1.1.1.1/dns-query`, then `https://one.one.one.one/dns-query`
+   when the first is unreachable). There is no UDP path and no system
    stub resolver in the loop — hickory is used purely as the in-process
    DNSSEC validation engine over that transport (we never trust an upstream
    resolver's AD bit). If the chain of trust does not validate — missing

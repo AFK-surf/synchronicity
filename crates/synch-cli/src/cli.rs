@@ -151,7 +151,8 @@ pub struct Cli {
     pub direct_tcp: bool,
 
     /// The DNS-over-HTTP(S) endpoint membership TXT records resolve
-    /// through; defaults to https://1.1.1.1/dns-query. http:// is accepted —
+    /// through; defaults to https://1.1.1.1/dns-query, then
+    /// https://one.one.one.one/dns-query when that is unreachable. http:// is accepted —
     /// answers are DNSSEC-validated in process either way.
     #[arg(long, global = true, env = "SYNCH_DOH", value_name = "URL")]
     pub doh: Option<String>,

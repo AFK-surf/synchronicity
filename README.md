@@ -334,7 +334,8 @@ keep their own expiry, and the member set shrinks toward static-only rather
 than falling open.
 
 Resolution travels DNS-over-HTTP(S) only — `https://1.1.1.1/dns-query` by
-default, or any endpoint named with `synch daemon run --doh <url>`
+default, falling back to `https://one.one.one.one/dns-query` where the address
+is blocked but the name gets through, or any endpoint named with `synch daemon run --doh <url>`
 (`SYNCH_DOH`). Plain `http://` endpoints are accepted for internal networks:
 answers are DNSSEC-validated in process either way, so the transport carries
 nothing trusted. For an internal zone signed by its own root,
