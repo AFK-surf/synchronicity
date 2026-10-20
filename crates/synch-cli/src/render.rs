@@ -336,7 +336,7 @@ pub(crate) fn trust_summary(status: &ResolverStatus) -> String {
                     RekorPolicy::Require => "rekor require".to_string(),
                     RekorPolicy::Off => "rekor OFF".to_string(),
                 },
-                format!("doh {}", config.doh_url),
+                format!("doh {}", config.doh_urls.join(" then ")),
             ];
             parts.push(match &config.dnssec_anchor {
                 None => "anchor icann-root".into(),

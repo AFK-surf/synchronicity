@@ -83,8 +83,18 @@ pub const CONTROL_PLANE_REPUBLISH_WINDOW: Duration = Duration::from_secs(
 /// revocation mechanism (§3.4 is).
 pub const DEFAULT_TRUST_GRACE: Duration = Duration::from_secs(15 * 60);
 
-/// The DoH endpoint used when none is configured.
-pub const DEFAULT_DOH_URL: &str = "https://1.1.1.1/dns-query";
+/// The DoH endpoints used when none is configured, tried in order.
+///
+/// The same resolver twice, by address and by name, because networks that
+/// block one often pass the other: some refuse traffic to `1.1.1.1` itself,
+/// and the proxies some users in China rely on route by domain name, so only
+/// the hostname reaches them. The transport is untrusted either way — every
+/// answer is validated in process — so a second road out costs nothing in
+/// what is accepted.
+pub const DEFAULT_DOH_URLS: &[&str] = &[
+    "https://1.1.1.1/dns-query",
+    "https://one.one.one.one/dns-query",
+];
 
 /// The query name for a membership domain.
 pub(crate) fn query_name(domain: &str) -> String {
@@ -827,7 +837,7 @@ pub struct DnssecTxt {
 
 /// How the resolver reaches the DNS and whom it ultimately trusts (§3.2).
 ///
-/// The defaults — the public endpoint at [`DEFAULT_DOH_URL`], the ICANN root
+/// The defaults — the public endpoints at [`DEFAULT_DOH_URLS`], the ICANN root
 /// trust anchor — are what production wants; both knobs exist for the
 /// environments where they are wrong: an internal DoH endpoint (http or
 /// https) for closed networks, and an internal test zone signed by its own
@@ -836,7 +846,7 @@ pub struct DnssecTxt {
 /// the endpoint is a transport, never a validator we defer to.
 #[derive(Debug, Clone, Default)]
 pub struct ResolverOptions {
-    /// The DNS-over-HTTP(S) endpoint, [`DEFAULT_DOH_URL`] when unset:
+    /// The DNS-over-HTTP(S) endpoint, [`DEFAULT_DOH_URLS`] when unset:
     /// `https://` or `http://`, then `host[:port][/path]` (path defaults to
     /// `/dns-query`). A plaintext endpoint is acceptable because the
     /// transport carries nothing trusted — every answer is DNSSEC-validated
@@ -945,8 +955,14 @@ impl DnssecResolver {
                 std::sync::Arc::new(anchors)
             }
         };
-        let url = doh_url(options.doh_url.as_deref().unwrap_or(DEFAULT_DOH_URL))?;
-        let handle = DohHandle::new(url)?;
+        let urls = match &options.doh_url {
+            Some(url) => vec![doh_url(url)?],
+            None => DEFAULT_DOH_URLS
+                .iter()
+                .map(|url| doh_url(url))
+                .collect::<Result<_, _>>()?,
+        };
+        let handle = DohHandle::new(urls)?;
         // §10.2's pin resolution order, decided once: key file (static
         // universe) ▸ persisted TUF-accepted set ▸ embedded bootstrap.
         let pins = match &options.rekor_key {
@@ -1799,14 +1815,25 @@ const MAX_DOH_RESPONSE: usize = 64 * 1024;
 /// DNSSEC validation. The endpoint hostname resolves through the operating
 /// system once per connection — name-to-address plumbing for the endpoint
 /// itself, not part of the membership trust path.
+///
+/// More than one endpoint is a fallback list: an exchange that fails to reach
+/// one is retried on the next, and the endpoint that last answered is asked
+/// first, so a network that blocks the first pays its timeout once rather than
+/// on every lookup. A response that arrives is never retried elsewhere —
+/// whether it validates is the validator's question, not the transport's.
 #[derive(Clone)]
 struct DohHandle {
     client: reqwest::Client,
-    url: reqwest::Url,
+    urls: std::sync::Arc<[reqwest::Url]>,
+    /// The index into `urls` of the endpoint that last answered.
+    preferred: std::sync::Arc<std::sync::atomic::AtomicUsize>,
 }
 
 impl DohHandle {
-    fn new(url: reqwest::Url) -> Result<Self, NetError> {
+    fn new(urls: Vec<reqwest::Url>) -> Result<Self, NetError> {
+        if urls.is_empty() {
+            return Err(NetError::Dns("no DoH endpoint".into()));
+        }
         // Environment proxies are honored, as reqwest does by default: on
         // networks where a proxy is the only road out, refusing it strands
         // exactly the deployments DoH exists for.
@@ -1814,24 +1841,50 @@ impl DohHandle {
             .timeout(DOH_TIMEOUT)
             .build()
             .map_err(|e| NetError::Dns(format!("DoH client: {e}")))?;
-        Ok(DohHandle { client, url })
+        Ok(DohHandle {
+            client,
+            urls: urls.into(),
+            preferred: Default::default(),
+        })
     }
 
-    /// POSTs one wire-format query, returning the wire-format answer.
+    /// Sends one wire-format query to the endpoints in turn, starting with the
+    /// one that last answered, and returns the first wire-format answer.
     async fn exchange(&self, body: Vec<u8>) -> Result<Vec<u8>, std::io::Error> {
+        use std::sync::atomic::Ordering;
+        let first = self.preferred.load(Ordering::Relaxed) % self.urls.len();
+        let mut errors = Vec::new();
+        for offset in 0..self.urls.len() {
+            let index = (first + offset) % self.urls.len();
+            match self.exchange_with(&self.urls[index], body.clone()).await {
+                Ok(answer) => {
+                    self.preferred.store(index, Ordering::Relaxed);
+                    return Ok(answer);
+                }
+                Err(error) => errors.push(error.to_string()),
+            }
+        }
+        Err(std::io::Error::other(errors.join("; ")))
+    }
+
+    /// POSTs one wire-format query to `url`, returning the wire-format answer.
+    async fn exchange_with(
+        &self,
+        url: &reqwest::Url,
+        body: Vec<u8>,
+    ) -> Result<Vec<u8>, std::io::Error> {
         let response = self
             .client
-            .post(self.url.clone())
+            .post(url.clone())
             .header("content-type", "application/dns-message")
             .header("accept", "application/dns-message")
             .body(body)
             .send()
             .await
-            .map_err(|e| std::io::Error::other(format!("{}: {e}", self.url)))?;
+            .map_err(|e| std::io::Error::other(format!("{url}: {e}")))?;
         if !response.status().is_success() {
             return Err(std::io::Error::other(format!(
-                "{} answered {}",
-                self.url,
+                "{url} answered {}",
                 response.status()
             )));
         }
@@ -1843,8 +1896,7 @@ impl DohHandle {
             .is_some_and(|n| n > MAX_DOH_RESPONSE as u64)
         {
             return Err(std::io::Error::other(format!(
-                "{}: response exceeds the {MAX_DOH_RESPONSE}-byte DoH ceiling",
-                self.url
+                "{url}: response exceeds the {MAX_DOH_RESPONSE}-byte DoH ceiling"
             )));
         }
         let mut response = response;
@@ -1852,12 +1904,11 @@ impl DohHandle {
         while let Some(chunk) = response
             .chunk()
             .await
-            .map_err(|e| std::io::Error::other(format!("{}: {e}", self.url)))?
+            .map_err(|e| std::io::Error::other(format!("{url}: {e}")))?
         {
             if bytes.len() + chunk.len() > MAX_DOH_RESPONSE {
                 return Err(std::io::Error::other(format!(
-                    "{}: response exceeds the {MAX_DOH_RESPONSE}-byte DoH ceiling",
-                    self.url
+                    "{url}: response exceeds the {MAX_DOH_RESPONSE}-byte DoH ceiling"
                 )));
             }
             bytes.extend_from_slice(&chunk);
@@ -2225,6 +2276,99 @@ mod tests {
         let err = doh_url("ftp://1.1.1.1/dns-query").unwrap_err();
         assert!(err.to_string().contains("https:// or http://"), "{err}");
         assert!(doh_url("not a url").is_err());
+    }
+
+    /// A one-endpoint HTTP server answering every request with `body`, and
+    /// the number of requests it has answered.
+    async fn answering(
+        body: &'static [u8],
+    ) -> (reqwest::Url, std::sync::Arc<std::sync::atomic::AtomicUsize>) {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = doh_url(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        let served = std::sync::Arc::new(std::sync::atomic::AtomicUsize::new(0));
+        let count = served.clone();
+        tokio::spawn(async move {
+            loop {
+                let (mut stream, _) = listener.accept().await.unwrap();
+                let count = count.clone();
+                tokio::spawn(async move {
+                    // Read the head and the body its Content-Length declares.
+                    let mut request = Vec::new();
+                    let mut buf = [0u8; 1024];
+                    loop {
+                        let n = stream.read(&mut buf).await.unwrap();
+                        request.extend_from_slice(&buf[..n]);
+                        let text = String::from_utf8_lossy(&request);
+                        if let Some(end) = text.find("\r\n\r\n") {
+                            let length = text[..end]
+                                .lines()
+                                .find_map(|line| {
+                                    line.to_ascii_lowercase()
+                                        .strip_prefix("content-length:")
+                                        .map(|v| v.trim().parse::<usize>().unwrap())
+                                })
+                                .unwrap_or(0);
+                            if request.len() >= end + 4 + length {
+                                break;
+                            }
+                        }
+                    }
+                    count.fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+                    let head = format!(
+                        "HTTP/1.1 200 OK\r\ncontent-type: application/dns-message\r\n\
+                         content-length: {}\r\nconnection: close\r\n\r\n",
+                        body.len()
+                    );
+                    stream.write_all(head.as_bytes()).await.unwrap();
+                    stream.write_all(body).await.unwrap();
+                });
+            }
+        });
+        (url, served)
+    }
+
+    /// An endpoint that drops every connection before answering. It stays
+    /// bound for the test's life, so no other server can take its port.
+    async fn unreachable() -> reqwest::Url {
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let url = doh_url(&format!("http://{}", listener.local_addr().unwrap())).unwrap();
+        tokio::spawn(async move {
+            loop {
+                drop(listener.accept().await.unwrap());
+            }
+        });
+        url
+    }
+
+    #[tokio::test]
+    async fn an_unreachable_doh_endpoint_falls_back_to_the_next_and_stays_there() {
+        let dead = unreachable().await;
+        let (live, served) = answering(b"answer").await;
+        let handle = DohHandle::new(vec![dead, live]).unwrap();
+
+        assert_eq!(handle.exchange(b"q".to_vec()).await.unwrap(), b"answer");
+        assert_eq!(
+            handle.preferred.load(std::sync::atomic::Ordering::SeqCst),
+            1
+        );
+        // The next lookup goes straight to the endpoint that answered.
+        assert_eq!(handle.exchange(b"q".to_vec()).await.unwrap(), b"answer");
+        assert_eq!(served.load(std::sync::atomic::Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn every_doh_endpoint_failing_names_each_one() {
+        let first = unreachable().await;
+        let second = unreachable().await;
+        let handle = DohHandle::new(vec![first.clone(), second.clone()]).unwrap();
+        let error = handle
+            .exchange(b"q".to_vec())
+            .await
+            .unwrap_err()
+            .to_string();
+        assert!(error.contains(first.as_str()), "{error}");
+        assert!(error.contains(second.as_str()), "{error}");
     }
 
     #[test]

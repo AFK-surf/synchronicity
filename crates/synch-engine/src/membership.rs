@@ -4,7 +4,7 @@ use std::{net::SocketAddr, time::Duration};
 
 use synch_core::{clock_is_trusted, now_ns, NodeId, OriginId};
 use synch_net::dns::{
-    clamp_ttl, DialHint, MemberResolver, MemberSet, RekorPolicy, ResolverOptions, DEFAULT_DOH_URL,
+    clamp_ttl, DialHint, MemberResolver, MemberSet, RekorPolicy, ResolverOptions, DEFAULT_DOH_URLS,
     DEFAULT_TRUST_GRACE, MIN_TTL,
 };
 use synch_store::{Binding, BindingSource, ClockStatus, Equivocation};
@@ -152,8 +152,8 @@ pub struct TrustConfig {
     /// Whether a validated answer additionally requires a verified
     /// transparency-log record for the zone key that signed it.
     pub rekor: RekorPolicy,
-    /// The DNS-over-HTTP(S) endpoint in force.
-    pub doh_url: String,
+    /// The DNS-over-HTTP(S) endpoints in force, in the order they are tried.
+    pub doh_urls: Vec<String>,
     /// Set when `--dnssec-anchor` *replaced* the ICANN root: with it, nothing
     /// signed under the real root validates.
     pub dnssec_anchor: Option<String>,
@@ -196,10 +196,10 @@ impl TrustConfig {
     pub fn of(options: &ResolverOptions, log_keys: &synch_net::rekor::LogKeys) -> TrustConfig {
         TrustConfig {
             rekor: options.rekor_policy(),
-            doh_url: options
-                .doh_url
-                .clone()
-                .unwrap_or_else(|| DEFAULT_DOH_URL.to_string()),
+            doh_urls: match &options.doh_url {
+                Some(url) => vec![url.clone()],
+                None => DEFAULT_DOH_URLS.iter().map(|url| url.to_string()).collect(),
+            },
             dnssec_anchor: options
                 .trust_anchor
                 .as_ref()
