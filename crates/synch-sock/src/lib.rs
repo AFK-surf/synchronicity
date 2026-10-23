@@ -31,6 +31,8 @@
 #![deny(missing_docs)]
 
 pub mod abi;
+#[cfg(feature = "compile-hold")]
+pub mod compile_hold;
 pub mod limits;
 pub mod manifest;
 pub mod policy;
