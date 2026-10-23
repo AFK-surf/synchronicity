@@ -387,6 +387,24 @@ impl Client {
         Ok(out)
     }
 
+    /// This node's home relays and whether each is connected now.
+    pub async fn relay_status(&mut self) -> Result<Vec<synch_net::HomeRelay>, ControlError> {
+        let relays = self
+            .inner
+            .relay_status(pb::RelayStatusRequest {})
+            .await?
+            .into_inner()
+            .relays;
+        Ok(relays
+            .into_iter()
+            .map(|relay| synch_net::HomeRelay {
+                url: relay.url,
+                connected: relay.connected,
+                last_error: relay.last_error,
+            })
+            .collect())
+    }
+
     /// Every known namespace and local role, as structured data rather than
     /// the lines bare `synch ls` prints (§9.4).
     pub async fn list_spaces(&mut self) -> Result<Vec<SpaceInfo>, ControlError> {

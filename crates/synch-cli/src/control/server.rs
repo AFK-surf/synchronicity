@@ -1349,6 +1349,25 @@ impl Control for ControlService {
         Ok(Response::new(Box::pin(stream)))
     }
 
+    async fn relay_status(
+        &self,
+        _request: Request<pb::RelayStatusRequest>,
+    ) -> Result<Response<pb::RelayStatusResponse>, Status> {
+        let relays = self
+            .served
+            .node()?
+            .net()
+            .home_relays()
+            .into_iter()
+            .map(|relay| pb::HomeRelay {
+                url: relay.url,
+                connected: relay.connected,
+                last_error: relay.last_error,
+            })
+            .collect();
+        Ok(Response::new(pb::RelayStatusResponse { relays }))
+    }
+
     async fn get_config(
         &self,
         request: Request<pb::GetConfigRequest>,
@@ -2164,6 +2183,11 @@ async fn dispatch(node: &Node, command: Command, out: &mut Frames) -> Done {
             out.line(format!(
                 "address: {}",
                 render::addr(&node.net().direct_addr())
+            ))
+            .await?;
+            out.line(format!(
+                "relays: {}",
+                render::relays(&node.net().home_relays())
             ))
             .await?;
             let spaces = read(node, |n| Ok(n.store().known_spaces()?)).await?;

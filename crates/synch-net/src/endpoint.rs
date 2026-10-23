@@ -309,6 +309,17 @@ impl crate::HeadSink for RefuseHeads {
     }
 }
 
+/// One home relay of an endpoint, as [`Net::home_relays`] reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct HomeRelay {
+    /// The relay's URL.
+    pub url: String,
+    /// Whether the endpoint is connected to it now.
+    pub connected: bool,
+    /// The most recent connection error while it is disconnected.
+    pub last_error: Option<String>,
+}
+
 /// A bound endpoint serving both ALPNs.
 #[derive(Debug, Clone)]
 pub struct Net {
@@ -549,6 +560,26 @@ impl Net {
         } else {
             addr
         }
+    }
+
+    /// This endpoint's home relays and whether each is connected now.
+    ///
+    /// Empty while relays are disabled or before the endpoint has picked one.
+    /// A node whose relays all stay disconnected can still reach peers on its
+    /// own network, but nothing behind a NAT: what a client needs to tell its
+    /// user to check the network rather than wait.
+    pub fn home_relays(&self) -> Vec<HomeRelay> {
+        use iroh::Watcher as _;
+        self.endpoint()
+            .home_relay_status()
+            .get()
+            .into_iter()
+            .map(|status| HomeRelay {
+                url: status.url().to_string(),
+                connected: status.is_connected(),
+                last_error: status.last_error().map(|error| error.to_string()),
+            })
+            .collect()
     }
 
     /// Connects to a peer on the metadata ALPN, reusing a live session.

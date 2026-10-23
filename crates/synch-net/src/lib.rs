@@ -41,7 +41,7 @@ pub use dns::{
     ControlPlaneRecord, DialHint, DnssecResolver, MemberResolver, MemberSet, RekorPolicy,
     ResolverOptions,
 };
-pub use endpoint::{Net, NetOptions};
+pub use endpoint::{HomeRelay, Net, NetOptions};
 pub use error::{NetError, Result};
 pub use lock::{LockClient, LockService};
 pub use mpt::{HeadSink, MptClient};
