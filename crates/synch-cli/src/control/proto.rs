@@ -67,7 +67,9 @@ pub use pb::{
 /// v7 adds cluster locks (`docs/LOCKS.md` §9.3) and fenced writes: a v6
 /// daemon would ignore a write's fence and commit it unconditionally, which
 /// is the one outcome a fence exists to prevent.
-pub const CONTROL_VERSION: u32 = 7;
+///
+/// v8 adds `RelayStatus`, a call addition, for the reason v2 gives.
+pub const CONTROL_VERSION: u32 = 8;
 
 /// How many payload bytes one chunk carries.
 ///

@@ -2598,6 +2598,19 @@ async fn a_daemon_starts_and_stops_with_a_peer_that_answers_nothing() {
     silent.close().await;
 }
 
+/// A node without relays says so, as data and on the status page, rather
+/// than leaving a client to infer it from peers that never answer.
+#[tokio::test]
+async fn relay_status_reports_a_node_without_relays() {
+    let dir = tempfile::tempdir().unwrap();
+    let daemon = Daemon::start(dir.path()).await;
+    let mut client = Client::connect(dir.path()).await.unwrap();
+    assert_eq!(client.relay_status().await.unwrap(), Vec::new());
+    let status = lines(dir.path(), daemon_status()).await;
+    assert!(status.contains("relays: none"), "{status}");
+    daemon.shutdown().await;
+}
+
 /// Every trust knob is settable by environment variable, invisible on the
 /// command line: `daemon status` and `doctor` are what distinguish a
 /// `require` daemon from a `--rekor off` one.

@@ -71,6 +71,13 @@ service Control {
   // column rather than to the data.
   rpc ListSpaces(ListSpacesRequest) returns (stream SpaceInfo);
 
+  // This node's home relays and whether each is connected now.
+  //
+  // `daemon status` prints the same for a person. A desktop client reads it to
+  // tell its user that the network cannot reach the relays — and so nothing
+  // behind a NAT — instead of leaving them waiting on peers that never answer.
+  rpc RelayStatus(RelayStatusRequest) returns (RelayStatusResponse);
+
   // Reads a config value from the `s3.*` namespace.
   rpc GetConfig(GetConfigRequest) returns (GetConfigResponse);
 
@@ -698,6 +705,22 @@ message SpaceInfo {
   optional string source_kind = 8;
   optional string checkout_path = 9;
   optional bool source_paused = 10;
+}
+
+message RelayStatusRequest {}
+
+message RelayStatusResponse {
+  // One per home relay whose URL is known; empty while relays are disabled or
+  // before the endpoint has picked one.
+  repeated HomeRelay relays = 1;
+}
+
+// One home relay of this node.
+message HomeRelay {
+  string url = 1;
+  bool connected = 2;
+  // The most recent connection error while it is disconnected.
+  optional string last_error = 3;
 }
 
 message GetConfigRequest {

@@ -28,6 +28,23 @@ pub fn addr(addr: &iroh::EndpointAddr) -> String {
     }
 }
 
+/// Renders a node's home relays and whether each is connected, as
+/// `daemon status` prints them.
+pub fn relays(relays: &[synch_net::HomeRelay]) -> String {
+    if relays.is_empty() {
+        return "none".into();
+    }
+    relays
+        .iter()
+        .map(|relay| match (relay.connected, &relay.last_error) {
+            (true, _) => format!("{} connected", relay.url),
+            (false, Some(error)) => format!("{} DISCONNECTED: {error}", relay.url),
+            (false, None) => format!("{} not connected", relay.url),
+        })
+        .collect::<Vec<_>>()
+        .join(", ")
+}
+
 /// The name of an entry kind, as `ls` and `status` print it.
 pub fn kind_name(kind: synch_core::EntryKind) -> &'static str {
     match kind {
@@ -802,6 +819,25 @@ fn json_string(value: &str) -> String {
 
 #[cfg(test)]
 mod tests {
+    #[test]
+    fn relays_name_each_relay_and_why_a_disconnected_one_is_down() {
+        let relay = |url: &str, connected, last_error: Option<&str>| synch_net::HomeRelay {
+            url: url.into(),
+            connected,
+            last_error: last_error.map(str::to_string),
+        };
+        assert_eq!(super::relays(&[]), "none");
+        assert_eq!(
+            super::relays(&[
+                relay("https://a.relay./", true, None),
+                relay("https://b.relay./", false, Some("tls handshake eof")),
+                relay("https://c.relay./", false, None),
+            ]),
+            "https://a.relay./ connected, https://b.relay./ DISCONNECTED: tls handshake eof, \
+             https://c.relay./ not connected"
+        );
+    }
+
     use super::*;
     use synch_core::{Hash, OriginId};
     use synch_engine::{CompareChange, CompareStatus};
