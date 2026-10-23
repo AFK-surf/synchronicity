@@ -803,6 +803,8 @@ impl ProgramCompiler {
 
         let elf = Arc::clone(elf);
         let unbound = tokio::task::spawn_blocking(move || {
+            #[cfg(feature = "compile-hold")]
+            crate::compile_hold::checkpoint();
             loader
                 .load(&mut rand::thread_rng(), &elf)
                 .map_err(|e| SockError::Load(e.to_string()))

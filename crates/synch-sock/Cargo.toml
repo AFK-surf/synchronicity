@@ -11,6 +11,13 @@ authors.workspace = true
 [lints]
 workspace = true
 
+[features]
+# Holds program loads in flight until a test releases them
+# (`crate::compile_hold`), so a probe of what a compile does to the worker
+# does not depend on how fast the machine compiles. Test machinery, enabled
+# below as a dev-dependency on this same crate.
+compile-hold = []
+
 [dependencies]
 synch-core.workspace = true
 
@@ -43,6 +50,8 @@ russh-sftp.workspace = true
 serde_json.workspace = true
 
 [dev-dependencies]
+# This crate's own tests hold compiles; production builds do not.
+synch-sock = { path = ".", features = ["compile-hold"] }
 # The compiler the tests build their fixtures with. A dev-dependency, so the
 # runtime does not carry a C compiler into anybody's binary, and so the two
 # crates stay independent: `synch-cc` does not know what a socket is.

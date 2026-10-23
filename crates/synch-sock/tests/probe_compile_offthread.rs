@@ -8,13 +8,13 @@
 //! cache and oldest-first eviction, a caller reaching more than 32 armed roots
 //! makes every admission a miss.
 //!
-//! `probe_program_cache_thrash` measures the same property with the small
-//! programs the rest of the suite uses, where a compile is under a millisecond
-//! and the stall is lost in the noise. This one compiles a program big enough
-//! for the JIT to take ~100ms, which is the only way the difference is visible
-//! at all: with the compile on the worker thread a co-resident's round-trip
-//! jumps to the whole compile time, and with it on the blocking pool the
-//! co-resident does not notice.
+//! This probe used to time a compile big enough to take ~170ms and compare the
+//! resident's round-trips against it, which failed on its own once runners
+//! loaded that program in 15ms. It now holds the cold load in flight
+//! (`synch_sock::compile_hold`) instead: for as long as the hold lasts, a
+//! worker compiling on its own thread serves nobody, and one that hands the
+//! load to the blocking pool keeps answering. That is the same on a fast
+//! machine and a slow one.
 
 #![cfg(all(
     any(target_os = "linux", target_os = "macos"),
@@ -23,72 +23,45 @@
 
 mod harness;
 
-use std::time::{Duration, Instant};
+use std::time::Duration;
 
 use harness::{compile_with, peer, Harness};
-use synch_sock::{DuplexStream, EffectivePolicy};
+use synch_sock::{compile_hold, DuplexStream, EffectivePolicy};
 use tokio::io::{AsyncReadExt, AsyncWriteExt};
 
-/// A poll-echo loop with `ROUNDS` straight-line statements in it, so the JIT
-/// has real work to do. `RET` keeps each variant a distinct content root.
-fn echo_source(rounds: usize) -> String {
-    // `rounds` helper functions, chained so that only `f0` is named from the
-    // entrypoint and nothing ever calls it. The ELF is large, so the eager load
-    // has real work to do; the entrypoint stays small, so this measures the
-    // eager load specifically. (The lazy per-function JIT is offloaded too, via
-    // `Timeslicer::run_blocking` — see `TokioTimeslicer`.)
-    let fns: String = (0..rounds)
-        .map(|i| {
-            let ops: String = (0..40)
-                .map(|j| format!("a += {j}; a ^= (a>>2); "))
-                .collect();
-            let tail = if i + 1 < rounds {
-                format!("if (a == 7) return f{}(a);", i + 1)
-            } else {
-                String::new()
-            };
-            format!("static sy_s64 f{i}(sy_s64 x) {{ sy_s64 a=x; {ops} {tail} return a; }}\n")
-        })
-        .collect();
-    // Never true, so the functions above are in the object and never run.
-    let never = if rounds > 0 {
-        "    if (acc == 987654321) return f0(acc);\n".to_string()
-    } else {
-        String::new()
-    };
-    let protos: String = (0..rounds)
-        .map(|i| format!("static sy_s64 f{i}(sy_s64 x);\n"))
-        .collect();
-    format!(
-        r#"#include <synch.h>
-{protos}
-{fns}
-SY_ENTRY sy_s64 entry(void) {{
+/// A poll-echo loop. `RET` keeps each variant a distinct content root.
+const ECHO: &str = r#"#include <synch.h>
+SY_ENTRY sy_s64 entry(void) {
   char buf[64];
   sy_s64 acc = RET;
-  for (;;) {{
-    struct sy_pollfd fds[1] = {{ {{ SY_SELF, SY_POLL_IN, 0 }} }};
+  for (;;) {
+    struct sy_pollfd fds[1] = { { SY_SELF, SY_POLL_IN, 0 } };
     sy_s64 r = sy_poll(fds, 1, -1);
     if (r < 0) return r;
     sy_s64 n = sy_read(SY_SELF, buf, sizeof buf);
     if (n == SY_EAGAIN) continue;
     if (n <= 0) return 0;
     acc += buf[0];
-{never}    sy_write(SY_SELF, buf, (sy_u64)n);
-  }}
-}}
-"#
-    )
+    sy_write(SY_SELF, buf, (sy_u64)n);
+  }
 }
+"#;
+
+/// Round-trips the resident answers while the cold load is held.
+const PINGS_DURING_HOLD: usize = 100;
+
+/// How long a round-trip may take before the worker counts as stalled. A free
+/// worker answers in microseconds; a stalled one never answers while the hold
+/// lasts, so this bounds a hang rather than measuring anything.
+const STALLED: Duration = Duration::from_secs(10);
 
 #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
 async fn a_cold_compile_does_not_stall_a_co_resident_invocation() {
     // One worker, so the two invocations are certainly co-resident.
     let harness = Harness::new();
 
-    let resident_elf = compile_with(&echo_source(0), "resident.c", &[("RET", "1")]);
-    let big_elf = compile_with(&echo_source(120), "big.c", &[("RET", "2")]);
-    eprintln!("big program: {} bytes of ELF", big_elf.len());
+    let resident_elf = compile_with(ECHO, "resident.c", &[("RET", "1")]);
+    let cold_elf = compile_with(ECHO, "cold.c", &[("RET", "2")]);
 
     // A resident invocation, already compiled and answering.
     let (mine, theirs) = tokio::io::duplex(64 * 1024);
@@ -107,112 +80,55 @@ async fn a_cold_compile_does_not_stall_a_co_resident_invocation() {
     async fn ping(
         w: &mut (impl tokio::io::AsyncWrite + Unpin),
         r: &mut (impl tokio::io::AsyncRead + Unpin),
-    ) -> Duration {
-        let t0 = Instant::now();
-        w.write_all(b"x").await.unwrap();
-        let mut b = [0u8; 1];
-        r.read_exact(&mut b).await.unwrap();
-        t0.elapsed()
+    ) -> bool {
+        let round_trip = async {
+            w.write_all(b"x").await.unwrap();
+            let mut b = [0u8; 1];
+            r.read_exact(&mut b).await.unwrap();
+        };
+        tokio::time::timeout(STALLED, round_trip).await.is_ok()
     }
 
-    // Warm up, then take a baseline with nothing else on the worker.
-    for _ in 0..5 {
-        ping(&mut my_w, &mut my_r).await;
-    }
-    let mut baseline = Vec::new();
-    for _ in 0..20 {
-        baseline.push(ping(&mut my_w, &mut my_r).await);
-    }
-    baseline.sort();
-    let base_median = baseline[baseline.len() / 2];
-    let base_max = *baseline.last().expect("twenty samples");
-    eprintln!("baseline round-trip: median {base_median:?}, max {base_max:?}");
+    assert!(ping(&mut my_w, &mut my_r).await, "the resident must answer");
 
-    // Admit the big program: a cache miss, and a compile of real length.
+    // Admit the cold program, and hold its load in flight.
+    compile_hold::hold();
     let (cold_mine, cold_theirs) = tokio::io::duplex(64 * 1024);
     let (cold_r, cold_w) = tokio::io::split(cold_theirs);
     let cold = harness.invocation(
-        &big_elf,
+        &cold_elf,
         DuplexStream::new(cold_r, cold_w),
         EffectivePolicy::default(),
         peer(None),
         vec![],
     );
     let pool = harness.pool.clone();
-    let compile_started = Instant::now();
     let cold_task = tokio::spawn(async move { pool.run(cold).await });
-    let cold_driver = tokio::spawn(async move {
-        let (mut r, mut w) = tokio::io::split(cold_mine);
-        w.write_all(b"y").await.unwrap();
-        let mut b = [0u8; 1];
-        let got = r.read_exact(&mut b).await;
-        (got.is_ok(), Instant::now())
-    });
+    // The resident's load was the first; this one is the second.
+    tokio::task::spawn_blocking(|| compile_hold::wait_entered(2))
+        .await
+        .expect("the wait ran");
 
-    // Keep the resident talking for as long as the cold admission takes.
-    let mut during = Vec::new();
-    while !cold_driver.is_finished() {
-        during.push(ping(&mut my_w, &mut my_r).await);
-        if during.len() > 100_000 {
-            break;
+    for answered in 0..PINGS_DURING_HOLD {
+        if !ping(&mut my_w, &mut my_r).await {
+            compile_hold::release();
+            panic!(
+                "BREAK: the resident stopped answering after {answered} round-trips while \
+                 another program was compiling: the worker is compiling on its own thread and \
+                 is unavailable to everything else placed on it"
+            );
         }
     }
-    let (cold_ok, cold_done) = cold_driver.await.expect("the cold driver ran");
-    let compile_elapsed = cold_done - compile_started;
-    assert!(cold_ok, "the cold invocation must answer");
 
-    during.sort();
-    let during_max = *during.last().expect("at least one ping during the compile");
-    let during_median = during[during.len() / 2];
-    eprintln!(
-        "cold admission took {compile_elapsed:?}; resident round-trip during it: \
-         median {during_median:?}, max {during_max:?} over {} pings",
-        during.len()
-    );
+    // Once released, the cold program loads and answers.
+    compile_hold::release();
+    let (mut r, mut w) = tokio::io::split(cold_mine);
+    w.write_all(b"y").await.unwrap();
+    let mut b = [0u8; 1];
+    r.read_exact(&mut b)
+        .await
+        .expect("the cold invocation must answer");
 
     resident_task.abort();
     cold_task.abort();
-
-    // The compile has to be long enough for the question to mean anything.
-    // 120 functions take ~170ms to load on the machine this was written on, and
-    // are about as many as fit: the object is already 800 KB and async-ebpf
-    // caps JIT code at 1 MiB per program (`docs/SOCKETS.md` §10). The
-    // bound is set an order of magnitude below that so a much faster runner
-    // still measures something real rather than failing on its own speed.
-    assert!(
-        compile_elapsed > Duration::from_millis(15),
-        "this machine loaded the big program in {compile_elapsed:?}, too fast for this probe \
-         to tell a stalled worker from a busy one; raise the function count"
-    );
-
-    // The property, measured as throughput rather than as a worst case.
-    //
-    // A single round-trip can still be unlucky — the JIT maps and re-protects
-    // its code arena, and those take the process-wide mmap lock, so the worker
-    // can lose a scheduling quantum to a compile happening on another thread.
-    // What changed is whether the worker is *available* at all: with the load
-    // inline it serves nobody for the whole compile, and with it on the
-    // blocking pool it keeps answering throughout. Counting completed
-    // round-trips sees that; a maximum does not.
-    //
-    // If the worker were blocked for the compile, the resident could complete
-    // about one round-trip in the window. Unblocked it manages hundreds. The
-    // threshold is deliberately far below what a healthy run achieves (~33% on
-    // an idle 4-core box) and far above what a blocked one can (~0.1%), so a
-    // loaded or small CI runner has room to be slow without being wrong.
-    let ideal = compile_elapsed.as_nanos() / base_median.as_nanos().max(1);
-    let achieved = during.len() as u128;
-    let fraction = achieved as f64 / ideal.max(1) as f64;
-    eprintln!(
-        "resident completed {achieved} round-trips during the compile, against {ideal} if the \
-         worker had never paused ({:.0}%)",
-        fraction * 100.0
-    );
-    assert!(
-        fraction > 0.05,
-        "BREAK: the resident completed only {achieved} round-trips ({:.1}%) of the {ideal} it \
-         could have during a {compile_elapsed:?} compile: the worker is compiling on its own \
-         thread and is unavailable to everything else placed on it",
-        fraction * 100.0
-    );
 }
