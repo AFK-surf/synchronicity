@@ -1,6 +1,6 @@
 # The build context is the repository root, but the image builds three Rust
 # binaries and nothing else, so only the workspace itself is an input:
-# Cargo.toml, Cargo.lock, crates/ and vendor/ (russh is a path dependency).
+# Cargo.toml, Cargo.lock, crates/ and vendor/ (including patched dependencies).
 #
 # Excluding by allowlist rather than by exception list, because the cost of
 # the two mistakes is not the same: a stray directory in the context only

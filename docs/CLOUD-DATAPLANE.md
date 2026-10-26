@@ -1273,6 +1273,12 @@ converge, its drain — ran through resources every other tenant needed.
   QUIC discovery and HTTPS relay fallback remain enabled. Endpoint binds run
   under independent tracing roots so Iroh's async span lifetime cannot attach
   another tenant's endpoint context to every background event.
+- **Buffered relay pongs survive scheduling delays.** The local Iroh patch
+  checks up to 32 ready responses before treating a ping deadline as a lost
+  connection. A busy runtime can otherwise discard a healthy relay before
+  reading its pong, then spend more CPU reconnecting. Missing or incorrect
+  pongs still time out, and unrelated traffic cannot extend a connection
+  indefinitely. See [the patch and regressions](../vendor/iroh/PATCHES.md).
 - **Restarts back off.** Re-provisioning discards the local database and
   replays the whole replica stream, so a tenant whose standing loops keep
   dying bought a full restore every poll — object-store egress and
