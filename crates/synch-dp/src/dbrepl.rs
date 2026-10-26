@@ -43,7 +43,8 @@
 //! and it is the whole of engine change (d) in §7.3.
 
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::atomic::{AtomicU64, Ordering};
+use std::sync::{Arc, LazyLock};
 use std::time::Duration;
 
 use celld_ltx::{Db, Replica, ReplicaClient};
@@ -62,28 +63,67 @@ pub const DEFAULT_INTERVAL: Duration = Duration::from_secs(1);
 /// of active restores by the pod's blocking-pool capacity.
 const RESTORE_DOWNLOADS: usize = 8;
 
+// Compaction is optional background work. Its object reads and 64 MiB merges
+// must not scale to one simultaneous pass per tenant on a shared shard.
+static COMPACTION_SLOTS: LazyLock<Arc<tokio::sync::Semaphore>> =
+    LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(4)));
+
+mod compaction;
+use compaction::Compaction;
+
 /// Runs additive compaction independently of the WAL shipper. An in-flight
 /// pass finishes before shutdown, so retirement cannot race an object write.
 pub(crate) async fn run_compaction(
     client: DbClient,
     tenant: String,
+    published: Arc<AtomicU64>,
     stop: tokio::sync::broadcast::Receiver<()>,
 ) {
+    // Spread restored tenants over the first L1 interval. Stable by tenant so
+    // a restart does not synchronize every level's object-store requests.
+    let hash = blake3::hash(tenant.as_bytes());
+    let offset = u64::from_le_bytes(hash.as_bytes()[..8].try_into().unwrap()) % 30_000;
+    let delay = Duration::from_millis(offset);
     match client {
-        DbClient::Objects(client) => compact_loop(*client, tenant, stop).await,
-        DbClient::Files(client) => compact_loop(client, tenant, stop).await,
+        DbClient::Objects(client) => {
+            compact_loop(
+                *client,
+                tenant,
+                published,
+                stop,
+                COMPACTION_SLOTS.clone(),
+                delay,
+            )
+            .await
+        }
+        DbClient::Files(client) => {
+            compact_loop(
+                client,
+                tenant,
+                published,
+                stop,
+                COMPACTION_SLOTS.clone(),
+                delay,
+            )
+            .await
+        }
     }
 }
 
 async fn compact_loop<C: ReplicaClient>(
     client: C,
     tenant: String,
+    published: Arc<AtomicU64>,
     mut stop: tokio::sync::broadcast::Receiver<()>,
+    slots: Arc<tokio::sync::Semaphore>,
+    delay: Duration,
 ) {
     let levels = &celld_ltx::compaction_level::DEFAULT_COMPACTION_LEVELS[1..];
-    let mut due = vec![tokio::time::Instant::now(); levels.len()];
-    let mut ticker = tokio::time::interval(levels[0].interval);
+    let first = tokio::time::Instant::now() + delay;
+    let mut due = vec![first; levels.len()];
+    let mut ticker = tokio::time::interval_at(first, levels[0].interval);
     ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
+    let mut compaction = Compaction::default();
     loop {
         tokio::select! {
             biased;
@@ -93,13 +133,19 @@ async fn compact_loop<C: ReplicaClient>(
                     if tokio::time::Instant::now() < *due {
                         continue;
                     }
-                    match compact_level(&client, level.level).await {
+                    let permit = tokio::select! {
+                        biased;
+                        _ = stop.recv() => return,
+                        permit = slots.acquire() => permit.expect("compaction slots stay open"),
+                    };
+                    match compaction.compact(&client, level.level, published.load(Ordering::Acquire)).await {
                         Ok(Some(output)) => tracing::info!(%tenant, level = level.level,
                             ?output, "compacted tenant database replica"),
                         Ok(None) => {}
                         Err(error) => tracing::warn!(%tenant, level = level.level,
                             %error, "tenant database compaction failed; will retry"),
                     }
+                    drop(permit);
                     *due = tokio::time::Instant::now() + level.interval;
                     // Finish a publication already started, but don't start
                     // another level once the tenant has begun draining.
@@ -111,18 +157,6 @@ async fn compact_loop<C: ReplicaClient>(
             }
         }
     }
-}
-
-async fn compact_level<C: ReplicaClient>(
-    client: &C,
-    level: i32,
-) -> celld_ltx::Result<Option<celld_ltx::replica_compactor::CompactionOutput>> {
-    // Source objects stay intact. The library validates continuity, merges
-    // off the async workers, and publishes one immutable destination object.
-    celld_ltx::replica_compactor::ReplicaCompactor::new(client)
-        .with_limits(256, 64 * 1024 * 1024)
-        .compact(level)
-        .await
 }
 
 /// Where a tenant's database stream is written.
@@ -171,6 +205,7 @@ pub struct Replicator {
     tenant: String,
     commands: mpsc::UnboundedSender<Command>,
     worker: Option<std::thread::JoinHandle<()>>,
+    published: Arc<AtomicU64>,
 }
 
 impl std::fmt::Debug for Replicator {
@@ -222,11 +257,13 @@ impl Replicator {
         let db_path = db_path.to_path_buf();
         let (commands, requests) = mpsc::unbounded_channel();
         let (ready, opened) = oneshot::channel();
+        let published = Arc::new(AtomicU64::new(0));
+        let progress = published.clone();
         let worker = std::thread::Builder::new()
             // Named for the tenant: a stuck thread in a stack dump has to say
             // which of this pod's tenants it belongs to.
             .name(format!("ltx-{tenant}"))
-            .spawn(move || serve(db_path, client, requests, ready))
+            .spawn(move || serve(db_path, client, requests, ready, progress))
             .map_err(|error| DpError::io("spawning the replication thread", error))?;
 
         let outcome = match opened.await {
@@ -241,6 +278,7 @@ impl Replicator {
                 tenant,
                 commands,
                 worker: Some(worker),
+                published,
             }),
             Err(error) => {
                 // Already finished — it answered by ending — so this join
@@ -254,6 +292,12 @@ impl Replicator {
     /// Captures what the database has committed, then ships it.
     pub async fn tick(&mut self) -> Result<()> {
         self.request(Command::Sync).await
+    }
+
+    /// The last successfully replicated L0 transaction. Zero means unknown,
+    /// not empty: compaction must still discover a restored stream's backlog.
+    pub(crate) fn published(&self) -> Arc<AtomicU64> {
+        self.published.clone()
     }
 
     /// Ships everything outstanding. The last thing a draining tenant does.
@@ -323,6 +367,7 @@ fn serve<C: ReplicaClient>(
     client: C,
     requests: mpsc::UnboundedReceiver<Command>,
     ready: oneshot::Sender<Result<()>>,
+    published: Arc<AtomicU64>,
 ) {
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -334,7 +379,7 @@ fn serve<C: ReplicaClient>(
             return;
         }
     };
-    runtime.block_on(replicate(db_path, client, requests, ready));
+    runtime.block_on(replicate(db_path, client, requests, ready, published));
 }
 
 /// Opens the replica, reports whether that worked, then serves commands.
@@ -343,6 +388,7 @@ async fn replicate<C: ReplicaClient>(
     client: C,
     mut requests: mpsc::UnboundedReceiver<Command>,
     ready: oneshot::Sender<Result<()>>,
+    published: Arc<AtomicU64>,
 ) {
     let mut replica = match open(&db_path, client).await {
         Ok(replica) => {
@@ -362,7 +408,11 @@ async fn replicate<C: ReplicaClient>(
     while let Some(command) = requests.recv().await {
         match command {
             Command::Sync(reply) => {
-                let _ = reply.send(sync(&mut replica).await);
+                let result = sync(&mut replica).await;
+                if result.is_ok() {
+                    published.store(replica.pos().txid.0, Ordering::Release);
+                }
+                let _ = reply.send(result);
             }
             Command::Close(reply) => {
                 let _ = reply.send(close(replica));
@@ -694,6 +744,256 @@ mod tests {
             .unwrap()
     }
 
+    struct CountedClient {
+        files: FileReplicaClient,
+        listings: std::sync::atomic::AtomicUsize,
+        // 1: reject the upload; 2: commit it but lose the response.
+        fail_upload: std::sync::atomic::AtomicU8,
+    }
+
+    impl CountedClient {
+        fn new(dir: &Path) -> Self {
+            Self {
+                files: FileReplicaClient::new(dir.to_string_lossy().into_owned()),
+                listings: Default::default(),
+                fail_upload: Default::default(),
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl ReplicaClient for CountedClient {
+        async fn ltx_files(
+            &self,
+            level: i32,
+            seek: celld_ltx::TXID,
+        ) -> celld_ltx::Result<Vec<celld_ltx::FileInfo>> {
+            self.listings.fetch_add(1, Ordering::Relaxed);
+            self.files.ltx_files(level, seek).await
+        }
+
+        async fn ltx_files_bounded(
+            &self,
+            level: i32,
+            seek: celld_ltx::TXID,
+            limit: usize,
+        ) -> celld_ltx::Result<Vec<celld_ltx::FileInfo>> {
+            self.listings.fetch_add(1, Ordering::Relaxed);
+            self.files.ltx_files_bounded(level, seek, limit).await
+        }
+
+        async fn open_ltx_file(
+            &self,
+            level: i32,
+            min: celld_ltx::TXID,
+            max: celld_ltx::TXID,
+        ) -> celld_ltx::Result<Vec<u8>> {
+            self.files.open_ltx_file(level, min, max).await
+        }
+
+        async fn write_ltx_file(
+            &self,
+            level: i32,
+            min: celld_ltx::TXID,
+            max: celld_ltx::TXID,
+            data: &[u8],
+        ) -> celld_ltx::Result<celld_ltx::FileInfo> {
+            let fail = self.fail_upload.swap(0, Ordering::Relaxed);
+            if fail == 1 {
+                return Err(celld_ltx::Error::Other("upload rejected".into()));
+            }
+            let info = self.files.write_ltx_file(level, min, max, data).await?;
+            if fail == 2 {
+                return Err(celld_ltx::Error::Other("upload response lost".into()));
+            }
+            Ok(info)
+        }
+
+        async fn delete_ltx_files(&self, _: &[celld_ltx::FileInfo]) -> celld_ltx::Result<()> {
+            panic!("compaction deleted its sources");
+        }
+
+        async fn delete_all(&self) -> celld_ltx::Result<()> {
+            panic!("compaction deleted its stream");
+        }
+    }
+
+    #[tokio::test]
+    async fn idle_compaction_issues_no_listings_and_new_writes_only_list_the_tail() {
+        let source = tempfile::tempdir().unwrap();
+        let remote = tempfile::tempdir().unwrap();
+        let store = open_store(source.path()).await;
+        let mut replicator = Replicator::start(&store.db_path(), client(remote.path()), "source")
+            .await
+            .unwrap();
+        let observed = CountedClient::new(remote.path());
+        let mut compaction = Compaction::default();
+        // Accumulate real immutable history rather than testing just an empty
+        // prefix. Each later write needs one bounded source listing per level.
+        for i in 0..20 {
+            ship_value(&store, &mut replicator, &format!("value {i}")).await;
+            let before = observed.listings.load(Ordering::Relaxed);
+            for level in 1..=3 {
+                assert!(compaction
+                    .compact(
+                        &observed,
+                        level,
+                        replicator.published().load(Ordering::Acquire)
+                    )
+                    .await
+                    .unwrap()
+                    .is_some());
+            }
+            let listings = observed.listings.load(Ordering::Relaxed) - before;
+            assert_eq!(listings, if i == 0 { 6 } else { 3 });
+        }
+        let before = observed.listings.load(Ordering::Relaxed);
+        for _ in 0..200 {
+            for level in 1..=3 {
+                assert!(compaction
+                    .compact(
+                        &observed,
+                        level,
+                        replicator.published().load(Ordering::Acquire)
+                    )
+                    .await
+                    .unwrap()
+                    .is_none());
+            }
+        }
+        assert_eq!(
+            observed.listings.load(Ordering::Relaxed),
+            before,
+            "idle passes fetched historical metadata"
+        );
+        // An unknown L0 position after restart must discover existing data.
+        ship_value(&store, &mut replicator, "after restart").await;
+        let mut restarted = Compaction::default();
+        assert!(restarted.compact(&observed, 1, 0).await.unwrap().is_some());
+        replicator.close().await.unwrap();
+        let restored = tempfile::tempdir().unwrap();
+        assert!(restore(client(remote.path()), restored.path())
+            .await
+            .unwrap());
+        assert_eq!(
+            restored_value(restored.path()).await.as_deref(),
+            Some("after restart")
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_compaction_publications_are_reconciled_before_advancing() {
+        for failure in [1, 2] {
+            let source = tempfile::tempdir().unwrap();
+            let remote = tempfile::tempdir().unwrap();
+            let store = open_store(source.path()).await;
+            let mut replicator =
+                Replicator::start(&store.db_path(), client(remote.path()), "source")
+                    .await
+                    .unwrap();
+            let observed = CountedClient::new(remote.path());
+            let mut compaction = Compaction::default();
+            ship_value(&store, &mut replicator, "before failure").await;
+            compaction.compact(&observed, 1, 0).await.unwrap().unwrap();
+            ship_value(&store, &mut replicator, "failed response").await;
+            observed.fail_upload.store(failure, Ordering::Relaxed);
+            assert!(compaction.compact(&observed, 1, 0).await.is_err());
+            // Add another transaction before retry. A committed-but-unanswered
+            // PUT must not lead to an overlapping destination object.
+            ship_value(&store, &mut replicator, "after failure").await;
+            compaction.compact(&observed, 1, 0).await.unwrap().unwrap();
+            let files = observed
+                .files
+                .ltx_files(1, celld_ltx::TXID(0))
+                .await
+                .unwrap();
+            let mut next = 1;
+            for file in files {
+                assert_eq!(
+                    file.min_txid.0, next,
+                    "overlap or gap after ambiguous publication"
+                );
+                next = file.max_txid.0 + 1;
+            }
+            assert_eq!(next - 1, replicator.published().load(Ordering::Acquire));
+            replicator.close().await.unwrap();
+            let restored = tempfile::tempdir().unwrap();
+            assert!(restore(client(remote.path()), restored.path())
+                .await
+                .unwrap());
+            assert_eq!(
+                restored_value(restored.path()).await.as_deref(),
+                Some("after failure")
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn compaction_concurrency_is_bounded_and_queued_tenants_can_stop() {
+        let source = tempfile::tempdir().unwrap();
+        let remote = tempfile::tempdir().unwrap();
+        let store = open_store(source.path()).await;
+        let mut replicator = Replicator::start(&store.db_path(), client(remote.path()), "source")
+            .await
+            .unwrap();
+        ship_value(&store, &mut replicator, "pending compaction").await;
+        let (entered, mut downloads) = mpsc::unbounded_channel();
+        let release = Arc::new(tokio::sync::Semaphore::new(0));
+        let _cleanup = CloseGate(release.clone());
+        let slots = Arc::new(tokio::sync::Semaphore::new(2));
+        let (stop, _) = tokio::sync::broadcast::channel(1);
+        let mut jobs = tokio::task::JoinSet::new();
+        for tenant in 0..6 {
+            jobs.spawn(compact_loop(
+                BlockedClient {
+                    files: FileReplicaClient::new(remote.path().to_string_lossy().into_owned()),
+                    entered: entered.clone(),
+                    release: release.clone(),
+                },
+                tenant.to_string(),
+                replicator.published(),
+                stop.subscribe(),
+                slots.clone(),
+                Duration::ZERO,
+            ));
+        }
+        for _ in 0..2 {
+            tokio::time::timeout(Duration::from_secs(5), downloads.recv())
+                .await
+                .unwrap()
+                .unwrap();
+        }
+        assert!(
+            downloads.try_recv().is_err(),
+            "more than two passes started"
+        );
+        stop.send(()).unwrap();
+        for _ in 0..4 {
+            tokio::time::timeout(Duration::from_secs(5), jobs.join_next())
+                .await
+                .unwrap()
+                .unwrap()
+                .unwrap();
+        }
+        assert_eq!(
+            jobs.len(),
+            2,
+            "in-flight passes must finish before retirement"
+        );
+        assert!(
+            downloads.try_recv().is_err(),
+            "a queued pass started after shutdown"
+        );
+        release.add_permits(2);
+        while let Some(result) = tokio::time::timeout(Duration::from_secs(5), jobs.join_next())
+            .await
+            .unwrap()
+        {
+            result.unwrap();
+        }
+        replicator.close().await.unwrap();
+    }
+
     // One async worker: restoring must also leave the supervisor responsive.
     #[tokio::test]
     async fn parallel_downloads_are_bounded_and_a_stalled_tenant_does_not_block_another() {
@@ -777,7 +1077,14 @@ mod tests {
             release: release.clone(),
         };
         let (stop, stopped) = tokio::sync::broadcast::channel(1);
-        let running = tokio::spawn(compact_loop(blocked, "source".into(), stopped));
+        let running = tokio::spawn(compact_loop(
+            blocked,
+            "source".into(),
+            replicator.published(),
+            stopped,
+            Arc::new(tokio::sync::Semaphore::new(1)),
+            Duration::ZERO,
+        ));
         tokio::time::timeout(Duration::from_secs(5), downloads.recv())
             .await
             .unwrap()
@@ -824,10 +1131,13 @@ mod tests {
         let sources = files.ltx_files(0, celld_ltx::TXID(0)).await.unwrap();
         assert!(sources.len() >= 3);
         let (stop, stopped) = tokio::sync::broadcast::channel(1);
-        let running = tokio::spawn(run_compaction(
-            client(remote.path()),
+        let running = tokio::spawn(compact_loop(
+            FileReplicaClient::new(remote.path().to_string_lossy().to_string()),
             "source".into(),
+            replicator.published(),
             stopped,
+            Arc::new(tokio::sync::Semaphore::new(1)),
+            Duration::ZERO,
         ));
         tokio::time::timeout(Duration::from_secs(5), async {
             loop {
@@ -854,7 +1164,11 @@ mod tests {
             sources.len()
         );
         assert!(
-            compact_level(&files, 1).await.unwrap().is_none(),
+            Compaction::default()
+                .compact(&files, 1, 0)
+                .await
+                .unwrap()
+                .is_none(),
             "repeating compaction has no new prefix to publish"
         );
         let plan = celld_ltx::replica::calc_restore_plan(&files, celld_ltx::TXID(0))
@@ -874,7 +1188,11 @@ mod tests {
             Some("after compaction")
         );
         assert!(
-            compact_level(&files, 1).await.unwrap().is_some(),
+            Compaction::default()
+                .compact(&files, 1, 0)
+                .await
+                .unwrap()
+                .is_some(),
             "a later pass picks up the new tail"
         );
     }

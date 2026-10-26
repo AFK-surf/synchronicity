@@ -14,6 +14,7 @@ use iroh_base::SecretKey;
 use iroh_mainline_address_lookup::DhtAddressLookup;
 use synch_core::{NodeId, ALPN_BLOB, ALPN_MPT};
 use synch_store::Store;
+use tracing::Instrument;
 
 use crate::{
     blob::{BlobClient, BlobProtocol},
@@ -75,6 +76,11 @@ pub struct NetOptions {
     /// never touch the network; self-hosted deployments can use it on closed
     /// networks.
     pub offline: bool,
+    /// This endpoint runs on a hosted server, without a LAN gateway or a
+    /// captive portal. Share addressing DNS caches with other hosted endpoints
+    /// and omit those local-network probes. QUIC discovery, HTTPS relay probes
+    /// and relay fallback remain enabled; membership DNS is separate.
+    pub server_network: bool,
     /// Iroh relay server URLs replacing n0's public relay map (§3.3).
     ///
     /// Self-hosted deployments point every node at their own relay here.
@@ -375,6 +381,15 @@ impl Net {
         let mut builder = Endpoint::builder(presets::N0)
             .secret_key(secret)
             .ca_tls_config(CaTlsConfig::system());
+        if options.server_network {
+            static DNS: std::sync::OnceLock<iroh::dns::DnsResolver> = std::sync::OnceLock::new();
+            let mut reports = iroh::NetReportConfig::default();
+            reports.captive_portal_check = false;
+            builder = builder
+                .dns_resolver(DNS.get_or_init(iroh::dns::DnsResolver::default).clone())
+                .portmapper_config(iroh::endpoint::PortmapperConfig::Disabled)
+                .net_report_config(reports);
+        }
         if options.offline {
             // Nothing to configure once nothing may leave the machine, and the
             // knobs below would only be cleared again on the way out.
@@ -408,30 +423,27 @@ impl Net {
                 .bind_addr(addr)
                 .map_err(|e| NetError::Endpoint(e.to_string()))?;
         }
-        let endpoint = builder
-            .alpns({
-                let mut alpns = vec![ALPN_MPT.to_vec(), ALPN_BLOB.to_vec()];
-                if options.sockets.is_some() {
-                    alpns.push(synch_core::ALPN_SOCK.to_vec());
+        let builder = builder.alpns({
+            let mut alpns = vec![ALPN_MPT.to_vec(), ALPN_BLOB.to_vec()];
+            if options.sockets.is_some() {
+                alpns.push(synch_core::ALPN_SOCK.to_vec());
+            }
+            if options.locks.is_some() {
+                alpns.push(synch_core::ALPN_LOCK.to_vec());
+            }
+            alpns
+        });
+        let endpoint = bind_endpoint(builder).await.map_err(|e| {
+            // Name the address: "Failed to bind sockets" with no port
+            // sends an operator to `synch init` when what they need is
+            // another --bind.
+            NetError::Endpoint(match options.bind_addr {
+                Some(addr) => {
+                    format!("could not bind {addr}: {e} (is the port already in use?)")
                 }
-                if options.locks.is_some() {
-                    alpns.push(synch_core::ALPN_LOCK.to_vec());
-                }
-                alpns
+                None => e.to_string(),
             })
-            .bind()
-            .await
-            .map_err(|e| {
-                // Name the address: "Failed to bind sockets" with no port
-                // sends an operator to `synch init` when what they need is
-                // another --bind.
-                NetError::Endpoint(match options.bind_addr {
-                    Some(addr) => {
-                        format!("could not bind {addr}: {e} (is the port already in use?)")
-                    }
-                    None => e.to_string(),
-                })
-            })?;
+        })?;
 
         // One gate for the endpoint, shared by every ALPN mounted on it: the
         // resource it protects — the process's blocking pool — is shared too,
@@ -769,10 +781,99 @@ impl Net {
     }
 }
 
+/// Iroh 1.0.3 holds an entered endpoint span across an await in `bind`.
+/// Concurrent binds can otherwise inherit unrelated tenants' endpoint scopes
+/// and keep those growing chains on every background event. An explicit root
+/// around each poll isolates the bind while retaining its own endpoint scope.
+/// Match Iroh's target so the root is enabled even when only Iroh is logged.
+async fn bind_endpoint(
+    builder: iroh::endpoint::Builder,
+) -> Result<Endpoint, iroh::endpoint::BindError> {
+    builder
+        .bind()
+        .instrument(tracing::info_span!(target: "iroh::endpoint", parent: None, "endpoint_bind"))
+        .await
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::testing::test_store;
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn concurrent_endpoints_do_not_inherit_other_endpoint_spans() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use tracing::instrument::WithSubscriber;
+        use tracing_subscriber::{layer::Context, prelude::*, registry::LookupSpan, Layer};
+
+        crate::tls::install_crypto_provider();
+
+        #[derive(Clone, Default)]
+        struct Depths(Arc<AtomicUsize>, Arc<AtomicUsize>);
+        impl<S: tracing::Subscriber + for<'a> LookupSpan<'a>> Layer<S> for Depths {
+            fn on_new_span(
+                &self,
+                attrs: &tracing::span::Attributes<'_>,
+                id: &tracing::Id,
+                ctx: Context<'_, S>,
+            ) {
+                if attrs.metadata().name() == "endpoint" {
+                    let depth = ctx
+                        .span(id)
+                        .unwrap()
+                        .scope()
+                        .filter(|s| s.name() == "endpoint")
+                        .count();
+                    self.0.fetch_max(depth, Ordering::Relaxed);
+                    self.1.fetch_add(1, Ordering::Relaxed);
+                }
+            }
+        }
+        let depths = Depths::default();
+        let dispatch = tracing::Dispatch::new(
+            tracing_subscriber::registry()
+                .with(tracing_subscriber::EnvFilter::new("iroh=info"))
+                .with(depths.clone()),
+        );
+        let mut jobs = tokio::task::JoinSet::new();
+        let slots = Arc::new(tokio::sync::Semaphore::new(16));
+        for _ in 0..128 {
+            let slots = slots.clone();
+            jobs.spawn(
+                async move {
+                    let _slot = slots.acquire().await.unwrap();
+                    bind_endpoint(
+                        Endpoint::builder(presets::N0)
+                            .relay_mode(RelayMode::Disabled)
+                            .clear_address_lookup()
+                            .clear_ip_transports()
+                            .bind_addr("127.0.0.1:0".parse::<SocketAddr>().unwrap())
+                            .unwrap(),
+                    )
+                    .await
+                    .unwrap()
+                }
+                .with_subscriber(dispatch.clone()),
+            );
+        }
+        let mut endpoints = Vec::new();
+        while let Some(endpoint) = jobs.join_next().await {
+            endpoints.push(endpoint.unwrap());
+        }
+        for endpoint in endpoints {
+            endpoint.close().await;
+        }
+        assert_eq!(
+            depths.1.load(Ordering::Relaxed),
+            128,
+            "every real endpoint was observed"
+        );
+        assert_eq!(
+            depths.0.load(Ordering::Relaxed),
+            1,
+            "an endpoint inherited another tenant's context"
+        );
+    }
 
     /// The config-string validators share one contract: parse, or name the
     /// offender — before any socket opens.
@@ -837,6 +938,7 @@ mod tests {
             SecretKey::generate(),
             NetOptions {
                 dht: true,
+                server_network: true,
                 dht_bootstrap: vec!["router.bittorrent.com:6881".to_string()],
                 ..NetOptions::loopback()
             },

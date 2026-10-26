@@ -326,11 +326,13 @@ impl Tenant {
         )
         .await?;
 
+        let published = replicator.published();
         self.spawn_loops(&node, config, resolver);
         self.spawn_replication(replicator, dbrepl::DEFAULT_INTERVAL, metrics);
         self.loops.push(tokio::spawn(dbrepl::run_compaction(
             compaction_client,
             self.network.key(),
+            published,
             self.shutdown.subscribe(),
         )));
 
@@ -367,6 +369,7 @@ impl Tenant {
             // See `DpConfig::max_inflight_per_tenant`.
             net: synch_net::NetOptions {
                 max_inflight_requests: Some(config.max_inflight_per_tenant),
+                server_network: true,
                 ..config.net.clone()
             },
             // Identity settles inside `Node::open`, from a resolver it builds

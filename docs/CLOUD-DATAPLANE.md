@@ -743,11 +743,18 @@ document starts lying after an upgrade.
   with a tick.
 - **Compaction**: a separate per-tenant loop runs the library's additive
   compactor at its default level intervals (30 seconds, 5 minutes, 1 hour),
-  with an initial pass at startup. Each level publishes at most one merged
-  object per pass, reading at most 256 source objects and 64 MiB. Source
-  objects remain intact; this reduces restore downloads without deleting
-  history. Errors retry on the next interval and do not delay WAL shipping
-  or other tenants. Drain waits for an active pass before retiring storage.
+  with startup spread over the first 30 seconds and at most four passes
+  active across the process. Each level publishes at most one merged object
+  per pass, reading at most 256 source objects and 64 MiB. The loop discovers
+  each destination's latest transaction once, then keeps one progress record
+  per level. The shipper reports successful L0 progress, so an idle pass
+  makes no object-store requests and a new write lists only the source tail.
+  An ambiguous upload failure invalidates the destination progress; the next
+  pass reads it back before choosing a new object key. Restart also rebuilds
+  this in-memory state from storage. Source objects remain intact; this reduces
+  restore downloads without deleting history. Errors retry on the next
+  interval and do not delay WAL shipping. Drain cancels queued passes and
+  waits for active passes before retiring storage.
 - **Restore**: on provisioning, before any init, at `TXID(0)` — meaning
   "whatever is latest". Each restore downloads up to eight segments
   concurrently with its own permits, so a slow tenant cannot occupy another
@@ -1260,6 +1267,12 @@ converge, its drain — ran through resources every other tenant needed.
   actually finished. Offboarding then removes the local directory under a
   tracked job before remote collection can begin, including when a restart
   drain was already underway.
+- **Hosted network maintenance shares addressing DNS caches.** Each tenant
+  keeps its own endpoint and identity, while lookups of common relay hosts
+  reuse one resolver. Hosted nodes omit LAN gateway and captive-portal probes;
+  QUIC discovery and HTTPS relay fallback remain enabled. Endpoint binds run
+  under independent tracing roots so Iroh's async span lifetime cannot attach
+  another tenant's endpoint context to every background event.
 - **Restarts back off.** Re-provisioning discards the local database and
   replays the whole replica stream, so a tenant whose standing loops keep
   dying bought a full restore every poll — object-store egress and
