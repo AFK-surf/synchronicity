@@ -62,6 +62,10 @@ type Owner {
 /// Every Workspace org holds exactly one network, and this is its name.
 const default_network = "default"
 
+/// Comma's Drive binding names this space before any device publishes files.
+/// The hosted node must retain it so a new Workspace accepts its first write.
+pub const default_space = "comma-drive"
+
 /// The name a minted key carries when the caller gives none. Comma's backend is
 /// the one holder, so the name only has to say which key this is in the
 /// org's list beside keys people minted.

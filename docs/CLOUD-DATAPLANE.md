@@ -221,6 +221,10 @@ org:
 - `device` is present once the data plane has registered a key (below), so
   a restarted, disk-less data plane can tell "network I have never joined"
   from "network whose identity I must recover" (§5.3).
+- `bootstrap_spaces` declares namespaces to retain before any file exists.
+  Comma-managed networks receive `["comma-drive"]`, derived from their
+  Workspace mapping; generic networks receive `[]`. Older documents may omit
+  this field. Write requests cannot add namespaces to it.
 - `collect` names offboarded networks whose retention hold (§6) has run
   out — this data plane's instruction to delete what *it* stored. Scoped
   the same way the network list is, from the owner stamped on the queue row
@@ -539,10 +543,12 @@ and ensure a replica exists for each —
 node.add_replica(space, policy_from_control_plane, grace, budget_share, None)
 ```
 
-The enumeration is `store().known_spaces()` — every space any origin has
-published entries for — run on the reconciler's tick. A space that appears
-between ticks waits one interval, which costs latency on a new space and
-nothing else.
+The enumeration combines the control plane's `bootstrap_spaces`, existing
+replicas, and `store().known_spaces()` (spaces with published entries).
+Declared spaces are considered first, within the same replica ceiling, so
+an empty Comma Workspace can accept its first cloud write without an online
+customer device. Existing empty replicas still receive policy updates.
+A space that appears between reconciler ticks waits one interval.
 
 Replicas are added and **never automatically removed**. Removal is the
 wrong tool twice over: `remove_replica` without `--pin-held` releases the

@@ -33,6 +33,10 @@ pub struct HostedNetwork {
     /// `current` or `forever`.
     #[serde(default = "default_retention")]
     pub retention: String,
+    /// Namespaces the control plane requires even before any member has
+    /// published a file. A write request never adds to this set.
+    #[serde(default)]
+    pub bootstrap_spaces: Vec<String>,
     /// The device this service has already registered, when it has.
     #[serde(default)]
     pub device: Option<HostedDevice>,
@@ -372,6 +376,7 @@ mod tests {
         // A network with no device yet is one never joined — the field's whole
         // purpose (§3.3).
         assert!(desired.networks[1].device.is_none());
+        assert!(desired.networks[1].bootstrap_spaces.is_empty());
         assert_eq!(
             desired.networks[1].replica_policy(),
             synch_store::ReplicaPolicy::Current
@@ -386,6 +391,7 @@ mod tests {
             domain: "b.a.example".into(),
             budget_bytes: 0,
             retention: "eternal".into(),
+            bootstrap_spaces: Vec::new(),
             device: None,
         };
         assert_eq!(

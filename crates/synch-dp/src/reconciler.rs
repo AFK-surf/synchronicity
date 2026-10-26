@@ -1222,6 +1222,7 @@ mod tests {
                 domain: "prod.acme.example".into(),
                 budget_bytes: 0,
                 retention: "current".into(),
+                bootstrap_spaces: Vec::new(),
                 device: None,
             }],
         };
@@ -1280,6 +1281,7 @@ mod tests {
                 domain: "acme.example".into(),
                 budget_bytes: 0,
                 retention: "current".into(),
+                bootstrap_spaces: Vec::new(),
                 device: None,
             }],
         };
@@ -1337,6 +1339,7 @@ mod tests {
             domain: "acme.example".into(),
             budget_bytes: 0,
             retention: "current".into(),
+            bootstrap_spaces: Vec::new(),
             device: None,
         };
         assert!(safe.names_are_safe());
@@ -1746,6 +1749,7 @@ mod tests {
             domain: format!("{org}.example"),
             budget_bytes: 0,
             retention: "current".into(),
+            bootstrap_spaces: Vec::new(),
             device: None,
         }
     }

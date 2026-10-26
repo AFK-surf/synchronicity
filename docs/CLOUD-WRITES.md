@@ -651,6 +651,11 @@ creating one is a larger act than putting a file in it, and the replicated-
 spaces ceiling (CLOUD-DATAPLANE §9.1) exists precisely because "how many
 spaces" is a number this service should not let a request choose.
 
+The control plane's `bootstrap_spaces` also establishes a managed namespace
+before it contains files (CLOUD-DATAPLANE §4.5). In particular, Comma's
+`comma-drive` is retained before its first write, without a customer device
+having to publish a file first.
+
 ### 6.3 What a commit is, precisely
 
 The engine seam (§7), which is the socket runtime's `TreeWriter` made public,

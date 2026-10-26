@@ -956,6 +956,7 @@ impl Harness {
             domain: APEX.into(),
             budget_bytes: 0,
             retention: "current".into(),
+            bootstrap_spaces: Vec::new(),
             device: None,
         };
 

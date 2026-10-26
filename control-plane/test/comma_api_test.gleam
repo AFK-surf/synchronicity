@@ -3,8 +3,10 @@
 
 import api/auth_api
 import api/browse_api
+import api/middleware
 import api/reads
 import api/router
+import auth/dataplane_key
 import config
 import email/mailer
 import fixtures.{tmp_db}
@@ -787,6 +789,40 @@ pub fn provisioning_enables_cloud_features_and_places_new_network_test() {
       [],
     )
     == 1
+
+  // The first cloud write must not depend on a Mac publishing a file first.
+  assert count(env, "SELECT count(*) FROM devices", []) == 0
+  let assert Ok(conn) = db.open_primary(env.db_path)
+  let assert Ok(#(token, _prefix)) =
+    dataplane_key.create(
+      conn,
+      id.new(),
+      "fleet",
+      "dp-comma",
+      None,
+      middleware.now_unix(),
+    )
+  sqlite.close(conn)
+  let desired =
+    router.handle(
+      simulate.request(Get, "/dp/v1/networks")
+        |> simulate.header("authorization", "Bearer " <> token),
+      env.ctx,
+    )
+  assert desired.status == 200
+  let decoder = {
+    use spaces <- decode.field(
+      "networks",
+      decode.list(decode.field(
+        "bootstrap_spaces",
+        decode.list(decode.string),
+        decode.success,
+      )),
+    )
+    decode.success(spaces)
+  }
+  assert json.parse(simulate.read_body(desired), decoder)
+    == Ok([["comma-drive"]])
 }
 
 pub fn backfill_reenables_features_preserves_placement_and_cancels_collection_test() {

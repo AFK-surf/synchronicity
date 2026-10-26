@@ -46,7 +46,7 @@ pub struct Coverage {
 /// it is not a tenant with a lot of shares, and the error-level log says so.
 const MAX_REPLICATED_SPACES: usize = 4096;
 
-/// Adds a replica for every space the network publishes.
+/// Adds a replica for every published or control-plane-declared space.
 ///
 /// Replicas are added and **never removed here**. Removing one releases its
 /// holds immediately, bypassing the grace period, so auto-removing on "the
@@ -73,9 +73,21 @@ async fn ensure_replicas_capped(
     let budget = network.budget_bytes;
     let node = node.clone();
     let tenant = network.key();
+    let bootstrap_spaces = network.bootstrap_spaces.clone();
     synch_core::offload(move || {
-        let spaces = node.store().known_spaces()?;
         let existing: Vec<synch_store::ReplicaRow> = node.store().replicas()?;
+        // An empty managed namespace cannot announce itself through file
+        // entries. Retain the control plane's declared spaces first so the
+        // first cloud write can pass admission without an online customer
+        // device. Existing empty replicas still receive policy changes.
+        let mut spaces = bootstrap_spaces;
+        spaces.extend(existing.iter().map(|replica| replica.space.clone()));
+        spaces.extend(node.store().known_spaces()?);
+        let mut seen = std::collections::HashSet::new();
+        spaces.retain(|space| seen.insert(space.clone()));
+        for space in &spaces {
+            synch_core::validate_space(space)?;
+        }
         // Decided before the loop and applied inside it as a stop rather than
         // as a filter over the result: a cap after the work is not a cap on
         // the work (DESIGN §12).
@@ -247,6 +259,7 @@ mod tests {
             domain: "prod.acme.example".into(),
             budget_bytes: 0,
             retention: "current".into(),
+            bootstrap_spaces: vec!["empty".into(), "empty".into()],
             device: None,
         };
 
@@ -266,6 +279,7 @@ mod tests {
             "the ceiling holds, and it holds on the first pass rather than \
              after the rows are already written"
         );
+        assert!(node.store().replica("empty").unwrap().is_some());
 
         // And it goes on holding: a second pass must not creep past it one
         // replica at a time, which is what a ceiling counted against the
@@ -281,7 +295,18 @@ mod tests {
         ensure_replicas_capped(&node, &network, 8)
             .await
             .expect("the third pass runs");
-        assert_eq!(replicas(node.clone()).await, 3);
+        assert_eq!(replicas(node.clone()).await, 4);
+
+        // Declared spaces remain retained if omitted by a later document,
+        // and their policy still converges while they contain no entries.
+        let mut changed = network.clone();
+        changed.bootstrap_spaces.clear();
+        changed.retention = "forever".into();
+        changed.budget_bytes = 1024;
+        ensure_replicas_capped(&node, &changed, 8).await.unwrap();
+        let empty = node.store().replica("empty").unwrap().unwrap();
+        assert_eq!(empty.retention, synch_store::ReplicaPolicy::Forever);
+        assert_eq!(empty.budget, Some(1024));
 
         node.shutdown().await.expect("the node shuts down");
     }

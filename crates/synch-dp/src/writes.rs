@@ -1541,18 +1541,17 @@ mod tests {
             .await
             .unwrap();
         let node = Node::open(NodeConfig::loopback(dir.path())).await.unwrap();
-        let n = node.clone();
-        synch_core::offload(move || {
-            n.add_replica(
-                "docs",
-                synch_store::ReplicaPolicy::Current,
-                None,
-                None,
-                None,
-            )
-        })
-        .await
+        // Exercise the real bootstrap path: no entries, sources, peers, or
+        // manually seeded replicas. The control plane declares the initial
+        // namespace, and normal convergence must make the first write work.
+        let network = serde_json::from_value(serde_json::json!({
+            "org": "acme", "network": "prod", "domain": "prod.acme.example",
+            "bootstrap_spaces": ["docs"]
+        }))
         .unwrap();
+        crate::spaces::ensure_replicas(&node, &network)
+            .await
+            .unwrap();
         (dir, node)
     }
 
@@ -1636,10 +1635,10 @@ mod tests {
         node.shutdown().await.unwrap();
     }
 
-    /// A whole write round-trips: `put`, frames under credit, `commit`, and
-    /// the version is readable back as this node's own.
+    /// The first write to an empty declared space round-trips: `put`, frames
+    /// under credit, `commit`, and the hosted node's version is readable.
     #[tokio::test(flavor = "multi_thread")]
-    async fn a_write_publishes_the_hosted_nodes_own_version() {
+    async fn the_first_write_to_a_declared_empty_space_publishes() {
         let _scope = synch_core::BlockingScope::enter();
         let (_dir, node) = tenant().await;
         let (down, mut up, _task) = session(&node, limits());

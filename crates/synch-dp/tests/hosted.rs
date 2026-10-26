@@ -238,6 +238,7 @@ async fn a_hosted_tenant_durably_replicates_what_a_customer_publishes() {
         domain: APEX.into(),
         budget_bytes: 0,
         retention: "current".into(),
+        bootstrap_spaces: vec!["empty".into()],
         device: None,
     };
 
@@ -300,6 +301,17 @@ async fn a_hosted_tenant_durably_replicates_what_a_customer_publishes() {
     )
     .await
     .expect("the tenant provisions");
+    assert!(
+        tenant
+            .node()
+            .unwrap()
+            .store()
+            .replica("empty")
+            .unwrap()
+            .is_some(),
+        "the declared empty space is retained before provisioning returns, \
+         without a customer publish or a later reconciliation pass"
+    );
     assert_eq!(
         cp_state.lock().unwrap().registered.as_deref(),
         Some(tenant_key.to_z32().as_str()),

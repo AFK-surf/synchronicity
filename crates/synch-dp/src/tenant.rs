@@ -313,6 +313,11 @@ impl Tenant {
         // opens with the same call for the same reason.
         node.readopt_self_on_startup().await?;
 
+        // Declare empty managed spaces before the browse and write tunnels
+        // attach. Otherwise a newly provisioned Workspace can look writable
+        // while its first write waits for the next reconciliation pass.
+        spaces::ensure_replicas(&node, &self.network).await?;
+
         let compaction_client = config.db_client(&self.network.org, &self.network.network)?;
         let replicator = Replicator::start(
             &node.store().db_path(),
@@ -994,6 +999,7 @@ mod tests {
                 domain: "prod.acme.example".into(),
                 budget_bytes: 0,
                 retention: "current".into(),
+                bootstrap_spaces: Vec::new(),
                 device: None,
             },
             state: State::Running,

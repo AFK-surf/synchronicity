@@ -23,6 +23,7 @@
 //// `Reads`, the rest take `AuthContext` because they write.
 
 import api/auth_api.{type AuthContext, with_db}
+import api/comma_api
 import api/common.{
   audit, body_decoder, constraint_response, db_error, ok_json, text_at,
   transaction, zone_mutation,
@@ -168,7 +169,9 @@ fn document(
   let networks =
     sqlite.query(
       conn,
-      "SELECT o.slug, n.name, n.id
+      "SELECT o.slug, n.name, n.id,
+              EXISTS (SELECT 1 FROM comma_workspace_orgs cw
+                      WHERE cw.network_id = n.id AND cw.org_id = o.id)
        FROM networks n JOIN orgs o ON o.id = n.org_id
        WHERE n.cloud_hosted = 1 AND n.cloud_dp_id = ?
        ORDER BY o.slug, n.name",
@@ -230,6 +233,16 @@ fn document(
                 #("domain", json.string(network <> "." <> slug <> "." <> apex)),
                 #("budget_bytes", json.int(default_budget_bytes)),
                 #("retention", json.string(default_retention)),
+                #(
+                  "bootstrap_spaces",
+                  json.array(
+                    case list.drop(row, 3) {
+                      [VInt(1), ..] -> [comma_api.default_space]
+                      _ -> []
+                    },
+                    json.string,
+                  ),
+                ),
                 #("device", device_json(hosted, text_at(row, 2))),
               ])
             }),

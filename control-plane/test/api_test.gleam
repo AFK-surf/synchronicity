@@ -3006,6 +3006,8 @@ pub fn hosting_is_off_until_an_admin_enables_it_test() {
   assert string.contains(after, "prod")
   // The membership domain, verbatim what the node is configured with.
   assert string.contains(after, "prod.acme.sync.test")
+  // A generic hosted network does not acquire Comma's managed namespace.
+  assert string.contains(after, "\"bootstrap_spaces\":[]")
 
   // And off again removes it, which is what starts a teardown.
   assert host_network(h, "acme", "prod", False) == 200
