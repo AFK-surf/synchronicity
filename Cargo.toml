@@ -75,7 +75,9 @@ range-collections = "0.4.6"
 # panicking on the first TLS handshake. The provider is installed at each
 # binary's entry point instead (`synch_net::tls`), and before `main` on test
 # builds via `ctor`.
-reqwest = { version = "0.13.4", default-features = false, features = ["rustls-no-provider", "stream"] }
+# Keep HTTP/2 when disabling reqwest's default TLS provider. Shared hosted
+# clients can multiplex concurrent DNS/control requests when servers support it.
+reqwest = { version = "0.13.4", default-features = false, features = ["rustls-no-provider", "stream", "http2"] }
 rustls = { version = "0.23.43", default-features = false, features = ["aws-lc-rs"] }
 # The host's trust store, in one crate for every TLS client here: the macOS
 # and Windows platform APIs, and `/etc/ssl` (honouring `SSL_CERT_FILE` and

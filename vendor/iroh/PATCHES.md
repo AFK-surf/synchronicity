@@ -47,6 +47,14 @@ probe plan no longer clears the last successful report. Major network changes
 still invalidate both the connection and report, and failed connections are
 still replaced. Full scans retain their HTTPS probes and fallback behavior.
 
+The HTTPS probe plan failed to cancel its remaining attempts after a relay had
+answered successfully. Each attempt constructs a new HTTP client and TLS
+connection. Success now cancels only that relay's remaining attempts; failures
+leave its retries available, and other relays keep their own retry groups.
+The real HTTP regression uses one immediately successful relay and one that
+fails its first request. Before the fix both receive three requests; after it
+they receive one and two respectively, with one successful report each.
+
 Regression tests in `src/socket/transports/relay/actor.rs` cover a buffered
 matching pong after a scheduling delay in the real send loop, a pong behind
 unrelated responses, an exhausted cooperative task budget, missing or incorrect
@@ -82,5 +90,6 @@ cargo test --manifest-path vendor/iroh/Cargo.toml \
 ```
 
 Remove these patches when upstream preserves buffered pongs across scheduler
-delays and reuses healthy discovery connections while continuing to observe
-address changes, with equivalent bounded processing and regressions.
+delays, reuses healthy discovery connections while continuing to observe
+address changes, and stops retrying successful relay probes, with equivalent
+bounded processing and regressions.

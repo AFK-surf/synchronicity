@@ -382,6 +382,7 @@ impl Actor {
             let proto = probe_set.proto();
             for (delay, relay) in probe_set.params() {
                 let probe_token = set_token.child_token();
+                let completed_set = set_token.clone();
 
                 let fut = probe_token.run_until_cancelled_owned(time::timeout(
                     PROBES_TIMEOUT,
@@ -398,7 +399,12 @@ impl Actor {
                     async move {
                         let res = fut.await;
                         let res = match res {
-                            Some(Ok(Ok(report))) => Ok(report),
+                            Some(Ok(Ok(report))) => {
+                                // One successful measurement satisfies this relay.
+                                // Other relays retain their independent retry groups.
+                                completed_set.cancel();
+                                Ok(report)
+                            }
                             Some(Ok(Err(err))) => {
                                 warn!("probe failed: {:#}", err);
                                 Err(e!(ProbesError::ProbeFailure, err))
@@ -893,6 +899,68 @@ mod tests {
     use n0_tracing_test::traced_test;
 
     use super::{super::test_utils, *};
+
+    #[tokio::test]
+    async fn successful_https_probe_cancels_only_its_own_retries() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        async fn relay(
+            failures: usize,
+        ) -> (RelayConfig, Arc<AtomicUsize>, tokio::task::JoinHandle<()>) {
+            let calls = Arc::new(AtomicUsize::new(0));
+            let counted = calls.clone();
+            let app = axum::Router::new().fallback(move || {
+                let counted = counted.clone();
+                async move {
+                    if counted.fetch_add(1, Ordering::Relaxed) < failures {
+                        axum::http::StatusCode::SERVICE_UNAVAILABLE
+                    } else {
+                        axum::http::StatusCode::NO_CONTENT
+                    }
+                }
+            });
+            let listener = tokio::net::TcpListener::bind((Ipv4Addr::LOCALHOST, 0))
+                .await
+                .unwrap();
+            let url = format!("http://{}/", listener.local_addr().unwrap())
+                .parse()
+                .unwrap();
+            let serving = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+            (RelayConfig::new(url, None), calls, serving)
+        }
+
+        let (fast, fast_calls, fast_server) = relay(0).await;
+        let (retrying, retry_calls, retry_server) = relay(1).await;
+        let (client, mut reports) = Client::new(
+            None,
+            RelayMap::from_iter([fast, retrying]),
+            std::collections::BTreeSet::from([Probe::Https]),
+            false,
+            IfStateDetails::fake(),
+            CancellationToken::new(),
+            SocketState {
+                quic_client: None,
+                dns_resolver: DnsResolver::new(),
+            },
+            iroh_relay::tls::make_dangerous_client_config(),
+        );
+        let mut successes = 0;
+        time::timeout(Duration::from_secs(4), async {
+            while let Some(result) = reports.recv().await {
+                if matches!(result, ProbeFinished::Regular(Ok(_))) {
+                    successes += 1;
+                }
+            }
+        })
+        .await
+        .expect("the bounded probe plan must finish");
+        drop(client);
+        fast_server.abort();
+        retry_server.abort();
+        assert_eq!(fast_calls.load(Ordering::Relaxed), 1);
+        assert_eq!(retry_calls.load(Ordering::Relaxed), 2);
+        assert_eq!(successes, 2, "one successful measurement per relay");
+    }
 
     #[tokio::test]
     async fn test_measure_https_latency() -> Result {
