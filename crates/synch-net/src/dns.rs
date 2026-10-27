@@ -1091,7 +1091,13 @@ impl DnssecResolver {
             handle: hickory_resolver::net::dnssec::DnssecDnsHandle::with_trust_anchor(
                 handle,
                 anchors.clone(),
-            ),
+            )
+            // A failed dependency fetch can leave a parent RRset marked
+            // bogus even after DoH recovers. Hickory otherwise caches that
+            // verdict for the record's full, unvalidated TTL (often an hour
+            // for DNSKEY). Keep the failure briefly, then validate again;
+            // successful proofs retain their normal TTL. RFC 9520 §3.4.
+            .negative_validation_ttl(Duration::from_secs(1)..=Duration::from_secs(5)),
             // The same anchor set the live validator uses, kept so that the
             // DNSSEC chain a log entry carries is checked against the trust
             // this resolver actually holds — "an override is a different

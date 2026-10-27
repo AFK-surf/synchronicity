@@ -923,6 +923,12 @@ HTTP/1 heartbeat returns its connection to the pool instead of forcing another
 TLS handshake. Job-completion wakes share the latest immutable desired-key
 snapshot; they do not copy every tenant name again for each completed job.
 
+DNSSEC validation failures are cached for at most five seconds. A failed
+dependency lookup can make a dependent RRset fail validation; retaining that
+verdict for the record's full TTL would keep readers detached after DoH
+recovers. Each retry still validates the complete chain, and successful proofs
+keep their normal cache lifetime.
+
 Each store keeps at most 64 prepared SQLite statements; their bindings and
 results are evaluated afresh. The shared DNS resolver retains at most 4096
 successful offline transparency-proof verifications, keyed by the complete

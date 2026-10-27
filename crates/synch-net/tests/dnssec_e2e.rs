@@ -148,3 +148,142 @@ async fn a_record_spliced_in_another_class_is_signed_by_nobody() {
     );
     server.abort();
 }
+
+/// A failed fetch of the root key makes dependent RRsets bogus in hickory's
+/// response. Its validation cache must not preserve that transient verdict for
+/// the signed records' full TTL after the endpoint recovers.
+#[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+async fn a_transient_chain_failure_expires_without_restarting_the_resolver() {
+    use hickory_resolver::proto::{
+        dnssec::rdata::DNSSECRData,
+        op::Message,
+        rr::{rdata::TXT, Name, RData, Record, RecordType},
+        serialize::binary::{BinDecodable, BinDecoder},
+    };
+    use std::sync::{
+        atomic::{AtomicU8, Ordering},
+        Arc,
+    };
+    use synch_net::sim::SimDelegation;
+    use tokio::io::{AsyncReadExt, AsyncWriteExt};
+
+    let records = common::member_records();
+    let ladder = SimDelegation::new("cluster.example", records.clone());
+    let anchor = common::write(&ladder.root.anchor_record());
+    let owner = Name::from_utf8("_synchronicity.cluster.example.").unwrap();
+    // Sign once: changing the signature on every response would change the
+    // cache key and conceal the failure being tested.
+    let mut answers = ladder.apex.signed_txt(
+        owner.clone(),
+        &records[0],
+        time::OffsetDateTime::now_utc() - time::Duration::hours(1),
+    );
+    for link in ladder.chain().links.iter().skip(1) {
+        let mut decoder = BinDecoder::new(&link.rrs);
+        while !decoder.is_empty() {
+            answers.push(Record::read(&mut decoder).unwrap());
+        }
+    }
+    let answers = Arc::new(answers);
+    // 0: root key fetch fails; 1: healthy chain; 2: unsigned TXT substitution.
+    let phase = Arc::new(AtomicU8::new(0));
+    let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+    let url = format!("http://{}/dns-query", listener.local_addr().unwrap());
+    let server_phase = phase.clone();
+    let server = tokio::spawn(async move {
+        loop {
+            let Ok((mut stream, _)) = listener.accept().await else {
+                return;
+            };
+            let answers = answers.clone();
+            let phase = server_phase.clone();
+            tokio::spawn(async move {
+                let mut raw = Vec::new();
+                let mut buf = [0; 4096];
+                let body = loop {
+                    let n = stream.read(&mut buf).await.unwrap();
+                    if n == 0 {
+                        return;
+                    }
+                    raw.extend_from_slice(&buf[..n]);
+                    if let Some(split) = raw.windows(4).position(|w| w == b"\r\n\r\n") {
+                        let head = String::from_utf8_lossy(&raw[..split]).to_ascii_lowercase();
+                        let length: usize = head
+                            .lines()
+                            .find_map(|line| line.strip_prefix("content-length:"))
+                            .unwrap()
+                            .trim()
+                            .parse()
+                            .unwrap();
+                        if raw.len() >= split + 4 + length {
+                            break &raw[split + 4..split + 4 + length];
+                        }
+                    }
+                };
+                let request = Message::from_vec(body).unwrap();
+                let query = request.queries[0].clone();
+                let phase = phase.load(Ordering::SeqCst);
+                if phase == 0 && query.name().is_root() && query.query_type() == RecordType::DNSKEY
+                {
+                    stream
+                        .write_all(b"HTTP/1.1 503 Unavailable\r\ncontent-length: 0\r\nconnection: close\r\n\r\n")
+                        .await
+                        .unwrap();
+                    return;
+                }
+                let mut response = request.into_response();
+                for record in answers.iter().filter(|record| {
+                    record.name == *query.name()
+                        && (record.record_type() == query.query_type()
+                            || matches!(&record.data, RData::DNSSEC(DNSSECRData::RRSIG(sig))
+                                if sig.input().type_covered == query.query_type()))
+                }) {
+                    let record = if phase == 2 && record.record_type() == RecordType::TXT {
+                        Record::from_rdata(
+                            record.name.clone(),
+                            record.ttl,
+                            RData::TXT(TXT::new(vec!["unsigned replacement".to_string()])),
+                        )
+                    } else {
+                        record.clone()
+                    };
+                    response.add_answer(record);
+                }
+                let body = response.to_vec().unwrap();
+                stream
+                    .write_all(format!("HTTP/1.1 200 OK\r\ncontent-type: application/dns-message\r\ncontent-length: {}\r\nconnection: close\r\n\r\n", body.len()).as_bytes())
+                    .await
+                    .unwrap();
+                stream.write_all(&body).await.unwrap();
+            });
+        }
+    });
+    let config = options(url, anchor.path());
+    let resolver = DnssecResolver::with_options(&config).unwrap();
+    resolver
+        .lookup_txt_ungated("cluster.example")
+        .await
+        .expect_err("the chain cannot validate while the root key is unavailable");
+    phase.store(1, Ordering::SeqCst);
+    DnssecResolver::with_options(&config)
+        .unwrap()
+        .lookup_txt_ungated("cluster.example")
+        .await
+        .expect("a fresh resolver proves that the endpoint has recovered");
+    resolver
+        .lookup_txt_ungated("cluster.example")
+        .await
+        .expect_err("the failed validation is briefly cached");
+    tokio::time::sleep(std::time::Duration::from_secs(6)).await;
+    let recovered = resolver
+        .lookup_txt_ungated("cluster.example")
+        .await
+        .expect("a transient failure must expire before the records' 300-second TTL");
+    assert_eq!(recovered.records, records);
+    phase.store(2, Ordering::SeqCst);
+    resolver
+        .lookup_txt_ungated("cluster.example")
+        .await
+        .expect_err("recovery must still reject an unsigned substitution");
+    server.abort();
+}
