@@ -508,7 +508,9 @@ impl Client {
                 let dns_resolver = self.socket_state.dns_resolver.clone();
                 let quic_client = quic_client.clone();
                 let relay_url = relay.url.clone();
-                let inner_token = cancel_v4.child_token();
+                // A retained connection must keep watching address changes
+                // after we cancel the surplus probes in this report.
+                let inner_token = shutdown_token.child_token();
                 v4_buf.spawn(
                     cancel_v4
                         .child_token()
@@ -525,7 +527,7 @@ impl Client {
                 let dns_resolver = self.socket_state.dns_resolver.clone();
                 let quic_client = quic_client.clone();
                 let relay_url = relay.url.clone();
-                let inner_token = cancel_v6.child_token();
+                let inner_token = shutdown_token.child_token();
                 v6_buf.spawn(
                     cancel_v6
                         .child_token()
@@ -857,7 +859,9 @@ async fn run_probe_v4(
         latency: conn.rtt(PathId::ZERO).unwrap_or_default(),
     };
 
-    let observer = Watchable::new(None);
+    // The stream only yields address changes after the report consumed above.
+    // Seed the cache now so a stable address can reuse this connection.
+    let observer = Watchable::new(Some(report.clone()));
     let endpoint = relay.url.clone();
     let handle = task::spawn(shutdown_token.run_until_cancelled_owned({
         let conn = conn.clone();
@@ -926,7 +930,9 @@ async fn run_probe_v6(
         latency: conn.rtt(PathId::ZERO).unwrap_or_default(),
     };
 
-    let observer = Watchable::new(None);
+    // The stream only yields address changes after the report consumed above.
+    // Seed the cache now so a stable address can reuse this connection.
+    let observer = Watchable::new(Some(report.clone()));
     let endpoint = relay.url.clone();
     let handle = task::spawn(shutdown_token.run_until_cancelled_owned({
         let observer = observer.clone();
@@ -1007,6 +1013,167 @@ mod tests {
 
     use super::*;
     use crate::net_report::probes::Probe;
+
+    fn qad_test_client(ip: std::net::IpAddr, relays: RelayMap) -> Result<(Client, noq::Endpoint)> {
+        let ep = noq::Endpoint::client(SocketAddr::new(ip, 0)).anyerr()?;
+        let options = Options::new(
+            CaTlsConfig::insecure_skip_verify()
+                .client_config(default_provider())
+                .unwrap(),
+        )
+        .quic_config(Some(QuicConfig {
+            ep: ep.clone(),
+            client_config: iroh_relay::tls::make_dangerous_client_config(),
+            ipv4: ip.is_ipv4(),
+            ipv6: ip.is_ipv6(),
+        }))
+        .net_report_config(NetReportConfig::minimal());
+        let client = Client::new(DnsResolver::new(), relays, options, Default::default());
+        Ok((client, ep))
+    }
+
+    async fn stable_qad_reports_reuse_connection(ip: std::net::IpAddr) -> Result<()> {
+        let mut config = iroh_relay::server::testing::server_config();
+        config.relay = None;
+        config.quic.as_mut().unwrap().bind_addr = SocketAddr::new(ip, 0);
+        let server = iroh_relay::server::Server::spawn(config).await?;
+        let addr = server.quic_addr().unwrap();
+        let relay = RelayConfig::new(
+            format!("https://localhost:{}/", addr.port())
+                .parse()
+                .unwrap(),
+            Some(iroh_relay::RelayQuicConfig::new(addr.port())),
+        );
+        let (mut client, ep) = qad_test_client(ip, RelayMap::from(relay))?;
+        let interfaces = IfStateDetails {
+            have_v4: ip.is_ipv4(),
+            have_v6: ip.is_ipv6(),
+        };
+        let shutdown = CancellationToken::new();
+        let mut observed = None;
+        for _ in 0..6 {
+            let report = client
+                .get_report(interfaces.clone(), false, shutdown.child_token())
+                .await;
+            let address = if ip.is_ipv4() {
+                report.global_v4.map(SocketAddr::V4)
+            } else {
+                report.global_v6.map(SocketAddr::V6)
+            };
+            assert!(address.is_some(), "discovery must report an address");
+            assert_eq!(*observed.get_or_insert(address), address);
+            // Let the address watcher and server finish processing before the
+            // next report: reuse must not depend on a second address update.
+            tokio::time::sleep(Duration::from_millis(100)).await;
+        }
+        assert_eq!(
+            server.metrics().server.qad_connections.get(),
+            1,
+            "an unchanged address must reuse the established discovery connection"
+        );
+
+        client
+            .get_report(interfaces.clone(), true, shutdown.child_token())
+            .await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            server.metrics().server.qad_connections.get(),
+            2,
+            "a full refresh must still establish a fresh discovery connection"
+        );
+        let cached = if ip.is_ipv4() {
+            client.qad_conns.v4.as_ref().unwrap()
+        } else {
+            client.qad_conns.v6.as_ref().unwrap()
+        };
+        cached
+            .1
+            .conn
+            .close(0u32.into(), b"test lost discovery connection");
+        client
+            .get_report(interfaces, false, shutdown.child_token())
+            .await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            server.metrics().server.qad_connections.get(),
+            3,
+            "a closed discovery connection must be replaced"
+        );
+
+        shutdown.cancel();
+        client.qad_conns.clear();
+        drop(client);
+        ep.wait_idle().await;
+        server.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn stable_qad_ipv4_reports_reuse_connection() -> Result<()> {
+        stable_qad_reports_reuse_connection(Ipv4Addr::LOCALHOST.into()).await
+    }
+
+    #[tokio::test]
+    async fn stable_qad_ipv6_reports_reuse_connection() -> Result<()> {
+        stable_qad_reports_reuse_connection(std::net::Ipv6Addr::LOCALHOST.into()).await
+    }
+
+    #[tokio::test]
+    async fn cached_qad_observes_address_changes_after_surplus_probes_cancel() -> Result<()> {
+        let (server, relay) = test_utils::relay().await;
+        // A nonresponding relay keeps a surplus probe pending until the first
+        // successful probe satisfies the requested report count.
+        let silent = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).anyerr()?;
+        let silent_addr = silent.local_addr().anyerr()?;
+        let silent_relay = RelayConfig::new(
+            format!("https://{silent_addr}/").parse().unwrap(),
+            Some(iroh_relay::RelayQuicConfig::new(silent_addr.port())),
+        );
+        let (mut client, ep) = qad_test_client(
+            Ipv4Addr::LOCALHOST.into(),
+            RelayMap::from_iter([relay, silent_relay]),
+        )?;
+        let shutdown = CancellationToken::new();
+        let reports = client
+            .spawn_qad_probes(
+                &IfStateDetails {
+                    have_v4: true,
+                    have_v6: false,
+                },
+                1,
+                true,
+                shutdown.child_token(),
+            )
+            .await;
+        assert_eq!(reports.len(), 1);
+
+        let mut updates = client.qad_conns.watch_v4();
+        let old_addr = ep.local_addr().anyerr()?;
+        ep.rebind(std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).anyerr()?)
+            .anyerr()?;
+        let new_addr = ep.local_addr().anyerr()?;
+        assert_ne!(old_addr, new_addr);
+        let update = time::timeout(Duration::from_secs(3), async {
+            loop {
+                if let Some(Some(report)) = updates.next().await
+                    && report.addr == new_addr
+                {
+                    break report;
+                }
+            }
+        })
+        .await
+        .anyerr()?;
+        assert_eq!(update.addr, new_addr);
+        assert_eq!(server.metrics().server.qad_connections.get(), 1);
+
+        shutdown.cancel();
+        client.qad_conns.clear();
+        drop(client);
+        ep.wait_idle().await;
+        server.shutdown().await?;
+        Ok(())
+    }
 
     #[tokio::test(flavor = "multi_thread")]
     #[traced_test]

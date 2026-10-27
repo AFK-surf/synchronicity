@@ -146,7 +146,7 @@ opt-level = 3
 lto = "thin"
 strip = true
 
-# Keep buffered relay pongs from becoming false timeouts after scheduler delays.
+# Preserve buffered relay pongs and reuse healthy address-discovery connections.
 # See vendor/iroh/PATCHES.md for the upstream base and regression coverage.
 [patch.crates-io]
 iroh = { path = "vendor/iroh" }
