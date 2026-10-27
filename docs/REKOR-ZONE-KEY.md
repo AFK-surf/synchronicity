@@ -1260,6 +1260,15 @@ correctly rather than inverting on the outcome that matters most.
   is cheap only if it is kept as a habit, and without it the reports are
   strictly less useful than they look.
 
+The resolver memoizes successful offline proof verification for identical proof
+records, membership domain, signing zone and live signing-key bytes. The memo
+is bounded to 4096 entries per resolver and is cleared when the pinned log-key
+set changes, including checkpoint-origin restrictions. Every lookup still
+validates the live DNS answers and the membership signature; absence, changed
+proofs, key rotation and DNS failures cannot reuse an older success. The
+offline chain verifier deliberately ignores historical RRSIG validity windows,
+so this memo adds no new time-based authorization assumption.
+
 ## 7. Rollout
 
 Clients ship with `require` as the default from the first release — the

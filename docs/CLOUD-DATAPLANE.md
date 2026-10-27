@@ -918,10 +918,17 @@ deliberately: every store touch of every tenant crosses it), one
 must be — one Sigstore outage should cost one attempt a day, not N), the
 reqwest client, the metrics registry.
 
-The practical v1 ceiling is file descriptors and blocking-pool contention,
-not CPU: **O(hundreds) of networks per data plane**, which one instance
-("scale-to-one", the serverless posture) serves for a long time before
-a second one matters.
+Each store keeps at most 64 prepared SQLite statements; their bindings and
+results are evaluated afresh. The shared DNS resolver retains at most 4096
+successful offline transparency-proof verifications, keyed by the complete
+proof records, membership domain, signing zone and live DNSKEY. It still
+validates every live DNS answer and invalidates the memo when log pins change.
+
+Capacity depends on file descriptors, blocking-pool contention **and sustained
+CPU allowance**. Idle timers, DNS verification and connection maintenance add
+up across hundreds of tenants. On shared CPUs, a healthy startup burst does
+not establish steady-state capacity: measure after every tenant has started
+and across discovery, membership-refresh and maintenance cycles.
 
 Blocking-pool contention is also the thing a hostile tenant reaches for, so
 it is not left to capacity planning alone. `SYNCH_DP_BLOCKING_THREADS` (a

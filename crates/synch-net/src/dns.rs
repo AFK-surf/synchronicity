@@ -626,6 +626,82 @@ pub struct DnssecResolver {
     rekor: RekorPolicy,
     pins: std::sync::Arc<std::sync::Mutex<Pins>>,
     tuf: Option<TufSource>,
+    /// Pure proof verification only. Live DNS answers, their signatures and
+    /// the key that signed membership are still checked on every lookup.
+    proofs: std::sync::Arc<std::sync::Mutex<ProofMemo>>,
+}
+
+/// Successful offline verifications under this resolver's immutable anchors.
+/// No DNS answer or failed verification is cached here. Pin replacement clears
+/// the memo, including changes to a log key's permitted checkpoint origin.
+#[derive(Default)]
+struct ProofMemo {
+    pins: LogKeys,
+    entries: BTreeMap<[u8; 32], VerifiedRecord>,
+    order: std::collections::VecDeque<[u8; 32]>,
+    #[cfg(test)]
+    hits: usize,
+}
+
+const MAX_PROOF_MEMOS: usize = 4096;
+
+impl ProofMemo {
+    fn get(&mut self, pins: &LogKeys, input: &[u8; 32]) -> Option<VerifiedRecord> {
+        self.use_pins(pins);
+        let value = self.entries.get(input)?.clone();
+        #[cfg(test)]
+        {
+            self.hits += 1;
+        }
+        Some(value)
+    }
+
+    fn insert(&mut self, pins: &LogKeys, input: [u8; 32], value: VerifiedRecord) {
+        self.use_pins(pins);
+        if self.entries.contains_key(&input) {
+            return;
+        }
+        if self.entries.len() == MAX_PROOF_MEMOS {
+            if let Some(oldest) = self.order.pop_front() {
+                self.entries.remove(&oldest);
+            }
+        }
+        self.order.push_back(input);
+        self.entries.insert(input, value);
+    }
+
+    fn use_pins(&mut self, pins: &LogKeys) {
+        if self.pins != *pins {
+            self.entries.clear();
+            self.order.clear();
+            self.pins = pins.clone();
+        }
+    }
+}
+
+/// Length-delimited fields bind the memo to every input of `rekor::verify`.
+/// Hash the validated TXT bytes before decoding to avoid repeatedly parsing
+/// the same certificate and chain for every hosted tenant's refresh.
+fn proof_memo_key(key: &ZoneKey<'_>, records: &[String]) -> [u8; 32] {
+    let mut hash = blake3::Hasher::new();
+    // DNS RRsets are unordered. Reassembly orders groups and chunk indexes,
+    // so canonicalize the memo input too, retaining duplicate records: a
+    // repeated chunk is a contradiction, not an interchangeable set member.
+    let mut records: Vec<&str> = records.iter().map(String::as_str).collect();
+    records.sort_unstable();
+    for field in [
+        key.domain.as_bytes(),
+        key.signing_zone.as_bytes(),
+        &key.key_tag.to_be_bytes(),
+        key.dnskey_rdata,
+    ]
+    .into_iter()
+    .chain(records.iter().map(|record| record.as_bytes()))
+    {
+        hash.update(&(field.len() as u64).to_be_bytes());
+        hash.update(field);
+    }
+    *hash.finalize().as_bytes()
 }
 
 /// The transparency-log pin set in force, and whether TUF may move it
@@ -1026,6 +1102,7 @@ impl DnssecResolver {
             rekor: options.rekor_policy(),
             pins: std::sync::Arc::new(std::sync::Mutex::new(pins)),
             tuf,
+            proofs: Default::default(),
         })
     }
 
@@ -1503,9 +1580,34 @@ impl DnssecResolver {
             }
         }
 
+        let key = ZoneKey {
+            domain,
+            signing_zone: &zone_text,
+            key_tag,
+            dnskey_rdata: &dnskey_rdata,
+        };
+        self.verify_proof_records(&name, &records, &key)
+    }
+
+    fn verify_proof_records(
+        &self,
+        name: &str,
+        records: &[String],
+        key: &ZoneKey<'_>,
+    ) -> Result<VerifiedRecord, NetError> {
+        let pins = self.log_keys();
+        let input = proof_memo_key(key, records);
+        let memo = || {
+            self.proofs
+                .lock()
+                .unwrap_or_else(std::sync::PoisonError::into_inner)
+        };
+        if let Some(verified) = memo().get(&pins, &input) {
+            return Ok(verified);
+        }
         let mut candidates = Vec::new();
         let mut malformed: Option<rekor::ProofError> = None;
-        for reassembled in rekor::proofs_from_txt(&records) {
+        for reassembled in rekor::proofs_from_txt(records) {
             match reassembled {
                 Ok(candidate) => candidates.push(candidate),
                 Err(e) => malformed = Some(e),
@@ -1518,32 +1620,32 @@ impl DnssecResolver {
             // for this key".
             return Err(match malformed {
                 Some(e) => NetError::RekorMalformed {
-                    name: name.clone(),
+                    name: name.to_owned(),
                     reason: e.to_string(),
                 },
-                None => absent(),
+                None => NetError::RekorAbsent {
+                    name: name.to_owned(),
+                    key_tag: key.key_tag,
+                },
             });
         }
 
-        let key = ZoneKey {
-            domain,
-            signing_zone: &zone_text,
-            key_tag,
-            dnskey_rdata: &dnskey_rdata,
-        };
         // Every candidate, not just the last: a record's subject is a key
         // set with no selector on the wire, and a zone can legitimately
         // serve more than one record; membership in a verified set decides.
         let candidates = candidates_to_verify(candidates);
         let mut last = None;
         for candidate in &candidates {
-            match rekor::verify(candidate, &key, &self.log_keys(), &self.anchors) {
-                Ok(verified) => return Ok(verified),
+            match rekor::verify(candidate, key, &pins, &self.anchors) {
+                Ok(verified) => {
+                    memo().insert(&pins, input, verified.clone());
+                    return Ok(verified);
+                }
                 Err(e) => last = Some(e),
             }
         }
         Err(rekor_error(
-            &name,
+            name,
             last.expect("a non-empty candidate list yields an error"),
         ))
     }
@@ -2225,6 +2327,139 @@ mod tests {
 
     fn key() -> NodeId {
         SecretKey::generate().public()
+    }
+
+    #[tokio::test]
+    async fn proof_memo_reuses_only_identical_inputs_and_current_pins() {
+        use crate::sim::{SimLog, SimZone};
+
+        let mut zone = SimZone::new(
+            "cluster.example",
+            vec![format!(
+                "v=sync1 id=nas nk={} apex=cluster.example",
+                key().to_z32()
+            )],
+        );
+        let mut log = SimLog::new("rekor.sim");
+        let mut proof = log.publish(&zone, "create");
+        let records = proof.to_txt().unwrap();
+        zone.rekor_txt = records.clone();
+        let anchor = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(anchor.path(), zone.anchor_record()).unwrap();
+        let log_key = tempfile::NamedTempFile::new().unwrap();
+        std::fs::write(log_key.path(), log.key_pem()).unwrap();
+        let rdata = zone.dnskey_rdata();
+        let key = ZoneKey {
+            domain: "cluster.example",
+            signing_zone: "cluster.example.",
+            key_tag: zone.key_tag(),
+            dnskey_rdata: &rdata,
+        };
+        let (url, server) = zone.serve().await;
+        let resolver = DnssecResolver::with_options(&ResolverOptions {
+            doh_url: Some(url),
+            trust_anchor: Some(anchor.path().to_owned()),
+            rekor_key: Some(log_key.path().to_owned()),
+            no_tuf: true,
+            ..Default::default()
+        })
+        .unwrap();
+        // Exercise the whole live lookup twice, including the same resolver
+        // shared by multiple tenant loops. Only offline proof work is reused.
+        resolver.member_set(key.domain).await.unwrap();
+        resolver.clone().member_set(key.domain).await.unwrap();
+        assert_eq!(resolver.proofs.lock().unwrap().hits, 1);
+        let name = rekor_query_name(key.domain);
+        let mut reordered = records.clone();
+        reordered.reverse();
+        resolver
+            .verify_proof_records(&name, &reordered, &key)
+            .unwrap();
+        let hits = || resolver.proofs.lock().unwrap().hits;
+        for changed in [
+            ZoneKey {
+                domain: "sibling.example",
+                ..key
+            },
+            ZoneKey {
+                signing_zone: "other.example",
+                ..key
+            },
+            // A colliding tag must not reuse a different public key's proof.
+            ZoneKey {
+                dnskey_rdata: &[0; 68],
+                ..key
+            },
+        ] {
+            assert!(resolver
+                .verify_proof_records(&name, &records, &changed)
+                .is_err());
+        }
+        assert_eq!(hits(), 2);
+        let mut duplicated = records.clone();
+        duplicated.push(records[0].clone());
+        assert!(resolver
+            .verify_proof_records(&name, &duplicated, &key)
+            .is_err());
+        proof.statement.push(b' ');
+        assert!(resolver
+            .verify_proof_records(&name, &proof.to_txt().unwrap(), &key)
+            .is_err());
+        assert!(resolver.verify_proof_records(&name, &[], &key).is_err());
+        assert_eq!(hits(), 2);
+
+        let pins = resolver.log_keys();
+        *resolver.pins() = Pins::Static(LogKeys::default());
+        assert!(resolver
+            .verify_proof_records(&name, &records, &key)
+            .is_err());
+        // Same key bytes but a newly constrained checkpoint origin also
+        // invalidates a prior success.
+        let constrained = LogKeys::from_keys(vec![pins.keys()[0]
+            .clone()
+            .for_origin("other-log.example".into())]);
+        *resolver.pins() = Pins::Static(constrained);
+        assert!(resolver
+            .verify_proof_records(&name, &records, &key)
+            .is_err());
+        *resolver.pins() = Pins::Static(pins);
+        resolver
+            .verify_proof_records(&name, &records, &key)
+            .unwrap();
+        assert_eq!(hits(), 2, "restored pins must reverify after invalidation");
+
+        // Even a warm proof memo cannot answer without live DNS validation.
+        server.abort();
+        let _ = server.await;
+        assert!(resolver.member_set(key.domain).await.is_err());
+        assert_eq!(hits(), 2);
+    }
+
+    #[test]
+    fn proof_memo_bounds_retained_verifications() {
+        let mut memo = ProofMemo::default();
+        let pins = LogKeys::default();
+        let verified = VerifiedRecord {
+            log_index: 1,
+            tree_size: 2,
+            origin: "test".into(),
+            action: "create".into(),
+        };
+        for i in 0..=MAX_PROOF_MEMOS {
+            let input = *blake3::hash(&i.to_le_bytes()).as_bytes();
+            memo.insert(&pins, input, verified.clone());
+        }
+        assert_eq!(memo.entries.len(), MAX_PROOF_MEMOS);
+        assert_eq!(memo.order.len(), MAX_PROOF_MEMOS);
+        assert!(memo
+            .get(&pins, blake3::hash(&0usize.to_le_bytes()).as_bytes())
+            .is_none());
+        assert!(memo
+            .get(
+                &pins,
+                blake3::hash(&MAX_PROOF_MEMOS.to_le_bytes()).as_bytes()
+            )
+            .is_some());
     }
 
     #[test]

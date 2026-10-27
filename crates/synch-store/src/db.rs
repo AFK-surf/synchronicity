@@ -425,6 +425,9 @@ impl Store {
         // without it — so the store defends its own files unconditionally.
         harden_permissions(&data_dir);
         let conn = Connection::open(data_dir.join(DB_FILE))?;
+        // The raw Lean interpreter repeats a small set of parameterized SQL
+        // shapes. Bound their bytecode cache per tenant, without caching rows.
+        conn.set_prepared_statement_cache_capacity(64);
         let cas_coord = cas_coord_for(&data_dir);
         let store = Store {
             conn: Mutex::new(conn),

@@ -612,7 +612,9 @@ fn raw_scan(
     bindings: &[Cell],
     width: usize,
 ) -> Result<Scan<StoreError>> {
-    let mut statement = conn.prepare(sql)?;
+    // Cache bytecode, never rows or decisions. Bindings and SQLite transaction
+    // visibility are evaluated anew on every call. The per-connection LRU is bounded.
+    let mut statement = conn.prepare_cached(sql)?;
     let rows = statement.query_map(params_from_iter(bindings.iter().map(BoundCell)), |row| {
         (0..width)
             .map(|index| {
@@ -656,7 +658,8 @@ impl Storage for SqliteStorage<'_> {
             predicate(relation, equals)?
         );
         self.conn
-            .query_row(&sql, params_from_iter(values(equals)), |row| row.get(0))
+            .prepare_cached(&sql)?
+            .query_row(params_from_iter(values(equals)), |row| row.get(0))
             .map_err(Into::into)
     }
 
@@ -784,7 +787,7 @@ impl Storage for SqliteStorage<'_> {
             sql.push_str(" ORDER BY ");
             sql.push_str(&terms.join(", "));
         }
-        let mut statement = self.conn.prepare(&sql)?;
+        let mut statement = self.conn.prepare_cached(&sql)?;
         let rows = statement.query_map(params_from_iter(values(equals)), |row| {
             columns
                 .iter()
@@ -821,7 +824,7 @@ impl Storage for SqliteStorage<'_> {
             let (rows, steps) = work.get();
             work.set((
                 rows + scan.rows.len(),
-                steps + statement.get_status(rusqlite::StatementStatus::FullscanStep),
+                steps + statement.reset_status(rusqlite::StatementStatus::FullscanStep),
             ));
         });
         Ok(scan)
@@ -874,7 +877,9 @@ impl Storage for SqliteStorage<'_> {
             projection(relation, &names)?,
             vec!["?"; fields.len()].join(", ")
         );
-        self.conn.execute(&sql, params_from_iter(values(fields)))?;
+        self.conn
+            .prepare_cached(&sql)?
+            .execute(params_from_iter(values(fields)))?;
         Ok(())
     }
 
@@ -914,7 +919,10 @@ impl Storage for SqliteStorage<'_> {
             format!(" WHERE {}", terms.join(" AND "))
         };
         let sql = format!("DELETE FROM \"{relation}\" AS \"target\"{predicate}");
-        Ok(self.conn.execute(&sql, params_from_iter(bindings))? as u64)
+        Ok(self
+            .conn
+            .prepare_cached(&sql)?
+            .execute(params_from_iter(bindings))? as u64)
     }
 
     fn delete_except(
@@ -936,14 +944,14 @@ impl Storage for SqliteStorage<'_> {
         {
             let mut insert = self
                 .conn
-                .prepare("INSERT OR IGNORE INTO lean_kept (key) VALUES (?1)")?;
+                .prepare_cached("INSERT OR IGNORE INTO lean_kept (key) VALUES (?1)")?;
             for key in keys {
                 insert.execute(rusqlite::params![*key])?;
             }
         }
         let sql =
             format!("DELETE FROM \"{relation}\" WHERE {column} NOT IN (SELECT key FROM lean_kept)");
-        let swept = self.conn.execute(&sql, [])?;
+        let swept = self.conn.prepare_cached(&sql)?.execute([])?;
         self.conn.execute_batch("DELETE FROM lean_kept;")?;
         Ok(swept as u64)
     }
@@ -955,7 +963,8 @@ impl Storage for SqliteStorage<'_> {
             _ => return Err(StoreError::invalid("unsupported byte-storage namespace")),
         };
         self.conn
-            .query_row(sql, [key], |row| row.get(0))
+            .prepare_cached(sql)?
+            .query_row([key], |row| row.get(0))
             .optional()
             .map_err(Into::into)
     }
@@ -1016,7 +1025,8 @@ impl Storage for SqliteStorage<'_> {
         );
         Ok(self
             .conn
-            .execute(&sql, params_from_iter(bindings.iter().map(BoundCell)))? as u64)
+            .prepare_cached(&sql)?
+            .execute(params_from_iter(bindings.iter().map(BoundCell)))? as u64)
     }
 
     fn copy_rows(
@@ -1062,7 +1072,8 @@ impl Storage for SqliteStorage<'_> {
             projection(target, &names)?, projected.join(", "), source.relation);
         Ok(self
             .conn
-            .execute(&sql, params_from_iter(bindings.iter().map(BoundCell)))? as u64)
+            .prepare_cached(&sql)?
+            .execute(params_from_iter(bindings.iter().map(BoundCell)))? as u64)
     }
 
     fn delete(&mut self, tx: u64, selection: &Selection) -> Result<u64> {
@@ -1071,7 +1082,8 @@ impl Storage for SqliteStorage<'_> {
         let sql = format!("DELETE FROM \"{}\"{predicate}", selection.relation);
         Ok(self
             .conn
-            .execute(&sql, params_from_iter(bindings.iter().map(BoundCell)))? as u64)
+            .prepare_cached(&sql)?
+            .execute(params_from_iter(bindings.iter().map(BoundCell)))? as u64)
     }
 
     fn write(
@@ -1123,7 +1135,9 @@ impl Storage for SqliteStorage<'_> {
             projection(relation, &names)?,
             vec!["?"; fields.len()].join(", ")
         );
-        self.conn.execute(&sql, params_from_iter(values(fields)))?;
+        self.conn
+            .prepare_cached(&sql)?
+            .execute(params_from_iter(values(fields)))?;
         Ok(())
     }
 }
@@ -1140,6 +1154,62 @@ mod tests {
             like_any: vec![],
             not_equals: vec![],
         }
+    }
+
+    #[test]
+    fn cached_statements_rebind_and_observe_rollback_and_schema_changes() {
+        let conn = connection();
+        let mut storage = SqliteStorage::new(&conn);
+        let fields = |root, holder: &str| {
+            vec![
+                ("root".into(), Cell::Blob(vec![root])),
+                ("holder".into(), Cell::Text(holder.into())),
+                ("created_at".into(), Cell::Integer(1)),
+            ]
+        };
+        let write = |storage: &mut SqliteStorage<'_>, tx, root, holder| {
+            storage.upsert(
+                tx,
+                "pins",
+                &fields(root, holder),
+                &names(&["root", "holder"]),
+                &[],
+            )
+        };
+        let tx = storage.begin().unwrap();
+        write(&mut storage, tx, 1, "replica:a").unwrap();
+        storage.commit(tx).unwrap();
+        let tx = storage.begin().unwrap();
+        write(&mut storage, tx, 2, "replica:b").unwrap();
+        storage.rollback(tx).unwrap();
+        let tx = storage.begin().unwrap();
+        for (root, expected) in [(1, true), (2, false), (1, true)] {
+            assert_eq!(
+                storage
+                    .exists_rows(tx, "pins", &vec![("root".into(), Cell::Blob(vec![root]))])
+                    .unwrap(),
+                expected
+            );
+        }
+        storage.commit(tx).unwrap();
+        conn.execute_batch("CREATE TRIGGER reject_pin BEFORE INSERT ON pins BEGIN SELECT RAISE(ABORT, 'refused'); END;").unwrap();
+        let tx = storage.begin().unwrap();
+        assert!(write(&mut storage, tx, 3, "replica:c").is_err());
+        storage.rollback(tx).unwrap();
+        conn.execute_batch("DROP TRIGGER reject_pin").unwrap();
+        let tx = storage.begin().unwrap();
+        write(&mut storage, tx, 3, "replica:c").unwrap();
+        let rows = storage
+            .read_rows(tx, "pins", &names(&["holder"]), &vec![], &[], &[])
+            .unwrap();
+        assert_eq!(
+            rows,
+            vec![
+                vec![Cell::Text("replica:a".into())],
+                vec![Cell::Text("replica:c".into())]
+            ]
+        );
+        storage.commit(tx).unwrap();
     }
 
     #[test]
