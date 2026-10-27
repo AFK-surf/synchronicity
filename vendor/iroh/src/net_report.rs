@@ -316,8 +316,13 @@ impl Client {
         {
             do_full = true;
         }
+        if is_major {
+            // A changed network invalidates the old address and NAT mapping.
+            self.reports.last = None;
+            #[cfg(not(wasm_browser))]
+            self.qad_conns.clear();
+        }
         if do_full {
-            self.reports.last = None; // causes ProbePlan::new below to do a full (initial) plan
             self.reports.next_full = false;
             self.reports.last_full = now;
             self.metrics.reports_full.inc();
@@ -338,7 +343,13 @@ impl Client {
 
         // Start the reportgen client to start any needed probes
         let (actor, mut probe_rx) = reportgen::Client::new(
-            self.reports.last.clone(),
+            // Periodic scans need a full probe plan, but must not discard the
+            // last successful report if this attempt is cancelled or times out.
+            if do_full {
+                None
+            } else {
+                self.reports.last.clone()
+            },
             self.relay_map.clone(),
             self.probes.clone(),
             self.captive_portal_check,
@@ -452,11 +463,6 @@ impl Client {
             return Vec::new();
         };
 
-        if do_full {
-            // clear out existing connections if we are doing a full reset
-            self.qad_conns.clear();
-        }
-
         if let Some((url, conn)) = &self.qad_conns.v4 {
             // verify conn is still around
             if let Some(reason) = conn.conn.close_reason() {
@@ -474,8 +480,8 @@ impl Client {
 
         let v4_report = self.qad_conns.current_v4();
         let v6_report = self.qad_conns.current_v6();
-        let needs_v4_probe = v4_report.is_none();
-        let needs_v6_probe = v6_report.is_some() != if_state.have_v6;
+        let needs_v4_probe = do_full || v4_report.is_none();
+        let needs_v6_probe = do_full || v6_report.is_some() != if_state.have_v6;
 
         let mut reports = Vec::new();
 
@@ -502,7 +508,19 @@ impl Client {
 
         let relays = self.relay_map.relays::<Vec<_>>();
         for relay in relays.into_iter().take(MAX_RELAYS) {
-            if if_state.have_v4 && needs_v4_probe {
+            // A periodic scan still measures alternative relays, while the
+            // retained connection supplies a live address and RTT for its relay.
+            let have_v4_relay = self
+                .qad_conns
+                .v4
+                .as_ref()
+                .is_some_and(|(url, _)| *url == relay.url);
+            let have_v6_relay = self
+                .qad_conns
+                .v6
+                .as_ref()
+                .is_some_and(|(url, _)| *url == relay.url);
+            if if_state.have_v4 && needs_v4_probe && !have_v4_relay {
                 trace!(?relay.url, "v4 QAD probe starting");
                 let relay = relay.clone();
                 let dns_resolver = self.socket_state.dns_resolver.clone();
@@ -521,7 +539,7 @@ impl Client {
                         .instrument(info_span!("QADv4", %relay_url)),
                 );
             }
-            if if_state.have_v6 && needs_v6_probe {
+            if if_state.have_v6 && needs_v6_probe && !have_v6_relay {
                 trace!(?relay.url, "v6 QAD probe starting");
                 let relay = relay.clone();
                 let dns_resolver = self.socket_state.dns_resolver.clone();
@@ -1072,6 +1090,17 @@ mod tests {
             "an unchanged address must reuse the established discovery connection"
         );
 
+        client.reports.last_full = Instant::now() - FULL_REPORT_INTERVAL - Duration::from_secs(1);
+        client
+            .get_report(interfaces.clone(), false, shutdown.child_token())
+            .await;
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            server.metrics().server.qad_connections.get(),
+            1,
+            "a periodic scan must reuse a healthy discovery connection"
+        );
+
         client
             .get_report(interfaces.clone(), true, shutdown.child_token())
             .await;
@@ -1116,6 +1145,114 @@ mod tests {
     #[tokio::test]
     async fn stable_qad_ipv6_reports_reuse_connection() -> Result<()> {
         stable_qad_reports_reuse_connection(std::net::Ipv6Addr::LOCALHOST.into()).await
+    }
+
+    #[tokio::test]
+    async fn periodic_scan_discovers_alternatives_without_replacing_working_connection()
+    -> Result<()> {
+        let (server, relay) = test_utils::relay().await;
+        let (mut client, ep) =
+            qad_test_client(Ipv4Addr::LOCALHOST.into(), RelayMap::from(relay.clone()))?;
+        let interfaces = IfStateDetails {
+            have_v4: true,
+            have_v6: false,
+        };
+        let shutdown = CancellationToken::new();
+        let initial = client
+            .get_report(interfaces.clone(), false, shutdown.child_token())
+            .await;
+        assert!(initial.global_v4.is_some());
+
+        let (alternative_server, alternative) = test_utils::relay().await;
+        client.relay_map = RelayMap::from_iter([relay, alternative.clone()]);
+        client.reports.last_full = Instant::now() - FULL_REPORT_INTERVAL - Duration::from_secs(1);
+        let report = client
+            .get_report(interfaces, false, shutdown.child_token())
+            .await;
+        assert_eq!(report.global_v4, initial.global_v4);
+        assert!(
+            report
+                .relay_latency
+                .iter()
+                .any(|(kind, url, _)| { kind == Probe::QadIpv4 && url == &alternative.url })
+        );
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(server.metrics().server.qad_connections.get(), 1);
+        assert_eq!(alternative_server.metrics().server.qad_connections.get(), 1);
+
+        shutdown.cancel();
+        client.qad_conns.clear();
+        drop(client);
+        ep.wait_idle().await;
+        server.shutdown().await?;
+        alternative_server.shutdown().await?;
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn cancelled_periodic_scan_keeps_working_discovery() -> Result<()> {
+        let (server, relay) = test_utils::relay().await;
+        let relays = RelayMap::from(relay.clone());
+        let (mut client, ep) = qad_test_client(Ipv4Addr::LOCALHOST.into(), relays.clone())?;
+        let interfaces = IfStateDetails {
+            have_v4: true,
+            have_v6: false,
+        };
+        let shutdown = CancellationToken::new();
+        let initial = client
+            .get_report(interfaces.clone(), false, shutdown.child_token())
+            .await;
+        assert!(initial.global_v4.is_some());
+        let original_connection = client.qad_conns.v4.as_ref().unwrap().1.conn.clone();
+
+        // A periodic scan of an unresponsive alternative exceeds its budget.
+        // The working connection and last report must survive that attempt.
+        let silent = std::net::UdpSocket::bind((Ipv4Addr::LOCALHOST, 0)).anyerr()?;
+        let addr = silent.local_addr().anyerr()?;
+        client.relay_map = RelayMap::from_iter([
+            relay,
+            RelayConfig::new(
+                format!("https://{addr}/").parse().unwrap(),
+                Some(iroh_relay::RelayQuicConfig::new(addr.port())),
+            ),
+        ]);
+        client.reports.last_full = Instant::now() - FULL_REPORT_INTERVAL - Duration::from_secs(1);
+        assert!(
+            time::timeout(
+                Duration::from_millis(100),
+                client.get_report(interfaces.clone(), false, shutdown.child_token()),
+            )
+            .await
+            .is_err()
+        );
+        assert!(
+            original_connection.close_reason().is_none(),
+            "a timed-out scan must not close a working connection"
+        );
+        assert_eq!(
+            client.reports.last.as_ref().and_then(|r| r.global_v4),
+            initial.global_v4
+        );
+
+        client.relay_map = relays;
+        let report = client
+            .get_report(interfaces, false, shutdown.child_token())
+            .await;
+        assert_eq!(report.global_v4, initial.global_v4);
+        tokio::time::sleep(Duration::from_millis(100)).await;
+        assert_eq!(
+            server.metrics().server.qad_connections.get(),
+            1,
+            "recovery must not require another handshake"
+        );
+
+        shutdown.cancel();
+        client.qad_conns.clear();
+        drop(original_connection);
+        drop(client);
+        ep.wait_idle().await;
+        server.shutdown().await?;
+        Ok(())
     }
 
     #[tokio::test]

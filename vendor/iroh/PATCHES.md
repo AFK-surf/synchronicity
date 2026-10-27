@@ -30,13 +30,22 @@ Address discovery consumed the first QUIC address report, then initialized the
 retained connection's result cache to `None`. The stream emits only changes, so
 a stable address never populated that cache. Every incremental report could
 therefore open new QUIC/TLS connections despite retaining a healthy connection.
-Both address families now cache the initial report. Full scans still refresh
-connections, and closed connections are still replaced.
+Both address families now cache the initial report. Closed connections are
+still replaced.
 
 The retained connection's address watcher also used the cancellation token for
 surplus probes. Finishing a scan early could stop that watcher. It now follows
 the report's shutdown token instead; dropping the retained connection still
 aborts the watcher through its existing owned task handle.
+
+Periodic full scans also closed healthy discovery connections and cleared the
+last successful report before any replacement completed. A cancelled or timed
+out scan therefore destroyed working state and made subsequent reports repeat
+discovery and HTTPS probes. Periodic scans now retain the live connection and
+its current address/RTT while probing alternative relays. Constructing a full
+probe plan no longer clears the last successful report. Major network changes
+still invalidate both the connection and report, and failed connections are
+still replaced. Full scans retain their HTTPS probes and fallback behavior.
 
 Regression tests in `src/socket/transports/relay/actor.rs` cover a buffered
 matching pong after a scheduling delay in the real send loop, a pong behind
@@ -45,12 +54,17 @@ pongs, and an always-ready response flood. The buffered-pong send-loop test fail
 against the original selection order and passes with this patch.
 
 Tests in `src/net_report.rs` use real local QUIC servers and count completed
-handshakes. For both IPv4 and IPv6, six stable reports establish one connection,
-then a full refresh and a closed connection each establish one replacement.
+handshakes. For both IPv4 and IPv6, six stable reports and a periodic full scan
+use one connection, then a major network change and a closed connection each
+establish one replacement.
 Before the cache fix, those six stable reports establish six connections. A
 separate regression cancels a surplus probe, rebinds the client UDP socket, and
 checks that the retained connection reports the new address without another
 handshake; it fails if the address watcher shares the surplus-probe token.
+Further tests verify that a periodic scan discovers a new relay without
+replacing the healthy connection, and that cancellation while probing an
+unresponsive alternative preserves both the connection and last report. The
+periodic reuse and cancellation tests fail with the original full-scan reset.
 
 Run the vendored crate separately; excluded workspace dependencies do not
 resolve their test dependencies through the workspace root:
