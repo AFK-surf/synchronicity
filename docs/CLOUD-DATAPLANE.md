@@ -922,9 +922,6 @@ The control client drains successful acknowledgements (up to 64 KiB) so an
 HTTP/1 heartbeat returns its connection to the pool instead of forcing another
 TLS handshake. Job-completion wakes share the latest immutable desired-key
 snapshot; they do not copy every tenant name again for each completed job.
-The shared HTTP client keeps HTTP/2 enabled when disabling reqwest's default
-TLS provider. Servers that negotiate it can multiplex concurrent DNS and
-control requests on pooled connections; HTTP/1 remains available as a fallback.
 
 Each store keeps at most 64 prepared SQLite statements; their bindings and
 results are evaluated afresh. The shared DNS resolver retains at most 4096
