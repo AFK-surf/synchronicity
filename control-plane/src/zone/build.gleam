@@ -211,16 +211,15 @@ pub fn owners_in_order(rrsets: List(Rrset)) -> List(Name) {
 
 fn nsec_chain(data: List(Rrset)) -> List(Rrset) {
   let owners = owners_in_order(data)
+  let records_by_owner = list.group(data, fn(r) { r.owner })
   let next_of = case owners {
     [first, ..rest] -> list.zip(owners, list.append(rest, [first]))
     [] -> []
   }
   list.map(next_of, fn(pair) {
     let #(owner, next) = pair
-    let types_here =
-      data
-      |> list.filter(fn(r) { r.owner == owner })
-      |> list.map(fn(r) { r.rtype })
+    let assert Ok(records) = dict.get(records_by_owner, owner)
+    let types_here = list.map(records, fn(r) { r.rtype })
     let types = [wire.type_rrsig, wire.type_nsec, ..types_here]
     Rrset(owner, wire.type_nsec, ttl_data, [rdata.nsec(next, types)])
   })

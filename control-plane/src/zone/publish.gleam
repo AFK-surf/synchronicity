@@ -1,8 +1,8 @@
 //// The one write path for zone contents: bump the serial, rebuild and
 //// re-sign the whole zone, replace the presigned RRsets and NSEC chain —
 //// all inside one transaction with whatever product mutation triggered
-//// it. The zone is small; a full re-sign is sub-second and leaves no
-//// partial-invalidation logic to get wrong.
+//// it. Indexed construction and bounded bulk inserts keep the write lock
+//// short as the fleet grows, without partial-invalidation logic.
 
 import dns/name.{type Name}
 import dns/rdata
@@ -203,21 +203,29 @@ fn emit(
 
   use _ <- result.try(exec(conn, "DELETE FROM presigned_rrsets"))
   use Nil <- result.try(
-    list.try_fold(signed, Nil, fn(_, s) {
+    list.try_fold(insert_batches(signed), Nil, fn(_, batch) {
+      let placeholders =
+        batch
+        |> list.map(fn(_) { "(?, ?, ?, ?, ?, ?, ?, ?, ?)" })
+        |> string.join(", ")
+      let values =
+        list.flat_map(batch, fn(s) {
+          [
+            Text(name.to_string(s.owner)),
+            VInt(s.rtype),
+            VInt(s.ttl),
+            Blob(s.rrset_wire),
+            Blob(s.rrsig_wire),
+            VInt(expiration),
+            VInt(meta.soa_serial),
+            VInt(now),
+            Blob(name.sort_key(s.owner)),
+          ]
+        })
       sqlite.exec(
         conn,
-        "INSERT INTO presigned_rrsets VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)",
-        [
-          Text(name.to_string(s.owner)),
-          VInt(s.rtype),
-          VInt(s.ttl),
-          Blob(s.rrset_wire),
-          Blob(s.rrsig_wire),
-          VInt(expiration),
-          VInt(meta.soa_serial),
-          VInt(now),
-          Blob(name.sort_key(s.owner)),
-        ],
+        "INSERT INTO presigned_rrsets VALUES " <> placeholders,
+        values,
       )
       |> result.map_error(Db)
       |> result.replace(Nil)
@@ -244,6 +252,29 @@ fn emit(
     |> result.map_error(Db),
   )
   Ok(meta.soa_serial)
+}
+
+/// One SQLite port round trip per batch instead of per RRset. Stay below
+/// even SQLite's legacy 999-parameter limit and the port's 64 MiB frame cap.
+/// A large RRset is sent alone, just as it was before batching. The 1 KiB
+/// allowance covers both owner encodings, scalar values and SQL per row.
+fn insert_batches(signed: List(Signed)) -> List(List(Signed)) {
+  let #(batches, batch, _, _) =
+    list.fold(signed, #([], [], 0, 0), fn(acc, s) {
+      let #(batches, batch, count, bytes) = acc
+      let size =
+        bit_array.byte_size(s.rrset_wire)
+        + bit_array.byte_size(s.rrsig_wire)
+        + 1024
+      case count > 0 && { count >= 64 || bytes + size > 4 * 1024 * 1024 } {
+        True -> #([list.reverse(batch), ..batches], [s], 1, size)
+        False -> #(batches, [s, ..batch], count + 1, bytes + size)
+      }
+    })
+  case batch {
+    [] -> list.reverse(batches)
+    _ -> list.reverse([list.reverse(batch), ..batches])
+  }
 }
 
 /// The external-mode publish: serial+1 and validation, in its own

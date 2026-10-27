@@ -8,6 +8,7 @@ import dns/rdata
 import dnssec/keys
 import gleam/bit_array
 import gleam/crypto
+import gleam/dict
 import gleam/list
 import gleam/result
 import gleam/string
@@ -379,18 +380,29 @@ fn read_txt_names(
       }
     }),
   )
-  // Group members per owner, preserving order.
-  let owners =
-    list.fold(flat, [], fn(acc, pair) {
+  // Index by canonical owner instead of scanning every earlier network for
+  // each member. Keep first-seen owner order and the SQL's member order.
+  let #(owners, members_by_owner) =
+    list.fold(flat, #([], dict.new()), fn(acc, pair) {
+      let #(owners, members_by_owner) = acc
       let #(owner, member) = pair
-      case list.key_find(acc, owner) {
-        Ok(members) -> list.key_set(acc, owner, [member, ..members])
-        Error(Nil) -> [#(owner, [member]), ..acc]
+      case dict.get(members_by_owner, owner) {
+        Ok(members) -> #(
+          owners,
+          dict.insert(members_by_owner, owner, [member, ..members]),
+        )
+        Error(Nil) -> #(
+          [owner, ..owners],
+          dict.insert(members_by_owner, owner, [member]),
+        )
       }
     })
   Ok(
     owners
     |> list.reverse
-    |> list.map(fn(pair) { TxtName(pair.0, list.reverse(pair.1)) }),
+    |> list.map(fn(owner) {
+      let assert Ok(members) = dict.get(members_by_owner, owner)
+      TxtName(owner, list.reverse(members))
+    }),
   )
 }
