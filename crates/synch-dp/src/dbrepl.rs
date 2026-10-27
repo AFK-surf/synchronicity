@@ -115,7 +115,9 @@ static COMPACTION_SLOTS: LazyLock<Arc<tokio::sync::Semaphore>> =
     LazyLock::new(|| Arc::new(tokio::sync::Semaphore::new(4)));
 
 mod compaction;
+mod local;
 use compaction::Compaction;
+use local::LocalSegments;
 
 /// Runs additive compaction independently of the WAL shipper. An in-flight
 /// pass finishes before shutdown, so retirement cannot race an object write.
@@ -483,6 +485,7 @@ async fn replicate<C: ReplicaClient>(
 struct Capture {
     observer: Option<rusqlite::Connection>,
     shipped: Option<(i64, tokio::time::Instant)>,
+    local_segments: LocalSegments,
 }
 
 impl Capture {
@@ -497,6 +500,7 @@ impl Capture {
         Self {
             observer,
             shipped: None,
+            local_segments: LocalSegments::new(),
         }
     }
 
@@ -527,6 +531,7 @@ impl Capture {
                 Some(previous) == version && started - at < Db::DEFAULT_CHECKPOINT_INTERVAL
             })
         {
+            self.prune_local_segments(replica);
             return Ok(false);
         }
         // A failed capture or upload must be retried even without a newer
@@ -534,7 +539,16 @@ impl Capture {
         self.shipped = None;
         sync(replica).await?;
         self.shipped = version.map(|version| (version, started));
+        self.prune_local_segments(replica);
         Ok(true)
+    }
+
+    fn prune_local_segments<C: ReplicaClient>(&mut self, replica: &Replica<C>) {
+        if let Err(error) = self.local_segments.prune(replica) {
+            // Shipping succeeded. Report maintenance separately rather than
+            // claiming the durable upload failed and recapturing every tick.
+            tracing::warn!(%error, "removing uploaded local database segments failed; will retry");
+        }
     }
 }
 
@@ -1383,6 +1397,138 @@ mod tests {
             .query_row("SELECT value FROM capture_probe", [], |row| row.get(0))
             .unwrap();
         assert_eq!(value, expected);
+    }
+
+    fn local_segment_paths(path: &Path) -> Vec<PathBuf> {
+        let metadata = Db::meta_path_for_path(path);
+        let directory = celld_ltx::ltx_level_dir(&metadata.to_string_lossy(), 0);
+        let mut paths = std::fs::read_dir(directory)
+            .unwrap()
+            .map(|entry| entry.unwrap().path())
+            .filter(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .is_some_and(|name| celld_ltx::ltx::parse_filename(name).is_ok())
+            })
+            .collect::<Vec<_>>();
+        paths.sort();
+        paths
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn uploaded_local_segments_are_bounded_and_reopen_keeps_shipping() {
+        let source = tempfile::tempdir().unwrap();
+        let remote = tempfile::tempdir().unwrap();
+        let store = open_store(source.path()).await;
+        let writer = rusqlite::Connection::open(store.db_path()).unwrap();
+        writer
+            .execute_batch(
+                "PRAGMA wal_autocheckpoint=0;
+            CREATE TABLE capture_probe(value TEXT); INSERT INTO capture_probe VALUES('initial')",
+            )
+            .unwrap();
+        let mut replica = open(&store.db_path(), CountedClient::new(remote.path()))
+            .await
+            .unwrap();
+        let mut capture = Capture::new(&store.db_path());
+        capture.sync(&mut replica, false).await.unwrap();
+        let local_directory = local_segment_paths(&store.db_path())[0]
+            .parent()
+            .unwrap()
+            .to_path_buf();
+        // Cleanup must not treat unrelated files or unfinished captures as
+        // acknowledged segments merely because they share the directory.
+        let unfinished = local_directory.join("0000000000000001-0000000000000001.ltx.tmp");
+        std::fs::write(&unfinished, b"unfinished").unwrap();
+        let unrelated = local_directory.join("operator-note");
+        std::fs::write(&unrelated, b"keep").unwrap();
+        for i in 0..16 {
+            writer
+                .execute("UPDATE capture_probe SET value=?1", [format!("value {i}")])
+                .unwrap();
+            tokio::time::advance(Duration::from_secs(60)).await;
+            capture.sync(&mut replica, false).await.unwrap();
+            assert_eq!(
+                local_segment_paths(&store.db_path()).len(),
+                1,
+                "uploaded capture files accumulated locally"
+            );
+        }
+        assert_eq!(std::fs::read(&unfinished).unwrap(), b"unfinished");
+        assert_eq!(std::fs::read(&unrelated).unwrap(), b"keep");
+        let files = replica
+            .client
+            .files
+            .ltx_files(0, celld_ltx::TXID(0))
+            .await
+            .unwrap();
+        assert!(files.len() >= 17, "cleanup removed durable history");
+        close(replica).unwrap();
+        assert_capture_value(remote.path(), "value 15").await;
+
+        // Reopen from just the continuity baseline, then produce and restore
+        // a later write. No reset, gap or replacement of the stream is needed.
+        let mut reopened = open(&store.db_path(), CountedClient::new(remote.path()))
+            .await
+            .unwrap();
+        writer
+            .execute("UPDATE capture_probe SET value=?1", ["after reopen"])
+            .unwrap();
+        Capture::new(&store.db_path())
+            .sync(&mut reopened, false)
+            .await
+            .unwrap();
+        close(reopened).unwrap();
+        assert_capture_value(remote.path(), "after reopen").await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn local_cleanup_preserves_unacknowledged_and_ambiguous_uploads() {
+        for failure in [1, 2] {
+            let source = tempfile::tempdir().unwrap();
+            let remote = tempfile::tempdir().unwrap();
+            let store = open_store(source.path()).await;
+            let writer = rusqlite::Connection::open(store.db_path()).unwrap();
+            writer.execute_batch("PRAGMA wal_autocheckpoint=0;
+                CREATE TABLE capture_probe(value TEXT); INSERT INTO capture_probe VALUES('initial')").unwrap();
+            let observed = CountedClient::new(remote.path());
+            let fail = observed.fail_upload.clone();
+            let mut replica = open(&store.db_path(), observed).await.unwrap();
+            let mut capture = Capture::new(&store.db_path());
+            for i in 0..4 {
+                writer
+                    .execute("UPDATE capture_probe SET value=?1", [format!("value {i}")])
+                    .unwrap();
+                capture.sync(&mut replica, false).await.unwrap();
+            }
+            let durable = replica.pos().txid;
+            writer
+                .execute(
+                    "UPDATE capture_probe SET value=?1",
+                    ["awaiting acknowledgement"],
+                )
+                .unwrap();
+            fail.store(failure, Ordering::Relaxed);
+            tokio::time::advance(Duration::from_secs(60)).await;
+            assert!(capture.sync(&mut replica, false).await.is_err());
+            assert_eq!(replica.pos().txid, durable);
+            let pending = replica.db_mut().unwrap().pos().unwrap().txid;
+            assert!(pending > durable);
+
+            // Exercise cleanup at the actual partial-upload frontier: even
+            // if the server committed but lost its reply, the local pending
+            // segment and the last acknowledged baseline must both survive.
+            capture.local_segments.prune(&replica).unwrap();
+            for txid in [durable, pending] {
+                assert!(Path::new(&replica.db().unwrap().ltx_path(0, txid, txid)).exists());
+            }
+            assert_eq!(local_segment_paths(&store.db_path()).len(), 2);
+            tokio::time::advance(Duration::from_secs(60)).await;
+            capture.sync(&mut replica, false).await.unwrap();
+            assert_eq!(local_segment_paths(&store.db_path()).len(), 1);
+            close(replica).unwrap();
+            assert_capture_value(remote.path(), "awaiting acknowledgement").await;
+        }
     }
 
     #[tokio::test]

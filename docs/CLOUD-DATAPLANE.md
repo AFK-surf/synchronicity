@@ -736,6 +736,14 @@ document starts lying after an upgrade.
   commits and failed uploads still run on the next tick. An unavailable
   observer falls back to full capture. Full capture also runs at least every
   60 seconds for checkpoint/continuity maintenance and on every final flush.
+- **Local segment retention**: after successful shipping, the replica owner
+  prunes local L0 segments older than the acknowledged transaction, at most
+  once per minute and only after that frontier advances. It keeps the newest
+  local segment for continuity/reopen checks and every unacknowledged segment,
+  including uploads whose responses were lost. Temporary or unrecognized
+  files are left to the library. This bounds the local capture spool during
+  healthy replication; a prolonged upload outage can still grow a backlog.
+  Durable object-store history and its restore/compaction policy are separate.
 - **A thread per tenant**: a replica owns a SQLite connection, so it is
   `Send` but not `Sync`, and the library's `sync` holds `&self` across an
   await — its future is therefore not `Send` and cannot be handed to
