@@ -924,9 +924,10 @@ or credentials builds a separate backing store. Quiet tenants therefore reuse
 the fleet's active connections instead of each rebuilding TLS connections
 between infrequent uploads.
 
-The control client drains successful acknowledgements (up to 64 KiB) so an
-HTTP/1 heartbeat returns its connection to the pool instead of forcing another
-TLS handshake. Job-completion wakes share the latest immutable desired-key
+HTTP clients negotiate HTTP/2 where the server supports it, so concurrent
+heartbeats and DNS queries can share a TLS connection. The control client also
+drains successful acknowledgements (up to 64 KiB) so HTTP/1 fallback returns
+its connection to the pool. Job-completion wakes share the latest immutable desired-key
 snapshot; they do not copy every tenant name again for each completed job.
 
 DNSSEC validation failures are cached for at most five seconds. A failed
