@@ -37,8 +37,9 @@ pub struct Reconciler {
     /// Wakes the supervisor to reap outcomes and refresh gauges promptly.
     job_wake: Arc<tokio::sync::Notify>,
     tenants: HashMap<String, Tenant>,
-    /// Keys in the latest validated desired document.
-    wanted: HashSet<String>,
+    /// Keys in the latest validated desired document. Completion wakes share
+    /// this snapshot instead of copying every tenant name for each finished job.
+    wanted: Arc<HashSet<String>>,
     /// What this pod knows about each network's recent failures: how many,
     /// and when it may next be tried.
     ///
@@ -281,7 +282,7 @@ impl Reconciler {
             provision_slots: Arc::new(tokio::sync::Semaphore::new(provision_limit)),
             job_wake: Arc::new(tokio::sync::Notify::new()),
             tenants: HashMap::new(),
-            wanted: HashSet::new(),
+            wanted: Arc::default(),
             logged_dp: None,
             parked: HashMap::new(),
             empty_answers: 0,
@@ -506,7 +507,7 @@ impl Reconciler {
         // Only intent this pass is actually willing to act on may drive
         // completion wakes between polls. In particular, an unconfirmed empty
         // answer must not let a later job completion retire local state.
-        self.wanted = wanted.keys().cloned().collect();
+        self.wanted = Arc::new(wanted.keys().cloned().collect());
 
         // Retire idle tenants that are no longer wanted. A tenant already in
         // a job is not cancelled: the next pass reaps it and schedules its
@@ -1637,7 +1638,7 @@ mod tests {
             metrics.clone(),
         );
         let key = "acme/prod".to_string();
-        reconciler.wanted.insert(key.clone());
+        Arc::make_mut(&mut reconciler.wanted).insert(key.clone());
         let tenant = Tenant::for_reconciler_test(hosted_network("acme", "prod"), dir);
         let wake = reconciler.job_wake.clone();
         let completed = Arc::new(AtomicBool::new(false));

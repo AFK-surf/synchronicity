@@ -918,6 +918,11 @@ deliberately: every store touch of every tenant crosses it), one
 must be — one Sigstore outage should cost one attempt a day, not N), the
 reqwest client, the metrics registry.
 
+The control client drains successful acknowledgements (up to 64 KiB) so an
+HTTP/1 heartbeat returns its connection to the pool instead of forcing another
+TLS handshake. Job-completion wakes share the latest immutable desired-key
+snapshot; they do not copy every tenant name again for each completed job.
+
 Each store keeps at most 64 prepared SQLite statements; their bindings and
 results are evaluated afresh. The shared DNS resolver retains at most 4096
 successful offline transparency-proof verifications, keyed by the complete

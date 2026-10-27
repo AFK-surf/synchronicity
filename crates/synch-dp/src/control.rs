@@ -18,6 +18,10 @@ use crate::error::{DpError, Result};
 /// that is down, and the fail-static path (§4.2) handles the latter well.
 const REQUEST_TIMEOUT: Duration = Duration::from_secs(30);
 
+/// Mutation acknowledgements are small JSON objects. Drain them for HTTP/1
+/// connection reuse without buffering them or accepting an unbounded reply.
+const MAX_ACK_BYTES: usize = 64 * 1024;
+
 /// One network the control plane wants hosted.
 #[derive(Debug, Clone, PartialEq, Eq, Deserialize, Serialize)]
 pub struct HostedNetwork {
@@ -251,7 +255,7 @@ impl ControlPlane {
             .send()
             .await
             .map_err(|error| DpError::Control(error.to_string()))?;
-        self.check(response).await.map(|_| ())
+        self.finish_ack(response).await
     }
 
     /// Retires (or revokes) a key this service registered.
@@ -270,7 +274,7 @@ impl ControlPlane {
             .send()
             .await
             .map_err(|error| DpError::Control(error.to_string()))?;
-        self.check(response).await.map(|_| ())
+        self.finish_ack(response).await
     }
 
     /// Records that this tenant's stored copy has been deleted (§6).
@@ -288,7 +292,7 @@ impl ControlPlane {
             .send()
             .await
             .map_err(|error| DpError::Control(error.to_string()))?;
-        self.check(response).await.map(|_| ())
+        self.finish_ack(response).await
     }
 
     /// Reports what this tenant holds, for metering and alerting.
@@ -304,7 +308,34 @@ impl ControlPlane {
             .send()
             .await
             .map_err(|error| DpError::Control(error.to_string()))?;
-        self.check(response).await.map(|_| ())
+        self.finish_ack(response).await
+    }
+
+    /// Reading to EOF returns the connection to reqwest's pool. Dropping a
+    /// success at its headers discards a still-arriving body and closes the
+    /// HTTP/1 connection, multiplying handshakes by the tenant heartbeat rate.
+    async fn finish_ack(&self, response: reqwest::Response) -> Result<()> {
+        let mut response = self.check(response).await?;
+        let oversized =
+            || DpError::Control(format!("acknowledgement exceeds {MAX_ACK_BYTES} bytes"));
+        if response
+            .content_length()
+            .is_some_and(|length| length > MAX_ACK_BYTES as u64)
+        {
+            return Err(oversized());
+        }
+        let mut read = 0usize;
+        while let Some(chunk) = response
+            .chunk()
+            .await
+            .map_err(|error| DpError::Control(format!("unreadable acknowledgement: {error}")))?
+        {
+            read = read.saturating_add(chunk.len());
+            if read > MAX_ACK_BYTES {
+                return Err(oversized());
+            }
+        }
+        Ok(())
     }
 
     /// Turns a non-2xx into an error carrying the body, which is where the
@@ -344,6 +375,105 @@ pub struct Status {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Headers may arrive before the small JSON acknowledgement. Dropping
+    /// that unread body closes HTTP/1 connections instead of returning them
+    /// to the pool, turning each tenant heartbeat into another TLS handshake.
+    #[tokio::test]
+    async fn acknowledgements_reuse_the_control_plane_connection() {
+        use axum::body::{Body, Bytes};
+        use axum::extract::ConnectInfo;
+        use axum::http::Response;
+        use std::net::SocketAddr;
+        use std::sync::{Arc, Mutex};
+
+        let peers = Arc::new(Mutex::new(Vec::new()));
+        let seen = peers.clone();
+        let app = axum::Router::new().fallback(
+            move |ConnectInfo(peer): ConnectInfo<SocketAddr>, _body: Bytes| {
+                let seen = seen.clone();
+                async move {
+                    seen.lock().unwrap().push(peer);
+                    let body = futures_util::stream::once(async {
+                        tokio::time::sleep(Duration::from_millis(20)).await;
+                        Ok::<_, std::io::Error>(Bytes::from_static(b"{\"ok\":true}"))
+                    });
+                    Response::builder()
+                        .header("content-length", "11")
+                        .body(Body::from_stream(body))
+                        .unwrap()
+                }
+            },
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let serving = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+        let control = ControlPlane::new(format!("http://{addr}"), "synchdp_test").unwrap();
+        control
+            .register_device("acme", "prod", "cloud-1", "key")
+            .await
+            .unwrap();
+        control
+            .report_status("acme", "prod", &Status::default())
+            .await
+            .unwrap();
+        control
+            .retire_key("acme", "prod", "key", false)
+            .await
+            .unwrap();
+        control.storage_collected("acme", "prod").await.unwrap();
+        serving.abort();
+        let peers = peers.lock().unwrap();
+        assert_eq!(peers.len(), 4);
+        assert!(
+            peers.iter().all(|peer| *peer == peers[0]),
+            "each acknowledgement should return the connection to the pool: {peers:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_unbounded_acknowledgement_is_refused() {
+        use axum::body::{Body, Bytes};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
+
+        let chunks = Arc::new(AtomicUsize::new(0));
+        let sent = chunks.clone();
+        let app = axum::Router::new().fallback(move || {
+            let sent = sent.clone();
+            async move {
+                Body::from_stream(futures_util::stream::unfold(sent, |sent| async move {
+                    tokio::time::sleep(Duration::from_millis(10)).await;
+                    sent.fetch_add(1, Ordering::Relaxed);
+                    Some((
+                        Ok::<_, std::io::Error>(Bytes::from_static(&[b'x'; 16 * 1024])),
+                        sent,
+                    ))
+                }))
+            }
+        });
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let addr = listener.local_addr().unwrap();
+        let serving = tokio::spawn(async move { axum::serve(listener, app).await.unwrap() });
+        let control = ControlPlane::new(format!("http://{addr}"), "synchdp_test").unwrap();
+        let error = tokio::time::timeout(
+            Duration::from_secs(3),
+            control.report_status("acme", "prod", &Status::default()),
+        )
+        .await
+        .expect("an acknowledgement must not wait for an endless body")
+        .unwrap_err();
+        serving.abort();
+        assert!(error.to_string().contains("acknowledgement exceeds"));
+        assert!(chunks.load(Ordering::Relaxed) < 20);
+    }
 
     /// The document shape in §3.3 must parse, including a network this
     /// service has never registered a device for.
