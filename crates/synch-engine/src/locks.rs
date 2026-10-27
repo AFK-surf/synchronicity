@@ -375,6 +375,9 @@ pub struct LockManager {
     table: std::sync::Mutex<Table>,
     /// Rung whenever a claim ends or expires, so waiters retry at once.
     changed: tokio::sync::Notify,
+    /// Wakes the maintenance loop when an empty table gains work. Separate
+    /// from `changed`: acquiring clients must not consume the loop's wakeup.
+    maintenance: tokio::sync::Notify,
     /// Serializes this node's own attempts on one lock.
     attempts: std::sync::Mutex<HashMap<LockName, Arc<tokio::sync::Mutex<()>>>>,
     /// Held for read by a fenced commit and for write by whatever ends this
@@ -397,6 +400,7 @@ impl LockManager {
             handoff_window,
             table: Default::default(),
             changed: tokio::sync::Notify::new(),
+            maintenance: tokio::sync::Notify::new(),
             attempts: Default::default(),
             fences: Default::default(),
         }
@@ -406,6 +410,23 @@ impl LockManager {
         self.table
             .lock()
             .unwrap_or_else(std::sync::PoisonError::into_inner)
+    }
+
+    /// Returns whether the loop was idle, so it can restart its tick clock.
+    /// `notify_one` retains a permit if work arrives between this check and
+    /// the await. No timer is needed until there is something to maintain.
+    async fn wait_for_work(&self) -> bool {
+        let mut idle = false;
+        loop {
+            {
+                let table = self.table();
+                if !table.locks.is_empty() || table.clock > table.saved {
+                    return idle;
+                }
+            }
+            idle = true;
+            self.maintenance.notified().await;
+        }
     }
 
     fn attempt_gate(&self, lock: &LockName) -> Arc<tokio::sync::Mutex<()>> {
@@ -484,6 +505,7 @@ impl LockManager {
                 acquired_at: row.acquired_at,
             });
         }
+        self.maintenance.notify_one();
         Ok(())
     }
 
@@ -750,6 +772,7 @@ impl LockManager {
             });
             (claim, receiver)
         };
+        self.maintenance.notify_one();
         // Persisted before the claim leaves, so no restart reissues its
         // ticket (§7).
         if let Err(e) = self.persist_clock().await {
@@ -1174,6 +1197,7 @@ impl LockManager {
             }
             victims
         };
+        self.maintenance.notify_one();
         self.changed.notify_waiters();
         for id in &victims {
             tracing::warn!(%lock, token = %id.token(), "breaking another node's lock claim");
@@ -1580,8 +1604,11 @@ impl LockManager {
 
 impl synch_net::LockService for LockManager {
     fn serve(&self, peer: NodeId, request: LockMessage) -> LockMessage {
-        self.serve_request(peer, request)
-            .unwrap_or_else(|e| refused(e.to_string()))
+        let response = self.serve_request(peer, request);
+        // A refused request can still advance the heard clock. Wake even on
+        // error so its persistence is retried by maintenance.
+        self.maintenance.notify_one();
+        response.unwrap_or_else(|e| refused(e.to_string()))
     }
 }
 
@@ -1639,9 +1666,16 @@ async fn run(weak: WeakNode) {
     let mut interval = tokio::time::interval(TICK);
     interval.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Delay);
     loop {
+        let locks = {
+            let Some(node) = weak.upgrade() else { return };
+            node.locks().clone()
+        };
+        // Do not hold the node alive while an unused lock manager sleeps.
+        if locks.wait_for_work().await {
+            interval.reset_immediately();
+        }
         interval.tick().await;
         let Some(node) = weak.upgrade() else { return };
-        let locks = node.locks().clone();
         locks.tick(&node).await;
     }
 }
@@ -1920,6 +1954,76 @@ fn jitter(max_ms: u64) -> u64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[tokio::test(start_paused = true)]
+    async fn unused_lock_maintenance_sleeps_and_an_incoming_claim_wakes_it() {
+        use std::future::Future;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::task::{Context, Poll, Wake, Waker};
+        use synch_net::LockService;
+
+        #[derive(Default)]
+        struct Wakes(AtomicUsize);
+        impl Wake for Wakes {
+            fn wake(self: Arc<Self>) {
+                self.0.fetch_add(1, Ordering::Relaxed);
+            }
+        }
+
+        let dir = tempfile::tempdir().unwrap();
+        let store = Arc::new(Store::open(dir.path()).unwrap());
+        let peer = iroh_base::SecretKey::generate().public();
+        let peer_origin = OriginId::Key(peer);
+        store
+            .put_binding(&synch_store::Binding {
+                origin: peer_origin.clone(),
+                node_id: peer,
+                source: synch_store::BindingSource::Static,
+                domain: None,
+                issuer: None,
+                spaces: Vec::new(),
+                read_only: Vec::new(),
+                note: None,
+                added_at: 0,
+                expires_at: None,
+            })
+            .unwrap();
+        let own = OriginId::Key(iroh_base::SecretKey::generate().public());
+        let manager = LockManager::new(store, own, TICK, TICK);
+        let wakes = Arc::new(Wakes::default());
+        let waker = Waker::from(wakes.clone());
+        let mut cx = Context::from_waker(&waker);
+        let mut waiting = std::pin::pin!(manager.wait_for_work());
+        assert!(waiting.as_mut().poll(&mut cx).is_pending());
+        tokio::time::advance(Duration::from_secs(3600)).await;
+        assert_eq!(
+            wakes.0.load(Ordering::Relaxed),
+            0,
+            "no periodic idle wakeups"
+        );
+
+        let request = LockMessage::Claim {
+            lock: LockName::new("media", "deploy").unwrap(),
+            claim: claim(
+                ClaimId {
+                    ticket: Ticket {
+                        lamport: 1,
+                        origin: peer_origin,
+                    },
+                    nonce: 1,
+                },
+                Vec::new(),
+            ),
+        };
+        assert!(matches!(
+            manager.serve(peer, request),
+            LockMessage::Answer { .. }
+        ));
+        assert_eq!(wakes.0.load(Ordering::Relaxed), 1);
+        assert_eq!(waiting.as_mut().poll(&mut cx), Poll::Ready(true));
+        // Work arriving before the loop starts waiting is observed too.
+        assert!(!manager.wait_for_work().await);
+    }
 
     fn id(lamport: u64, who: &str) -> ClaimId {
         ClaimId {

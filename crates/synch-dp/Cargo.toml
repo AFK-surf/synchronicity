@@ -39,6 +39,7 @@ futures-util.workspace = true
 hex.workspace = true
 tokio-tungstenite.workspace = true
 reqwest = { workspace = true, features = ["json"] }
+rusqlite.workspace = true
 rustls.workspace = true
 serde.workspace = true
 serde_json.workspace = true

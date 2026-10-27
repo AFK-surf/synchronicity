@@ -86,8 +86,14 @@ impl Metrics {
     /// ever failed".
     pub fn replication_attempt(&self, key: &str, ok: bool) {
         if let Ok(mut failures) = self.replication_failures.lock() {
-            let run = failures.entry(key.to_string()).or_insert(0);
-            *run = if ok { 0 } else { run.saturating_add(1) };
+            // This runs once per second per tenant. Borrow the existing key
+            // instead of allocating and freeing its name on every idle tick.
+            match failures.get_mut(key) {
+                Some(run) => *run = if ok { 0 } else { run.saturating_add(1) },
+                None => {
+                    failures.insert(key.to_string(), u64::from(!ok));
+                }
+            }
         }
     }
 

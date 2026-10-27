@@ -194,6 +194,8 @@ impl std::fmt::Debug for DbClient {
 enum Command {
     /// Capture what the database has committed, then ship it.
     Sync(oneshot::Sender<Result<()>>),
+    /// Capture even when the idle check says nothing changed.
+    Flush(oneshot::Sender<Result<()>>),
     /// Close the database, releasing its long-running read lock.
     Close(oneshot::Sender<Result<()>>),
 }
@@ -302,7 +304,7 @@ impl Replicator {
 
     /// Ships everything outstanding. The last thing a draining tenant does.
     pub async fn flush(&mut self) -> Result<()> {
-        self.tick().await
+        self.request(Command::Flush).await
     }
 
     /// Closes the database cleanly and stops the thread.
@@ -405,20 +407,88 @@ async fn replicate<C: ReplicaClient>(
             return;
         }
     };
+    let mut capture = Capture::new(&db_path);
     while let Some(command) = requests.recv().await {
+        let force = matches!(&command, Command::Flush(_));
         match command {
-            Command::Sync(reply) => {
-                let result = sync(&mut replica).await;
-                if result.is_ok() {
+            Command::Sync(reply) | Command::Flush(reply) => {
+                let result = capture.sync(&mut replica, force).await;
+                if matches!(&result, Ok(true)) {
                     published.store(replica.pos().txid.0, Ordering::Release);
                 }
-                let _ = reply.send(result);
+                let _ = reply.send(result.map(|_| ()));
             }
             Command::Close(reply) => {
                 let _ = reply.send(close(replica));
                 return;
             }
         }
+    }
+}
+
+/// Avoid rescanning an idle WAL every second for every hosted tenant. The
+/// observer never writes or holds a transaction: SQLite's data_version on
+/// this *same* connection changes for commits by every other connection,
+/// including the shipper's own checkpoint/control writes.
+/// https://www.sqlite.org/pragma.html#pragma_data_version
+///
+/// This only gates work; celld-ltx still decides which frames are committed
+/// and owns all capture, continuity checking and checkpointing.
+struct Capture {
+    observer: Option<rusqlite::Connection>,
+    shipped: Option<(i64, tokio::time::Instant)>,
+}
+
+impl Capture {
+    fn new(db_path: &Path) -> Self {
+        let observer = rusqlite::Connection::open_with_flags(
+            db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY
+                | rusqlite::OpenFlags::SQLITE_OPEN_NO_MUTEX,
+        )
+        .map_err(|error| tracing::warn!(%error, "idle database observation unavailable; capturing every tick"))
+        .ok();
+        Self {
+            observer,
+            shipped: None,
+        }
+    }
+
+    fn version(&self) -> Option<i64> {
+        self.observer
+            .as_ref()?
+            .prepare_cached("PRAGMA data_version")
+            .ok()?
+            .query_row([], |row| row.get(0))
+            .ok()
+    }
+
+    /// Returns whether capture ran. An unavailable observer always falls
+    /// back to capture, and even an idle database gets the library's normal
+    /// maintenance at least once per checkpoint interval.
+    async fn sync<C: ReplicaClient>(
+        &mut self,
+        replica: &mut Replica<C>,
+        force: bool,
+    ) -> Result<bool> {
+        let started = tokio::time::Instant::now();
+        // Read BEFORE capture. A commit during capture/upload must remain
+        // visible on the next tick, not be mistaken for already shipped data.
+        let version = self.version();
+        if !force
+            && version.is_some()
+            && self.shipped.is_some_and(|(previous, at)| {
+                Some(previous) == version && started - at < Db::DEFAULT_CHECKPOINT_INTERVAL
+            })
+        {
+            return Ok(false);
+        }
+        // A failed capture or upload must be retried even without a newer
+        // database commit. Invalidate before awaiting, including cancellation.
+        self.shipped = None;
+        sync(replica).await?;
+        self.shipped = version.map(|version| (version, started));
+        Ok(true)
     }
 }
 
@@ -748,7 +818,8 @@ mod tests {
         files: FileReplicaClient,
         listings: std::sync::atomic::AtomicUsize,
         // 1: reject the upload; 2: commit it but lose the response.
-        fail_upload: std::sync::atomic::AtomicU8,
+        fail_upload: Arc<std::sync::atomic::AtomicU8>,
+        commit_on_upload: Arc<std::sync::Mutex<Option<(PathBuf, String)>>>,
     }
 
     impl CountedClient {
@@ -757,6 +828,7 @@ mod tests {
                 files: FileReplicaClient::new(dir.to_string_lossy().into_owned()),
                 listings: Default::default(),
                 fail_upload: Default::default(),
+                commit_on_upload: Default::default(),
             }
         }
     }
@@ -803,6 +875,12 @@ mod tests {
                 return Err(celld_ltx::Error::Other("upload rejected".into()));
             }
             let info = self.files.write_ltx_file(level, min, max, data).await?;
+            if let Some((path, value)) = self.commit_on_upload.lock().unwrap().take() {
+                let db = rusqlite::Connection::open(path).unwrap();
+                db.execute_batch("PRAGMA wal_autocheckpoint=0").unwrap();
+                db.execute("UPDATE capture_probe SET value=?1", [value])
+                    .unwrap();
+            }
             if fail == 2 {
                 return Err(celld_ltx::Error::Other("upload response lost".into()));
             }
@@ -1211,6 +1289,129 @@ mod tests {
         replicator.tick().await.unwrap();
         replicator.tick().await.unwrap();
         replicator.close().await.unwrap();
+    }
+
+    // Real SQLite + LTX restore exercise both halves of the idle optimization:
+    // avoiding capture and preserving the next committed value, even when a
+    // rolled-back transaction has already spilled pages into the WAL.
+    #[tokio::test]
+    async fn idle_capture_skips_wal_scans_and_ships_after_rolled_back_spill() {
+        let source = tempfile::tempdir().unwrap();
+        let remote = tempfile::tempdir().unwrap();
+        let store = open_store(source.path()).await;
+        let writer = rusqlite::Connection::open(store.db_path()).unwrap();
+        writer
+            .execute_batch(
+                "PRAGMA wal_autocheckpoint=0; PRAGMA cache_size=2;
+            CREATE TABLE capture_probe(value TEXT); INSERT INTO capture_probe VALUES('initial')",
+            )
+            .unwrap();
+        let mut replica = open(&store.db_path(), CountedClient::new(remote.path()))
+            .await
+            .unwrap();
+        let mut capture = Capture::new(&store.db_path());
+        // The first capture can write celld's control row, which is itself a
+        // change observed on the next tick. Settle it before testing idleness.
+        capture.sync(&mut replica, false).await.unwrap();
+        capture.sync(&mut replica, false).await.unwrap();
+        for _ in 0..100 {
+            assert!(!capture.sync(&mut replica, false).await.unwrap());
+        }
+        writer
+            .execute_batch("BEGIN; UPDATE capture_probe SET value=zeroblob(200000); ROLLBACK")
+            .unwrap();
+        assert!(!capture.sync(&mut replica, false).await.unwrap());
+        writer
+            .execute("UPDATE capture_probe SET value=?1", ["committed"])
+            .unwrap();
+        assert!(capture.sync(&mut replica, false).await.unwrap());
+        close(replica).unwrap();
+        assert_capture_value(remote.path(), "committed").await;
+    }
+
+    async fn assert_capture_value(remote: &Path, expected: &str) {
+        let restored = tempfile::tempdir().unwrap();
+        assert!(restore(client(remote), restored.path()).await.unwrap());
+        let db = rusqlite::Connection::open(restored.path().join(synch_store::DB_FILE)).unwrap();
+        let value: String = db
+            .query_row("SELECT value FROM capture_probe", [], |row| row.get(0))
+            .unwrap();
+        assert_eq!(value, expected);
+    }
+
+    #[tokio::test]
+    async fn capture_retries_failed_uploads_without_another_commit() {
+        for failure in [1, 2] {
+            let source = tempfile::tempdir().unwrap();
+            let remote = tempfile::tempdir().unwrap();
+            let store = open_store(source.path()).await;
+            let writer = rusqlite::Connection::open(store.db_path()).unwrap();
+            writer.execute_batch("PRAGMA wal_autocheckpoint=0;
+                CREATE TABLE capture_probe(value TEXT); INSERT INTO capture_probe VALUES('initial')").unwrap();
+            let observed = CountedClient::new(remote.path());
+            let fail = observed.fail_upload.clone();
+            let mut replica = open(&store.db_path(), observed).await.unwrap();
+            let mut capture = Capture::new(&store.db_path());
+            capture.sync(&mut replica, false).await.unwrap();
+            capture.sync(&mut replica, false).await.unwrap();
+            writer
+                .execute("UPDATE capture_probe SET value=?1", ["retry me"])
+                .unwrap();
+            fail.store(failure, Ordering::Relaxed);
+            assert!(capture.sync(&mut replica, false).await.is_err());
+            assert!(capture.sync(&mut replica, false).await.unwrap());
+            close(replica).unwrap();
+            assert_capture_value(remote.path(), "retry me").await;
+        }
+    }
+
+    #[tokio::test]
+    async fn a_commit_during_upload_is_captured_on_the_next_tick() {
+        let source = tempfile::tempdir().unwrap();
+        let remote = tempfile::tempdir().unwrap();
+        let store = open_store(source.path()).await;
+        let writer = rusqlite::Connection::open(store.db_path()).unwrap();
+        writer
+            .execute_batch(
+                "PRAGMA wal_autocheckpoint=0;
+            CREATE TABLE capture_probe(value TEXT); INSERT INTO capture_probe VALUES('initial')",
+            )
+            .unwrap();
+        let observed = CountedClient::new(remote.path());
+        let during_upload = observed.commit_on_upload.clone();
+        let mut replica = open(&store.db_path(), observed).await.unwrap();
+        let mut capture = Capture::new(&store.db_path());
+        capture.sync(&mut replica, false).await.unwrap();
+        capture.sync(&mut replica, false).await.unwrap();
+        writer
+            .execute("UPDATE capture_probe SET value=?1", ["before upload"])
+            .unwrap();
+        *during_upload.lock().unwrap() = Some((store.db_path(), "during upload".into()));
+        capture.sync(&mut replica, false).await.unwrap();
+        assert_capture_value(remote.path(), "before upload").await;
+        assert!(capture.sync(&mut replica, false).await.unwrap());
+        close(replica).unwrap();
+        assert_capture_value(remote.path(), "during upload").await;
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn idle_capture_still_runs_maintenance_flush_and_observer_failure_fallback() {
+        let source = tempfile::tempdir().unwrap();
+        let remote = tempfile::tempdir().unwrap();
+        let store = open_store(source.path()).await;
+        let mut replica = open(&store.db_path(), CountedClient::new(remote.path()))
+            .await
+            .unwrap();
+        let mut capture = Capture::new(&store.db_path());
+        capture.sync(&mut replica, false).await.unwrap();
+        capture.sync(&mut replica, false).await.unwrap();
+        assert!(!capture.sync(&mut replica, false).await.unwrap());
+        tokio::time::advance(Db::DEFAULT_CHECKPOINT_INTERVAL).await;
+        assert!(capture.sync(&mut replica, false).await.unwrap());
+        assert!(capture.sync(&mut replica, true).await.unwrap());
+        capture.observer = None;
+        assert!(capture.sync(&mut replica, false).await.unwrap());
+        close(replica).unwrap();
     }
 
     /// The property the whole provisioning order rests on: a stream that

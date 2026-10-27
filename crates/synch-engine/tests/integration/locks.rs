@@ -194,7 +194,6 @@ async fn a_partition_grants_both_sides_and_the_heal_keeps_one() {
     // The survivor is the lesser ticket, and both sides agree on it.
     let keeper = if a.id < b.id { "east" } else { "west" };
     assert_ne!(lost, keeper);
-    tokio::time::sleep(Duration::from_secs(1)).await;
     let (survivor, loser) = if keeper == "east" {
         (east, west)
     } else {
@@ -204,10 +203,21 @@ async fn a_partition_grants_both_sides_and_the_heal_keeps_one() {
         .locks()
         .current(&lock())
         .is_some_and(|v| v.mode.is_some()));
-    let view = loser
-        .locks()
-        .current(&lock())
-        .expect("the loser sees the survivor");
+    // The loser can learn of the winning ticket from an Answer before the
+    // winner's next Renew advertises its held claim. Maintenance now starts
+    // with each node's first claim, so their renewal clocks need not align.
+    // Allow two renewal rounds (TTL/3), while still bounding convergence.
+    let view = tokio::time::timeout(Duration::from_secs(5), async {
+        loop {
+            if let Some(view) = loser.locks().current(&lock()) {
+                break view;
+            }
+            tokio::time::sleep(Duration::from_millis(20)).await;
+        }
+    })
+    .await
+    .expect("the loser sees the survivor within two renewal rounds");
+    assert_eq!(view.claim.id, if keeper == "east" { a.id } else { b.id });
     assert!(view.mode.is_none());
     shutdown(&[east, west]).await;
 }

@@ -5908,6 +5908,7 @@ dependencies = [
  "iroh-base",
  "opendal",
  "reqwest 0.13.4",
+ "rusqlite",
  "rustls",
  "serde",
  "serde_json",

@@ -730,6 +730,12 @@ document starts lying after an upgrade.
   unshipped writes are bounded by the interval; as with Litestream, the
   replica can only be *behind* the bucket's CAS state, never ahead, which
   is the direction §8.3 of SERVERLESS already reasons about.
+  Idle ticks compare SQLite's `data_version` on a dedicated read-only
+  connection instead of rescanning an unchanged WAL. The remembered version
+  is read before capture and kept only after successful upload, so concurrent
+  commits and failed uploads still run on the next tick. An unavailable
+  observer falls back to full capture. Full capture also runs at least every
+  60 seconds for checkpoint/continuity maintenance and on every final flush.
 - **A thread per tenant**: a replica owns a SQLite connection, so it is
   `Send` but not `Sync`, and the library's `sync` holds `&self` across an
   await — its future is therefore not `Send` and cannot be handed to
@@ -902,7 +908,7 @@ if the DB replica is also gone does the key-replacement path (§5.3) run.
 | SQLite | 1 file, 1 serialized connection | all access via the blocking pool |
 | OS threads | 0 | with engine change (a); today 4 (socket pool) |
 | tokio tasks | ~8 standing | §4.4 loop set |
-| DB replicator | 1 standing task, 1 read connection | in-process, §5.3 |
+| DB replicator | 1 task and worker, read lock + read-only change observer | in-process, §5.3 |
 | memory | O(trie working set + cache index) | dominated by anti-entropy peaks |
 | blocking-pool slots | ≤ `SYNCH_DP_MAX_INFLIGHT_PER_TENANT` from peers | the tenancy bound, §9.1 |
 
