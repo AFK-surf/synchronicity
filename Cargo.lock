@@ -5906,6 +5906,7 @@ dependencies = [
  "futures-util",
  "hex",
  "iroh-base",
+ "object_store",
  "opendal",
  "reqwest 0.13.4",
  "rusqlite",

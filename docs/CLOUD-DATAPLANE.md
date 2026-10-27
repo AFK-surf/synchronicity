@@ -918,6 +918,12 @@ deliberately: every store touch of every tenant crosses it), one
 must be — one Sigstore outage should cost one attempt a day, not N), the
 reqwest client, the metrics registry.
 
+Database restore, WAL shipping and compaction share one S3 connection pool.
+Each replication client still owns its tenant prefix; changing bucket options
+or credentials builds a separate backing store. Quiet tenants therefore reuse
+the fleet's active connections instead of each rebuilding TLS connections
+between infrequent uploads.
+
 The control client drains successful acknowledgements (up to 64 KiB) so an
 HTTP/1 heartbeat returns its connection to the pool instead of forcing another
 TLS handshake. Job-completion wakes share the latest immutable desired-key

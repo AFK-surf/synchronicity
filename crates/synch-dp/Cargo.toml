@@ -24,6 +24,8 @@ opendal.workspace = true
 # configures it rather than reimplementing it (`docs/CLOUD-DATAPLANE.md` §5.3).
 # Pinned to a commit: it is unpublished, so there is no version to track.
 celld-ltx = { git = "https://github.com/denoland/celld", rev = "a52f9905425bc41134d817694bdc2c50bcc5e856" }
+# The backing bucket is shared by celld-ltx clients with separate tenant prefixes.
+object_store = { version = "0.12.5", default-features = false }
 
 # `json` for the metrics/stub surfaces; the workspace default keeps axum lean
 # for the gateway, which does not need it.

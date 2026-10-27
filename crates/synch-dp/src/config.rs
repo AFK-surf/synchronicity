@@ -36,6 +36,9 @@ pub struct DpConfig {
     pub poll_interval: Duration,
     /// The object store: OpenDAL service and its options.
     pub objects: ObjectConfig,
+    /// Shared bucket transport for restore, shipping and compaction. Each
+    /// database client retains its own tenant prefix.
+    pub db_store: crate::dbrepl::SharedDbStore,
     /// Total cache budget across all tenants on this pod.
     pub cache_bytes_total: u64,
     /// How many tenants this pod is sized for. Divides the cache budget.
@@ -101,7 +104,7 @@ pub struct DpConfig {
 }
 
 /// The object store both the CAS and the database streams live in.
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ObjectConfig {
     /// `s3`, `gcs`, `azblob`, or `memory`.
     pub service: String,
@@ -197,6 +200,7 @@ impl DpConfig {
                 service: "memory".into(),
                 options: HashMap::new(),
             },
+            db_store: Default::default(),
             cache_bytes_total: 64 * 1024 * 1024,
             max_tenants: 4,
             replica_concurrency: synch_engine::DEFAULT_REPLICA_CONCURRENCY,
@@ -266,6 +270,7 @@ impl DpConfig {
             base_dir,
             poll_interval,
             objects: ObjectConfig { service, options },
+            db_store: Default::default(),
             cache_bytes_total: parse("SYNCH_DP_CACHE_BYTES_TOTAL", 64 * 1024 * 1024 * 1024)?,
             max_tenants,
             replica_concurrency,
@@ -334,8 +339,8 @@ impl DpConfig {
     ///
     /// `celld-ltx` brings its own storage client rather than OpenDAL, so this
     /// is configured from the same environment as the CAS instead of sharing
-    /// its operator. Two clients, one bucket, separate prefixes — which is
-    /// what §5.1 already asks for.
+    /// its operator. Restore, replication and compaction share the database
+    /// bucket's connection pool, with a distinct prefix on each client.
     ///
     /// It also brings only two: S3-compatible object storage, and a local
     /// directory. So a GCS or Azure deployment is refused here rather than
@@ -348,19 +353,22 @@ impl DpConfig {
         let get = |key: &str| options.get(key).cloned().unwrap_or_default();
         match self.objects.service.as_str() {
             "s3" => Ok(crate::dbrepl::DbClient::Objects(Box::new(
-                celld_ltx::ObjectStoreClient::new(celld_ltx::ObjectStoreConfig {
-                    bucket: get("bucket"),
-                    path: self.db_prefix(org, network),
-                    region: get("region"),
-                    endpoint: get("endpoint"),
-                    access_key_id: get("access_key_id"),
-                    secret_access_key: get("secret_access_key"),
-                    // A custom endpoint is MinIO/R2/Backblaze in practice, and
-                    // all of them want path-style addressing; native AWS does
-                    // not.
-                    force_path_style: !get("endpoint").is_empty(),
-                    ..Default::default()
-                }),
+                self.db_store.client(
+                    &self.objects,
+                    celld_ltx::ObjectStoreConfig {
+                        bucket: get("bucket"),
+                        path: self.db_prefix(org, network),
+                        region: get("region"),
+                        endpoint: get("endpoint"),
+                        access_key_id: get("access_key_id"),
+                        secret_access_key: get("secret_access_key"),
+                        // A custom endpoint is MinIO/R2/Backblaze in practice, and
+                        // all of them want path-style addressing; native AWS does
+                        // not.
+                        force_path_style: !get("endpoint").is_empty(),
+                        ..Default::default()
+                    },
+                )?,
             ))),
             // The CAS's `memory` service is for tests, and so is this: a
             // directory beside the tenant data rather than inside the bucket.
@@ -572,6 +580,7 @@ mod tests {
                 service: "memory".into(),
                 options: HashMap::new(),
             },
+            db_store: Default::default(),
             cache_bytes_total: 1024,
             max_tenants: 4,
             replica_concurrency: synch_engine::DEFAULT_REPLICA_CONCURRENCY,
@@ -586,6 +595,106 @@ mod tests {
         }
     }
 
+    /// Sharing the transport must preserve tenant prefixes and credentials,
+    /// including when an embedder changes the options on a cloned config.
+    #[tokio::test]
+    async fn database_clients_reuse_connections_without_reusing_tenant_prefixes() {
+        use axum::extract::{ConnectInfo, Query};
+        use axum::http::HeaderMap;
+        use std::net::SocketAddr;
+        use std::sync::{Arc, Mutex};
+
+        synch_net::tls::install_crypto_provider();
+        let requests = Arc::new(Mutex::new(Vec::new()));
+        let observed = requests.clone();
+        let app = axum::Router::new().fallback(
+            move |ConnectInfo(peer): ConnectInfo<SocketAddr>,
+                  Query(query): Query<HashMap<String, String>>,
+                  headers: HeaderMap| {
+                let observed = observed.clone();
+                async move {
+                    observed.lock().unwrap().push((
+                        peer,
+                        query["prefix"].clone(),
+                        headers["authorization"].to_str().unwrap().to_string(),
+                    ));
+                    r#"<?xml version="1.0" encoding="UTF-8"?>
+                    <ListBucketResult xmlns="http://s3.amazonaws.com/doc/2006-03-01/">
+                    <Name>test</Name><IsTruncated>false</IsTruncated>
+                    </ListBucketResult>"#
+                }
+            },
+        );
+        let listener = tokio::net::TcpListener::bind("127.0.0.1:0").await.unwrap();
+        let address = listener.local_addr().unwrap();
+        let server = tokio::spawn(async move {
+            axum::serve(
+                listener,
+                app.into_make_service_with_connect_info::<SocketAddr>(),
+            )
+            .await
+            .unwrap();
+        });
+        let mut config = config();
+        config.objects.service = "s3".into();
+        config.objects.options = HashMap::from([
+            ("bucket".into(), "test".into()),
+            ("region".into(), "us-east-1".into()),
+            ("endpoint".into(), format!("http://{address}")),
+            ("access_key_id".into(), "first-key".into()),
+            ("secret_access_key".into(), "test-secret".into()),
+        ]);
+        let clients = [
+            config.db_client("alpha", "default").unwrap(),
+            config.clone().db_client("beta", "default").unwrap(),
+            config.db_client("alpha", "other").unwrap(),
+        ];
+        for client in &clients {
+            let crate::dbrepl::DbClient::Objects(client) = client else {
+                unreachable!()
+            };
+            assert!(!client.has_any_object().await.unwrap());
+        }
+        let mut changed = config.clone();
+        changed
+            .objects
+            .options
+            .insert("access_key_id".into(), "second-key".into());
+        let crate::dbrepl::DbClient::Objects(second) =
+            changed.db_client("gamma", "default").unwrap()
+        else {
+            unreachable!()
+        };
+        assert!(!second.has_any_object().await.unwrap());
+        // Existing clients remain attached to their original credentials.
+        let crate::dbrepl::DbClient::Objects(first) = &clients[0] else {
+            unreachable!()
+        };
+        assert!(!first.has_any_object().await.unwrap());
+        server.abort();
+
+        let requests = requests.lock().unwrap();
+        assert_eq!(requests.len(), 5);
+        assert_eq!(requests[0].0, requests[1].0);
+        assert_eq!(requests[0].0, requests[2].0);
+        assert_eq!(requests[0].0, requests[4].0);
+        assert_ne!(requests[0].0, requests[3].0);
+        assert_eq!(
+            requests.iter().map(|r| r.1.as_str()).collect::<Vec<_>>(),
+            [
+                "db/alpha/default/",
+                "db/beta/default/",
+                "db/alpha/other/",
+                "db/gamma/default/",
+                "db/alpha/default/",
+            ]
+        );
+        for (i, request) in requests.iter().enumerate() {
+            let key = if i == 3 { "second-key" } else { "first-key" };
+            assert!(request.2.contains(&format!("Credential={key}/")));
+        }
+    }
+
     /// The replication library speaks S3 and local files, and nothing else.
     /// A backend it cannot write is a data plane that would mint device keys, get
     /// them named in customer zones, and lose them all on its first
@@ -595,6 +704,10 @@ mod tests {
         let mut config = config();
         for service in ["s3", "memory"] {
             config.objects.service = service.into();
+            config
+                .objects
+                .options
+                .insert("bucket".into(), "test".into());
             assert!(
                 config.check_db_replication().is_ok(),
                 "{service} should be replicable"

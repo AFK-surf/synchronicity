@@ -44,13 +44,59 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicU64, Ordering};
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::time::Duration;
 
 use celld_ltx::{Db, Replica, ReplicaClient};
 use tokio::sync::{mpsc, oneshot};
 
 use crate::error::{DpError, Result};
+
+/// One bucket connection pool for every database stream in a data plane.
+/// Cloned configurations share it; changed bucket options replace the cached
+/// store so a test or embedder cannot accidentally reuse different credentials.
+#[derive(Clone, Default)]
+pub struct SharedDbStore(Arc<Mutex<Option<CachedBucket>>>);
+
+struct CachedBucket {
+    options: crate::config::ObjectConfig,
+    store: Arc<dyn object_store::ObjectStore>,
+}
+
+impl std::fmt::Debug for SharedDbStore {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        // Neither the configuration nor the backend's Debug may print credentials.
+        f.debug_struct("SharedDbStore").finish_non_exhaustive()
+    }
+}
+
+impl SharedDbStore {
+    pub(crate) fn client(
+        &self,
+        options: &crate::config::ObjectConfig,
+        config: celld_ltx::ObjectStoreConfig,
+    ) -> Result<celld_ltx::ObjectStoreClient> {
+        let mut cached = self.0.lock().expect("bucket cache lock is not poisoned");
+        if cached
+            .as_ref()
+            .is_none_or(|entry| entry.options != *options)
+        {
+            let store = config.build_store().map_err(DpError::store)?;
+            *cached = Some(CachedBucket {
+                options: options.clone(),
+                store,
+            });
+        }
+        let store = cached
+            .as_ref()
+            .expect("bucket was initialized")
+            .store
+            .clone();
+        // Only the transport and bucket are shared. The library still prefixes
+        // every list, read, write and deletion with this client's tenant path.
+        Ok(celld_ltx::ObjectStoreClient::with_store(config, store))
+    }
+}
 
 /// How often the replicator captures and ships.
 ///

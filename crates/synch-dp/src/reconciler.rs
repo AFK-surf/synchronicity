@@ -1775,6 +1775,7 @@ mod tests {
                 service: "memory".into(),
                 options: HashMap::new(),
             },
+            db_store: Default::default(),
             cache_bytes_total: 1024,
             max_tenants: 4,
             replica_concurrency: synch_engine::DEFAULT_REPLICA_CONCURRENCY,
