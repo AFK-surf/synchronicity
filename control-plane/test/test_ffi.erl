@@ -4,6 +4,39 @@
 -module(test_ffi).
 -export([tmp_db/0, kill9/1, rename/2, udp_roundtrip/2, http_get/2]).
 -export([smtp_listen/0, smtp_transcript/0]).
+-export([abandon_pool_checkout/2]).
+
+%% Suspend only the test pool, wait for a real request to reach its
+%% mailbox, then kill that requester before any ownership transfer.
+abandon_pool_checkout(Dispatcher, Request) ->
+    true = erlang:suspend_process(Dispatcher),
+    {Borrower, Ref} = spawn_monitor(Request),
+    try
+        await_pool_checkout(Dispatcher, Borrower, 200),
+        exit(Borrower, kill),
+        receive
+            {'DOWN', Ref, process, Borrower, killed} -> nil
+        after 1000 -> error(borrower_did_not_exit)
+        end
+    after
+        exit(Borrower, kill),
+        erlang:demonitor(Ref, [flush]),
+        erlang:resume_process(Dispatcher)
+    end.
+
+await_pool_checkout(_Dispatcher, _Borrower, 0) ->
+    error(checkout_not_queued);
+await_pool_checkout(Dispatcher, Borrower, Attempts) ->
+    {messages, Messages} = process_info(Dispatcher, messages),
+    case lists:any(fun
+        ({_, {checkout, Caller, _}}) when Caller == Borrower -> true;
+        (_) -> false
+    end, Messages) of
+        true -> ok;
+        false ->
+            timer:sleep(5),
+            await_pool_checkout(Dispatcher, Borrower, Attempts - 1)
+    end.
 
 tmp_db() ->
     %% unique_integer is only unique within one VM run; the wall clock keeps

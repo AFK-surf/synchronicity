@@ -11,6 +11,8 @@
 //// monitor and its worker killed (SQLite discards any open transaction
 //// on worker exit). The dispatcher traps exits so an idle worker dying
 //// cannot take the pool down.
+//// Abandoned checkouts are dropped. Each checkout can open at most one
+//// replacement worker before returning an error to the caller.
 
 import exception
 import gleam/erlang/process.{type Pid, type Subject}
@@ -29,7 +31,7 @@ pub opaque type Pool {
 }
 
 pub opaque type Msg {
-  Checkout(caller: Pid, reply: Subject(Connection))
+  Checkout(caller: Pid, reply: Subject(Result(Connection, sqlite.Error)))
   /// Both carry the connection rather than the borrower: one process may
   /// hold more than one lease at a time (a request that resolves a session
   /// on one connection and does its work on another), so returning a
@@ -45,7 +47,7 @@ type Lease {
 }
 
 type Waiter =
-  #(Pid, Subject(Connection))
+  #(Pid, Subject(Result(Connection, sqlite.Error)))
 
 type State {
   State(
@@ -150,8 +152,9 @@ fn acquire(pool: Pool, attempts: Int) -> Result(Connection, sqlite.Error) {
     0 -> Error(sqlite.ConnectionClosed)
     _ -> {
       let self = process.self()
-      let conn =
-        process.call(pool.subject, waiting: 10_000, sending: Checkout(self, _))
+      use conn <- result.try(
+        process.call(pool.subject, waiting: 10_000, sending: Checkout(self, _)),
+      )
       sqlite.take(conn)
       // The checkout contract: pristine state, current file — and never a
       // file from a newer build (replicas may have one swapped in by
@@ -257,12 +260,39 @@ fn handle_msg(state: State, msg: Msg) -> actor.Next(State, Msg) {
 
 /// Hands an idle (or freshly opened) connection to `caller`, culling dead
 /// ports along the way; queues the caller when at capacity.
-fn lend(state: State, caller: Pid, reply: Subject(Connection)) -> State {
+fn lend(
+  state: State,
+  caller: Pid,
+  reply: Subject(Result(Connection, sqlite.Error)),
+) -> State {
+  lend_with_replacement(state, caller, reply, True)
+}
+
+fn lend_with_replacement(
+  state: State,
+  caller: Pid,
+  reply: Subject(Result(Connection, sqlite.Error)),
+  can_open: Bool,
+) -> State {
+  // port_connect fails for a dead caller as well as a dead port. Recheck
+  // on every retry: the caller can die during the ownership transfer.
+  case process.is_alive(caller) {
+    False -> state
+    True -> lend_to_alive_caller(state, caller, reply, can_open)
+  }
+}
+
+fn lend_to_alive_caller(
+  state: State,
+  caller: Pid,
+  reply: Subject(Result(Connection, sqlite.Error)),
+  can_open: Bool,
+) -> State {
   case state.idle {
     [conn, ..rest] ->
       case sqlite.give(conn, caller) {
         Ok(Nil) -> {
-          process.send(reply, conn)
+          process.send(reply, Ok(conn))
           State(..state, idle: rest, leases: [
             Lease(caller, process.monitor(caller), conn),
             ..state.leases
@@ -270,21 +300,36 @@ fn lend(state: State, caller: Pid, reply: Subject(Connection)) -> State {
         }
         Error(Nil) -> {
           sqlite.kill(conn)
-          lend(State(..state, idle: rest), caller, reply)
+          lend_with_replacement(
+            State(..state, idle: rest),
+            caller,
+            reply,
+            can_open,
+          )
         }
       }
     [] -> {
       let live = list.length(state.leases)
-      case live < state.size {
-        True ->
+      case live < state.size, can_open {
+        True, True ->
           case sqlite.open(state.path, state.mode) {
-            Ok(conn) -> lend(State(..state, idle: [conn]), caller, reply)
-            Error(_) ->
-              // Cannot open (database gone?): queue; the caller's call
-              // timeout is the backstop.
-              State(..state, waiters: [#(caller, reply), ..state.waiters])
+            Ok(conn) ->
+              lend_with_replacement(
+                State(..state, idle: [conn]),
+                caller,
+                reply,
+                False,
+              )
+            Error(error) -> {
+              process.send(reply, Error(error))
+              state
+            }
           }
-        False -> State(..state, waiters: [#(caller, reply), ..state.waiters])
+        True, False -> {
+          process.send(reply, Error(sqlite.ConnectionClosed))
+          state
+        }
+        False, _ -> State(..state, waiters: [#(caller, reply), ..state.waiters])
       }
     }
   }
@@ -298,7 +343,7 @@ fn place(state: State, conn: Connection) -> State {
       let state = State(..state, waiters: list.reverse(rest))
       case sqlite.give(conn, pid) {
         Ok(Nil) -> {
-          process.send(reply, conn)
+          process.send(reply, Ok(conn))
           State(..state, leases: [
             Lease(pid, process.monitor(pid), conn),
             ..state.leases

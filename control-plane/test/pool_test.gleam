@@ -1,8 +1,80 @@
+import exception
 import fixtures.{ready_db, tmp_db}
 import gleam/erlang/process
 import store/db
 import store/pool
 import store/sqlite.{Int as VInt}
+
+pub fn abandoned_checkout_does_not_block_other_borrowers_test() {
+  let path = tmp_db()
+  ready_db(path)
+  let child =
+    pool.supervised(
+      process.new_name("abandoned_checkout"),
+      path,
+      sqlite.ReadWrite,
+      db.primary_pragmas,
+      1,
+    )
+  let assert Ok(started) = child.start()
+  process.unlink(started.pid)
+  use <- exception.defer(fn() { process.kill(started.pid) })
+
+  // A real checkout reaches the dispatcher's mailbox, but its requester
+  // dies before the dispatcher can transfer the connection.
+  abandon_checkout(started.pid, fn() {
+    pool.with_connection(started.data, fn(conn) {
+      sqlite.query(conn, "SELECT 1", [])
+    })
+  })
+
+  let replies = process.new_subject()
+  let borrower =
+    process.spawn_unlinked(fn() {
+      process.send(
+        replies,
+        pool.with_connection(started.data, fn(conn) {
+          sqlite.query(conn, "SELECT 1", [])
+        }),
+      )
+    })
+  use <- exception.defer(fn() { process.kill(borrower) })
+  assert process.receive(replies, 2000) == Ok(Ok(Ok([[VInt(1)]])))
+}
+
+pub fn unavailable_database_returns_error_and_pool_recovers_test() {
+  let path = tmp_db()
+  let child =
+    pool.supervised(
+      process.new_name("unavailable_database"),
+      path,
+      sqlite.ReadWrite,
+      db.primary_pragmas,
+      1,
+    )
+  let assert Ok(started) = child.start()
+  process.unlink(started.pid)
+  use <- exception.defer(fn() { process.kill(started.pid) })
+  let replies = process.new_subject()
+  let borrower =
+    process.spawn_unlinked(fn() {
+      process.send(
+        replies,
+        pool.with_connection(started.data, fn(conn) {
+          sqlite.query(conn, "SELECT 1", [])
+        }),
+      )
+    })
+  use <- exception.defer(fn() { process.kill(borrower) })
+  // Opening without CREATE must report the missing database, not leave
+  // the request queued until its checkout times out.
+  let assert Ok(Error(sqlite.Sqlite(_, _))) = process.receive(replies, 2000)
+  ready_db(path)
+  assert pool.with_connection(started.data, fn(conn) {
+      sqlite.query(conn, "SELECT 1", [])
+    })
+    == Ok(Ok([[VInt(1)]]))
+}
 
 pub fn checkout_reset_isolates_borrowers_test() {
   let path = tmp_db()
@@ -126,3 +198,6 @@ pub fn dead_nested_borrower_releases_write_lock_test() {
 
 @external(erlang, "test_ffi", "rename")
 fn rename(from: String, to: String) -> Nil
+
+@external(erlang, "test_ffi", "abandon_pool_checkout")
+fn abandon_checkout(dispatcher: process.Pid, request: fn() -> a) -> Nil
